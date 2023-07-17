@@ -1,4 +1,4 @@
-# `deploy`
+# `devops`
 
 A simple CLI tool to deploy Rust musl binaries.
 

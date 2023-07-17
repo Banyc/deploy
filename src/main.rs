@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use deploy::{
+use devops::{
     deploy::{deploy, DeployArgs},
     systemctl::{systemctl, SystemctlArgs},
 };
