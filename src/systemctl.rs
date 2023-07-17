@@ -3,6 +3,7 @@ use std::sync::Arc;
 use clap::Args;
 use xshell::{cmd, Shell};
 
+/// Overwrite systemd service file.
 #[derive(Debug, Args)]
 pub struct SystemctlArgs {
     /// e.g.: `user@server-address`

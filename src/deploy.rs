@@ -8,6 +8,7 @@ use clap::Args;
 use time::OffsetDateTime;
 use xshell::{cmd, Shell};
 
+/// Deploy musl binary to a remote server.
 #[derive(Debug, Args)]
 pub struct DeployArgs {
     /// e.g.: `user@server-address`
