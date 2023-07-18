@@ -2,6 +2,11 @@
 
 A simple CLI tool to deploy Rust musl binaries.
 
+## Commands
+
+- `deploy`: `scp`, `ln -s`, and then `systemctl restart`.
+- `systemctl`: Overwrite a systemd service file.
+
 ## Usage
 
 1. Clone the repository
