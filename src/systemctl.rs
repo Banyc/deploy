@@ -34,7 +34,7 @@ pub fn systemctl(args: SystemctlArgs) -> Result<(), Box<dyn std::error::Error>> 
     temp_file.write_all(text.as_bytes())?;
 
     let binary_name = args.binary_name;
-    let service_file_path = format!("/etc/systemd/user/{binary_name}.service");
+    let service_file_path = format!("/etc/systemd/system/{binary_name}.service");
     let server_ssh = args.server_ssh.as_ref();
     let sh = Shell::new()?;
 
