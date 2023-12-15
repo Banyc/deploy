@@ -64,10 +64,7 @@ pub fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 fn remote_file_name(binary_name: &str, commit_hash: &str, file_hash: &str) -> String {
     let build_timestamp = OffsetDateTime::now_utc().unix_timestamp();
-    format!(
-        "{}-{}-{}-{}",
-        binary_name, commit_hash, build_timestamp, file_hash
-    )
+    format!("{binary_name}-{build_timestamp}-{commit_hash}-{file_hash}",)
 }
 
 fn file_hash<P>(file_path: P) -> io::Result<String>
