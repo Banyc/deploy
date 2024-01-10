@@ -6,8 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-blake3 = "1.4.1"
-clap = { version = "4.3.12", features = ["derive"] }
-tempfile = "3.6.0"
-time = { version = "0.3.23", features = ["std"] }
-xshell = "0.2.5"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+tar = "0.4"
+tempfile = "3"
+time = { version = "0.3", features = ["std"] }
+xshell = "0.2"

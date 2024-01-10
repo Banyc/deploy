@@ -1,6 +1,7 @@
 use std::{
+    ffi::OsStr,
     io::{self, BufRead},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -20,15 +21,12 @@ pub struct DeployArgs {
 }
 
 impl DeployArgs {
-    pub fn server_restart_command(&self) -> String {
+    pub fn restart_command(&self) -> String {
         format!("systemctl restart {}", self.binary_name)
     }
 
-    pub fn output_file_path(&self) -> String {
-        format!(
-            "./target/x86_64-unknown-linux-musl/release/{}",
-            self.binary_name
-        )
+    pub fn output_file_path(&self) -> PathBuf {
+        PathBuf::from("./target/x86_64-unknown-linux-musl/release").join(self.binary_name.as_ref())
     }
 }
 
@@ -46,17 +44,17 @@ pub fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> {
         &sh,
         &args.server_ssh,
         &args.server_path,
-        &args.output_file_path(),
+        args.output_file_path(),
         &remote_file_name,
     )?;
 
-    start_server(
+    restart(
         &sh,
         &args.server_ssh,
         &args.server_path,
         &remote_file_name,
         &args.binary_name,
-        &args.server_restart_command(),
+        &args.restart_command(),
     )?;
 
     Ok(())
@@ -67,10 +65,7 @@ fn remote_file_name(binary_name: &str, commit_hash: &str, file_hash: &str) -> St
     format!("{binary_name}-{build_timestamp}-{commit_hash}-{file_hash}",)
 }
 
-fn file_hash<P>(file_path: P) -> io::Result<String>
-where
-    P: AsRef<Path>,
-{
+fn file_hash(file_path: impl AsRef<Path>) -> io::Result<String> {
     let mut binary = std::fs::File::open(file_path)?;
     let mut reader = std::io::BufReader::new(&mut binary);
     let mut hasher = blake3::Hasher::new();
@@ -86,7 +81,7 @@ fn transfer_file(
     sh: &Shell,
     server_ssh: &str,
     server_path: &str,
-    file_path: &str,
+    file_path: impl AsRef<OsStr>,
     remote_file_name: &str,
 ) -> Result<(), xshell::Error> {
     // make sure the remote directory exists
@@ -103,7 +98,7 @@ fn transfer_file(
     Ok(())
 }
 
-fn start_server(
+fn restart(
     sh: &Shell,
     server_ssh: &str,
     server_path: &str,
