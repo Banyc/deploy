@@ -91,7 +91,11 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
 
     let config_path = proj.join("deploy.yaml");
     let config = Config::load(&config_path)?;
-    assert_eq!(config.release.path, Path::new("releases/v1"));
+    assert_eq!(config.release.as_str(), "v1");
+    assert!(
+        config.release_root(&config_path).ends_with("releases/v1"),
+        "release directory is forced beneath releases/"
+    );
     assert_eq!(config.targets["production"].servers.len(), 2);
     let variant = config.variant("standard")?;
     assert_eq!(&variant.artifact.mappings[0].from, "artifacts/build/output/");

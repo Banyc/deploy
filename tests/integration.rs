@@ -51,11 +51,7 @@ const CONFIG: &str = r#"
 schema_version: 1
 application: example
 remote_root: /srv/deploy/example
-release:
-  path: releases/v1
-  variants:
-    standard: standard.yaml
-    high-capacity: high-capacity.yaml
+release: v1
 targets:
   production:
     rollout:
@@ -256,10 +252,7 @@ fn fleet_rollback_after_variant_rename_succeeds() -> Result<()> {
 schema_version: 1
 application: example
 remote_root: /srv/deploy/example
-release:
-  path: releases/v1
-  variants:
-    {variant}: {variant}.yaml
+release: v1
 targets:
   production:
     rollout: {{ batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }}
@@ -714,10 +707,7 @@ fn single_target_yaml(stop_on_failure: bool, batch_size: u32) -> String {
 schema_version: 1
 application: example
 remote_root: /srv/deploy/example
-release:
-  path: releases/v1
-  variants:
-    standard: standard.yaml
+release: v1
 targets:
   production:
     rollout:
@@ -772,10 +762,7 @@ fn cli_reaches_configured_endpoint() -> Result<()> {
 schema_version: 1
 application: example
 remote_root: /srv/deploy/example
-release:
-  path: releases/v1
-  variants:
-    standard: standard.yaml
+release: v1
 targets:
   production:
     rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
@@ -1253,10 +1240,7 @@ fn stop_on_failure_records_all_servers() -> Result<()> {
 schema_version: 1
 application: example
 remote_root: /srv/deploy/example
-release:
-  path: releases/v1
-  variants:
-    standard: standard.yaml
+release: v1
 targets:
   production:
     rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }

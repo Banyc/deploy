@@ -81,13 +81,18 @@ deploy push production HEAD: current
 There are no required user-facing package, upload, activate, systemd-register, or rotate commands. Those are stages of `push`. A `rollback` command may exist as a convenience alias, but rollback remains a push of an older deployment reference.
 
 ## Declarative configuration
-The project contains one deployment definition:
+The project file structure is forced: one deployment definition naming the active release, and a `releases/` tree where each release directory holds its variant files (every `*.yaml` file inside is a variant named by its file stem) and its artifact sources:
 
 ```text
 my-project/
-  deploy.yaml
-  build/
-  deployment/
+  deploy.yaml            # release: v1
+  releases/
+    v1/
+      standard.yaml      # variant file: mappings + policies
+      high-capacity.yaml
+      artifacts/         # artifact sources referenced by mappings
+    v2/
+      ...
 ```
 
 Example `deploy.yaml`:
@@ -96,16 +101,11 @@ Example `deploy.yaml`:
 schema_version: 1
 application: example
 remote_root: /srv/deploy/example
-release:
-  # Directory (relative to this file) holding the sibling variant YAML files.
-  path: releases/v1
-  variants:
-    standard: standard.yaml
-    high-capacity: high-capacity.yaml
-  pins:
-    - release: rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1
-      variants: all
-      reason: known-good recovery release
+release: v1              # the release directory is forced to releases/v1/
+pins:
+  - release: rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1
+    variants: all
+    reason: known-good recovery release
 targets:
   production:
     rollout:
@@ -127,14 +127,14 @@ targets:
         variant: high-capacity
 ```
 
-Each declared variant is described by its own sibling YAML file inside the
-release directory (e.g. `releases/v1/standard.yaml`). A variant file owns its
-artifact mappings and its deployment policies:
+Each variant is described by its own file inside the release directory (e.g.
+`releases/v1/standard.yaml`); there is no explicit variant list to keep in
+sync. A variant file owns its artifact mappings and its deployment policies:
 
 ```yaml
 # releases/v1/standard.yaml
-# All `from` paths are relative to the release directory (the directory named by
-# `release.path` in deploy.yaml), so artifact sources live under `artifacts/`.
+# All `from` paths are relative to the release directory (`releases/v1/` — the
+# project structure is forced), so artifact sources live under `artifacts/`.
 description: Standard deployment
 artifact:
   mappings:

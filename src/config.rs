@@ -1,11 +1,13 @@
 //! Declarative deployment configuration (`deploy.yaml`, schema version 1).
 //!
-//! `deploy.yaml` selects a release directory (`release.path`) relative to the
-//! directory containing `deploy.yaml`. That release directory holds one sibling
-//! variant YAML file per declared variant; each variant file owns its own
-//! artifact mappings and deployment policies (activation, verification,
-//! capacity, rotation). Targets contain only their rollout policy and their
-//! stable server membership with per-server variant assignment.
+//! The project file structure is forced: `deploy.yaml` names the active release
+//! (`release: <name>`), and every regular `*.yaml` file directly inside
+//! `<project>/releases/<name>/` is discovered as a variant named by its file
+//! stem. Each variant file owns its own artifact mappings and deployment
+//! policies (activation, verification, capacity, rotation); artifact sources
+//! conventionally live beneath `releases/<name>/artifacts/`. Targets contain
+//! only their rollout policy and their stable server membership with per-server
+//! variant assignment.
 //!
 //! The same local inputs always produce one target-independent release identity
 //! (see `model::ReleaseDigest`): the name-sorted per-variant mappings, the
@@ -16,6 +18,7 @@ use crate::error::{Error, Result};
 use crate::model::SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 /// Reject any path that is absolute or contains a parent/root/prefix component,
@@ -55,9 +58,9 @@ pub enum PinVariants {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Mapping {
-    /// Source path relative to the release directory (`release.path`), where
-    /// the convention is `artifacts/...`. `{{ variant }}` is the only allowed
-    /// interpolation variable.
+    /// Source path relative to the release directory (`releases/<release>/`),
+    /// where the convention is `artifacts/...`. `{{ variant }}` is the only
+    /// allowed interpolation variable.
     pub from: String,
     /// Artifact-relative destination path.
     pub to: String,
@@ -219,13 +222,56 @@ pub struct Pin {
     pub reason: String,
 }
 
-/// Selects a release directory plus its sibling variant files.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReleaseConfig {
-    pub path: PathBuf,
-    pub variants: BTreeMap<String, PathBuf>,
-    #[serde(default)]
-    pub pins: Vec<Pin>,
+/// The active release: the name of a directory directly beneath `releases/` in
+/// the project root. The project structure is forced to
+/// `<project>/releases/<name>/<variant>.yaml`; there is no configurable path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ReleaseName(String);
+
+impl ReleaseName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ReleaseName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReleaseName {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ReleaseNameVisitor;
+        impl<'d> serde::de::Visitor<'d> for ReleaseNameVisitor {
+            type Value = ReleaseName;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str(
+                    "a release name like `release: v1` (the release directory is forced to `releases/<name>/`)",
+                )
+            }
+
+            fn visit_str<E>(self, v: &str) -> std::result::Result<ReleaseName, E> {
+                Ok(ReleaseName(v.to_string()))
+            }
+
+            fn visit_map<A>(self, _map: A) -> std::result::Result<ReleaseName, A::Error>
+            where
+                A: serde::de::MapAccess<'d>,
+            {
+                Err(serde::de::Error::custom(
+                    "schema v1 forces the project structure `<project>/releases/<name>/<variant>.yaml`: \
+                     set `release: <name>` and drop the release.path/release.variants map",
+                ))
+            }
+        }
+        deserializer.deserialize_any(ReleaseNameVisitor)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -282,7 +328,12 @@ pub struct Config {
     pub schema_version: u32,
     pub application: String,
     pub remote_root: PathBuf,
-    pub release: ReleaseConfig,
+    /// The active release: the name of a directory directly beneath
+    /// `releases/` in the project root (`release: v1` -> `releases/v1/`).
+    pub release: ReleaseName,
+    /// Durable retention pins applied on every rotation.
+    #[serde(default)]
+    pub pins: Vec<Pin>,
     pub targets: BTreeMap<String, TargetDef>,
     #[serde(skip)]
     variants: BTreeMap<String, VariantConfig>,
@@ -290,8 +341,9 @@ pub struct Config {
 
 impl Config {
     /// Load and validate a configuration from a `deploy.yaml` path. The project
-    /// root is the directory containing the file. Variant files are resolved
-    /// from the release directory selected by `release.path`.
+    /// root is the directory containing the file. Variant files are discovered
+    /// inside `<project>/releases/<release>/` (the release directory named by
+    /// `release:`).
     pub fn load(path: &Path) -> Result<Config> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| Error::config(format!("reading {}: {e}", path.display())))?;
@@ -309,9 +361,11 @@ impl Config {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
-    /// Absolute release directory: the project root joined with `release.path`.
+    /// Absolute release directory: forced to `<project>/releases/<release>`.
     pub fn release_root(&self, config_path: &Path) -> PathBuf {
-        self.project_root(config_path).join(&self.release.path)
+        self.project_root(config_path)
+            .join("releases")
+            .join(self.release.as_str())
     }
 
     /// Validate the configuration per schema version 1 rules.
@@ -320,6 +374,18 @@ impl Config {
             return Err(Error::config(format!(
                 "unsupported schema_version {} (expected {SCHEMA_VERSION})",
                 self.schema_version
+            )));
+        }
+        // The release name must be exactly one directory component so it cannot
+        // escape the forced `releases/` directory.
+        let name = self.release.as_str();
+        let single_component = matches!(
+            Path::new(name).components().collect::<Vec<_>>().as_slice(),
+            [Component::Normal(c)] if *c == std::ffi::OsStr::new(name)
+        );
+        if !single_component {
+            return Err(Error::config(format!(
+                "release '{name}' must be a single directory name (the release directory is forced to `releases/<name>/`)"
             )));
         }
         if self.variants.is_empty() {
@@ -440,87 +506,88 @@ impl Config {
             .ok_or_else(|| Error::config(format!("unknown release variant '{name}'")))
     }
 
-    /// Load every declared variant file from the release directory selected by
-    /// `release.path`. Rejects absolute/parent config paths and any variant
-    /// config path that escapes the release directory.
+    /// Discover variant files inside the release directory. The project
+    /// structure is forced: every regular, non-hidden `*.yaml` file directly
+    /// inside `<project>/releases/<release>/` is a variant named by its file
+    /// stem. Other entries (such as the `artifacts/` directory) are ignored.
     fn load_variants(&mut self, config_path: &Path) -> Result<()> {
-        Self::validate_source_path(&self.release.path, "release.path")?;
-        if self.release.variants.is_empty() {
-            return Err(Error::config("at least one release variant must be declared"));
-        }
         let project_root = self
             .project_root(config_path)
             .canonicalize()
             .map_err(|e| Error::config(format!("canonicalize project root for deploy.yaml: {e}")))?;
-        let release_root = project_root.join(&self.release.path);
-        let canonical_release = release_root
-            .canonicalize()
-            .map_err(|e| {
-                Error::config(format!(
-                    "canonicalize release path '{}': {e}",
-                    self.release.path.display()
-                ))
-            })?;
-        if !canonical_release.starts_with(&project_root) || !canonical_release.is_dir() {
+        let release_root = project_root.join("releases").join(self.release.as_str());
+        let canonical_release = release_root.canonicalize().map_err(|_| {
+            Error::config(format!(
+                "release directory '{}' not found; the project structure is forced: \
+                 <project>/releases/{}/<variant>.yaml",
+                release_root.display(),
+                self.release
+            ))
+        })?;
+        if !canonical_release.is_dir() {
             return Err(Error::config(format!(
-                "release.path '{}' must resolve to a directory beneath the deploy.yaml directory",
-                self.release.path.display()
+                "release '{}' is not a directory ({})",
+                self.release,
+                release_root.display()
+            )));
+        }
+        let mut variant_files: Vec<(String, PathBuf)> = Vec::new();
+        let entries = std::fs::read_dir(&canonical_release).map_err(|e| {
+            Error::config(format!(
+                "reading release directory '{}': {e}",
+                canonical_release.display()
+            ))
+        })?;
+        for entry in entries {
+            let entry = entry
+                .map_err(|e| Error::config(format!("reading release directory entry: {e}")))?;
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue; // non-UTF-8 names are never variants
+            };
+            if file_name.starts_with('.') {
+                continue; // hidden files are never variants
+            }
+            let Some(stem) = file_name.strip_suffix(".yaml") else {
+                continue; // only *.yaml files declare variants
+            };
+            if stem.trim().is_empty() {
+                return Err(Error::config(format!(
+                    "variant file '{file_name}' in '{}' has an empty variant name",
+                    canonical_release.display()
+                )));
+            }
+            if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                return Err(Error::config(format!(
+                    "variant '{stem}' config '{file_name}' must be a regular file inside the release directory"
+                )));
+            }
+            variant_files.push((stem.to_string(), entry.path()));
+        }
+        variant_files.sort_by(|a, b| a.0.cmp(&b.0));
+        if variant_files.is_empty() {
+            return Err(Error::config(format!(
+                "release directory '{}' declares no variants (expected at least one <variant>.yaml file)",
+                release_root.display()
             )));
         }
         let mut variants = BTreeMap::new();
-        for (name, relative_path) in &self.release.variants {
-            if name.trim().is_empty() {
-                return Err(Error::config("release variant name must not be empty"));
-            }
-            Self::validate_source_path(relative_path, &format!("release.variants.{name}"))?;
-            let path = canonical_release.join(relative_path);
-            let canonical_path = path.canonicalize().map_err(|e| {
-                Error::config(format!(
-                    "canonicalize variant '{name}' config '{}': {e}",
-                    path.display()
-                ))
-            })?;
-            if !canonical_path.starts_with(&canonical_release) || !canonical_path.is_file() {
-                return Err(Error::config(format!(
-                    "variant '{name}' config '{}' must resolve to a file beneath the release directory",
-                    relative_path.display()
-                )));
-            }
-            let text = std::fs::read_to_string(&canonical_path).map_err(|e| {
+        for (name, path) in variant_files {
+            let text = std::fs::read_to_string(&path).map_err(|e| {
                 Error::config(format!(
                     "reading variant '{name}' config '{}': {e}",
-                    canonical_path.display()
+                    path.display()
                 ))
             })?;
             let variant: VariantConfig = serde_yaml::from_str(&text).map_err(|e| {
                 Error::config(format!(
                     "parsing variant '{name}' config '{}': {e}",
-                    canonical_path.display()
+                    path.display()
                 ))
             })?;
-            variants.insert(name.clone(), variant);
+            variants.insert(name, variant);
         }
         self.variants = variants;
-        Ok(())
-    }
-
-    /// Reject any path that is absolute or contains a parent/root/prefix
-    /// component, so a release or variant config path cannot escape the
-    /// directory containing `deploy.yaml`.
-    fn validate_source_path(path: &Path, field: &str) -> Result<()> {
-        if path.as_os_str().is_empty()
-            || path.is_absolute()
-            || path.components().any(|component| {
-                matches!(
-                    component,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                )
-            })
-        {
-            return Err(Error::config(format!(
-                "{field} must be a non-empty relative path without '..'"
-            )));
-        }
         Ok(())
     }
 }
@@ -577,15 +644,12 @@ verification: { adapter: command, argv: ["true"], timeout_seconds: 5, attempts: 
 capacity: { reserve_bytes: 0, reserve_percent: 0 }
 rotation: { per_server: { keep_distinct_artifacts: 1, keep_days: 0, protect_previous: true }, fleet: { protect_deployments: 1 } }
 "#;
-        std::fs::write(release_dir.join("var1.yaml"), variant_yaml).unwrap();
+        std::fs::write(release_dir.join("standard.yaml"), variant_yaml).unwrap();
         let yaml = r#"
 schema_version: 1
 application: esc
 remote_root: /srv/esc
-release:
-  path: releases/v1
-  variants:
-    standard: var1.yaml
+release: v1
 targets:
   t1:
     rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
@@ -642,11 +706,7 @@ rotation: { per_server: { keep_distinct_artifacts: 5, keep_days: 14, protect_pre
 schema_version: 1
 application: example
 remote_root: /srv/example
-release:
-  path: releases/v1
-  variants:
-    standard: standard.yaml
-    high-capacity: high-capacity.yaml
+release: v1
 targets:
   t1:
     rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
@@ -678,5 +738,150 @@ targets:
 
         // Unknown variant name is rejected.
         assert!(cfg.variant("missing").is_err());
+    }
+
+    const MINIMAL_VARIANT: &str = r#"
+artifact: { mappings: [] }
+activation: { adapter: none }
+verification: { adapter: command, argv: ["true"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
+capacity: { reserve_bytes: 0, reserve_percent: 0 }
+rotation: { per_server: { keep_distinct_artifacts: 1, keep_days: 0, protect_previous: true }, fleet: { protect_deployments: 1 } }
+"#;
+
+    fn deploy_yaml(release_value: &str) -> String {
+        format!(
+            r#"
+schema_version: 1
+application: forced
+remote_root: /srv/forced
+release: {release_value}
+targets:
+  t1:
+    rollout: {{ batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }}
+    servers:
+      - id: s1
+        address: a
+        user: u
+        variant: standard
+"#
+        )
+    }
+
+    fn write_standard_release(project: &Path, release: &str) {
+        let release_dir = project.join("releases").join(release);
+        std::fs::create_dir_all(&release_dir).unwrap();
+        std::fs::write(release_dir.join("standard.yaml"), MINIMAL_VARIANT).unwrap();
+    }
+
+    #[test]
+    fn forced_structure_discovers_variant_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        // Non-variant entries inside the release directory are ignored.
+        std::fs::create_dir_all(project.join("releases/v1/artifacts")).unwrap();
+        std::fs::write(project.join("releases/v1/README.md"), "notes").unwrap();
+        std::fs::write(project.join("releases/v1/.hidden.yaml"), MINIMAL_VARIANT).unwrap();
+        std::fs::write(project.join("releases/v1/other.yml"), MINIMAL_VARIANT).unwrap();
+        std::fs::write(
+            project.join("releases/v1/high-capacity.yaml"),
+            MINIMAL_VARIANT,
+        )
+        .unwrap();
+
+        let p = project.join("deploy.yaml");
+        std::fs::write(&p, deploy_yaml("v1")).unwrap();
+        let cfg = Config::load(&p).expect("config loads from the forced structure");
+        assert_eq!(cfg.release.as_str(), "v1");
+        assert_eq!(
+            cfg.variant_names(),
+            vec!["high-capacity".to_string(), "standard".to_string()],
+            "every *.yaml file stem is a variant; other entries are ignored"
+        );
+        assert_eq!(
+            cfg.release_root(&p),
+            project.join("releases").join("v1")
+        );
+    }
+
+    #[test]
+    fn release_name_map_form_is_rejected_with_migration_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        // The pre-forcing deploy.yaml shape must not parse silently.
+        let yaml = r#"
+schema_version: 1
+application: legacy
+remote_root: /srv/legacy
+release:
+  path: releases/v1
+  variants:
+    standard: standard.yaml
+targets:
+  t1:
+    rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
+    servers:
+      - id: s1
+        address: a
+        user: u
+        variant: standard
+"#;
+        let p = project.join("deploy.yaml");
+        std::fs::write(&p, yaml).unwrap();
+        let err = Config::load(&p).expect_err("old release map form must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("release: <name>"),
+            "error must explain the forced structure, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn release_name_must_be_a_single_directory_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        for bad in ["../v1", "a/b", ".", "..", "/abs"] {
+            let p = project.join("deploy.yaml");
+            std::fs::write(&p, deploy_yaml(bad)).unwrap();
+            assert!(
+                Config::load(&p).is_err(),
+                "release name '{bad}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_release_directory_errors_with_structure_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let p = project.join("deploy.yaml");
+        std::fs::write(&p, deploy_yaml("v9")).unwrap();
+        let err = Config::load(&p).expect_err("missing release dir must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("releases/v9") || msg.contains("releases") && msg.contains("v9"),
+            "error must point at the forced release directory, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn release_directory_without_variants_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(project.join("releases/v1")).unwrap();
+        let p = project.join("deploy.yaml");
+        std::fs::write(&p, deploy_yaml("v1")).unwrap();
+        let err = Config::load(&p).expect_err("empty release dir must fail");
+        assert!(
+            err.to_string().contains("no variants"),
+            "error must mention the missing variant files, got: {err}"
+        );
     }
 }

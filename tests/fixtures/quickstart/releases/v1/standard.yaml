@@ -1,6 +1,7 @@
 # The `standard` variant: its artifact mappings plus deployment policies.
-# `from` paths resolve inside the release directory selected by `release.path`,
-# so artifact sources live under `releases/v1/artifacts/`.
+# `from` paths resolve inside the release directory (`releases/<name>/` — the
+# project structure is forced), so artifact sources live under
+# `releases/v1/artifacts/`.
 description: Standard deployment
 
 artifact:

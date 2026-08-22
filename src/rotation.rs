@@ -195,10 +195,7 @@ rotation:
 schema_version: 1
 application: rot
 remote_root: /srv
-release:
-  path: releases/v1
-  variants:
-    standard: standard.yaml
+release: v1
 targets:
   t1:
     rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
@@ -260,7 +257,7 @@ targets:
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let c = cfg();
         let rotation = &c.variant("standard").unwrap().rotation;
-        let retained = compute_retained(&helper, rotation, &c.release.pins, &store).unwrap();
+        let retained = compute_retained(&helper, rotation, &c.pins, &store).unwrap();
         assert!(retained.contains("t2"), "current tree retained");
         assert!(retained.contains("t1"), "previous tree retained");
     }

@@ -2,12 +2,10 @@ schema_version: 1
 application: example
 remote_root: /srv/deploy/example
 
-# The release directory holds one generation of the deployment: its variant
-# files and the artifact sources those variants map into the tree.
-release:
-  path: releases/v1
-  variants:
-    standard: standard.yaml
+# The active release. The project structure is forced: the release directory
+# is `releases/<name>/`, and every `*.yaml` file inside it is a variant
+# (e.g. `standard`); artifact sources live beneath its `artifacts/` tree.
+release: v1
 
 targets:
   production:

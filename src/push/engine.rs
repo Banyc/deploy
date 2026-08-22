@@ -131,10 +131,11 @@ fn push_inner(
     opts: &PushOptions,
 ) -> Result<PushReport> {
     // 3. Materialize every declared variant. Mappings resolve from the release
-    //    directory selected by `release.path`, not the project root, so an
-    //    artifact `from` can never escape into the project's other files. Dry-run
-    //    uses disposable staging and never writes to the object store.
-    let release_root = project_root.join(&config.release.path);
+    //    directory (`<project>/releases/<release>/` — the structure is forced),
+    //    not the project root, so an artifact `from` can never escape into the
+    //    project's other files. Dry-run uses disposable staging and never writes
+    //    to the object store.
+    let release_root = project_root.join("releases").join(config.release.as_str());
     let mut variant_trees: BTreeMap<String, TreeDigest> = BTreeMap::new();
     if matches!(pref, PushRef::Head) {
         for v in config.variant_names() {
@@ -847,7 +848,7 @@ fn push_inner(
         if let Some(policy) = policy
             && helper.acquire_lock(op_id.as_str(), false).is_ok()
         {
-            let retained = compute_retained(helper, &policy.rotation, &config.release.pins, store)?;
+            let retained = compute_retained(helper, &policy.rotation, &config.pins, store)?;
             let active_incoming = HashSet::from([deployment_id.as_str().to_string()]);
             helper.rotate(&retained, &active_incoming)?;
             helper.release_lock(op_id.as_str())?;
@@ -1359,7 +1360,7 @@ fn capacity_preflight(
                     resolve_variant_policy(config, store, &a.release, a.variant.as_str())
                 {
                     let retained =
-                        compute_retained(helper, &policy.rotation, &config.release.pins, store)?;
+                        compute_retained(helper, &policy.rotation, &config.pins, store)?;
                     let active = HashSet::from([deployment_id.as_str().to_string()]);
                     helper.rotate(&retained, &active).ok();
                 }
@@ -1505,10 +1506,7 @@ rotation: { per_server: { keep_distinct_artifacts: 1, keep_days: 0, protect_prev
 schema_version: 1
 application: eng
 remote_root: /srv/eng
-release:
-  path: releases/v1
-  variants:
-    standard: standard.yaml
+release: v1
 targets:
   t1:
     rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
@@ -1548,10 +1546,7 @@ rotation: { per_server: { keep_distinct_artifacts: 1, keep_days: 0, protect_prev
 schema_version: 1
 application: eng
 remote_root: /srv/eng
-release:
-  path: releases/v1
-  variants:
-    standard: standard.yaml
+release: v1
 targets:
   t1:
     rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }

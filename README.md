@@ -35,7 +35,7 @@ my-project/
         build/output/app/server
 ```
 
-`deploy.yaml` selects the release directory and declares the fleet:
+`deploy.yaml` names the active release and declares the fleet:
 
 <!-- fixture: tests/fixtures/quickstart/deploy.yaml -->
 ```yaml
@@ -43,12 +43,10 @@ schema_version: 1
 application: example
 remote_root: /srv/deploy/example
 
-# The release directory holds one generation of the deployment: its variant
-# files and the artifact sources those variants map into the tree.
-release:
-  path: releases/v1
-  variants:
-    standard: standard.yaml
+# The active release. The project structure is forced: the release directory
+# is `releases/<name>/`, and every `*.yaml` file inside it is a variant
+# (e.g. `standard`); artifact sources live beneath its `artifacts/` tree.
+release: v1
 
 targets:
   production:
@@ -67,16 +65,17 @@ targets:
         variant: standard
 ```
 
-Each variant is a sibling YAML file inside the release directory. It owns its
-artifact mappings and deployment policies (activation, verification, capacity,
-rotation). `from` paths resolve inside the release directory, so artifact
-sources live under `releases/v1/artifacts/`:
+Each variant is a `*.yaml` file directly inside the release directory, named by
+its file stem. It owns its artifact mappings and deployment policies
+(activation, verification, capacity, rotation). `from` paths resolve inside the
+release directory, so artifact sources live under `releases/v1/artifacts/`:
 
 <!-- fixture: tests/fixtures/quickstart/releases/v1/standard.yaml -->
 ```yaml
 # The `standard` variant: its artifact mappings plus deployment policies.
-# `from` paths resolve inside the release directory selected by `release.path`,
-# so artifact sources live under `releases/v1/artifacts/`.
+# `from` paths resolve inside the release directory (`releases/<name>/` — the
+# project structure is forced), so artifact sources live under
+# `releases/v1/artifacts/`.
 description: Standard deployment
 
 artifact:
@@ -117,8 +116,8 @@ Then deploy:
 deploy push production
 ```
 
-To cut a new release, copy the release directory (e.g. `releases/v2`), point
-`release.path` at it, and edit its variant files.
+To cut a new release, copy the release directory (e.g. `releases/v2`), set
+`release: v2` in `deploy.yaml`, and edit its variant files.
 
 ## Commands
 
@@ -177,18 +176,19 @@ artifact:
 
 ## Variants
 
-Declare variants as sibling files in the release directory, list them under
-`release.variants`, and assign one per server. A typical use is a different
-build flavor for beefier machines:
+Every `*.yaml` file directly inside the release directory is a variant named by
+its file stem — declaring a variant is adding a file. Assign one per server. A
+typical use is a different build flavor for beefier machines:
+
+```text
+releases/
+  v1/
+    standard.yaml
+    high-capacity.yaml
+```
 
 ```yaml
-# deploy.yaml
-release:
-  path: releases/v1
-  variants:
-    standard: standard.yaml
-    high-capacity: high-capacity.yaml
-
+# deploy.yaml — the target chooses which variant each server runs
 targets:
   production:
     servers:
