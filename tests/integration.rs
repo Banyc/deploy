@@ -361,6 +361,11 @@ struct FaultRemote {
     fail_rename: bool,
     fail_write: bool,
     fail_exec: bool,
+    /// Fail only the durable `committed` transaction-record write (path
+    /// `transactions/<op>.json`, content carries `"committed"`).
+    fail_committed_txn: bool,
+    /// Fail only the fleet-commit marker write (path `state/commits/...`).
+    fail_commit_marker: bool,
     attempted: Arc<AtomicUsize>,
 }
 
@@ -377,6 +382,40 @@ impl FaultRemote {
             fail_rename,
             fail_write,
             fail_exec,
+            fail_committed_txn: false,
+            fail_commit_marker: false,
+            attempted,
+        }))
+    }
+    /// Build a `FaultRemote` that fails the durable `committed`
+    /// transaction-record write (finding 6: the last bookkeeping write).
+    fn build_committed_fault(
+        base: std::path::PathBuf,
+        attempted: Arc<AtomicUsize>,
+    ) -> Result<Box<dyn Remote>> {
+        Ok(Box::new(FaultRemote {
+            inner: LocalTransport::new(base)?,
+            fail_rename: false,
+            fail_write: false,
+            fail_exec: false,
+            fail_committed_txn: true,
+            fail_commit_marker: false,
+            attempted,
+        }))
+    }
+    /// Build a `FaultRemote` that fails the fleet-commit marker write
+    /// (finding 6: the fleet bookkeeping write).
+    fn build_commit_marker_fault(
+        base: std::path::PathBuf,
+        attempted: Arc<AtomicUsize>,
+    ) -> Result<Box<dyn Remote>> {
+        Ok(Box::new(FaultRemote {
+            inner: LocalTransport::new(base)?,
+            fail_rename: false,
+            fail_write: false,
+            fail_exec: false,
+            fail_committed_txn: false,
+            fail_commit_marker: true,
             attempted,
         }))
     }
@@ -394,6 +433,17 @@ impl Remote for FaultRemote {
         if self.fail_write {
             return Err(deploy::error::Error::remote(
                 "FaultRemote: write forced to fail",
+            ));
+        }
+        // Targeted fault injection for finding 6's bookkeeping writes.
+        if self.fail_committed_txn && String::from_utf8_lossy(data).contains("\"committed\"") {
+            return Err(deploy::error::Error::remote(
+                "FaultRemote: committed transaction record write forced to fail",
+            ));
+        }
+        if self.fail_commit_marker && rel.to_string_lossy().starts_with("state/commits/") {
+            return Err(deploy::error::Error::remote(
+                "FaultRemote: commit marker write forced to fail",
             ));
         }
         self.inner.write(rel, data, mode)
@@ -775,8 +825,98 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
         .map(|v| v.as_str().unwrap().to_string())
         .collect::<Vec<_>>();
     assert_eq!(
-        verify_argv, vec!["true".to_string()],
+        verify_argv,
+        vec!["true".to_string()],
         "historical release behavior.json must keep behavior A, not be overwritten with B"
+    );
+    Ok(())
+}
+
+// ---- Finding 7: a historical/rollback push whose immutable historical
+// behavior cannot be read must fail closed in preflight, NOT silently fall back
+// to the caller's current configuration.
+
+#[test]
+fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store = LocalStore::with_base(tmp.path().join("store"))?;
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    // Deploy behavior A (verification succeeds) as f0.
+    let config_a = Config::load(&write_string(
+        &proj.join("deploy.yaml"),
+        &single_target_yaml("true", true, 1),
+    ))?;
+    write_file(&proj.join("build/output/app/server"), "v1\n");
+    write_file(&proj.join("deployment/common/README"), "common\n");
+
+    let rb = remotes_base.clone();
+    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+        Ok(Box::new(LocalTransport::new(rb.join(&s.id))?))
+    };
+
+    let r0 = push(
+        &config_a,
+        &proj.join("deploy.yaml"),
+        &store,
+        &factory,
+        "production",
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r0.status, Some(DeploymentStatus::Successful));
+
+    // The historical release published by f0.
+    let hist_release = r0
+        .attempt
+        .as_ref()
+        .unwrap()
+        .servers
+        .get(&ServerId::new("server-01"))
+        .unwrap()
+        .release
+        .as_str()
+        .to_string();
+
+    // Remove the historical release's immutable behavior.json, then attempt a
+    // rollback to f0 with a DIFFERENT current configuration (behavior B). The
+    // push must fail closed (preflight) rather than deploy behavior B.
+    let behavior_path = store
+        .base()
+        .join("releases")
+        .join(&hist_release)
+        .join("behavior.json");
+    assert!(
+        behavior_path.exists(),
+        "historical behavior.json must exist"
+    );
+    std::fs::remove_file(&behavior_path)
+        .map_err(|e| deploy::error::Error::store(format!("rm {e}")))?;
+
+    let config_b = Config::load(&write_string(
+        &proj.join("deploy.yaml"),
+        &single_target_yaml("false", true, 1),
+    ))?;
+    let rrb = push(
+        &config_b,
+        &proj.join("deploy.yaml"),
+        &store,
+        &factory,
+        "production",
+        &PushOptions {
+            dry_run: false,
+            ref_token: Some("production@f0".to_string()),
+        },
+    );
+    assert!(
+        rrb.is_err(),
+        "rollback with unavailable historical behavior must fail closed, got {:?}",
+        rrb.map(|r| r.status)
     );
     Ok(())
 }
@@ -951,6 +1091,126 @@ fn post_lock_failure_releases_lock_and_records() -> Result<()> {
     assert!(
         !remotes_base.join("server-01/state/operation.lock").exists(),
         "mutation lock must be released after post-lock failure"
+    );
+    Ok(())
+}
+
+// ---- Finding 6: a failed committed-transaction write must not be reported as
+// a successful (fully bookkept) deployment. The service is active, but the
+// attempt must be marked `PendingCommit` (recoverable metadata failure).
+
+#[test]
+fn committed_txn_write_failure_pends_commit() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store = LocalStore::with_base(tmp.path().join("store"))?;
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    let config = Config::load(&write_string(
+        &proj.join("deploy.yaml"),
+        &single_target_yaml("true", true, 1),
+    ))?;
+    write_file(&proj.join("build/output/app/server"), "v1\n");
+    write_file(&proj.join("deployment/common/README"), "common\n");
+
+    let attempted = Arc::new(AtomicUsize::new(0));
+    let at = attempted.clone();
+    let remotes_for_factory = remotes_base.clone();
+    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+        FaultRemote::build_committed_fault(remotes_for_factory.join(&s.id), at.clone())
+    };
+
+    let r = push(
+        &config,
+        &proj.join("deploy.yaml"),
+        &store,
+        &factory,
+        "production",
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert!(
+        attempted.load(Ordering::SeqCst) > 0,
+        "the committed transaction record write was attempted"
+    );
+
+    // The service is active (current was advanced) but the bookkeeping write
+    // failed, so the attempt must NOT be `Successful`.
+    assert_eq!(
+        r.status,
+        Some(DeploymentStatus::PendingCommit),
+        "failed committed-transaction write must yield PendingCommit, got {:?}",
+        r.status
+    );
+
+    // The attempt is still recorded (the error did not bypass it).
+    let attempts = store.read_attempts("production")?;
+    assert_eq!(attempts.len(), 1, "attempt must be recorded");
+
+    // Remote mutation lock released despite the bookkeeping failure.
+    assert!(
+        !remotes_base.join("server-01/state/operation.lock").exists(),
+        "mutation lock must be released"
+    );
+    Ok(())
+}
+
+// ---- Finding 6: a failed fleet-commit marker write must not be silently
+// upgraded to `Successful`; it must be marked `PendingCommit`.
+
+#[test]
+fn commit_marker_write_failure_pends_commit() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store = LocalStore::with_base(tmp.path().join("store"))?;
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    let config = Config::load(&write_string(
+        &proj.join("deploy.yaml"),
+        &single_target_yaml("true", true, 1),
+    ))?;
+    write_file(&proj.join("build/output/app/server"), "v1\n");
+    write_file(&proj.join("deployment/common/README"), "common\n");
+
+    let attempted = Arc::new(AtomicUsize::new(0));
+    let at = attempted.clone();
+    let remotes_for_factory = remotes_base.clone();
+    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+        FaultRemote::build_commit_marker_fault(remotes_for_factory.join(&s.id), at.clone())
+    };
+
+    let r = push(
+        &config,
+        &proj.join("deploy.yaml"),
+        &store,
+        &factory,
+        "production",
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+
+    // All servers activated and the committed-transaction write succeeded, but
+    // the fleet-commit marker write failed: do not report `Successful`.
+    assert_eq!(
+        r.status,
+        Some(DeploymentStatus::PendingCommit),
+        "failed commit-marker write must yield PendingCommit, got {:?}",
+        r.status
+    );
+
+    let attempts = store.read_attempts("production")?;
+    assert_eq!(attempts.len(), 1, "attempt must be recorded");
+    assert!(
+        !remotes_base.join("server-01/state/operation.lock").exists(),
+        "mutation lock must be released"
     );
     Ok(())
 }

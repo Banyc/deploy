@@ -221,12 +221,8 @@ pub fn run_activation(
     // remote state; a path traversal here would escape the generation root.
     for u in &cfg.units {
         validate_unit_name(&u.name)?;
-        validate_relative_path(Path::new(&u.artifact_path)).map_err(|e| {
-            Error::remote(format!(
-                "unit '{}' artifact path invalid: {e}",
-                u.name
-            ))
-        })?;
+        validate_relative_path(Path::new(&u.artifact_path))
+            .map_err(|e| Error::remote(format!("unit '{}' artifact path invalid: {e}", u.name)))?;
     }
     // Resolve the unit directory base on the *remote* host, not the controller.
     let config_home = resolve_remote_config_home(remote)?;

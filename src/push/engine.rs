@@ -26,10 +26,9 @@ use crate::rotation::compute_retained;
 use crate::store::local::LocalStore;
 use crate::tree;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
-use std::time::Duration;
 
 pub struct PushOptions {
     pub dry_run: bool,
@@ -74,26 +73,29 @@ pub fn push(
         *target = TargetName::new(target_name.to_string());
     }
 
-    // 2. Acquire local application-store lock then target lock (in that order).
+    // 2. Acquire local application-store lock then target lock (in that order),
+    //    held as advisory (flock) locks on open file descriptors. An advisory
+    //    lock is released by the kernel when the owning process dies, so a
+    //    stale lock from a crashed controller can never be double-owned; two
+    //    contenders for the same lock can never both believe they hold it.
     //    Dry-run never acquires a persistent lock (local or remote).
-    let local_lock = if opts.dry_run {
+    let local_guard = if opts.dry_run {
         None
     } else {
-        Some(store.base().join("operation.lock"))
+        Some(FileLock::acquire(
+            &store.base().join("operation.lock"),
+            op_id.as_str(),
+        )?)
     };
-    if let Some(p) = &local_lock {
-        acquire_lock_file(p, op_id.as_str())?;
-    }
-    let target_lock = if opts.dry_run {
+    let target_guard = if opts.dry_run {
         None
     } else {
         let p = store.target_dir(target_name).join("operation.lock");
-        std::fs::create_dir_all(p.parent().unwrap()).ok();
-        Some(p)
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        Some(FileLock::acquire(&p, op_id.as_str())?)
     };
-    if let Some(p) = &target_lock {
-        acquire_lock_file(p, op_id.as_str())?;
-    }
 
     let result = push_inner(
         config,
@@ -108,13 +110,10 @@ pub fn push(
         opts,
     );
 
-    // Always release local locks.
-    if let Some(p) = &target_lock {
-        release_lock_file(p, op_id.as_str()).ok();
-    }
-    if let Some(p) = &local_lock {
-        release_lock_file(p, op_id.as_str()).ok();
-    }
+    // The guards drop here (releasing both advisory locks) regardless of how
+    // `push_inner` resolves.
+    drop(target_guard);
+    drop(local_guard);
     result
 }
 
@@ -205,30 +204,29 @@ fn push_inner(
             PushRef::Release { release, .. } => release.clone(),
             PushRef::Head => unreachable!(),
         };
-        if !opts.dry_run
-            && let Ok(rec) = store.read_release(&rid)
-        {
+        if !opts.dry_run {
+            let rec = store.read_release(&rid).map_err(|e| {
+                Error::preflight(format!("historical release {rid} not found: {e}"))
+            })?;
             let release_json = serde_json::to_string(&rec)
                 .map_err(|e| Error::store(format!("serialize release: {e}")))?;
             // Restore the historical behavior contract from the release record,
-            // NOT the caller's current configuration: a historical or rollback
-            // push must publish the immutable historical release's own behavior
-            // rather than overwriting it with the current config.
-            let hist_behavior = store
-                .read_release_behavior(&rid)
-                .unwrap_or_else(|_| BehaviorContract {
-                    activation: config.activation.clone(),
-                    verification: config.verification.clone(),
-                });
+            // NOT the caller's current configuration. A historical/rollback push
+            // must publish the immutable historical release's own behavior; if
+            // that behavior is unavailable we fail closed (preflight) rather than
+            // silently deploying the caller's current configuration instead.
+            let hist_behavior = store.read_release_behavior(&rid).map_err(|e| {
+                Error::preflight(format!(
+                    "historical behavior for release {rid} unavailable (immutable behavior required): {e}"
+                ))
+            })?;
             let hist_behavior_json = serde_json::json!({
                 "activation": serde_json::to_value(&hist_behavior.activation)?,
                 "verification": serde_json::to_value(&hist_behavior.verification)?,
             });
             REMOTE_RELEASE_JSON.with(|c| {
-                c.borrow_mut().insert(
-                    rid.clone(),
-                    (release_json, hist_behavior_json.to_string()),
-                )
+                c.borrow_mut()
+                    .insert(rid.clone(), (release_json, hist_behavior_json.to_string()))
             });
         }
         rid
@@ -237,14 +235,27 @@ fn push_inner(
 
     // The behavior contract this attempt is bound to. A historical or rollback
     // push loads the historical contract from the release instead of using the
-    // caller's current configuration.
+    // caller's current configuration. If that immutable historical behavior
+    // cannot be read we fail the push in preflight: falling back to the current
+    // configuration would claim a successful restoration while actually
+    // deploying different service behavior.
     let desired_behavior: BehaviorContract = if !opts.dry_run {
-        store
-            .read_release_behavior(&local_release_id)
-            .unwrap_or_else(|_| BehaviorContract {
-                activation: config.activation.clone(),
-                verification: config.verification.clone(),
-            })
+        match store.read_release_behavior(&local_release_id) {
+            Ok(b) => b,
+            Err(e) => {
+                if matches!(pref, PushRef::Head) {
+                    // HEAD pushes write the behavior just above, so a read failure
+                    // here is a genuine local-store fault; surface it instead of
+                    // masking it with the current configuration.
+                    return Err(Error::preflight(format!(
+                        "behavior for release {local_release_id} unavailable: {e}"
+                    )));
+                }
+                return Err(Error::preflight(format!(
+                    "historical behavior for release {local_release_id} unavailable (immutable behavior required): {e}"
+                )));
+            }
+        }
     } else {
         BehaviorContract {
             activation: config.activation.clone(),
@@ -556,6 +567,10 @@ fn push_inner(
     if had_failure && failure_policy == "rollback_changed" {
         for sid in &advanced {
             let prior = plan_servers[sid].expected_generation.as_ref();
+            // A compensation failure (e.g. prior behavior unavailable, or
+            // activation/verification failed during rollback) is reported as a
+            // failed compensation rather than aborting the whole push; the
+            // server stays advanced and the attempt is marked Degraded.
             let ok = compensate_server(
                 config,
                 store,
@@ -566,7 +581,8 @@ fn push_inner(
                 sid,
                 prior,
                 &new_gen[sid],
-            )?;
+            )
+            .unwrap_or_default();
             if ok {
                 compensated.push(sid.clone());
                 if let Some(r) = results.get_mut(sid) {
@@ -595,8 +611,10 @@ fn push_inner(
     let mut commit_status = status.clone();
     if status == DeploymentStatus::Successful {
         // The full server-ID set participating in this fleet commit.
-        let server_ids: Vec<String> =
-            servers_order.iter().map(|s| s.as_str().to_string()).collect();
+        let server_ids: Vec<String> = servers_order
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect();
         for sid in &servers_order {
             let helper = &helpers[sid];
             // Hold the lock for the whole commit step so a failure cannot leak it
@@ -610,17 +628,47 @@ fn push_inner(
             };
             // Check the generation *before* writing the marker; a mismatch means
             // another controller changed `current` and this marker would be wrong.
-            let cur = helper.status()?.current_generation;
+            let cur = match helper.status() {
+                Ok(s) => s.current_generation,
+                Err(_) => {
+                    // Recoverable metadata failure: do not abort the whole push
+                    // (which would leave the attempt unrecorded); mark the fleet
+                    // commit incomplete and keep going.
+                    commit_status = DeploymentStatus::PendingCommit;
+                    continue;
+                }
+            };
             if cur.as_deref() != Some(new_gen[sid].as_str()) {
+                // The live generation no longer matches what we deployed: the
+                // controller's view diverged, so this marker would be wrong.
+                // Report Degraded rather than a falsely successful commit.
+                commit_status = DeploymentStatus::Degraded;
+                continue;
+            }
+            if helper
+                .write_commit_marker(deployment_id.as_str(), new_gen[sid].as_str(), &server_ids)
+                .is_err()
+            {
+                // Recoverable metadata failure writing the marker.
                 commit_status = DeploymentStatus::PendingCommit;
                 continue;
             }
-            helper.write_commit_marker(
-                deployment_id.as_str(),
-                new_gen[sid].as_str(),
-                &server_ids,
-            )?;
             // `_guard` drops here, releasing the lock.
+        }
+    }
+
+    // A server whose committed-transaction record write failed is still active
+    // but not durably bookkept. Do not report the attempt as `Successful`:
+    // demote to `PendingCommit` so the metadata gap is visible.
+    if commit_status == DeploymentStatus::Successful {
+        for sid in &servers_order {
+            if let Some(r) = results.get(sid)
+                && r.outcome == ServerOutcomeKind::Activated
+                && r.error.is_some()
+            {
+                commit_status = DeploymentStatus::PendingCommit;
+                break;
+            }
         }
     }
 
@@ -643,12 +691,19 @@ fn push_inner(
                     tree: TreeDigest::new(asn.tree),
                     generation: Some(GenerationId::new(g)),
                 },
-                Err(_) => AttemptServer {
-                    release: a.release.clone(),
-                    variant: a.variant.clone(),
-                    tree: a.tree.clone(),
-                    generation: Some(new_gen[sid].clone()),
-                },
+                Err(_) => {
+                    // The generation is observed (`g`), but its assignment could
+                    // not be read. Never substitute the planned (desired)
+                    // release/tree/variant for a failed observation: preserve the
+                    // observed generation and mark the assignment unknown rather
+                    // than fabricating desired state.
+                    AttemptServer {
+                        release: ReleaseId::new(String::new()),
+                        variant: VariantName::new(String::new()),
+                        tree: TreeDigest::new(String::new()),
+                        generation: Some(GenerationId::new(g)),
+                    }
+                }
             },
             None => AttemptServer {
                 release: a.release.clone(),
@@ -710,7 +765,9 @@ fn push_inner(
             tree: Some(asv.tree.clone()),
             last_deployment: Some(deployment_id.clone()),
         };
-        observed.servers.insert(sid.clone(), observed_server.clone());
+        observed
+            .servers
+            .insert(sid.clone(), observed_server.clone());
         store.write_server(&crate::records::ServerState {
             id: sid.clone(),
             last_seen_target: Some(TargetName::new(target_name.to_string())),
@@ -1006,14 +1063,22 @@ fn process_server(
 
     // The swap, activation, and verification all succeeded, so the new generation
     // is live (current points at it and the service is healthy). A failure to
-    // write the bookkeeping record must NOT be reported as a rolled-back state
-    // that is in fact still active; treat the server as advanced.
-    if helper.transaction_record(op_id.as_str(), "committed").is_err() {
+    // write the bookkeeping record is a *recoverable metadata* failure: the
+    // service is active but the attempt cannot be durably marked committed. We
+    // still report the server as Activated, but carry the error so the attempt
+    // status is demoted to `PendingCommit` rather than erroneously `Successful`.
+    if helper
+        .transaction_record(op_id.as_str(), "committed")
+        .is_err()
+    {
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Activated,
             generation: new_gen.clone(),
             did_compensate: false,
-            error: None,
+            error: Some(
+                "committed transaction record write failed; server active but bookkeeping incomplete"
+                    .to_string(),
+            ),
         });
     }
     Ok(ServerProc {
@@ -1056,21 +1121,20 @@ fn compensate_server(
                 Ok(a) => a,
                 Err(_) => return Ok(false),
             };
+            // Load the prior generation's behavior contract from the remote. If it
+            // is unavailable we cannot verify what we are restoring, so we must
+            // not pretend restoration succeeded by substituting a default
+            // contract: report the failure so the attempt is marked Degraded.
             let prior_behavior = helper
                 .read_behavior(&prior_assignment.release)
-                .unwrap_or_else(|_| BehaviorContract {
-                    activation: crate::config::ActivationConfig::default(),
-                    verification: crate::config::VerificationConfig::default(),
-                });
+                .map_err(|e| {
+                    Error::remote(format!("compensation: prior behavior unavailable: {e}"))
+                })?;
             // Compare-and-swap: only roll back if `current` still points at the
             // generation we just activated. Otherwise another controller changed
             // it and we must not clobber their state.
             if helper
-                .swap_current(
-                    Some(advanced_gen.as_str()),
-                    prior.as_str(),
-                    op_id.as_str(),
-                )
+                .swap_current(Some(advanced_gen.as_str()), prior.as_str(), op_id.as_str())
                 .is_err()
             {
                 return Ok(false);
@@ -1080,9 +1144,13 @@ fn compensate_server(
                 .join("generations")
                 .join(prior.as_str())
                 .join("root");
-            // Re-run prior activation contract + verification.
-            let _ = run_activation(&prior_behavior.activation, remote, remote.root(), &root);
-            let _ = run_verification(remote, &prior_behavior.verification);
+            // Re-run prior activation contract + verification. A failure means the
+            // service was not actually restored to prior behavior, so propagate
+            // it as a compensation failure (the attempt is marked Degraded).
+            run_activation(&prior_behavior.activation, remote, remote.root(), &root)
+                .map_err(|e| Error::remote(format!("compensation activation failed: {e}")))?;
+            run_verification(remote, &prior_behavior.verification)
+                .map_err(|e| Error::remote(format!("compensation verification failed: {e}")))?;
             Ok(true)
         }
         None => {
@@ -1203,65 +1271,69 @@ fn tree_size_on_host(root: &Path) -> u64 {
         .sum()
 }
 
-fn acquire_lock_file(path: &Path, op_id: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| Error::preflight(format!("mkdir {}: {e}", parent.display())))?;
-    }
-    // Atomic create-if-absent (O_CREAT|O_EXCL) so two processes cannot both win
-    // the race for a free lock.
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(mut f) => {
-            use std::io::Write;
-            f.write_all(op_id.as_bytes())
-                .map_err(|e| Error::preflight(format!("write {}: {e}", path.display())))?;
-            Ok(())
+/// An advisory (flock) lock held by an open file descriptor. While the guard
+/// is alive the kernel prevents any other process from acquiring the same lock,
+/// and the lock is released automatically if the owning process dies. This
+/// makes the stale-lock double-ownership race impossible: a dead controller's
+/// lock is released by the kernel rather than lingering, and two live
+/// contenders can never both win the acquisition.
+struct FileLock {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+}
+
+impl FileLock {
+    fn acquire(path: &Path, op_id: &str) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::preflight(format!("mkdir {}: {e}", parent.display())))?;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let held = std::fs::read_to_string(path).unwrap_or_default();
-            if held.trim() == op_id {
-                return Ok(());
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|e| Error::preflight(format!("open lock {}: {e}", path.display())))?;
+        let fd = file.as_raw_fd();
+        // Exclusive, non-blocking advisory lock. Only one holder at a time.
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
+                    let held = std::fs::read_to_string(path).unwrap_or_default();
+                    return Err(Error::preflight(format!(
+                        "local lock {} held by '{}'",
+                        path.display(),
+                        held.trim()
+                    )));
+                }
+                _ => {
+                    return Err(Error::preflight(format!("flock {}: {err}", path.display())));
+                }
             }
-            // Treat a stale lock (older than 1 hour) as recoverable.
-            if let Ok(meta) = std::fs::metadata(path)
-                && let Ok(modified) = meta.modified()
-                && let Ok(elapsed) = std::time::SystemTime::now().duration_since(modified)
-                && elapsed < Duration::from_secs(3600)
-            {
-                return Err(Error::preflight(format!(
-                    "local lock {} held by '{}'",
-                    path.display(),
-                    held.trim()
-                )));
-            }
-            std::fs::remove_file(path).ok();
-            // Try once more after clearing a stale lock.
-            let _ = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .and_then(|mut f| f.write_all(op_id.as_bytes()).map(|_| ()));
-            Ok(())
         }
-        Err(e) => Err(Error::preflight(format!(
-            "acquire lock {}: {e}",
-            path.display()
-        ))),
+        // We hold the lock: record our operation id for diagnostics.
+        use std::io::Write;
+        file.set_len(0)
+            .and_then(|_| file.write_all(op_id.as_bytes()))
+            .map_err(|e| Error::preflight(format!("write lock {}: {e}", path.display())))?;
+        Ok(FileLock {
+            file,
+            path: path.to_path_buf(),
+        })
     }
 }
 
-fn release_lock_file(path: &Path, op_id: &str) -> Result<()> {
-    if path.exists() {
-        let held = std::fs::read_to_string(path).unwrap_or_default();
-        if held.trim() == op_id {
-            std::fs::remove_file(path).ok();
+impl std::ops::Drop for FileLock {
+    fn drop(&mut self) {
+        // Release the advisory lock, then remove the (now-unlocked) file.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
+        let _ = std::fs::remove_file(&self.path);
     }
-    Ok(())
 }
 
 // Per-process cache of release JSON for remote publication (avoids re-reading

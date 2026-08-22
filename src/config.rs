@@ -196,12 +196,19 @@ fn default_batch_size() -> u32 {
 fn default_failure_policy() -> String {
     "rollback_changed".to_string()
 }
+fn default_ssh_port() -> u16 {
+    22
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServerDef {
     pub id: String,
     pub address: String,
     pub user: String,
+    /// SSH port used to reach the server (default 22). Passed to both `ssh -p`
+    /// and `ssh-keyscan -p`.
+    #[serde(default = "default_ssh_port")]
+    pub port: u16,
     pub variant: String,
     /// Dedicated `known_hosts` file used with `StrictHostKeyChecking=yes` for
     /// this server. Either this or `host_key_fingerprint` must be configured;

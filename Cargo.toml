@@ -16,6 +16,7 @@ hex = "0.4"
 tempfile = "3"
 walkdir = "2"
 unicode-normalization = "0.1"
+libc = "0.2"
 
 [dev-dependencies]
 assert_fs = "1"

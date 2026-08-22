@@ -30,6 +30,7 @@ pub fn create_remote(config: &Config, server: &ServerDef) -> Result<Box<dyn Remo
     Ok(Box::new(ssh::SshTransport::new(
         &server.user,
         &server.address,
+        server.port,
         &config.remote_root,
         server.known_hosts.as_deref(),
         server.host_key_fingerprint.as_deref(),
