@@ -89,7 +89,8 @@ pub fn compute_retained(
         }
     }
     // Sort by most recent activation descending.
-    let mut ordered: Vec<((String, String, String), DateTime<Utc>)> = distinct.into_iter().collect();
+    let mut ordered: Vec<((String, String, String), DateTime<Utc>)> =
+        distinct.into_iter().collect();
     ordered.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
 
     let keep_distinct = config.rotation.per_server.keep_distinct_artifacts as usize;
@@ -160,7 +161,6 @@ pub fn retained_summary(retained: &HashSet<String>) -> Vec<TreeDigest> {
         .collect()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,8 +203,14 @@ targets:
         let dir = tempfile::tempdir().unwrap();
         let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
         let helper = RemoteHelper::new(&remote);
-        helper.remote().create_dir_all(Path::new("objects/sha256/t1/root")).unwrap();
-        helper.remote().create_dir_all(Path::new("objects/sha256/t2/root")).unwrap();
+        helper
+            .remote()
+            .create_dir_all(Path::new("objects/sha256/t1/root"))
+            .unwrap();
+        helper
+            .remote()
+            .create_dir_all(Path::new("objects/sha256/t2/root"))
+            .unwrap();
         helper
             .create_generation(
                 "op",

@@ -43,10 +43,9 @@ pub fn plan_assignments(
             for s in &target.servers {
                 let sid = ServerId::new(s.id.clone());
                 let variant = VariantName::new(s.variant.clone());
-                let tree = variant_trees
-                    .get(&s.variant)
-                    .cloned()
-                    .ok_or_else(|| Error::plan(format!("variant '{}' not materialized", s.variant)))?;
+                let tree = variant_trees.get(&s.variant).cloned().ok_or_else(|| {
+                    Error::plan(format!("variant '{}' not materialized", s.variant))
+                })?;
                 out.push(PlannedAssignment {
                     server_id: sid,
                     variant,
@@ -60,8 +59,11 @@ pub fn plan_assignments(
             target: ft, index, ..
         } => {
             let entry = resolve_fleet_ref(store, ft, *index)?;
-            let recorded: BTreeSet<String> =
-                entry.servers.keys().map(|s| s.as_str().to_string()).collect();
+            let recorded: BTreeSet<String> = entry
+                .servers
+                .keys()
+                .map(|s| s.as_str().to_string())
+                .collect();
             let current: BTreeSet<String> =
                 server_ids.iter().map(|s| s.as_str().to_string()).collect();
             if recorded != current {
@@ -72,10 +74,9 @@ pub fn plan_assignments(
             let mut out = Vec::new();
             for s in &target.servers {
                 let sid = ServerId::new(s.id.clone());
-                let a = entry
-                    .servers
-                    .get(&sid)
-                    .ok_or_else(|| Error::rollback(format!("server {sid} missing in fleet snapshot")))?;
+                let a = entry.servers.get(&sid).ok_or_else(|| {
+                    Error::rollback(format!("server {sid} missing in fleet snapshot"))
+                })?;
                 out.push(PlannedAssignment {
                     server_id: sid,
                     variant: a.variant.clone(),
@@ -99,16 +100,9 @@ pub fn plan_assignments(
             for s in &target.servers {
                 let sid = ServerId::new(s.id.clone());
                 let variant = VariantName::new(s.variant.clone());
-                let tree = rec
-                    .variants
-                    .get(&s.variant)
-                    .cloned()
-                    .ok_or_else(|| {
-                        Error::rollback(format!(
-                            "release {release} lacks variant '{}'",
-                            s.variant
-                        ))
-                    })?;
+                let tree = rec.variants.get(&s.variant).cloned().ok_or_else(|| {
+                    Error::rollback(format!("release {release} lacks variant '{}'", s.variant))
+                })?;
                 out.push(PlannedAssignment {
                     server_id: sid,
                     variant,
@@ -116,7 +110,11 @@ pub fn plan_assignments(
                     tree: TreeDigest::new(tree),
                 });
             }
-            Ok((out, release.clone(), PlanSource::ReleaseRef(release.clone())))
+            Ok((
+                out,
+                release.clone(),
+                PlanSource::ReleaseRef(release.clone()),
+            ))
         }
     }
 }

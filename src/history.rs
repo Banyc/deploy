@@ -33,8 +33,12 @@ impl PushRef {
     pub fn is_current_variant(&self) -> bool {
         match self {
             PushRef::Head => true,
-            PushRef::Fleet { current_variant, .. } => *current_variant,
-            PushRef::Release { current_variant, .. } => *current_variant,
+            PushRef::Fleet {
+                current_variant, ..
+            } => *current_variant,
+            PushRef::Release {
+                current_variant, ..
+            } => *current_variant,
         }
     }
 }
@@ -115,7 +119,11 @@ pub fn build_reflog_entry(index: u64, attempt: &AttemptRecord) -> ReflogEntry {
 }
 
 /// Resolve a fleet reflog index to its entry.
-pub fn resolve_fleet_ref(store: &LocalStore, target: &TargetName, index: u64) -> Result<ReflogEntry> {
+pub fn resolve_fleet_ref(
+    store: &LocalStore,
+    target: &TargetName,
+    index: u64,
+) -> Result<ReflogEntry> {
     let target = target.as_str();
     let entries = store.read_reflog(target)?;
     entries
@@ -126,7 +134,10 @@ pub fn resolve_fleet_ref(store: &LocalStore, target: &TargetName, index: u64) ->
 
 /// Reconstruct the set of successful fleet deployments for a target from the
 /// reflog (used to rebuild history from servers when the local ref is stale).
-pub fn successful_fleet_history(store: &LocalStore, target: &TargetName) -> Result<Vec<ReflogEntry>> {
+pub fn successful_fleet_history(
+    store: &LocalStore,
+    target: &TargetName,
+) -> Result<Vec<ReflogEntry>> {
     store.read_reflog(target.as_str())
 }
 
@@ -136,14 +147,16 @@ pub fn attempt_server_ids(attempt: &AttemptRecord) -> Vec<ServerId> {
 }
 
 /// Build a map of `<target>@fN` -> entry for display.
-pub fn reflog_index(store: &LocalStore, target: &TargetName) -> Result<BTreeMap<String, ReflogEntry>> {
+pub fn reflog_index(
+    store: &LocalStore,
+    target: &TargetName,
+) -> Result<BTreeMap<String, ReflogEntry>> {
     let mut out = BTreeMap::new();
     for e in store.read_reflog(target.as_str())? {
         out.insert(ref_name(target, e.index), e);
     }
     Ok(out)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -180,6 +193,9 @@ mod tests {
 
     #[test]
     fn ref_name_index() {
-        assert_eq!(ref_name(&TargetName::new("production".to_string()), 3), "production@f3");
+        assert_eq!(
+            ref_name(&TargetName::new("production".to_string()), 3),
+            "production@f3"
+        );
     }
 }

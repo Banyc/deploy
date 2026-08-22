@@ -182,8 +182,9 @@ impl Remote for LocalTransport {
         if let Some(parent) = t.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        std::fs::rename(&f, &t)
-            .map_err(|e| Error::transport(format!("rename {} -> {}: {e}", f.display(), t.display())))
+        std::fs::rename(&f, &t).map_err(|e| {
+            Error::transport(format!("rename {} -> {}: {e}", f.display(), t.display()))
+        })
     }
 
     fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
@@ -193,7 +194,13 @@ impl Remote for LocalTransport {
         }
         let _ = std::fs::remove_file(&l);
         let res = std::os::unix::fs::symlink(target, &l);
-        res.map_err(|e| Error::transport(format!("symlink {} -> {}: {e}", l.display(), target.display())))
+        res.map_err(|e| {
+            Error::transport(format!(
+                "symlink {} -> {}: {e}",
+                l.display(),
+                target.display()
+            ))
+        })
     }
 
     fn read_link(&self, rel: &Path) -> Result<PathBuf> {
@@ -205,14 +212,26 @@ impl Remote for LocalTransport {
     fn remove_file(&self, rel: &Path) -> Result<()> {
         let p = join(&self.base, rel);
         std::fs::remove_file(&p)
-            .or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
+            .or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })
             .map_err(|e| Error::transport(format!("remove {}: {e}", p.display())))
     }
 
     fn remove_dir_all(&self, rel: &Path) -> Result<()> {
         let p = join(&self.base, rel);
         std::fs::remove_dir_all(&p)
-            .or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
+            .or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })
             .map_err(|e| Error::transport(format!("rmdir {}: {e}", p.display())))
     }
 
@@ -277,9 +296,10 @@ impl Remote for LocalTransport {
             .map_err(|e| Error::transport(format!("df: {e}")))?;
         let text = String::from_utf8_lossy(&out.stdout);
         // Second line: Filesystem  blocks  used  avail  capacity  mount
-        let line = text.lines().nth(1).ok_or_else(|| {
-            Error::transport("unexpected df output".to_string())
-        })?;
+        let line = text
+            .lines()
+            .nth(1)
+            .ok_or_else(|| Error::transport("unexpected df output".to_string()))?;
         let cols: Vec<&str> = line.split_whitespace().collect();
         // avail is the 4th column (1-indexed) on both macOS and Linux.
         let avail_kb = cols
@@ -300,10 +320,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let t = LocalTransport::new(dir.path().join("r")).unwrap();
         t.create_dir_all(Path::new("generations/gen1")).unwrap();
-        t.symlink(Path::new("generations/gen1"), Path::new(".tmp.x")).unwrap();
+        t.symlink(Path::new("generations/gen1"), Path::new(".tmp.x"))
+            .unwrap();
         assert!(t.exists(Path::new(".tmp.x")), "symlink should exist");
         t.rename(Path::new(".tmp.x"), Path::new("current")).unwrap();
-        assert!(t.exists(Path::new("current")), "current should exist after rename");
+        assert!(
+            t.exists(Path::new("current")),
+            "current should exist after rename"
+        );
         let target = t.read_link(Path::new("current")).unwrap();
         assert_eq!(target, Path::new("generations/gen1"));
     }

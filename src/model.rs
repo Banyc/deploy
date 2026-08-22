@@ -1,5 +1,4 @@
 //! Core identity types and canonical data structures.
-//!
 //! The deployment core is deliberately ignorant of application semantics. It
 //! understands only filesystem entries, mappings, trees, artifacts, variants,
 //! releases, targets, and activation adapters. The important identities are:
@@ -16,6 +15,7 @@
 //! IDs (UUIDv7 in schema version 1). They identify events and are never used
 //! as content identity.
 
+use crate::config::{ActivationConfig, VerificationConfig};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
@@ -29,7 +29,9 @@ fn new_uuid_v7() -> String {
 
 macro_rules! id_newtype {
     ($name:ident) => {
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default)]
+        #[derive(
+            Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
+        )]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -66,7 +68,15 @@ macro_rules! id_newtype {
     };
 }
 
-id_newtype!(HexDigest);
+/// The canonical behavior contract (activation + verification) that fully
+/// describes how an assignment is activated and verified. It is frozen into the
+/// release identity and copied into every generation record so a historical
+/// push restores its original behavior rather than the caller's current config.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BehaviorContract {
+    pub activation: ActivationConfig,
+    pub verification: VerificationConfig,
+}
 
 id_newtype!(ReleaseDigest);
 
@@ -228,13 +238,22 @@ mod tests {
         let d = "7b278acf5041d50a9704392ac9fac4c6c02ca2cf3be9e5aee61668c8070526d2";
         let rid = ReleaseId::from_digest(&ReleaseDigest::from(d.to_string()));
         assert_eq!(rid.as_str(), format!("rel-sha256-{d}"));
-        assert_eq!(rid, ReleaseId::from_digest(&ReleaseDigest::from(d.to_string())));
+        assert_eq!(
+            rid,
+            ReleaseId::from_digest(&ReleaseDigest::from(d.to_string()))
+        );
     }
 
     #[test]
     fn newtypes_parse_and_eq() {
-        assert_eq!(TreeDigest::from("a".to_string()), TreeDigest::from("a".to_string()));
-        assert_ne!(TreeDigest::from("a".to_string()), TreeDigest::from("b".to_string()));
+        assert_eq!(
+            TreeDigest::from("a".to_string()),
+            TreeDigest::from("a".to_string())
+        );
+        assert_ne!(
+            TreeDigest::from("a".to_string()),
+            TreeDigest::from("b".to_string())
+        );
         assert_eq!(GenerationId::from("gen-x".to_string()).as_str(), "gen-x");
     }
 }

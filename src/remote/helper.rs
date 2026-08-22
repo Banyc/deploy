@@ -6,10 +6,11 @@
 //! keyed by an operation ID and is idempotent.
 
 use crate::error::{Error, Result};
+use crate::model::BehaviorContract;
 use crate::remote::transport::Remote;
-use std::os::unix::fs::MetadataExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use walkdir::WalkDir;
 
@@ -50,10 +51,12 @@ impl<'a> RemoteHelper<'a> {
 
     /// Protocol handshake. Records the protocol version marker.
     pub fn handshake(&self) -> Result<u32> {
-        let marker = serde_json::json!({ "protocol_version": crate::remote::transport::PROTOCOL_VERSION });
+        let marker =
+            serde_json::json!({ "protocol_version": crate::remote::transport::PROTOCOL_VERSION });
         let bytes = serde_json::to_vec_pretty(&marker)
             .map_err(|e| Error::remote(format!("serialize marker: {e}")))?;
-        self.remote.write(Path::new("control/protocol.json"), &bytes, 0o644)?;
+        self.remote
+            .write(Path::new("control/protocol.json"), &bytes, 0o644)?;
         Ok(crate::remote::transport::PROTOCOL_VERSION)
     }
 
@@ -65,7 +68,10 @@ impl<'a> RemoteHelper<'a> {
         // Current generation via the top-level `current` symlink.
         if self.remote.exists(Path::new("current")) {
             let target = self.remote.read_link(Path::new("current"))?;
-            let comps: Vec<&str> = target.components().map(|c| c.as_os_str().to_str().unwrap_or("")).collect();
+            let comps: Vec<&str> = target
+                .components()
+                .map(|c| c.as_os_str().to_str().unwrap_or(""))
+                .collect();
             if let Some(pos) = comps.iter().position(|&c| c == "generations")
                 && let Some(gid) = comps.get(pos + 1)
             {
@@ -108,9 +114,19 @@ impl<'a> RemoteHelper<'a> {
     }
 
     pub fn read_assignment(&self, gen_id: &str) -> Result<GenerationAssignment> {
-        let p = Path::new("generations").join(gen_id).join("assignment.json");
+        let p = Path::new("generations")
+            .join(gen_id)
+            .join("assignment.json");
         let data = self.remote.read(&p)?;
         serde_json::from_slice(&data).map_err(|e| Error::remote(format!("parse assignment: {e}")))
+    }
+
+    /// Read the behavior contract stored for a release.
+    pub fn read_behavior(&self, release_id: &str) -> Result<BehaviorContract> {
+        let p = Path::new("releases").join(release_id).join("behavior.json");
+        let data = self.remote.read(&p)?;
+        crate::release::behavior_contract_from_json(&data)
+            .map_err(|e| Error::remote(format!("parse behavior for {release_id}: {e}")))
     }
 
     /// Acquire the server mutation lock. `force` overrides a held lock (used
@@ -144,8 +160,21 @@ impl<'a> RemoteHelper<'a> {
         Ok(())
     }
 
+    /// Acquire the server mutation lock and return a guard that releases it on
+    /// drop, so every return path (including early errors) releases the lock.
+    /// Returns an error only if the lock is held by a different operation.
+    pub fn acquire_lock_guard(&self, op_id: &str) -> Result<LockGuard<'_>> {
+        self.acquire_lock(op_id, false)?;
+        Ok(LockGuard {
+            helper: self,
+            op_id: op_id.to_string(),
+            active: true,
+        })
+    }
+
     pub fn tree_exists(&self, digest: &str) -> bool {
-        self.remote.exists(&Path::new("objects/sha256").join(digest).join("root"))
+        self.remote
+            .exists(&Path::new("objects/sha256").join(digest).join("root"))
     }
 
     /// Copy a host-local tree into the remote object store, verifying the
@@ -178,11 +207,7 @@ impl<'a> RemoteHelper<'a> {
 
     /// Create a generation record and its `root` symlink. Does not move
     /// `current`.
-    pub fn create_generation(
-        &self,
-        op_id: &str,
-        assignment: &GenerationAssignment,
-    ) -> Result<()> {
+    pub fn create_generation(&self, op_id: &str, assignment: &GenerationAssignment) -> Result<()> {
         let gen_dir = Path::new("generations").join(&assignment.generation_id);
         self.remote.create_dir_all(&gen_dir)?;
         let json = serde_json::to_vec_pretty(assignment)
@@ -194,8 +219,7 @@ impl<'a> RemoteHelper<'a> {
         let root_link = Path::new("../../objects/sha256")
             .join(&assignment.tree)
             .join("root");
-        self.remote
-            .symlink(&root_link, &gen_dir.join("root"))?;
+        self.remote.symlink(&root_link, &gen_dir.join("root"))?;
         let _ = op_id;
         Ok(())
     }
@@ -214,11 +238,13 @@ impl<'a> RemoteHelper<'a> {
                 .iter()
                 .position(|c| c == "generations")
                 .and_then(|i| comps.get(i + 1).cloned());
-            if let Some(exp) = expected && actual.as_deref() != Some(exp) {
-                    return Err(Error::remote(format!(
-                        "compare-and-swap precondition failed: current generation is {:?}, expected {exp}",
-                        actual
-                    )));
+            if let Some(exp) = expected
+                && actual.as_deref() != Some(exp)
+            {
+                return Err(Error::remote(format!(
+                    "compare-and-swap precondition failed: current generation is {:?}, expected {exp}",
+                    actual
+                )));
             }
         }
         let new_target = Path::new("generations").join(gen_id).join("root");
@@ -263,7 +289,8 @@ impl<'a> RemoteHelper<'a> {
         inv.sort();
         let json = serde_json::to_vec_pretty(&inv)
             .map_err(|e| Error::remote(format!("serialize inventory: {e}")))?;
-        self.remote.write(Path::new("state/inventory.json"), &json, 0o644)?;
+        self.remote
+            .write(Path::new("state/inventory.json"), &json, 0o644)?;
         Ok(())
     }
 
@@ -283,13 +310,16 @@ impl<'a> RemoteHelper<'a> {
 
     /// Mark-and-sweep rotation: delete tree objects whose digest is not in the
     /// retained set, and remove abandoned incoming directories.
-    pub fn rotate(&self, retained: &HashSet<String>, active_incoming: &HashSet<String>) -> Result<()> {
+    pub fn rotate(
+        &self,
+        retained: &HashSet<String>,
+        active_incoming: &HashSet<String>,
+    ) -> Result<()> {
         let obj_root = Path::new("objects/sha256");
         if self.remote.exists(obj_root) {
             for e in self.remote.list(obj_root)? {
                 if e.is_dir && !retained.contains(&e.name) {
-                    self.remote
-                        .remove_dir_all(&obj_root.join(&e.name))?;
+                    self.remote.remove_dir_all(&obj_root.join(&e.name))?;
                 }
             }
         }
@@ -395,6 +425,32 @@ pub fn copy_host_tree_to_remote(host: &Path, rel_dest: &Path, remote: &dyn Remot
         }
     }
     Ok(())
+}
+
+/// RAII guard for the server mutation lock. Releases the lock when dropped or
+/// when [`LockGuard::release`] is called explicitly.
+pub struct LockGuard<'a> {
+    helper: &'a RemoteHelper<'a>,
+    op_id: String,
+    active: bool,
+}
+
+impl<'a> LockGuard<'a> {
+    /// Release the lock early (idempotent).
+    pub fn release(mut self) {
+        if self.active {
+            let _ = self.helper.release_lock(&self.op_id);
+            self.active = false;
+        }
+    }
+}
+
+impl<'a> Drop for LockGuard<'a> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.helper.release_lock(&self.op_id);
+        }
+    }
 }
 
 pub fn now_rfc3339() -> String {

@@ -2,7 +2,8 @@
 //! the fleet history / rollback subsystem.
 
 use crate::model::{
-    DeploymentId, GenerationId, ReleaseId, ServerId, TargetName, TreeDigest, VariantName,
+    BehaviorContract, DeploymentId, GenerationId, ReleaseId, ServerId, TargetName, TreeDigest,
+    VariantName,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -44,7 +45,10 @@ pub struct AttemptServer {
     pub release: ReleaseId,
     pub variant: VariantName,
     pub tree: TreeDigest,
-    pub generation: GenerationId,
+    /// The generation this server actually advanced to. `None` when the server
+    /// was never started (e.g. skipped after an earlier failure under
+    /// `stop_on_failure`).
+    pub generation: Option<GenerationId>,
 }
 
 /// A persisted deployment attempt (also the fleet history entry).
@@ -136,6 +140,10 @@ pub struct DeploymentPlan {
     pub deployment_id: DeploymentId,
     pub target: TargetName,
     pub behavior_sha256: String,
+    /// The frozen activation + verification contract this attempt is bound to.
+    /// Historical and rollback pushes carry the historical contract here rather
+    /// than the caller's current configuration.
+    pub behavior: BehaviorContract,
     pub server_ids: Vec<ServerId>,
     pub servers: BTreeMap<ServerId, ServerPlan>,
     pub source: PlanSource,
@@ -146,7 +154,8 @@ pub struct DeploymentPlan {
 pub struct ServerResult {
     pub server_id: ServerId,
     pub outcome: ServerOutcomeKind,
-    pub generation: GenerationId,
+    /// The generation this server advanced to, or `None` if it never started.
+    pub generation: Option<GenerationId>,
     pub compensated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,

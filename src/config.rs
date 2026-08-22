@@ -10,7 +10,25 @@ use crate::error::{Error, Result};
 use crate::model::SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+/// Reject any path that is absolute or contains a parent/root/prefix component,
+/// so a mapping destination cannot escape the artifact-relative namespace.
+///
+/// `PackageRelativePath`/`Mapping.to` values must stay beneath the staging root.
+pub fn validate_relative_path(path: &Path) -> Result<()> {
+    if path.is_absolute()
+        || path.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(Error::path("path must remain artifact-relative"));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -290,9 +308,11 @@ impl Config {
             }
         }
 
-        // Validate mapping modes.
+        // Validate mapping modes and artifact-relative destinations.
         for (i, m) in self.artifact.mappings.iter().enumerate() {
-            if let Some(mode) = &m.mode && mode != "preserve" {
+            if let Some(mode) = &m.mode
+                && mode != "preserve"
+            {
                 parse_octal_mode(mode)
                     .map_err(|e| Error::config(format!("mapping[{i}] mode: {e}")))?;
             }
@@ -301,6 +321,8 @@ impl Config {
                     "mapping[{i}] requires non-empty from/to"
                 )));
             }
+            validate_relative_path(Path::new(&m.to))
+                .map_err(|e| Error::config(format!("mapping[{i}] to: {e}")))?;
         }
         Ok(())
     }
@@ -314,8 +336,7 @@ impl Config {
 pub fn parse_octal_mode(s: &str) -> Result<u32> {
     let s = s.trim();
     let digits: String = s.chars().filter(|c| *c != '_').collect();
-    u32::from_str_radix(&digits, 8)
-        .map_err(|_| Error::config(format!("invalid octal mode '{s}'")))
+    u32::from_str_radix(&digits, 8).map_err(|_| Error::config(format!("invalid octal mode '{s}'")))
 }
 
 /// Resolve an activation mode override, returning `None` when `preserve`.
@@ -324,5 +345,57 @@ pub fn resolved_mode(mode: &Option<String>) -> Result<Option<u32>> {
         None => Ok(None),
         Some(m) if m == "preserve" => Ok(None),
         Some(m) => Ok(Some(parse_octal_mode(m)?)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn relative_path_validation() {
+        assert!(validate_relative_path(Path::new("app/server")).is_ok());
+        assert!(validate_relative_path(Path::new("nested/deep/file.conf")).is_ok());
+        // Absolute paths are rejected.
+        assert!(validate_relative_path(Path::new("/etc/passwd")).is_err());
+        // Single-level parent escape is rejected.
+        assert!(validate_relative_path(Path::new("../escape")).is_err());
+        // Nested escapes are rejected.
+        assert!(validate_relative_path(Path::new("nested/../../escape")).is_err());
+    }
+
+    #[test]
+    fn mapping_to_must_be_artifact_relative() {
+        let yaml = r#"
+        schema_version: 1
+        application: esc
+        remote_root: /srv/esc
+        variants: { standard: {} }
+        artifact:
+          mappings:
+            - from: build/output/
+              to: ../escape
+              recursive: true
+        activation: { adapter: none }
+        verification: { adapter: command, argv: ["true"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
+        capacity: { reserve_bytes: 0, reserve_percent: 0 }
+        rotation: { per_server: { keep_distinct_artifacts: 1, keep_days: 0, protect_previous: true }, fleet: { protect_deployments: 1 } }
+        targets:
+          t1:
+            rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
+            servers:
+              - id: s1
+                address: a
+                user: u
+                variant: standard
+        "#;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("deploy.yaml");
+        std::fs::write(&p, yaml).unwrap();
+        assert!(
+            Config::load(&p).is_err(),
+            "escaping mapping `to` must be rejected"
+        );
     }
 }

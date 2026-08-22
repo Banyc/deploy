@@ -2,14 +2,18 @@
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::push::engine::{push, PushOptions, PushReport};
-use crate::remote::transport::{LocalTransport, Remote};
+use crate::push::engine::{PushOptions, PushReport, push};
+use crate::remote::create_remote;
+use crate::remote::transport::Remote;
 use crate::store::local::LocalStore;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "deploy", about = "Simple deployment system with a Git-push-style interface")]
+#[command(
+    name = "deploy",
+    about = "Simple deployment system with a Git-push-style interface"
+)]
 struct Cli {
     /// Path to deploy.yaml (defaults to ./deploy.yaml).
     #[arg(long)]
@@ -38,9 +42,7 @@ enum Command {
 /// CLI entry point.
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    let config_path = cli
-        .config
-        .unwrap_or_else(|| PathBuf::from("deploy.yaml"));
+    let config_path = cli.config.unwrap_or_else(|| PathBuf::from("deploy.yaml"));
     if !config_path.exists() {
         return Err(Error::config(format!(
             "config '{}' not found",
@@ -52,9 +54,9 @@ pub fn run() -> Result<()> {
     let remotes_base = store.base().join("remotes");
     std::fs::create_dir_all(&remotes_base).ok();
 
+    let config_for_factory = config.clone();
     let factory = move |s: &crate::config::ServerDef| -> Result<Box<dyn Remote>> {
-        let p = remotes_base.join(&s.id);
-        Ok(Box::new(LocalTransport::new(p)?))
+        create_remote(&config_for_factory, s)
     };
 
     match cli.command {
@@ -82,10 +84,7 @@ pub fn run() -> Result<()> {
                 println!("no deployments for target '{target}'");
             }
             for a in &attempts {
-                println!(
-                    "{}  {:?}  {}",
-                    a.deployment_id, a.status, a.attempted_at
-                );
+                println!("{}  {:?}  {}", a.deployment_id, a.status, a.attempted_at);
             }
         }
         Command::Status { target } => {
@@ -109,7 +108,7 @@ fn print_report(report: &PushReport) {
     if let Some(attempt) = &report.attempt {
         for (sid, s) in &attempt.servers {
             println!(
-                "  {sid}  variant={} tree={} generation={}",
+                "  {sid}  variant={} tree={} generation={:?}",
                 s.variant, s.tree, s.generation
             );
         }

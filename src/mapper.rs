@@ -9,6 +9,7 @@
 
 use crate::config::{ConflictPolicy, Mapping, resolved_mode};
 use crate::error::{Error, Result};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
@@ -59,21 +60,23 @@ fn dest_for(staging: &Path, to: &str, src_is_dir: bool, rel: &Path) -> PathBuf {
 fn set_mode(path: &Path, mode: Option<u32>) -> Result<()> {
     let m = mode.unwrap_or(0o755);
     let perms = std::fs::Permissions::from_mode(m);
-    std::fs::set_permissions(path, perms).map_err(|e| {
-        Error::materialization(format!("set_permissions {}: {e}", path.display()))
-    })?;
+    std::fs::set_permissions(path, perms)
+        .map_err(|e| Error::materialization(format!("set_permissions {}: {e}", path.display())))?;
     Ok(())
 }
 
 /// Copy a single source entry (file or symlink) to a destination, applying the
-/// mapping mode override. Directories are created with a canonical 0755 mode.
+/// mapping mode override. When the override is `None` the source's own mode is
+/// preserved (instead of defaulting to 0755). Directories are created with a
+/// canonical 0755 mode.
 fn copy_entry(src: &Path, dst: &Path, mode_override: Option<u32>) -> Result<()> {
     let ft = std::fs::symlink_metadata(src)
         .map_err(|e| Error::materialization(format!("stat {}: {e}", src.display())))?;
     if ft.is_dir() {
         std::fs::create_dir_all(dst)
             .map_err(|e| Error::materialization(format!("mkdir {}: {e}", dst.display())))?;
-        set_mode(dst, Some(mode_override.unwrap_or(0o755)))?;
+        let final_mode = mode_override.unwrap_or_else(|| ft.mode() & 0o7777);
+        set_mode(dst, Some(final_mode))?;
         return Ok(());
     }
     if ft.is_symlink() {
@@ -92,18 +95,39 @@ fn copy_entry(src: &Path, dst: &Path, mode_override: Option<u32>) -> Result<()> 
         // remove existing dst if present (replace policy handled by caller)
         let _ = std::fs::remove_file(dst);
         std::os::unix::fs::symlink(&target, dst).map_err(|e| {
-            Error::materialization(format!("symlink {} -> {}: {e}", dst.display(), target.display()))
+            Error::materialization(format!(
+                "symlink {} -> {}: {e}",
+                dst.display(),
+                target.display()
+            ))
         })?;
         return Ok(());
     }
+    // Regular file: preserve the source mode unless an override is given.
+    let source_mode = ft.mode() & 0o7777;
+    let final_mode = mode_override.unwrap_or(source_mode);
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| Error::materialization(format!("mkdir {}: {e}", parent.display())))?;
     }
     let _ = std::fs::remove_file(dst);
-    std::fs::copy(src, dst)
-        .map_err(|e| Error::materialization(format!("copy {} -> {}: {e}", src.display(), dst.display())))?;
-    set_mode(dst, mode_override)?;
+    std::fs::copy(src, dst).map_err(|e| {
+        Error::materialization(format!("copy {} -> {}: {e}", src.display(), dst.display()))
+    })?;
+    set_mode(dst, Some(final_mode))?;
+    Ok(())
+}
+
+/// Defensively verify that a computed destination stays beneath the staging
+/// root, rejecting any path that escapes it.
+fn ensure_within_dest(dest_root: &Path, dst: &Path) -> Result<()> {
+    dst.strip_prefix(dest_root).map_err(|_| {
+        Error::mapping(format!(
+            "computed destination '{}' escapes staging root '{}'",
+            dst.display(),
+            dest_root.display()
+        ))
+    })?;
     Ok(())
 }
 
@@ -144,6 +168,9 @@ pub fn materialize_variant(
             // Merge directory contents into `to`.
             let to_rel = Path::new(&m.to);
             let base = dest.join(to_rel);
+            ensure_within_dest(dest, &base)?;
+            // Preserve the source directory's mode on the merge base.
+            let base_mode = src_meta.mode() & 0o7777;
             for entry in WalkDir::new(&src).min_depth(1).into_iter() {
                 let entry = entry.map_err(|e| Error::mapping(format!("walk {e}")))?;
                 let rel = entry
@@ -151,6 +178,7 @@ pub fn materialize_variant(
                     .strip_prefix(&src)
                     .map_err(|e| Error::mapping(format!("{e}")))?;
                 let dst = base.join(rel);
+                ensure_within_dest(dest, &dst)?;
                 if dst.exists() {
                     match m.conflict {
                         ConflictPolicy::Error => {
@@ -165,9 +193,16 @@ pub fn materialize_variant(
                 }
                 copy_entry(entry.path(), &dst, mode_override)?;
             }
+            set_mode(&base, Some(base_mode)).ok();
         } else {
             // Single file or non-recursive dir.
-            let dst = dest_for(dest, &m.to, src_meta.is_dir() && !m.recursive, Path::new(&from));
+            let dst = dest_for(
+                dest,
+                &m.to,
+                src_meta.is_dir() && !m.recursive,
+                Path::new(&from),
+            );
+            ensure_within_dest(dest, &dst)?;
             if dst.exists() {
                 match m.conflict {
                     ConflictPolicy::Error => {
@@ -186,11 +221,50 @@ pub fn materialize_variant(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{ConflictPolicy, Mapping};
+
+    #[test]
+    fn preserves_source_mode_when_no_override() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        let app_dir = root.join("app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        // Build source files/dirs with explicit modes.
+        for (name, mode) in [("f0640", 0o640), ("f0644", 0o644), ("f0750", 0o750)] {
+            let p = app_dir.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let sub = app_dir.join("sub0750");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o750)).unwrap();
+        std::fs::write(sub.join("inside"), b"y").unwrap();
+
+        let mappings = vec![Mapping {
+            from: "app/".into(),
+            to: "out/".into(),
+            recursive: true,
+            conflict: ConflictPolicy::Replace,
+            mode: None,
+            optional: false,
+        }];
+        let dest = dir.path().join("dest");
+        materialize_variant(&root, &mappings, "standard", &dest).unwrap();
+
+        let check = |rel: &str, want: u32| {
+            let m = std::fs::metadata(dest.join(rel)).unwrap().mode() & 0o7777;
+            assert_eq!(m, want, "mode of '{rel}' (got {m:o}) should be {want:o}");
+        };
+        check("out/f0640", 0o640);
+        check("out/f0644", 0o644);
+        check("out/f0750", 0o750);
+        check("out/sub0750", 0o750);
+        check("out/sub0750/inside", 0o644);
+    }
 
     #[test]
     fn interpolation_and_conflict_replace() {
@@ -203,9 +277,30 @@ mod tests {
         std::fs::create_dir_all(root.join("build/output")).unwrap();
         std::fs::write(root.join("build/output/server"), b"srv").unwrap();
         let mappings = vec![
-            Mapping { from: "build/output/".into(), to: "app/".into(), recursive: true, conflict: ConflictPolicy::Keep, mode: None, optional: false },
-            Mapping { from: "deployment/common/".into(), to: "app/".into(), recursive: true, conflict: ConflictPolicy::Keep, mode: None, optional: false },
-            Mapping { from: "deployment/variants/{{ variant }}/".into(), to: "app/".into(), recursive: true, conflict: ConflictPolicy::Replace, mode: None, optional: false },
+            Mapping {
+                from: "build/output/".into(),
+                to: "app/".into(),
+                recursive: true,
+                conflict: ConflictPolicy::Keep,
+                mode: None,
+                optional: false,
+            },
+            Mapping {
+                from: "deployment/common/".into(),
+                to: "app/".into(),
+                recursive: true,
+                conflict: ConflictPolicy::Keep,
+                mode: None,
+                optional: false,
+            },
+            Mapping {
+                from: "deployment/variants/{{ variant }}/".into(),
+                to: "app/".into(),
+                recursive: true,
+                conflict: ConflictPolicy::Replace,
+                mode: None,
+                optional: false,
+            },
         ];
         let dest = dir.path().join("dest");
         materialize_variant(&root, &mappings, "standard", &dest).unwrap();

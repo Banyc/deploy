@@ -9,8 +9,8 @@
 use crate::config::{ActivationConfig, Mapping, VerificationConfig};
 use crate::digest::sha256_bytes;
 use crate::model::{
-    CanonicalReleasePayload, Provenance, ReleaseDigest, ReleaseId, ReleaseRecord, TreeDigest,
-    VariantName,
+    BehaviorContract, CanonicalReleasePayload, Provenance, ReleaseDigest, ReleaseId, ReleaseRecord,
+    TreeDigest, VariantName,
 };
 use chrono::Utc;
 use std::collections::BTreeMap;
@@ -28,6 +28,18 @@ pub fn behavior_digest(activation: &ActivationConfig, verification: &Verificatio
     let ver = serde_json::to_value(verification).expect("verification serializes");
     let payload = serde_json::json!({ "activation": act, "verification": ver });
     sha256_bytes(&serde_json::to_vec(&payload).expect("payload serializes"))
+}
+
+/// Canonical digest of a resolved [`BehaviorContract`].
+pub fn behavior_contract_digest(contract: &BehaviorContract) -> String {
+    behavior_digest(&contract.activation, &contract.verification)
+}
+
+/// Reconstruct a [`BehaviorContract`] from serialized JSON bytes.
+pub fn behavior_contract_from_json(
+    bytes: &[u8],
+) -> std::result::Result<BehaviorContract, serde_json::Error> {
+    serde_json::from_slice(bytes)
 }
 
 /// Derive the release digest from the canonical payload.
@@ -55,11 +67,7 @@ pub fn git_revision(root: &Path) -> Option<String> {
         .ok()?;
     if out.status.success() {
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if s.is_empty() {
-            None
-        } else {
-            Some(s)
-        }
+        if s.is_empty() { None } else { Some(s) }
     } else {
         None
     }

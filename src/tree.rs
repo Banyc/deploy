@@ -7,7 +7,7 @@
 
 use crate::digest::sha256_bytes;
 use crate::error::{Error, Result};
-use crate::model::{TreeEntry, TreeMetadata, TreeDigest};
+use crate::model::{TreeDigest, TreeEntry, TreeMetadata};
 use std::collections::BTreeSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};

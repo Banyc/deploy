@@ -10,12 +10,8 @@
 //! ```
 
 use crate::error::{Error, Result};
-use crate::model::{
-    ReleaseId, ReleaseRecord, TreeDigest, TreeMetadata,
-};
-use crate::records::{
-    AttemptRecord, DeploymentResults, ObservedTarget, ReflogEntry, ServerState,
-};
+use crate::model::{BehaviorContract, ReleaseId, ReleaseRecord, TreeDigest, TreeMetadata};
+use crate::records::{AttemptRecord, DeploymentResults, ObservedTarget, ReflogEntry, ServerState};
 use serde::Serialize;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -47,8 +43,8 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| Error::store(format!("read {}: {e}", path.display())))?;
+    let bytes =
+        std::fs::read(path).map_err(|e| Error::store(format!("read {}: {e}", path.display())))?;
     serde_json::from_slice(&bytes)
         .map_err(|e| Error::store(format!("deserialize {}: {e}", path.display())))
 }
@@ -116,9 +112,7 @@ impl LocalStore {
         ensure_private_dir(&base.join("servers"))?;
         ensure_private_dir(&base.join("deployments"))?;
         ensure_private_dir(&base.join("staging"))?;
-        Ok(LocalStore {
-            base,
-        })
+        Ok(LocalStore { base })
     }
 
     pub fn base(&self) -> &Path {
@@ -132,7 +126,10 @@ impl LocalStore {
     // ---- objects ----------------------------------------------------------
 
     pub fn object_root(&self, digest: &TreeDigest) -> PathBuf {
-        self.base.join("objects/sha256").join(digest.as_str()).join("root")
+        self.base
+            .join("objects/sha256")
+            .join(digest.as_str())
+            .join("root")
     }
 
     pub fn object_tree_json(&self, digest: &TreeDigest) -> PathBuf {
@@ -152,9 +149,8 @@ impl LocalStore {
         let root = self.object_root(digest);
         if root.exists() {
             // Verify existing object integrity before reuse.
-            let existing = std::fs::read_dir(&root).map_err(|e| {
-                Error::integrity(format!("read object {}: {e}", digest.as_str()))
-            })?;
+            let existing = std::fs::read_dir(&root)
+                .map_err(|e| Error::integrity(format!("read object {}: {e}", digest.as_str())))?;
             if existing.count() > 0 {
                 let meta = crate::tree::canonicalize_tree(&root)?;
                 if meta.tree_sha256 != digest.as_str() {
@@ -231,10 +227,19 @@ impl LocalStore {
         let bp = dir.join("behavior.json");
         let bytes = serde_json::to_vec_pretty(behavior_json)
             .map_err(|e| Error::store(format!("serialize behavior: {e}")))?;
-        std::fs::write(&bp, bytes)
-            .map_err(|e| Error::store(format!("write behavior: {e}")))?;
+        std::fs::write(&bp, bytes).map_err(|e| Error::store(format!("write behavior: {e}")))?;
         set_private(&bp)?;
         Ok(())
+    }
+
+    /// Read the behavior contract (activation + verification) stored alongside a
+    /// release record.
+    pub fn read_release_behavior(&self, id: &ReleaseId) -> Result<BehaviorContract> {
+        let p = self.release_dir(id).join("behavior.json");
+        let bytes = std::fs::read(&p)
+            .map_err(|e| Error::store(format!("read behavior {}: {e}", p.display())))?;
+        crate::release::behavior_contract_from_json(&bytes)
+            .map_err(|e| Error::store(format!("parse behavior {}: {e}", p.display())))
     }
 
     // ---- targets ----------------------------------------------------------
@@ -273,8 +278,7 @@ impl LocalStore {
         .map_err(|e| Error::store(format!("open attempts: {e}")))?;
         let line = serde_json::to_string(attempt)
             .map_err(|e| Error::store(format!("serialize attempt: {e}")))?;
-        writeln!(f, "{line}")
-            .map_err(|e| Error::store(format!("write attempt: {e}")))?;
+        writeln!(f, "{line}").map_err(|e| Error::store(format!("write attempt: {e}")))?;
         drop(f);
         set_private(&p)
     }
@@ -284,8 +288,8 @@ impl LocalStore {
         if !p.exists() {
             return Ok(vec![]);
         }
-        let text = std::fs::read_to_string(&p)
-            .map_err(|e| Error::store(format!("read attempts: {e}")))?;
+        let text =
+            std::fs::read_to_string(&p).map_err(|e| Error::store(format!("read attempts: {e}")))?;
         let mut out = Vec::new();
         for line in text.lines() {
             if line.trim().is_empty() {
@@ -316,7 +320,9 @@ impl LocalStore {
 
     pub fn read_last_successful(&self, target: &str) -> Option<String> {
         let p = self.refs_dir(target).join("last-successful");
-        std::fs::read_to_string(p).ok().filter(|s| !s.trim().is_empty())
+        std::fs::read_to_string(p)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
     }
 
     pub fn append_reflog(&self, target: &str, entry: &ReflogEntry) -> Result<()> {
@@ -341,8 +347,8 @@ impl LocalStore {
         if !p.exists() {
             return Ok(vec![]);
         }
-        let text = std::fs::read_to_string(&p)
-            .map_err(|e| Error::store(format!("read reflog: {e}")))?;
+        let text =
+            std::fs::read_to_string(&p).map_err(|e| Error::store(format!("read reflog: {e}")))?;
         let mut out = Vec::new();
         for line in text.lines() {
             if line.trim().is_empty() {
@@ -359,12 +365,16 @@ impl LocalStore {
     // ---- servers ----------------------------------------------------------
 
     pub fn write_server(&self, state: &ServerState) -> Result<()> {
-        let p = self.base.join("servers").join(format!("{}.json", sanitize(state.id.as_str())));
+        let p = self
+            .base
+            .join("servers")
+            .join(format!("{}.json", sanitize(state.id.as_str())));
         write_json(&p, state)
     }
 
     pub fn read_server(&self, id: &str) -> Result<ServerState> {
-        let p = self.base
+        let p = self
+            .base
             .join("servers")
             .join(format!("{id}.json", id = sanitize(id)));
         read_json(&p)
@@ -393,6 +403,11 @@ impl LocalStore {
         let dir = self.deployment_dir(id);
         ensure_private_dir(&dir)?;
         write_json(&dir.join("results.json"), results)
+    }
+
+    pub fn read_results(&self, id: &str) -> Result<DeploymentResults> {
+        let p = self.deployment_dir(id).join("results.json");
+        read_json(&p)
     }
 
     pub fn write_status(&self, id: &str, status: &str) -> Result<()> {
