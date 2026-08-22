@@ -22,88 +22,87 @@ cargo install --path .
 
 ## Quick start
 
-Your project needs a `deploy.yaml` plus a release directory containing the
+Your project needs a `deploy.toml` plus a release directory containing the
 variant files and the artifact sources they map:
 
 ```text
 my-project/
-  deploy.yaml
+  deploy.toml
   releases/
     v1/
-      standard.yaml        # the "standard" variant: mappings + policies
+      standard.toml        # the "standard" variant: mappings + policies
       artifacts/
         build/output/app/server
 ```
 
-`deploy.yaml` names the active release and declares the fleet:
+`deploy.toml` names the active release and declares the fleet:
 
-<!-- fixture: tests/fixtures/quickstart/deploy.yaml -->
-```yaml
-schema_version: 1
-application: example
-remote_root: /srv/deploy/example
+<!-- fixture: tests/fixtures/quickstart/deploy.toml -->
+```toml
+schema_version = 1
+application = "example"
+remote_root = "/srv/deploy/example"
 
 # The active release. The project structure is forced: the release directory
-# is `releases/<name>/`, and every `*.yaml` file inside it is a variant
+# is `releases/<name>/`, and every `*.toml` file inside it is a variant
 # (e.g. `standard`); artifact sources live beneath its `artifacts/` tree.
-release: v1
+release = "v1"
 
-targets:
-  production:
-    rollout:
-      batch_size: 1
-      stop_on_failure: true
-      failure_policy: rollback_changed
-    servers:
-      - id: server-01            # durable ID; never rename it
-        address: server-01.example.com
-        user: deploy
-        variant: standard
-      - id: server-02
-        address: server-02.example.com
-        user: deploy
-        variant: standard
+[targets.production]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+
+[[targets.production.servers]]
+id = "server-01"            # durable ID; never rename it
+address = "server-01.example.com"
+user = "deploy"
+variant = "standard"
+
+[[targets.production.servers]]
+id = "server-02"
+address = "server-02.example.com"
+user = "deploy"
+variant = "standard"
 ```
 
-Each variant is a `*.yaml` file directly inside the release directory, named by
+Each variant is a `*.toml` file directly inside the release directory, named by
 its file stem. It owns its artifact mappings and deployment policies
 (activation, verification, capacity, rotation). `from` paths resolve inside the
 release directory, so artifact sources live under `releases/v1/artifacts/`:
 
-<!-- fixture: tests/fixtures/quickstart/releases/v1/standard.yaml -->
-```yaml
+<!-- fixture: tests/fixtures/quickstart/releases/v1/standard.toml -->
+```toml
 # The `standard` variant: its artifact mappings plus deployment policies.
 # `from` paths resolve inside the release directory (`releases/<name>/` — the
 # project structure is forced), so artifact sources live under
 # `releases/v1/artifacts/`.
-description: Standard deployment
+description = "Standard deployment"
 
-artifact:
-  mappings:
-    - from: artifacts/build/output/
-      to: app/
-      recursive: true
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
 
-activation:
-  adapter: none          # or: systemd (scope: user)
+[activation]
+adapter = "none"          # or: systemd (scope = "user")
 
-verification:
-  adapter: command
-  argv:
-    - /srv/deploy/example/current/app/server
-    - health-check
-  timeout_seconds: 15
-  attempts: 3
-  interval_seconds: 2
+[verification]
+adapter = "command"
+argv = ["/srv/deploy/example/current/app/server", "health-check"]
+timeout_seconds = 15
+attempts = 3
+interval_seconds = 2
 
-capacity:
-  reserve_bytes: 1073741824   # keep at least 1 GiB free on servers
+[capacity]
+reserve_bytes = 1073741824   # keep at least 1 GiB free on servers
+reserve_percent = 0
 
-rotation:
-  per_server:
-    keep_distinct_artifacts: 5
-    keep_days: 14
-    protect_previous: true
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.fleet]
+protect_deployments = 2
 ```
 
 These examples are checked against real fixture files under
@@ -117,7 +116,7 @@ deploy push production
 ```
 
 To cut a new release, copy the release directory (e.g. `releases/v2`), set
-`release: v2` in `deploy.yaml`, and edit its variant files.
+`release = "v2"` in `deploy.toml`, and edit its variant files.
 
 ## Commands
 
@@ -150,21 +149,20 @@ Show what is actually running on each server right now: generation, release,
 variant, and tree digest.
 
 Global flag: `--config <path>` to use a different config file than
-`./deploy.yaml`.
+`./deploy.toml`.
 
 ## How mappings work
 
 Each variant file maps local files into the artifact tree:
 
-```yaml
-# inside releases/v1/standard.yaml
-artifact:
-  mappings:
-    - from: artifacts/build/output/          # relative to the release directory
-      to: app/
-      recursive: true
-      conflict: replace                        # error | replace | keep
-      mode: "0755"                             # optional explicit mode
+```toml
+# inside releases/v1/standard.toml
+[[artifact.mappings]]
+from = "artifacts/build/output/"          # relative to the release directory
+to = "app/"
+recursive = true
+conflict = "replace"                        # "error" | "replace" | "keep"
+mode = "0755"                               # optional explicit mode
 ```
 
 - Mappings apply in declaration order; collisions fail unless you set
@@ -176,31 +174,34 @@ artifact:
 
 ## Variants
 
-Every `*.yaml` file directly inside the release directory is a variant named by
+Every `*.toml` file directly inside the release directory is a variant named by
 its file stem — declaring a variant is adding a file. Assign one per server. A
 typical use is a different build flavor for beefier machines:
 
 ```text
 releases/
   v1/
-    standard.yaml
-    high-capacity.yaml
+    standard.toml
+    high-capacity.toml
 ```
 
-```yaml
-# deploy.yaml — the target chooses which variant each server runs
-targets:
-  production:
-    servers:
-      - id: server-01
-        address: ...
-        variant: standard
-      - id: server-03
-        address: ...
-        variant: high-capacity
+```toml
+# deploy.toml — the target chooses which variant each server runs
+[targets.production]
+rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "rollback_changed" }
+
+[[targets.production.servers]]
+id = "server-01"
+address = "..."
+variant = "standard"
+
+[[targets.production.servers]]
+id = "server-03"
+address = "..."
+variant = "high-capacity"
 ```
 
-Each variant file has the same shape as `standard.yaml` in the Quick start —
+Each variant file has the same shape as `standard.toml` in the Quick start —
 its own mappings, activation, verification, capacity, and rotation.
 
 ## systemd support
@@ -209,17 +210,18 @@ Set `adapter: systemd` with `scope: user` in the variant file to have pushes
 register, enable, and restart unit files that you map into the artifact (e.g.
 `integration/systemd/example.service`):
 
-```yaml
-# inside releases/v1/standard.yaml
-activation:
-  adapter: systemd
-  scope: user
-  reconcile_managed_units: true
-  units:
-    - name: example.service
-      artifact_path: integration/systemd/example.service
-      enable: true
-      restart: true
+```toml
+# inside releases/v1/standard.toml
+[activation]
+adapter = "systemd"
+scope = "user"
+reconcile_managed_units = true
+
+[[activation.units]]
+name = "example.service"
+artifact_path = "integration/systemd/example.service"
+enable = true
+restart = true
 ```
 
 On rollback the previous generation's units are restored and verified.

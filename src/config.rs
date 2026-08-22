@@ -1,7 +1,7 @@
-//! Declarative deployment configuration (`deploy.yaml`, schema version 1).
+//! Declarative deployment configuration (`deploy.toml`, schema version 1).
 //!
-//! The project file structure is forced: `deploy.yaml` names the active release
-//! (`release: <name>`), and every regular `*.yaml` file directly inside
+//! The project file structure is forced: `deploy.toml` names the active release
+//! (`release: <name>`), and every regular `*.toml` file directly inside
 //! `<project>/releases/<name>/` is discovered as a variant named by its file
 //! stem. Each variant file owns its own artifact mappings and deployment
 //! policies (activation, verification, capacity, rotation); artifact sources
@@ -190,7 +190,7 @@ pub struct VariantPolicy {
 
 /// A per-release variant's own artifact and deployment policy. Each variant is
 /// described by a sibling YAML file inside the release directory selected by
-/// `deploy.yaml`.
+/// `deploy.toml`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VariantConfig {
     #[serde(default)]
@@ -224,7 +224,7 @@ pub struct Pin {
 
 /// The active release: the name of a directory directly beneath `releases/` in
 /// the project root. The project structure is forced to
-/// `<project>/releases/<name>/<variant>.yaml`; there is no configurable path.
+/// `<project>/releases/<name>/<variant>.toml`; there is no configurable path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct ReleaseName(String);
@@ -265,7 +265,7 @@ impl<'de> Deserialize<'de> for ReleaseName {
                 A: serde::de::MapAccess<'d>,
             {
                 Err(serde::de::Error::custom(
-                    "schema v1 forces the project structure `<project>/releases/<name>/<variant>.yaml`: \
+                    "schema v1 forces the project structure `<project>/releases/<name>/<variant>.toml`: \
                      set `release: <name>` and drop the release.path/release.variants map",
                 ))
             }
@@ -340,15 +340,15 @@ pub struct Config {
 }
 
 impl Config {
-    /// Load and validate a configuration from a `deploy.yaml` path. The project
+    /// Load and validate a configuration from a `deploy.toml` path. The project
     /// root is the directory containing the file. Variant files are discovered
     /// inside `<project>/releases/<release>/` (the release directory named by
     /// `release:`).
     pub fn load(path: &Path) -> Result<Config> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| Error::config(format!("reading {}: {e}", path.display())))?;
-        let mut cfg: Config = serde_yaml::from_str(&text)
-            .map_err(|e| Error::config(format!("parsing deploy.yaml: {e}")))?;
+        let mut cfg: Config = toml::from_str(&text)
+            .map_err(|e| Error::config(format!("parsing deploy.toml: {e}")))?;
         cfg.load_variants(path)?;
         cfg.validate()?;
         Ok(cfg)
@@ -507,19 +507,19 @@ impl Config {
     }
 
     /// Discover variant files inside the release directory. The project
-    /// structure is forced: every regular, non-hidden `*.yaml` file directly
+    /// structure is forced: every regular, non-hidden `*.toml` file directly
     /// inside `<project>/releases/<release>/` is a variant named by its file
     /// stem. Other entries (such as the `artifacts/` directory) are ignored.
     fn load_variants(&mut self, config_path: &Path) -> Result<()> {
         let project_root = self
             .project_root(config_path)
             .canonicalize()
-            .map_err(|e| Error::config(format!("canonicalize project root for deploy.yaml: {e}")))?;
+            .map_err(|e| Error::config(format!("canonicalize project root for deploy.toml: {e}")))?;
         let release_root = project_root.join("releases").join(self.release.as_str());
         let canonical_release = release_root.canonicalize().map_err(|_| {
             Error::config(format!(
                 "release directory '{}' not found; the project structure is forced: \
-                 <project>/releases/{}/<variant>.yaml",
+                 <project>/releases/{}/<variant>.toml",
                 release_root.display(),
                 self.release
             ))
@@ -548,8 +548,8 @@ impl Config {
             if file_name.starts_with('.') {
                 continue; // hidden files are never variants
             }
-            let Some(stem) = file_name.strip_suffix(".yaml") else {
-                continue; // only *.yaml files declare variants
+            let Some(stem) = file_name.strip_suffix(".toml") else {
+                continue; // only *.toml files declare variants
             };
             if stem.trim().is_empty() {
                 return Err(Error::config(format!(
@@ -567,7 +567,7 @@ impl Config {
         variant_files.sort_by(|a, b| a.0.cmp(&b.0));
         if variant_files.is_empty() {
             return Err(Error::config(format!(
-                "release directory '{}' declares no variants (expected at least one <variant>.yaml file)",
+                "release directory '{}' declares no variants (expected at least one <variant>.toml file)",
                 release_root.display()
             )));
         }
@@ -579,7 +579,7 @@ impl Config {
                     path.display()
                 ))
             })?;
-            let variant: VariantConfig = serde_yaml::from_str(&text).map_err(|e| {
+            let variant: VariantConfig = toml::from_str(&text).map_err(|e| {
                 Error::config(format!(
                     "parsing variant '{name}' config '{}': {e}",
                     path.display()
@@ -632,35 +632,54 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
         std::fs::create_dir_all(&release_dir).unwrap();
-        let variant_yaml = r#"
-description: escaping
-artifact:
-  mappings:
-    - from: build/output/
-      to: ../escape
-      recursive: true
-activation: { adapter: none }
-verification: { adapter: command, argv: ["true"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
-capacity: { reserve_bytes: 0, reserve_percent: 0 }
-rotation: { per_server: { keep_distinct_artifacts: 1, keep_days: 0, protect_previous: true }, fleet: { protect_deployments: 1 } }
+        let variant_toml = r#"
+description = "escaping"
+
+[[artifact.mappings]]
+from = "build/output/"
+to = "../escape"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+
+[capacity]
+reserve_bytes = 0
+reserve_percent = 0
+
+[rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[rotation.fleet]
+protect_deployments = 1
 "#;
-        std::fs::write(release_dir.join("standard.yaml"), variant_yaml).unwrap();
-        let yaml = r#"
-schema_version: 1
-application: esc
-remote_root: /srv/esc
-release: v1
-targets:
-  t1:
-    rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
-    servers:
-      - id: s1
-        address: a
-        user: u
-        variant: standard
+        std::fs::write(release_dir.join("standard.toml"), variant_toml).unwrap();
+        let deploy_toml = r#"
+schema_version = 1
+application = "esc"
+remote_root = "/srv/esc"
+release = "v1"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+
+[[targets.t1.servers]]
+id = "s1"
+address = "a"
+user = "u"
+variant = "standard"
 "#;
-        let p = project.join("deploy.yaml");
-        std::fs::write(&p, yaml).unwrap();
+        let p = project.join("deploy.toml");
+        std::fs::write(&p, deploy_toml).unwrap();
         assert!(
             Config::load(&p).is_err(),
             "escaping mapping `to` must be rejected"
@@ -675,49 +694,88 @@ targets:
         let release_dir = project.join("releases").join("v1");
         std::fs::create_dir_all(&release_dir).unwrap();
 
-        let standard_yaml = r#"
-description: Standard deployment
-artifact:
-  mappings:
-    - from: build/output/
-      to: app/
-      recursive: true
-activation: { adapter: none }
-verification: { adapter: command, argv: ["true"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
-capacity: { reserve_bytes: 0, reserve_percent: 0 }
-rotation: { per_server: { keep_distinct_artifacts: 5, keep_days: 14, protect_previous: true }, fleet: { protect_deployments: 2 } }
-"#;
-        let hc_yaml = r#"
-description: High capacity deployment
-artifact:
-  mappings:
-    - from: build/output/
-      to: app/
-      recursive: true
-activation: { adapter: systemd, scope: user, units: [{ name: x.service, artifact_path: integration/systemd/x.service, enable: true, restart: true }] }
-verification: { adapter: command, argv: ["false"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
-capacity: { reserve_bytes: 1073741824, reserve_percent: 5 }
-rotation: { per_server: { keep_distinct_artifacts: 5, keep_days: 14, protect_previous: true }, fleet: { protect_deployments: 2 } }
-"#;
-        std::fs::write(release_dir.join("standard.yaml"), standard_yaml).unwrap();
-        std::fs::write(release_dir.join("high-capacity.yaml"), hc_yaml).unwrap();
+        let standard_toml = r#"
+description = "Standard deployment"
 
-        let deploy_yaml = r#"
-schema_version: 1
-application: example
-remote_root: /srv/example
-release: v1
-targets:
-  t1:
-    rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
-    servers:
-      - id: s1
-        address: a
-        user: u
-        variant: standard
+[[artifact.mappings]]
+from = "build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+
+[capacity]
+reserve_bytes = 0
+reserve_percent = 0
+
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.fleet]
+protect_deployments = 2
 "#;
-        let p = project.join("deploy.yaml");
-        std::fs::write(&p, deploy_yaml).unwrap();
+        let hc_toml = r#"
+description = "High capacity deployment"
+
+[[artifact.mappings]]
+from = "build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "systemd"
+scope = "user"
+units = [{ name = "x.service", artifact_path = "integration/systemd/x.service", enable = true, restart = true }]
+
+[verification]
+adapter = "command"
+argv = ["false"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+
+[capacity]
+reserve_bytes = 1073741824
+reserve_percent = 5
+
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.fleet]
+protect_deployments = 2
+"#;
+        std::fs::write(release_dir.join("standard.toml"), standard_toml).unwrap();
+        std::fs::write(release_dir.join("high-capacity.toml"), hc_toml).unwrap();
+
+        let deploy_toml = r#"
+schema_version = 1
+application = "example"
+remote_root = "/srv/example"
+release = "v1"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+
+[[targets.t1.servers]]
+id = "s1"
+address = "a"
+user = "u"
+variant = "standard"
+"#;
+        let p = project.join("deploy.toml");
+        std::fs::write(&p, deploy_toml).unwrap();
 
         let cfg = Config::load(&p).expect("config loads with sibling variant files");
         let names = cfg.variant_names();
@@ -741,28 +799,48 @@ targets:
     }
 
     const MINIMAL_VARIANT: &str = r#"
-artifact: { mappings: [] }
-activation: { adapter: none }
-verification: { adapter: command, argv: ["true"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
-capacity: { reserve_bytes: 0, reserve_percent: 0 }
-rotation: { per_server: { keep_distinct_artifacts: 1, keep_days: 0, protect_previous: true }, fleet: { protect_deployments: 1 } }
+[artifact]
+mappings = []
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+
+[capacity]
+reserve_bytes = 0
+reserve_percent = 0
+
+[rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[rotation.fleet]
+protect_deployments = 1
 "#;
 
-    fn deploy_yaml(release_value: &str) -> String {
+    fn deploy_toml(release_value: &str) -> String {
         format!(
             r#"
-schema_version: 1
-application: forced
-remote_root: /srv/forced
-release: {release_value}
-targets:
-  t1:
-    rollout: {{ batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }}
-    servers:
-      - id: s1
-        address: a
-        user: u
-        variant: standard
+schema_version = 1
+application = "forced"
+remote_root = "/srv/forced"
+release = "{release_value}"
+
+[targets.t1]
+rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
+
+[[targets.t1.servers]]
+id = "s1"
+address = "a"
+user = "u"
+variant = "standard"
 "#
         )
     }
@@ -770,7 +848,7 @@ targets:
     fn write_standard_release(project: &Path, release: &str) {
         let release_dir = project.join("releases").join(release);
         std::fs::create_dir_all(&release_dir).unwrap();
-        std::fs::write(release_dir.join("standard.yaml"), MINIMAL_VARIANT).unwrap();
+        std::fs::write(release_dir.join("standard.toml"), MINIMAL_VARIANT).unwrap();
     }
 
     #[test]
@@ -782,22 +860,22 @@ targets:
         // Non-variant entries inside the release directory are ignored.
         std::fs::create_dir_all(project.join("releases/v1/artifacts")).unwrap();
         std::fs::write(project.join("releases/v1/README.md"), "notes").unwrap();
-        std::fs::write(project.join("releases/v1/.hidden.yaml"), MINIMAL_VARIANT).unwrap();
+        std::fs::write(project.join("releases/v1/.hidden.toml"), MINIMAL_VARIANT).unwrap();
         std::fs::write(project.join("releases/v1/other.yml"), MINIMAL_VARIANT).unwrap();
         std::fs::write(
-            project.join("releases/v1/high-capacity.yaml"),
+            project.join("releases/v1/high-capacity.toml"),
             MINIMAL_VARIANT,
         )
         .unwrap();
 
-        let p = project.join("deploy.yaml");
-        std::fs::write(&p, deploy_yaml("v1")).unwrap();
+        let p = project.join("deploy.toml");
+        std::fs::write(&p, deploy_toml("v1")).unwrap();
         let cfg = Config::load(&p).expect("config loads from the forced structure");
         assert_eq!(cfg.release.as_str(), "v1");
         assert_eq!(
             cfg.variant_names(),
             vec!["high-capacity".to_string(), "standard".to_string()],
-            "every *.yaml file stem is a variant; other entries are ignored"
+            "every *.toml file stem is a variant; other entries are ignored"
         );
         assert_eq!(
             cfg.release_root(&p),
@@ -811,26 +889,25 @@ targets:
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         write_standard_release(&project, "v1");
-        // The pre-forcing deploy.yaml shape must not parse silently.
-        let yaml = r#"
-schema_version: 1
-application: legacy
-remote_root: /srv/legacy
-release:
-  path: releases/v1
-  variants:
-    standard: standard.yaml
-targets:
-  t1:
-    rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
-    servers:
-      - id: s1
-        address: a
-        user: u
-        variant: standard
+        // The pre-forcing deploy.toml shape (release as a map) must not parse
+        // silently.
+        let legacy_toml = r#"
+schema_version = 1
+application = "legacy"
+remote_root = "/srv/legacy"
+release = { path = "releases/v1", variants = { standard = "standard.toml" } }
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+
+[[targets.t1.servers]]
+id = "s1"
+address = "a"
+user = "u"
+variant = "standard"
 "#;
-        let p = project.join("deploy.yaml");
-        std::fs::write(&p, yaml).unwrap();
+        let p = project.join("deploy.toml");
+        std::fs::write(&p, legacy_toml).unwrap();
         let err = Config::load(&p).expect_err("old release map form must be rejected");
         let msg = err.to_string();
         assert!(
@@ -846,8 +923,8 @@ targets:
         std::fs::create_dir_all(&project).unwrap();
         write_standard_release(&project, "v1");
         for bad in ["../v1", "a/b", ".", "..", "/abs"] {
-            let p = project.join("deploy.yaml");
-            std::fs::write(&p, deploy_yaml(bad)).unwrap();
+            let p = project.join("deploy.toml");
+            std::fs::write(&p, deploy_toml(bad)).unwrap();
             assert!(
                 Config::load(&p).is_err(),
                 "release name '{bad}' must be rejected"
@@ -860,8 +937,8 @@ targets:
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
-        let p = project.join("deploy.yaml");
-        std::fs::write(&p, deploy_yaml("v9")).unwrap();
+        let p = project.join("deploy.toml");
+        std::fs::write(&p, deploy_toml("v9")).unwrap();
         let err = Config::load(&p).expect_err("missing release dir must fail");
         let msg = err.to_string();
         assert!(
@@ -876,8 +953,8 @@ targets:
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(project.join("releases/v1")).unwrap();
-        let p = project.join("deploy.yaml");
-        std::fs::write(&p, deploy_yaml("v1")).unwrap();
+        let p = project.join("deploy.toml");
+        std::fs::write(&p, deploy_toml("v1")).unwrap();
         let err = Config::load(&p).expect_err("empty release dir must fail");
         assert!(
             err.to_string().contains("no variants"),

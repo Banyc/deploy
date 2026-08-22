@@ -181,32 +181,50 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
         std::fs::create_dir_all(&release_dir).unwrap();
-        let variant_yaml = r#"
-artifact: { mappings: [] }
-activation: { adapter: none }
-verification: { adapter: command, argv: ["true"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
-capacity: { reserve_bytes: 0, reserve_percent: 0 }
-rotation:
-  per_server: { keep_distinct_artifacts: 1, keep_days: 0, protect_previous: true }
-  fleet: { protect_deployments: 1 }
+        let variant_toml = r#"
+[artifact]
+mappings = []
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+
+[capacity]
+reserve_bytes = 0
+reserve_percent = 0
+
+[rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[rotation.fleet]
+protect_deployments = 1
 "#;
-        std::fs::write(release_dir.join("standard.yaml"), variant_yaml).unwrap();
-        let deploy_yaml = r#"
-schema_version: 1
-application: rot
-remote_root: /srv
-release: v1
-targets:
-  t1:
-    rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
-    servers:
-      - id: s1
-        address: a
-        user: u
-        variant: standard
+        std::fs::write(release_dir.join("standard.toml"), variant_toml).unwrap();
+        let deploy_toml = r#"
+schema_version = 1
+application = "rot"
+remote_root = "/srv"
+release = "v1"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+
+[[targets.t1.servers]]
+id = "s1"
+address = "a"
+user = "u"
+variant = "standard"
 "#;
-        let p = project.join("deploy.yaml");
-        std::fs::write(&p, deploy_yaml).unwrap();
+        let p = project.join("deploy.toml");
+        std::fs::write(&p, deploy_toml).unwrap();
         Config::load(&p).unwrap()
     }
 

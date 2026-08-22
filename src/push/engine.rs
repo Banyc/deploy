@@ -187,7 +187,7 @@ fn push_inner(
     let behavior_sha = crate::release::variant_behaviors_digest(&variant_behaviors);
     let behavior_json = serde_json::to_value(&variant_behaviors)?;
     let policies_json = serde_json::to_value(&variant_policies)?;
-    let mapping_yaml = serde_yaml::to_string(&variant_mappings)
+    let mapping_toml = toml::to_string_pretty(&variant_mappings)
         .map_err(|e| Error::store(format!("serialize mappings: {e}")))?;
 
     // Historical and rollback pushes carry the bound release's own per-variant
@@ -209,7 +209,7 @@ fn push_inner(
                 store.write_release(&rec)?;
                 let release_json = serde_json::to_string(&rec)
                     .map_err(|e| Error::store(format!("serialize release: {e}")))?;
-                store.write_release_aux(&rid, &mapping_yaml, &behavior_json, &policies_json)?;
+                store.write_release_aux(&rid, &mapping_toml, &behavior_json, &policies_json)?;
                 // Persist release JSON string for remote publication.
                 REMOTE_RELEASE_JSON.with(|c| {
                     c.borrow_mut()
@@ -1488,73 +1488,115 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     const NONE_VARIANT: &str = r#"
-artifact:
-  mappings:
-    - from: artifacts/build/output/
-      to: app/
-      recursive: true
-    - from: artifacts/deployment/common/
-      to: app/
-      recursive: true
-activation: { adapter: none }
-verification: { adapter: command, argv: ["true"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
-capacity: { reserve_bytes: 0, reserve_percent: 0 }
-rotation: { per_server: { keep_distinct_artifacts: 1, keep_days: 0, protect_previous: true }, fleet: { protect_deployments: 1 } }
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[[artifact.mappings]]
+from = "artifacts/deployment/common/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+
+[capacity]
+reserve_bytes = 0
+reserve_percent = 0
+
+[rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[rotation.fleet]
+protect_deployments = 1
 "#;
 
-    const NONE_YAML: &str = r#"
-schema_version: 1
-application: eng
-remote_root: /srv/eng
-release: v1
-targets:
-  t1:
-    rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
-    servers:
-      - id: s1
-        address: a
-        user: u
-        variant: standard
+    const NONE_TOML: &str = r#"
+schema_version = 1
+application = "eng"
+remote_root = "/srv/eng"
+release = "v1"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+
+[[targets.t1.servers]]
+id = "s1"
+address = "a"
+user = "u"
+variant = "standard"
 "#;
 
     const SYSTEMD_VARIANT: &str = r#"
-artifact:
-  mappings:
-    - from: artifacts/build/output/
-      to: app/
-      recursive: true
-    - from: artifacts/deployment/common/
-      to: app/
-      recursive: true
-    - from: artifacts/units/
-      to: integration/systemd/
-      recursive: true
-activation:
-  adapter: systemd
-  scope: user
-  units:
-    - name: example.service
-      artifact_path: integration/systemd/example.service
-      enable: true
-      restart: true
-verification: { adapter: command, argv: ["true"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
-capacity: { reserve_bytes: 0, reserve_percent: 0 }
-rotation: { per_server: { keep_distinct_artifacts: 1, keep_days: 0, protect_previous: true }, fleet: { protect_deployments: 1 } }
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[[artifact.mappings]]
+from = "artifacts/deployment/common/"
+to = "app/"
+recursive = true
+
+[[artifact.mappings]]
+from = "artifacts/units/"
+to = "integration/systemd/"
+recursive = true
+
+[activation]
+adapter = "systemd"
+scope = "user"
+
+[[activation.units]]
+name = "example.service"
+artifact_path = "integration/systemd/example.service"
+enable = true
+restart = true
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+
+[capacity]
+reserve_bytes = 0
+reserve_percent = 0
+
+[rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[rotation.fleet]
+protect_deployments = 1
 "#;
 
-    const SYSTEMD_YAML: &str = r#"
-schema_version: 1
-application: eng
-remote_root: /srv/eng
-release: v1
-targets:
-  t1:
-    rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
-    servers:
-      - id: s1
-        address: a
-        user: u
-        variant: standard
+    const SYSTEMD_TOML: &str = r#"
+schema_version = 1
+application = "eng"
+remote_root = "/srv/eng"
+release = "v1"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+
+[[targets.t1.servers]]
+id = "s1"
+address = "a"
+user = "u"
+variant = "standard"
 "#;
 
     struct Harness {
@@ -1567,15 +1609,15 @@ targets:
     }
 
     impl Harness {
-        fn new(deploy_yaml: &str, variant_yaml: &str, files: &[(&str, &str)]) -> Harness {
+        fn new(deploy_toml: &str, variant_toml: &str, files: &[(&str, &str)]) -> Harness {
             let dir = tempfile::tempdir().unwrap();
             let project = dir.path().join("proj");
             std::fs::create_dir_all(&project).unwrap();
             let release_dir = project.join("releases").join("v1");
             std::fs::create_dir_all(&release_dir).unwrap();
-            std::fs::write(release_dir.join("standard.yaml"), variant_yaml).unwrap();
-            let cfg_path = project.join("deploy.yaml");
-            std::fs::write(&cfg_path, deploy_yaml).unwrap();
+            std::fs::write(release_dir.join("standard.toml"), variant_toml).unwrap();
+            let cfg_path = project.join("deploy.toml");
+            std::fs::write(&cfg_path, deploy_toml).unwrap();
             // Artifact sources live beneath the release directory (release_root /
             // `artifacts`), so a `from` never reaches into the project root.
             let artifacts_dir = release_dir.join("artifacts");
@@ -1664,7 +1706,7 @@ targets:
     #[test]
     fn clean_publish_activates() {
         let h = Harness::new(
-            NONE_YAML,
+            NONE_TOML,
             NONE_VARIANT,
             &[
                 ("build/output/app/server", "v1"),
@@ -1680,7 +1722,7 @@ targets:
     #[test]
     fn corrupted_existing_remote_object_fails_integrity() {
         let h = Harness::new(
-            NONE_YAML,
+            NONE_TOML,
             NONE_VARIANT,
             &[
                 ("build/output/app/server", "v1"),
@@ -1712,7 +1754,7 @@ targets:
     #[test]
     fn corrupted_upload_fails_integrity() {
         let h = Harness::new(
-            NONE_YAML,
+            NONE_TOML,
             NONE_VARIANT,
             &[
                 ("build/output/app/server", "v1"),
@@ -1732,7 +1774,7 @@ targets:
     fn missing_systemd_unit_fails() {
         // The unit file is NOT present in the tree.
         let h = Harness::new(
-            SYSTEMD_YAML,
+            SYSTEMD_TOML,
             SYSTEMD_VARIANT,
             &[
                 ("build/output/app/server", "v1"),
@@ -1750,7 +1792,7 @@ targets:
     fn wrong_artifact_type_fails() {
         // The artifact path exists but is a DIRECTORY, not a regular file.
         let h = Harness::new(
-            SYSTEMD_YAML,
+            SYSTEMD_TOML,
             SYSTEMD_VARIANT,
             &[
                 ("build/output/app/server", "v1"),
@@ -1774,8 +1816,8 @@ targets:
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
         std::fs::create_dir_all(&release_dir).unwrap();
-        std::fs::write(release_dir.join("standard.yaml"), NONE_VARIANT).unwrap();
-        std::fs::write(project.join("deploy.yaml"), NONE_YAML).unwrap();
+        std::fs::write(release_dir.join("standard.toml"), NONE_VARIANT).unwrap();
+        std::fs::write(project.join("deploy.toml"), NONE_TOML).unwrap();
 
         // Release-local artifact sources (under release_root/artifacts).
         let artifacts_dir = release_dir.join("artifacts");
@@ -1793,7 +1835,7 @@ targets:
         std::fs::create_dir_all(project_root_file.parent().unwrap()).unwrap();
         std::fs::write(project_root_file, "PROJECT-ROOT\n").unwrap();
 
-        let cfg_path = project.join("deploy.yaml");
+        let cfg_path = project.join("deploy.toml");
         let config = Config::load(&cfg_path).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let release_root = config.release_root(&cfg_path);

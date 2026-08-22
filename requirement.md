@@ -81,103 +81,115 @@ deploy push production HEAD: current
 There are no required user-facing package, upload, activate, systemd-register, or rotate commands. Those are stages of `push`. A `rollback` command may exist as a convenience alias, but rollback remains a push of an older deployment reference.
 
 ## Declarative configuration
-The project file structure is forced: one deployment definition naming the active release, and a `releases/` tree where each release directory holds its variant files (every `*.yaml` file inside is a variant named by its file stem) and its artifact sources:
+The project file structure is forced: one deployment definition naming the active release, and a `releases/` tree where each release directory holds its variant files (every `*.toml` file inside is a variant named by its file stem) and its artifact sources:
 
 ```text
 my-project/
-  deploy.yaml            # release: v1
+  deploy.toml            # release = "v1"
   releases/
     v1/
-      standard.yaml      # variant file: mappings + policies
-      high-capacity.yaml
+      standard.toml      # variant file: mappings + policies
+      high-capacity.toml
       artifacts/         # artifact sources referenced by mappings
     v2/
       ...
 ```
 
-Example `deploy.yaml`:
+Example `deploy.toml`:
 
-```yaml
-schema_version: 1
-application: example
-remote_root: /srv/deploy/example
-release: v1              # the release directory is forced to releases/v1/
-pins:
-  - release: rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1
-    variants: all
-    reason: known-good recovery release
-targets:
-  production:
-    rollout:
-      batch_size: 1
-      stop_on_failure: true
-      failure_policy: rollback_changed
-    servers:
-      - id: server-01
-        address: server-01.example.com
-        user: deploy
-        variant: standard
-      - id: server-02
-        address: server-02.example.com
-        user: deploy
-        variant: standard
-      - id: server-03
-        address: server-03.example.com
-        user: deploy
-        variant: high-capacity
+```toml
+schema_version = 1
+application = "example"
+remote_root = "/srv/deploy/example"
+release = "v1"              # the release directory is forced to releases/v1/
+
+[[pins]]
+release = "rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1"
+variants = "all"
+reason = "known-good recovery release"
+
+[targets.production]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+
+[[targets.production.servers]]
+id = "server-01"
+address = "server-01.example.com"
+user = "deploy"
+variant = "standard"
+
+[[targets.production.servers]]
+id = "server-02"
+address = "server-02.example.com"
+user = "deploy"
+variant = "standard"
+
+[[targets.production.servers]]
+id = "server-03"
+address = "server-03.example.com"
+user = "deploy"
+variant = "high-capacity"
 ```
 
 Each variant is described by its own file inside the release directory (e.g.
-`releases/v1/standard.yaml`); there is no explicit variant list to keep in
+`releases/v1/standard.toml`); there is no explicit variant list to keep in
 sync. A variant file owns its artifact mappings and its deployment policies:
 
-```yaml
-# releases/v1/standard.yaml
+```toml
+# releases/v1/standard.toml
 # All `from` paths are relative to the release directory (`releases/v1/` — the
 # project structure is forced), so artifact sources live under `artifacts/`.
-description: Standard deployment
-artifact:
-  mappings:
-    - from: artifacts/build/output/
-      to: app/
-      recursive: true
-    - from: artifacts/deployment/common/
-      to: app/
-      recursive: true
-    - from: "artifacts/deployment/variants/{{ variant }}/"
-      to: app/
-      recursive: true
-      conflict: replace
-    - from: artifacts/deployment/systemd/example.service
-      to: integration/systemd/example.service
-      mode: "0644"
-activation:
-  adapter: systemd
-  scope: user
-  reconcile_managed_units: true
-  units:
-    - name: example.service
-      artifact_path: integration/systemd/example.service
-      enable: true
-      restart: true
-verification:
-  adapter: command
-  argv:
-    - /srv/deploy/example/current/app/server
-    - health-check
-  timeout_seconds: 15
-  attempts: 3
-  interval_seconds: 2
-capacity:
-  reserve_bytes: 1073741824
-  reserve_percent: 5
-rotation:
-  per_server:
-    keep_distinct_artifacts: 5
-    keep_days: 14
-    protect_previous: true
-  fleet:
-    protect_deployments: 2
+description = "Standard deployment"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[[artifact.mappings]]
+from = "artifacts/deployment/common/"
+to = "app/"
+recursive = true
+
+[[artifact.mappings]]
+from = "artifacts/deployment/variants/{{ variant }}/"
+to = "app/"
+recursive = true
+conflict = "replace"
+
+[[artifact.mappings]]
+from = "artifacts/deployment/systemd/example.service"
+to = "integration/systemd/example.service"
+mode = "0644"
+
+[activation]
+adapter = "systemd"
+scope = "user"
+reconcile_managed_units = true
+
+[[activation.units]]
+name = "example.service"
+artifact_path = "integration/systemd/example.service"
+enable = true
+restart = true
+
+[verification]
+adapter = "command"
+argv = ["/srv/deploy/example/current/app/server", "health-check"]
+timeout_seconds = 15
+attempts = 3
+interval_seconds = 2
+
+[capacity]
+reserve_bytes = 1073741824
+reserve_percent = 5
+
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.fleet]
+protect_deployments = 2
 ```
 
 Server IDs are durable identities and cannot be inferred from mutable network addresses. Deployment history is keyed by server ID. A rollback connects using the server's current address and verifies its configured SSH host identity; it never silently connects to a historical address.
@@ -189,19 +201,20 @@ A mapping is only:
 local source path → artifact-relative destination path
 ```
 
-In schema version 1, `from` is relative to the directory containing `deploy.yaml` and must remain beneath that project root. Absolute and escaping source paths are rejected. Recursive directory mappings merge directories; their conflict policy applies to colliding descendant entries rather than deleting unrelated entries already placed at the destination.
+In schema version 1, `from` is relative to the release directory (`releases/<release>/`) and must remain beneath it. Absolute and escaping source paths are rejected. Recursive directory mappings merge directories; their conflict policy applies to colliding descendant entries rather than deleting unrelated entries already placed at the destination.
 
 Supported mapping controls should include:
 
-```yaml
-- from: local/path
-  to: artifact/path
-  recursive: true
-  conflict: error
-  mode: preserve
-  # optional: false
-  # error, replace, or keep
-  # preserve or an explicit octal mode
+```toml
+[[artifact.mappings]]
+from = "local/path"
+to = "artifact/path"
+recursive = true
+conflict = "error"
+mode = "preserve"
+optional = false
+# conflict: "error" | "replace" | "keep"
+# mode: "preserve" or an explicit octal mode
 ```
 
 Mappings are applied in declaration order. A collision fails unless the mapping explicitly selects another conflict behavior. In schema version 1, `{{ variant }}` is the only interpolation variable. Target name and server, environment variables, and machine state cannot influence a tree; all servers assigned the same release variant must receive the same digest.
@@ -230,7 +243,7 @@ The local store contains the exact immutable trees sent to servers, immutable re
   tree.json
   releases/
     <release-id>/
-      mapping.yaml
+      mapping.toml
       behavior.json
       policies.json
       release.json

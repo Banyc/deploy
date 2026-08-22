@@ -1,0 +1,23 @@
+schema_version = 1
+application = "example"
+remote_root = "/srv/deploy/example"
+
+# The active release. The project structure is forced: the release directory
+# is `releases/<name>/`, and every `*.toml` file inside it is a variant
+# (e.g. `standard`); artifact sources live beneath its `artifacts/` tree.
+release = "v1"
+
+[targets.production]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+
+[[targets.production.servers]]
+id = "server-01"            # durable ID; never rename it
+address = "server-01.example.com"
+user = "deploy"
+variant = "standard"
+
+[[targets.production.servers]]
+id = "server-02"
+address = "server-02.example.com"
+user = "deploy"
+variant = "standard"

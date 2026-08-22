@@ -15,7 +15,7 @@ use std::path::PathBuf;
     about = "Simple deployment system with a Git-push-style interface"
 )]
 struct Cli {
-    /// Path to deploy.yaml (defaults to ./deploy.yaml).
+    /// Path to deploy.toml (defaults to ./deploy.toml).
     #[arg(long)]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -42,7 +42,7 @@ enum Command {
 /// CLI entry point.
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    let config_path = cli.config.unwrap_or_else(|| PathBuf::from("deploy.yaml"));
+    let config_path = cli.config.unwrap_or_else(|| PathBuf::from("deploy.toml"));
     if !config_path.exists() {
         return Err(Error::config(format!(
             "config '{}' not found",

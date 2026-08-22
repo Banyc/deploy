@@ -53,7 +53,7 @@ fn readme_examples_match_fixture_files() {
     let found = readme_fixtures(&md);
     assert!(
         found.len() >= 2,
-        "expected the Quick Start deploy.yaml and standard.yaml fixture blocks"
+        "expected the Quick Start deploy.toml and standard.toml fixture blocks"
     );
     for (path, body) in &found {
         let disk = std::fs::read_to_string(path)
@@ -89,7 +89,7 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
         &proj,
     );
 
-    let config_path = proj.join("deploy.yaml");
+    let config_path = proj.join("deploy.toml");
     let config = Config::load(&config_path)?;
     assert_eq!(config.release.as_str(), "v1");
     assert!(

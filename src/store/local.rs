@@ -3,7 +3,7 @@
 //! ```text
 //! <base>/
 //!   objects/sha256/<digest>/root/ , tree.json
-//!   releases/<release-id>/mapping.yaml, behavior.json, policies.json, release.json
+//!   releases/<release-id>/mapping.toml, behavior.json, policies.json, release.json
 //!   targets/<target>/observed.json, attempts.jsonl, refs/last-successful, refs/reflog.jsonl
 //!   servers/<server-id>.json
 //!   deployments/<deployment-id>/plan.json, results.json, status
@@ -217,14 +217,14 @@ impl LocalStore {
     pub fn write_release_aux(
         &self,
         id: &ReleaseId,
-        mapping_yaml: &str,
+        mapping_toml: &str,
         behavior_json: &serde_json::Value,
         policies_json: &serde_json::Value,
     ) -> Result<()> {
         let dir = self.release_dir(id);
         ensure_private_dir(&dir)?;
-        let mp = dir.join("mapping.yaml");
-        std::fs::write(&mp, mapping_yaml)
+        let mp = dir.join("mapping.toml");
+        std::fs::write(&mp, mapping_toml)
             .map_err(|e| Error::store(format!("write mapping: {e}")))?;
         set_private(&mp)?;
         let bp = dir.join("behavior.json");

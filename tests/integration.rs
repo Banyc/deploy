@@ -14,63 +14,71 @@ use std::path::Path;
 /// so the same file content describes both the `standard` and `high-capacity`
 /// variants; their trees differ via `deployment/variants/<variant>/`.
 const VARIANT_BODY: &str = r#"
-artifact:
-  mappings:
-    - from: artifacts/build/output/
-      to: app/
-      recursive: true
-    - from: artifacts/deployment/common/
-      to: app/
-      recursive: true
-    - from: "artifacts/deployment/variants/{{ variant }}/"
-      to: app/
-      recursive: true
-      conflict: replace
-activation:
-  adapter: none
-verification:
-  adapter: command
-  argv:
-    - "true"
-  timeout_seconds: 5
-  attempts: 1
-  interval_seconds: 0
-capacity:
-  reserve_bytes: 0
-  reserve_percent: 0
-rotation:
-  per_server:
-    keep_distinct_artifacts: 5
-    keep_days: 14
-    protect_previous: true
-  fleet:
-    protect_deployments: 2
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[[artifact.mappings]]
+from = "artifacts/deployment/common/"
+to = "app/"
+recursive = true
+
+[[artifact.mappings]]
+from = "artifacts/deployment/variants/{{ variant }}/"
+to = "app/"
+recursive = true
+conflict = "replace"
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+
+[capacity]
+reserve_bytes = 0
+reserve_percent = 0
+
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.fleet]
+protect_deployments = 2
 "#;
 
 const CONFIG: &str = r#"
-schema_version: 1
-application: example
-remote_root: /srv/deploy/example
-release: v1
-targets:
-  production:
-    rollout:
-      batch_size: 2
-      stop_on_failure: true
-      failure_policy: rollback_changed
-    servers:
-      - id: server-01
-        address: server-01.example.com
-        user: deploy
-        variant: standard
-      - id: server-02
-        address: server-02.example.com
-        user: deploy
-        variant: standard
-      - id: server-03
-        address: server-03.example.com
-        user: deploy
-        variant: high-capacity
+schema_version = 1
+application = "example"
+remote_root = "/srv/deploy/example"
+release = "v1"
+
+[targets.production]
+rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "rollback_changed" }
+
+[[targets.production.servers]]
+id = "server-01"
+address = "server-01.example.com"
+user = "deploy"
+variant = "standard"
+
+[[targets.production.servers]]
+id = "server-02"
+address = "server-02.example.com"
+user = "deploy"
+variant = "standard"
+
+[[targets.production.servers]]
+id = "server-03"
+address = "server-03.example.com"
+user = "deploy"
+variant = "high-capacity"
 "#;
 
 fn write_file(path: &Path, content: &str) {
@@ -80,15 +88,15 @@ fn write_file(path: &Path, content: &str) {
     std::fs::write(path, content).unwrap();
 }
 
-/// Write a sibling variant YAML file into the release directory selected by the
+/// Write a sibling variant file into the release directory selected by the
 /// deploy config (`releases/v1`).
 fn write_variant_file(proj: &Path, name: &str, body: &str) {
     let release_dir = proj.join("releases").join("v1");
-    write_file(&release_dir.join(format!("{name}.yaml")), body);
+    write_file(&release_dir.join(format!("{name}.toml")), body);
 }
 
 fn setup(proj: &Path) -> (Config, std::path::PathBuf) {
-    write_file(&proj.join("deploy.yaml"), CONFIG);
+    write_file(&proj.join("deploy.toml"), CONFIG);
     write_variant_file(proj, "standard", VARIANT_BODY);
     write_variant_file(proj, "high-capacity", VARIANT_BODY);
     // Artifact sources live beneath the release directory's `artifacts` tree.
@@ -100,8 +108,8 @@ fn setup(proj: &Path) -> (Config, std::path::PathBuf) {
         &artifacts.join("deployment/variants/high-capacity/extra"),
         "hc\n",
     );
-    let config = Config::load(&proj.join("deploy.yaml")).unwrap();
-    (config, proj.join("deploy.yaml"))
+    let config = Config::load(&proj.join("deploy.toml")).unwrap();
+    (config, proj.join("deploy.toml"))
 }
 
 #[test]
@@ -246,27 +254,28 @@ fn fleet_rollback_after_variant_rename_succeeds() -> Result<()> {
     let remotes_base = tmp.path().join("remotes");
     std::fs::create_dir_all(&remotes_base).unwrap();
 
-    fn config_yaml(variant: &str) -> String {
+    fn config_toml(variant: &str) -> String {
         format!(
             r#"
-schema_version: 1
-application: example
-remote_root: /srv/deploy/example
-release: v1
-targets:
-  production:
-    rollout: {{ batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }}
-    servers:
-      - id: server-01
-        address: server-01.example.com
-        user: deploy
-        variant: {variant}
+schema_version = 1
+application = "example"
+remote_root = "/srv/deploy/example"
+release = "v1"
+
+[targets.production]
+rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
+
+[[targets.production.servers]]
+id = "server-01"
+address = "server-01.example.com"
+user = "deploy"
+variant = "{variant}"
 "#
         )
     }
 
     // f0: deploy variant `old`.
-    let config_path = write_string(&proj.join("deploy.yaml"), &config_yaml("old"));
+    let config_path = write_string(&proj.join("deploy.toml"), &config_toml("old"));
     write_variant_file(&proj, "old", VARIANT_BODY);
     let artifacts = proj.join("releases").join("v1").join("artifacts");
     write_file(&artifacts.join("build/output/app/server"), "v1\n");
@@ -305,11 +314,11 @@ targets:
     );
 
     // Rename the variant: the configuration now declares `new`, and the
-    // `old.yaml` variant file is removed entirely.
-    write_string(&proj.join("deploy.yaml"), &config_yaml("new"));
+    // `old.toml` variant file is removed entirely.
+    write_string(&proj.join("deploy.toml"), &config_toml("new"));
     write_variant_file(&proj, "new", VARIANT_BODY);
     write_file(&artifacts.join("deployment/variants/new/extra"), "new\n");
-    std::fs::remove_file(proj.join("releases").join("v1").join("old.yaml")).unwrap();
+    std::fs::remove_file(proj.join("releases").join("v1").join("old.toml")).unwrap();
     let config1 = Config::load(&config_path)?;
     assert!(
         config1.variant("old").is_err(),
@@ -669,61 +678,64 @@ impl Remote for FaultRemote {
 fn single_variant_body(verify_argv: &str) -> String {
     format!(
         r#"
-artifact:
-  mappings:
-    - from: artifacts/build/output/
-      to: app/
-      recursive: true
-    - from: artifacts/deployment/common/
-      to: app/
-      recursive: true
-activation: {{ adapter: none }}
-verification:
-  adapter: command
-  argv:
-    - {verify_argv}
-  timeout_seconds: 5
-  attempts: 1
-  interval_seconds: 0
-capacity:
-  reserve_bytes: 0
-  reserve_percent: 0
-rotation:
-  per_server:
-    keep_distinct_artifacts: 5
-    keep_days: 14
-    protect_previous: true
-  fleet:
-    protect_deployments: 2
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[[artifact.mappings]]
+from = "artifacts/deployment/common/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["{verify_argv}"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+
+[capacity]
+reserve_bytes = 0
+reserve_percent = 0
+
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.fleet]
+protect_deployments = 2
 "#
     )
 }
 
-/// Minimal deploy.yaml body with a single `standard` variant and
-/// `activation: none`. The variant's policy lives in `standard.yaml`.
+/// Minimal deploy.toml body with a single `standard` variant and
+/// `activation: none`. The variant's policy lives in `standard.toml`.
 fn single_target_yaml(stop_on_failure: bool, batch_size: u32) -> String {
     format!(
         r#"
-schema_version: 1
-application: example
-remote_root: /srv/deploy/example
-release: v1
-targets:
-  production:
-    rollout:
-      batch_size: {batch_size}
-      stop_on_failure: {stop_on_failure}
-      failure_policy: rollback_changed
-    servers:
-      - id: server-01
-        address: server-01.example.com
-        user: deploy
-        variant: standard
+schema_version = 1
+application = "example"
+remote_root = "/srv/deploy/example"
+release = "v1"
+
+[targets.production]
+rollout = {{ batch_size = {batch_size}, stop_on_failure = {stop_on_failure}, failure_policy = "rollback_changed" }}
+
+[[targets.production.servers]]
+id = "server-01"
+address = "server-01.example.com"
+user = "deploy"
+variant = "standard"
 "#
     )
 }
 
-/// Build the single-variant project (deploy.yaml + `standard.yaml` variant
+/// Build the single-variant project (deploy.toml + `standard.toml` variant
 /// file + source inputs) and load its config.
 fn setup_single(
     proj: &Path,
@@ -732,7 +744,7 @@ fn setup_single(
     batch_size: u32,
 ) -> Config {
     let p = write_string(
-        &proj.join("deploy.yaml"),
+        &proj.join("deploy.toml"),
         &single_target_yaml(stop_on_failure, batch_size),
     );
     write_variant_file(proj, "standard", &single_variant_body(verify_argv));
@@ -757,39 +769,57 @@ fn cli_reaches_configured_endpoint() -> Result<()> {
 
     // Addresses are explicit `local://` paths: the configured endpoint, NOT the
     // application store's `remotes/` directory. The `standard` variant's policy
-    // lives in its own sibling YAML file inside the release directory.
-    let config_yaml = r#"
-schema_version: 1
-application: example
-remote_root: /srv/deploy/example
-release: v1
-targets:
-  production:
-    rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
-    servers:
-      - id: server-01
-        address: local:///dev/null/should-not-be-used
-        user: deploy
-        variant: standard
+    // lives in its own sibling file inside the release directory.
+    let config_toml = r#"
+schema_version = 1
+application = "example"
+remote_root = "/srv/deploy/example"
+release = "v1"
+
+[targets.production]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+
+[[targets.production.servers]]
+id = "server-01"
+address = "local:///dev/null/should-not-be-used"
+user = "deploy"
+variant = "standard"
 "#;
-    let variant_yaml = r#"
-artifact:
-  mappings:
-    - from: artifacts/build/output/
-      to: app/
-      recursive: true
-activation: { adapter: none }
-verification: { adapter: command, argv: ["true"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
-capacity: { reserve_bytes: 0, reserve_percent: 0 }
-rotation: { per_server: { keep_distinct_artifacts: 5, keep_days: 14, protect_previous: true }, fleet: { protect_deployments: 2 } }
+    let variant_toml = r#"
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+
+[capacity]
+reserve_bytes = 0
+reserve_percent = 0
+
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.fleet]
+protect_deployments = 2
 "#;
-    write_file(&proj.join("deploy.yaml"), config_yaml);
-    write_variant_file(&proj, "standard", variant_yaml);
+    write_file(&proj.join("deploy.toml"), config_toml);
+    write_variant_file(&proj, "standard", variant_toml);
     let artifacts = proj.join("releases").join("v1").join("artifacts");
     write_file(&artifacts.join("build/output/app/server"), "v1\n");
     write_file(&artifacts.join("deployment/common/README"), "common\n");
 
-    let mut config = Config::load(&proj.join("deploy.yaml"))?;
+    let mut config = Config::load(&proj.join("deploy.toml"))?;
     let store = LocalStore::with_base(store_base.clone())?;
 
     // Plug the real endpoint directory into the server address and use the real
@@ -805,7 +835,7 @@ rotation: { per_server: { keep_distinct_artifacts: 5, keep_days: 14, protect_pre
 
     let r = push(
         &config,
-        &proj.join("deploy.yaml"),
+        &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
@@ -852,7 +882,7 @@ fn dry_run_does_not_mutate() -> Result<()> {
 
     let r = push(
         &config,
-        &proj.join("deploy.yaml"),
+        &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
@@ -923,7 +953,7 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
     // Deploy with behavior A (f0).
     let r0 = push(
         &config_a,
-        &proj.join("deploy.yaml"),
+        &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
@@ -938,7 +968,7 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
     let config_b = setup_single(&proj, "false", true, 1);
     let rrb = push(
         &config_b,
-        &proj.join("deploy.yaml"),
+        &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
@@ -1030,7 +1060,7 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
 
     let r0 = push(
         &config_a,
-        &proj.join("deploy.yaml"),
+        &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
@@ -1071,7 +1101,7 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
     let config_b = setup_single(&proj, "false", true, 1);
     let rrb = push(
         &config_b,
-        &proj.join("deploy.yaml"),
+        &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
@@ -1144,7 +1174,7 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
 
     let r0 = push(
         &config_a,
-        &proj.join("deploy.yaml"),
+        &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
@@ -1184,7 +1214,7 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
     let config_b = setup_single(&proj, "false", true, 1);
     let rrb = push(
         &config_b,
-        &proj.join("deploy.yaml"),
+        &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
@@ -1236,45 +1266,67 @@ fn stop_on_failure_records_all_servers() -> Result<()> {
     std::fs::create_dir_all(&remotes_base).unwrap();
 
     // Three servers; verification always fails so the first server fails.
-    let yaml = r#"
-schema_version: 1
-application: example
-remote_root: /srv/deploy/example
-release: v1
-targets:
-  production:
-    rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
-    servers:
-      - id: server-01
-        address: a
-        user: u
-        variant: standard
-      - id: server-02
-        address: b
-        user: u
-        variant: standard
-      - id: server-03
-        address: c
-        user: u
-        variant: standard
+    let deploy_toml = r#"
+schema_version = 1
+application = "example"
+remote_root = "/srv/deploy/example"
+release = "v1"
+
+[targets.production]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+
+[[targets.production.servers]]
+id = "server-01"
+address = "a"
+user = "u"
+variant = "standard"
+
+[[targets.production.servers]]
+id = "server-02"
+address = "b"
+user = "u"
+variant = "standard"
+
+[[targets.production.servers]]
+id = "server-03"
+address = "c"
+user = "u"
+variant = "standard"
 "#;
-    let variant_yaml = r#"
-artifact:
-  mappings:
-    - from: artifacts/build/output/
-      to: app/
-      recursive: true
-activation: { adapter: none }
-verification: { adapter: command, argv: ["false"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
-capacity: { reserve_bytes: 0, reserve_percent: 0 }
-rotation: { per_server: { keep_distinct_artifacts: 5, keep_days: 14, protect_previous: true }, fleet: { protect_deployments: 2 } }
+    let variant_toml = r#"
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["false"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+
+[capacity]
+reserve_bytes = 0
+reserve_percent = 0
+
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.fleet]
+protect_deployments = 2
 "#;
-    write_file(&proj.join("deploy.yaml"), yaml);
-    write_variant_file(&proj, "standard", variant_yaml);
+    write_file(&proj.join("deploy.toml"), deploy_toml);
+    write_variant_file(&proj, "standard", variant_toml);
     let artifacts = proj.join("releases").join("v1").join("artifacts");
     write_file(&artifacts.join("build/output/app/server"), "v1\n");
 
-    let config = Config::load(&proj.join("deploy.yaml"))?;
+    let config = Config::load(&proj.join("deploy.toml"))?;
     let rf = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
@@ -1283,7 +1335,7 @@ rotation: { per_server: { keep_distinct_artifacts: 5, keep_days: 14, protect_pre
     // Must not panic.
     let r = push(
         &config,
-        &proj.join("deploy.yaml"),
+        &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
@@ -1362,7 +1414,7 @@ fn post_lock_failure_releases_lock_and_records() -> Result<()> {
 
     let r = push(
         &config,
-        &proj.join("deploy.yaml"),
+        &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
@@ -1420,7 +1472,7 @@ fn committed_txn_write_failure_pends_commit() -> Result<()> {
 
     let r = push(
         &config,
-        &proj.join("deploy.yaml"),
+        &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
@@ -1478,7 +1530,7 @@ fn commit_marker_write_failure_pends_commit() -> Result<()> {
 
     let r = push(
         &config,
-        &proj.join("deploy.yaml"),
+        &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
