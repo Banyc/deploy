@@ -37,9 +37,9 @@ struct GenRecord {
 /// release's immutable policy snapshot.
 pub fn compute_retained(
     helper: &RemoteHelper,
-    rotation: &RotationConfig,
     pins: &[Pin],
     store: &LocalStore,
+    rotation: &RotationConfig,
 ) -> Result<HashSet<String>> {
     let mut retained: HashSet<String> = HashSet::new();
     let status = helper.status()?;
@@ -280,7 +280,7 @@ pods = ["p1"]
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let c = cfg();
         let retained =
-            compute_retained(&helper, &c.targets["t1"].rotation, &c.pins, &store).unwrap();
+            compute_retained(&helper, &c.pins, &store, &c.targets["t1"].rotation).unwrap();
         assert!(retained.contains("t2"), "current tree retained");
         assert!(retained.contains("t1"), "previous tree retained");
     }

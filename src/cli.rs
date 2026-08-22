@@ -56,7 +56,7 @@ pub fn run() -> Result<()> {
 
     let config_for_factory = config.clone();
     let factory = move |s: &crate::config::ServerDef| -> Result<Box<dyn Remote>> {
-        create_remote(&config_for_factory, s)
+        create_remote(s, &config_for_factory)
     };
 
     match cli.command {
@@ -66,11 +66,11 @@ pub fn run() -> Result<()> {
             dry_run,
         } => {
             let report = push(
-                &config,
                 &config_path,
                 &store,
                 &factory,
                 &target,
+                &config,
                 &PushOptions {
                     dry_run,
                     ref_token: reference,

@@ -47,11 +47,11 @@ type RemoteFactory = dyn Fn(&crate::config::ServerDef) -> Result<Box<dyn Remote>
 
 /// Run a push against `target_name`.
 pub fn push(
-    config: &Config,
     config_path: &Path,
     store: &LocalStore,
     factory: &RemoteFactory,
     target_name: &str,
+    config: &Config,
     opts: &PushOptions,
 ) -> Result<PushReport> {
     let deployment_id = DeploymentId::generate();
@@ -98,15 +98,15 @@ pub fn push(
     };
 
     let result = push_inner(
-        config,
         &project_root,
         store,
         factory,
         target_name,
-        target,
         &pref,
         &deployment_id,
         &op_id,
+        config,
+        target,
         opts,
     );
 
@@ -119,15 +119,15 @@ pub fn push(
 
 #[allow(clippy::too_many_arguments)]
 fn push_inner(
-    config: &Config,
     project_root: &Path,
     store: &LocalStore,
     factory: &RemoteFactory,
     target_name: &str,
-    target: &crate::config::TargetDef,
     pref: &PushRef,
     deployment_id: &DeploymentId,
     op_id: &OperationId,
+    config: &Config,
+    target: &crate::config::TargetDef,
     opts: &PushOptions,
 ) -> Result<PushReport> {
     // 3. Materialize every declared variant. Mappings resolve from the release
@@ -269,12 +269,12 @@ fn push_inner(
     // 5 & 7. Reconcile each server and build the plan, recovering missing local
     // objects from servers that retain them.
     let (assignments, desired_release, source) = crate::push::plan::plan_assignments(
-        config,
         target_name,
         pref,
         &local_release_id,
         &variant_trees,
         store,
+        config,
     )?;
 
     // Behavior coverage gate: every planned assignment's variant must have a
@@ -487,13 +487,13 @@ fn push_inner(
 
     // 8 & 9. Capacity preflight and staging.
     capacity_preflight(
-        config,
-        &target.rotation,
         store,
         &assignments,
         &helpers,
         op_id,
         deployment_id,
+        config,
+        &target.rotation,
     )?;
     // Stage every needed tree into operation-unique incoming paths.
     for a in &assignments {
@@ -549,9 +549,6 @@ fn push_inner(
             let variant_behavior_sha =
                 crate::release::behavior_contract_digest(variant_behavior);
             let outcome = process_server(
-                config,
-                variant_behavior,
-                &variant_behavior_sha,
                 store,
                 remotes[sid].as_ref(),
                 &helpers[sid],
@@ -563,6 +560,9 @@ fn push_inner(
                 &a.tree,
                 &new_gen[sid],
                 plan_servers[sid].expected_generation.as_ref(),
+                variant_behavior,
+                &variant_behavior_sha,
+                config,
             )?;
             let ServerProc {
                 kind,
@@ -626,7 +626,6 @@ fn push_inner(
             // failed compensation rather than aborting the whole push; the
             // server stays advanced and the attempt is marked Degraded.
             let ok = compensate_server(
-                config,
                 store,
                 remotes[sid].as_ref(),
                 &helpers[sid],
@@ -635,6 +634,7 @@ fn push_inner(
                 sid,
                 prior,
                 &new_gen[sid],
+                config,
             )
             .unwrap_or_default();
             if ok {
@@ -850,7 +850,7 @@ fn push_inner(
     for sid in &servers_order {
         let helper = &helpers[sid];
         if helper.acquire_lock(op_id.as_str(), false).is_ok() {
-            let retained = compute_retained(helper, &target.rotation, &config.pins, store)?;
+            let retained = compute_retained(helper, &config.pins, store, &target.rotation)?;
             let active_incoming = HashSet::from([deployment_id.as_str().to_string()]);
             helper.rotate(&retained, &active_incoming)?;
             helper.release_lock(op_id.as_str())?;
@@ -877,9 +877,6 @@ struct ServerProc {
 
 #[allow(clippy::too_many_arguments)]
 fn process_server(
-    config: &Config,
-    behavior: &BehaviorContract,
-    behavior_sha256: &str,
     store: &LocalStore,
     remote: &dyn Remote,
     helper: &RemoteHelper,
@@ -891,6 +888,9 @@ fn process_server(
     tree: &TreeDigest,
     new_gen: &GenerationId,
     expected_gen: Option<&GenerationId>,
+    behavior: &BehaviorContract,
+    behavior_sha256: &str,
+    config: &Config,
 ) -> Result<ServerProc> {
     // Acquire the server mutation lock via an RAII guard so every return path
     // (including errors) releases it.
@@ -988,7 +988,7 @@ fn process_server(
     }
 
     // 3. Validate all declared artifact paths and types before changing current.
-    if let Err(e) = validate_artifact_paths(remote, &behavior.activation, &remote_root_rel) {
+    if let Err(e) = validate_artifact_paths(remote, &remote_root_rel, &behavior.activation) {
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Failed,
             generation: new_gen.clone(),
@@ -1061,13 +1061,12 @@ fn process_server(
 
     // Activation adapter. On failure, compensate (current was advanced).
     if let Err(e) = run_activation(
-        &behavior.activation,
         remote,
         remote.root(),
         &generation_root,
+        &behavior.activation,
     ) {
         let comp = compensate_server(
-            config,
             store,
             remote,
             helper,
@@ -1076,6 +1075,7 @@ fn process_server(
             server_id,
             expected_gen,
             new_gen,
+            config,
         );
         let _ = helper.transaction_record(op_id.as_str(), "compensated");
         let did_comp = matches!(comp, Ok(true));
@@ -1095,7 +1095,6 @@ fn process_server(
     // Verification adapter. On failure, compensate.
     if let Err(e) = run_verification(remote, &behavior.verification) {
         let comp = compensate_server(
-            config,
             store,
             remote,
             helper,
@@ -1104,6 +1103,7 @@ fn process_server(
             server_id,
             expected_gen,
             new_gen,
+            config,
         );
         let _ = helper.transaction_record(op_id.as_str(), "compensated");
         let did_comp = matches!(comp, Ok(true));
@@ -1156,7 +1156,6 @@ fn process_server(
 /// restored prior state.
 #[allow(clippy::too_many_arguments)]
 fn compensate_server(
-    _config: &Config,
     _store: &LocalStore,
     remote: &dyn Remote,
     helper: &RemoteHelper,
@@ -1165,6 +1164,7 @@ fn compensate_server(
     _server_id: &ServerId,
     prior_gen: Option<&GenerationId>,
     advanced_gen: &GenerationId,
+    _config: &Config,
 ) -> Result<bool> {
     // Hold the server mutation lock for the duration of compensation. Re-acquiring
     // is idempotent when the same op_id already holds it (process_server holds it
@@ -1209,7 +1209,7 @@ fn compensate_server(
             // Re-run prior activation contract + verification. A failure means the
             // service was not actually restored to prior behavior, so propagate
             // it as a compensation failure (the attempt is marked Degraded).
-            run_activation(&prior_behavior.activation, remote, remote.root(), &root)
+            run_activation(remote, remote.root(), &root, &prior_behavior.activation)
                 .map_err(|e| Error::remote(format!("compensation activation failed: {e}")))?;
             run_verification(remote, &prior_behavior.verification)
                 .map_err(|e| Error::remote(format!("compensation verification failed: {e}")))?;
@@ -1325,16 +1325,16 @@ fn validate_behavior_coverage(
 /// default (zero) reserve is used. Rotation (used for the protected pre-rotation)
 /// is fleet-wide configuration from `deploy.toml`.
 fn capacity_preflight(
-    config: &Config,
-    rotation: &crate::config::RotationConfig,
     store: &LocalStore,
     assignments: &[crate::push::plan::PlannedAssignment],
     helpers: &HashMap<ServerId, RemoteHelper>,
     op_id: &OperationId,
     deployment_id: &DeploymentId,
+    config: &Config,
+    rotation: &crate::config::RotationConfig,
 ) -> Result<()> {
     for a in assignments {
-        let capacity = resolve_variant_policy(config, store, &a.release, a.variant.as_str())
+        let capacity = resolve_variant_policy(store, &a.release, a.variant.as_str(), config)
             .map(|p| p.capacity)
             .unwrap_or_default();
         let reserve_bytes = capacity.reserve_bytes;
@@ -1357,7 +1357,7 @@ fn capacity_preflight(
             // Run protected rotation using the target's rotation policy, then
             // recheck capacity directly rather than failing the restore.
             if helper.acquire_lock(op_id.as_str(), false).is_ok() {
-                let retained = compute_retained(helper, rotation, &config.pins, store)?;
+                let retained = compute_retained(helper, &config.pins, store, rotation)?;
                 let active = HashSet::from([deployment_id.as_str().to_string()]);
                 helper.rotate(&retained, &active).ok();
                 helper.release_lock(op_id.as_str()).ok();
@@ -1382,10 +1382,10 @@ fn capacity_preflight(
 /// is not part of this resolution: it belongs to the target and is read from
 /// `target.rotation`.
 fn resolve_variant_policy(
-    config: &Config,
     store: &LocalStore,
     release: &ReleaseId,
     variant: &str,
+    config: &Config,
 ) -> Option<crate::config::VariantPolicy> {
     if let Ok(Some(policies)) = store.read_release_policies(release)
         && let Some(p) = policies.get(variant)
@@ -1685,9 +1685,6 @@ pods = ["p1"]
             let new_gen = GenerationId::generate();
             let helper = self.helper();
             process_server(
-                &self.config,
-                &behavior,
-                &sha,
                 &self.store,
                 &self.remote,
                 &helper,
@@ -1699,6 +1696,9 @@ pods = ["p1"]
                 &self.tree,
                 &new_gen,
                 expected_gen.as_ref(),
+                &behavior,
+                &sha,
+                &self.config,
             )
             .unwrap()
         }

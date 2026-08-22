@@ -20,12 +20,12 @@ pub struct PlannedAssignment {
 /// push reference. Returns the assignments, the release the attempt is bound to,
 /// and the plan source.
 pub fn plan_assignments(
-    config: &Config,
     target_name: &str,
     pref: &PushRef,
     local_release_id: &ReleaseId,
     variant_trees: &BTreeMap<String, TreeDigest>,
     store: &LocalStore,
+    config: &Config,
 ) -> Result<(Vec<PlannedAssignment>, ReleaseId, PlanSource)> {
     if !config.targets.contains_key(target_name) {
         return Err(Error::not_found(format!("target '{target_name}'")));

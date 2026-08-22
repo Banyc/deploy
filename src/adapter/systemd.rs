@@ -115,10 +115,10 @@ fn validate_unit_name(name: &str) -> Result<()> {
 /// [`resolve_remote_config_home`]); unit links are placed under it so the path
 /// is correct on the remote host rather than reflecting the controller's env.
 pub fn activation_commands(
-    cfg: &ActivationConfig,
     _remote_root: &Path,
     generation_root: &Path,
     config_home: &Path,
+    cfg: &ActivationConfig,
 ) -> Vec<Vec<String>> {
     let mut cmds = Vec::new();
     let scope_user = matches!(cfg.scope, crate::config::ActivationScope::User);
@@ -184,8 +184,8 @@ pub fn activation_commands(
 /// tree with the correct type before changing `current`.
 pub fn validate_artifact_paths(
     remote: &dyn Remote,
-    cfg: &ActivationConfig,
     generation_root_rel: &Path,
+    cfg: &ActivationConfig,
 ) -> Result<()> {
     for u in &cfg.units {
         let p = generation_root_rel.join(&u.artifact_path);
@@ -209,10 +209,10 @@ pub fn validate_artifact_paths(
 /// Run activation: build and execute the systemd commands, then record the
 /// managed unit links.
 pub fn run_activation(
-    cfg: &ActivationConfig,
     remote: &dyn Remote,
     remote_root: &Path,
     generation_root: &Path,
+    cfg: &ActivationConfig,
 ) -> Result<()> {
     if cfg.adapter != "systemd" {
         return Ok(());
@@ -226,7 +226,7 @@ pub fn run_activation(
     }
     // Resolve the unit directory base on the *remote* host, not the controller.
     let config_home = resolve_remote_config_home(remote)?;
-    let cmds = activation_commands(cfg, remote_root, generation_root, &config_home);
+    let cmds = activation_commands(remote_root, generation_root, &config_home, cfg);
     for argv in &cmds {
         let outcome = remote.exec(argv, Duration::from_secs(30))?;
         if !outcome.success() {
@@ -305,10 +305,10 @@ mod tests {
     fn user_commands_link_before_reload() {
         let c = cfg(ActivationScope::User, vec!["example.service"]);
         let cmds = activation_commands(
-            &c,
             Path::new("/srv/x"),
             Path::new("/gen"),
             Path::new("/home/deploy/.config"),
+            &c,
         );
         // First commands must mkdir + ln (link), then daemon-reload after.
         assert_eq!(cmds[0][0], "mkdir");
@@ -335,10 +335,10 @@ mod tests {
     fn system_scope_does_not_link_user_units() {
         let c = cfg(ActivationScope::System, vec!["wrapper.service"]);
         let cmds = activation_commands(
-            &c,
             Path::new("/srv/x"),
             Path::new("/gen"),
             Path::new("/home/deploy/.config"),
+            &c,
         );
         // No mkdir/ln for artifact links in system scope.
         assert!(!cmds.iter().any(|c| c[0] == "mkdir"));

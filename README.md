@@ -39,7 +39,6 @@ my-project/
 level, binds each server to a variant with a pod, and groups pods into targets
 by ID:
 
-<!-- fixture: tests/fixtures/quickstart/deploy.toml -->
 ```toml
 schema_version = 1
 application = "example"
@@ -92,7 +91,6 @@ its file stem. It owns its artifact mappings and deployment policies
 target. `from` paths resolve inside the release
 directory, so artifact sources live under `releases/v1/artifacts/`:
 
-<!-- fixture: tests/fixtures/quickstart/releases/v1/standard.toml -->
 ```toml
 # The `standard` variant: its artifact mappings plus deployment policies.
 # `from` paths resolve inside the release directory (`releases/<name>/` — the
@@ -120,10 +118,6 @@ interval_seconds = 2
 reserve_bytes = 1073741824   # keep at least 1 GiB free on servers
 reserve_percent = 0
 ```
-
-These examples are checked against real fixture files under
-`tests/fixtures/quickstart/`; a schema change that would invalidate them fails
-the test suite.
 
 Then deploy:
 

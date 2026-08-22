@@ -145,11 +145,11 @@ fn end_to_end_push_rollback() -> Result<()> {
 
     // First push (f0).
     let r0 = push(
-        &config,
         &config_path,
         &store,
         &factory,
         "production",
+        &config,
         &PushOptions {
             dry_run: false,
             ref_token: None,
@@ -167,11 +167,11 @@ fn end_to_end_push_rollback() -> Result<()> {
 
     // Up-to-date push should be a no-op (no attempt created).
     let r_up = push(
-        &config,
         &config_path,
         &store,
         &factory,
         "production",
+        &config,
         &PushOptions {
             dry_run: false,
             ref_token: None,
@@ -191,11 +191,11 @@ fn end_to_end_push_rollback() -> Result<()> {
         "server-v2\n",
     );
     let r1 = push(
-        &config,
         &config_path,
         &store,
         &factory,
         "production",
+        &config,
         &PushOptions {
             dry_run: false,
             ref_token: None,
@@ -213,11 +213,11 @@ fn end_to_end_push_rollback() -> Result<()> {
 
     // Rollback to fleet snapshot f0 restores the original standard tree.
     let rrb = push(
-        &config,
         &config_path,
         &store,
         &factory,
         "production",
+        &config,
         &PushOptions {
             dry_run: false,
             ref_token: Some("production@f0".to_string()),
@@ -309,11 +309,11 @@ pods = ["p1"]
     };
 
     let r0 = push(
-        &config0,
         &config_path,
         &store,
         &factory,
         "production",
+        &config0,
         &PushOptions {
             dry_run: false,
             ref_token: None,
@@ -346,11 +346,11 @@ pods = ["p1"]
 
     // f1: deploy variant `new`.
     let r1 = push(
-        &config1,
         &config_path,
         &store,
         &factory,
         "production",
+        &config1,
         &PushOptions {
             dry_run: false,
             ref_token: None,
@@ -365,11 +365,11 @@ pods = ["p1"]
     // Roll back to the f0 fleet snapshot: restores variant `old` even though the
     // current configuration neither declares it nor ships its variant file.
     let rrb = push(
-        &config1,
         &config_path,
         &store,
         &factory,
         "production",
+        &config1,
         &PushOptions {
             dry_run: false,
             ref_token: Some("production@f0".to_string()),
@@ -411,11 +411,11 @@ fn dry_run_reports_plan() -> Result<()> {
         Ok(Box::new(LocalTransport::new(p)?))
     };
     let r = push(
-        &config,
         &config_path,
         &store,
         &factory,
         "production",
+        &config,
         &PushOptions {
             dry_run: true,
             ref_token: None,
@@ -863,15 +863,15 @@ reserve_percent = 0
 
     let factory_config = config.clone();
     let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
-        create_remote(&factory_config, s)
+        create_remote(s, &factory_config)
     };
 
     let r = push(
-        &config,
         &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
+        &config,
         &PushOptions {
             dry_run: false,
             ref_token: None,
@@ -914,11 +914,11 @@ fn dry_run_does_not_mutate() -> Result<()> {
     };
 
     let r = push(
-        &config,
         &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
+        &config,
         &PushOptions {
             dry_run: true,
             ref_token: None,
@@ -985,11 +985,11 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
 
     // Deploy with behavior A (f0).
     let r0 = push(
-        &config_a,
         &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
+        &config_a,
         &PushOptions {
             dry_run: false,
             ref_token: None,
@@ -1000,11 +1000,11 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
     // Change the configuration to behavior B, then roll back to f0.
     let config_b = setup_single(&proj, "false", true, 1);
     let rrb = push(
-        &config_b,
         &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
+        &config_b,
         &PushOptions {
             dry_run: false,
             ref_token: Some("production@f0".to_string()),
@@ -1092,11 +1092,11 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
     };
 
     let r0 = push(
-        &config_a,
         &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
+        &config_a,
         &PushOptions {
             dry_run: false,
             ref_token: None,
@@ -1133,11 +1133,11 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
 
     let config_b = setup_single(&proj, "false", true, 1);
     let rrb = push(
-        &config_b,
         &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
+        &config_b,
         &PushOptions {
             dry_run: false,
             ref_token: Some("production@f0".to_string()),
@@ -1206,11 +1206,11 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
     };
 
     let r0 = push(
-        &config_a,
         &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
+        &config_a,
         &PushOptions {
             dry_run: false,
             ref_token: None,
@@ -1246,11 +1246,11 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
     // push must fail closed in preflight, NOT fall back to B and NOT panic.
     let config_b = setup_single(&proj, "false", true, 1);
     let rrb = push(
-        &config_b,
         &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
+        &config_b,
         &PushOptions {
             dry_run: false,
             ref_token: Some("production@f0".to_string()),
@@ -1380,11 +1380,11 @@ reserve_percent = 0
 
     // Must not panic.
     let r = push(
-        &config,
         &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
+        &config,
         &PushOptions {
             dry_run: false,
             ref_token: None,
@@ -1459,11 +1459,11 @@ fn post_lock_failure_releases_lock_and_records() -> Result<()> {
     };
 
     let r = push(
-        &config,
         &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
+        &config,
         &PushOptions {
             dry_run: false,
             ref_token: None,
@@ -1517,11 +1517,11 @@ fn committed_txn_write_failure_pends_commit() -> Result<()> {
     };
 
     let r = push(
-        &config,
         &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
+        &config,
         &PushOptions {
             dry_run: false,
             ref_token: None,
@@ -1575,11 +1575,11 @@ fn commit_marker_write_failure_pends_commit() -> Result<()> {
     };
 
     let r = push(
-        &config,
         &proj.join("deploy.toml"),
         &store,
         &factory,
         "production",
+        &config,
         &PushOptions {
             dry_run: false,
             ref_token: None,

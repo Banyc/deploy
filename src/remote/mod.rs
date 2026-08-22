@@ -16,7 +16,7 @@ use crate::remote::transport::{LocalTransport, Remote};
 /// `address` is an explicit `local://` path, which routes the transport to that
 /// exact filesystem location (an explicit local endpoint) rather than the
 /// application store's `remotes/` directory.
-pub fn create_remote(config: &Config, server: &ServerDef) -> Result<Box<dyn Remote>> {
+pub fn create_remote(server: &ServerDef, config: &Config) -> Result<Box<dyn Remote>> {
     if let Some(local_path) = server.address.strip_prefix("local://") {
         let p = std::path::PathBuf::from(local_path);
         if p.is_relative() {
