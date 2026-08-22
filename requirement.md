@@ -117,28 +117,41 @@ protect_previous = true
 [rotation.fleet]
 protect_deployments = 2
 
-# Every server is declared once at the top level; targets reference them by ID.
+# Servers are declared once; a pod binds one server to one variant, and
+# targets reference pods by ID.
 [[servers]]
 id = "server-01"
 address = "server-01.example.com"
 user = "deploy"
-variant = "standard"
 
 [[servers]]
 id = "server-02"
 address = "server-02.example.com"
 user = "deploy"
-variant = "standard"
 
 [[servers]]
 id = "server-03"
 address = "server-03.example.com"
 user = "deploy"
+
+[[pods]]
+id = "app-1"
+server = "server-01"
+variant = "standard"
+
+[[pods]]
+id = "app-2"
+server = "server-02"
+variant = "standard"
+
+[[pods]]
+id = "hc-1"
+server = "server-03"
 variant = "high-capacity"
 
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-servers = ["server-01", "server-02", "server-03"]
+pods = ["app-1", "app-2", "hc-1"]
 ```
 
 Each variant is described by its own file inside the release directory (e.g.

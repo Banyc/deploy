@@ -96,7 +96,7 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
         config.release_root(&config_path).ends_with("releases/v1"),
         "release directory is forced beneath releases/"
     );
-    assert_eq!(config.targets["production"].servers.len(), 2);
+    assert_eq!(config.targets["production"].pods.len(), 2);
     let variant = config.variant("standard")?;
     assert_eq!(&variant.artifact.mappings[0].from, "artifacts/build/output/");
     assert_eq!(variant.capacity.reserve_bytes, 1_073_741_824);

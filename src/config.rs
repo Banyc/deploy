@@ -7,8 +7,9 @@
 //! policies (activation, verification, capacity); artifact sources
 //! conventionally live beneath `releases/<name>/artifacts/`. Rotation is a
 //! fleet-wide retention policy declared once at the top level of `deploy.toml`.
-//! Servers are declared once at the top level; targets contain only their
-//! rollout policy and reference member servers by ID.
+//! Servers are declared once at the top level; a pod binds one server to one
+//! variant under an ID, and targets contain only their rollout policy and
+//! references to member pods by ID.
 //!
 //! The same local inputs always produce one target-independent release identity
 //! (see `model::ReleaseDigest`): the name-sorted per-variant mappings, the
@@ -303,7 +304,6 @@ pub struct ServerDef {
     /// and `ssh-keyscan -p`.
     #[serde(default = "default_ssh_port")]
     pub port: u16,
-    pub variant: String,
     /// Dedicated `known_hosts` file used with `StrictHostKeyChecking=yes` for
     /// this server. Either this or `host_key_fingerprint` must be configured;
     /// trust-on-first-use is disabled.
@@ -316,13 +316,24 @@ pub struct ServerDef {
     pub host_key_fingerprint: Option<String>,
 }
 
+/// Binds one server to one variant under an ID. The connection details live on
+/// the top-level `[[servers]]` entry; the workload choice lives here. Targets
+/// reference pods by ID.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PodDef {
+    pub id: String,
+    /// The ID of the top-level server this pod deploys onto.
+    pub server: String,
+    pub variant: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TargetDef {
     #[serde(default)]
     pub rollout: RolloutConfig,
-    /// The IDs of this target's member servers, in deployment order. Each ID
-    /// must reference a top-level `[[servers]]` declaration.
-    pub servers: Vec<String>,
+    /// The IDs of this target's member pods, in deployment order. Each ID must
+    /// reference a top-level `[[pods]]` declaration.
+    pub pods: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -341,8 +352,11 @@ pub struct Config {
     #[serde(default)]
     pub rotation: RotationConfig,
     /// Every deployable server, declared once at the top level of
-    /// `deploy.toml`; targets reference these by ID.
+    /// `deploy.toml`; pods reference these by ID.
     pub servers: Vec<ServerDef>,
+    /// Workload bindings: one pod = one server + one variant, under an ID.
+    /// Targets reference pods by ID.
+    pub pods: Vec<PodDef>,
     pub targets: BTreeMap<String, TargetDef>,
     #[serde(skip)]
     variants: BTreeMap<String, VariantConfig>,
@@ -410,20 +424,13 @@ impl Config {
             self.validate_variant(name, variant)?;
         }
 
-        // Server declarations are unique and well-formed; targets reference
-        // known server IDs.
-        let mut all_ids = std::collections::HashSet::new();
+        // Server declarations are unique and well-formed.
+        let mut all_server_ids = std::collections::HashSet::new();
         for s in &self.servers {
-            if !all_ids.insert(s.id.clone()) {
+            if !all_server_ids.insert(s.id.clone()) {
                 return Err(Error::config(format!(
                     "duplicate server id '{}' in top-level servers",
                     s.id
-                )));
-            }
-            if !self.variants.contains_key(&s.variant) {
-                return Err(Error::config(format!(
-                    "server '{}' references unknown variant '{}'",
-                    s.id, s.variant
                 )));
             }
             // When an identity source is provided it must be well-formed. The
@@ -447,14 +454,48 @@ impl Config {
                 )));
             }
         }
-        for (tname, target) in &self.targets {
-            if target.servers.is_empty() {
-                return Err(Error::config(format!("target '{tname}' has no servers")));
+
+        // Pods bind one declared server to one declared variant, under a unique
+        // ID.
+        let mut pod_by_id = std::collections::BTreeMap::new();
+        for p in &self.pods {
+            if pod_by_id.insert(p.id.clone(), p).is_some() {
+                return Err(Error::config(format!(
+                    "duplicate pod id '{}' in top-level pods",
+                    p.id
+                )));
             }
-            for id in &target.servers {
-                if !all_ids.contains(id) {
+            if !all_server_ids.contains(&p.server) {
+                return Err(Error::config(format!(
+                    "pod '{}' references unknown server '{}'",
+                    p.id, p.server
+                )));
+            }
+            if !self.variants.contains_key(&p.variant) {
+                return Err(Error::config(format!(
+                    "pod '{}' references unknown variant '{}'",
+                    p.id, p.variant
+                )));
+            }
+        }
+
+        for (tname, target) in &self.targets {
+            if target.pods.is_empty() {
+                return Err(Error::config(format!("target '{tname}' has no pods")));
+            }
+            // One server runs exactly one generation, so two member pods of the
+            // same target can never share a server.
+            let mut used_servers = std::collections::HashSet::new();
+            for pid in &target.pods {
+                let Some(pod) = pod_by_id.get(pid) else {
                     return Err(Error::config(format!(
-                        "target '{tname}' references unknown server '{id}'"
+                        "target '{tname}' references unknown pod '{pid}'"
+                    )));
+                };
+                if !used_servers.insert(pod.server.as_str()) {
+                    return Err(Error::config(format!(
+                        "target '{tname}' has multiple pods on server '{}'",
+                        pod.server
                     )));
                 }
             }
@@ -523,28 +564,38 @@ impl Config {
             .ok_or_else(|| Error::config(format!("unknown release variant '{name}'")))
     }
 
-    /// Resolve a target's member servers in the order they are listed, against
-    /// the top-level `[[servers]]` declarations. References are validated at
-    /// load time, so a miss here is a configuration error.
-    pub fn target_servers(&self, target_name: &str) -> Result<Vec<&ServerDef>> {
+    /// Resolve a target's member pods in the order they are listed, pairing
+    /// each pod with its declared server. References are validated at load
+    /// time, so a miss here is a configuration error.
+    pub fn target_pods(&self, target_name: &str) -> Result<Vec<(&PodDef, &ServerDef)>> {
         let target = self
             .targets
             .get(target_name)
             .ok_or_else(|| Error::not_found(format!("target '{target_name}'")))?;
-        target
-            .servers
-            .iter()
-            .map(|id| {
+        let mut out = Vec::with_capacity(target.pods.len());
+        for pid in &target.pods {
+            let pod = self
+                .pods
+                .iter()
+                .find(|p| &p.id == pid)
+                .ok_or_else(|| {
+                    Error::config(format!(
+                        "target '{target_name}' references unknown pod '{pid}'"
+                    ))
+                })?;
+            let server =
                 self.servers
                     .iter()
-                    .find(|s| &s.id == id)
+                    .find(|s| s.id == pod.server)
                     .ok_or_else(|| {
                         Error::config(format!(
-                            "target '{target_name}' references unknown server '{id}'"
+                            "pod '{}' references unknown server '{}'",
+                            pod.id, pod.server
                         ))
-                    })
-            })
-            .collect()
+                    })?;
+            out.push((pod, server));
+        }
+        Ok(out)
     }
 
     /// Discover variant files inside the release directory. The project
@@ -714,11 +765,15 @@ protect_deployments = 1
 id = "s1"
 address = "a"
 user = "u"
+
+[[pods]]
+id = "p1"
+server = "s1"
 variant = "standard"
 
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-servers = ["s1"]
+pods = ["p1"]
 "#;
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml).unwrap();
@@ -803,11 +858,15 @@ protect_deployments = 2
 id = "s1"
 address = "a"
 user = "u"
+
+[[pods]]
+id = "p1"
+server = "s1"
 variant = "standard"
 
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-servers = ["s1"]
+pods = ["p1"]
 "#;
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml).unwrap();
@@ -874,11 +933,15 @@ protect_deployments = 1
 id = "s1"
 address = "a"
 user = "u"
+
+[[pods]]
+id = "p1"
+server = "s1"
 variant = "standard"
 
 [targets.t1]
 rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
-servers = ["s1"]
+pods = ["p1"]
 "#
         )
     }
@@ -939,11 +1002,15 @@ release = { path = "releases/v1", variants = { standard = "standard.toml" } }
 id = "s1"
 address = "a"
 user = "u"
+
+[[pods]]
+id = "p1"
+server = "s1"
 variant = "standard"
 
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-servers = ["s1"]
+pods = ["p1"]
 "#;
         let p = project.join("deploy.toml");
         std::fs::write(&p, legacy_toml).unwrap();
@@ -1002,22 +1069,55 @@ servers = ["s1"]
     }
 
     #[test]
-    fn targets_must_reference_declared_servers() {
+    fn targets_must_reference_declared_pods() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         write_standard_release(&project, "v1");
-        // The target references `ghost`, which no [[servers]] entry declares.
+        // The target references `ghost`, which no [[pods]] entry declares.
         let p = project.join("deploy.toml");
         std::fs::write(
             &p,
-            deploy_toml("v1").replace("servers = [\"s1\"]", "servers = [\"ghost\"]"),
+            deploy_toml("v1").replace("pods = [\"p1\"]", "pods = [\"ghost\"]"),
         )
         .unwrap();
-        let err = Config::load(&p).expect_err("unknown server reference must fail");
+        let err = Config::load(&p).expect_err("unknown pod reference must fail");
         assert!(
-            err.to_string().contains("unknown server 'ghost'"),
-            "error must name the unknown server reference, got: {err}"
+            err.to_string().contains("unknown pod 'ghost'"),
+            "error must name the unknown pod reference, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pods_must_reference_known_servers_and_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+
+        // A pod bound to a server that does not exist.
+        let p = project.join("deploy.toml");
+        std::fs::write(
+            &p,
+            deploy_toml("v1").replace("server = \"s1\"", "server = \"ghost\""),
+        )
+        .unwrap();
+        let err = Config::load(&p).expect_err("pod with unknown server must fail");
+        assert!(
+            err.to_string().contains("references unknown server 'ghost'"),
+            "got: {err}"
+        );
+
+        // A pod bound to a variant the release directory does not declare.
+        std::fs::write(
+            &p,
+            deploy_toml("v1").replace("variant = \"standard\"", "variant = \"ghost\""),
+        )
+        .unwrap();
+        let err = Config::load(&p).expect_err("pod with unknown variant must fail");
+        assert!(
+            err.to_string().contains("references unknown variant 'ghost'"),
+            "got: {err}"
         );
     }
 

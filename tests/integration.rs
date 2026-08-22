@@ -64,23 +64,35 @@ protect_deployments = 2
 id = "server-01"
 address = "server-01.example.com"
 user = "deploy"
-variant = "standard"
 
 [[servers]]
 id = "server-02"
 address = "server-02.example.com"
 user = "deploy"
-variant = "standard"
 
 [[servers]]
 id = "server-03"
 address = "server-03.example.com"
 user = "deploy"
+
+[[pods]]
+id = "p1"
+server = "server-01"
+variant = "standard"
+
+[[pods]]
+id = "p2"
+server = "server-02"
+variant = "standard"
+
+[[pods]]
+id = "p3"
+server = "server-03"
 variant = "high-capacity"
 
 [targets.production]
 rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "rollback_changed" }
-servers = ["server-01", "server-02", "server-03"]
+pods = ["p1", "p2", "p3"]
 "#;
 
 fn write_file(path: &Path, content: &str) {
@@ -268,11 +280,15 @@ release = "v1"
 id = "server-01"
 address = "server-01.example.com"
 user = "deploy"
+
+[[pods]]
+id = "p1"
+server = "server-01"
 variant = "{variant}"
 
 [targets.production]
 rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
-servers = ["server-01"]
+pods = ["p1"]
 "#
         )
     }
@@ -730,11 +746,15 @@ protect_deployments = 2
 id = "server-01"
 address = "server-01.example.com"
 user = "deploy"
+
+[[pods]]
+id = "p1"
+server = "server-01"
 variant = "standard"
 
 [targets.production]
 rollout = {{ batch_size = {batch_size}, stop_on_failure = {stop_on_failure}, failure_policy = "rollback_changed" }}
-servers = ["server-01"]
+pods = ["p1"]
 "#
     )
 }
@@ -792,11 +812,15 @@ protect_deployments = 2
 id = "server-01"
 address = "local:///dev/null/should-not-be-used"
 user = "deploy"
+
+[[pods]]
+id = "p1"
+server = "server-01"
 variant = "standard"
 
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-servers = ["server-01"]
+pods = ["p1"]
 "#;
     let variant_toml = r#"
 [[artifact.mappings]]
@@ -1293,23 +1317,35 @@ protect_deployments = 2
 id = "server-01"
 address = "a"
 user = "u"
-variant = "standard"
 
 [[servers]]
 id = "server-02"
 address = "b"
 user = "u"
-variant = "standard"
 
 [[servers]]
 id = "server-03"
 address = "c"
 user = "u"
+
+[[pods]]
+id = "p1"
+server = "server-01"
+variant = "standard"
+
+[[pods]]
+id = "p2"
+server = "server-02"
+variant = "standard"
+
+[[pods]]
+id = "p3"
+server = "server-03"
 variant = "standard"
 
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-servers = ["server-01", "server-02", "server-03"]
+pods = ["p1", "p2", "p3"]
 "#;
     let variant_toml = r#"
 [[artifact.mappings]]

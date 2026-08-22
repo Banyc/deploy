@@ -218,11 +218,15 @@ protect_deployments = 1
 id = "s1"
 address = "a"
 user = "u"
+
+[[pods]]
+id = "p1"
+server = "s1"
 variant = "standard"
 
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-servers = ["s1"]
+pods = ["p1"]
 "#;
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml).unwrap();

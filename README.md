@@ -36,7 +36,8 @@ my-project/
 ```
 
 `deploy.toml` names the active release, declares every server once at the top
-level, and groups them into targets by ID:
+level, binds each server to a variant with a pod, and groups pods into targets
+by ID:
 
 <!-- fixture: tests/fixtures/quickstart/deploy.toml -->
 ```toml
@@ -59,22 +60,31 @@ protect_previous = true       # never delete the artifact `current` can roll bac
 [rotation.fleet]
 protect_deployments = 2       # keep each server's artifacts of the newest 2 successful deployments
 
-# Every server is declared once at the top level; targets reference them by ID.
+# Servers are declared once; a pod binds one server to one variant, and
+# targets reference pods by ID.
 [[servers]]
 id = "server-01"            # durable ID; never rename it
 address = "server-01.example.com"
 user = "deploy"
-variant = "standard"
 
 [[servers]]
 id = "server-02"
 address = "server-02.example.com"
 user = "deploy"
+
+[[pods]]
+id = "app-1"
+server = "server-01"
+variant = "standard"
+
+[[pods]]
+id = "app-2"
+server = "server-02"
 variant = "standard"
 
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-servers = ["server-01", "server-02"]
+pods = ["app-1", "app-2"]
 ```
 
 Each variant is a `*.toml` file directly inside the release directory, named by
@@ -193,25 +203,34 @@ releases/
 ```
 
 ```toml
-# deploy.toml — each server declares its variant once, at the top level
+# deploy.toml — a pod binds one server to one variant
 [[servers]]
 id = "server-01"
 address = "..."
-variant = "standard"
 
 [[servers]]
 id = "server-03"
 address = "..."
+
+[[pods]]
+id = "app-1"
+server = "server-01"
+variant = "standard"
+
+[[pods]]
+id = "hc-1"
+server = "server-03"
 variant = "high-capacity"
 
-# the target groups servers by ID and sets the rollout policy
+# the target groups pods by ID and sets the rollout policy
 [targets.production]
 rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "rollback_changed" }
-servers = ["server-01", "server-03"]
+pods = ["app-1", "hc-1"]
 ```
 
-A server can be a member of several targets; its variant is declared once on
-the `[[servers]]` entry.
+A pod can be a member of several targets. Two pods may share one server in
+different targets, but within a single target each server appears at most once
+(one running generation per server).
 
 Each variant file has the same shape as `standard.toml` in the Quick start —
 its own mappings, activation, verification, and capacity. Retention
