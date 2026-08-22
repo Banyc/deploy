@@ -186,6 +186,7 @@ fn push_inner(
     }
     let mapping_sha = crate::release::variant_mappings_digest(&variant_mappings);
     let behavior_sha = crate::release::variant_behaviors_digest(&variant_behaviors);
+    let policies_sha = crate::release::variant_policies_digest(&variant_policies);
     let behavior_json = serde_json::to_value(&variant_behaviors)?;
     let policies_json = serde_json::to_value(&variant_policies)?;
     let mapping_toml = toml::to_string_pretty(&variant_mappings)
@@ -202,6 +203,7 @@ fn push_inner(
             let rec = crate::release::build_release(
                 &mapping_sha,
                 &behavior_sha,
+                &policies_sha,
                 &bindings,
                 project_root,
             );
@@ -259,7 +261,6 @@ fn push_inner(
             }
             (rid, hist_behaviors)
         };
-    let _ = &local_release_id;
 
     // The behavior digest this attempt is bound to: the frozen, name-keyed set of
     // every declared variant's activation + verification contract. Historical
@@ -485,7 +486,15 @@ fn push_inner(
     store.write_plan(deployment_id.as_str(), &plan)?;
     store.write_status(deployment_id.as_str(), "in_progress")?;
 
-    // 8 & 9. Capacity preflight and staging.
+    // 8 & 9. Capacity preflight and staging. Only a HEAD push may consult its
+    // just-frozen in-memory policy snapshot (a dry-run never persists it); any
+    // historical reference resolves strictly from the store and fails
+    // preflight when the assigned snapshot is missing or corrupt.
+    let frozen_policies = if matches!(pref, PushRef::Head) {
+        Some((&local_release_id, &variant_policies))
+    } else {
+        None
+    };
     capacity_preflight(
         store,
         &assignments,
@@ -494,6 +503,7 @@ fn push_inner(
         deployment_id,
         config,
         &target.rotation,
+        frozen_policies,
     )?;
     // Stage every needed tree into operation-unique incoming paths.
     for a in &assignments {
@@ -1317,13 +1327,14 @@ fn validate_behavior_coverage(
 /// the configured safety headroom, running protected rotation first if needed.
 ///
 /// Capacity headroom is per-variant policy bound to the release being deployed.
-/// It is resolved from the immutable policy snapshot persisted with that
-/// release, so a rollback to a release whose variant was later renamed or
-/// removed still applies the policy that was in force when the release was
-/// created. Releases recorded before policy persistence fall back to the
-/// caller's current configuration; if the variant is unknown there too, the
-/// default (zero) reserve is used. Rotation (used for the protected pre-rotation)
-/// is fleet-wide configuration from `deploy.toml`.
+/// It is resolved strictly from the immutable policy snapshot persisted with
+/// that release; `frozen` supplies the just-computed snapshot for the release
+/// materialized by this push (a dry-run never persists it). Resolution fails
+/// closed: a missing or corrupt assigned policy snapshot aborts the attempt in
+/// preflight instead of silently substituting the caller's current configuration
+/// or defaults. Rotation (used for the protected pre-rotation) is target-level
+/// configuration from `deploy.toml`.
+#[allow(clippy::too_many_arguments)]
 fn capacity_preflight(
     store: &LocalStore,
     assignments: &[crate::push::plan::PlannedAssignment],
@@ -1332,11 +1343,18 @@ fn capacity_preflight(
     deployment_id: &DeploymentId,
     config: &Config,
     rotation: &crate::config::RotationConfig,
+    frozen: Option<(
+        &ReleaseId,
+        &BTreeMap<String, crate::config::VariantPolicy>,
+    )>,
 ) -> Result<()> {
     for a in assignments {
-        let capacity = resolve_variant_policy(store, &a.release, a.variant.as_str(), config)
-            .map(|p| p.capacity)
-            .unwrap_or_default();
+        // Resolve (and thus validate) the assigned policy snapshot for every
+        // assignment, even when the tree is already installed remotely: a
+        // corrupt or missing snapshot must fail this attempt in preflight
+        // rather than surfacing only when space happens to run short.
+        let capacity = resolve_variant_policy(store, &a.release, a.variant.as_str(), frozen)?
+            .capacity;
         let reserve_bytes = capacity.reserve_bytes;
         let reserve_percent = capacity.reserve_percent as f64 / 100.0;
         let helper = helpers.get(&a.server_id).expect("helper present");
@@ -1374,25 +1392,45 @@ fn capacity_preflight(
     Ok(())
 }
 
-/// Resolve the capacity policy bound to a (release, variant) assignment.
-/// Prefers the immutable policy snapshot persisted with the release so
-/// historical deployments use the capacity policy in force at release time even
-/// when the variant has since been renamed or removed; releases recorded before
-/// policy persistence fall back to the caller's current configuration. Rotation
+/// Resolve the capacity policy bound to a (release, variant) assignment,
+/// strictly from the immutable snapshot persisted with the release. `frozen`
+/// supplies the just-frozen in-memory snapshot for the release materialized by
+/// the current push (a dry-run never persists it). Resolution fails closed:
+/// a missing or corrupt assigned policy snapshot is a preflight error, never a
+/// silent fallback to the caller's current configuration or defaults. Rotation
 /// is not part of this resolution: it belongs to the target and is read from
 /// `target.rotation`.
 fn resolve_variant_policy(
     store: &LocalStore,
     release: &ReleaseId,
     variant: &str,
-    config: &Config,
-) -> Option<crate::config::VariantPolicy> {
-    if let Ok(Some(policies)) = store.read_release_policies(release)
-        && let Some(p) = policies.get(variant)
+    frozen: Option<(
+        &ReleaseId,
+        &BTreeMap<String, crate::config::VariantPolicy>,
+    )>,
+) -> Result<crate::config::VariantPolicy> {
+    if let Some((frozen_release, frozen_policies)) = frozen
+        && frozen_release == release
+        && let Some(p) = frozen_policies.get(variant)
     {
-        return Some(p.clone());
+        return Ok(p.clone());
     }
-    config.variant(variant).ok().map(crate::config::VariantPolicy::from)
+    match store.read_release_policies(release) {
+        Ok(Some(policies)) => policies.get(variant).cloned().ok_or_else(|| {
+            Error::preflight(format!(
+                "policy snapshot for release {} is missing variant '{variant}'",
+                release.as_str()
+            ))
+        }),
+        Ok(None) => Err(Error::preflight(format!(
+            "release {} has no capacity policy snapshot; refusing to plan a mutation",
+            release.as_str()
+        ))),
+        Err(e) => Err(Error::preflight(format!(
+            "policy snapshot for release {} is corrupt or unreadable: {e}",
+            release.as_str()
+        ))),
+    }
 }
 
 fn tree_size_on_host(root: &Path) -> u64 {

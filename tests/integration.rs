@@ -1611,3 +1611,214 @@ fn write_string(path: &Path, content: &str) -> std::path::PathBuf {
     std::fs::write(path, content).unwrap();
     path.to_path_buf()
 }
+
+// ---- Capacity policy snapshots: identity binding + fail-closed resolution --
+
+/// Changing ONLY `[capacity]` in a variant file must produce a NEW release
+/// identity (the canonical policy digest is part of the release payload) while
+/// keeping the tree bytes identical, and both releases must retain their own
+/// immutable capacity snapshots.
+#[test]
+fn capacity_only_change_produces_new_release_identity() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store_base = tmp.path().join("store");
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    let (config, config_path) = {
+        let p = write_string(
+            &proj.join("deploy.toml"),
+            &single_target_toml(true, 1),
+        );
+        write_variant_file(&proj, "standard", &single_variant_body("true"));
+        let artifacts = proj.join("releases").join("v1").join("artifacts");
+        write_file(&artifacts.join("build/output/app/server"), "v1\n");
+        write_file(&artifacts.join("deployment/common/README"), "common\n");
+        (Config::load(&p).unwrap(), p)
+    };
+    let store = LocalStore::with_base(store_base.clone())?;
+    let rf = remotes_base.clone();
+    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+    };
+
+    // f0: deploy with reserve_bytes = 0.
+    let r0 = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r0.status, Some(DeploymentStatus::Successful));
+    let first = r0.attempt.expect("attempt recorded").servers
+        [&ServerId::new("server-01")]
+        .clone();
+    assert_eq!(first.variant.as_str(), "standard");
+
+    // Capacity-only change: identical bytes except `reserve_bytes`.
+    let variant_path = proj.join("releases").join("v1").join("standard.toml");
+    let body = std::fs::read_to_string(&variant_path)?;
+    let changed = body.replace("[capacity]\nreserve_bytes = 0", "[capacity]\nreserve_bytes = 4096");
+    assert_ne!(body, changed, "capacity line must exist in fixture");
+    std::fs::write(&variant_path, changed).unwrap();
+    let config2 = Config::load(&config_path)?;
+
+    let r1 = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config2,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+    let second = r1.attempt.expect("attempt recorded").servers
+        [&ServerId::new("server-01")]
+        .clone();
+
+    // New release identity, same tree bytes.
+    assert_ne!(
+        second.release, first.release,
+        "a capacity-only change must produce a new release id"
+    );
+    assert_eq!(
+        second.tree, first.tree,
+        "tree bytes must be unchanged by a capacity-only change"
+    );
+
+    // Each release retains its own immutable snapshot.
+    let old_policies = store
+        .read_release_policies(&first.release)?
+        .expect("old release keeps its snapshot");
+    assert_eq!(old_policies["standard"].capacity.reserve_bytes, 0);
+    let new_policies = store
+        .read_release_policies(&second.release)?
+        .expect("new release persists its snapshot");
+    assert_eq!(new_policies["standard"].capacity.reserve_bytes, 4096);
+    Ok(())
+}
+
+/// A corrupt historical policies.json must fail the attempt during preflight —
+/// never fall back to current configuration or defaults — and must leave every
+/// server untouched.
+#[test]
+fn corrupt_historical_policies_fail_preflight_without_remote_mutation() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store_base = tmp.path().join("store");
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    let (config, config_path) = {
+        let p = write_string(
+            &proj.join("deploy.toml"),
+            &single_target_toml(true, 1),
+        );
+        write_variant_file(&proj, "standard", &single_variant_body("true"));
+        let artifacts = proj.join("releases").join("v1").join("artifacts");
+        write_file(&artifacts.join("build/output/app/server"), "v1\n");
+        write_file(&artifacts.join("deployment/common/README"), "common\n");
+        (Config::load(&p).unwrap(), p)
+    };
+    let store = LocalStore::with_base(store_base.clone())?;
+    let rf = remotes_base.clone();
+    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+    };
+
+    let r0 = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r0.status, Some(DeploymentStatus::Successful));
+    let release = r0.attempt.expect("attempt recorded").servers
+        [&ServerId::new("server-01")]
+        .release
+        .clone();
+
+    // Deploy different content so the fleet advances to f1 and a rollback to
+    // f0 becomes real work instead of an up-to-date no-op.
+    write_file(
+        &proj
+            .join("releases")
+            .join("v1")
+            .join("artifacts")
+            .join("build/output/app/server"),
+        "v2\n",
+    );
+    let config_v2 = Config::load(&config_path)?;
+    let r1 = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config_v2,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+    assert_ne!(
+        r1.attempt.expect("attempt recorded").servers[&ServerId::new("server-01")]
+            .release,
+        release,
+        "changed inputs must produce a new release"
+    );
+
+    // Snapshot of healthy remote state before corruption.
+    let current_before = std::fs::read_link(remotes_base.join("server-01/current"))?;
+
+    // Corrupt the historical snapshot.
+    let policies_path = store_base
+        .join("releases")
+        .join(release.as_str())
+        .join("policies.json");
+    std::fs::write(&policies_path, b"{ this is not json").unwrap();
+
+    // Rollback to @f0 now fails during preflight...
+    let err = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: Some("production@f0".to_string()),
+        },
+    )
+    .err()
+    .expect("corrupt policy snapshot must fail the push");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("polic") && msg.to_lowercase().contains("preflight"),
+        "error must name the policy preflight failure, got: {msg}"
+    );
+
+    // ...and no server was touched.
+    let current_after = std::fs::read_link(remotes_base.join("server-01/current"))?;
+    assert_eq!(
+        current_before, current_after,
+        "`current` must be unchanged by the failed attempt"
+    );
+    Ok(())
+}

@@ -213,11 +213,27 @@ impl<'a> RemoteHelper<'a> {
         behavior_json: &str,
     ) -> Result<()> {
         let dir = Path::new("releases").join(release_id);
-        self.remote
-            .write(&dir.join("release.json"), release_json.as_bytes(), 0o644)?;
-        self.remote
-            .write(&dir.join("behavior.json"), behavior_json.as_bytes(), 0o644)?;
-        Ok(())
+        self.publish_release_file(&dir.join("release.json"), release_json.as_bytes())?;
+        self.publish_release_file(&dir.join("behavior.json"), behavior_json.as_bytes())
+    }
+
+    /// Install one immutable release-side file with create-or-compare
+    /// semantics: the first writer wins via an exclusive create; a subsequent
+    /// writer must observe equivalent content or fail. Equivalence is
+    /// semantic for JSON (key order and whitespace may differ between
+    /// serializations of the same contract) and byte-exact otherwise.
+    fn publish_release_file(&self, rel: &Path, data: &[u8]) -> Result<()> {
+        if self.remote.try_write_new(rel, data)? {
+            return Ok(());
+        }
+        let existing = self.remote.read(rel)?;
+        if json_semantically_equal(&existing, data) {
+            return Ok(());
+        }
+        Err(Error::integrity(format!(
+            "refusing to replace existing {} with different content",
+            rel.display()
+        )))
     }
 
     /// Create a generation record and its `root` symlink. Does not move
@@ -454,6 +470,22 @@ impl<'a> RemoteHelper<'a> {
 
 /// Copy a host-local tree into a remote-relative path, reconstructing symlinks
 /// and modes.
+/// Compare two serialized JSON documents semantically: equal when they parse
+/// to equal `serde_json` values (object key order and whitespace are not part
+/// of the contract). Falls back to byte equality when either side is not JSON.
+fn json_semantically_equal(a: &[u8], b: &[u8]) -> bool {
+    if a == b {
+        return true;
+    }
+    match (
+        serde_json::from_slice::<serde_json::Value>(a),
+        serde_json::from_slice::<serde_json::Value>(b),
+    ) {
+        (Ok(va), Ok(vb)) => va == vb,
+        _ => false,
+    }
+}
+
 pub fn copy_host_tree_to_remote(host: &Path, rel_dest: &Path, remote: &dyn Remote) -> Result<()> {
     remote.create_dir_all(rel_dest)?;
     for entry in WalkDir::new(host).min_depth(1).into_iter() {

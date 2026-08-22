@@ -57,6 +57,50 @@ fn set_private(path: &Path) -> Result<()> {
         .map_err(|e| Error::store(format!("chmod {}: {e}", path.display())))
 }
 
+/// Install immutable content-addressed file bytes (release records, mapping,
+/// behavior, and policy snapshots) with create-or-compare semantics.
+///
+/// * If the file does not exist yet, the bytes are written to a temporary file
+///   in the same directory and atomically renamed into place, so a reader never
+///   observes a partially written snapshot.
+/// * If the file already exists, its contents must be byte-identical: an
+///   identical rewrite is an idempotent success, and any attempt to replace the
+///   existing snapshot with different content fails. Snapshots are bound to
+///   release identity by digest; they are never mutable in place.
+///
+/// Callers serialize writes per store with the application-store lock; the
+/// temporary name additionally carries the process id to stay collision-free.
+fn write_atomic_cas(path: &Path, bytes: &[u8]) -> Result<()> {
+    if path.exists() {
+        let existing = std::fs::read(path)
+            .map_err(|e| Error::store(format!("read {}: {e}", path.display())))?;
+        if existing == bytes {
+            return Ok(());
+        }
+        return Err(Error::store(format!(
+            "refusing to replace existing {} with different content",
+            path.display()
+        )));
+    }
+    let mut tmp_name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    let _ = std::fs::remove_file(&tmp);
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| Error::store(format!("create {}: {e}", tmp.display())))?;
+        f.write_all(bytes)
+            .map_err(|e| Error::store(format!("write {}: {e}", tmp.display())))?;
+    }
+    set_private(&tmp)?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| Error::store(format!("rename {}: {e}", path.display())))?;
+    Ok(())
+}
+
 fn ensure_private_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)
         .map_err(|e| Error::store(format!("mkdir {}: {e}", path.display())))?;
@@ -206,8 +250,9 @@ impl LocalStore {
             return Ok(()); // idempotent
         }
         ensure_private_dir(&dir)?;
-        write_json(&dir.join("release.json"), rec)?;
-        Ok(())
+        let bytes = serde_json::to_vec_pretty(rec)
+            .map_err(|e| Error::store(format!("serialize release: {e}")))?;
+        write_atomic_cas(&dir.join("release.json"), &bytes)
     }
 
     pub fn read_release(&self, id: &ReleaseId) -> Result<ReleaseRecord> {
@@ -223,25 +268,20 @@ impl LocalStore {
     ) -> Result<()> {
         let dir = self.release_dir(id);
         ensure_private_dir(&dir)?;
-        let mp = dir.join("mapping.toml");
-        std::fs::write(&mp, mapping_toml)
-            .map_err(|e| Error::store(format!("write mapping: {e}")))?;
-        set_private(&mp)?;
-        let bp = dir.join("behavior.json");
+        write_atomic_cas(&dir.join("mapping.toml"), mapping_toml.as_bytes())?;
         let bytes = serde_json::to_vec_pretty(behavior_json)
             .map_err(|e| Error::store(format!("serialize behavior: {e}")))?;
-        std::fs::write(&bp, bytes).map_err(|e| Error::store(format!("write behavior: {e}")))?;
-        set_private(&bp)?;
+        write_atomic_cas(&dir.join("behavior.json"), &bytes)?;
         // Persist each variant's capacity policy with the release. A historical
         // deployment must resolve it from this snapshot, because the caller's
         // current configuration may have renamed or removed the variant since
-        // the release was created. (Rotation is fleet-wide configuration and is
-        // not part of the snapshot.)
-        let pp = dir.join("policies.json");
+        // the release was created. The snapshot is immutable (create-or-compare
+        // via `write_atomic_cas`) and its canonical digest is part of the
+        // release identity, so it can never be rewritten in place. (Rotation is
+        // target-level configuration and is not part of the snapshot.)
         let bytes = serde_json::to_vec_pretty(policies_json)
             .map_err(|e| Error::store(format!("serialize policies: {e}")))?;
-        std::fs::write(&pp, bytes).map_err(|e| Error::store(format!("write policies: {e}")))?;
-        set_private(&pp)?;
+        write_atomic_cas(&dir.join("policies.json"), &bytes)?;
         Ok(())
     }
 
@@ -468,4 +508,48 @@ pub fn sanitize(name: &str) -> String {
         out.push('_');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_aux_snapshots_are_immutable_and_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let id = ReleaseId::new("rel-sha256-aa".to_string());
+        let behavior = serde_json::json!({});
+        let policies = serde_json::json!({
+            "standard": { "capacity": { "reserve_bytes": 1, "reserve_percent": 0 } }
+        });
+
+        store
+            .write_release_aux(&id, "mapping", &behavior, &policies)
+            .expect("first write creates the snapshot");
+
+        // Identical rewrite is an idempotent success.
+        store
+            .write_release_aux(&id, "mapping", &behavior, &policies)
+            .expect("identical rewrite must succeed");
+
+        // Replacing the policy snapshot with different content fails...
+        let conflicting = serde_json::json!({
+            "standard": { "capacity": { "reserve_bytes": 2, "reserve_percent": 0 } }
+        });
+        let err = store
+            .write_release_aux(&id, "mapping", &behavior, &conflicting)
+            .expect_err("conflicting rewrite must fail");
+        assert!(
+            err.to_string().contains("different content"),
+            "error must name the immutability violation, got: {err}"
+        );
+
+        // ...and the stored snapshot is untouched (no torn write).
+        let read = store
+            .read_release_policies(&id)
+            .unwrap()
+            .expect("snapshot exists");
+        assert_eq!(read["standard"].capacity.reserve_bytes, 1);
+    }
 }

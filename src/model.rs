@@ -188,6 +188,10 @@ pub struct CanonicalReleasePayload {
     pub schema_version: u32,
     pub mapping_sha256: String,
     pub behavior_sha256: String,
+    /// Canonical digest of the name-sorted per-variant capacity-policy
+    /// snapshot. Capacity headroom is part of the release identity: a
+    /// capacity-only configuration change produces a new release.
+    pub policies_sha256: String,
     /// Sorted `variant -> tree digest` bindings.
     pub variants: std::collections::BTreeMap<String, String>,
 }
