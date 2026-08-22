@@ -189,8 +189,8 @@ pub struct VariantPolicy {
 }
 
 /// A per-release variant's own artifact and deployment policy. Each variant is
-/// described by a sibling YAML file inside the release directory selected by
-/// `deploy.toml`.
+/// described by a `*.toml` file directly inside the release directory named by
+/// `deploy.toml` (`releases/<name>/<variant>.toml`).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VariantConfig {
     #[serde(default)]

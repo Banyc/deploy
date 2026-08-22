@@ -715,7 +715,7 @@ protect_deployments = 2
 
 /// Minimal deploy.toml body with a single `standard` variant and
 /// `activation: none`. The variant's policy lives in `standard.toml`.
-fn single_target_yaml(stop_on_failure: bool, batch_size: u32) -> String {
+fn single_target_toml(stop_on_failure: bool, batch_size: u32) -> String {
     format!(
         r#"
 schema_version = 1
@@ -745,7 +745,7 @@ fn setup_single(
 ) -> Config {
     let p = write_string(
         &proj.join("deploy.toml"),
-        &single_target_yaml(stop_on_failure, batch_size),
+        &single_target_toml(stop_on_failure, batch_size),
     );
     write_variant_file(proj, "standard", &single_variant_body(verify_argv));
     let artifacts = proj.join("releases").join("v1").join("artifacts");

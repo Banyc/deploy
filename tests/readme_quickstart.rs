@@ -103,7 +103,7 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
 
     // A dry-run materializes the release's artifacts and builds the full plan:
     // the documented example stays a working configuration, not merely
-    // parseable YAML.
+    // parseable TOML.
     let store = LocalStore::with_base(tmp.path().join("store"))?;
     let remotes_base = tmp.path().join("remotes");
     std::fs::create_dir_all(&remotes_base).unwrap();
