@@ -55,8 +55,9 @@ pub enum PinVariants {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Mapping {
-    /// Source path relative to the project root. `{{ variant }}` is the only
-    /// allowed interpolation variable.
+    /// Source path relative to the release directory (`release.path`), where
+    /// the convention is `artifacts/...`. `{{ variant }}` is the only allowed
+    /// interpolation variable.
     pub from: String,
     /// Artifact-relative destination path.
     pub to: String,

@@ -22,28 +22,66 @@ cargo install --path .
 
 ## Quick start
 
-Your project needs one file, `deploy.yaml`, next to the files you want to ship:
+Your project needs a `deploy.yaml` plus a release directory containing the
+variant files and the artifact sources they map:
 
 ```text
 my-project/
   deploy.yaml
-  build/
-  deployment/
+  releases/
+    v1/
+      standard.yaml        # the "standard" variant: mappings + policies
+      artifacts/
+        build/output/app/server
 ```
 
-A minimal example that deploys two servers via SSH:
+`deploy.yaml` selects the release directory and declares the fleet:
 
+<!-- fixture: tests/fixtures/quickstart/deploy.yaml -->
 ```yaml
 schema_version: 1
 application: example
 remote_root: /srv/deploy/example
 
-variants:
-  standard: {}
+# The release directory holds one generation of the deployment: its variant
+# files and the artifact sources those variants map into the tree.
+release:
+  path: releases/v1
+  variants:
+    standard: standard.yaml
+
+targets:
+  production:
+    rollout:
+      batch_size: 1
+      stop_on_failure: true
+      failure_policy: rollback_changed
+    servers:
+      - id: server-01            # durable ID; never rename it
+        address: server-01.example.com
+        user: deploy
+        variant: standard
+      - id: server-02
+        address: server-02.example.com
+        user: deploy
+        variant: standard
+```
+
+Each variant is a sibling YAML file inside the release directory. It owns its
+artifact mappings and deployment policies (activation, verification, capacity,
+rotation). `from` paths resolve inside the release directory, so artifact
+sources live under `releases/v1/artifacts/`:
+
+<!-- fixture: tests/fixtures/quickstart/releases/v1/standard.yaml -->
+```yaml
+# The `standard` variant: its artifact mappings plus deployment policies.
+# `from` paths resolve inside the release directory selected by `release.path`,
+# so artifact sources live under `releases/v1/artifacts/`.
+description: Standard deployment
 
 artifact:
   mappings:
-    - from: build/output/
+    - from: artifacts/build/output/
       to: app/
       recursive: true
 
@@ -67,29 +105,20 @@ rotation:
     keep_distinct_artifacts: 5
     keep_days: 14
     protect_previous: true
-
-targets:
-  production:
-    rollout:
-      batch_size: 1
-      stop_on_failure: true
-      failure_policy: rollback_changed
-    servers:
-      - id: server-01            # durable ID; never rename it
-        address: server-01.example.com
-        user: deploy
-        variant: standard
-      - id: server-02
-        address: server-02.example.com
-        user: deploy
-        variant: standard
 ```
+
+These examples are checked against real fixture files under
+`tests/fixtures/quickstart/`; a schema change that would invalidate them fails
+the test suite.
 
 Then deploy:
 
 ```sh
 deploy push production
 ```
+
+To cut a new release, copy the release directory (e.g. `releases/v2`), point
+`release.path` at it, and edit its variant files.
 
 ## Commands
 
@@ -126,12 +155,13 @@ Global flag: `--config <path>` to use a different config file than
 
 ## How mappings work
 
-Each mapping copies local files into the artifact tree:
+Each variant file maps local files into the artifact tree:
 
 ```yaml
+# inside releases/v1/standard.yaml
 artifact:
   mappings:
-    - from: build/output/                      # relative to deploy.yaml
+    - from: artifacts/build/output/          # relative to the release directory
       to: app/
       recursive: true
       conflict: replace                        # error | replace | keep
@@ -142,18 +172,22 @@ artifact:
   `conflict`.
 - `{{ variant }}` is the only template variable, so all servers assigned the
   same variant always receive identical content.
-- Sources must stay under the project root; absolute paths and `..` escapes
-  are rejected.
+- `from` paths resolve inside the release directory (`artifacts/` is the
+  convention); absolute paths and `..` escapes are rejected.
 
 ## Variants
 
-Declare any number of variants and assign them per server. A typical use is a
-different build flavor for beefier machines:
+Declare variants as sibling files in the release directory, list them under
+`release.variants`, and assign one per server. A typical use is a different
+build flavor for beefier machines:
 
 ```yaml
-variants:
-  standard: {}
-  high-capacity: {}
+# deploy.yaml
+release:
+  path: releases/v1
+  variants:
+    standard: standard.yaml
+    high-capacity: high-capacity.yaml
 
 targets:
   production:
@@ -166,13 +200,17 @@ targets:
         variant: high-capacity
 ```
 
+Each variant file has the same shape as `standard.yaml` in the Quick start —
+its own mappings, activation, verification, capacity, and rotation.
+
 ## systemd support
 
-Set `adapter: systemd` with `scope: user` to have pushes register, enable,
-and restart unit files that you map into the artifact (e.g.
+Set `adapter: systemd` with `scope: user` in the variant file to have pushes
+register, enable, and restart unit files that you map into the artifact (e.g.
 `integration/systemd/example.service`):
 
 ```yaml
+# inside releases/v1/standard.yaml
 activation:
   adapter: systemd
   scope: user

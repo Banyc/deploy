@@ -1,0 +1,31 @@
+# The `standard` variant: its artifact mappings plus deployment policies.
+# `from` paths resolve inside the release directory selected by `release.path`,
+# so artifact sources live under `releases/v1/artifacts/`.
+description: Standard deployment
+
+artifact:
+  mappings:
+    - from: artifacts/build/output/
+      to: app/
+      recursive: true
+
+activation:
+  adapter: none          # or: systemd (scope: user)
+
+verification:
+  adapter: command
+  argv:
+    - /srv/deploy/example/current/app/server
+    - health-check
+  timeout_seconds: 15
+  attempts: 3
+  interval_seconds: 2
+
+capacity:
+  reserve_bytes: 1073741824   # keep at least 1 GiB free on servers
+
+rotation:
+  per_server:
+    keep_distinct_artifacts: 5
+    keep_days: 14
+    protect_previous: true

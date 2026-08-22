@@ -1,0 +1,3 @@
+#!/bin/sh
+# Placeholder for the real build output shipped by `deploy push`.
+echo "ok"

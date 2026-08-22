@@ -1,0 +1,26 @@
+schema_version: 1
+application: example
+remote_root: /srv/deploy/example
+
+# The release directory holds one generation of the deployment: its variant
+# files and the artifact sources those variants map into the tree.
+release:
+  path: releases/v1
+  variants:
+    standard: standard.yaml
+
+targets:
+  production:
+    rollout:
+      batch_size: 1
+      stop_on_failure: true
+      failure_policy: rollback_changed
+    servers:
+      - id: server-01            # durable ID; never rename it
+        address: server-01.example.com
+        user: deploy
+        variant: standard
+      - id: server-02
+        address: server-02.example.com
+        user: deploy
+        variant: standard
