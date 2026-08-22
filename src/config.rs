@@ -5,11 +5,10 @@
 //! `<project>/releases/<name>/` is discovered as a variant named by its file
 //! stem. Each variant file owns its own artifact mappings and deployment
 //! policies (activation, verification, capacity); artifact sources
-//! conventionally live beneath `releases/<name>/artifacts/`. Rotation is a
-//! fleet-wide retention policy declared once at the top level of `deploy.toml`.
-//! Servers are declared once at the top level; a pod binds one server to one
-//! variant under an ID, and targets contain only their rollout policy and
-//! references to member pods by ID.
+//! conventionally live beneath `releases/<name>/artifacts/`. Servers are
+//! declared once at the top level; a pod binds one server to one variant under
+//! an ID, and targets contain their rollout policy, references to member pods
+//! by ID, and their own retention (`rotation`) policy.
 //!
 //! The same local inputs always produce one target-independent release identity
 //! (see `model::ReleaseDigest`): the name-sorted per-variant mappings, the
@@ -334,6 +333,9 @@ pub struct TargetDef {
     /// The IDs of this target's member pods, in deployment order. Each ID must
     /// reference a top-level `[[pods]]` declaration.
     pub pods: Vec<String>,
+    /// Retention policy applied to this target's servers on every rotation.
+    #[serde(default)]
+    pub rotation: RotationConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -347,10 +349,6 @@ pub struct Config {
     /// Durable retention pins applied on every rotation.
     #[serde(default)]
     pub pins: Vec<Pin>,
-    /// Fleet-wide rotation policy. Declared once at the top level of
-    /// `deploy.toml`; it is not a per-variant setting.
-    #[serde(default)]
-    pub rotation: RotationConfig,
     /// Every deployable server, declared once at the top level of
     /// `deploy.toml`; pods reference these by ID.
     pub servers: Vec<ServerDef>,
@@ -753,12 +751,12 @@ application = "esc"
 remote_root = "/srv/esc"
 release = "v1"
 
-[rotation.per_server]
+[targets.t1.rotation.per_server]
 keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[rotation.fleet]
+[targets.t1.rotation.fleet]
 protect_deployments = 1
 
 [[servers]]
@@ -846,12 +844,12 @@ application = "example"
 remote_root = "/srv/example"
 release = "v1"
 
-[rotation.per_server]
+[targets.t1.rotation.per_server]
 keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[rotation.fleet]
+[targets.t1.rotation.fleet]
 protect_deployments = 2
 
 [[servers]]
@@ -872,8 +870,8 @@ pods = ["p1"]
         std::fs::write(&p, deploy_toml).unwrap();
 
         let cfg = Config::load(&p).expect("config loads with sibling variant files");
-        assert_eq!(cfg.rotation.per_server.keep_distinct_artifacts, 5);
-        assert_eq!(cfg.rotation.fleet.protect_deployments, 2);
+        assert_eq!(cfg.targets["t1"].rotation.per_server.keep_distinct_artifacts, 5);
+        assert_eq!(cfg.targets["t1"].rotation.fleet.protect_deployments, 2);
         let names = cfg.variant_names();
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"standard".to_string()));
@@ -921,12 +919,12 @@ application = "forced"
 remote_root = "/srv/forced"
 release = "{release_value}"
 
-[rotation.per_server]
+[targets.t1.rotation.per_server]
 keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[rotation.fleet]
+[targets.t1.rotation.fleet]
 protect_deployments = 1
 
 [[servers]]

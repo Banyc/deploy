@@ -486,7 +486,15 @@ fn push_inner(
     store.write_status(deployment_id.as_str(), "in_progress")?;
 
     // 8 & 9. Capacity preflight and staging.
-    capacity_preflight(config, store, &assignments, &helpers, op_id, deployment_id)?;
+    capacity_preflight(
+        config,
+        &target.rotation,
+        store,
+        &assignments,
+        &helpers,
+        op_id,
+        deployment_id,
+    )?;
     // Stage every needed tree into operation-unique incoming paths.
     for a in &assignments {
         let _remote = remotes[&a.server_id].as_ref();
@@ -836,13 +844,13 @@ fn push_inner(
     // 17. Per-server rotation under each server's mutation lock. Rotation uses
     // the server's ACTUAL final assignment (read after any compensation), not
     // the desired plan: a compensated server restored its prior variant. The
-    // retention policy is the fleet-wide `rotation` configuration from
+    // retention policy is the target's `rotation` configuration from
     // `deploy.toml`, so it applies uniformly regardless of which variant each
     // server ended up running.
     for sid in &servers_order {
         let helper = &helpers[sid];
         if helper.acquire_lock(op_id.as_str(), false).is_ok() {
-            let retained = compute_retained(helper, &config.rotation, &config.pins, store)?;
+            let retained = compute_retained(helper, &target.rotation, &config.pins, store)?;
             let active_incoming = HashSet::from([deployment_id.as_str().to_string()]);
             helper.rotate(&retained, &active_incoming)?;
             helper.release_lock(op_id.as_str())?;
@@ -1318,6 +1326,7 @@ fn validate_behavior_coverage(
 /// is fleet-wide configuration from `deploy.toml`.
 fn capacity_preflight(
     config: &Config,
+    rotation: &crate::config::RotationConfig,
     store: &LocalStore,
     assignments: &[crate::push::plan::PlannedAssignment],
     helpers: &HashMap<ServerId, RemoteHelper>,
@@ -1345,10 +1354,10 @@ fn capacity_preflight(
         let _ = total;
         let reserve = reserve_bytes.max((avail as f64 * reserve_percent) as u64);
         if need + reserve > avail {
-            // Run protected rotation using the fleet-wide rotation policy, then
+            // Run protected rotation using the target's rotation policy, then
             // recheck capacity directly rather than failing the restore.
             if helper.acquire_lock(op_id.as_str(), false).is_ok() {
-                let retained = compute_retained(helper, &config.rotation, &config.pins, store)?;
+                let retained = compute_retained(helper, rotation, &config.pins, store)?;
                 let active = HashSet::from([deployment_id.as_str().to_string()]);
                 helper.rotate(&retained, &active).ok();
                 helper.release_lock(op_id.as_str()).ok();
@@ -1370,7 +1379,8 @@ fn capacity_preflight(
 /// historical deployments use the capacity policy in force at release time even
 /// when the variant has since been renamed or removed; releases recorded before
 /// policy persistence fall back to the caller's current configuration. Rotation
-/// is not part of this resolution: it is read directly from `config.rotation`.
+/// is not part of this resolution: it belongs to the target and is read from
+/// `target.rotation`.
 fn resolve_variant_policy(
     config: &Config,
     store: &LocalStore,
@@ -1504,12 +1514,12 @@ application = "eng"
 remote_root = "/srv/eng"
 release = "v1"
 
-[rotation.per_server]
+[targets.t1.rotation.per_server]
 keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[rotation.fleet]
+[targets.t1.rotation.fleet]
 protect_deployments = 1
 
 [[servers]]
@@ -1571,12 +1581,12 @@ application = "eng"
 remote_root = "/srv/eng"
 release = "v1"
 
-[rotation.per_server]
+[targets.t1.rotation.per_server]
 keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[rotation.fleet]
+[targets.t1.rotation.fleet]
 protect_deployments = 1
 
 [[servers]]

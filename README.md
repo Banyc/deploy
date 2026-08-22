@@ -50,16 +50,6 @@ remote_root = "/srv/deploy/example"
 # (e.g. `standard`); artifact sources live beneath its `artifacts/` tree.
 release = "v1"
 
-# Fleet-wide retention policy — a top-level setting of deploy.toml, not a
-# per-variant one.
-[rotation.per_server]
-keep_distinct_artifacts = 5   # keep the newest 5 distinct artifacts per server
-keep_days = 14                # ...and everything activated in the last 14 days
-protect_previous = true       # never delete the artifact `current` can roll back to
-
-[rotation.fleet]
-protect_deployments = 2       # keep each server's artifacts of the newest 2 successful deployments
-
 # Servers are declared once; a pod binds one server to one variant, and
 # targets reference pods by ID.
 [[servers]]
@@ -85,12 +75,21 @@ variant = "standard"
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 pods = ["app-1", "app-2"]
+
+# Retention belongs to the target: how aggressively its servers rotate.
+[targets.production.rotation.per_server]
+keep_distinct_artifacts = 5   # keep the newest 5 distinct artifacts per server
+keep_days = 14                # ...and everything activated in the last 14 days
+protect_previous = true       # never delete the artifact `current` can roll back to
+
+[targets.production.rotation.fleet]
+protect_deployments = 2       # keep each server's artifacts of the newest 2 successful deployments
 ```
 
 Each variant is a `*.toml` file directly inside the release directory, named by
 its file stem. It owns its artifact mappings and deployment policies
-(activation, verification, capacity); retention (`rotation`) is declared once
-at the top level of `deploy.toml`. `from` paths resolve inside the release
+(activation, verification, capacity); retention (`rotation`) belongs to each
+target. `from` paths resolve inside the release
 directory, so artifact sources live under `releases/v1/artifacts/`:
 
 <!-- fixture: tests/fixtures/quickstart/releases/v1/standard.toml -->
@@ -98,8 +97,8 @@ directory, so artifact sources live under `releases/v1/artifacts/`:
 # The `standard` variant: its artifact mappings plus deployment policies.
 # `from` paths resolve inside the release directory (`releases/<name>/` — the
 # project structure is forced), so artifact sources live under
-# `releases/v1/artifacts/`. Rotation is not a variant setting: it lives at the
-# top level of deploy.toml.
+# `releases/v1/artifacts/`. Rotation is not a variant setting: it belongs to
+# the target.
 description = "Standard deployment"
 
 [[artifact.mappings]]
@@ -234,8 +233,8 @@ different targets, but within a single target each server appears at most once
 
 Each variant file has the same shape as `standard.toml` in the Quick start —
 its own mappings, activation, verification, and capacity. Retention
-(`rotation`) is shared: it is configured once at the top level of
-`deploy.toml` for the whole fleet.
+(`rotation`) belongs to the target: each target declares how aggressively its
+own servers rotate, so a canary target can retain more than production.
 
 ## systemd support
 

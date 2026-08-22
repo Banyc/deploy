@@ -52,12 +52,12 @@ application = "example"
 remote_root = "/srv/deploy/example"
 release = "v1"
 
-[rotation.per_server]
+[targets.production.rotation.per_server]
 keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[rotation.fleet]
+[targets.production.rotation.fleet]
 protect_deployments = 2
 
 [[servers]]
@@ -734,12 +734,12 @@ application = "example"
 remote_root = "/srv/deploy/example"
 release = "v1"
 
-[rotation.per_server]
+[targets.production.rotation.per_server]
 keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[rotation.fleet]
+[targets.production.rotation.fleet]
 protect_deployments = 2
 
 [[servers]]
@@ -800,12 +800,12 @@ application = "example"
 remote_root = "/srv/deploy/example"
 release = "v1"
 
-[rotation.per_server]
+[targets.production.rotation.per_server]
 keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[rotation.fleet]
+[targets.production.rotation.fleet]
 protect_deployments = 2
 
 [[servers]]
@@ -1305,12 +1305,12 @@ application = "example"
 remote_root = "/srv/deploy/example"
 release = "v1"
 
-[rotation.per_server]
+[targets.production.rotation.per_server]
 keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[rotation.fleet]
+[targets.production.rotation.fleet]
 protect_deployments = 2
 
 [[servers]]

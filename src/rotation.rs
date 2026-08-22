@@ -206,12 +206,12 @@ application = "rot"
 remote_root = "/srv"
 release = "v1"
 
-[rotation.per_server]
+[targets.t1.rotation.per_server]
 keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[rotation.fleet]
+[targets.t1.rotation.fleet]
 protect_deployments = 1
 
 [[servers]]
@@ -279,7 +279,8 @@ pods = ["p1"]
         helper.swap_current(None, "g2", "op").unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let c = cfg();
-        let retained = compute_retained(&helper, &c.rotation, &c.pins, &store).unwrap();
+        let retained =
+            compute_retained(&helper, &c.targets["t1"].rotation, &c.pins, &store).unwrap();
         assert!(retained.contains("t2"), "current tree retained");
         assert!(retained.contains("t1"), "previous tree retained");
     }
