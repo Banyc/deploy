@@ -140,10 +140,11 @@ pub struct DeploymentPlan {
     pub deployment_id: DeploymentId,
     pub target: TargetName,
     pub behavior_sha256: String,
-    /// The frozen activation + verification contract this attempt is bound to.
-    /// Historical and rollback pushes carry the historical contract here rather
-    /// than the caller's current configuration.
-    pub behavior: BehaviorContract,
+    /// The frozen, name-keyed activation + verification contracts this attempt
+    /// is bound to, one per declared variant. Historical and rollback pushes
+    /// carry the historical contracts here rather than the caller's current
+    /// configuration.
+    pub behaviors: BTreeMap<String, BehaviorContract>,
     pub server_ids: Vec<ServerId>,
     pub servers: BTreeMap<ServerId, ServerPlan>,
     pub source: PlanSource,

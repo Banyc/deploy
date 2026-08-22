@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 use crate::model::{BehaviorContract, ReleaseId, ReleaseRecord, TreeDigest, TreeMetadata};
 use crate::records::{AttemptRecord, DeploymentResults, ObservedTarget, ReflogEntry, ServerState};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -232,13 +233,16 @@ impl LocalStore {
         Ok(())
     }
 
-    /// Read the behavior contract (activation + verification) stored alongside a
+    /// Read the name-keyed per-variant behavior contracts stored alongside a
     /// release record.
-    pub fn read_release_behavior(&self, id: &ReleaseId) -> Result<BehaviorContract> {
+    pub fn read_release_behaviors(
+        &self,
+        id: &ReleaseId,
+    ) -> Result<BTreeMap<String, BehaviorContract>> {
         let p = self.release_dir(id).join("behavior.json");
         let bytes = std::fs::read(&p)
             .map_err(|e| Error::store(format!("read behavior {}: {e}", p.display())))?;
-        crate::release::behavior_contract_from_json(&bytes)
+        crate::release::behavior_contracts_from_json(&bytes)
             .map_err(|e| Error::store(format!("parse behavior {}: {e}", p.display())))
     }
 

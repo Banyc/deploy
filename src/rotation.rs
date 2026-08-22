@@ -30,12 +30,16 @@ struct GenRecord {
     deployment_id: String,
 }
 
-/// Compute the set of retained tree digests for one server.
+/// Compute the set of retained tree digests for one server, using the rotation
+/// policy of the server's assigned variant and the durable pins declared in the
+/// release configuration.
 pub fn compute_retained(
     helper: &RemoteHelper,
     config: &Config,
     store: &LocalStore,
+    variant_name: &str,
 ) -> Result<HashSet<String>> {
+    let rotation = &config.variant(variant_name)?.rotation;
     let mut retained: HashSet<String> = HashSet::new();
     let status = helper.status()?;
 
@@ -70,7 +74,7 @@ pub fn compute_retained(
     }
 
     // Prior distinct successful artifact when protect_previous is true.
-    if config.rotation.per_server.protect_previous
+    if rotation.per_server.protect_previous
         && let Some(cur) = &status.current_generation
         && let Ok(a) = helper.read_assignment(cur)
         && let Some(prior) = &a.prior_generation
@@ -93,12 +97,12 @@ pub fn compute_retained(
         distinct.into_iter().collect();
     ordered.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
 
-    let keep_distinct = config.rotation.per_server.keep_distinct_artifacts as usize;
+    let keep_distinct = rotation.per_server.keep_distinct_artifacts as usize;
     for ((_, _, tree), _) in ordered.iter().take(keep_distinct) {
         retained.insert(tree.clone());
     }
 
-    let keep_days = config.rotation.per_server.keep_days;
+    let keep_days = rotation.per_server.keep_days;
     if keep_days > 0 {
         let cutoff = Utc::now() - chrono::Duration::days(keep_days as i64);
         for ((_, _, tree), ts) in &ordered {
@@ -109,7 +113,7 @@ pub fn compute_retained(
     }
 
     // Fleet window: newest `protect_deployments` distinct deployment IDs.
-    let protect_deployments = config.rotation.fleet.protect_deployments as usize;
+    let protect_deployments = rotation.fleet.protect_deployments as usize;
     if protect_deployments > 0 {
         let mut depl: BTreeMap<String, DateTime<Utc>> = BTreeMap::new();
         for g in &gens {
@@ -133,7 +137,7 @@ pub fn compute_retained(
     }
 
     // Durable pins.
-    for pin in &config.pins {
+    for pin in &config.release.pins {
         let rid = ReleaseId::parse(&pin.release);
         let rec = match store.read_release(&rid) {
             Ok(r) => r,
@@ -171,11 +175,12 @@ mod tests {
     use std::path::Path;
 
     fn cfg() -> Config {
-        let yaml = r#"
-schema_version: 1
-application: rot
-remote_root: /srv
-variants: { standard: {} }
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        let variant_yaml = r#"
 artifact: { mappings: [] }
 activation: { adapter: none }
 verification: { adapter: command, argv: ["true"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
@@ -183,6 +188,16 @@ capacity: { reserve_bytes: 0, reserve_percent: 0 }
 rotation:
   per_server: { keep_distinct_artifacts: 1, keep_days: 0, protect_previous: true }
   fleet: { protect_deployments: 1 }
+"#;
+        std::fs::write(release_dir.join("standard.yaml"), variant_yaml).unwrap();
+        let deploy_yaml = r#"
+schema_version: 1
+application: rot
+remote_root: /srv
+release:
+  path: releases/v1
+  variants:
+    standard: standard.yaml
 targets:
   t1:
     rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
@@ -192,9 +207,8 @@ targets:
         user: u
         variant: standard
 "#;
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("deploy.yaml");
-        std::fs::write(&p, yaml).unwrap();
+        let p = project.join("deploy.yaml");
+        std::fs::write(&p, deploy_yaml).unwrap();
         Config::load(&p).unwrap()
     }
 
@@ -243,7 +257,7 @@ targets:
             .unwrap();
         helper.swap_current(None, "g2", "op").unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let retained = compute_retained(&helper, &cfg(), &store).unwrap();
+        let retained = compute_retained(&helper, &cfg(), &store, "standard").unwrap();
         assert!(retained.contains("t2"), "current tree retained");
         assert!(retained.contains("t1"), "previous tree retained");
     }

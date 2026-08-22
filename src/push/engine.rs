@@ -9,7 +9,7 @@
 
 use crate::adapter::systemd::{run_activation, validate_artifact_paths};
 use crate::adapter::verify::run_verification;
-use crate::config::Config;
+use crate::config::{Config, Mapping};
 use crate::error::{Error, Result};
 use crate::history::{self, PushRef};
 use crate::model::{
@@ -145,7 +145,7 @@ fn push_inner(
             };
             crate::mapper::materialize_variant(
                 project_root,
-                &config.artifact.mappings,
+                &config.variant(&v)?.artifact.mappings,
                 &v,
                 &staging,
             )?;
@@ -157,112 +157,102 @@ fn push_inner(
         }
     }
 
-    // 4. Freeze mapping + behavior and generate or reuse the release record.
-    let mapping_sha = crate::release::mapping_digest(&config.artifact.mappings);
-    let behavior_sha = crate::release::behavior_digest(&config.activation, &config.verification);
-    let behavior_json = serde_json::json!({
-        "activation": serde_json::to_value(&config.activation)?,
-        "verification": serde_json::to_value(&config.verification)?,
-    });
-    let mapping_yaml = serde_yaml::to_string(&config.artifact.mappings)
+    // 4. Freeze per-variant mappings + behavior and generate or reuse the
+    // release record. The release identity covers the name-sorted mappings and
+    // behavior contracts of every declared variant plus each variant's tree.
+    let mut variant_mappings: BTreeMap<String, Vec<Mapping>> = BTreeMap::new();
+    let mut variant_behaviors: BTreeMap<String, BehaviorContract> = BTreeMap::new();
+    for v in config.variant_names() {
+        let vcfg = config.variant(&v)?;
+        variant_mappings.insert(v.clone(), vcfg.artifact.mappings.clone());
+        variant_behaviors.insert(
+            v.clone(),
+            BehaviorContract {
+                activation: vcfg.activation.clone(),
+                verification: vcfg.verification.clone(),
+            },
+        );
+    }
+    let mapping_sha = crate::release::variant_mappings_digest(&variant_mappings);
+    let behavior_sha = crate::release::variant_behaviors_digest(&variant_behaviors);
+    let behavior_json = serde_json::to_value(&variant_behaviors)?;
+    let mapping_yaml = serde_yaml::to_string(&variant_mappings)
         .map_err(|e| Error::store(format!("serialize mappings: {e}")))?;
 
-    let local_release_id: ReleaseId = if matches!(pref, PushRef::Head) {
-        let bindings: BTreeMap<VariantName, TreeDigest> = variant_trees
-            .iter()
-            .map(|(k, v)| (VariantName::new(k.clone()), v.clone()))
-            .collect();
-        let rec =
-            crate::release::build_release(&mapping_sha, &behavior_sha, &bindings, project_root);
-        let rid = ReleaseId::new(rec.release_id.clone());
-        if !opts.dry_run {
-            store.write_release(&rec)?;
-            let release_json = serde_json::to_string(&rec)
-                .map_err(|e| Error::store(format!("serialize release: {e}")))?;
-            store.write_release_aux(&rid, &mapping_yaml, &behavior_json)?;
-            // Persist release JSON string for remote publication.
-            REMOTE_RELEASE_JSON.with(|c| {
-                c.borrow_mut()
-                    .insert(rid.clone(), (release_json, behavior_json.to_string()))
-            });
-        }
-        rid
-    } else {
-        // Historical ref: resolve the bound release.
-        let rid = match pref {
-            PushRef::Fleet {
-                target: ft, index, ..
-            } => {
-                let entry = history::resolve_fleet_ref(store, ft, *index)?;
-                entry
-                    .servers
-                    .values()
-                    .next()
-                    .map(|a| a.release.clone())
-                    .unwrap_or_else(|| ReleaseId::new(String::new()))
+    // Historical and rollback pushes carry the bound release's own per-variant
+    // behavior contracts; they never fall back to the caller's current config.
+    let (local_release_id, desired_behaviors): (ReleaseId, BTreeMap<String, BehaviorContract>) =
+        if matches!(pref, PushRef::Head) {
+            let bindings: BTreeMap<VariantName, TreeDigest> = variant_trees
+                .iter()
+                .map(|(k, v)| (VariantName::new(k.clone()), v.clone()))
+                .collect();
+            let rec = crate::release::build_release(
+                &mapping_sha,
+                &behavior_sha,
+                &bindings,
+                project_root,
+            );
+            let rid = ReleaseId::new(rec.release_id.clone());
+            if !opts.dry_run {
+                store.write_release(&rec)?;
+                let release_json = serde_json::to_string(&rec)
+                    .map_err(|e| Error::store(format!("serialize release: {e}")))?;
+                store.write_release_aux(&rid, &mapping_yaml, &behavior_json)?;
+                // Persist release JSON string for remote publication.
+                REMOTE_RELEASE_JSON.with(|c| {
+                    c.borrow_mut()
+                        .insert(rid.clone(), (release_json, behavior_json.to_string()))
+                });
             }
-            PushRef::Release { release, .. } => release.clone(),
-            PushRef::Head => unreachable!(),
-        };
-        if !opts.dry_run {
-            let rec = store.read_release(&rid).map_err(|e| {
-                Error::preflight(format!("historical release {rid} not found: {e}"))
-            })?;
-            let release_json = serde_json::to_string(&rec)
-                .map_err(|e| Error::store(format!("serialize release: {e}")))?;
-            // Restore the historical behavior contract from the release record,
-            // NOT the caller's current configuration. A historical/rollback push
-            // must publish the immutable historical release's own behavior; if
-            // that behavior is unavailable we fail closed (preflight) rather than
+            (rid, variant_behaviors)
+        } else {
+            // Historical ref: resolve the bound release.
+            let rid = match pref {
+                PushRef::Fleet {
+                    target: ft, index, ..
+                } => {
+                    let entry = history::resolve_fleet_ref(store, ft, *index)?;
+                    entry
+                        .servers
+                        .values()
+                        .next()
+                        .map(|a| a.release.clone())
+                        .unwrap_or_else(|| ReleaseId::new(String::new()))
+                }
+                PushRef::Release { release, .. } => release.clone(),
+                PushRef::Head => unreachable!(),
+            };
+            // Restore the historical per-variant behavior contracts from the
+            // release record, NOT the caller's current configuration. If that
+            // behavior is unavailable we fail closed (preflight) rather than
             // silently deploying the caller's current configuration instead.
-            let hist_behavior = store.read_release_behavior(&rid).map_err(|e| {
+            let hist_behaviors = store.read_release_behaviors(&rid).map_err(|e| {
                 Error::preflight(format!(
                     "historical behavior for release {rid} unavailable (immutable behavior required): {e}"
                 ))
             })?;
-            let hist_behavior_json = serde_json::json!({
-                "activation": serde_json::to_value(&hist_behavior.activation)?,
-                "verification": serde_json::to_value(&hist_behavior.verification)?,
-            });
-            REMOTE_RELEASE_JSON.with(|c| {
-                c.borrow_mut()
-                    .insert(rid.clone(), (release_json, hist_behavior_json.to_string()))
-            });
-        }
-        rid
-    };
+            if !opts.dry_run {
+                let rec = store.read_release(&rid).map_err(|e| {
+                    Error::preflight(format!("historical release {rid} not found: {e}"))
+                })?;
+                let release_json = serde_json::to_string(&rec)
+                    .map_err(|e| Error::store(format!("serialize release: {e}")))?;
+                let hist_behaviors_json = serde_json::to_string(&hist_behaviors)
+                    .map_err(|e| Error::store(format!("serialize behavior: {e}")))?;
+                REMOTE_RELEASE_JSON.with(|c| {
+                    c.borrow_mut()
+                        .insert(rid.clone(), (release_json, hist_behaviors_json))
+                });
+            }
+            (rid, hist_behaviors)
+        };
     let _ = &local_release_id;
 
-    // The behavior contract this attempt is bound to. A historical or rollback
-    // push loads the historical contract from the release instead of using the
-    // caller's current configuration. If that immutable historical behavior
-    // cannot be read we fail the push in preflight: falling back to the current
-    // configuration would claim a successful restoration while actually
-    // deploying different service behavior.
-    let desired_behavior: BehaviorContract = if !opts.dry_run {
-        match store.read_release_behavior(&local_release_id) {
-            Ok(b) => b,
-            Err(e) => {
-                if matches!(pref, PushRef::Head) {
-                    // HEAD pushes write the behavior just above, so a read failure
-                    // here is a genuine local-store fault; surface it instead of
-                    // masking it with the current configuration.
-                    return Err(Error::preflight(format!(
-                        "behavior for release {local_release_id} unavailable: {e}"
-                    )));
-                }
-                return Err(Error::preflight(format!(
-                    "historical behavior for release {local_release_id} unavailable (immutable behavior required): {e}"
-                )));
-            }
-        }
-    } else {
-        BehaviorContract {
-            activation: config.activation.clone(),
-            verification: config.verification.clone(),
-        }
-    };
-    let desired_behavior_sha = crate::release::behavior_contract_digest(&desired_behavior);
+    // The behavior digest this attempt is bound to: the frozen, name-keyed set of
+    // every declared variant's activation + verification contract. Historical
+    // and rollback pushes use the historical release's own contracts.
+    let desired_behavior_sha = crate::release::variant_behaviors_digest(&desired_behaviors);
 
     // 5 & 7. Reconcile each server and build the plan, recovering missing local
     // objects from servers that retain them.
@@ -368,7 +358,7 @@ fn push_inner(
         deployment_id: deployment_id.clone(),
         target: TargetName::new(target_name.to_string()),
         behavior_sha256: desired_behavior_sha.clone(),
-        behavior: desired_behavior.clone(),
+        behaviors: desired_behaviors.clone(),
         server_ids: assignments.iter().map(|a| a.server_id.clone()).collect(),
         servers: plan_servers.clone(),
         source,
@@ -446,7 +436,7 @@ fn push_inner(
             let mut verified = true;
             for a in &assignments {
                 let remote = remotes[&a.server_id].as_ref();
-                if run_verification(remote, &plan.behavior.verification).is_err() {
+                if run_verification(remote, &desired_behaviors[a.variant.as_str()].verification).is_err() {
                     verified = false;
                     break;
                 }
@@ -494,10 +484,17 @@ fn push_inner(
         let end = (idx + batch_size).min(servers_order.len());
         for sid in &servers_order[idx..end] {
             let a = assignments.iter().find(|x| &x.server_id == sid).unwrap();
+            // Select the assigned variant's frozen behavior contract (never the
+            // caller's current variant file) before activation/verification.
+            let variant_behavior = desired_behaviors
+                .get(a.variant.as_str())
+                .expect("assigned variant behavior present");
+            let variant_behavior_sha =
+                crate::release::behavior_contract_digest(variant_behavior);
             let outcome = process_server(
                 config,
-                &plan.behavior,
-                &plan.behavior_sha256,
+                variant_behavior,
+                &variant_behavior_sha,
                 store,
                 remotes[sid].as_ref(),
                 &helpers[sid],
@@ -791,7 +788,11 @@ fn push_inner(
     for sid in &servers_order {
         let helper = &helpers[sid];
         if helper.acquire_lock(op_id.as_str(), false).is_ok() {
-            let retained = compute_retained(helper, config, store)?;
+            let variant_name = plan_servers
+                .get(sid)
+                .map(|s| s.variant.as_str())
+                .unwrap_or("");
+            let retained = compute_retained(helper, config, store, variant_name)?;
             let active_incoming = HashSet::from([deployment_id.as_str().to_string()]);
             helper.rotate(&retained, &active_incoming)?;
             helper.release_lock(op_id.as_str())?;
@@ -1126,7 +1127,10 @@ fn compensate_server(
             // not pretend restoration succeeded by substituting a default
             // contract: report the failure so the attempt is marked Degraded.
             let prior_behavior = helper
-                .read_behavior(&prior_assignment.release)
+                .read_behavior(
+                    &ReleaseId::new(prior_assignment.release.clone()),
+                    &prior_assignment.variant,
+                )
                 .map_err(|e| {
                     Error::remote(format!("compensation: prior behavior unavailable: {e}"))
                 })?;
@@ -1226,9 +1230,12 @@ fn capacity_preflight(
     op_id: &OperationId,
     deployment_id: &DeploymentId,
 ) -> Result<()> {
-    let reserve_bytes = config.capacity.reserve_bytes;
-    let reserve_percent = config.capacity.reserve_percent as f64 / 100.0;
     for a in assignments {
+        // Capacity headroom is per-variant policy; derive it from the assigned
+        // variant's configuration.
+        let capacity = config.variant(a.variant.as_str())?.capacity.clone();
+        let reserve_bytes = capacity.reserve_bytes;
+        let reserve_percent = capacity.reserve_percent as f64 / 100.0;
         let helper = helpers.get(&a.server_id).expect("helper present");
         if helper.tree_exists(a.tree.as_str()) {
             continue;
@@ -1246,7 +1253,8 @@ fn capacity_preflight(
         if need + reserve > avail {
             // Run protected rotation, then recheck.
             if helper.acquire_lock(op_id.as_str(), false).is_ok() {
-                let retained = compute_retained(helper, config, store)?;
+                let retained =
+                    compute_retained(helper, config, store, a.variant.as_str())?;
                 let active = HashSet::from([deployment_id.as_str().to_string()]);
                 helper.rotate(&retained, &active).ok();
                 helper.release_lock(op_id.as_str()).ok();
@@ -1350,11 +1358,7 @@ mod tests {
     use crate::remote::transport::LocalTransport;
     use std::path::{Path, PathBuf};
 
-    const NONE_YAML: &str = r#"
-schema_version: 1
-application: eng
-remote_root: /srv/eng
-variants: { standard: {} }
+    const NONE_VARIANT: &str = r#"
 artifact:
   mappings:
     - from: build/output/
@@ -1367,6 +1371,16 @@ activation: { adapter: none }
 verification: { adapter: command, argv: ["true"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
 capacity: { reserve_bytes: 0, reserve_percent: 0 }
 rotation: { per_server: { keep_distinct_artifacts: 1, keep_days: 0, protect_previous: true }, fleet: { protect_deployments: 1 } }
+"#;
+
+    const NONE_YAML: &str = r#"
+schema_version: 1
+application: eng
+remote_root: /srv/eng
+release:
+  path: releases/v1
+  variants:
+    standard: standard.yaml
 targets:
   t1:
     rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
@@ -1377,11 +1391,7 @@ targets:
         variant: standard
 "#;
 
-    const SYSTEMD_YAML: &str = r#"
-schema_version: 1
-application: eng
-remote_root: /srv/eng
-variants: { standard: {} }
+    const SYSTEMD_VARIANT: &str = r#"
 artifact:
   mappings:
     - from: build/output/
@@ -1404,6 +1414,16 @@ activation:
 verification: { adapter: command, argv: ["true"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
 capacity: { reserve_bytes: 0, reserve_percent: 0 }
 rotation: { per_server: { keep_distinct_artifacts: 1, keep_days: 0, protect_previous: true }, fleet: { protect_deployments: 1 } }
+"#;
+
+    const SYSTEMD_YAML: &str = r#"
+schema_version: 1
+application: eng
+remote_root: /srv/eng
+release:
+  path: releases/v1
+  variants:
+    standard: standard.yaml
 targets:
   t1:
     rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
@@ -1424,12 +1444,15 @@ targets:
     }
 
     impl Harness {
-        fn new(yaml: &str, files: &[(&str, &str)]) -> Harness {
+        fn new(deploy_yaml: &str, variant_yaml: &str, files: &[(&str, &str)]) -> Harness {
             let dir = tempfile::tempdir().unwrap();
             let project = dir.path().join("proj");
             std::fs::create_dir_all(&project).unwrap();
+            let release_dir = project.join("releases").join("v1");
+            std::fs::create_dir_all(&release_dir).unwrap();
+            std::fs::write(release_dir.join("standard.yaml"), variant_yaml).unwrap();
             let cfg_path = project.join("deploy.yaml");
-            std::fs::write(&cfg_path, yaml).unwrap();
+            std::fs::write(&cfg_path, deploy_yaml).unwrap();
             for (p, c) in files {
                 let fp = project.join(p);
                 std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
@@ -1438,10 +1461,11 @@ targets:
             let config = Config::load(&cfg_path).unwrap();
             let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
+            let vcfg = config.variant("standard").unwrap();
             let staging = store.staging_dir().join("standard");
             crate::mapper::materialize_variant(
                 &project,
-                &config.artifact.mappings,
+                &vcfg.artifact.mappings,
                 "standard",
                 &staging,
             )
@@ -1464,9 +1488,10 @@ targets:
         }
 
         fn behave(&self) -> BehaviorContract {
+            let v = self.config.variant("standard").unwrap();
             BehaviorContract {
-                activation: self.config.activation.clone(),
-                verification: self.config.verification.clone(),
+                activation: v.activation.clone(),
+                verification: v.verification.clone(),
             }
         }
 
@@ -1512,6 +1537,7 @@ targets:
     fn clean_publish_activates() {
         let h = Harness::new(
             NONE_YAML,
+            NONE_VARIANT,
             &[
                 ("build/output/app/server", "v1"),
                 ("deployment/common/README", "common"),
@@ -1527,6 +1553,7 @@ targets:
     fn corrupted_existing_remote_object_fails_integrity() {
         let h = Harness::new(
             NONE_YAML,
+            NONE_VARIANT,
             &[
                 ("build/output/app/server", "v1"),
                 ("deployment/common/README", "common"),
@@ -1558,6 +1585,7 @@ targets:
     fn corrupted_upload_fails_integrity() {
         let h = Harness::new(
             NONE_YAML,
+            NONE_VARIANT,
             &[
                 ("build/output/app/server", "v1"),
                 ("deployment/common/README", "common"),
@@ -1577,6 +1605,7 @@ targets:
         // The unit file is NOT present in the tree.
         let h = Harness::new(
             SYSTEMD_YAML,
+            SYSTEMD_VARIANT,
             &[
                 ("build/output/app/server", "v1"),
                 ("deployment/common/README", "common"),
@@ -1594,6 +1623,7 @@ targets:
         // The artifact path exists but is a DIRECTORY, not a regular file.
         let h = Harness::new(
             SYSTEMD_YAML,
+            SYSTEMD_VARIANT,
             &[
                 ("build/output/app/server", "v1"),
                 ("deployment/common/README", "common"),

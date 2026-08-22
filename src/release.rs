@@ -42,6 +42,31 @@ pub fn behavior_contract_from_json(
     serde_json::from_slice(bytes)
 }
 
+/// Canonical digest over name-sorted per-variant mapping sets. Two releases
+/// share this digest only when every declared variant materializes the same
+/// mappings.
+pub fn variant_mappings_digest(mappings: &BTreeMap<String, Vec<Mapping>>) -> String {
+    let value = serde_json::to_vec(mappings).expect("variant mappings serialize");
+    sha256_bytes(&value)
+}
+
+/// Canonical digest over name-sorted per-variant behavior contracts. Two
+/// releases share this digest only when every declared variant's activation and
+/// verification behavior is identical.
+pub fn variant_behaviors_digest(
+    contracts: &BTreeMap<String, BehaviorContract>,
+) -> String {
+    let value = serde_json::to_vec(contracts).expect("variant behaviors serialize");
+    sha256_bytes(&value)
+}
+
+/// Reconstruct the name-keyed per-variant behavior map from serialized JSON.
+pub fn behavior_contracts_from_json(
+    bytes: &[u8],
+) -> std::result::Result<BTreeMap<String, BehaviorContract>, serde_json::Error> {
+    serde_json::from_slice(bytes)
+}
+
 /// Derive the release digest from the canonical payload.
 pub fn release_digest(
     mapping_sha: &str,

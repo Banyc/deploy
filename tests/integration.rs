@@ -10,13 +10,10 @@ use deploy::remote::transport::{LocalTransport, Remote};
 use deploy::store::local::LocalStore;
 use std::path::Path;
 
-const CONFIG: &str = r#"
-schema_version: 1
-application: example
-remote_root: /srv/deploy/example
-variants:
-  standard: {}
-  high-capacity: {}
+/// Shared per-variant policy body. It uses only `{{ variant }}` interpolation,
+/// so the same file content describes both the `standard` and `high-capacity`
+/// variants; their trees differ via `deployment/variants/<variant>/`.
+const VARIANT_BODY: &str = r#"
 artifact:
   mappings:
     - from: build/output/
@@ -48,6 +45,17 @@ rotation:
     protect_previous: true
   fleet:
     protect_deployments: 2
+"#;
+
+const CONFIG: &str = r#"
+schema_version: 1
+application: example
+remote_root: /srv/deploy/example
+release:
+  path: releases/v1
+  variants:
+    standard: standard.yaml
+    high-capacity: high-capacity.yaml
 targets:
   production:
     rollout:
@@ -76,8 +84,17 @@ fn write_file(path: &Path, content: &str) {
     std::fs::write(path, content).unwrap();
 }
 
+/// Write a sibling variant YAML file into the release directory selected by the
+/// deploy config (`releases/v1`).
+fn write_variant_file(proj: &Path, name: &str, body: &str) {
+    let release_dir = proj.join("releases").join("v1");
+    write_file(&release_dir.join(format!("{name}.yaml")), body);
+}
+
 fn setup(proj: &Path) -> (Config, std::path::PathBuf) {
     write_file(&proj.join("deploy.yaml"), CONFIG);
+    write_variant_file(proj, "standard", VARIANT_BODY);
+    write_variant_file(proj, "high-capacity", VARIANT_BODY);
     write_file(&proj.join("build/output/app/server"), "server-v1\n");
     write_file(&proj.join("deployment/common/README"), "common\n");
     write_file(&proj.join("deployment/variants/standard/extra"), "std\n");
@@ -507,15 +524,10 @@ impl Remote for FaultRemote {
     }
 }
 
-/// Minimal target with a single variant and `activation: none`.
-fn single_target_yaml(verify_argv: &str, stop_on_failure: bool, batch_size: u32) -> String {
+/// Per-variant policy body for the single-variant helpers.
+fn single_variant_body(verify_argv: &str) -> String {
     format!(
         r#"
-schema_version: 1
-application: example
-remote_root: /srv/deploy/example
-variants:
-  standard: {{}}
 artifact:
   mappings:
     - from: build/output/
@@ -542,6 +554,22 @@ rotation:
     protect_previous: true
   fleet:
     protect_deployments: 2
+"#
+    )
+}
+
+/// Minimal deploy.yaml body with a single `standard` variant and
+/// `activation: none`. The variant's policy lives in `standard.yaml`.
+fn single_target_yaml(stop_on_failure: bool, batch_size: u32) -> String {
+    format!(
+        r#"
+schema_version: 1
+application: example
+remote_root: /srv/deploy/example
+release:
+  path: releases/v1
+  variants:
+    standard: standard.yaml
 targets:
   production:
     rollout:
@@ -555,6 +583,24 @@ targets:
         variant: standard
 "#
     )
+}
+
+/// Build the single-variant project (deploy.yaml + `standard.yaml` variant
+/// file + source inputs) and load its config.
+fn setup_single(
+    proj: &Path,
+    verify_argv: &str,
+    stop_on_failure: bool,
+    batch_size: u32,
+) -> Config {
+    let p = write_string(
+        &proj.join("deploy.yaml"),
+        &single_target_yaml(stop_on_failure, batch_size),
+    );
+    write_variant_file(proj, "standard", &single_variant_body(verify_argv));
+    write_file(&proj.join("build/output/app/server"), "v1\n");
+    write_file(&proj.join("deployment/common/README"), "common\n");
+    Config::load(&p).unwrap()
 }
 
 // ---- Finding 1: production CLI must target the configured remote endpoint --
@@ -571,22 +617,16 @@ fn cli_reaches_configured_endpoint() -> Result<()> {
     std::fs::create_dir_all(&endpoints).unwrap();
 
     // Addresses are explicit `local://` paths: the configured endpoint, NOT the
-    // application store's `remotes/` directory.
+    // application store's `remotes/` directory. The `standard` variant's policy
+    // lives in its own sibling YAML file inside the release directory.
     let config_yaml = r#"
 schema_version: 1
 application: example
 remote_root: /srv/deploy/example
-variants:
-  standard: {}
-artifact:
-  mappings:
-    - from: build/output/
-      to: app/
-      recursive: true
-activation: { adapter: none }
-verification: { adapter: command, argv: ["true"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
-capacity: { reserve_bytes: 0, reserve_percent: 0 }
-rotation: { per_server: { keep_distinct_artifacts: 5, keep_days: 14, protect_previous: true }, fleet: { protect_deployments: 2 } }
+release:
+  path: releases/v1
+  variants:
+    standard: standard.yaml
 targets:
   production:
     rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
@@ -596,7 +636,19 @@ targets:
         user: deploy
         variant: standard
 "#;
+    let variant_yaml = r#"
+artifact:
+  mappings:
+    - from: build/output/
+      to: app/
+      recursive: true
+activation: { adapter: none }
+verification: { adapter: command, argv: ["true"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
+capacity: { reserve_bytes: 0, reserve_percent: 0 }
+rotation: { per_server: { keep_distinct_artifacts: 5, keep_days: 14, protect_previous: true }, fleet: { protect_deployments: 2 } }
+"#;
     write_file(&proj.join("deploy.yaml"), config_yaml);
+    write_variant_file(&proj, "standard", variant_yaml);
     write_file(&proj.join("build/output/app/server"), "v1\n");
     write_file(&proj.join("deployment/common/README"), "common\n");
 
@@ -652,12 +704,7 @@ fn dry_run_does_not_mutate() -> Result<()> {
     let remote_base = tmp.path().join("remote");
     std::fs::create_dir_all(&remote_base).unwrap();
 
-    let config = Config::load(&write_string(
-        &proj.join("deploy.yaml"),
-        &single_target_yaml("true", true, 1),
-    ))?;
-    write_file(&proj.join("build/output/app/server"), "v1\n");
-    write_file(&proj.join("deployment/common/README"), "common\n");
+    let config = setup_single(&proj, "true", true, 1);
 
     let mutations = Arc::new(AtomicUsize::new(0));
     let m = mutations.clone();
@@ -720,20 +767,14 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
     std::fs::create_dir_all(&remotes_base).unwrap();
 
     // Behavior A: verification succeeds.
-    let config_a = Config::load(&write_string(
-        &proj.join("deploy.yaml"),
-        &single_target_yaml("true", true, 1),
-    ))?;
-    write_file(&proj.join("build/output/app/server"), "v1\n");
-    write_file(&proj.join("deployment/common/README"), "common\n");
-    let a_digest = release::behavior_digest(&config_a.activation, &config_a.verification);
+    let config_a = setup_single(&proj, "true", true, 1);
+    let a_var = config_a.variant("standard").expect("standard variant present");
+    let a_digest = release::behavior_digest(&a_var.activation, &a_var.verification);
     let b_digest = {
         // Behavior B: verification command differs (so its digest differs).
-        let config_b = Config::load(&write_string(
-            &proj.join("deploy.yaml"),
-            &single_target_yaml("false", true, 1),
-        ))?;
-        release::behavior_digest(&config_b.activation, &config_b.verification)
+        let config_b = setup_single(&proj, "false", true, 1);
+        let b_var = config_b.variant("standard").expect("standard variant present");
+        release::behavior_digest(&b_var.activation, &b_var.verification)
     };
     assert_ne!(a_digest, b_digest, "behaviors must differ");
 
@@ -757,10 +798,7 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
 
     // Change the configuration to behavior B, then roll back to f0.
-    let config_b = Config::load(&write_string(
-        &proj.join("deploy.yaml"),
-        &single_target_yaml("false", true, 1),
-    ))?;
+    let config_b = setup_single(&proj, "false", true, 1);
     let rrb = push(
         &config_b,
         &proj.join("deploy.yaml"),
@@ -818,7 +856,7 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
         .join("behavior.json");
     let behavior: serde_json::Value =
         serde_json::from_slice(&remote.read(&behavior_path).unwrap()).unwrap();
-    let verify_argv = behavior["verification"]["argv"]
+    let verify_argv = behavior["standard"]["verification"]["argv"]
         .as_array()
         .unwrap()
         .iter()
@@ -846,12 +884,7 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
     std::fs::create_dir_all(&remotes_base).unwrap();
 
     // Deploy behavior A (verification succeeds) as f0.
-    let config_a = Config::load(&write_string(
-        &proj.join("deploy.yaml"),
-        &single_target_yaml("true", true, 1),
-    ))?;
-    write_file(&proj.join("build/output/app/server"), "v1\n");
-    write_file(&proj.join("deployment/common/README"), "common\n");
+    let config_a = setup_single(&proj, "true", true, 1);
 
     let rb = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
@@ -898,10 +931,7 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
     std::fs::remove_file(&behavior_path)
         .map_err(|e| deploy::error::Error::store(format!("rm {e}")))?;
 
-    let config_b = Config::load(&write_string(
-        &proj.join("deploy.yaml"),
-        &single_target_yaml("false", true, 1),
-    ))?;
+    let config_b = setup_single(&proj, "false", true, 1);
     let rrb = push(
         &config_b,
         &proj.join("deploy.yaml"),
@@ -937,17 +967,10 @@ fn stop_on_failure_records_all_servers() -> Result<()> {
 schema_version: 1
 application: example
 remote_root: /srv/deploy/example
-variants:
-  standard: {}
-artifact:
-  mappings:
-    - from: build/output/
-      to: app/
-      recursive: true
-activation: { adapter: none }
-verification: { adapter: command, argv: ["false"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
-capacity: { reserve_bytes: 0, reserve_percent: 0 }
-rotation: { per_server: { keep_distinct_artifacts: 5, keep_days: 14, protect_previous: true }, fleet: { protect_deployments: 2 } }
+release:
+  path: releases/v1
+  variants:
+    standard: standard.yaml
 targets:
   production:
     rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
@@ -965,7 +988,19 @@ targets:
         user: u
         variant: standard
 "#;
+    let variant_yaml = r#"
+artifact:
+  mappings:
+    - from: build/output/
+      to: app/
+      recursive: true
+activation: { adapter: none }
+verification: { adapter: command, argv: ["false"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
+capacity: { reserve_bytes: 0, reserve_percent: 0 }
+rotation: { per_server: { keep_distinct_artifacts: 5, keep_days: 14, protect_previous: true }, fleet: { protect_deployments: 2 } }
+"#;
     write_file(&proj.join("deploy.yaml"), yaml);
+    write_variant_file(&proj, "standard", variant_yaml);
     write_file(&proj.join("build/output/app/server"), "v1\n");
 
     let config = Config::load(&proj.join("deploy.yaml"))?;
@@ -1037,12 +1072,7 @@ fn post_lock_failure_releases_lock_and_records() -> Result<()> {
     let remotes_base = tmp.path().join("remotes");
     std::fs::create_dir_all(&remotes_base).unwrap();
 
-    let config = Config::load(&write_string(
-        &proj.join("deploy.yaml"),
-        &single_target_yaml("true", true, 1),
-    ))?;
-    write_file(&proj.join("build/output/app/server"), "v1\n");
-    write_file(&proj.join("deployment/common/README"), "common\n");
+    let config = setup_single(&proj, "true", true, 1);
 
     // Fail the rename that performs the tree publish, AFTER the mutation lock is
     // acquired.
@@ -1108,12 +1138,7 @@ fn committed_txn_write_failure_pends_commit() -> Result<()> {
     let remotes_base = tmp.path().join("remotes");
     std::fs::create_dir_all(&remotes_base).unwrap();
 
-    let config = Config::load(&write_string(
-        &proj.join("deploy.yaml"),
-        &single_target_yaml("true", true, 1),
-    ))?;
-    write_file(&proj.join("build/output/app/server"), "v1\n");
-    write_file(&proj.join("deployment/common/README"), "common\n");
+    let config = setup_single(&proj, "true", true, 1);
 
     let attempted = Arc::new(AtomicUsize::new(0));
     let at = attempted.clone();
@@ -1171,12 +1196,7 @@ fn commit_marker_write_failure_pends_commit() -> Result<()> {
     let remotes_base = tmp.path().join("remotes");
     std::fs::create_dir_all(&remotes_base).unwrap();
 
-    let config = Config::load(&write_string(
-        &proj.join("deploy.yaml"),
-        &single_target_yaml("true", true, 1),
-    ))?;
-    write_file(&proj.join("build/output/app/server"), "v1\n");
-    write_file(&proj.join("deployment/common/README"), "common\n");
+    let config = setup_single(&proj, "true", true, 1);
 
     let attempted = Arc::new(AtomicUsize::new(0));
     let at = attempted.clone();

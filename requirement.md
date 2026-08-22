@@ -36,7 +36,7 @@ Deployment, operation, and generation IDs are opaque collision-resistant IDs (UU
 
 Tree objects contain no release- or variant-specific metadata, so identical trees can be deduplicated safely. Release records bind variants to trees.
 
-The canonical release ID is derived from a versioned canonical identity payload containing the frozen mapping digest, all declared `variant → tree digest` bindings, and the activation and verification contract digest. It explicitly excludes the resulting release ID, creation time, display name, and provenance, avoiding a circular hash. Its stored form is `pel-sha256-full-`
+The canonical release ID is derived from a versioned canonical identity payload covering the name-sorted per-variant mapping digests, all declared `variant → tree digest` bindings, and the name-sorted per-variant activation and verification behavior-contract digest. It explicitly excludes the resulting release ID, creation time, display name, and provenance, avoiding a circular hash. Two variants may share tree bytes while still requiring different activation and verification behavior, so behavior is captured per variant rather than once per release. Its stored form is `pel-sha256-full-`
 release-digest`; the CLI may display and accept an unambiguous digest prefix. Git revision and creation time are provenance only because mapped inputs can include generated or untracked files.
 
 Mapping and behavior digests are computed from versioned canonical data after schema defaults, path normalization, and validation, not from YAML whitespace, comments, or key order. The original configuration remains available as provenance, while `behavior.json` records the canonical behavior contract.
@@ -96,9 +96,16 @@ Example `deploy.yaml`:
 schema_version: 1
 application: example
 remote_root: /srv/deploy/example
-variants:
-  standard: {}
-  high-capacity: {}
+release:
+  # Directory (relative to this file) holding the sibling variant YAML files.
+  path: releases/v1
+  variants:
+    standard: standard.yaml
+    high-capacity: high-capacity.yaml
+  pins:
+    - release: rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1
+      variants: all
+      reason: known-good recovery release
 targets:
   production:
     rollout:
@@ -118,52 +125,57 @@ targets:
         address: server-03.example.com
         user: deploy
         variant: high-capacity
-    artifact:
-      mappings:
-        - from: build/output/
-          to: app/
-          recursive: true
-        - from: deployment/common/
-          to: app/
-          recursive: true
-        - from: "deployment/variants/{{ variant }}/..."
-          to: app/
-          recursive: true
-          conflict: replace
-        - from: deployment/systemd/example.service
-          to: integration/systemd/example.service
-          mode: "0644"
-    activation:
-      adapter: systemd
-      scope: user
-      reconcile_managed_units: true
-      units:
-        - name: example.service
-          artifact_path: integration/systemd/example.service
-          enable: true
-          restart: true
-    verification:
-      adapter: command
-      argv:
-        - /srv/deploy/example/current/app/server
-        - health-check
-      timeout_seconds: 15
-      attempts: 3
-      interval_seconds: 2
-    capacity:
-      reserve_bytes: 1073741824
-      reserve_percent: 5
-    rotation:
-      per_server:
-        keep_distinct_artifacts: 5
-        keep_days: 14
-        protect_previous: true
-      fleet:
-        protect_deployments:
-    pins:
-      - release: rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1
-        variants: all
-        reason: known-good recovery release
+```
+
+Each declared variant is described by its own sibling YAML file inside the
+release directory (e.g. `releases/v1/standard.yaml`). A variant file owns its
+artifact mappings and its deployment policies:
+
+```yaml
+# releases/v1/standard.yaml
+description: Standard deployment
+artifact:
+  mappings:
+    - from: build/output/
+      to: app/
+      recursive: true
+    - from: deployment/common/
+      to: app/
+      recursive: true
+    - from: "deployment/variants/{{ variant }}/"
+      to: app/
+      recursive: true
+      conflict: replace
+    - from: deployment/systemd/example.service
+      to: integration/systemd/example.service
+      mode: "0644"
+activation:
+  adapter: systemd
+  scope: user
+  reconcile_managed_units: true
+  units:
+    - name: example.service
+      artifact_path: integration/systemd/example.service
+      enable: true
+      restart: true
+verification:
+  adapter: command
+  argv:
+    - /srv/deploy/example/current/app/server
+    - health-check
+  timeout_seconds: 15
+  attempts: 3
+  interval_seconds: 2
+capacity:
+  reserve_bytes: 1073741824
+  reserve_percent: 5
+rotation:
+  per_server:
+    keep_distinct_artifacts: 5
+    keep_days: 14
+    protect_previous: true
+  fleet:
+    protect_deployments: 2
 ```
 
 Server IDs are durable identities and cannot be inferred from mutable network addresses. Deployment history is keyed by server ID. A rollback connects using the server's current address and verifies its configured SSH host identity; it never silently connects to a historical address.

@@ -6,7 +6,7 @@
 //! keyed by an operation ID and is idempotent.
 
 use crate::error::{Error, Result};
-use crate::model::BehaviorContract;
+use crate::model::{BehaviorContract, ReleaseId};
 use crate::remote::transport::Remote;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -121,12 +121,21 @@ impl<'a> RemoteHelper<'a> {
         serde_json::from_slice(&data).map_err(|e| Error::remote(format!("parse assignment: {e}")))
     }
 
-    /// Read the behavior contract stored for a release.
-    pub fn read_behavior(&self, release_id: &str) -> Result<BehaviorContract> {
-        let p = Path::new("releases").join(release_id).join("behavior.json");
+    /// Read the behavior contract for a specific variant of a release. The
+    /// release's `behavior.json` stores one contract per declared variant; the
+    /// assigned variant is selected explicitly rather than falling back to the
+    /// caller's current configuration.
+    pub fn read_behavior(&self, release_id: &ReleaseId, variant: &str) -> Result<BehaviorContract> {
+        let p = Path::new("releases")
+            .join(release_id.as_str())
+            .join("behavior.json");
         let data = self.remote.read(&p)?;
-        crate::release::behavior_contract_from_json(&data)
-            .map_err(|e| Error::remote(format!("parse behavior for {release_id}: {e}")))
+        let behaviors = crate::release::behavior_contracts_from_json(&data)
+            .map_err(|e| Error::remote(format!("parse behavior for {release_id}: {e}")))?;
+        behaviors
+            .get(variant)
+            .cloned()
+            .ok_or_else(|| Error::remote(format!("release {release_id} has no behavior for variant '{variant}'")))
     }
 
     /// Acquire the server mutation lock. `force` overrides a held lock (used

@@ -1,10 +1,16 @@
 //! Declarative deployment configuration (`deploy.yaml`, schema version 1).
 //!
-//! Mapping, activation, verification, capacity, rotation, and pins are project
-//! level so that the same local inputs always produce one target-independent
-//! release identity (see `model::ReleaseDigest`). Targets contain only their
-//! rollout policy and their stable server membership with per-server variant
-//! assignment.
+//! `deploy.yaml` selects a release directory (`release.path`) relative to the
+//! directory containing `deploy.yaml`. That release directory holds one sibling
+//! variant YAML file per declared variant; each variant file owns its own
+//! artifact mappings and deployment policies (activation, verification,
+//! capacity, rotation). Targets contain only their rollout policy and their
+//! stable server membership with per-server variant assignment.
+//!
+//! The same local inputs always produce one target-independent release identity
+//! (see `model::ReleaseDigest`): the name-sorted per-variant mappings, the
+//! name-sorted per-variant behavior contracts, and every declared variant's
+//! tree binding.
 
 use crate::error::{Error, Result};
 use crate::model::SCHEMA_VERSION;
@@ -45,13 +51,6 @@ pub enum PinVariants {
     #[default]
     All,
     Some(Vec<String>),
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct VariantDef {
-    /// Reserved for future per-variant mapping overrides.
-    #[serde(default)]
-    pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -172,12 +171,38 @@ pub struct RotationConfig {
     pub fleet: FleetRotation,
 }
 
+/// A per-release variant's own artifact and deployment policy. Each variant is
+/// described by a sibling YAML file inside the release directory selected by
+/// `deploy.yaml`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VariantConfig {
+    #[serde(default)]
+    pub description: Option<String>,
+    pub artifact: ArtifactConfig,
+    #[serde(default)]
+    pub activation: ActivationConfig,
+    pub verification: VerificationConfig,
+    #[serde(default)]
+    pub capacity: CapacityConfig,
+    #[serde(default)]
+    pub rotation: RotationConfig,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Pin {
     pub release: String,
     #[serde(default)]
     pub variants: PinVariants,
     pub reason: String,
+}
+
+/// Selects a release directory plus its sibling variant files.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseConfig {
+    pub path: PathBuf,
+    pub variants: BTreeMap<String, PathBuf>,
+    #[serde(default)]
+    pub pins: Vec<Pin>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -234,29 +259,22 @@ pub struct Config {
     pub schema_version: u32,
     pub application: String,
     pub remote_root: PathBuf,
-    #[serde(default)]
-    pub variants: BTreeMap<String, VariantDef>,
-    pub artifact: ArtifactConfig,
-    #[serde(default)]
-    pub activation: ActivationConfig,
-    pub verification: VerificationConfig,
-    #[serde(default)]
-    pub capacity: CapacityConfig,
-    #[serde(default)]
-    pub rotation: RotationConfig,
-    #[serde(default)]
-    pub pins: Vec<Pin>,
+    pub release: ReleaseConfig,
     pub targets: BTreeMap<String, TargetDef>,
+    #[serde(skip)]
+    variants: BTreeMap<String, VariantConfig>,
 }
 
 impl Config {
     /// Load and validate a configuration from a `deploy.yaml` path. The project
-    /// root is the directory containing the file.
+    /// root is the directory containing the file. Variant files are resolved
+    /// from the release directory selected by `release.path`.
     pub fn load(path: &Path) -> Result<Config> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| Error::config(format!("reading {}: {e}", path.display())))?;
-        let cfg: Config = serde_yaml::from_str(&text)
+        let mut cfg: Config = serde_yaml::from_str(&text)
             .map_err(|e| Error::config(format!("parsing deploy.yaml: {e}")))?;
+        cfg.load_variants(path)?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -268,6 +286,11 @@ impl Config {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
+    /// Absolute release directory: the project root joined with `release.path`.
+    pub fn release_root(&self, config_path: &Path) -> PathBuf {
+        self.project_root(config_path).join(&self.release.path)
+    }
+
     /// Validate the configuration per schema version 1 rules.
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != SCHEMA_VERSION {
@@ -277,28 +300,19 @@ impl Config {
             )));
         }
         if self.variants.is_empty() {
-            return Err(Error::config("at least one variant must be declared"));
+            return Err(Error::config("at least one release variant must be declared"));
         }
         if self.targets.is_empty() {
             return Err(Error::config("at least one target must be declared"));
         }
-        if self.activation.adapter != "none" && self.activation.adapter != "systemd" {
-            return Err(Error::config(format!(
-                "unknown activation adapter '{}'",
-                self.activation.adapter
-            )));
-        }
-        if self.verification.adapter != "command" {
-            return Err(Error::config(format!(
-                "unsupported verification adapter '{}'",
-                self.verification.adapter
-            )));
-        }
-        if self.verification.argv.is_empty() {
-            return Err(Error::config("verification argv must not be empty"));
+
+        // Each loaded variant carries its own artifact/activation/verification/
+        // capacity/rotation policy; validate each one.
+        for (name, variant) in &self.variants {
+            self.validate_variant(name, variant)?;
         }
 
-        // Variant names must be known.
+        // Variant names must be known; server IDs unique; SSH identity well-formed.
         let mut all_ids = std::collections::HashSet::new();
         for (tname, target) in &self.targets {
             if target.servers.is_empty() {
@@ -338,34 +352,153 @@ impl Config {
                     )));
                 }
             }
-            if self.activation.adapter == "systemd" && self.activation.units.is_empty() {
-                return Err(Error::config(
-                    "systemd activation requires at least one unit",
-                ));
-            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate a single loaded variant's artifact mappings and deployment
+    /// policies, prefixing every error with the variant name.
+    fn validate_variant(&self, name: &str, variant: &VariantConfig) -> Result<()> {
+        if variant.activation.adapter != "none" && variant.activation.adapter != "systemd" {
+            return Err(Error::config(format!(
+                "variant '{name}': unknown activation adapter '{}'",
+                variant.activation.adapter
+            )));
+        }
+        if variant.verification.adapter != "command" {
+            return Err(Error::config(format!(
+                "variant '{name}': unsupported verification adapter '{}'",
+                variant.verification.adapter
+            )));
+        }
+        if variant.verification.argv.is_empty() {
+            return Err(Error::config(format!(
+                "variant '{name}': verification argv must not be empty"
+            )));
+        }
+        if variant.activation.adapter == "systemd" && variant.activation.units.is_empty() {
+            return Err(Error::config(format!(
+                "variant '{name}': systemd activation requires at least one unit"
+            )));
+        }
+        if variant.capacity.reserve_percent > 100 {
+            return Err(Error::config(format!(
+                "variant '{name}': reserve_percent must not exceed 100"
+            )));
         }
 
         // Validate mapping modes and artifact-relative destinations.
-        for (i, m) in self.artifact.mappings.iter().enumerate() {
+        for (i, m) in variant.artifact.mappings.iter().enumerate() {
             if let Some(mode) = &m.mode
                 && mode != "preserve"
             {
                 parse_octal_mode(mode)
-                    .map_err(|e| Error::config(format!("mapping[{i}] mode: {e}")))?;
+                    .map_err(|e| Error::config(format!("variant '{name}' mapping[{i}] mode: {e}")))?;
             }
             if m.from.trim().is_empty() || m.to.trim().is_empty() {
                 return Err(Error::config(format!(
-                    "mapping[{i}] requires non-empty from/to"
+                    "variant '{name}' mapping[{i}] requires non-empty from/to"
                 )));
             }
             validate_relative_path(Path::new(&m.to))
-                .map_err(|e| Error::config(format!("mapping[{i}] to: {e}")))?;
+                .map_err(|e| Error::config(format!("variant '{name}' mapping[{i}] to: {e}")))?;
         }
         Ok(())
     }
 
     pub fn variant_names(&self) -> Vec<String> {
         self.variants.keys().cloned().collect()
+    }
+
+    pub fn variant(&self, name: &str) -> Result<&VariantConfig> {
+        self.variants
+            .get(name)
+            .ok_or_else(|| Error::config(format!("unknown release variant '{name}'")))
+    }
+
+    /// Load every declared variant file from the release directory selected by
+    /// `release.path`. Rejects absolute/parent config paths and any variant
+    /// config path that escapes the release directory.
+    fn load_variants(&mut self, config_path: &Path) -> Result<()> {
+        Self::validate_source_path(&self.release.path, "release.path")?;
+        if self.release.variants.is_empty() {
+            return Err(Error::config("at least one release variant must be declared"));
+        }
+        let project_root = self
+            .project_root(config_path)
+            .canonicalize()
+            .map_err(|e| Error::config(format!("canonicalize project root for deploy.yaml: {e}")))?;
+        let release_root = project_root.join(&self.release.path);
+        let canonical_release = release_root
+            .canonicalize()
+            .map_err(|e| {
+                Error::config(format!(
+                    "canonicalize release path '{}': {e}",
+                    self.release.path.display()
+                ))
+            })?;
+        if !canonical_release.starts_with(&project_root) || !canonical_release.is_dir() {
+            return Err(Error::config(format!(
+                "release.path '{}' must resolve to a directory beneath the deploy.yaml directory",
+                self.release.path.display()
+            )));
+        }
+        let mut variants = BTreeMap::new();
+        for (name, relative_path) in &self.release.variants {
+            if name.trim().is_empty() {
+                return Err(Error::config("release variant name must not be empty"));
+            }
+            Self::validate_source_path(relative_path, &format!("release.variants.{name}"))?;
+            let path = canonical_release.join(relative_path);
+            let canonical_path = path.canonicalize().map_err(|e| {
+                Error::config(format!(
+                    "canonicalize variant '{name}' config '{}': {e}",
+                    path.display()
+                ))
+            })?;
+            if !canonical_path.starts_with(&canonical_release) || !canonical_path.is_file() {
+                return Err(Error::config(format!(
+                    "variant '{name}' config '{}' must resolve to a file beneath the release directory",
+                    relative_path.display()
+                )));
+            }
+            let text = std::fs::read_to_string(&canonical_path).map_err(|e| {
+                Error::config(format!(
+                    "reading variant '{name}' config '{}': {e}",
+                    canonical_path.display()
+                ))
+            })?;
+            let variant: VariantConfig = serde_yaml::from_str(&text).map_err(|e| {
+                Error::config(format!(
+                    "parsing variant '{name}' config '{}': {e}",
+                    canonical_path.display()
+                ))
+            })?;
+            variants.insert(name.clone(), variant);
+        }
+        self.variants = variants;
+        Ok(())
+    }
+
+    /// Reject any path that is absolute or contains a parent/root/prefix
+    /// component, so a release or variant config path cannot escape the
+    /// directory containing `deploy.yaml`.
+    fn validate_source_path(path: &Path, field: &str) -> Result<()> {
+        if path.as_os_str().is_empty()
+            || path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(Error::config(format!(
+                "{field} must be a non-empty relative path without '..'"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -404,35 +537,123 @@ mod tests {
 
     #[test]
     fn mapping_to_must_be_artifact_relative() {
-        let yaml = r#"
-        schema_version: 1
-        application: esc
-        remote_root: /srv/esc
-        variants: { standard: {} }
-        artifact:
-          mappings:
-            - from: build/output/
-              to: ../escape
-              recursive: true
-        activation: { adapter: none }
-        verification: { adapter: command, argv: ["true"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
-        capacity: { reserve_bytes: 0, reserve_percent: 0 }
-        rotation: { per_server: { keep_distinct_artifacts: 1, keep_days: 0, protect_previous: true }, fleet: { protect_deployments: 1 } }
-        targets:
-          t1:
-            rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
-            servers:
-              - id: s1
-                address: a
-                user: u
-                variant: standard
-        "#;
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("deploy.yaml");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        let variant_yaml = r#"
+description: escaping
+artifact:
+  mappings:
+    - from: build/output/
+      to: ../escape
+      recursive: true
+activation: { adapter: none }
+verification: { adapter: command, argv: ["true"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
+capacity: { reserve_bytes: 0, reserve_percent: 0 }
+rotation: { per_server: { keep_distinct_artifacts: 1, keep_days: 0, protect_previous: true }, fleet: { protect_deployments: 1 } }
+"#;
+        std::fs::write(release_dir.join("var1.yaml"), variant_yaml).unwrap();
+        let yaml = r#"
+schema_version: 1
+application: esc
+remote_root: /srv/esc
+release:
+  path: releases/v1
+  variants:
+    standard: var1.yaml
+targets:
+  t1:
+    rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
+    servers:
+      - id: s1
+        address: a
+        user: u
+        variant: standard
+"#;
+        let p = project.join("deploy.yaml");
         std::fs::write(&p, yaml).unwrap();
         assert!(
             Config::load(&p).is_err(),
             "escaping mapping `to` must be rejected"
         );
+    }
+
+    #[test]
+    fn loads_variant_config_from_release_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+
+        let standard_yaml = r#"
+description: Standard deployment
+artifact:
+  mappings:
+    - from: build/output/
+      to: app/
+      recursive: true
+activation: { adapter: none }
+verification: { adapter: command, argv: ["true"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
+capacity: { reserve_bytes: 0, reserve_percent: 0 }
+rotation: { per_server: { keep_distinct_artifacts: 5, keep_days: 14, protect_previous: true }, fleet: { protect_deployments: 2 } }
+"#;
+        let hc_yaml = r#"
+description: High capacity deployment
+artifact:
+  mappings:
+    - from: build/output/
+      to: app/
+      recursive: true
+activation: { adapter: systemd, scope: user, units: [{ name: x.service, artifact_path: integration/systemd/x.service, enable: true, restart: true }] }
+verification: { adapter: command, argv: ["false"], timeout_seconds: 5, attempts: 1, interval_seconds: 0 }
+capacity: { reserve_bytes: 1073741824, reserve_percent: 5 }
+rotation: { per_server: { keep_distinct_artifacts: 5, keep_days: 14, protect_previous: true }, fleet: { protect_deployments: 2 } }
+"#;
+        std::fs::write(release_dir.join("standard.yaml"), standard_yaml).unwrap();
+        std::fs::write(release_dir.join("high-capacity.yaml"), hc_yaml).unwrap();
+
+        let deploy_yaml = r#"
+schema_version: 1
+application: example
+remote_root: /srv/example
+release:
+  path: releases/v1
+  variants:
+    standard: standard.yaml
+    high-capacity: high-capacity.yaml
+targets:
+  t1:
+    rollout: { batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }
+    servers:
+      - id: s1
+        address: a
+        user: u
+        variant: standard
+"#;
+        let p = project.join("deploy.yaml");
+        std::fs::write(&p, deploy_yaml).unwrap();
+
+        let cfg = Config::load(&p).expect("config loads with sibling variant files");
+        let names = cfg.variant_names();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"standard".to_string()));
+        assert!(names.contains(&"high-capacity".to_string()));
+
+        let std = cfg.variant("standard").expect("standard variant present");
+        assert_eq!(std.verification.argv, vec!["true".to_string()]);
+        assert_eq!(std.activation.adapter, "none");
+        assert_eq!(std.capacity.reserve_percent, 0);
+
+        let hc = cfg.variant("high-capacity").expect("high-capacity variant present");
+        assert_eq!(hc.verification.argv, vec!["false".to_string()]);
+        assert_eq!(hc.activation.adapter, "systemd");
+        assert!(!hc.activation.units.is_empty());
+        assert_eq!(hc.capacity.reserve_bytes, 1073741824);
+
+        // Unknown variant name is rejected.
+        assert!(cfg.variant("missing").is_err());
     }
 }
