@@ -4,10 +4,11 @@
 //! (`release: <name>`), and every regular `*.toml` file directly inside
 //! `<project>/releases/<name>/` is discovered as a variant named by its file
 //! stem. Each variant file owns its own artifact mappings and deployment
-//! policies (activation, verification, capacity, rotation); artifact sources
-//! conventionally live beneath `releases/<name>/artifacts/`. Targets contain
-//! only their rollout policy and their stable server membership with per-server
-//! variant assignment.
+//! policies (activation, verification, capacity); artifact sources
+//! conventionally live beneath `releases/<name>/artifacts/`. Rotation is a
+//! fleet-wide retention policy declared once at the top level of `deploy.toml`.
+//! Targets contain only their rollout policy and their stable server membership
+//! with per-server variant assignment.
 //!
 //! The same local inputs always produce one target-independent release identity
 //! (see `model::ReleaseDigest`): the name-sorted per-variant mappings, the
@@ -167,6 +168,8 @@ pub struct FleetRotation {
     pub protect_deployments: u32,
 }
 
+/// Fleet-wide retention policy, declared once at the top level of
+/// `deploy.toml` (not per variant). Applied on every rotation.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RotationConfig {
     #[serde(default)]
@@ -175,22 +178,22 @@ pub struct RotationConfig {
     pub fleet: FleetRotation,
 }
 
-/// A variant's capacity + rotation policy. This is persisted alongside the
-/// immutable release record so historical deployments (fleet and release
-/// rollbacks) resolve these policies from the release snapshot rather than the
-/// caller's current configuration, where the variant may since have been
-/// renamed or removed.
+/// A variant's capacity policy. This is persisted alongside the immutable
+/// release record so historical deployments (fleet and release rollbacks)
+/// resolve capacity headroom from the release snapshot rather than the caller's
+/// current configuration, where the variant may since have been renamed or
+/// removed. Rotation is not snapshotted per variant: it is fleet-wide
+/// configuration declared once in `deploy.toml` and read from there.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct VariantPolicy {
     #[serde(default)]
     pub capacity: CapacityConfig,
-    #[serde(default)]
-    pub rotation: RotationConfig,
 }
 
 /// A per-release variant's own artifact and deployment policy. Each variant is
 /// described by a `*.toml` file directly inside the release directory named by
-/// `deploy.toml` (`releases/<name>/<variant>.toml`).
+/// `deploy.toml` (`releases/<name>/<variant>.toml`). Rotation is not
+/// per-variant: it lives at the top level of `deploy.toml`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VariantConfig {
     #[serde(default)]
@@ -201,15 +204,12 @@ pub struct VariantConfig {
     pub verification: VerificationConfig,
     #[serde(default)]
     pub capacity: CapacityConfig,
-    #[serde(default)]
-    pub rotation: RotationConfig,
 }
 
 impl From<&VariantConfig> for VariantPolicy {
     fn from(v: &VariantConfig) -> Self {
         VariantPolicy {
             capacity: v.capacity.clone(),
-            rotation: v.rotation.clone(),
         }
     }
 }
@@ -334,6 +334,10 @@ pub struct Config {
     /// Durable retention pins applied on every rotation.
     #[serde(default)]
     pub pins: Vec<Pin>,
+    /// Fleet-wide rotation policy. Declared once at the top level of
+    /// `deploy.toml`; it is not a per-variant setting.
+    #[serde(default)]
+    pub rotation: RotationConfig,
     pub targets: BTreeMap<String, TargetDef>,
     #[serde(skip)]
     variants: BTreeMap<String, VariantConfig>,
@@ -396,7 +400,7 @@ impl Config {
         }
 
         // Each loaded variant carries its own artifact/activation/verification/
-        // capacity/rotation policy; validate each one.
+        // capacity policy; validate each one.
         for (name, variant) in &self.variants {
             self.validate_variant(name, variant)?;
         }
@@ -653,6 +657,13 @@ interval_seconds = 0
 [capacity]
 reserve_bytes = 0
 reserve_percent = 0
+"#;
+        std::fs::write(release_dir.join("standard.toml"), variant_toml).unwrap();
+        let deploy_toml = r#"
+schema_version = 1
+application = "esc"
+remote_root = "/srv/esc"
+release = "v1"
 
 [rotation.per_server]
 keep_distinct_artifacts = 1
@@ -661,13 +672,6 @@ protect_previous = true
 
 [rotation.fleet]
 protect_deployments = 1
-"#;
-        std::fs::write(release_dir.join("standard.toml"), variant_toml).unwrap();
-        let deploy_toml = r#"
-schema_version = 1
-application = "esc"
-remote_root = "/srv/esc"
-release = "v1"
 
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
@@ -715,14 +719,6 @@ interval_seconds = 0
 [capacity]
 reserve_bytes = 0
 reserve_percent = 0
-
-[rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[rotation.fleet]
-protect_deployments = 2
 "#;
         let hc_toml = r#"
 description = "High capacity deployment"
@@ -747,14 +743,6 @@ interval_seconds = 0
 [capacity]
 reserve_bytes = 1073741824
 reserve_percent = 5
-
-[rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[rotation.fleet]
-protect_deployments = 2
 "#;
         std::fs::write(release_dir.join("standard.toml"), standard_toml).unwrap();
         std::fs::write(release_dir.join("high-capacity.toml"), hc_toml).unwrap();
@@ -764,6 +752,14 @@ schema_version = 1
 application = "example"
 remote_root = "/srv/example"
 release = "v1"
+
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.fleet]
+protect_deployments = 2
 
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
@@ -778,6 +774,8 @@ variant = "standard"
         std::fs::write(&p, deploy_toml).unwrap();
 
         let cfg = Config::load(&p).expect("config loads with sibling variant files");
+        assert_eq!(cfg.rotation.per_server.keep_distinct_artifacts, 5);
+        assert_eq!(cfg.rotation.fleet.protect_deployments, 2);
         let names = cfg.variant_names();
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"standard".to_string()));
@@ -815,14 +813,6 @@ interval_seconds = 0
 [capacity]
 reserve_bytes = 0
 reserve_percent = 0
-
-[rotation.per_server]
-keep_distinct_artifacts = 1
-keep_days = 0
-protect_previous = true
-
-[rotation.fleet]
-protect_deployments = 1
 "#;
 
     fn deploy_toml(release_value: &str) -> String {
@@ -832,6 +822,14 @@ schema_version = 1
 application = "forced"
 remote_root = "/srv/forced"
 release = "{release_value}"
+
+[rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[rotation.fleet]
+protect_deployments = 1
 
 [targets.t1]
 rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}

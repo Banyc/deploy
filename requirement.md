@@ -39,7 +39,7 @@ Tree objects contain no release- or variant-specific metadata, so identical tree
 The canonical release ID is derived from a versioned canonical identity payload covering the name-sorted per-variant mapping digests, all declared `variant → tree digest` bindings, and the name-sorted per-variant activation and verification behavior-contract digest. It explicitly excludes the resulting release ID, creation time, display name, and provenance, avoiding a circular hash. Two variants may share tree bytes while still requiring different activation and verification behavior, so behavior is captured per variant rather than once per release. Its stored form is `pel-sha256-full-`
 release-digest`; the CLI may display and accept an unambiguous digest prefix. Git revision and creation time are provenance only because mapped inputs can include generated or untracked files.
 
-Mapping and behavior digests are computed from versioned canonical data after schema defaults, path normalization, and validation, not from TOML formatting, comments, or key order. The original configuration remains available as provenance, while `behavior.json` records the canonical behavior contract. Each variant's capacity and rotation policy is likewise persisted with the release record in `policies.json`; historical deployments resolve capacity headroom and retention from that snapshot rather than the caller's current configuration, so a variant that was renamed or removed after the release was created still rolls back exactly.
+Mapping and behavior digests are computed from versioned canonical data after schema defaults, path normalization, and validation, not from TOML formatting, comments, or key order. The original configuration remains available as provenance, while `behavior.json` records the canonical behavior contract. Each variant's capacity policy is likewise persisted with the release record in `policies.json`; historical deployments resolve capacity headroom from that snapshot rather than the caller's current configuration, so a variant that was renamed or removed after the release was created still rolls back exactly. Retention (`rotation`) is fleet-wide configuration declared at the top level of the project file, not a per-variant setting, and is read from the caller's current configuration on every push.
 
 The first materialization fixes the immutable release record's `created_at` and first-seen provenance. Reusing the same release later does not rewrite that record; the new deployment attempt records its own current provenance.
 
@@ -108,6 +108,15 @@ release = "rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f02
 variants = "all"
 reason = "known-good recovery release"
 
+# Fleet-wide retention policy — a top-level setting, not a per-variant one.
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.fleet]
+protect_deployments = 2
+
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 
@@ -132,7 +141,9 @@ variant = "high-capacity"
 
 Each variant is described by its own file inside the release directory (e.g.
 `releases/v1/standard.toml`); there is no explicit variant list to keep in
-sync. A variant file owns its artifact mappings and its deployment policies:
+sync. A variant file owns its artifact mappings and its deployment policies
+(capacity, activation, verification); rotation is declared once at the top
+level of `deploy.toml`:
 
 ```toml
 # releases/v1/standard.toml
@@ -182,14 +193,6 @@ interval_seconds = 2
 [capacity]
 reserve_bytes = 1073741824
 reserve_percent = 5
-
-[rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[rotation.fleet]
-protect_deployments = 2
 ```
 
 Server IDs are durable identities and cannot be inferred from mutable network addresses. Deployment history is keyed by server ID. A rollback connects using the server's current address and verifies its configured SSH host identity; it never silently connects to a historical address.

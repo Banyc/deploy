@@ -67,8 +67,9 @@ pub fn behavior_contracts_from_json(
     serde_json::from_slice(bytes)
 }
 
-/// Reconstruct the name-keyed per-variant capacity/rotation policy map from
-/// serialized JSON.
+/// Reconstruct the name-keyed per-variant capacity policy map from serialized
+/// JSON. Older snapshots may also embed a per-variant `rotation` key; it is
+/// ignored — rotation is now fleet-wide configuration in `deploy.toml`.
 pub fn variant_policies_from_json(
     bytes: &[u8],
 ) -> std::result::Result<BTreeMap<String, VariantPolicy>, serde_json::Error> {

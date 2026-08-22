@@ -7,6 +7,16 @@ remote_root = "/srv/deploy/example"
 # (e.g. `standard`); artifact sources live beneath its `artifacts/` tree.
 release = "v1"
 
+# Fleet-wide retention policy — a top-level setting of deploy.toml, not a
+# per-variant one.
+[rotation.per_server]
+keep_distinct_artifacts = 5   # keep the newest 5 distinct artifacts per server
+keep_days = 14                # ...and everything activated in the last 14 days
+protect_previous = true       # never delete the artifact `current` can roll back to
+
+[rotation.fleet]
+protect_deployments = 2       # keep each server's artifacts of the newest 2 successful deployments
+
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 

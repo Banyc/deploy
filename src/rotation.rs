@@ -30,11 +30,11 @@ struct GenRecord {
     deployment_id: String,
 }
 
-/// Compute the set of retained tree digests for one server, using the rotation
-/// policy supplied by the caller and the durable pins declared in the release
-/// configuration. The caller resolves the policy from the release's immutable
-/// policy snapshot (falling back to current configuration for legacy records),
-/// so historical deployments of renamed or removed variants retain correctly.
+/// Compute the set of retained tree digests for one server, using the
+/// fleet-wide rotation policy supplied by the caller and the durable pins
+/// declared in `deploy.toml`. The policy is read from the caller's current
+/// configuration; capacity headroom, by contrast, resolves per variant from the
+/// release's immutable policy snapshot.
 pub fn compute_retained(
     helper: &RemoteHelper,
     rotation: &RotationConfig,
@@ -198,6 +198,13 @@ interval_seconds = 0
 [capacity]
 reserve_bytes = 0
 reserve_percent = 0
+"#;
+        std::fs::write(release_dir.join("standard.toml"), variant_toml).unwrap();
+        let deploy_toml = r#"
+schema_version = 1
+application = "rot"
+remote_root = "/srv"
+release = "v1"
 
 [rotation.per_server]
 keep_distinct_artifacts = 1
@@ -206,13 +213,6 @@ protect_previous = true
 
 [rotation.fleet]
 protect_deployments = 1
-"#;
-        std::fs::write(release_dir.join("standard.toml"), variant_toml).unwrap();
-        let deploy_toml = r#"
-schema_version = 1
-application = "rot"
-remote_root = "/srv"
-release = "v1"
 
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
@@ -274,8 +274,7 @@ variant = "standard"
         helper.swap_current(None, "g2", "op").unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let c = cfg();
-        let rotation = &c.variant("standard").unwrap().rotation;
-        let retained = compute_retained(&helper, rotation, &c.pins, &store).unwrap();
+        let retained = compute_retained(&helper, &c.rotation, &c.pins, &store).unwrap();
         assert!(retained.contains("t2"), "current tree retained");
         assert!(retained.contains("t1"), "previous tree retained");
     }

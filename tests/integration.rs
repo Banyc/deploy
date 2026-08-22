@@ -12,7 +12,8 @@ use std::path::Path;
 
 /// Shared per-variant policy body. It uses only `{{ variant }}` interpolation,
 /// so the same file content describes both the `standard` and `high-capacity`
-/// variants; their trees differ via `deployment/variants/<variant>/`.
+/// variants; their trees differ via `deployment/variants/<variant>/`. Rotation
+/// is not a variant setting: it lives at the top level of `deploy.toml`.
 const VARIANT_BODY: &str = r#"
 [[artifact.mappings]]
 from = "artifacts/build/output/"
@@ -43,6 +44,13 @@ interval_seconds = 0
 [capacity]
 reserve_bytes = 0
 reserve_percent = 0
+"#;
+
+const CONFIG: &str = r#"
+schema_version = 1
+application = "example"
+remote_root = "/srv/deploy/example"
+release = "v1"
 
 [rotation.per_server]
 keep_distinct_artifacts = 5
@@ -51,13 +59,6 @@ protect_previous = true
 
 [rotation.fleet]
 protect_deployments = 2
-"#;
-
-const CONFIG: &str = r#"
-schema_version = 1
-application = "example"
-remote_root = "/srv/deploy/example"
-release = "v1"
 
 [targets.production]
 rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "rollback_changed" }
@@ -243,7 +244,7 @@ fn end_to_end_push_rollback() -> Result<()> {
 
 /// Deploy variant `old`, replace it with `new` in the configuration (the old
 /// variant file is removed entirely), then restore the `@f0` fleet snapshot.
-/// Historical capacity/rotation policies must resolve from the immutable
+/// Historical capacity policies must resolve from the immutable
 /// release record, not the caller's current configuration.
 #[test]
 fn fleet_rollback_after_variant_rename_succeeds() -> Result<()> {
@@ -306,7 +307,7 @@ variant = "{variant}"
     let old_tree = old_server.tree.clone();
     let old_release = old_server.release.clone();
 
-    // The old release persists its per-variant capacity/rotation policies.
+    // The old release persists its per-variant capacity policies.
     let policies = store.read_release_policies(&old_release)?;
     assert!(
         policies.as_ref().is_some_and(|p| p.contains_key("old")),
@@ -701,6 +702,19 @@ interval_seconds = 0
 [capacity]
 reserve_bytes = 0
 reserve_percent = 0
+"#
+    )
+}
+
+/// Minimal deploy.toml body with a single `standard` variant and
+/// `activation: none`. Rotation is a top-level setting of `deploy.toml`.
+fn single_target_toml(stop_on_failure: bool, batch_size: u32) -> String {
+    format!(
+        r#"
+schema_version = 1
+application = "example"
+remote_root = "/srv/deploy/example"
+release = "v1"
 
 [rotation.per_server]
 keep_distinct_artifacts = 5
@@ -709,19 +723,6 @@ protect_previous = true
 
 [rotation.fleet]
 protect_deployments = 2
-"#
-    )
-}
-
-/// Minimal deploy.toml body with a single `standard` variant and
-/// `activation: none`. The variant's policy lives in `standard.toml`.
-fn single_target_toml(stop_on_failure: bool, batch_size: u32) -> String {
-    format!(
-        r#"
-schema_version = 1
-application = "example"
-remote_root = "/srv/deploy/example"
-release = "v1"
 
 [targets.production]
 rollout = {{ batch_size = {batch_size}, stop_on_failure = {stop_on_failure}, failure_policy = "rollback_changed" }}
@@ -768,13 +769,21 @@ fn cli_reaches_configured_endpoint() -> Result<()> {
     std::fs::create_dir_all(&endpoints).unwrap();
 
     // Addresses are explicit `local://` paths: the configured endpoint, NOT the
-    // application store's `remotes/` directory. The `standard` variant's policy
-    // lives in its own sibling file inside the release directory.
+    // application store's `remotes/` directory. Rotation is a top-level setting
+    // of `deploy.toml`.
     let config_toml = r#"
 schema_version = 1
 application = "example"
 remote_root = "/srv/deploy/example"
 release = "v1"
+
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.fleet]
+protect_deployments = 2
 
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
@@ -804,14 +813,6 @@ interval_seconds = 0
 [capacity]
 reserve_bytes = 0
 reserve_percent = 0
-
-[rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[rotation.fleet]
-protect_deployments = 2
 "#;
     write_file(&proj.join("deploy.toml"), config_toml);
     write_variant_file(&proj, "standard", variant_toml);
@@ -1272,6 +1273,14 @@ application = "example"
 remote_root = "/srv/deploy/example"
 release = "v1"
 
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.fleet]
+protect_deployments = 2
+
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 
@@ -1312,14 +1321,6 @@ interval_seconds = 0
 [capacity]
 reserve_bytes = 0
 reserve_percent = 0
-
-[rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[rotation.fleet]
-protect_deployments = 2
 "#;
     write_file(&proj.join("deploy.toml"), deploy_toml);
     write_variant_file(&proj, "standard", variant_toml);

@@ -232,10 +232,11 @@ impl LocalStore {
             .map_err(|e| Error::store(format!("serialize behavior: {e}")))?;
         std::fs::write(&bp, bytes).map_err(|e| Error::store(format!("write behavior: {e}")))?;
         set_private(&bp)?;
-        // Persist each variant's capacity + rotation policy with the release. A
-        // historical deployment must resolve these from this snapshot, because
-        // the caller's current configuration may have renamed or removed the
-        // variant since the release was created.
+        // Persist each variant's capacity policy with the release. A historical
+        // deployment must resolve it from this snapshot, because the caller's
+        // current configuration may have renamed or removed the variant since
+        // the release was created. (Rotation is fleet-wide configuration and is
+        // not part of the snapshot.)
         let pp = dir.join("policies.json");
         let bytes = serde_json::to_vec_pretty(policies_json)
             .map_err(|e| Error::store(format!("serialize policies: {e}")))?;
@@ -257,8 +258,8 @@ impl LocalStore {
             .map_err(|e| Error::store(format!("parse behavior {}: {e}", p.display())))
     }
 
-    /// Read the name-keyed per-variant capacity/rotation policies stored
-    /// alongside a release record. Returns `None` when the release predates
+    /// Read the name-keyed per-variant capacity policies stored alongside a
+    /// release record. Returns `None` when the release predates
     /// policy persistence; callers then fall back to the current configuration
     /// for variants that still exist there.
     pub fn read_release_policies(
