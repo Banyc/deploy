@@ -7,7 +7,7 @@
 //! narrowly scoped restart permission; it never links an artifact-controlled
 //! unit into `/etc/systemd/system`.
 
-use crate::config::ActivationConfig;
+use crate::config::{ActivationConfig, validate_relative_path};
 use crate::error::{Error, Result};
 use crate::remote::transport::Remote;
 use std::path::{Path, PathBuf};
@@ -50,6 +50,56 @@ pub fn user_unit_link_for(config_base: &Path, unit: &str) -> PathBuf {
     config_base.join("systemd/user").join(unit)
 }
 
+/// Resolve the XDG config base on the *remote* host by asking its shell. The
+/// systemd user unit directory lives under `${XDG_CONFIG_HOME:-$HOME/.config}`,
+/// and that value must come from the host where the unit will be linked and
+/// activated, not from the controller's own environment.
+pub fn resolve_remote_config_home(remote: &dyn Remote) -> Result<PathBuf> {
+    let outcome = remote.exec(
+        &[
+            "sh".into(),
+            "-c".into(),
+            r#"printf "%s" "${XDG_CONFIG_HOME:-$HOME/.config}""#.into(),
+        ],
+        Duration::from_secs(30),
+    )?;
+    if !outcome.success() {
+        return Err(Error::remote(format!(
+            "resolve remote config home failed: {}",
+            outcome.stderr
+        )));
+    }
+    let home = outcome.stdout.trim().to_string();
+    if home.is_empty() {
+        return Err(Error::remote("remote config home resolved to empty"));
+    }
+    Ok(PathBuf::from(home))
+}
+
+/// Reject unit names that could escape the systemd/user directory
+/// (absolute paths, parent-dir components, or empty names).
+fn validate_unit_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::config("systemd unit name must not be empty"));
+    }
+    if Path::new(name).is_absolute() {
+        return Err(Error::config(format!(
+            "systemd unit name '{}' must not be an absolute path",
+            name
+        )));
+    }
+    let dangerous = name
+        .split('/')
+        .any(|c| c == ".." || c == "." || c.is_empty());
+    if dangerous {
+        return Err(Error::config(format!(
+            "systemd unit name '{}' must be a single filename",
+            name
+        )));
+    }
+    Ok(())
+}
+
 /// Build the activation command vectors for the given generation root.
 ///
 /// Ordering follows the required contract:
@@ -60,10 +110,15 @@ pub fn user_unit_link_for(config_base: &Path, unit: &str) -> PathBuf {
 ///
 /// System scope never links an artifact-controlled unit; it only performs the
 /// narrowly scoped restart of the fixed wrapper unit.
+///
+/// `config_home` is the remote host's resolved config base (see
+/// [`resolve_remote_config_home`]); unit links are placed under it so the path
+/// is correct on the remote host rather than reflecting the controller's env.
 pub fn activation_commands(
     cfg: &ActivationConfig,
-    remote_root: &Path,
+    _remote_root: &Path,
     generation_root: &Path,
+    config_home: &Path,
 ) -> Vec<Vec<String>> {
     let mut cmds = Vec::new();
     let scope_user = matches!(cfg.scope, crate::config::ActivationScope::User);
@@ -72,7 +127,7 @@ pub fn activation_commands(
     if scope_user {
         for u in &cfg.units {
             let link_target = generation_root.join(&u.artifact_path);
-            let link = user_unit_link(remote_root, &u.name);
+            let link = user_unit_link_for(config_home, &u.name);
             if let Some(parent) = link.parent() {
                 cmds.push(vec![
                     "mkdir".into(),
@@ -162,7 +217,20 @@ pub fn run_activation(
     if cfg.adapter != "systemd" {
         return Ok(());
     }
-    let cmds = activation_commands(cfg, remote_root, generation_root);
+    // Validate every declared unit name and artifact path before touching any
+    // remote state; a path traversal here would escape the generation root.
+    for u in &cfg.units {
+        validate_unit_name(&u.name)?;
+        validate_relative_path(Path::new(&u.artifact_path)).map_err(|e| {
+            Error::remote(format!(
+                "unit '{}' artifact path invalid: {e}",
+                u.name
+            ))
+        })?;
+    }
+    // Resolve the unit directory base on the *remote* host, not the controller.
+    let config_home = resolve_remote_config_home(remote)?;
+    let cmds = activation_commands(cfg, remote_root, generation_root, &config_home);
     for argv in &cmds {
         let outcome = remote.exec(argv, Duration::from_secs(30))?;
         if !outcome.success() {
@@ -240,7 +308,12 @@ mod tests {
     #[test]
     fn user_commands_link_before_reload() {
         let c = cfg(ActivationScope::User, vec!["example.service"]);
-        let cmds = activation_commands(&c, Path::new("/srv/x"), Path::new("/gen"));
+        let cmds = activation_commands(
+            &c,
+            Path::new("/srv/x"),
+            Path::new("/gen"),
+            Path::new("/home/deploy/.config"),
+        );
         // First commands must mkdir + ln (link), then daemon-reload after.
         assert_eq!(cmds[0][0], "mkdir");
         assert_eq!(cmds[1][0], "ln");
@@ -265,7 +338,12 @@ mod tests {
     #[test]
     fn system_scope_does_not_link_user_units() {
         let c = cfg(ActivationScope::System, vec!["wrapper.service"]);
-        let cmds = activation_commands(&c, Path::new("/srv/x"), Path::new("/gen"));
+        let cmds = activation_commands(
+            &c,
+            Path::new("/srv/x"),
+            Path::new("/gen"),
+            Path::new("/home/deploy/.config"),
+        );
         // No mkdir/ln for artifact links in system scope.
         assert!(!cmds.iter().any(|c| c[0] == "mkdir"));
         assert!(!cmds.iter().any(|c| c[0] == "ln"));

@@ -26,6 +26,8 @@ use crate::rotation::compute_retained;
 use crate::store::local::LocalStore;
 use crate::tree;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -208,9 +210,25 @@ fn push_inner(
         {
             let release_json = serde_json::to_string(&rec)
                 .map_err(|e| Error::store(format!("serialize release: {e}")))?;
+            // Restore the historical behavior contract from the release record,
+            // NOT the caller's current configuration: a historical or rollback
+            // push must publish the immutable historical release's own behavior
+            // rather than overwriting it with the current config.
+            let hist_behavior = store
+                .read_release_behavior(&rid)
+                .unwrap_or_else(|_| BehaviorContract {
+                    activation: config.activation.clone(),
+                    verification: config.verification.clone(),
+                });
+            let hist_behavior_json = serde_json::json!({
+                "activation": serde_json::to_value(&hist_behavior.activation)?,
+                "verification": serde_json::to_value(&hist_behavior.verification)?,
+            });
             REMOTE_RELEASE_JSON.with(|c| {
-                c.borrow_mut()
-                    .insert(rid.clone(), (release_json, behavior_json.to_string()))
+                c.borrow_mut().insert(
+                    rid.clone(),
+                    (release_json, hist_behavior_json.to_string()),
+                )
             });
         }
         rid
@@ -314,11 +332,23 @@ fn push_inner(
         );
         pre_push.insert(
             a.server_id.clone(),
-            expected.as_ref().map(|g| AttemptServer {
-                release: a.release.clone(),
-                variant: a.variant.clone(),
-                tree: a.tree.clone(),
-                generation: Some(g.clone()),
+            expected.as_ref().map(|g| {
+                // Record the server's *actual* current assignment (read from the
+                // remote generation), not the desired one.
+                helpers[&a.server_id]
+                    .read_assignment(g.as_str())
+                    .map(|asn| AttemptServer {
+                        release: ReleaseId::new(asn.release),
+                        variant: VariantName::new(asn.variant),
+                        tree: TreeDigest::new(asn.tree),
+                        generation: Some(g.clone()),
+                    })
+                    .unwrap_or_else(|_| AttemptServer {
+                        release: a.release.clone(),
+                        variant: a.variant.clone(),
+                        tree: a.tree.clone(),
+                        generation: Some(g.clone()),
+                    })
             }),
         );
     }
@@ -378,11 +408,9 @@ fn push_inner(
         });
     }
 
-    // Persist the plan before any server mutation (finding 6).
-    store.write_plan(deployment_id.as_str(), &plan)?;
-    store.write_status(deployment_id.as_str(), "in_progress")?;
-
-    // Early "Everything up to date" check for HEAD pushes.
+    // Early "Everything up to date" check for HEAD pushes. Run BEFORE persisting
+    // any plan/status record so an up-to-date no-op leaves no dangling
+    // `in_progress` deployment behind.
     if matches!(pref, PushRef::Head) {
         let mut all_match = true;
         for a in &assignments {
@@ -422,6 +450,10 @@ fn push_inner(
             }
         }
     }
+
+    // Persist the plan before any server mutation (finding 6).
+    store.write_plan(deployment_id.as_str(), &plan)?;
+    store.write_status(deployment_id.as_str(), "in_progress")?;
 
     // 8 & 9. Capacity preflight and staging.
     capacity_preflight(config, store, &assignments, &helpers, op_id, deployment_id)?;
@@ -533,7 +565,7 @@ fn push_inner(
                 deployment_id,
                 sid,
                 prior,
-                true,
+                &new_gen[sid],
             )?;
             if ok {
                 compensated.push(sid.clone());
@@ -562,33 +594,70 @@ fn push_inner(
     // 15. Fleet-commit markers (only for otherwise-successful attempts).
     let mut commit_status = status.clone();
     if status == DeploymentStatus::Successful {
+        // The full server-ID set participating in this fleet commit.
+        let server_ids: Vec<String> =
+            servers_order.iter().map(|s| s.as_str().to_string()).collect();
         for sid in &servers_order {
             let helper = &helpers[sid];
-            helper.acquire_lock(op_id.as_str(), false)?;
-            helper.write_commit_marker(deployment_id.as_str())?;
-            // Confirm generation still matches this attempt's creation.
+            // Hold the lock for the whole commit step so a failure cannot leak it
+            // (a `?` on a manual lock would otherwise leave the lock held).
+            let _guard = match helper.acquire_lock_guard(op_id.as_str()) {
+                Ok(g) => g,
+                Err(_) => {
+                    commit_status = DeploymentStatus::PendingCommit;
+                    continue;
+                }
+            };
+            // Check the generation *before* writing the marker; a mismatch means
+            // another controller changed `current` and this marker would be wrong.
             let cur = helper.status()?.current_generation;
-            let matches = cur.as_deref() == Some(new_gen[sid].as_str());
-            helper.release_lock(op_id.as_str())?;
-            if !matches {
+            if cur.as_deref() != Some(new_gen[sid].as_str()) {
                 commit_status = DeploymentStatus::PendingCommit;
+                continue;
             }
+            helper.write_commit_marker(
+                deployment_id.as_str(),
+                new_gen[sid].as_str(),
+                &server_ids,
+            )?;
+            // `_guard` drops here, releasing the lock.
         }
     }
 
     // 16 & 17. Record attempt, history, rotation.
+    //
+    // `actual_servers` reflects each server's *real* final state, read from the
+    // remote generation it currently points at, rather than the desired plan
+    // values. Failed/skipped/restored servers therefore report their actual
+    // release/tree/variant instead of the desired ones.
     let mut actual_servers: BTreeMap<ServerId, AttemptServer> = BTreeMap::new();
     for a in &assignments {
-        let r = results.get(&a.server_id).expect("result present");
-        actual_servers.insert(
-            a.server_id.clone(),
-            AttemptServer {
+        let sid = &a.server_id;
+        let helper = &helpers[sid];
+        let final_gen = helper.status().ok().and_then(|s| s.current_generation);
+        let actual = match final_gen {
+            Some(g) => match helper.read_assignment(&g) {
+                Ok(asn) => AttemptServer {
+                    release: ReleaseId::new(asn.release),
+                    variant: VariantName::new(asn.variant),
+                    tree: TreeDigest::new(asn.tree),
+                    generation: Some(GenerationId::new(g)),
+                },
+                Err(_) => AttemptServer {
+                    release: a.release.clone(),
+                    variant: a.variant.clone(),
+                    tree: a.tree.clone(),
+                    generation: Some(new_gen[sid].clone()),
+                },
+            },
+            None => AttemptServer {
                 release: a.release.clone(),
                 variant: a.variant.clone(),
                 tree: a.tree.clone(),
-                generation: r.generation.clone(),
+                generation: None,
             },
-        );
+        };
+        actual_servers.insert(sid.clone(), actual);
     }
     let desired_map: BTreeMap<ServerId, AttemptServer> = assignments
         .iter()
@@ -615,7 +684,7 @@ fn push_inner(
         attempted_at: crate::remote::helper::now_rfc3339(),
         desired: desired_map,
         pre_push,
-        servers: actual_servers,
+        servers: actual_servers.clone(),
     };
     store.append_attempt(target_name, &attempt)?;
     store.write_results(
@@ -633,28 +702,19 @@ fn push_inner(
         target: TargetName::new(target_name.to_string()),
         servers: Default::default(),
     };
-    for a in &assignments {
-        let r = results.get(&a.server_id).expect("result present");
-        observed.servers.insert(
-            a.server_id.clone(),
-            ObservedServer {
-                generation: r.generation.clone(),
-                release: Some(a.release.clone()),
-                variant: Some(a.variant.clone()),
-                tree: Some(a.tree.clone()),
-                last_deployment: Some(deployment_id.clone()),
-            },
-        );
+    for (sid, asv) in &actual_servers {
+        let observed_server = ObservedServer {
+            generation: asv.generation.clone(),
+            release: Some(asv.release.clone()),
+            variant: Some(asv.variant.clone()),
+            tree: Some(asv.tree.clone()),
+            last_deployment: Some(deployment_id.clone()),
+        };
+        observed.servers.insert(sid.clone(), observed_server.clone());
         store.write_server(&crate::records::ServerState {
-            id: a.server_id.clone(),
+            id: sid.clone(),
             last_seen_target: Some(TargetName::new(target_name.to_string())),
-            last_observed: Some(ObservedServer {
-                generation: r.generation.clone(),
-                release: Some(a.release.clone()),
-                variant: Some(a.variant.clone()),
-                tree: Some(a.tree.clone()),
-                last_deployment: Some(deployment_id.clone()),
-            }),
+            last_observed: Some(observed_server),
         })?;
     }
     store.write_observed(target_name, &observed)?;
@@ -866,8 +926,8 @@ fn process_server(
         new_gen.as_str(),
         op_id.as_str(),
     );
-    let advanced = match swap {
-        Ok(()) => true,
+    match swap {
+        Ok(()) => {}
         Err(e) => {
             return Ok(ServerProc {
                 kind: ServerOutcomeKind::Failed,
@@ -899,7 +959,7 @@ fn process_server(
             deployment_id,
             server_id,
             expected_gen,
-            advanced,
+            new_gen,
         );
         let _ = helper.transaction_record(op_id.as_str(), "compensated");
         let did_comp = matches!(comp, Ok(true));
@@ -927,7 +987,7 @@ fn process_server(
             deployment_id,
             server_id,
             expected_gen,
-            advanced,
+            new_gen,
         );
         let _ = helper.transaction_record(op_id.as_str(), "compensated");
         let did_comp = matches!(comp, Ok(true));
@@ -944,12 +1004,16 @@ fn process_server(
         });
     }
 
-    if let Err(e) = helper.transaction_record(op_id.as_str(), "committed") {
+    // The swap, activation, and verification all succeeded, so the new generation
+    // is live (current points at it and the service is healthy). A failure to
+    // write the bookkeeping record must NOT be reported as a rolled-back state
+    // that is in fact still active; treat the server as advanced.
+    if helper.transaction_record(op_id.as_str(), "committed").is_err() {
         return Ok(ServerProc {
-            kind: ServerOutcomeKind::Failed,
+            kind: ServerOutcomeKind::Activated,
             generation: new_gen.clone(),
             did_compensate: false,
-            error: Some(format!("transaction commit record failed: {e}")),
+            error: None,
         });
     }
     Ok(ServerProc {
@@ -962,7 +1026,10 @@ fn process_server(
 
 /// Restore the prior generation (or remove `current` on first deploy). Uses the
 /// prior generation's stored behavior contract rather than the caller's current
-/// configuration. Returns true if compensation restored prior state.
+/// configuration. `advanced_gen` is the generation this server was just advanced
+/// to; it is used as the compare-and-swap precondition so a concurrent
+/// controller cannot have its `current` clobbered. Returns true if compensation
+/// restored prior state.
 #[allow(clippy::too_many_arguments)]
 fn compensate_server(
     _config: &Config,
@@ -973,8 +1040,15 @@ fn compensate_server(
     _deployment_id: &DeploymentId,
     _server_id: &ServerId,
     prior_gen: Option<&GenerationId>,
-    _advanced: bool,
+    advanced_gen: &GenerationId,
 ) -> Result<bool> {
+    // Hold the server mutation lock for the duration of compensation. Re-acquiring
+    // is idempotent when the same op_id already holds it (process_server holds it
+    // via a guard that is still alive on the in-process failure paths).
+    let _guard = match helper.acquire_lock_guard(op_id.as_str()) {
+        Ok(g) => g,
+        Err(_) => return Ok(false),
+    };
     match prior_gen {
         Some(prior) => {
             // Load the prior generation's behavior contract from the remote.
@@ -988,7 +1062,19 @@ fn compensate_server(
                     activation: crate::config::ActivationConfig::default(),
                     verification: crate::config::VerificationConfig::default(),
                 });
-            helper.swap_current(None, prior.as_str(), op_id.as_str())?;
+            // Compare-and-swap: only roll back if `current` still points at the
+            // generation we just activated. Otherwise another controller changed
+            // it and we must not clobber their state.
+            if helper
+                .swap_current(
+                    Some(advanced_gen.as_str()),
+                    prior.as_str(),
+                    op_id.as_str(),
+                )
+                .is_err()
+            {
+                return Ok(false);
+            }
             let root = remote
                 .root()
                 .join("generations")
@@ -1000,8 +1086,11 @@ fn compensate_server(
             Ok(true)
         }
         None => {
-            helper.remove_current()?;
-            Ok(true)
+            // First deploy: remove `current` only if it still points at the
+            // generation we advanced (compare-and-swap style).
+            Ok(helper
+                .remove_current_if(advanced_gen.as_str())
+                .unwrap_or(false))
         }
     }
 }
@@ -1034,19 +1123,29 @@ fn download_tree_to_host(remote: &dyn Remote, rel: &Path, host_dest: &Path) -> R
     for entry in remote.list(rel)? {
         let child_rel = rel.join(&entry.name);
         let dest = host_dest.join(&entry.name);
-        if entry.is_dir {
-            download_tree_to_host(remote, &child_rel, &dest)?;
-        } else if entry.is_symlink {
+        if entry.is_symlink {
+            // Reconstruct the exact symlink target; remove any stale entry first.
             let target = remote.read_link(&child_rel)?;
+            let _ = std::fs::remove_file(&dest);
             std::os::unix::fs::symlink(&target, &dest)
-                .map_err(|e| Error::transport(format!("symlink: {e}")))?;
+                .map_err(|e| Error::transport(format!("symlink {}: {e}", dest.display())))?;
+        } else if entry.is_dir {
+            download_tree_to_host(remote, &child_rel, &dest)?;
+            set_mode(&dest, entry.mode)?;
         } else {
             let data = remote.read(&child_rel)?;
             std::fs::write(&dest, data)
                 .map_err(|e| Error::transport(format!("write {}: {e}", dest.display())))?;
+            set_mode(&dest, entry.mode)?;
         }
     }
     Ok(())
+}
+
+/// Apply a mode to a local file/directory, preserving only the permission bits.
+fn set_mode(path: &Path, mode: u32) -> Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777))
+        .map_err(|e| Error::transport(format!("chmod {}: {e}", path.display())))
 }
 
 /// Coarse capacity preflight: ensure each server has room for the new trees plus
@@ -1105,28 +1204,54 @@ fn tree_size_on_host(root: &Path) -> u64 {
 }
 
 fn acquire_lock_file(path: &Path, op_id: &str) -> Result<()> {
-    if path.exists() {
-        let held = std::fs::read_to_string(path).unwrap_or_default();
-        if held.trim() == op_id {
-            return Ok(());
-        }
-        // Treat a stale lock (older than 1 hour) as recoverable.
-        if let Ok(meta) = std::fs::metadata(path)
-            && let Ok(modified) = meta.modified()
-            && let Ok(elapsed) = std::time::SystemTime::now().duration_since(modified)
-            && elapsed < Duration::from_secs(3600)
-        {
-            return Err(Error::preflight(format!(
-                "local lock {} held by '{}'",
-                path.display(),
-                held.trim()
-            )));
-        }
-        std::fs::remove_file(path).ok();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::preflight(format!("mkdir {}: {e}", parent.display())))?;
     }
-    std::fs::write(path, op_id)
-        .map_err(|e| Error::preflight(format!("acquire lock {}: {e}", path.display())))?;
-    Ok(())
+    // Atomic create-if-absent (O_CREAT|O_EXCL) so two processes cannot both win
+    // the race for a free lock.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(op_id.as_bytes())
+                .map_err(|e| Error::preflight(format!("write {}: {e}", path.display())))?;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let held = std::fs::read_to_string(path).unwrap_or_default();
+            if held.trim() == op_id {
+                return Ok(());
+            }
+            // Treat a stale lock (older than 1 hour) as recoverable.
+            if let Ok(meta) = std::fs::metadata(path)
+                && let Ok(modified) = meta.modified()
+                && let Ok(elapsed) = std::time::SystemTime::now().duration_since(modified)
+                && elapsed < Duration::from_secs(3600)
+            {
+                return Err(Error::preflight(format!(
+                    "local lock {} held by '{}'",
+                    path.display(),
+                    held.trim()
+                )));
+            }
+            std::fs::remove_file(path).ok();
+            // Try once more after clearing a stale lock.
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .and_then(|mut f| f.write_all(op_id.as_bytes()).map(|_| ()));
+            Ok(())
+        }
+        Err(e) => Err(Error::preflight(format!(
+            "acquire lock {}: {e}",
+            path.display()
+        ))),
+    }
 }
 
 fn release_lock_file(path: &Path, op_id: &str) -> Result<()> {

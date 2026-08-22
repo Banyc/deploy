@@ -133,20 +133,26 @@ impl<'a> RemoteHelper<'a> {
     /// only during recovery). Returns true if the lock is now owned by `op_id`.
     pub fn acquire_lock(&self, op_id: &str, force: bool) -> Result<bool> {
         let p = Path::new("state/operation.lock");
-        if self.remote.exists(p) {
-            let held = self.remote.read(p)?;
-            let held = String::from_utf8_lossy(&held).trim().to_string();
-            if held == op_id {
-                return Ok(true);
-            }
-            if !force {
-                return Err(Error::remote(format!(
-                    "remote mutation lock held by '{held}', not '{op_id}'"
-                )));
+        // Atomic create-if-absent: only one caller wins the race for a free lock.
+        match self.remote.try_write_new(p, op_id.as_bytes())? {
+            true => Ok(true),
+            false => {
+                // The lock already existed. Read who holds it.
+                let held = self.remote.read(p)?;
+                let held = String::from_utf8_lossy(&held).trim().to_string();
+                if held == op_id {
+                    return Ok(true);
+                }
+                if !force {
+                    return Err(Error::remote(format!(
+                        "remote mutation lock held by '{held}', not '{op_id}'"
+                    )));
+                }
+                // Force path: overwrite the holder. (Used only during recovery.)
+                self.remote.write(p, op_id.as_bytes(), 0o644)?;
+                Ok(true)
             }
         }
-        self.remote.write(p, op_id.as_bytes(), 0o644)?;
-        Ok(true)
     }
 
     pub fn release_lock(&self, op_id: &str) -> Result<()> {
@@ -359,15 +365,54 @@ impl<'a> RemoteHelper<'a> {
         Ok(())
     }
 
-    /// Remove the top-level `current` symlink (used for first-deploy compensation).
+    /// Remove the top-level `current` symlink (used for first-deploy
+    /// compensation). `expected` makes the removal a compare-and-swap: the link
+    /// is removed only if it currently points at `expected`, so a concurrent
+    /// activation cannot be clobbered.
     pub fn remove_current(&self) -> Result<()> {
         self.remote.remove_file(Path::new("current"))
     }
 
-    /// Write a fleet-commit marker for a deployment under this server.
-    pub fn write_commit_marker(&self, deployment_id: &str) -> Result<()> {
+    /// Remove `current` only if it currently points at `expected`. Returns true
+    /// if it was removed, false if `current` pointed elsewhere (or did not exist).
+    pub fn remove_current_if(&self, expected: &str) -> Result<bool> {
+        if !self.remote.exists(Path::new("current")) {
+            return Ok(false);
+        }
+        let target = self.remote.read_link(Path::new("current"))?;
+        let comps: Vec<String> = target
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        let actual = comps
+            .iter()
+            .position(|c| c == "generations")
+            .and_then(|i| comps.get(i + 1).cloned());
+        if actual.as_deref() == Some(expected) {
+            self.remote.remove_file(Path::new("current"))?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Write a fleet-commit marker for a deployment under this server. The marker
+    /// records the generation this server committed and the full set of server
+    /// IDs that participate in the fleet commit, so a partial marker can never
+    /// masquerade as a complete commit.
+    pub fn write_commit_marker(
+        &self,
+        deployment_id: &str,
+        generation: &str,
+        server_ids: &[String],
+    ) -> Result<()> {
         let p = Path::new("state/commits").join(format!("{deployment_id}.json"));
-        let payload = serde_json::json!({ "deployment_id": deployment_id, "committed": true });
+        let payload = serde_json::json!({
+            "deployment_id": deployment_id,
+            "committed": true,
+            "generation": generation,
+            "servers": server_ids,
+        });
         let bytes = serde_json::to_vec_pretty(&payload)
             .map_err(|e| Error::remote(format!("serialize commit: {e}")))?;
         self.remote.write(&p, &bytes, 0o644)

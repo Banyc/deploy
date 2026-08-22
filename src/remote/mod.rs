@@ -31,5 +31,7 @@ pub fn create_remote(config: &Config, server: &ServerDef) -> Result<Box<dyn Remo
         &server.user,
         &server.address,
         &config.remote_root,
+        server.known_hosts.as_deref(),
+        server.host_key_fingerprint.as_deref(),
     )?))
 }

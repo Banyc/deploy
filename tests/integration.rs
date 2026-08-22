@@ -291,6 +291,12 @@ impl Remote for SpyRemote {
             "SpyRemote: write is forbidden",
         ))
     }
+    fn try_write_new(&self, _rel: &Path, _data: &[u8]) -> deploy::error::Result<bool> {
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+        Err(deploy::error::Error::remote(
+            "SpyRemote: write is forbidden",
+        ))
+    }
     fn create_dir(&self, _rel: &Path) -> deploy::error::Result<()> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
         Err(deploy::error::Error::remote(
@@ -391,6 +397,15 @@ impl Remote for FaultRemote {
             ));
         }
         self.inner.write(rel, data, mode)
+    }
+    fn try_write_new(&self, rel: &Path, data: &[u8]) -> deploy::error::Result<bool> {
+        self.attempted.fetch_add(1, Ordering::SeqCst);
+        if self.fail_write {
+            return Err(deploy::error::Error::remote(
+                "FaultRemote: write forced to fail",
+            ));
+        }
+        self.inner.try_write_new(rel, data)
     }
     fn create_dir(&self, rel: &Path) -> deploy::error::Result<()> {
         self.inner.create_dir(rel)
@@ -733,6 +748,35 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
     assert_ne!(
         assignment.behavior_sha256, b_digest,
         "rollback must NOT use the current (B) behavior"
+    );
+
+    // The historical release's remote `behavior.json` must NOT be overwritten by
+    // the current (B) config. Read the release that f0 published and confirm it
+    // still describes behavior A (verification argv "true").
+    let hist_release = r0
+        .attempt
+        .as_ref()
+        .unwrap()
+        .servers
+        .get(&ServerId::new("server-01"))
+        .unwrap()
+        .release
+        .as_str()
+        .to_string();
+    let behavior_path = Path::new("releases")
+        .join(&hist_release)
+        .join("behavior.json");
+    let behavior: serde_json::Value =
+        serde_json::from_slice(&remote.read(&behavior_path).unwrap()).unwrap();
+    let verify_argv = behavior["verification"]["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        verify_argv, vec!["true".to_string()],
+        "historical release behavior.json must keep behavior A, not be overwritten with B"
     );
     Ok(())
 }

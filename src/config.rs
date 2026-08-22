@@ -203,6 +203,16 @@ pub struct ServerDef {
     pub address: String,
     pub user: String,
     pub variant: String,
+    /// Dedicated `known_hosts` file used with `StrictHostKeyChecking=yes` for
+    /// this server. Either this or `host_key_fingerprint` must be configured;
+    /// trust-on-first-use is disabled.
+    #[serde(default)]
+    pub known_hosts: Option<PathBuf>,
+    /// Pre-verified host-key fingerprint (e.g. `SHA256:...`). When set without a
+    /// `known_hosts` file, the host key is fetched and pinned on first contact
+    /// only if its fingerprint matches this value.
+    #[serde(default)]
+    pub host_key_fingerprint: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -298,6 +308,26 @@ impl Config {
                     return Err(Error::config(format!(
                         "server '{}' references unknown variant '{}'",
                         s.id, s.variant
+                    )));
+                }
+                // When an identity source is provided it must be well-formed. The
+                // actual enforcement (refusing trust-on-first-use) happens in the
+                // SSH transport, so a missing source is not rejected here — local
+                // and `local://` transports never perform host verification.
+                if let Some(kh) = &s.known_hosts
+                    && !kh.is_absolute()
+                {
+                    return Err(Error::config(format!(
+                        "server '{}' known_hosts must be an absolute path",
+                        s.id
+                    )));
+                }
+                if let Some(fp) = &s.host_key_fingerprint
+                    && !fp.starts_with("SHA256:")
+                {
+                    return Err(Error::config(format!(
+                        "server '{}' host_key_fingerprint must be a SHA256:... value",
+                        s.id
                     )));
                 }
             }

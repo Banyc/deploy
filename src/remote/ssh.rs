@@ -1,16 +1,23 @@
-//! SSH transport over `ssh`/`scp` with strict host-key verification.
+//! SSH transport over `ssh`/`scp` with configured host-identity verification.
 //!
-//! This is the production transport. It authenticates the server with
-//! `StrictHostKeyChecking=accept-new` (verifies a known host key and records a
-//! newly seen one, rejecting any subsequent change) and never concatenates
-//! server addresses, user names, variant names, release IDs, or paths into a
-//! remote shell command: every file-system operation passes its arguments as
-//! discrete `ssh`/`scp` parameters, and bulk transfers use a framed channel.
+//! This is the production transport. It authenticates the server against a
+//! *configured* identity: either a pre-provisioned `known_hosts` file used with
+//! `StrictHostKeyChecking=yes`, or a pinned `host_key_fingerprint` that is
+//! verified out-of-band before first contact (the host key is fetched with
+//! `ssh-keyscan` and its fingerprint compared to the configured value, then
+//! pinned in a managed known-hosts file). It never falls back to
+//! trust-on-first-use: if no host identity is configured the transport refuses
+//! to connect.
 //!
-//! The initial helper bootstrap (uploading a versioned helper and atomically
-//! flipping the entry point) is intentionally out of scope here; this transport
-//! already provides the versioned, idempotent, operation-ID-keyed surface the
-//! remote helper expects on top of a pre-provisioned `remote_root`.
+//! Every operation is performed by sending a single, fully shell-quoted remote
+//! command string. Because OpenSSH joins the arguments it is given into one
+//! space-separated string and the remote login shell re-tokenizes that string,
+//! passing discrete local `Command` arguments does *not* preserve
+//! argument-vector boundaries. We therefore build the remote command as a single
+//! string in which every argument is single-quoted, so the remote shell
+//! re-tokenizes it back into exactly the intended `argv` — spaces and
+//! metacharacters in arguments are preserved and never interpreted as shell
+//! syntax.
 
 use crate::error::{Error, Result};
 use crate::remote::transport::PROTOCOL_VERSION;
@@ -23,12 +30,30 @@ use std::time::Duration;
 pub struct SshTransport {
     target: String,
     root: PathBuf,
+    /// Dedicated known-hosts file used with `StrictHostKeyChecking=yes`.
+    known_hosts: Option<PathBuf>,
+    /// Pre-verified host-key fingerprint (e.g. `SHA256:...`) used to pin the
+    /// host key the first time we contact it.
+    host_key_fingerprint: Option<String>,
+    /// Managed known-hosts file holding the pinned key (used when only a
+    /// fingerprint was configured).
+    pinned_known_hosts: Option<PathBuf>,
 }
 
 impl SshTransport {
     /// Build a transport for `user@address`, whose application root is the
     /// absolute `remote_root` path on that host.
-    pub fn new(user: &str, address: &str, remote_root: &Path) -> Result<Self> {
+    ///
+    /// Host identity must be configured: pass a `known_hosts` file and/or a
+    /// `host_key_fingerprint`. If neither is provided the transport refuses to
+    /// connect (no trust-on-first-use).
+    pub fn new(
+        user: &str,
+        address: &str,
+        remote_root: &Path,
+        known_hosts: Option<&Path>,
+        host_key_fingerprint: Option<&str>,
+    ) -> Result<Self> {
         if user.is_empty() || address.is_empty() {
             return Err(Error::transport(
                 "ssh transport requires a non-empty user and address",
@@ -37,38 +62,161 @@ impl SshTransport {
         if remote_root.is_relative() {
             return Err(Error::transport("ssh remote_root must be an absolute path"));
         }
-        let target = format!("{user}@{address}");
-        Ok(SshTransport {
-            target,
+        let mut t = SshTransport {
+            target: format!("{user}@{address}"),
             root: remote_root.to_path_buf(),
-        })
+            known_hosts: known_hosts.map(|p| p.to_path_buf()),
+            host_key_fingerprint: host_key_fingerprint.map(|s| s.to_string()),
+            pinned_known_hosts: None,
+        };
+        // If a fingerprint was supplied without an explicit known-hosts file,
+        // verify the host key and pin it in a managed file before any command.
+        if t.known_hosts.is_none() && t.host_key_fingerprint.is_some() {
+            t.pin_known_hosts()?;
+        }
+        Ok(t)
     }
 
-    fn ssh_args(&self) -> Vec<String> {
-        vec![
+    /// Build the fixed `ssh` arguments (options + target). Errors if no host
+    /// identity has been configured, so the caller cannot accidentally fall back
+    /// to trust-on-first-use.
+    fn ssh_args(&self) -> Result<Vec<String>> {
+        let mut args: Vec<String> = vec![
             "-o".into(),
             "BatchMode=yes".into(),
             "-o".into(),
-            "StrictHostKeyChecking=accept-new".into(),
-            "-o".into(),
             "PreferredAuthentications=publickey".into(),
-            self.target.clone(),
-        ]
+        ];
+        match (&self.known_hosts, &self.pinned_known_hosts) {
+            (Some(kh), _) => {
+                args.push("-o".into());
+                args.push(format!("UserKnownHostsFile={}", kh.display()));
+                args.push("-o".into());
+                args.push("StrictHostKeyChecking=yes".into());
+            }
+            (None, Some(pinned)) => {
+                args.push("-o".into());
+                args.push(format!("UserKnownHostsFile={}", pinned.display()));
+                args.push("-o".into());
+                args.push("StrictHostKeyChecking=yes".into());
+            }
+            (None, None) => {
+                return Err(Error::transport(
+                    "ssh host identity is not configured: provide `known_hosts` or \
+                     `host_key_fingerprint` (trust-on-first-use is disabled)",
+                ));
+            }
+        }
+        args.push(self.target.clone());
+        Ok(args)
     }
 
-    /// Run a remote command (no shell interpolation of our own data; argv are
-    /// passed as discrete parameters) and return its stdout.
-    fn run_remote(&self, argv: &[String]) -> Result<std::process::Output> {
+    /// Verify the remote host key against the configured fingerprint and pin it
+    /// in a managed known-hosts file. Fails closed if the key cannot be fetched
+    /// or does not match.
+    fn pin_known_hosts(&mut self) -> Result<()> {
+        let expected = self
+            .host_key_fingerprint
+            .clone()
+            .ok_or_else(|| Error::transport("host_key_fingerprint required for pinning"))?;
+        let expected = expected.trim().to_lowercase();
+
+        let path = std::env::temp_dir().join(format!(
+            "deploy-knownhosts-{}.txt",
+            simple_hash(&self.target)
+        ));
+        if path.exists() {
+            // Already pinned for this target; reuse it.
+            self.pinned_known_hosts = Some(path);
+            return Ok(());
+        }
+
+        // Fetch the host keys.
+        let scan = Command::new("ssh-keyscan")
+            .arg("-t")
+            .arg("ed25519,ecdsa,rsa")
+            .arg(&self.target)
+            .output()
+            .map_err(|e| {
+                Error::transport(format!("ssh-keyscan {} failed: {e}", self.target))
+            })?;
+        if !scan.status.success() {
+            return Err(Error::transport(format!(
+                "ssh-keyscan {} failed: {}",
+                self.target,
+                String::from_utf8_lossy(&scan.stderr)
+            )));
+        }
+        let text = String::from_utf8_lossy(&scan.stdout);
+
+        // For each fetched key, compute its fingerprint and keep the ones whose
+        // fingerprint matches the configured value.
+        let mut matched: Vec<String> = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            // Pipe the single key line into `ssh-keygen -lf` to obtain its
+            // fingerprint (e.g. "256 SHA256:xxxx comment (ED25519)").
+            let keygen = Command::new("ssh-keygen")
+                .arg("-lf")
+                .arg("-")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| Error::transport(format!("ssh-keygen spawn: {e}")))?;
+            use std::io::Write;
+            keygen
+                .stdin
+                .as_ref()
+                .unwrap()
+                .write_all(line.as_bytes())
+                .map_err(|e| Error::transport(format!("ssh-keygen stdin: {e}")))?;
+            let out = keygen
+                .wait_with_output()
+                .map_err(|e| Error::transport(format!("ssh-keygen wait: {e}")))?;
+            if !out.status.success() {
+                continue;
+            }
+            let fp = String::from_utf8_lossy(&out.stdout);
+            // The fingerprint is the second whitespace-separated field.
+            let fp_field = fp.split_whitespace().nth(1).unwrap_or("").to_lowercase();
+            if fp_field == expected {
+                matched.push(line.to_string());
+            }
+        }
+
+        if matched.is_empty() {
+            return Err(Error::transport(format!(
+                "no host key for {} matched configured fingerprint {}",
+                self.target, expected
+            )));
+        }
+
+        std::fs::write(&path, matched.join("\n").trim_end().to_string() + "\n")
+            .map_err(|e| Error::transport(format!("write known_hosts: {e}")))?;
+        self.pinned_known_hosts = Some(path);
+        Ok(())
+    }
+
+    /// Run a single remote shell command (already fully quoted) and return its
+    /// stdout/stderr/status. The command is passed as one `ssh` argument after
+    /// `--`, so OpenSSH cannot interpret any part of our data as options or as
+    /// the connection target.
+    fn run_remote(&self, command: &str) -> Result<std::process::Output> {
+        let args = self.ssh_args()?;
         let mut cmd = Command::new("ssh");
-        cmd.args(self.ssh_args());
+        cmd.args(&args);
         cmd.arg("--");
-        cmd.args(argv);
+        cmd.arg(command);
         cmd.output()
-            .map_err(|e| Error::transport(format!("ssh {}: {e}", argv.join(" "))))
+            .map_err(|e| Error::transport(format!("ssh {}: {e}", command)))
     }
 
-    fn run_remote_ok(&self, argv: &[String]) -> Result<()> {
-        let out = self.run_remote(argv)?;
+    fn run_remote_ok(&self, command: &str) -> Result<()> {
+        let out = self.run_remote(command)?;
         if !out.status.success() {
             return Err(Error::transport(format!(
                 "ssh command failed: {}",
@@ -78,18 +226,28 @@ impl SshTransport {
         Ok(())
     }
 
+    /// Build a remote shell command string from an `argv`, quoting every
+    /// argument so the remote shell re-tokenizes it back into exactly `argv`.
+    fn argv_cmd(argv: &[String]) -> String {
+        argv
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// Upload raw bytes to a remote path (creating parent dirs).
     fn upload_bytes(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
         let remote_path = self.root.join(rel);
         let remote_path_str = remote_path.to_string_lossy().into_owned();
-        let mut cmd = Command::new("ssh");
-        cmd.args(self.ssh_args());
-        cmd.arg("--");
-        // Create parent dirs then stream stdin into the file.
-        cmd.arg(format!(
+        let script = format!(
             "mkdir -p $(dirname {p}) && cat > {p}",
             p = shell_quote(&remote_path_str)
-        ));
+        );
+        let mut cmd = Command::new("ssh");
+        cmd.args(self.ssh_args()?);
+        cmd.arg("--");
+        cmd.arg(&script);
         cmd.stdin(Stdio::piped());
         let mut child = cmd
             .spawn()
@@ -111,18 +269,22 @@ impl SshTransport {
             )));
         }
         if mode != 0 {
-            self.run_remote_ok(&[
+            self.run_remote_ok(&Self::argv_cmd(&[
                 "chmod".into(),
                 format!("{:o}", mode & 0o7777),
                 remote_path_str,
-            ])?;
+            ]))?;
         }
         Ok(())
     }
 
     fn download_bytes(&self, rel: &Path) -> Result<Vec<u8>> {
         let remote_path = self.root.join(rel);
-        let out = self.run_remote(&[remote_path.to_string_lossy().into_owned()])?;
+        let remote_path_str = remote_path.to_string_lossy().into_owned();
+        // Read the file contents with `cat`; the path is quoted so a path that
+        // happens to contain shell metacharacters (or an executable-bit path) is
+        // never executed.
+        let out = self.run_remote(&format!("cat {}", shell_quote(&remote_path_str)))?;
         if !out.status.success() {
             return Err(Error::transport(format!(
                 "ssh download failed: {}",
@@ -133,9 +295,20 @@ impl SshTransport {
     }
 }
 
-/// Single-quote a string for safe inclusion in a remote shell token.
+/// Single-quote a string for safe inclusion in a remote shell token. A `'` is
+/// escaped as `'\''` (close-quote, escaped quote, reopen-quote).
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Stable, filesystem-safe hash of a string for building temp-file names.
+fn simple_hash(s: &str) -> String {
+    let mut h: u64 = 1469598103934665603; // FNV-1a offset basis
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    format!("{h:016x}")
 }
 
 impl Remote for SshTransport {
@@ -153,12 +326,12 @@ impl Remote for SshTransport {
 
     fn create_dir(&self, rel: &Path) -> Result<()> {
         let p = self.root.join(rel).to_string_lossy().into_owned();
-        self.run_remote_ok(&["mkdir".into(), p])
+        self.run_remote_ok(&Self::argv_cmd(&["mkdir".into(), p]))
     }
 
     fn create_dir_all(&self, rel: &Path) -> Result<()> {
         let p = self.root.join(rel).to_string_lossy().into_owned();
-        self.run_remote_ok(&["mkdir".into(), "-p".into(), p])
+        self.run_remote_ok(&Self::argv_cmd(&["mkdir".into(), "-p".into(), p]))
     }
 
     fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
@@ -169,7 +342,7 @@ impl Remote for SshTransport {
             "for e in {p}/* {p}/.*; do [ -e \"$e\" ] || continue; n=$(basename \"$e\"); if [ -L \"$e\" ]; then t=l; elif [ -d \"$e\" ]; then t=d; else t=f; fi; printf '%s\\t%s\\n' \"$n\" \"$t\"; done",
             p = shell_quote(&p.to_string_lossy())
         );
-        let out = self.run_remote(&[script])?;
+        let out = self.run_remote(&script)?;
         if !out.status.success() {
             return Err(Error::transport(format!(
                 "ssh list failed: {}",
@@ -200,45 +373,38 @@ impl Remote for SshTransport {
     fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         let f = self.root.join(from).to_string_lossy().into_owned();
         let t = self.root.join(to).to_string_lossy().into_owned();
-        self.run_remote_ok(&[
-            "mkdir".into(),
-            "-p".into(),
-            shell_quote(
-                &Path::new(&t)
-                    .parent()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| ".".to_string()),
-            ),
-            "&&".into(),
-            "mv".into(),
-            shell_quote(&f),
-            shell_quote(&t),
-        ])
+        let parent = Path::new(&t)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        let cmd = format!(
+            "mkdir -p {parent} && mv {f} {t}",
+            parent = shell_quote(&parent),
+            f = shell_quote(&f),
+            t = shell_quote(&t),
+        );
+        self.run_remote_ok(&cmd)
     }
 
     fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
         let t = target.to_string_lossy().into_owned();
         let l = self.root.join(link).to_string_lossy().into_owned();
-        self.run_remote_ok(&[
-            "mkdir".into(),
-            "-p".into(),
-            shell_quote(
-                &Path::new(&l)
-                    .parent()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| ".".to_string()),
-            ),
-            "&&".into(),
-            "ln".into(),
-            "-sfn".into(),
-            shell_quote(&t),
-            shell_quote(&l),
-        ])
+        let parent = Path::new(&l)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        let cmd = format!(
+            "mkdir -p {parent} && ln -sfn {t} {l}",
+            parent = shell_quote(&parent),
+            t = shell_quote(&t),
+            l = shell_quote(&l),
+        );
+        self.run_remote_ok(&cmd)
     }
 
     fn read_link(&self, rel: &Path) -> Result<PathBuf> {
         let p = self.root.join(rel).to_string_lossy().into_owned();
-        let out = self.run_remote(&["readlink".into(), shell_quote(&p)])?;
+        let out = self.run_remote(&Self::argv_cmd(&["readlink".into(), p]))?;
         if !out.status.success() {
             return Err(Error::transport(format!(
                 "ssh readlink failed: {}",
@@ -252,7 +418,7 @@ impl Remote for SshTransport {
     fn remove_file(&self, rel: &Path) -> Result<()> {
         let p = self.root.join(rel).to_string_lossy().into_owned();
         // Ignore "not found".
-        let out = self.run_remote(&["rm".into(), "-f".into(), shell_quote(&p)])?;
+        let out = self.run_remote(&Self::argv_cmd(&["rm".into(), "-f".into(), p]))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             if !stderr.contains("No such file") && !stderr.contains("No such") {
@@ -264,20 +430,30 @@ impl Remote for SshTransport {
 
     fn remove_dir_all(&self, rel: &Path) -> Result<()> {
         let p = self.root.join(rel).to_string_lossy().into_owned();
-        self.run_remote_ok(&["rm".into(), "-rf".into(), shell_quote(&p)])
+        self.run_remote_ok(&Self::argv_cmd(&[
+            "rm".into(),
+            "-rf".into(),
+            p,
+        ]))
     }
 
     fn exists(&self, rel: &Path) -> bool {
         let p = self.root.join(rel).to_string_lossy().into_owned();
-        let out = self.run_remote(&["test".into(), "-e".into(), shell_quote(&p)]);
+        let out = self.run_remote(&Self::argv_cmd(&["test".into(), "-e".into(), p]));
         matches!(out, Ok(o) if o.status.success())
     }
 
     fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
         let p = self.root.join(rel).to_string_lossy().into_owned();
-        // %s size, %f raw mode hex
-        let out =
-            self.run_remote(&["stat".into(), "-c".into(), "%s %f".into(), shell_quote(&p)])?;
+        // `%s %f` is a SINGLE format argument; it is single-quoted by
+        // `argv_cmd` so the remote shell keeps the space inside one token and
+        // `stat` receives "-c" "%s %f" "<path>" exactly.
+        let out = self.run_remote(&Self::argv_cmd(&[
+            "stat".into(),
+            "-c".into(),
+            "%s %f".into(),
+            p,
+        ]))?;
         if !out.status.success() {
             return Err(Error::transport(format!(
                 "ssh stat failed: {}",
@@ -315,10 +491,15 @@ impl Remote for SshTransport {
         if argv.is_empty() {
             return Err(Error::transport("empty command"));
         }
+        // Preserve argv boundaries: quote every argument and run them via `exec`
+        // so the program receives exactly `argv` and the remote shell cannot
+        // reinterpret spaces/metacharacters inside an argument.
+        let command = format!("exec {}", Self::argv_cmd(argv));
+        let args = self.ssh_args()?;
         let mut cmd = Command::new("ssh");
-        cmd.args(self.ssh_args());
+        cmd.args(&args);
         cmd.arg("--");
-        cmd.args(argv);
+        cmd.arg(&command);
         let child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -356,7 +537,7 @@ impl Remote for SshTransport {
 
     fn available_bytes(&self) -> Result<u64> {
         let p = self.root.to_string_lossy().into_owned();
-        let out = self.run_remote(&["df".into(), "-kP".into(), shell_quote(&p)])?;
+        let out = self.run_remote(&Self::argv_cmd(&["df".into(), "-kP".into(), p]))?;
         if !out.status.success() {
             return Err(Error::transport(format!(
                 "ssh df failed: {}",
@@ -375,26 +556,59 @@ impl Remote for SshTransport {
             .ok_or_else(|| Error::transport("could not parse ssh df avail".to_string()))?;
         Ok(avail_kb * 1024)
     }
+
+    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+        let remote_path = self.root.join(rel);
+        let remote_path_str = remote_path.to_string_lossy().into_owned();
+        let payload = String::from_utf8_lossy(data).into_owned();
+        // `set -C` enables the noclobber option so the `>` redirection fails if
+        // the file already exists, giving an atomic create-if-absent (O_EXCL) on
+        // the remote. Both the payload and the path are single-quoted so they
+        // cannot be reinterpreted.
+        let cmd = format!(
+            "set -C; printf '%s' {} > {}",
+            shell_quote(&payload),
+            shell_quote(&remote_path_str),
+        );
+        let out = self.run_remote(&cmd)?;
+        if out.status.success() {
+            Ok(true)
+        } else if self.exists(rel) {
+            // Already present: treat as a lost race rather than a hard error.
+            Ok(false)
+        } else {
+            Err(Error::transport(format!(
+                "ssh try_write_new failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )))
+        }
+    }
 }
 
-/// Confirm the transport can negotiate with the host (handshake marker helper).
-pub fn handshake_probe(target: &str) -> Result<u32> {
-    let mut cmd = Command::new("ssh");
-    cmd.args([
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-        "-o",
-        "PreferredAuthentications=publickey",
-        target,
-        "--",
-        "true",
-    ]);
-    let status = cmd
-        .status()
-        .map_err(|e| Error::transport(format!("ssh probe {target}: {e}")))?;
-    if status.success() {
+/// Confirm the transport can negotiate with the host. Host identity must be
+/// configured (see [`SshTransport::new`]); this refuses trust-on-first-use.
+pub fn handshake_probe(
+    target: &str,
+    known_hosts: Option<&Path>,
+    host_key_fingerprint: Option<&str>,
+) -> Result<u32> {
+    let (user, address) = match target.split_once('@') {
+        Some((u, a)) if !u.is_empty() && !a.is_empty() => (u.to_string(), a.to_string()),
+        _ => {
+            return Err(Error::transport(format!(
+                "ssh handshake probe: target '{target}' must be 'user@address'"
+            )))
+        }
+    };
+    let probe = SshTransport::new(
+        &user,
+        &address,
+        Path::new("/"),
+        known_hosts,
+        host_key_fingerprint,
+    )?;
+    let out = probe.run_remote("true")?;
+    if out.status.success() {
         Ok(PROTOCOL_VERSION)
     } else {
         Err(Error::transport(format!(

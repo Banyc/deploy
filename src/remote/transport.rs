@@ -52,6 +52,13 @@ pub trait Remote {
     fn root(&self) -> &Path;
     fn read(&self, rel: &Path) -> Result<Vec<u8>>;
     fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()>;
+    /// Atomically create `rel` with `data` only if it does not already exist.
+    /// Returns `Ok(true)` if the file was created, `Ok(false)` if it already
+    /// existed (the existing content is left untouched), or `Err` on other
+    /// failures. This is the non-racy primitive used for lock acquisition:
+    /// `exists`-then-`write` would let two controllers both observe "no lock"
+    /// and both proceed.
+    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool>;
     fn create_dir(&self, rel: &Path) -> Result<()>;
     fn create_dir_all(&self, rel: &Path) -> Result<()>;
     fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>>;
@@ -162,8 +169,9 @@ impl Remote for LocalTransport {
             .map_err(|e| Error::transport(format!("read_dir {}: {e}", dir.display())))?
         {
             let e = e.map_err(|e| Error::transport(format!("entry: {e}")))?;
-            let m = e
-                .metadata()
+            // `symlink_metadata` (not `metadata`) so a symlink is reported as a
+            // symlink with its own mode rather than being followed to its target.
+            let m = std::fs::symlink_metadata(e.path())
                 .map_err(|e| Error::transport(format!("meta: {e}")))?;
             out.push(RemoteEntry {
                 name: e.file_name().to_string_lossy().into_owned(),
@@ -220,6 +228,30 @@ impl Remote for LocalTransport {
                 }
             })
             .map_err(|e| Error::transport(format!("remove {}: {e}", p.display())))
+    }
+
+    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+        let p = join(&self.base, rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::transport(format!("mkdir {}: {e}", parent.display())))?;
+        }
+        // `create_new` maps to O_CREAT|O_EXCL: the create succeeds only if the
+        // file did not already exist, so two callers cannot both win the race.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                f.write_all(data)
+                    .map_err(|e| Error::transport(format!("write {}: {e}", p.display())))?;
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(Error::transport(format!("create {}: {e}", p.display()))),
+        }
     }
 
     fn remove_dir_all(&self, rel: &Path) -> Result<()> {
