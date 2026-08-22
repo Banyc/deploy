@@ -133,20 +133,22 @@ artifact mappings and its deployment policies:
 
 ```yaml
 # releases/v1/standard.yaml
+# All `from` paths are relative to the release directory (the directory named by
+# `release.path` in deploy.yaml), so artifact sources live under `artifacts/`.
 description: Standard deployment
 artifact:
   mappings:
-    - from: build/output/
+    - from: artifacts/build/output/
       to: app/
       recursive: true
-    - from: deployment/common/
+    - from: artifacts/deployment/common/
       to: app/
       recursive: true
-    - from: "deployment/variants/{{ variant }}/"
+    - from: "artifacts/deployment/variants/{{ variant }}/"
       to: app/
       recursive: true
       conflict: replace
-    - from: deployment/systemd/example.service
+    - from: artifacts/deployment/systemd/example.service
       to: integration/systemd/example.service
       mode: "0644"
 activation:

@@ -16,13 +16,13 @@ use std::path::Path;
 const VARIANT_BODY: &str = r#"
 artifact:
   mappings:
-    - from: build/output/
+    - from: artifacts/build/output/
       to: app/
       recursive: true
-    - from: deployment/common/
+    - from: artifacts/deployment/common/
       to: app/
       recursive: true
-    - from: "deployment/variants/{{ variant }}/"
+    - from: "artifacts/deployment/variants/{{ variant }}/"
       to: app/
       recursive: true
       conflict: replace
@@ -95,11 +95,13 @@ fn setup(proj: &Path) -> (Config, std::path::PathBuf) {
     write_file(&proj.join("deploy.yaml"), CONFIG);
     write_variant_file(proj, "standard", VARIANT_BODY);
     write_variant_file(proj, "high-capacity", VARIANT_BODY);
-    write_file(&proj.join("build/output/app/server"), "server-v1\n");
-    write_file(&proj.join("deployment/common/README"), "common\n");
-    write_file(&proj.join("deployment/variants/standard/extra"), "std\n");
+    // Artifact sources live beneath the release directory's `artifacts` tree.
+    let artifacts = proj.join("releases").join("v1").join("artifacts");
+    write_file(&artifacts.join("build/output/app/server"), "server-v1\n");
+    write_file(&artifacts.join("deployment/common/README"), "common\n");
+    write_file(&artifacts.join("deployment/variants/standard/extra"), "std\n");
     write_file(
-        &proj.join("deployment/variants/high-capacity/extra"),
+        &artifacts.join("deployment/variants/high-capacity/extra"),
         "hc\n",
     );
     let config = Config::load(&proj.join("deploy.yaml")).unwrap();
@@ -160,8 +162,16 @@ fn end_to_end_push_rollback() -> Result<()> {
     assert!(r_up.status.is_none(), "re-push with no change is a no-op");
     assert_eq!(r_up.message, "Everything up to date");
 
-    // Change content and push again (f1).
-    write_file(&proj.join("build/output/app/server"), "server-v2\n");
+    // Change content and push again (f1). The artifact source lives beneath the
+    // release directory's `artifacts` tree, not the project root.
+    write_file(
+        &proj
+            .join("releases")
+            .join("v1")
+            .join("artifacts")
+            .join("build/output/app/server"),
+        "server-v2\n",
+    );
     let r1 = push(
         &config,
         &config_path,
@@ -530,10 +540,10 @@ fn single_variant_body(verify_argv: &str) -> String {
         r#"
 artifact:
   mappings:
-    - from: build/output/
+    - from: artifacts/build/output/
       to: app/
       recursive: true
-    - from: deployment/common/
+    - from: artifacts/deployment/common/
       to: app/
       recursive: true
 activation: {{ adapter: none }}
@@ -598,8 +608,9 @@ fn setup_single(
         &single_target_yaml(stop_on_failure, batch_size),
     );
     write_variant_file(proj, "standard", &single_variant_body(verify_argv));
-    write_file(&proj.join("build/output/app/server"), "v1\n");
-    write_file(&proj.join("deployment/common/README"), "common\n");
+    let artifacts = proj.join("releases").join("v1").join("artifacts");
+    write_file(&artifacts.join("build/output/app/server"), "v1\n");
+    write_file(&artifacts.join("deployment/common/README"), "common\n");
     Config::load(&p).unwrap()
 }
 
@@ -639,7 +650,7 @@ targets:
     let variant_yaml = r#"
 artifact:
   mappings:
-    - from: build/output/
+    - from: artifacts/build/output/
       to: app/
       recursive: true
 activation: { adapter: none }
@@ -649,8 +660,9 @@ rotation: { per_server: { keep_distinct_artifacts: 5, keep_days: 14, protect_pre
 "#;
     write_file(&proj.join("deploy.yaml"), config_yaml);
     write_variant_file(&proj, "standard", variant_yaml);
-    write_file(&proj.join("build/output/app/server"), "v1\n");
-    write_file(&proj.join("deployment/common/README"), "common\n");
+    let artifacts = proj.join("releases").join("v1").join("artifacts");
+    write_file(&artifacts.join("build/output/app/server"), "v1\n");
+    write_file(&artifacts.join("deployment/common/README"), "common\n");
 
     let mut config = Config::load(&proj.join("deploy.yaml"))?;
     let store = LocalStore::with_base(store_base.clone())?;
@@ -991,7 +1003,7 @@ targets:
     let variant_yaml = r#"
 artifact:
   mappings:
-    - from: build/output/
+    - from: artifacts/build/output/
       to: app/
       recursive: true
 activation: { adapter: none }
@@ -1001,7 +1013,8 @@ rotation: { per_server: { keep_distinct_artifacts: 5, keep_days: 14, protect_pre
 "#;
     write_file(&proj.join("deploy.yaml"), yaml);
     write_variant_file(&proj, "standard", variant_yaml);
-    write_file(&proj.join("build/output/app/server"), "v1\n");
+    let artifacts = proj.join("releases").join("v1").join("artifacts");
+    write_file(&artifacts.join("build/output/app/server"), "v1\n");
 
     let config = Config::load(&proj.join("deploy.yaml"))?;
     let rf = remotes_base.clone();

@@ -130,8 +130,11 @@ fn push_inner(
     op_id: &OperationId,
     opts: &PushOptions,
 ) -> Result<PushReport> {
-    // 3. Materialize every declared variant. Dry-run uses disposable staging and
-    //    never writes to the object store.
+    // 3. Materialize every declared variant. Mappings resolve from the release
+    //    directory selected by `release.path`, not the project root, so an
+    //    artifact `from` can never escape into the project's other files. Dry-run
+    //    uses disposable staging and never writes to the object store.
+    let release_root = project_root.join(&config.release.path);
     let mut variant_trees: BTreeMap<String, TreeDigest> = BTreeMap::new();
     if matches!(pref, PushRef::Head) {
         for v in config.variant_names() {
@@ -144,7 +147,7 @@ fn push_inner(
                 store.staging_dir().join(&v)
             };
             crate::mapper::materialize_variant(
-                project_root,
+                &release_root,
                 &config.variant(&v)?.artifact.mappings,
                 &v,
                 &staging,
@@ -1361,10 +1364,10 @@ mod tests {
     const NONE_VARIANT: &str = r#"
 artifact:
   mappings:
-    - from: build/output/
+    - from: artifacts/build/output/
       to: app/
       recursive: true
-    - from: deployment/common/
+    - from: artifacts/deployment/common/
       to: app/
       recursive: true
 activation: { adapter: none }
@@ -1394,13 +1397,13 @@ targets:
     const SYSTEMD_VARIANT: &str = r#"
 artifact:
   mappings:
-    - from: build/output/
+    - from: artifacts/build/output/
       to: app/
       recursive: true
-    - from: deployment/common/
+    - from: artifacts/deployment/common/
       to: app/
       recursive: true
-    - from: units/
+    - from: artifacts/units/
       to: integration/systemd/
       recursive: true
 activation:
@@ -1453,18 +1456,23 @@ targets:
             std::fs::write(release_dir.join("standard.yaml"), variant_yaml).unwrap();
             let cfg_path = project.join("deploy.yaml");
             std::fs::write(&cfg_path, deploy_yaml).unwrap();
+            // Artifact sources live beneath the release directory (release_root /
+            // `artifacts`), so a `from` never reaches into the project root.
+            let artifacts_dir = release_dir.join("artifacts");
             for (p, c) in files {
-                let fp = project.join(p);
+                let fp = artifacts_dir.join(p);
                 std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
                 std::fs::write(&fp, c).unwrap();
             }
             let config = Config::load(&cfg_path).unwrap();
             let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
+            // Materialize from the release directory, not the project root.
+            let release_root = config.release_root(&cfg_path);
             let vcfg = config.variant("standard").unwrap();
             let staging = store.staging_dir().join("standard");
             crate::mapper::materialize_variant(
-                &project,
+                &release_root,
                 &vcfg.artifact.mappings,
                 "standard",
                 &staging,
@@ -1633,5 +1641,76 @@ targets:
         let proc = h.run(None);
         assert_eq!(proc.kind, ServerOutcomeKind::Failed);
         assert!(proc.error.unwrap().to_lowercase().contains("type"));
+    }
+
+    #[test]
+    fn materialization_prefers_release_local_artifacts() {
+        // A file with the same relative path exists both at the project root and
+        // inside the release directory's `artifacts` tree. The conflicting
+        // project-root copy is created BEFORE materialization; if `from` were
+        // resolved against the project root it would win. It must not.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        std::fs::write(release_dir.join("standard.yaml"), NONE_VARIANT).unwrap();
+        std::fs::write(project.join("deploy.yaml"), NONE_YAML).unwrap();
+
+        // Release-local artifact sources (under release_root/artifacts).
+        let artifacts_dir = release_dir.join("artifacts");
+        std::fs::create_dir_all(artifacts_dir.join("build/output/app")).unwrap();
+        std::fs::write(
+            artifacts_dir.join("build/output/app/server"),
+            "RELEASE-LOCAL\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(artifacts_dir.join("deployment/common")).unwrap();
+        std::fs::write(artifacts_dir.join("deployment/common/README"), "common\n").unwrap();
+
+        // Conflicting copy at the project root, present before materialization.
+        let project_root_file = project.join("build/output/app/server");
+        std::fs::create_dir_all(project_root_file.parent().unwrap()).unwrap();
+        std::fs::write(project_root_file, "PROJECT-ROOT\n").unwrap();
+
+        let cfg_path = project.join("deploy.yaml");
+        let config = Config::load(&cfg_path).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let release_root = config.release_root(&cfg_path);
+        let vcfg = config.variant("standard").unwrap();
+        let staging = store.staging_dir().join("standard");
+        crate::mapper::materialize_variant(
+            &release_root,
+            &vcfg.artifact.mappings,
+            "standard",
+            &staging,
+        )
+        .unwrap();
+        let meta = tree::canonicalize_tree(&staging).unwrap();
+        let tree = TreeDigest::new(meta.tree_sha256.clone());
+        store
+            .store_object(&meta.tree_sha256.into(), &staging)
+            .unwrap();
+
+        // Find the materialized `server` file wherever the recursive mapping
+        // placed it (the source dir's contents merge under `app/`).
+        let obj_root = store.object_root(&tree);
+        let server_file = std::fs::read_dir(&obj_root)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                e.path()
+                    .join("app")
+                    .join("server")
+                    .exists()
+                    .then_some(e.path().join("app").join("server"))
+            })
+            .next();
+        let server_file = server_file.expect("materialized server file present");
+        let content = std::fs::read_to_string(&server_file).unwrap();
+        assert_eq!(
+            content, "RELEASE-LOCAL\n",
+            "materialization must read from the release directory, not the project root"
+        );
     }
 }
