@@ -27,7 +27,9 @@ tree        = immutable filesystem content, identified only by its tree digest
 variant     = a name bound to one tree within a release
 artifact    = the immutable release + variant + tree binding
 release     = an immutable map of every declared variant to a tree digest
-target      = a named group of stable server IDs and its rollout policy
+server      = a durable machine identity: a stable ID plus its current address
+pod         = a binding of one top-level server to one variant
+target      = a named group of pods plus its rollout and retention policy
 deployment  = an attempted push and its exact per-server assignments
 generation  = one server's durable activation record for one assignment
 ```
@@ -36,8 +38,7 @@ Deployment, operation, and generation IDs are opaque collision-resistant IDs (UU
 
 Tree objects contain no release- or variant-specific metadata, so identical trees can be deduplicated safely. Release records bind variants to trees.
 
-The canonical release ID is derived from a versioned canonical identity payload covering the name-sorted per-variant mapping digests, all declared `variant → tree digest` bindings, and the name-sorted per-variant activation and verification behavior-contract digest. It explicitly excludes the resulting release ID, creation time, display name, and provenance, avoiding a circular hash. Two variants may share tree bytes while still requiring different activation and verification behavior, so behavior is captured per variant rather than once per release. Its stored form is `pel-sha256-full-`
-release-digest`; the CLI may display and accept an unambiguous digest prefix. Git revision and creation time are provenance only because mapped inputs can include generated or untracked files.
+The canonical release ID is derived from a versioned canonical identity payload covering the name-sorted per-variant mapping digests, all declared `variant → tree digest` bindings, and the name-sorted per-variant activation and verification behavior-contract digest. It explicitly excludes the resulting release ID, creation time, display name, and provenance, avoiding a circular hash. Two variants may share tree bytes while still requiring different activation and verification behavior, so behavior is captured per variant rather than once per release. Its stored form is `rel-sha256-<release-digest>`; the CLI may display and accept an unambiguous digest prefix. Git revision and creation time are provenance only because mapped inputs can include generated or untracked files.
 
 Mapping and behavior digests are computed from versioned canonical data after schema defaults, path normalization, and validation, not from TOML formatting, comments, or key order. The original configuration remains available as provenance, while `behavior.json` records the canonical behavior contract. Each variant's capacity policy is likewise persisted with the release record in `policies.json`; historical deployments resolve capacity headroom from that snapshot rather than the caller's current configuration, so a variant that was renamed or removed after the release was created still rolls back exactly. Retention (`rotation`) is target-level configuration declared within each target of the project file, not a per-variant or global setting, and is read from the caller's current configuration on every push.
 
@@ -59,7 +60,7 @@ deploy log production
 # Inspect the actual generation on every server.
 deploy status production
 # Restore the exact fleet assignment from an earlier deployment
-deploy push production production@f1}:current
+deploy push production production@f1
 ```
 
 `production` is not a built-in environment type. It is a user-chosen target name, analogous to a Git remote name such as `origin`, except that one target may fan out to multiple servers. Other valid names include `test-lab`, `datacenter-hk`, or `customer-acme`.
@@ -73,7 +74,7 @@ deploy push production
 is equivalent to:
 
 ```sh
-deploy push production HEAD: current
+deploy push production HEAD
 ```
 
 `HEAD` means "materialize the currently mapped local files" rather than "use only Git-tracked bytes." Pushing identical content reuses the existing local release and tree objects. It is a complete no-op only when reconciliation also shows that every target server already has the intended assignment and passes verification; otherwise the push repairs or completes the remote state.
@@ -153,6 +154,16 @@ variant = "high-capacity"
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 pods = ["app-1", "app-2", "hc-1"]
 ```
+
+Servers are declared exactly once at the top level; a pod binds one server to
+one variant, and each target lists its member pods by ID. A pod may be a member
+of several targets, and two pods may share one server in different targets, but
+within a single target each server appears at most once (one running generation
+per server). Besides `id`, `address`, and `user`, every server accepts an
+optional `port` (default 22) and exactly one host-identity source: a dedicated
+`known_hosts` file used with `StrictHostKeyChecking=yes`, or a pre-verified
+`host_key_fingerprint` (`SHA256:...`) that is pinned on first contact.
+Trust-on-first-use without a configured identity source is disabled.
 
 Each variant is described by its own file inside the release directory (e.g.
 `releases/v1/standard.toml`); there is no explicit variant list to keep in
@@ -257,7 +268,8 @@ The local store contains the exact immutable trees sent to servers, immutable re
       <tree-digest>/
         root/
           ... arbitrary files
-  tree.json
+        tree.json
+  staging/
   releases/
     <release-id>/
       mapping.toml
@@ -300,8 +312,9 @@ Tree metadata is identity-neutral. For example,
 }
 ```
 
-`tree.json` is:
-Release-specific metadata lives outside the tree object. For example, `release.json` is:
+`tree.json` is content-addressed, identity-neutral metadata stored next to
+every tree object (locally and remotely), as shown earlier. Release-specific
+metadata lives outside the tree object. For example, `release.json` is:
 
 ```json
 {
@@ -334,43 +347,39 @@ Each server stores only variants it has actually received:
 ```text
 /srv/deploy/example/
   control/
-  helpers/
-    <protocol-version>/deploy-helper
-    current-helper → helpers/<protocol-version>/deploy-helper
+    protocol.json            # protocol-version handshake marker
   objects/
     sha256/
       <tree-digest>/
         root/
           ... arbitrary files
         tree.json
-  files
   releases/
     <release-id>/
-      behavior.json
       release.json
+      behavior.json
   generations/
     <generation-id>/
       assignment.json
       root → ../../objects/sha256/<tree-digest>/root
-      current → generations/<generation-id>/root
-    incoming/
-      <deployment-id>/
-        <tree-digest>.partial/
-    state/
-      history.jsonl
-      inventory.json
-      pins.json
-      operation.lock
-    adapters/
-      systemd.json
-    transactions/
-      <operation-id>.json
+  current → generations/<generation-id>/root
+  incoming/
+    <deployment-id>/
+      <tree-digest>.partial/
+  adapters/
+    systemd.json             # unit links owned by the systemd adapter
+  transactions/
+    <operation-id>.json
+  state/
+    history.jsonl
+    inventory.json
+    pins.json
+    operation.lock
 ```
 
 Tree objects, release records, and generation records are immutable. Staging uploads may run concurrently because each uses a deployment-specific incoming path that is invisible to activation and rotation. The remote mutation lock is acquired before a staged tree is published and held through publication, generation creation, activation, verification, state recording, and rotation. Existing objects are reused only after their digest and manifest are verified.
 
-Publishing renames a verified incoming directory into `objects/` on the same filesystem. A generation binds a deployment ID, release ID, `variant`, tree digest, behavior snapshot, and prior generation. After its files and a durable transaction record have been written and synced, activation cre
-ates a temporary symlink beside `current`, atomically renames it over `current`, and syncs the parent directory. This single durable pointer replacement is the per-server commit point.
+Publishing renames a verified incoming directory into `objects/` on the same filesystem. A generation binds a deployment ID, release ID, `variant`, tree digest, behavior snapshot, and prior generation. After its files and a durable transaction record have been written and synced, activation creates a temporary symlink beside `current`, atomically renames it over `current`, and syncs the parent directory. This single durable pointer replacement is the per-server commit point.
 
 There is no independently updated `previous` symlink. The previous successful generation is derived from the immutable generation chain and history. This avoids pretending that two reference updates can be atomic. On startup or the next connection, the remote helper reconciles any unfinished transaction with the actual `current` target and either completes its record or restores the prior generation before accepting another mutation.
 
@@ -378,7 +387,7 @@ Atomicity is per server, not across a fleet. Fleet consistency is provided by th
 
 ## Push transaction
 `deploy push <target>` performs the following:
-1. Validate the configuration, unique stable server IDs, variant assignments, paths, adapter settings, and SSH host identities.
+1. Validate the configuration, unique stable server IDs, pod-to-variant bindings, paths, adapter settings, and SSH host identities.
 2. Acquire the local application-store lock and target lock in that order. Application-store publication and local rotation are serialized across targets; target history updates are serialized per target.
 3. Materialize every declared variant, generate canonical tree objects, and reuse any object whose digest already exists and verifies correctly.
 4. Freeze the mapping, activation, and verification contract; generate or reuse the immutable release record.
@@ -405,7 +414,7 @@ The local target lock prevents competing pushes from the same local store. Expec
 If materialization produces an existing release and reconciliation finds the exact desired generation healthy on every server, the command prints `Everything up to date` without creating a deployment attempt. Existing local
 content never suppresses required remote repair.
 
-`-dry-run` materializes and inspects local content and performs read-only remote status queries in disposable staging. It does not publish local objects, recover remote transactions, upload, publish remotely, activate, execute application verification, write history, or rotate. Instead, it reports any recovery that a real push would have to perform.
+`--dry-run` materializes and inspects local content and performs read-only remote status queries in disposable staging. It does not publish local objects, recover remote transactions, upload, publish remotely, activate, execute application verification, write history, or rotate. Instead, it reports any recovery that a real push would have to perform.
 
 ## Fleet history and rollback
 Every deployment attempt records its target snapshot, behavior contract, pre-push state, desired state, and actual result. A successful example is:
@@ -418,6 +427,7 @@ Every deployment attempt records its target snapshot, behavior contract, pre-pus
   "target": "production",
   "server_ids": ["server-01", "server-02", "server-03"],
   "behavior_sha256": "03df...",
+  "attempted_at": "2026-08-21T10:20:00Z",
   "servers": {
     "server-01": {
       "release": "rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1",
@@ -441,14 +451,17 @@ Every deployment attempt records its target snapshot, behavior contract, pre-pus
 }
 ```
 
-The target reflog contains only fully successful fleet snapshots and exposes them as `production@f0}`, `production@f1}`, and so on. Failed and degraded attempts remain visible through `deploy log production` and `attempts.jsonl`, but are not valid rollback sources.
+(The example omits the parallel `desired` and `pre_push` maps for brevity; the
+stored record contains both alongside `servers`.)
+
+The target reflog contains only fully successful fleet snapshots and exposes them as `production@f0`, `production@f1`, and so on. Failed and degraded attempts remain visible through `deploy log production` and `attempts.jsonl`, but are not valid rollback sources.
 
 A fleet commit is authoritative only when the same deployment ID and server-ID set are committed on every member. This lets a fresh or repaired local store reconstruct successful fleet history from the servers instead of trusting a stale local ref.
 
 Pushing an older successful reference restores its complete assignment, including the historical behavior contract and different variants on different servers:
 
 ```sh
-deploy push production production@f1}:current
+deploy push production production@f1
 ```
 
 Exact fleet rollback requires the current target to contain the same stable server-ID set as the saved deployment. Addresses may change and are taken from the current target definition after host-identity verification. If membership has changed, exact rollback fails during preflight without modifying a server.
@@ -466,7 +479,7 @@ That form assigns each current server the named release's tree for its current v
 Rollback never rebuilds a tree. It uses the retained immutable object with the recorded digest. All required objects are checked locally and staged remotely before the first server changes. If an object is missing locally, reconciliation first attempts to recover it from a target server that retains the verified digest. If no verified copy can be recovered, preflight fails and leaves every `current` pointer unchanged.
 
 ## Protection and rotation
-Retention is evaluated per server because servers may have different release and variant histories. A successful fleet deployment is committed back to each participating server before rotation, allowing its generation history to record the fleet deployment ID. Rotation does not run if those commit markers cannot be reconciled.
+The retention policy comes from the pushed target's own `rotation` configuration, so different targets can retain differently (a canary target may retain more than production). Retention is evaluated per server because servers may have different release and variant histories. A successful fleet deployment is committed back to each participating server before rotation, allowing its generation history to record the fleet deployment ID. Rotation does not run if those commit markers cannot be reconciled.
 
 Capacity preflight reserves the larger of `capacity.reserve_bytes` and `capacity.reserve_percent` of the destination filesystem after the upload. It may invoke the same protected rotation before staging, but never weakens the retained set merely to make a deployment fit.
 
@@ -479,8 +492,7 @@ For each server, the retained content set is exactly this union:
 - artifacts or releases selected by durable pins
 - the newest keep_distinct_artifacts distinct successful artifact bindings
 - artifacts successfully activated less than keep_days ago
-- that server's artifacts in the newest fleet. protect_deployments
-- fleet commits
+- that server's artifacts in the newest protect_deployments fleet commits
 ```
 
 An artifact binding is `(release ID, variant, tree digest)`. Repeated repair or restart generations for the same binding consume one retention slot, not many.
@@ -521,12 +533,11 @@ Artifact-controlled unit files are supported by default only with `scope: user`,
 For a system service, an administrator installs a root-owned wrapper unit whose security-sensitive directives, service user, and stable command entry point are not writable by the deployment account. In `scope: system`, `push` only verifies that wrapper's identity and uses a narrowly scoped permission to restart that specific unit. It never links an artifact-controlled unit into `/etc/systemd/system`. Treating a deployment account as authorized to replace system unit contents would make that account effectively root and is outside the safe default design.
 
 ## Transport and remote helper
-The initial transport is SSH with strict host-key verification. Server IDs, target names, variant names, release IDs, and paths are validated data and are never concatenated into remote shell commands. Bulk tree transfer uses SFTP or an equivalent framed channel.
+The initial transport is SSH with strict host-key verification (per-server `known_hosts` or pinned `host_key_fingerprint`). An explicit `local://<absolute-path>` server address instead routes the transport to that exact filesystem endpoint; it exists for tests and for local targets. Server IDs, target names, variant names, release IDs, and paths are validated data and are never concatenated into remote shell commands. Bulk tree transfer uses SFTP or an equivalent framed channel.
 
-A small versioned remote helper owns status inspection, locking, object publication, generation switching, transaction recovery, adapter invocation, and rotation. Client and helper perform a protocol-version handshake before mutation. Every mutating request carries an operation ID and is idempotent, so a disconnected client can reconnect and learn whether the operation prepared, committed, compensated, or never began.
+A small versioned remote helper owns status inspection, locking, object publication, generation switching, transaction recovery, adapter invocation, and rotation. Client and helper perform a protocol-version handshake before mutation (the negotiated version is recorded under `control/`; schema version 1 speaks protocol 1). Every mutating request carries an operation ID and is idempotent, so a disconnected client can reconnect and learn whether the operation prepared, committed, compensated, or never began. Packaging these operations as a single versioned helper binary uploaded beneath `remote_root` is the planned evolution; it does not change this contract.
 
-Remote-helper bootstrap is an internal first-push stage. After authenticating
-the server, the client uploads its matching helper into a versioned location beneath `remote_root`, verifies the expected digest, and atomically updates the unprivileged helper entry point. If the deployment account cannot create `remote_root`, an administrator must provision that directory once. Privileged systemd control must likewise be provisioned through the fixed, root-owned wrapper and narrowly scoped restart permission described above; `push` does not grant itself privileges.
+If the deployment account cannot create `remote_root`, an administrator must provision that directory once. Privileged systemd control must likewise be provisioned through the fixed, root-owned wrapper and narrowly scoped restart permission described above; `push` does not grant itself privileges.
 
 The remote application root and state are writable only by the deployment account. Artifact permissions may make selected files readable by the runtime service account, but state, incoming content, and manifests are not generally readable. Because the core cannot recognize secrets, users must understand that any sensitive bytes mapped into a tree will be retained in multiple local and remote versions. External credential references are preferred when versioned secret retention is undesirable.
 
