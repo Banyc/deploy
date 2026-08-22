@@ -66,15 +66,15 @@ impl<'a> RemoteHelper<'a> {
         if self.remote.exists(Path::new("current")) {
             let target = self.remote.read_link(Path::new("current"))?;
             let comps: Vec<&str> = target.components().map(|c| c.as_os_str().to_str().unwrap_or("")).collect();
-            if let Some(pos) = comps.iter().position(|&c| c == "generations") {
-                if let Some(gid) = comps.get(pos + 1) {
-                    status.current_generation = Some(gid.to_string());
-                }
+            if let Some(pos) = comps.iter().position(|&c| c == "generations")
+                && let Some(gid) = comps.get(pos + 1)
+            {
+                status.current_generation = Some(gid.to_string());
             }
-            if let Some(genid) = &status.current_generation {
-                if let Ok(a) = self.read_assignment(genid) {
-                    status.current_tree = Some(a.tree);
-                }
+            if let Some(genid) = &status.current_generation
+                && let Ok(a) = self.read_assignment(genid)
+            {
+                status.current_tree = Some(a.tree);
             }
         }
 
@@ -214,23 +214,21 @@ impl<'a> RemoteHelper<'a> {
                 .iter()
                 .position(|c| c == "generations")
                 .and_then(|i| comps.get(i + 1).cloned());
-            if let Some(exp) = expected {
-                if actual.as_deref() != Some(exp) {
+            if let Some(exp) = expected && actual.as_deref() != Some(exp) {
                     return Err(Error::remote(format!(
                         "compare-and-swap precondition failed: current generation is {:?}, expected {exp}",
                         actual
                     )));
-                }
             }
         }
         let new_target = Path::new("generations").join(gen_id).join("root");
         let tmp_name = format!(".current.tmp.{op_id}");
         let tmp = Path::new(&tmp_name);
         // Remove any stale temp link.
-        self.remote.remove_file(&tmp)?;
-        self.remote.symlink(&new_target, &tmp)?;
-        self.remote.rename(&tmp, Path::new("current"))?;
-        self.remote.remove_file(&tmp).ok();
+        self.remote.remove_file(tmp)?;
+        self.remote.symlink(new_target.as_path(), tmp)?;
+        self.remote.rename(tmp, Path::new("current"))?;
+        self.remote.remove_file(tmp).ok();
         Ok(())
     }
 

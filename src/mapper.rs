@@ -173,7 +173,7 @@ pub fn materialize_variant(
                     ConflictPolicy::Error => {
                         return Err(Error::conflict(format!(
                             "mapping[{idx}] destination '{}' already exists",
-                            normalize_rel(&dst.strip_prefix(dest).unwrap_or(&dst))
+                            normalize_rel(dst.strip_prefix(dest).unwrap_or(dst.as_path()))
                         )));
                     }
                     ConflictPolicy::Keep => continue,

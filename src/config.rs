@@ -12,31 +12,21 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ConflictPolicy {
+    #[default]
     Error,
     Replace,
     Keep,
 }
 
-impl Default for ConflictPolicy {
-    fn default() -> Self {
-        ConflictPolicy::Error
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PinVariants {
+    #[default]
     All,
     Some(Vec<String>),
-}
-
-impl Default for PinVariants {
-    fn default() -> Self {
-        PinVariants::All
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,17 +73,12 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ActivationScope {
+    #[default]
     User,
     System,
-}
-
-impl Default for ActivationScope {
-    fn default() -> Self {
-        ActivationScope::User
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -307,11 +292,9 @@ impl Config {
 
         // Validate mapping modes.
         for (i, m) in self.artifact.mappings.iter().enumerate() {
-            if let Some(mode) = &m.mode {
-                if mode != "preserve" {
-                    parse_octal_mode(mode)
-                        .map_err(|e| Error::config(format!("mapping[{i}] mode: {e}")))?;
-                }
+            if let Some(mode) = &m.mode && mode != "preserve" {
+                parse_octal_mode(mode)
+                    .map_err(|e| Error::config(format!("mapping[{i}] mode: {e}")))?;
             }
             if m.from.trim().is_empty() || m.to.trim().is_empty() {
                 return Err(Error::config(format!(

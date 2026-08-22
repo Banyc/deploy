@@ -57,15 +57,13 @@ pub fn activation_commands(
             link_target.to_string_lossy().into_owned(),
             link.to_string_lossy().into_owned(),
         ]);
-        if u.enable {
-            if let Some(flag) = scope_flag {
-                cmds.push(vec![
-                    "systemctl".into(),
-                    flag.into(),
-                    "enable".into(),
-                    u.name.clone(),
-                ]);
-            }
+        if u.enable && let Some(flag) = scope_flag {
+            cmds.push(vec![
+                "systemctl".into(),
+                flag.into(),
+                "enable".into(),
+                u.name.clone(),
+            ]);
         }
         if u.restart {
             if let Some(flag) = scope_flag {

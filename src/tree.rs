@@ -165,7 +165,7 @@ pub fn compute_tree_digest(meta: &TreeMetadata) -> String {
 /// Re-canonicalize an existing object root to verify its recorded digest.
 pub fn verify_tree_root(root: &Path, expected: &TreeDigest) -> Result<bool> {
     let meta = canonicalize_tree(root)?;
-    Ok(&meta.tree_sha256 == expected.as_str())
+    Ok(meta.tree_sha256 == expected.as_str())
 }
 
 /// Build the artifact-relative path strings for a tree's entries (used by the

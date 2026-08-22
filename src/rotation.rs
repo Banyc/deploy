@@ -70,16 +70,13 @@ pub fn compute_retained(
     }
 
     // Prior distinct successful artifact when protect_previous is true.
-    if config.rotation.per_server.protect_previous {
-        if let Some(cur) = &status.current_generation {
-            if let Ok(a) = helper.read_assignment(cur) {
-                if let Some(prior) = &a.prior_generation {
-                    if let Ok(pa) = helper.read_assignment(prior) {
-                        retained.insert(pa.tree);
-                    }
-                }
-            }
-        }
+    if config.rotation.per_server.protect_previous
+        && let Some(cur) = &status.current_generation
+        && let Ok(a) = helper.read_assignment(cur)
+        && let Some(prior) = &a.prior_generation
+        && let Ok(pa) = helper.read_assignment(prior)
+    {
+        retained.insert(pa.tree);
     }
 
     // Distinct successful artifact bindings, keyed by (release, variant, tree).
@@ -93,7 +90,7 @@ pub fn compute_retained(
     }
     // Sort by most recent activation descending.
     let mut ordered: Vec<((String, String, String), DateTime<Utc>)> = distinct.into_iter().collect();
-    ordered.sort_by(|a, b| b.1.cmp(&a.1));
+    ordered.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
 
     let keep_distinct = config.rotation.per_server.keep_distinct_artifacts as usize;
     for ((_, _, tree), _) in ordered.iter().take(keep_distinct) {
@@ -121,7 +118,7 @@ pub fn compute_retained(
             }
         }
         let mut depl_ordered: Vec<(String, DateTime<Utc>)> = depl.into_iter().collect();
-        depl_ordered.sort_by(|a, b| b.1.cmp(&a.1));
+        depl_ordered.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
         let keep_ids: HashSet<String> = depl_ordered
             .iter()
             .take(protect_deployments)
@@ -198,8 +195,7 @@ targets:
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("deploy.yaml");
         std::fs::write(&p, yaml).unwrap();
-        let c = Config::load(&p).unwrap();
-        c
+        Config::load(&p).unwrap()
     }
 
     #[test]

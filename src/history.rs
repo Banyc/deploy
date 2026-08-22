@@ -68,7 +68,7 @@ pub fn parse_push_ref(token: &str) -> Result<PushRef> {
         });
     }
     if base.starts_with("release/") {
-        let id = base["release/".len()..].to_string();
+        let id = base.strip_prefix("release/").unwrap().to_string();
         return Ok(PushRef::Release {
             release: ReleaseId::parse(&id),
             current_variant,

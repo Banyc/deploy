@@ -29,7 +29,7 @@ fn new_uuid_v7() -> String {
 
 macro_rules! id_newtype {
     ($name:ident) => {
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default)]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -217,30 +217,6 @@ pub struct ArtifactBinding {
     pub release: ReleaseId,
     pub variant: VariantName,
     pub tree: TreeDigest,
-}
-
-impl Default for TargetName {
-    fn default() -> Self {
-        TargetName(String::new())
-    }
-}
-
-impl Default for ServerId {
-    fn default() -> Self {
-        ServerId(String::new())
-    }
-}
-
-impl Default for VariantName {
-    fn default() -> Self {
-        VariantName(String::new())
-    }
-}
-
-impl Default for TreeDigest {
-    fn default() -> Self {
-        TreeDigest(String::new())
-    }
 }
 
 #[cfg(test)]

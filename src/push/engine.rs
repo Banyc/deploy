@@ -66,10 +66,8 @@ pub fn push(
         Some(t) => history::parse_push_ref(t)?,
         None => PushRef::Head,
     };
-    if let PushRef::Fleet { target, .. } = &mut pref {
-        if target.as_str().is_empty() {
-            *target = TargetName::new(target_name.to_string());
-        }
+    if let PushRef::Fleet { target, .. } = &mut pref && target.as_str().is_empty() {
+        *target = TargetName::new(target_name.to_string());
     }
 
     // 2. Acquire local application-store lock then target lock (in that order).
@@ -208,13 +206,11 @@ fn push_inner(
                 helper.remove_incoming(pend)?;
             }
         }
-        if let Some(held) = &status.lock {
-            if held != op_id.as_str() {
+        if let Some(held) = &status.lock && held != op_id.as_str() {
                 return Err(Error::preflight(format!(
                     "server {sid} mutation lock held by '{held}'"
                 )));
             }
-        }
         // Recover any desired trees missing locally from this server.
         for a in &assignments {
             if a.server_id == sid {
@@ -607,8 +603,9 @@ fn process_server(
     helper.acquire_lock(op_id.as_str(), false)?;
     // Compare-and-swap precondition on current generation.
     let status = helper.status()?;
-    if let Some(exp) = expected_gen {
-        if status.current_generation.as_deref() != Some(exp.as_str()) {
+    if let Some(exp) = expected_gen
+        && status.current_generation.as_deref() != Some(exp.as_str())
+    {
             helper.release_lock(op_id.as_str())?;
             return Ok(ServerProc {
                 kind: ServerOutcomeKind::Skipped,
@@ -620,7 +617,6 @@ fn process_server(
                 )),
             });
         }
-    }
 
     // Validate artifact paths exist in the desired tree.
     validate_artifact_paths(remote, &config.activation, &Path::new("objects/sha256").join(tree.as_str()).join("root")).ok();
@@ -695,6 +691,7 @@ fn process_server(
 
 /// Restore the prior generation (or remove `current` on first deploy). Returns
 /// true if compensation restored prior state.
+#[allow(clippy::too_many_arguments)]
 fn compensate_server(
     config: &Config,
     _store: &LocalStore,
@@ -807,17 +804,11 @@ fn capacity_preflight(
 }
 
 fn tree_size_on_host(root: &Path) -> u64 {
-    let mut total = 0u64;
-    for entry in walkdir::WalkDir::new(root) {
-        if let Ok(e) = entry {
-            if let Ok(m) = e.metadata() {
-                if m.is_file() {
-                    total += m.len();
-                }
-            }
-        }
-    }
-    total
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.metadata().ok().filter(|m| m.is_file()).map(|m| m.len()))
+        .sum()
 }
 
 fn acquire_lock_file(path: &Path, op_id: &str) -> Result<()> {
@@ -827,18 +818,16 @@ fn acquire_lock_file(path: &Path, op_id: &str) -> Result<()> {
             return Ok(());
         }
         // Treat a stale lock (older than 1 hour) as recoverable.
-        if let Ok(meta) = std::fs::metadata(path) {
-            if let Ok(modified) = meta.modified() {
-                if let Ok(elapsed) = std::time::SystemTime::now().duration_since(modified) {
-                    if elapsed < Duration::from_secs(3600) {
-                        return Err(Error::preflight(format!(
+        if let Ok(meta) = std::fs::metadata(path)
+            && let Ok(modified) = meta.modified()
+            && let Ok(elapsed) = std::time::SystemTime::now().duration_since(modified)
+            && elapsed < Duration::from_secs(3600)
+        {
+            return Err(Error::preflight(format!(
                             "local lock {} held by '{}'",
                             path.display(),
                             held.trim()
                         )));
-                    }
-                }
-            }
         }
         std::fs::remove_file(path).ok();
     }

@@ -157,7 +157,7 @@ impl LocalStore {
             })?;
             if existing.count() > 0 {
                 let meta = crate::tree::canonicalize_tree(&root)?;
-                if &meta.tree_sha256 != digest.as_str() {
+                if meta.tree_sha256 != digest.as_str() {
                     return Err(Error::integrity(format!(
                         "existing object {} failed verification",
                         digest.as_str()
@@ -168,7 +168,7 @@ impl LocalStore {
         }
         copy_dir_recursive(src_root, &root)?;
         let meta = crate::tree::canonicalize_tree(&root)?;
-        if &meta.tree_sha256 != digest.as_str() {
+        if meta.tree_sha256 != digest.as_str() {
             let _ = std::fs::remove_dir_all(&root);
             return Err(Error::integrity(format!(
                 "stored object digest mismatch for {}",
