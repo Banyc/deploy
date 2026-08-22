@@ -13,7 +13,7 @@
 //! Rotation is a mark-and-sweep operation: a tree object is deleted only when no
 //! retained binding or applicable pin references it.
 
-use crate::config::{Config, PinVariants};
+use crate::config::{Pin, PinVariants, RotationConfig};
 use crate::error::Result;
 use crate::model::{ReleaseId, TreeDigest};
 use crate::remote::helper::RemoteHelper;
@@ -31,15 +31,16 @@ struct GenRecord {
 }
 
 /// Compute the set of retained tree digests for one server, using the rotation
-/// policy of the server's assigned variant and the durable pins declared in the
-/// release configuration.
+/// policy supplied by the caller and the durable pins declared in the release
+/// configuration. The caller resolves the policy from the release's immutable
+/// policy snapshot (falling back to current configuration for legacy records),
+/// so historical deployments of renamed or removed variants retain correctly.
 pub fn compute_retained(
     helper: &RemoteHelper,
-    config: &Config,
+    rotation: &RotationConfig,
+    pins: &[Pin],
     store: &LocalStore,
-    variant_name: &str,
 ) -> Result<HashSet<String>> {
-    let rotation = &config.variant(variant_name)?.rotation;
     let mut retained: HashSet<String> = HashSet::new();
     let status = helper.status()?;
 
@@ -137,7 +138,7 @@ pub fn compute_retained(
     }
 
     // Durable pins.
-    for pin in &config.release.pins {
+    for pin in pins {
         let rid = ReleaseId::parse(&pin.release);
         let rec = match store.read_release(&rid) {
             Ok(r) => r,
@@ -257,7 +258,9 @@ targets:
             .unwrap();
         helper.swap_current(None, "g2", "op").unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let retained = compute_retained(&helper, &cfg(), &store, "standard").unwrap();
+        let c = cfg();
+        let rotation = &c.variant("standard").unwrap().rotation;
+        let retained = compute_retained(&helper, rotation, &c.release.pins, &store).unwrap();
         assert!(retained.contains("t2"), "current tree retained");
         assert!(retained.contains("t1"), "previous tree retained");
     }

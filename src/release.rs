@@ -6,7 +6,7 @@
 //! contract digest. It explicitly excludes the resulting release ID, creation
 //! time, display name, and provenance, avoiding a circular hash.
 
-use crate::config::{ActivationConfig, Mapping, VerificationConfig};
+use crate::config::{ActivationConfig, Mapping, VariantPolicy, VerificationConfig};
 use crate::digest::sha256_bytes;
 use crate::model::{
     BehaviorContract, CanonicalReleasePayload, Provenance, ReleaseDigest, ReleaseId, ReleaseRecord,
@@ -64,6 +64,14 @@ pub fn variant_behaviors_digest(
 pub fn behavior_contracts_from_json(
     bytes: &[u8],
 ) -> std::result::Result<BTreeMap<String, BehaviorContract>, serde_json::Error> {
+    serde_json::from_slice(bytes)
+}
+
+/// Reconstruct the name-keyed per-variant capacity/rotation policy map from
+/// serialized JSON.
+pub fn variant_policies_from_json(
+    bytes: &[u8],
+) -> std::result::Result<BTreeMap<String, VariantPolicy>, serde_json::Error> {
     serde_json::from_slice(bytes)
 }
 

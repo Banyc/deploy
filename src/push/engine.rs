@@ -163,8 +163,13 @@ fn push_inner(
     // 4. Freeze per-variant mappings + behavior and generate or reuse the
     // release record. The release identity covers the name-sorted mappings and
     // behavior contracts of every declared variant plus each variant's tree.
+    // Each variant's capacity + rotation policy is persisted alongside the
+    // release record so historical deployments resolve policy from the snapshot
+    // even when the variant has since been renamed or removed from the caller's
+    // current configuration.
     let mut variant_mappings: BTreeMap<String, Vec<Mapping>> = BTreeMap::new();
     let mut variant_behaviors: BTreeMap<String, BehaviorContract> = BTreeMap::new();
+    let mut variant_policies: BTreeMap<String, crate::config::VariantPolicy> = BTreeMap::new();
     for v in config.variant_names() {
         let vcfg = config.variant(&v)?;
         variant_mappings.insert(v.clone(), vcfg.artifact.mappings.clone());
@@ -175,10 +180,12 @@ fn push_inner(
                 verification: vcfg.verification.clone(),
             },
         );
+        variant_policies.insert(v.clone(), crate::config::VariantPolicy::from(vcfg));
     }
     let mapping_sha = crate::release::variant_mappings_digest(&variant_mappings);
     let behavior_sha = crate::release::variant_behaviors_digest(&variant_behaviors);
     let behavior_json = serde_json::to_value(&variant_behaviors)?;
+    let policies_json = serde_json::to_value(&variant_policies)?;
     let mapping_yaml = serde_yaml::to_string(&variant_mappings)
         .map_err(|e| Error::store(format!("serialize mappings: {e}")))?;
 
@@ -201,7 +208,7 @@ fn push_inner(
                 store.write_release(&rec)?;
                 let release_json = serde_json::to_string(&rec)
                     .map_err(|e| Error::store(format!("serialize release: {e}")))?;
-                store.write_release_aux(&rid, &mapping_yaml, &behavior_json)?;
+                store.write_release_aux(&rid, &mapping_yaml, &behavior_json, &policies_json)?;
                 // Persist release JSON string for remote publication.
                 REMOTE_RELEASE_JSON.with(|c| {
                     c.borrow_mut()
@@ -787,15 +794,24 @@ fn push_inner(
         message = format!("push successful; fleet ref {}@f{idx}", target_name);
     }
 
-    // 17. Per-server rotation under each server's mutation lock.
+    // 17. Per-server rotation under each server's mutation lock. Rotation uses
+    // the server's ACTUAL final assignment (read after any compensation), not
+    // the desired plan: a compensated server restored its prior variant, and
+    // that variant's rotation policy governs retention. The policy is resolved
+    // from the immutable snapshot persisted with the assignment's release, so a
+    // variant renamed or removed from the caller's current configuration still
+    // rotates with its historical policy. If no policy can be resolved (a
+    // legacy release and the variant is gone from current configuration),
+    // rotation is skipped for that server rather than failing the whole push.
     for sid in &servers_order {
         let helper = &helpers[sid];
-        if helper.acquire_lock(op_id.as_str(), false).is_ok() {
-            let variant_name = plan_servers
-                .get(sid)
-                .map(|s| s.variant.as_str())
-                .unwrap_or("");
-            let retained = compute_retained(helper, config, store, variant_name)?;
+        let policy = actual_servers
+            .get(sid)
+            .and_then(|a| resolve_variant_policy(config, store, &a.release, a.variant.as_str()));
+        if let Some(policy) = policy
+            && helper.acquire_lock(op_id.as_str(), false).is_ok()
+        {
+            let retained = compute_retained(helper, &policy.rotation, &config.release.pins, store)?;
             let active_incoming = HashSet::from([deployment_id.as_str().to_string()]);
             helper.rotate(&retained, &active_incoming)?;
             helper.release_lock(op_id.as_str())?;
@@ -1225,6 +1241,14 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
 
 /// Coarse capacity preflight: ensure each server has room for the new trees plus
 /// the configured safety headroom, running protected rotation first if needed.
+///
+/// Capacity headroom is per-variant policy bound to the release being deployed.
+/// It is resolved from the immutable policy snapshot persisted with that
+/// release, so a rollback to a release whose variant was later renamed or
+/// removed still applies the policy that was in force when the release was
+/// created. Releases recorded before policy persistence fall back to the
+/// caller's current configuration; if the variant is unknown there too, the
+/// default (zero) reserve is used.
 fn capacity_preflight(
     config: &Config,
     store: &LocalStore,
@@ -1234,9 +1258,9 @@ fn capacity_preflight(
     deployment_id: &DeploymentId,
 ) -> Result<()> {
     for a in assignments {
-        // Capacity headroom is per-variant policy; derive it from the assigned
-        // variant's configuration.
-        let capacity = config.variant(a.variant.as_str())?.capacity.clone();
+        let capacity = resolve_variant_policy(config, store, &a.release, a.variant.as_str())
+            .map(|p| p.capacity)
+            .unwrap_or_default();
         let reserve_bytes = capacity.reserve_bytes;
         let reserve_percent = capacity.reserve_percent as f64 / 100.0;
         let helper = helpers.get(&a.server_id).expect("helper present");
@@ -1254,12 +1278,20 @@ fn capacity_preflight(
         let _ = total;
         let reserve = reserve_bytes.max((avail as f64 * reserve_percent) as u64);
         if need + reserve > avail {
-            // Run protected rotation, then recheck.
+            // Run protected rotation using the assignment's bound rotation
+            // policy, then recheck. If no policy can be resolved (legacy release
+            // and the variant is gone from current configuration), skip the
+            // pre-rotation and recheck capacity directly rather than failing
+            // the restore.
             if helper.acquire_lock(op_id.as_str(), false).is_ok() {
-                let retained =
-                    compute_retained(helper, config, store, a.variant.as_str())?;
-                let active = HashSet::from([deployment_id.as_str().to_string()]);
-                helper.rotate(&retained, &active).ok();
+                if let Some(policy) =
+                    resolve_variant_policy(config, store, &a.release, a.variant.as_str())
+                {
+                    let retained =
+                        compute_retained(helper, &policy.rotation, &config.release.pins, store)?;
+                    let active = HashSet::from([deployment_id.as_str().to_string()]);
+                    helper.rotate(&retained, &active).ok();
+                }
                 helper.release_lock(op_id.as_str()).ok();
             }
             let avail2 = helper.remote().available_bytes().unwrap_or(0);
@@ -1272,6 +1304,28 @@ fn capacity_preflight(
         }
     }
     Ok(())
+}
+
+/// Resolve the capacity + rotation policy bound to a (release, variant)
+/// assignment. Prefers the immutable policy snapshot persisted with the release
+/// so historical deployments use the policy in force at release time even when
+/// the variant has since been renamed or removed; releases recorded before
+/// policy persistence fall back to the caller's current configuration.
+fn resolve_variant_policy(
+    config: &Config,
+    store: &LocalStore,
+    release: &ReleaseId,
+    variant: &str,
+) -> Option<crate::config::VariantPolicy> {
+    if let Ok(Some(policies)) = store.read_release_policies(release)
+        && let Some(p) = policies.get(variant)
+    {
+        return Some(p.clone());
+    }
+    config
+        .variant(variant)
+        .ok()
+        .map(crate::config::VariantPolicy::from)
 }
 
 fn tree_size_on_host(root: &Path) -> u64 {

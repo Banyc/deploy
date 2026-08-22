@@ -3,12 +3,13 @@
 //! ```text
 //! <base>/
 //!   objects/sha256/<digest>/root/ , tree.json
-//!   releases/<release-id>/mapping.yaml, behavior.json, release.json
+//!   releases/<release-id>/mapping.yaml, behavior.json, policies.json, release.json
 //!   targets/<target>/observed.json, attempts.jsonl, refs/last-successful, refs/reflog.jsonl
 //!   servers/<server-id>.json
 //!   deployments/<deployment-id>/plan.json, results.json, status
 //! ```
 
+use crate::config::VariantPolicy;
 use crate::error::{Error, Result};
 use crate::model::{BehaviorContract, ReleaseId, ReleaseRecord, TreeDigest, TreeMetadata};
 use crate::records::{AttemptRecord, DeploymentResults, ObservedTarget, ReflogEntry, ServerState};
@@ -218,6 +219,7 @@ impl LocalStore {
         id: &ReleaseId,
         mapping_yaml: &str,
         behavior_json: &serde_json::Value,
+        policies_json: &serde_json::Value,
     ) -> Result<()> {
         let dir = self.release_dir(id);
         ensure_private_dir(&dir)?;
@@ -230,6 +232,15 @@ impl LocalStore {
             .map_err(|e| Error::store(format!("serialize behavior: {e}")))?;
         std::fs::write(&bp, bytes).map_err(|e| Error::store(format!("write behavior: {e}")))?;
         set_private(&bp)?;
+        // Persist each variant's capacity + rotation policy with the release. A
+        // historical deployment must resolve these from this snapshot, because
+        // the caller's current configuration may have renamed or removed the
+        // variant since the release was created.
+        let pp = dir.join("policies.json");
+        let bytes = serde_json::to_vec_pretty(policies_json)
+            .map_err(|e| Error::store(format!("serialize policies: {e}")))?;
+        std::fs::write(&pp, bytes).map_err(|e| Error::store(format!("write policies: {e}")))?;
+        set_private(&pp)?;
         Ok(())
     }
 
@@ -244,6 +255,25 @@ impl LocalStore {
             .map_err(|e| Error::store(format!("read behavior {}: {e}", p.display())))?;
         crate::release::behavior_contracts_from_json(&bytes)
             .map_err(|e| Error::store(format!("parse behavior {}: {e}", p.display())))
+    }
+
+    /// Read the name-keyed per-variant capacity/rotation policies stored
+    /// alongside a release record. Returns `None` when the release predates
+    /// policy persistence; callers then fall back to the current configuration
+    /// for variants that still exist there.
+    pub fn read_release_policies(
+        &self,
+        id: &ReleaseId,
+    ) -> Result<Option<BTreeMap<String, VariantPolicy>>> {
+        let p = self.release_dir(id).join("policies.json");
+        if !p.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&p)
+            .map_err(|e| Error::store(format!("read policies {}: {e}", p.display())))?;
+        let map = crate::release::variant_policies_from_json(&bytes)
+            .map_err(|e| Error::store(format!("parse policies {}: {e}", p.display())))?;
+        Ok(Some(map))
     }
 
     // ---- targets ----------------------------------------------------------

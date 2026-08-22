@@ -237,6 +237,144 @@ fn end_to_end_push_rollback() -> Result<()> {
     Ok(())
 }
 
+/// Deploy variant `old`, replace it with `new` in the configuration (the old
+/// variant file is removed entirely), then restore the `@f0` fleet snapshot.
+/// Historical capacity/rotation policies must resolve from the immutable
+/// release record, not the caller's current configuration.
+#[test]
+fn fleet_rollback_after_variant_rename_succeeds() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store_base = tmp.path().join("store");
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    fn config_yaml(variant: &str) -> String {
+        format!(
+            r#"
+schema_version: 1
+application: example
+remote_root: /srv/deploy/example
+release:
+  path: releases/v1
+  variants:
+    {variant}: {variant}.yaml
+targets:
+  production:
+    rollout: {{ batch_size: 1, stop_on_failure: true, failure_policy: rollback_changed }}
+    servers:
+      - id: server-01
+        address: server-01.example.com
+        user: deploy
+        variant: {variant}
+"#
+        )
+    }
+
+    // f0: deploy variant `old`.
+    let config_path = write_string(&proj.join("deploy.yaml"), &config_yaml("old"));
+    write_variant_file(&proj, "old", VARIANT_BODY);
+    let artifacts = proj.join("releases").join("v1").join("artifacts");
+    write_file(&artifacts.join("build/output/app/server"), "v1\n");
+    write_file(&artifacts.join("deployment/common/README"), "common\n");
+    write_file(&artifacts.join("deployment/variants/old/extra"), "old\n");
+
+    let config0 = Config::load(&config_path)?;
+    let store = LocalStore::with_base(store_base)?;
+    let rf = remotes_base.clone();
+    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+    };
+
+    let r0 = push(
+        &config0,
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r0.status, Some(DeploymentStatus::Successful));
+    let attempt0 = r0.attempt.expect("attempt recorded");
+    let old_server = &attempt0.servers[&ServerId::new("server-01")];
+    let old_tree = old_server.tree.clone();
+    let old_release = old_server.release.clone();
+
+    // The old release persists its per-variant capacity/rotation policies.
+    let policies = store.read_release_policies(&old_release)?;
+    assert!(
+        policies.as_ref().is_some_and(|p| p.contains_key("old")),
+        "release record carries the `old` variant policy snapshot"
+    );
+
+    // Rename the variant: the configuration now declares `new`, and the
+    // `old.yaml` variant file is removed entirely.
+    write_string(&proj.join("deploy.yaml"), &config_yaml("new"));
+    write_variant_file(&proj, "new", VARIANT_BODY);
+    write_file(&artifacts.join("deployment/variants/new/extra"), "new\n");
+    std::fs::remove_file(proj.join("releases").join("v1").join("old.yaml")).unwrap();
+    let config1 = Config::load(&config_path)?;
+    assert!(
+        config1.variant("old").is_err(),
+        "current configuration no longer declares `old`"
+    );
+
+    // f1: deploy variant `new`.
+    let r1 = push(
+        &config1,
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+    let new_tree = r1.attempt.expect("attempt recorded").servers[&ServerId::new("server-01")]
+        .tree
+        .clone();
+    assert_ne!(old_tree, new_tree, "renamed variant materializes a new tree");
+
+    // Roll back to the f0 fleet snapshot: restores variant `old` even though the
+    // current configuration neither declares it nor ships its variant file.
+    let rrb = push(
+        &config1,
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &PushOptions {
+            dry_run: false,
+            ref_token: Some("production@f0".to_string()),
+        },
+    )?;
+    assert_eq!(
+        rrb.status,
+        Some(DeploymentStatus::Successful),
+        "exact fleet rollback must succeed after the variant was renamed"
+    );
+    let observed = store.read_observed("production")?;
+    let restored = &observed.servers[&ServerId::new("server-01")];
+    assert_eq!(restored.tree.as_ref(), Some(&old_tree), "tree restored from f0");
+    assert_eq!(
+        restored.variant.as_ref().map(|v| v.as_str()),
+        Some("old"),
+        "variant restored from f0"
+    );
+    assert_eq!(
+        restored.release.as_ref(),
+        Some(&old_release),
+        "release restored from f0"
+    );
+    Ok(())
+}
+
 #[test]
 fn dry_run_reports_plan() -> Result<()> {
     let tmp = tempfile::tempdir().unwrap();

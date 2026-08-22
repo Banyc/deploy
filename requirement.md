@@ -39,7 +39,7 @@ Tree objects contain no release- or variant-specific metadata, so identical tree
 The canonical release ID is derived from a versioned canonical identity payload covering the name-sorted per-variant mapping digests, all declared `variant → tree digest` bindings, and the name-sorted per-variant activation and verification behavior-contract digest. It explicitly excludes the resulting release ID, creation time, display name, and provenance, avoiding a circular hash. Two variants may share tree bytes while still requiring different activation and verification behavior, so behavior is captured per variant rather than once per release. Its stored form is `pel-sha256-full-`
 release-digest`; the CLI may display and accept an unambiguous digest prefix. Git revision and creation time are provenance only because mapped inputs can include generated or untracked files.
 
-Mapping and behavior digests are computed from versioned canonical data after schema defaults, path normalization, and validation, not from YAML whitespace, comments, or key order. The original configuration remains available as provenance, while `behavior.json` records the canonical behavior contract.
+Mapping and behavior digests are computed from versioned canonical data after schema defaults, path normalization, and validation, not from YAML whitespace, comments, or key order. The original configuration remains available as provenance, while `behavior.json` records the canonical behavior contract. Each variant's capacity and rotation policy is likewise persisted with the release record in `policies.json`; historical deployments resolve capacity headroom and retention from that snapshot rather than the caller's current configuration, so a variant that was renamed or removed after the release was created still rolls back exactly.
 
 The first materialization fixes the immutable release record's `created_at` and first-seen provenance. Reusing the same release later does not rewrite that record; the new deployment attempt records its own current provenance.
 
@@ -232,6 +232,7 @@ The local store contains the exact immutable trees sent to servers, immutable re
     <release-id>/
       mapping.yaml
       behavior.json
+      policies.json
       release.json
   targets/
     production/

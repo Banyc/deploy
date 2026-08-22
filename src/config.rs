@@ -171,6 +171,19 @@ pub struct RotationConfig {
     pub fleet: FleetRotation,
 }
 
+/// A variant's capacity + rotation policy. This is persisted alongside the
+/// immutable release record so historical deployments (fleet and release
+/// rollbacks) resolve these policies from the release snapshot rather than the
+/// caller's current configuration, where the variant may since have been
+/// renamed or removed.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct VariantPolicy {
+    #[serde(default)]
+    pub capacity: CapacityConfig,
+    #[serde(default)]
+    pub rotation: RotationConfig,
+}
+
 /// A per-release variant's own artifact and deployment policy. Each variant is
 /// described by a sibling YAML file inside the release directory selected by
 /// `deploy.yaml`.
@@ -186,6 +199,15 @@ pub struct VariantConfig {
     pub capacity: CapacityConfig,
     #[serde(default)]
     pub rotation: RotationConfig,
+}
+
+impl From<&VariantConfig> for VariantPolicy {
+    fn from(v: &VariantConfig) -> Self {
+        VariantPolicy {
+            capacity: v.capacity.clone(),
+            rotation: v.rotation.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
