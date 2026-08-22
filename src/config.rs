@@ -7,8 +7,8 @@
 //! policies (activation, verification, capacity); artifact sources
 //! conventionally live beneath `releases/<name>/artifacts/`. Rotation is a
 //! fleet-wide retention policy declared once at the top level of `deploy.toml`.
-//! Targets contain only their rollout policy and their stable server membership
-//! with per-server variant assignment.
+//! Servers are declared once at the top level; targets contain only their
+//! rollout policy and reference member servers by ID.
 //!
 //! The same local inputs always produce one target-independent release identity
 //! (see `model::ReleaseDigest`): the name-sorted per-variant mappings, the
@@ -320,7 +320,9 @@ pub struct ServerDef {
 pub struct TargetDef {
     #[serde(default)]
     pub rollout: RolloutConfig,
-    pub servers: Vec<ServerDef>,
+    /// The IDs of this target's member servers, in deployment order. Each ID
+    /// must reference a top-level `[[servers]]` declaration.
+    pub servers: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -338,6 +340,9 @@ pub struct Config {
     /// `deploy.toml`; it is not a per-variant setting.
     #[serde(default)]
     pub rotation: RotationConfig,
+    /// Every deployable server, declared once at the top level of
+    /// `deploy.toml`; targets reference these by ID.
+    pub servers: Vec<ServerDef>,
     pub targets: BTreeMap<String, TargetDef>,
     #[serde(skip)]
     variants: BTreeMap<String, VariantConfig>,
@@ -405,43 +410,51 @@ impl Config {
             self.validate_variant(name, variant)?;
         }
 
-        // Variant names must be known; server IDs unique; SSH identity well-formed.
+        // Server declarations are unique and well-formed; targets reference
+        // known server IDs.
         let mut all_ids = std::collections::HashSet::new();
+        for s in &self.servers {
+            if !all_ids.insert(s.id.clone()) {
+                return Err(Error::config(format!(
+                    "duplicate server id '{}' in top-level servers",
+                    s.id
+                )));
+            }
+            if !self.variants.contains_key(&s.variant) {
+                return Err(Error::config(format!(
+                    "server '{}' references unknown variant '{}'",
+                    s.id, s.variant
+                )));
+            }
+            // When an identity source is provided it must be well-formed. The
+            // actual enforcement (refusing trust-on-first-use) happens in the
+            // SSH transport, so a missing source is not rejected here — local
+            // and `local://` transports never perform host verification.
+            if let Some(kh) = &s.known_hosts
+                && !kh.is_absolute()
+            {
+                return Err(Error::config(format!(
+                    "server '{}' known_hosts must be an absolute path",
+                    s.id
+                )));
+            }
+            if let Some(fp) = &s.host_key_fingerprint
+                && !fp.starts_with("SHA256:")
+            {
+                return Err(Error::config(format!(
+                    "server '{}' host_key_fingerprint must be a SHA256:... value",
+                    s.id
+                )));
+            }
+        }
         for (tname, target) in &self.targets {
             if target.servers.is_empty() {
                 return Err(Error::config(format!("target '{tname}' has no servers")));
             }
-            for s in &target.servers {
-                if !all_ids.insert(s.id.clone()) {
+            for id in &target.servers {
+                if !all_ids.contains(id) {
                     return Err(Error::config(format!(
-                        "duplicate server id '{}' across targets",
-                        s.id
-                    )));
-                }
-                if !self.variants.contains_key(&s.variant) {
-                    return Err(Error::config(format!(
-                        "server '{}' references unknown variant '{}'",
-                        s.id, s.variant
-                    )));
-                }
-                // When an identity source is provided it must be well-formed. The
-                // actual enforcement (refusing trust-on-first-use) happens in the
-                // SSH transport, so a missing source is not rejected here — local
-                // and `local://` transports never perform host verification.
-                if let Some(kh) = &s.known_hosts
-                    && !kh.is_absolute()
-                {
-                    return Err(Error::config(format!(
-                        "server '{}' known_hosts must be an absolute path",
-                        s.id
-                    )));
-                }
-                if let Some(fp) = &s.host_key_fingerprint
-                    && !fp.starts_with("SHA256:")
-                {
-                    return Err(Error::config(format!(
-                        "server '{}' host_key_fingerprint must be a SHA256:... value",
-                        s.id
+                        "target '{tname}' references unknown server '{id}'"
                     )));
                 }
             }
@@ -508,6 +521,30 @@ impl Config {
         self.variants
             .get(name)
             .ok_or_else(|| Error::config(format!("unknown release variant '{name}'")))
+    }
+
+    /// Resolve a target's member servers in the order they are listed, against
+    /// the top-level `[[servers]]` declarations. References are validated at
+    /// load time, so a miss here is a configuration error.
+    pub fn target_servers(&self, target_name: &str) -> Result<Vec<&ServerDef>> {
+        let target = self
+            .targets
+            .get(target_name)
+            .ok_or_else(|| Error::not_found(format!("target '{target_name}'")))?;
+        target
+            .servers
+            .iter()
+            .map(|id| {
+                self.servers
+                    .iter()
+                    .find(|s| &s.id == id)
+                    .ok_or_else(|| {
+                        Error::config(format!(
+                            "target '{target_name}' references unknown server '{id}'"
+                        ))
+                    })
+            })
+            .collect()
     }
 
     /// Discover variant files inside the release directory. The project
@@ -673,14 +710,15 @@ protect_previous = true
 [rotation.fleet]
 protect_deployments = 1
 
-[targets.t1]
-rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-
-[[targets.t1.servers]]
+[[servers]]
 id = "s1"
 address = "a"
 user = "u"
 variant = "standard"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+servers = ["s1"]
 "#;
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml).unwrap();
@@ -761,14 +799,15 @@ protect_previous = true
 [rotation.fleet]
 protect_deployments = 2
 
-[targets.t1]
-rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-
-[[targets.t1.servers]]
+[[servers]]
 id = "s1"
 address = "a"
 user = "u"
 variant = "standard"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+servers = ["s1"]
 "#;
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml).unwrap();
@@ -831,14 +870,15 @@ protect_previous = true
 [rotation.fleet]
 protect_deployments = 1
 
-[targets.t1]
-rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
-
-[[targets.t1.servers]]
+[[servers]]
 id = "s1"
 address = "a"
 user = "u"
 variant = "standard"
+
+[targets.t1]
+rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
+servers = ["s1"]
 "#
         )
     }
@@ -895,14 +935,15 @@ application = "legacy"
 remote_root = "/srv/legacy"
 release = { path = "releases/v1", variants = { standard = "standard.toml" } }
 
-[targets.t1]
-rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-
-[[targets.t1.servers]]
+[[servers]]
 id = "s1"
 address = "a"
 user = "u"
 variant = "standard"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+servers = ["s1"]
 "#;
         let p = project.join("deploy.toml");
         std::fs::write(&p, legacy_toml).unwrap();
@@ -957,6 +998,45 @@ variant = "standard"
         assert!(
             err.to_string().contains("no variants"),
             "error must mention the missing variant files, got: {err}"
+        );
+    }
+
+    #[test]
+    fn targets_must_reference_declared_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        // The target references `ghost`, which no [[servers]] entry declares.
+        let p = project.join("deploy.toml");
+        std::fs::write(
+            &p,
+            deploy_toml("v1").replace("servers = [\"s1\"]", "servers = [\"ghost\"]"),
+        )
+        .unwrap();
+        let err = Config::load(&p).expect_err("unknown server reference must fail");
+        assert!(
+            err.to_string().contains("unknown server 'ghost'"),
+            "error must name the unknown server reference, got: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_top_level_server_ids_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        let mut toml = deploy_toml("v1");
+        // Insert a second [[servers]] entry with the same ID before [targets.t1].
+        let dup = "[[servers]]\nid = \"s1\"\naddress = \"a2\"\nuser = \"u\"\nvariant = \"standard\"\n\n";
+        toml = toml.replacen("[targets.t1]", &format!("{dup}[targets.t1]"), 1);
+        let p = project.join("deploy.toml");
+        std::fs::write(&p, toml).unwrap();
+        let err = Config::load(&p).expect_err("duplicate server id must fail");
+        assert!(
+            err.to_string().contains("duplicate server id 's1'"),
+            "error must name the duplicated id, got: {err}"
         );
     }
 }

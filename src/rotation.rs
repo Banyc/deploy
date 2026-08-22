@@ -214,14 +214,15 @@ protect_previous = true
 [rotation.fleet]
 protect_deployments = 1
 
-[targets.t1]
-rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-
-[[targets.t1.servers]]
+[[servers]]
 id = "s1"
 address = "a"
 user = "u"
 variant = "standard"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+servers = ["s1"]
 "#;
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml).unwrap();

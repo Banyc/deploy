@@ -60,26 +60,27 @@ protect_previous = true
 [rotation.fleet]
 protect_deployments = 2
 
-[targets.production]
-rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "rollback_changed" }
-
-[[targets.production.servers]]
+[[servers]]
 id = "server-01"
 address = "server-01.example.com"
 user = "deploy"
 variant = "standard"
 
-[[targets.production.servers]]
+[[servers]]
 id = "server-02"
 address = "server-02.example.com"
 user = "deploy"
 variant = "standard"
 
-[[targets.production.servers]]
+[[servers]]
 id = "server-03"
 address = "server-03.example.com"
 user = "deploy"
 variant = "high-capacity"
+
+[targets.production]
+rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "rollback_changed" }
+servers = ["server-01", "server-02", "server-03"]
 "#;
 
 fn write_file(path: &Path, content: &str) {
@@ -263,14 +264,15 @@ application = "example"
 remote_root = "/srv/deploy/example"
 release = "v1"
 
-[targets.production]
-rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
-
-[[targets.production.servers]]
+[[servers]]
 id = "server-01"
 address = "server-01.example.com"
 user = "deploy"
 variant = "{variant}"
+
+[targets.production]
+rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
+servers = ["server-01"]
 "#
         )
     }
@@ -724,14 +726,15 @@ protect_previous = true
 [rotation.fleet]
 protect_deployments = 2
 
-[targets.production]
-rollout = {{ batch_size = {batch_size}, stop_on_failure = {stop_on_failure}, failure_policy = "rollback_changed" }}
-
-[[targets.production.servers]]
+[[servers]]
 id = "server-01"
 address = "server-01.example.com"
 user = "deploy"
 variant = "standard"
+
+[targets.production]
+rollout = {{ batch_size = {batch_size}, stop_on_failure = {stop_on_failure}, failure_policy = "rollback_changed" }}
+servers = ["server-01"]
 "#
     )
 }
@@ -785,14 +788,15 @@ protect_previous = true
 [rotation.fleet]
 protect_deployments = 2
 
-[targets.production]
-rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-
-[[targets.production.servers]]
+[[servers]]
 id = "server-01"
 address = "local:///dev/null/should-not-be-used"
 user = "deploy"
 variant = "standard"
+
+[targets.production]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+servers = ["server-01"]
 "#;
     let variant_toml = r#"
 [[artifact.mappings]]
@@ -826,8 +830,12 @@ reserve_percent = 0
     // Plug the real endpoint directory into the server address and use the real
     // CLI remote factory (create_remote), which routes `local://` addresses to
     // the configured endpoint rather than the application store's remotes/.
-    config.targets.get_mut("production").unwrap().servers[0].address =
-        format!("local://{}", endpoints.join("server-01").display());
+    config
+        .servers
+        .iter_mut()
+        .find(|s| s.id == "server-01")
+        .unwrap()
+        .address = format!("local://{}", endpoints.join("server-01").display());
 
     let factory_config = config.clone();
     let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
@@ -1281,26 +1289,27 @@ protect_previous = true
 [rotation.fleet]
 protect_deployments = 2
 
-[targets.production]
-rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-
-[[targets.production.servers]]
+[[servers]]
 id = "server-01"
 address = "a"
 user = "u"
 variant = "standard"
 
-[[targets.production.servers]]
+[[servers]]
 id = "server-02"
 address = "b"
 user = "u"
 variant = "standard"
 
-[[targets.production.servers]]
+[[servers]]
 id = "server-03"
 address = "c"
 user = "u"
 variant = "standard"
+
+[targets.production]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+servers = ["server-01", "server-02", "server-03"]
 "#;
     let variant_toml = r#"
 [[artifact.mappings]]

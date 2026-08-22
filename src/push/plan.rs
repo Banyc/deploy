@@ -27,12 +27,11 @@ pub fn plan_assignments(
     variant_trees: &BTreeMap<String, TreeDigest>,
     store: &LocalStore,
 ) -> Result<(Vec<PlannedAssignment>, ReleaseId, PlanSource)> {
-    let target = config
-        .targets
-        .get(target_name)
-        .ok_or_else(|| Error::not_found(format!("target '{target_name}'")))?;
-    let server_ids: Vec<ServerId> = target
-        .servers
+    if !config.targets.contains_key(target_name) {
+        return Err(Error::not_found(format!("target '{target_name}'")));
+    }
+    let server_defs = config.target_servers(target_name)?;
+    let server_ids: Vec<ServerId> = server_defs
         .iter()
         .map(|s| ServerId::new(s.id.clone()))
         .collect();
@@ -40,7 +39,7 @@ pub fn plan_assignments(
     match pref {
         PushRef::Head => {
             let mut out = Vec::new();
-            for s in &target.servers {
+            for s in &server_defs {
                 let sid = ServerId::new(s.id.clone());
                 let variant = VariantName::new(s.variant.clone());
                 let tree = variant_trees.get(&s.variant).cloned().ok_or_else(|| {
@@ -72,7 +71,7 @@ pub fn plan_assignments(
                 ));
             }
             let mut out = Vec::new();
-            for s in &target.servers {
+            for s in &server_defs {
                 let sid = ServerId::new(s.id.clone());
                 let a = entry.servers.get(&sid).ok_or_else(|| {
                     Error::rollback(format!("server {sid} missing in fleet snapshot"))
@@ -97,7 +96,7 @@ pub fn plan_assignments(
                 .read_release(release)
                 .map_err(|_| Error::rollback(format!("release {release} not available locally")))?;
             let mut out = Vec::new();
-            for s in &target.servers {
+            for s in &server_defs {
                 let sid = ServerId::new(s.id.clone());
                 let variant = VariantName::new(s.variant.clone());
                 let tree = rec.variants.get(&s.variant).cloned().ok_or_else(|| {

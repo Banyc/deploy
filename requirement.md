@@ -117,26 +117,28 @@ protect_previous = true
 [rotation.fleet]
 protect_deployments = 2
 
-[targets.production]
-rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-
-[[targets.production.servers]]
+# Every server is declared once at the top level; targets reference them by ID.
+[[servers]]
 id = "server-01"
 address = "server-01.example.com"
 user = "deploy"
 variant = "standard"
 
-[[targets.production.servers]]
+[[servers]]
 id = "server-02"
 address = "server-02.example.com"
 user = "deploy"
 variant = "standard"
 
-[[targets.production.servers]]
+[[servers]]
 id = "server-03"
 address = "server-03.example.com"
 user = "deploy"
 variant = "high-capacity"
+
+[targets.production]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+servers = ["server-01", "server-02", "server-03"]
 ```
 
 Each variant is described by its own file inside the release directory (e.g.

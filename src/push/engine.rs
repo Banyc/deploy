@@ -287,15 +287,16 @@ fn push_inner(
     validate_behavior_coverage(&desired_behaviors, &assignments, &desired_release)?;
 
     // Open a remote handle per server and run reconciliation / recovery.
+    let server_defs = config.target_servers(target_name)?;
     let mut remotes: HashMap<ServerId, Box<dyn Remote>> = HashMap::new();
     let mut helpers: HashMap<ServerId, RemoteHelper> = HashMap::new();
     let mut statuses: HashMap<ServerId, crate::remote::helper::RemoteStatus> = HashMap::new();
-    for s in &target.servers {
+    for s in &server_defs {
         let sid = ServerId::new(s.id.clone());
         let remote = factory(s)?;
         remotes.insert(sid.clone(), remote);
     }
-    for s in &target.servers {
+    for s in &server_defs {
         let sid = ServerId::new(s.id.clone());
         let r = remotes.get(&sid).unwrap();
         let helper = RemoteHelper::new(r.as_ref());
@@ -1511,14 +1512,15 @@ protect_previous = true
 [rotation.fleet]
 protect_deployments = 1
 
-[targets.t1]
-rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-
-[[targets.t1.servers]]
+[[servers]]
 id = "s1"
 address = "a"
 user = "u"
 variant = "standard"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+servers = ["s1"]
 "#;
 
     const SYSTEMD_VARIANT: &str = r#"
@@ -1573,14 +1575,15 @@ protect_previous = true
 [rotation.fleet]
 protect_deployments = 1
 
-[targets.t1]
-rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-
-[[targets.t1.servers]]
+[[servers]]
 id = "s1"
 address = "a"
 user = "u"
 variant = "standard"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+servers = ["s1"]
 "#;
 
     struct Harness {
