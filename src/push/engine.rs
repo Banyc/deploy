@@ -275,6 +275,15 @@ fn push_inner(
         store,
     )?;
 
+    // Behavior coverage gate: every planned assignment's variant must have a
+    // frozen behavior contract BEFORE any remote state is touched (handshake,
+    // incoming cleanup, staging, publication). A historical behavior snapshot
+    // can be incomplete (a corrupted or truncated behavior.json parses fine but
+    // lacks a variant); without this gate the missing entry would panic
+    // mid-rollout, after remote trees had already been staged. Fail closed in
+    // preflight with context instead.
+    validate_behavior_coverage(&desired_behaviors, &assignments, &desired_release)?;
+
     // Open a remote handle per server and run reconciliation / recovery.
     let mut remotes: HashMap<ServerId, Box<dyn Remote>> = HashMap::new();
     let mut helpers: HashMap<ServerId, RemoteHelper> = HashMap::new();
@@ -446,7 +455,14 @@ fn push_inner(
             let mut verified = true;
             for a in &assignments {
                 let remote = remotes[&a.server_id].as_ref();
-                if run_verification(remote, &desired_behaviors[a.variant.as_str()].verification).is_err() {
+                let Some(variant_behavior) = desired_behaviors.get(a.variant.as_str()) else {
+                    // Coverage was validated before any remote mutation; a miss
+                    // means the up-to-date claim cannot be established. Fall
+                    // through to a real push rather than panicking.
+                    verified = false;
+                    break;
+                };
+                if run_verification(remote, &variant_behavior.verification).is_err() {
                     verified = false;
                     break;
                 }
@@ -496,9 +512,29 @@ fn push_inner(
             let a = assignments.iter().find(|x| &x.server_id == sid).unwrap();
             // Select the assigned variant's frozen behavior contract (never the
             // caller's current variant file) before activation/verification.
-            let variant_behavior = desired_behaviors
-                .get(a.variant.as_str())
-                .expect("assigned variant behavior present");
+            // Coverage was validated before any remote mutation, so a miss here
+            // is an internal invariant violation: record a per-server failure
+            // instead of panicking.
+            let Some(variant_behavior) = desired_behaviors.get(a.variant.as_str()) else {
+                had_failure = true;
+                results.insert(
+                    sid.clone(),
+                    ServerResult {
+                        server_id: sid.clone(),
+                        outcome: ServerOutcomeKind::Failed,
+                        generation: Some(new_gen[sid].clone()),
+                        compensated: false,
+                        error: Some(format!(
+                            "internal: no behavior contract for variant '{}' after coverage check",
+                            a.variant
+                        )),
+                    },
+                );
+                if stop_on_failure {
+                    break 'batches;
+                }
+                continue;
+            };
             let variant_behavior_sha =
                 crate::release::behavior_contract_digest(variant_behavior);
             let outcome = process_server(
@@ -1237,6 +1273,41 @@ fn download_tree_to_host(remote: &dyn Remote, rel: &Path, host_dest: &Path) -> R
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777))
         .map_err(|e| Error::transport(format!("chmod {}: {e}", path.display())))
+}
+
+/// Fail closed in preflight if any planned assignment's variant lacks a frozen
+/// behavior contract. Historical behavior snapshots can be incomplete (a
+/// corrupted or truncated `behavior.json` parses successfully but covers only
+/// some variants); reaching rollout with a missing entry previously panicked
+/// after trees were already staged onto servers. This gate runs before any
+/// remote mutation and names the snapshot, the missing variants, and the
+/// affected servers.
+fn validate_behavior_coverage(
+    behaviors: &BTreeMap<String, BehaviorContract>,
+    assignments: &[crate::push::plan::PlannedAssignment],
+    desired_release: &ReleaseId,
+) -> Result<()> {
+    let mut missing: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for a in assignments {
+        if !behaviors.contains_key(a.variant.as_str()) {
+            missing
+                .entry(a.variant.as_str())
+                .or_default()
+                .push(a.server_id.as_str());
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let detail = missing
+        .iter()
+        .map(|(variant, servers)| format!("variant '{variant}' (servers: {})", servers.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(Error::preflight(format!(
+        "behavior snapshot for release {desired_release} is incomplete: missing {detail}; \
+         refusing to start before any remote state is changed"
+    )))
 }
 
 /// Coarse capacity preflight: ensure each server has room for the new trees plus

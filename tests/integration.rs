@@ -1101,6 +1101,142 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
     Ok(())
 }
 
+// ---- A corrupted historical behavior snapshot that PARSSES but is missing a
+// planned variant's contract must fail in preflight BEFORE any remote mutation,
+// rather than panic mid-rollout after staging.
+
+/// Snapshot of a remote directory: sorted (relative path, kind+content digest)
+/// pairs, including symlink targets. Two fingerprints are equal iff the
+/// directory trees are identical.
+fn remote_fingerprint(root: &Path) -> Vec<(String, String)> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .map(|rd| rd.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        entries.sort();
+        for p in entries {
+            let rel = p
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let ft = std::fs::symlink_metadata(&p).unwrap().file_type();
+            if ft.is_symlink() {
+                let target = std::fs::read_link(&p).unwrap().to_string_lossy().into_owned();
+                out.push((rel, format!("symlink:{target}")));
+            } else if ft.is_dir() {
+                out.push((rel, "dir".to_string()));
+                walk(root, &p, out);
+            } else {
+                let data = std::fs::read(&p).unwrap();
+                out.push((rel, format!("file:{}", deploy::digest::sha256_bytes(&data))));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
+}
+
+#[test]
+fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store = LocalStore::with_base(tmp.path().join("store"))?;
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    // Deploy behavior A (verification succeeds) as f0.
+    let config_a = setup_single(&proj, "true", true, 1);
+
+    let rb = remotes_base.clone();
+    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+        Ok(Box::new(LocalTransport::new(rb.join(&s.id))?))
+    };
+
+    let r0 = push(
+        &config_a,
+        &proj.join("deploy.yaml"),
+        &store,
+        &factory,
+        "production",
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r0.status, Some(DeploymentStatus::Successful));
+    let hist_release = r0
+        .attempt
+        .as_ref()
+        .unwrap()
+        .servers
+        .get(&ServerId::new("server-01"))
+        .unwrap()
+        .release
+        .as_str()
+        .to_string();
+
+    // Corrupt the historical release's immutable behavior.json so it PARSEs but
+    // does not cover the planned `standard` variant.
+    let behavior_path = store
+        .base()
+        .join("releases")
+        .join(&hist_release)
+        .join("behavior.json");
+    assert!(behavior_path.exists(), "historical behavior.json must exist");
+    std::fs::write(&behavior_path, "{}\n").unwrap();
+
+    // Fingerprint every server remote before the rollback attempt.
+    let before = remote_fingerprint(&remotes_base);
+    let attempts_before = store.read_attempts("production")?.len();
+
+    // Roll back to f0 under a DIFFERENT current configuration (behavior B). The
+    // push must fail closed in preflight, NOT fall back to B and NOT panic.
+    let config_b = setup_single(&proj, "false", true, 1);
+    let rrb = push(
+        &config_b,
+        &proj.join("deploy.yaml"),
+        &store,
+        &factory,
+        "production",
+        &PushOptions {
+            dry_run: false,
+            ref_token: Some("production@f0".to_string()),
+        },
+    );
+    let err = match rrb {
+        Err(e) => e.to_string(),
+        Ok(r) => panic!(
+            "rollback with an incomplete behavior snapshot must fail, got {:?}",
+            r.status
+        ),
+    };
+    assert!(
+        err.contains("preflight"),
+        "failure must be a preflight error, got: {err}"
+    );
+    assert!(
+        err.contains("incomplete") && err.contains("standard"),
+        "error must name the missing variant and the incomplete snapshot, got: {err}"
+    );
+
+    // No remote state changed: the fingerprint is byte-for-byte identical.
+    let after = remote_fingerprint(&remotes_base);
+    assert_eq!(
+        before, after,
+        "preflight failure must leave every remote untouched"
+    );
+    // And no deployment attempt was recorded.
+    assert_eq!(
+        store.read_attempts("production")?.len(),
+        attempts_before,
+        "preflight failure must not record an attempt"
+    );
+    Ok(())
+}
+
 // ---- Finding 5: stop_on_failure must not panic; later servers untouched --
 
 #[test]
