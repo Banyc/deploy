@@ -28,8 +28,8 @@ variant     = a name bound to one tree within a release
 artifact    = the immutable release + variant + tree binding
 release     = an immutable map of every declared variant to a tree digest
 server      = a durable machine identity: a stable ID plus its current address
-deployment slot = a binding of one top-level server to one variant under an ID, with an absolute deploy_dir
-target      = a named group of slots plus its rollout and retention policy
+deployment slot = a binding of one top-level server to one variant under an ID, with an absolute deploy_dir, declared inside the variant file that owns the workload; its `target` field binds it to exactly one target
+target      = a named group of slots (derived from the slots' `target` fields) plus its rollout and retention policy
 deployment  = an attempted push and its exact per-server assignments
 generation  = one server's durable activation record for one assignment
 ```
@@ -116,8 +116,9 @@ protect_previous = true
 [targets.production.rotation.fleet]
 protect_deployments = 2
 
-# Servers are declared once; a slot binds one server to one variant, and
-# targets reference slots by ID. Capacity is a per-server policy, shared by
+# Servers are declared once; slots are declared inside the variant files and
+# bind themselves to a target with their `target` field (a target's members
+# are derived from the slots). Capacity is a per-server policy, shared by
 # every deployment slot on the server and resolved from this file at preflight
 # time — it is never part of a release.
 [[servers]]
@@ -138,33 +139,21 @@ address = "server-03.example.com"
 user = "deploy"
 capacity = { reserve_bytes = 1073741824, reserve_percent = 5 }
 
-[[slots]]
-id = "app-1"
-server = "server-01"
-variant = "standard"
-deploy_dir = "/srv/deploy/example"
-
-[[slots]]
-id = "app-2"
-server = "server-02"
-variant = "standard"
-deploy_dir = "/srv/deploy/example"
-
-[[slots]]
-id = "hc-1"
-server = "server-03"
-variant = "high-capacity"
-
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-slots = ["app-1", "app-2", "hc-1"]
 ```
 
-Servers are declared exactly once at the top level; a slot binds one server to
-one variant, and each target lists its member slots by ID. A slot belongs to
-exactly one target (its on-server `deploy_dir` state is single), and two slots
-may share one server in different targets, but within a single target each
-server appears at most once (one running generation per server). Besides `id`,
+Servers and targets are declared once at the top level of `deploy.toml`;
+slots are declared inside the variant files. Each slot binds one server to the
+variant whose file declares it, names an absolute `deploy_dir`, and carries a
+`target` field naming the ONE target it belongs to — a target's member slots
+are DERIVED by scanning every variant's slots for that target name. A slot
+belongs to exactly one target (its on-server `deploy_dir` state is single;
+the per-target records keyed by slot ID cannot attribute it otherwise), and
+this is STRUCTURAL: a slot has a single `target` field, so it cannot be a
+member of two targets. Two slots may share one server in different targets,
+but within a single target each server appears at most once (one running
+generation per server). Besides `id`,
 `address`, and `user`, every server accepts an
 optional `port` (default 22), exactly one host-identity source — a dedicated
 `known_hosts` file used with `StrictHostKeyChecking=yes`, or a pre-verified
@@ -187,14 +176,31 @@ Trust-on-first-use without a configured identity source is disabled.
 
 Each variant is described by its own file inside the release directory (e.g.
 `releases/v1/standard.toml`); there is no explicit variant list to keep in
-sync. A variant file owns its artifact mappings and its deployment policies
-(activation, verification); rotation is declared once per target:
+sync. A variant file owns its artifact mappings, its deployment policies
+(activation, verification), AND its deployment slots — the `[[slots]]`
+entries of the file, whose `target` field binds each slot to exactly one
+top-level target; rotation is declared once per target:
 
 ```toml
 # releases/v1/standard.toml
 # All `from` paths are relative to the release directory (`releases/v1/` — the
 # project structure is forced), so artifact sources live under `artifacts/`.
 description = "Standard deployment"
+
+# This variant's deployment slots: app-1/app-2 (server-01/server-02) belong to
+# target `production`; the variant's `high-capacity` sibling declares hc-1
+# (server-03) the same way. A target's members are derived from these fields.
+[[slots]]
+id = "app-1"
+server = "server-01"
+target = "production"
+deploy_dir = "/srv/deploy/example"
+
+[[slots]]
+id = "app-2"
+server = "server-02"
+target = "production"
+deploy_dir = "/srv/deploy/example"
 
 [[artifact.mappings]]
 from = "artifacts/build/output/"
@@ -448,7 +454,7 @@ Atomicity is per server, not across a fleet. Fleet consistency is provided by th
 4. Freeze the mapping, activation, and verification contract; generate or reuse the immutable release record.
 5. Reconcile every server's actual `current`, object inventory, and unfinished transactions. Recovery must complete before planning a new mutation.
 6. Create and durably save the deployment attempt INTENT (expected pre-push generation and desired assignment for every placement slot; no outcomes) BEFORE changing any server, so a crash after servers advanced can never lose the deployment.
-7. Before changing any server, prove that every desired tree is available locally. For historical pushes, also require the current target membership to match the historical deployment's stable placement-slot set, and each slot's current `[[slots]]` `server` binding to match the binding the snapshot recorded (an unrecorded legacy binding is unverifiable and refused).
+7. Before changing any server, prove that every desired tree is available locally. For historical pushes, also require the current target membership to match the historical deployment's stable placement-slot set, and each slot's current `server` binding (declared in its variant file's `[[slots]]` entry) to match the binding the snapshot recorded (an unrecorded legacy binding is unverifiable and refused).
 8. Check local and remote capacity with the configured safety headroom (the per-server `capacity` policy read from the caller's current `deploy.toml`). If needed, run the ordinary protected rotation under each remote mutation lock before staging, then recheck. Abort before activation if required space is still unavailable.
 9. Upload and verify missing trees in operation-unique incoming paths on every server before activating the first batch. Uploading and staged verification may be parallel, but incoming content is not installable and rotation ignores it.
 10. Process servers in configured batches. For each server, acquire its remote mutation lock and compare `current` with the plan's expected generation. If it differs, fail that server without mutation. Otherwise publish and reverify the tree and release record, create a generation and transaction record, atomically move `current`, run the activation adapter, and run
@@ -537,7 +543,7 @@ Pushing an older successful reference restores its complete assignment, includin
 deploy push production production@f1
 ```
 
-Exact fleet rollback requires the current target to contain the same stable placement-slot set as the saved deployment AND each slot's physical server binding (the `[[slots]]` `server`) to match the binding the snapshot recorded (`servers[slot]`): a slot rebound to a different server would otherwise receive the historical generations on the wrong host. A legacy snapshot entry that never recorded the binding is unverifiable and is refused the same way. Addresses may change and are taken from the current target definition after host-identity verification. If membership has changed or any slot was rebound, exact rollback fails during preflight without modifying a server.
+Exact fleet rollback requires the current target to contain the same stable placement-slot set as the saved deployment AND each slot's physical server binding (the slot's `server` field in its variant file's `[[slots]]` entry) to match the binding the snapshot recorded (`servers[slot]`): a slot rebound to a different server would otherwise receive the historical generations on the wrong host. A legacy snapshot entry that never recorded the binding is unverifiable and is refused the same way. Addresses may change and are taken from the current target definition after host-identity verification. If membership has changed or any slot was rebound, exact rollback fails during preflight without modifying a server.
 
 Schema version 1 permits a target-history ref only as a source for that same target; cross-target deployment uses a release ref instead.
 

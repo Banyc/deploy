@@ -3,13 +3,15 @@
 //! The project file structure is forced: `deploy.toml` names the active release
 //! (`release: <name>`), and every regular `*.toml` file directly inside
 //! `<project>/releases/<name>/` is discovered as a variant named by its file
-//! stem. Each variant file owns its own artifact mappings and deployment
-//! policies (activation, verification); artifact sources conventionally live
-//! beneath `releases/<name>/artifacts/`. Capacity is a per-server policy
-//! declared on the server entry. Servers are declared once at the top level; a
-//! deployment slot binds one server to one variant under an ID, and targets
-//! contain their rollout policy, references to member slots by ID, and their
-//! own retention (`rotation`) policy.
+//! stem. Each variant file owns its artifact mappings, its deployment policies
+//! (activation, verification), AND its deployment slots: the `[[slots]]`
+//! entries of the variant file are the slot declarations, the declaring file
+//! is the slot's variant binding, and each slot's `target` field binds it to
+//! exactly one top-level target. Artifact sources conventionally live beneath
+//! `releases/<name>/artifacts/`. Capacity is a per-server policy declared on
+//! the server entry. Servers and targets are declared once at the top level of
+//! `deploy.toml`; targets carry rollout + rotation only, and their member
+//! slots are DERIVED from the slots' `target` fields.
 //!
 //! The same local inputs always produce one target-independent release identity
 //! (see `model::ReleaseDigest`): the name-sorted per-variant mappings, the
@@ -200,12 +202,15 @@ pub struct RotationConfig {
     pub fleet: FleetRotation,
 }
 
-/// A per-release variant's own artifact and deployment policy. Each variant is
-/// described by a `*.toml` file directly inside the release directory named by
-/// `deploy.toml` (`releases/<name>/<variant>.toml`). Rotation is not
-/// per-variant: it lives at the top level of `deploy.toml`. Capacity is not
-/// per-variant either: it is a per-server policy declared on the server entry
-/// and resolved from the caller's current configuration.
+/// A per-release variant's own artifact, deployment, and slot policy. Each
+/// variant is described by a `*.toml` file directly inside the release
+/// directory named by `deploy.toml` (`releases/<name>/<variant>.toml`).
+/// Rotation is not per-variant: it lives at the top level of `deploy.toml`.
+/// Capacity is not per-variant either: it is a per-server policy declared on
+/// the server entry and resolved from the caller's current configuration.
+/// Slots ARE per-variant: the `[[slots]]` entries of this file declare the
+/// variant's deployment slots, and the declaring file is each slot's variant
+/// binding.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct VariantConfig {
@@ -215,6 +220,11 @@ pub struct VariantConfig {
     #[serde(default)]
     pub activation: ActivationConfig,
     pub verification: VerificationConfig,
+    /// This variant's deployment slots, declared inside its own file. The
+    /// declaring variant file is the slot's variant binding: there is no
+    /// `variant` field on [`SlotDef`].
+    #[serde(default)]
+    pub slots: Vec<SlotDef>,
 }
 
 /// Durable protection for one whole release: every variant's artifact in the
@@ -331,20 +341,30 @@ pub struct ServerDef {
     pub capacity: CapacityConfig,
 }
 
-/// A deployment slot: binds one server to one variant under an ID, with an
-/// absolute `deploy_dir` on the server. The connection details live on the
-/// top-level `[[servers]]` entry; the workload choice and its on-server
-/// location live here. Targets reference slots by ID.
+/// A deployment slot: binds one server to one workload under an ID, with an
+/// absolute `deploy_dir` on the server, and belongs to EXACTLY ONE target.
+/// The connection details live on the top-level `[[servers]]` entry; the
+/// workload choice, its on-server location, and its target membership live
+/// here. Slots are declared INSIDE the variant file that owns the workload:
+/// the `[[slots]]` entries of `<release>/<variant>.toml` are the slot
+/// declarations, the declaring variant file IS the slot's variant binding
+/// (there is no `variant` field — it is the enclosing file), and the slot's
+/// `target` field is what binds it to a top-level target. A target's members
+/// are DERIVED by scanning every variant's slots for its name.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SlotDef {
     pub id: String,
     /// The ID of the top-level server this slot deploys onto.
     pub server: String,
-    pub variant: String,
     /// Absolute directory on the server where this slot's deployment state
     /// (objects, releases, generations, `current`) lives.
     pub deploy_dir: PathBuf,
+    /// The target this slot belongs to. A slot belongs to exactly one target
+    /// (its on-server `deploy_dir` state is single), so this is a single
+    /// field, not a membership list: the target's member slots are derived by
+    /// scanning every variant's slots for this value.
+    pub target: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -352,9 +372,6 @@ pub struct SlotDef {
 pub struct TargetDef {
     #[serde(default)]
     pub rollout: RolloutConfig,
-    /// The IDs of this target's member slots, in deployment order. Each ID must
-    /// reference a top-level `[[slots]]` declaration.
-    pub slots: Vec<String>,
     /// Retention policy applied to this target's servers on every rotation.
     #[serde(default)]
     pub rotation: RotationConfig,
@@ -374,9 +391,6 @@ pub struct Config {
     /// Every deployable server, declared once at the top level of
     /// `deploy.toml`; slots reference these by ID.
     pub servers: Vec<ServerDef>,
-    /// Workload bindings: one slot = one server + one variant, under an ID.
-    /// Targets reference slots by ID.
-    pub slots: Vec<SlotDef>,
     pub targets: BTreeMap<String, TargetDef>,
     #[serde(skip)]
     variants: BTreeMap<String, VariantConfig>,
@@ -502,65 +516,71 @@ impl Config {
             }
         }
 
-        // Slots bind one declared server to one declared variant, under a unique
-        // ID.
-        let mut slot_by_id = std::collections::BTreeMap::new();
+        // Slots are declared INSIDE each variant's file (the declaring file is
+        // the slot's variant binding), so they are aggregated across every
+        // variant: IDs are unique across ALL variants, each slot's server must
+        // exist among the top-level `[[servers]]` entries, each slot's declared
+        // `target` must exist among the top-level `[targets.<name>]` keys, and
+        // a (server, deploy_dir) pair names one on-server deployment location
+        // that exactly one slot may own.
+        let mut slot_ids = std::collections::HashSet::new();
         let mut bound_locations: std::collections::BTreeMap<(&str, &Path), &str> =
             std::collections::BTreeMap::new();
-        for p in &self.slots {
-            if slot_by_id.insert(p.id.clone(), p).is_some() {
-                return Err(Error::config(format!(
-                    "duplicate slot id '{}' in top-level slots",
-                    p.id
-                )));
+        for (vname, variant) in &self.variants {
+            for p in &variant.slots {
+                if !slot_ids.insert(p.id.clone()) {
+                    return Err(Error::config(format!(
+                        "duplicate slot id '{}' (declared by variant '{vname}')",
+                        p.id
+                    )));
+                }
+                if !all_server_ids.contains(&p.server) {
+                    return Err(Error::config(format!(
+                        "variant '{vname}': slot '{}' references unknown server '{}'",
+                        p.id, p.server
+                    )));
+                }
+                if !self.targets.contains_key(&p.target) {
+                    return Err(Error::config(format!(
+                        "variant '{vname}': slot '{}' references unknown target '{}'",
+                        p.id, p.target
+                    )));
+                }
+                if p.deploy_dir.is_relative() {
+                    return Err(Error::config(format!(
+                        "variant '{vname}': slot '{}' deploy_dir must be an absolute path on the server",
+                        p.id
+                    )));
+                }
+                // A (server, deploy_dir) pair names one on-server deployment
+                // location: its objects, releases, generations, and `current`.
+                // Two slots bound there would race over the same state.
+                if let Some(existing) =
+                    bound_locations.get(&(p.server.as_str(), p.deploy_dir.as_path()))
+                {
+                    return Err(Error::config(format!(
+                        "slots '{existing}' and '{}' bind the same location (server '{}', deploy_dir '{}'); each server+deploy_dir pair must belong to exactly one slot",
+                        p.id,
+                        p.server,
+                        p.deploy_dir.display()
+                    )));
+                }
+                bound_locations.insert((p.server.as_str(), p.deploy_dir.as_path()), &p.id);
             }
-            if !all_server_ids.contains(&p.server) {
-                return Err(Error::config(format!(
-                    "slot '{}' references unknown server '{}'",
-                    p.id, p.server
-                )));
-            }
-            if !self.variants.contains_key(&p.variant) {
-                return Err(Error::config(format!(
-                    "slot '{}' references unknown variant '{}'",
-                    p.id, p.variant
-                )));
-            }
-            if p.deploy_dir.is_relative() {
-                return Err(Error::config(format!(
-                    "slot '{}' deploy_dir must be an absolute path on the server",
-                    p.id
-                )));
-            }
-            // A (server, deploy_dir) pair names one on-server deployment
-            // location: its objects, releases, generations, and `current`. Two
-            // slots bound there would race over the same state.
-            if let Some(existing) =
-                bound_locations.get(&(p.server.as_str(), p.deploy_dir.as_path()))
-            {
-                return Err(Error::config(format!(
-                    "slots '{existing}' and '{}' bind the same location (server '{}', deploy_dir '{}'); each server+deploy_dir pair must belong to exactly one slot",
-                    p.id,
-                    p.server,
-                    p.deploy_dir.display()
-                )));
-            }
-            bound_locations.insert((p.server.as_str(), p.deploy_dir.as_path()), &p.id);
         }
 
-        for (tname, target) in &self.targets {
-            if target.slots.is_empty() {
-                return Err(Error::config(format!("target '{tname}' has no slots")));
-            }
-            // One server runs exactly one generation, so two member slots of the
-            // same target can never share a server.
+        // A target's members are DERIVED by scanning every variant's slots for
+        // the target name (targets no longer list their slots). One server runs
+        // exactly one generation, so two member slots of the same target can
+        // never share a server — and a target must have at least one member.
+        for (tname, _target) in &self.targets {
             let mut used_servers = std::collections::HashSet::new();
-            for pid in &target.slots {
-                let Some(slot) = slot_by_id.get(pid) else {
-                    return Err(Error::config(format!(
-                        "target '{tname}' references unknown slot '{pid}'"
-                    )));
-                };
+            let mut members = 0;
+            for slot in self.slot_defs() {
+                if slot.target != *tname {
+                    continue;
+                }
+                members += 1;
                 if !used_servers.insert(slot.server.as_str()) {
                     return Err(Error::config(format!(
                         "target '{tname}' has multiple slots on server '{}'",
@@ -568,29 +588,16 @@ impl Config {
                     )));
                 }
             }
+            if members == 0 {
+                return Err(Error::config(format!("target '{tname}' has no slots")));
+            }
         }
 
-        // Ownership invariant: each slot belongs to exactly ONE target. The
-        // slot's REMOTE state (`deploy_dir`) is single — a slot in two targets
-        // would race over the same on-server state, and the per-target records
-        // (attempts, snapshots, observed) cannot attribute it — so scan the
-        // targets' slot lists and reject any id referenced by two or more
-        // targets.
-        let mut slot_owners: std::collections::BTreeMap<&str, Vec<&str>> =
-            std::collections::BTreeMap::new();
-        for (tname, target) in &self.targets {
-            for pid in &target.slots {
-                slot_owners.entry(pid).or_default().push(tname);
-            }
-        }
-        for (pid, owners) in &slot_owners {
-            if owners.len() > 1 {
-                return Err(Error::config(format!(
-                    "slot '{pid}' is referenced by targets '{}' and '{}'; a slot belongs to exactly one target",
-                    owners[0], owners[1]
-                )));
-            }
-        }
+        // Ownership invariant: each slot belongs to exactly ONE target. This
+        // is now STRUCTURAL — a slot carries a single `target` field, so it
+        // cannot be a member of two targets — no scan is needed (a slot in two
+        // targets would race over the same on-server `deploy_dir` state, and
+        // the per-target records could not attribute it).
 
         Ok(())
     }
@@ -651,21 +658,45 @@ impl Config {
             .ok_or_else(|| Error::config(format!("unknown release variant '{name}'")))
     }
 
-    /// Resolve a target's member slots in the order they are listed, pairing
-    /// each slot with its declared server. References are validated at load
-    /// time, so a miss here is a configuration error.
+    /// The aggregated slot declarations of every variant: each variant's
+    /// `[[slots]]` entries in deterministic order — variants in name order
+    /// (the `BTreeMap` is already sorted), then each variant's slots in file
+    /// order.
+    pub fn slot_defs(&self) -> Vec<&SlotDef> {
+        self.variants
+            .values()
+            .flat_map(|v| v.slots.iter())
+            .collect()
+    }
+
+    /// The variant whose file declares the given slot: slots are declared
+    /// inside a variant's file, so the declaring file IS the slot's variant
+    /// binding.
+    pub fn slot_variant(&self, slot_id: &str) -> Result<&str> {
+        for (name, variant) in &self.variants {
+            if variant.slots.iter().any(|s| s.id == slot_id) {
+                return Ok(name);
+            }
+        }
+        Err(Error::config(format!(
+            "slot '{slot_id}' is not declared by any variant"
+        )))
+    }
+
+    /// Resolve a target's member slots, pairing each slot with its declared
+    /// server. Membership is DERIVED from the slots' declared `target` field
+    /// (targets no longer list their slots): every slot whose `target` is
+    /// `target_name`, in deterministic order — variants in name order, then
+    /// each variant's slots in file order.
     pub fn target_slots(&self, target_name: &str) -> Result<Vec<(&SlotDef, &ServerDef)>> {
-        let target = self
-            .targets
+        self.targets
             .get(target_name)
             .ok_or_else(|| Error::not_found(format!("target '{target_name}'")))?;
-        let mut out = Vec::with_capacity(target.slots.len());
-        for pid in &target.slots {
-            let slot = self.slots.iter().find(|p| &p.id == pid).ok_or_else(|| {
-                Error::config(format!(
-                    "target '{target_name}' references unknown slot '{pid}'"
-                ))
-            })?;
+        let mut out = Vec::new();
+        for slot in self.slot_defs() {
+            if slot.target != target_name {
+                continue;
+            }
             let server = self
                 .servers
                 .iter()
@@ -679,6 +710,16 @@ impl Config {
             out.push((slot, server));
         }
         Ok(out)
+    }
+
+    /// The slot IDs of a target's members, in the same deterministic order as
+    /// [`Config::target_slots`].
+    pub fn target_slot_ids(&self, target_name: &str) -> Result<Vec<String>> {
+        Ok(self
+            .target_slots(target_name)?
+            .into_iter()
+            .map(|(slot, _)| slot.id.clone())
+            .collect())
     }
 
     /// The slot→server binding map for a target, keyed by placement slot ID:
@@ -829,6 +870,12 @@ mod tests {
         let variant_toml = r#"
 description = "escaping"
 
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+deploy_dir = "/srv/esc"
+
 [[artifact.mappings]]
 from = "build/output/"
 to = "../escape"
@@ -864,15 +911,8 @@ address = "a"
 user = "u"
 host_key_fingerprint = "SHA256:test"
 
-[[slots]]
-id = "p1"
-server = "s1"
-variant = "standard"
-deploy_dir = "/srv/esc"
-
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-slots = ["p1"]
 "#;
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml).unwrap();
@@ -892,6 +932,12 @@ slots = ["p1"]
 
         let standard_toml = r#"
 description = "Standard deployment"
+
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+deploy_dir = "/srv/example"
 
 [[artifact.mappings]]
 from = "build/output/"
@@ -951,15 +997,8 @@ user = "u"
 host_key_fingerprint = "SHA256:test"
 capacity = { reserve_bytes = 1073741824, reserve_percent = 5 }
 
-[[slots]]
-id = "p1"
-server = "s1"
-variant = "standard"
-deploy_dir = "/srv/example"
-
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-slots = ["p1"]
 "#;
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml).unwrap();
@@ -1015,6 +1054,19 @@ attempts = 1
 interval_seconds = 0
 "#;
 
+    /// The default slot body appended to the `standard` variant file used by
+    /// the tests below: `p1` on server `s1`, belonging to target `t1`. Slots
+    /// are declared inside the variant file that owns the workload and bind
+    /// themselves to a target with the `target` field; a target's members are
+    /// derived from these declarations.
+    const STANDARD_SLOTS: &str = r#"
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+deploy_dir = "/srv/forced"
+"#;
+
     fn deploy_toml(release_value: &str) -> String {
         format!(
             r#"
@@ -1036,15 +1088,8 @@ address = "a"
 user = "u"
 host_key_fingerprint = "SHA256:test"
 
-[[slots]]
-id = "p1"
-server = "s1"
-variant = "standard"
-deploy_dir = "/srv/forced"
-
 [targets.t1]
 rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
-slots = ["p1"]
 "#
         )
     }
@@ -1052,7 +1097,13 @@ slots = ["p1"]
     fn write_standard_release(project: &Path, release: &str) {
         let release_dir = project.join("releases").join(release);
         std::fs::create_dir_all(&release_dir).unwrap();
-        std::fs::write(release_dir.join("standard.toml"), MINIMAL_VARIANT).unwrap();
+        // The standard variant file declares the `p1` slot the `deploy_toml()`
+        // target references.
+        std::fs::write(
+            release_dir.join("standard.toml"),
+            format!("{MINIMAL_VARIANT}\n{STANDARD_SLOTS}"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1168,89 +1219,122 @@ slots = ["p1"]
         );
     }
 
+    /// A slot's `target` field must name a top-level `[targets.<name>]` key:
+    /// membership is derived from the slot declarations, so a slot bound to an
+    /// undeclared target is a configuration error.
     #[test]
-    fn targets_must_reference_declared_slots() {
+    fn slot_target_must_reference_declared_target() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         write_standard_release(&project, "v1");
-        // The target references `ghost`, which no [[slots]] entry declares.
         let p = project.join("deploy.toml");
-        std::fs::write(
-            &p,
-            deploy_toml("v1").replace("slots = [\"p1\"]", "slots = [\"ghost\"]"),
-        )
-        .unwrap();
-        let err = Config::load(&p).expect_err("unknown slot reference must fail");
-        assert!(
-            err.to_string().contains("unknown slot 'ghost'"),
-            "error must name the unknown slot reference, got: {err}"
+        std::fs::write(&p, deploy_toml("v1")).unwrap();
+        let bad_variant = format!(
+            "{MINIMAL_VARIANT}\n[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntarget = \"ghost\"\ndeploy_dir = \"/srv/forced\"\n"
         );
-    }
-
-    /// A slot owns exactly one on-server deployment location (`deploy_dir`)
-    /// and the per-target records (attempts, snapshots, observed) are keyed by
-    /// target, so a slot referenced by two targets would race over the same
-    /// remote state. The model invariant is ONE TARGET PER SLOT: the second
-    /// reference is rejected at validation, naming the slot and both targets.
-    #[test]
-    fn slot_referenced_by_two_targets_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let project = dir.path().join("proj");
-        std::fs::create_dir_all(&project).unwrap();
-        write_standard_release(&project, "v1");
-        let p = project.join("deploy.toml");
-        // A second target that also references slot `p1`.
-        let second = "\n[targets.t2]\nrollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }\nslots = [\"p1\"]\n";
-        std::fs::write(&p, format!("{}{}", deploy_toml("v1"), second)).unwrap();
-        let err = Config::load(&p).expect_err("slot in two targets must fail");
+        std::fs::write(project.join("releases/v1/standard.toml"), bad_variant).unwrap();
+        let err = Config::load(&p).expect_err("unknown target reference must fail");
         let msg = err.to_string();
         assert!(
-            msg.contains("slot 'p1' is referenced by targets 't1' and 't2'")
-                && msg.contains("a slot belongs to exactly one target"),
-            "error must name the slot and both targets, got: {msg}"
+            msg.contains("references unknown target 'ghost'") && msg.contains("variant 'standard'"),
+            "error must name the unknown target and the declaring variant, got: {msg}"
         );
-
-        // Two targets with DISJOINT slot sets remain valid.
-        let disjoint = "\n[[slots]]\nid = \"p2\"\nserver = \"s1\"\nvariant = \"standard\"\ndeploy_dir = \"/srv/forced-2\"\n\n[targets.t2]\nrollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }\nslots = [\"p2\"]\n";
-        std::fs::write(&p, format!("{}{}", deploy_toml("v1"), disjoint)).unwrap();
-        let cfg = Config::load(&p).expect("disjoint slot ownership across targets is valid");
-        assert_eq!(cfg.targets.len(), 2);
-        assert_eq!(cfg.slots.len(), 2);
     }
 
+    /// Each slot owns exactly one on-server deployment location (`deploy_dir`)
+    /// and the per-target records (attempts, snapshots, observed) are keyed by
+    /// target, so the model invariant is ONE TARGET PER SLOT. With the slot's
+    /// single `target` field this is STRUCTURAL — a slot cannot be a member of
+    /// two targets; a target's members are DERIVED by scanning the slots.
     #[test]
-    fn slots_must_reference_known_servers_and_variants() {
+    fn slots_declare_their_target_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        let p = project.join("deploy.toml");
+
+        // A second slot, declared in the same variant file, belongs to a
+        // second target (disjoint targets, disjoint memberships).
+        let standard_toml = format!(
+            "{MINIMAL_VARIANT}\n{STANDARD_SLOTS}\n[[slots]]\nid = \"p2\"\nserver = \"s1\"\ntarget = \"t2\"\ndeploy_dir = \"/srv/forced-2\"\n"
+        );
+        std::fs::write(project.join("releases/v1/standard.toml"), standard_toml).unwrap();
+        let t2 = "\n[targets.t2]\nrollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }\n";
+        std::fs::write(&p, format!("{}{}", deploy_toml("v1"), t2)).unwrap();
+        let cfg = Config::load(&p).expect("slots spread across targets are valid");
+        assert_eq!(cfg.targets.len(), 2);
+        assert_eq!(cfg.slot_defs().len(), 2);
+        // Membership is derived from each slot's declared target.
+        assert_eq!(cfg.target_slot_ids("t1").unwrap(), vec!["p1"]);
+        assert_eq!(cfg.target_slot_ids("t2").unwrap(), vec!["p2"]);
+
+        // A target with NO member slot is rejected.
+        let t3 = "\n[targets.t3]\nrollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }\n";
+        std::fs::write(&p, format!("{}{}{}", deploy_toml("v1"), t2, t3)).unwrap();
+        let err = Config::load(&p).expect_err("target without slots must fail");
+        assert!(
+            err.to_string().contains("target 't3' has no slots"),
+            "error must name the empty target, got: {err}"
+        );
+    }
+
+    /// Slots are declared inside the variant files, so the server reference of
+    /// a variant's slot must resolve against the top-level `[[servers]]` list
+    /// — reported against the declaring variant — and the slot's variant
+    /// binding IS the declaring file.
+    #[test]
+    fn slots_must_reference_known_servers() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         write_standard_release(&project, "v1");
 
-        // A slot bound to a server that does not exist.
+        // A slot bound to a server that does not exist (declared in the
+        // variant file, reported with the variant context).
         let p = project.join("deploy.toml");
-        std::fs::write(
-            &p,
-            deploy_toml("v1").replace("server = \"s1\"", "server = \"ghost\""),
-        )
-        .unwrap();
+        std::fs::write(&p, deploy_toml("v1")).unwrap();
+        let bad_variant = format!(
+            "{MINIMAL_VARIANT}\n[[slots]]\nid = \"p1\"\nserver = \"ghost\"\ntarget = \"t1\"\ndeploy_dir = \"/srv/forced\"\n"
+        );
+        std::fs::write(project.join("releases/v1/standard.toml"), bad_variant).unwrap();
         let err = Config::load(&p).expect_err("slot with unknown server must fail");
+        let msg = err.to_string();
         assert!(
-            err.to_string()
-                .contains("references unknown server 'ghost'"),
-            "got: {err}"
+            msg.contains("references unknown server 'ghost'") && msg.contains("variant 'standard'"),
+            "error must name the unknown server and the declaring variant, got: {msg}"
         );
 
-        // A slot bound to a variant the release directory does not declare.
+        // The declaring file is the slot's variant binding: `slot_variant`
+        // resolves the slot to the file that declares it.
         std::fs::write(
-            &p,
-            deploy_toml("v1").replace("variant = \"standard\"", "variant = \"ghost\""),
+            project.join("releases/v1/standard.toml"),
+            format!("{MINIMAL_VARIANT}\n{STANDARD_SLOTS}"),
         )
         .unwrap();
-        let err = Config::load(&p).expect_err("slot with unknown variant must fail");
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.slot_variant("p1").unwrap(), "standard");
+        assert!(cfg.slot_variant("ghost-slot").is_err());
+    }
+
+    #[test]
+    fn duplicate_slot_ids_across_variants_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        // A second variant declares a slot with the SAME id: the id must be
+        // unique across every variant's slots.
+        let dup = format!("{MINIMAL_VARIANT}\n{STANDARD_SLOTS}\n");
+        std::fs::write(project.join("releases/v1/high-capacity.toml"), dup).unwrap();
+        let p = project.join("deploy.toml");
+        std::fs::write(&p, deploy_toml("v1")).unwrap();
+        let err = Config::load(&p).expect_err("duplicate slot id across variants must fail");
+        let msg = err.to_string();
         assert!(
-            err.to_string()
-                .contains("references unknown variant 'ghost'"),
-            "got: {err}"
+            msg.contains("duplicate slot id 'p1'") && msg.contains("variant 'standard'"),
+            "error must name the duplicate id and the variant where the collision was found, got: {msg}"
         );
     }
 
@@ -1262,9 +1346,13 @@ slots = ["p1"]
         write_standard_release(&project, "v1");
         let p = project.join("deploy.toml");
 
-        // Second slot, same server, SAME deploy_dir: rejected.
-        let dup = "\n[[slots]]\nid = \"p2\"\nserver = \"s1\"\nvariant = \"standard\"\ndeploy_dir = \"/srv/forced\"\n\n[targets.t1]";
-        std::fs::write(&p, deploy_toml("v1").replace("\n[targets.t1]", dup)).unwrap();
+        // Second slot in the same variant file, same server, SAME deploy_dir:
+        // rejected (the location collision fires regardless of target).
+        let dup = format!(
+            "{MINIMAL_VARIANT}\n{STANDARD_SLOTS}\n[[slots]]\nid = \"p2\"\nserver = \"s1\"\ntarget = \"t1\"\ndeploy_dir = \"/srv/forced\"\n"
+        );
+        std::fs::write(project.join("releases/v1/standard.toml"), dup).unwrap();
+        std::fs::write(&p, deploy_toml("v1")).unwrap();
         let err = Config::load(&p).expect_err("shared server+deploy_dir must fail");
         let msg = err.to_string();
         assert!(
@@ -1272,11 +1360,23 @@ slots = ["p1"]
             "error must name the colliding slots, got: {msg}"
         );
 
-        // Second slot, same server, DIFFERENT deploy_dir: accepted.
-        let ok = "\n[[slots]]\nid = \"p2\"\nserver = \"s1\"\nvariant = \"standard\"\ndeploy_dir = \"/srv/other\"\n\n[targets.t1]";
-        std::fs::write(&p, deploy_toml("v1").replace("\n[targets.t1]", ok)).unwrap();
+        // A DIFFERENT variant file declares p2 with a DIFFERENT deploy_dir on
+        // the same server for a DIFFERENT target: accepted (the uniqueness
+        // rule spans all variants' slots; two slots may share one server in
+        // different targets).
+        std::fs::write(
+            project.join("releases/v1/standard.toml"),
+            format!("{MINIMAL_VARIANT}\n{STANDARD_SLOTS}"),
+        )
+        .unwrap();
+        let other = format!(
+            "{MINIMAL_VARIANT}\n[[slots]]\nid = \"p2\"\nserver = \"s1\"\ntarget = \"t2\"\ndeploy_dir = \"/srv/other\"\n"
+        );
+        std::fs::write(project.join("releases/v1/other.toml"), other).unwrap();
+        let t2 = "\n[targets.t2]\nrollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }\n";
+        std::fs::write(&p, format!("{}{}", deploy_toml("v1"), t2)).unwrap();
         let cfg = Config::load(&p).expect("distinct deploy_dir on the same server is valid");
-        assert_eq!(cfg.slots.len(), 2);
+        assert_eq!(cfg.slot_defs().len(), 2);
     }
 
     #[test]
@@ -1326,8 +1426,8 @@ slots = ["p1"]
 
         // A valid inline capacity table parses into the server policy.
         let ok = deploy_toml("v1").replace(
-            "\n[[slots]]",
-            "\ncapacity = { reserve_bytes = 4096, reserve_percent = 10 }\n[[slots]]",
+            "user = \"u\"\nhost_key_fingerprint",
+            "user = \"u\"\ncapacity = { reserve_bytes = 4096, reserve_percent = 10 }\nhost_key_fingerprint",
         );
         std::fs::write(&p, ok).unwrap();
         let cfg = Config::load(&p).expect("inline server capacity parses");
@@ -1456,6 +1556,32 @@ slots = ["p1"]
             "error must name the unknown activation field, got: {msg}"
         );
 
+        // Unknown field inside a variant's [[slots]] entry (slots are declared
+        // in the variant files, and every struct stays strict there too).
+        let bad_slot_variant = format!(
+            "{MINIMAL_VARIANT}\n[[slots]]\nid = \"p1\"\nserver = \"s1\"\nreserve_byts = 1\ndeploy_dir = \"/srv/forced\"\n"
+        );
+        std::fs::write(project.join("releases/v1/standard.toml"), bad_slot_variant).unwrap();
+        let err = Config::load(&p).expect_err("unknown slot field must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reserve_byts") && msg.contains("unknown field"),
+            "error must name the unknown slot field, got: {msg}"
+        );
+
+        // Slots moved INTO the variant files: a top-level `[[slots]]` block in
+        // deploy.toml is now an unknown field on the manifest.
+        let with_top_slots = format!(
+            "{base}\n[[slots]]\nid = \"p1\"\nserver = \"s1\"\ndeploy_dir = \"/srv/forced\"\n"
+        );
+        std::fs::write(&p, with_top_slots).unwrap();
+        let err = Config::load(&p).expect_err("top-level [[slots]] must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("slots") && msg.contains("unknown field"),
+            "error must name the unknown top-level slots field, got: {msg}"
+        );
+
         // Enums reject unknown variants by default (no attribute needed).
         let err = toml::from_str::<Mapping>("from = \"a\"\nto = \"b\"\nconflict = \"nope\"")
             .expect_err("unknown conflict variant must fail");
@@ -1464,7 +1590,11 @@ slots = ["p1"]
         // The known-good fixtures still load under the strict rules.
         let fixture = project.join("deploy.toml");
         std::fs::write(&fixture, base).unwrap();
-        std::fs::write(project.join("releases/v1/standard.toml"), MINIMAL_VARIANT).unwrap();
+        std::fs::write(
+            project.join("releases/v1/standard.toml"),
+            format!("{MINIMAL_VARIANT}\n{STANDARD_SLOTS}"),
+        )
+        .unwrap();
         Config::load(&fixture).expect("known-good config still loads");
     }
 }

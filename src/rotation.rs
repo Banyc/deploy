@@ -183,6 +183,12 @@ mod tests {
 [artifact]
 mappings = []
 
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+deploy_dir = "/srv"
+
 [activation]
 adapter = "none"
 
@@ -213,15 +219,8 @@ address = "a"
 user = "u"
 host_key_fingerprint = "SHA256:test"
 
-[[slots]]
-id = "p1"
-server = "s1"
-variant = "standard"
-deploy_dir = "/srv"
-
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-slots = ["p1"]
 "#;
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml).unwrap();

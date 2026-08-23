@@ -44,13 +44,18 @@ What it generates (also visible in `deploy init --help`):
 
 ```text
 my-app/
-  deploy.toml                          # schema v1: one server, one slot, target `production`
-  releases/v1/standard.toml            # the `standard` variant (mappings + policies)
+  deploy.toml                          # schema v1: one server, target `production` (rollout+rotation)
+  releases/v1/standard.toml            # the `standard` variant (mappings + its slot + policies)
   releases/v1/systemd.toml             # example `systemd` activation variant with a real unit
   releases/v1/artifacts/build/output/app/hello   # placeholder artifact source
   releases/v1/artifacts/systemd/example.service  # the unit shipped by the systemd variant
   .deploy-remote/                      # local deployment endpoint (git-ignored)
 ```
+
+Slots are declared INSIDE the variant files: `releases/v1/standard.toml`
+carries the project's one slot (`app-1` → `server-01`, bound to the
+`production` target by its `target` field — targets derive their member slots
+from the slots, they do not list them).
 
 The generated files are typed TOML serialized from the same config structs
 `Config::load` parses into — not formatted strings. `deploy init` validates
@@ -116,21 +121,26 @@ deploy push production release/rel-41da2f63:current   # same, but keep each serv
 ## Project structure (forced)
 
 ```text
-deploy.toml                    # names the active release, servers, slots, targets
+deploy.toml                    # names the active release, servers, and targets (rollout + rotation)
 releases/<name>/              # the release directory named by `release:`
-releases/<name>/<variant>.toml  # every *.toml file here is a variant (file stem = name)
+releases/<name>/<variant>.toml  # every *.toml file here is a variant (file stem = name);
+                                # each variant declares its own [[slots]] (server, deploy_dir, target)
 releases/<name>/artifacts/    # artifact sources referenced by variant mappings
 ```
 
 - A **release** is a directory under `releases/`. `deploy.toml` names the
   active one with `release: <name>`.
 - A **variant** is a `*.toml` file directly inside the release directory,
-  named by its file stem. It owns its artifact mappings and deployment
-  policies (activation, verification). Capacity is a per-server policy
-  declared on the server entry.
-  A **deployment slot** binds one server to one variant under an ID and names
-  the absolute `deploy_dir` on the server. A **target** groups slots (in rollout
-  order) and carries the rollout and rotation policy.
+  named by its file stem. It owns its artifact mappings, its deployment
+  policies (activation, verification), and its deployment **slots**: the
+  `[[slots]]` entries of the file are the slot declarations, and the declaring
+  file IS the slot's variant binding. Capacity is a per-server policy declared
+  on the server entry.
+- A **deployment slot** binds one server to one workload under an ID, names the
+  absolute `deploy_dir` on the server, and declares the ONE target it belongs
+  to (`target = "..."`). A **target** carries the rollout and rotation policy;
+  its member slots are DERIVED from the slots' `target` fields — targets do
+  not list their slots.
 - Retention (`rotation`) belongs to the target, not the variant.
 
 ## Config reference (condensed)
@@ -150,15 +160,9 @@ capacity = { reserve_bytes = 0, reserve_percent = 0 }  # per-server headroom, ze
 # known_hosts = "/etc/ssh/known_hosts"   # absolute path
 # host_key_fingerprint = "SHA256:..."    # pre-verified fingerprint; both together are rejected
 
-[[slots]]                     # one server + one variant under an id
-id = "app-1"
-server = "server-01"
-variant = "standard"
-deploy_dir = "/srv/deploy/my-app"   # absolute path on the server
-
-[targets.production]         # targets group slots and set policy
+[targets.production]         # targets carry rollout + rotation only: their member
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-slots = ["app-1"]
+                            # slots are derived from the slots' `target` fields
 
 [targets.production.rotation.per_server]   # retention is per target
 keep_distinct_artifacts = 5
@@ -166,10 +170,20 @@ keep_days = 14
 protect_previous = true
 ```
 
-A variant file (`releases/<release>/<name>.toml`) is a mapping plus policy:
+A variant file (`releases/<release>/<name>.toml`) is a mapping plus policy —
+plus the variant's deployment slots:
 
 ```toml
 description = "Standard deployment"
+
+# This variant's deployment slots: one slot = one server + this variant, under
+# an ID, with an absolute deploy_dir, belonging to exactly ONE target (targets
+# derive their members from these declarations).
+[[slots]]
+id = "app-1"
+server = "server-01"
+target = "production"
+deploy_dir = "/srv/deploy/my-app"   # absolute path on the server
 
 [[artifact.mappings]]
 from = "artifacts/build/output/"   # relative to the release directory
@@ -215,8 +229,10 @@ zero by default), is shared by every deployment slot on that server, and is
 resolved from this file at preflight time — it is never part of a release.
 
 Validation is strict: `deploy_dir` and `known_hosts` must be absolute paths,
-server/slot IDs must be unique, targets must reference declared slots, and each
-slot's variant must exist. Every SSH-shaped server address must configure
+server/slot IDs must be unique (slot IDs across every variant's slots), each
+slot's server must be a declared `[[servers]]` entry, each slot's `target`
+must be a declared `[targets.<name>]` key, and each target must have at least
+one member slot. Every SSH-shaped server address must configure
 EXACTLY ONE of `known_hosts` or `host_key_fingerprint` (neither means
 trust-on-first-use, which is refused; both are ambiguous) — `local://`
 addresses are exempt. A config that fails validation is rejected at load time,
@@ -224,10 +240,13 @@ before anything is touched.
 
 ## Maintenance
 
-- **Add a variant**: add `releases/<release>/<new-name>.toml` and bind a slot
-  to it (`variant = "<new-name>"`).
-- **Add a server**: add a `[[servers]]` entry, a `[[slots]]` entry binding it to
-  a variant and absolute `deploy_dir`, and add the slot ID to the target(s).
+- **Add a variant**: add `releases/<release>/<new-name>.toml`; declare its
+  slots in the file itself.
+- **Add a server**: add a `[[servers]]` entry to `deploy.toml`, then a
+  `[[slots]]` entry inside the variant file that owns the workload (server,
+  absolute `deploy_dir`, `target`).
+- **Add a slot to a target**: the slot's `target` field is the membership —
+  set it (and only it) to the target's name; targets do not list slots.
 - **Cut a release**: copy the release directory (e.g. `releases/v1` →
   `releases/v2`), edit the variant files (new mappings, verification, etc.),
   and set `release = "v2"` in `deploy.toml`. Old releases stay deployable via

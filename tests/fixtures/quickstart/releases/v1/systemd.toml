@@ -6,6 +6,10 @@
 # installed into the user service manager (`~/.config/systemd/user/`),
 # enabled, and restarted after `current` is swapped.
 #
+# It declares NO slots: to use it, add a [[slots]] entry (id, server,
+# deploy_dir, target) like standard.toml's — the `target` field binds the
+# slot to one target.
+#
 # `standard.toml` documents every setting made live here, including the
 # caveats: artifact-controlled unit files assume `scope = "user"`
 # (systemctl --user), which holds no more authority than the deployment

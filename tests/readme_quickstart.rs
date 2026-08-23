@@ -43,14 +43,23 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
         config.release_root(&config_path).ends_with("releases/v1"),
         "release directory is forced beneath releases/"
     );
-    assert_eq!(config.targets["production"].slots.len(), 2);
+    // Membership is DERIVED from the slots' `target` field: the two slots are
+    // declared inside releases/v1/standard.toml and both bind to `production`.
+    assert_eq!(config.target_slot_ids("production")?.len(), 2);
+    let std_slots = &config.variant("standard")?.slots;
+    assert_eq!(std_slots.len(), 2, "standard.toml declares app-1 and app-2");
+    assert!(
+        std_slots.iter().all(|s| s.target == "production"),
+        "both slots bind to target `production`"
+    );
     let variant = config.variant("standard")?;
     assert_eq!(
         &variant.artifact.mappings[0].from,
         "artifacts/build/output/"
     );
     // The `systemd` example variant ships a real unit file as an artifact; it
-    // is not bound to any slot, so the dry-run push stays adapter-agnostic.
+    // declares no slots (you add a slot with a `target` field to bind it), so
+    // the dry-run push stays adapter-agnostic.
     let systemd = config.variant("systemd")?;
     assert_eq!(systemd.activation.adapter, "systemd");
     assert_eq!(

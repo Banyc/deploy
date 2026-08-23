@@ -1825,8 +1825,8 @@ fn capacity_preflight(
         // slot; the slot binds one server. A miss is an internal invariant
         // violation: the assignment was planned against this config.
         let slot = config
-            .slots
-            .iter()
+            .slot_defs()
+            .into_iter()
             .find(|s| s.id.as_str() == a.placement_slot.as_str())
             .expect("assignment slot present in config");
         let server = config
@@ -2050,6 +2050,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     const NONE_VARIANT: &str = r#"
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+deploy_dir = "/srv/eng"
+
 [[artifact.mappings]]
 from = "artifacts/build/output/"
 to = "app/"
@@ -2090,18 +2096,17 @@ address = "a"
 user = "u"
 host_key_fingerprint = "SHA256:test"
 
-[[slots]]
-id = "p1"
-server = "s1"
-variant = "standard"
-deploy_dir = "/srv/eng"
-
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-slots = ["p1"]
 "#;
 
     const SYSTEMD_VARIANT: &str = r#"
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+deploy_dir = "/srv/eng"
+
 [[artifact.mappings]]
 from = "artifacts/build/output/"
 to = "app/"
@@ -2154,15 +2159,8 @@ address = "a"
 user = "u"
 host_key_fingerprint = "SHA256:test"
 
-[[slots]]
-id = "p1"
-server = "s1"
-variant = "standard"
-deploy_dir = "/srv/eng"
-
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-slots = ["p1"]
 "#;
 
     struct Harness {

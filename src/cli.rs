@@ -25,9 +25,10 @@ use std::path::PathBuf;
     long_about = "Deploy your local files to every server in a named target with one command.\n\
 \n\
 PROJECT STRUCTURE (forced):\n\
-  deploy.toml                    names the active release, servers, slots, targets\n\
+  deploy.toml                    names the active release, servers, targets (rollout + rotation)\n\
   releases/<name>/              the release directory named by `release:` in deploy.toml\n\
-  releases/<name>/<variant>.toml   every *.toml file here is a variant (file stem = name)\n\
+  releases/<name>/<variant>.toml   every *.toml file here is a variant (file stem = name);\n\
+                                  each variant declares its own [[slots]] (server, deploy_dir, target)\n\
   releases/<name>/artifacts/    artifact sources referenced by variant mappings\n\
 \n\
 The quickest start is `deploy init` — it scaffolds a working project with a\n\
@@ -55,13 +56,18 @@ enum Command {
 \n\
 Creates (never clobbers; the target must not already contain deploy.toml or a\n\
 releases/ tree):\n\
-  deploy.toml                        schema v1 config: one server, one slot, target `production`\n\
-  releases/v1/standard.toml          the `standard` variant (mappings + policies)\n\
+  deploy.toml                        schema v1 config: one server, target `production` (rollout+rotation)\n\
+  releases/v1/standard.toml          the `standard` variant (mappings + its slot + policies)\n\
   releases/v1/systemd.toml           example `systemd` activation variant with a real unit\n\
   releases/v1/artifacts/build/output/app/hello   placeholder artifact source\n\
   releases/v1/artifacts/systemd/example.service  the unit shipped by the systemd variant\n\
   .deploy-remote/                    LOCAL deployment endpoint (see below)\n\
   .gitignore                         ignores the local endpoint in a repo\n\
+\n\
+Slots are declared INSIDE the variant files: releases/v1/standard.toml\n\
+carries the project's one slot (app-1 -> server-01, bound to target\n\
+`production` by its `target` field — targets derive their members from the\n\
+slots, they do not list them).\n\
 \n\
 The generated files are typed TOML serialized from the same config structs\n\
 `Config::load` parses into — not formatted strings. Init validates the flags\n\

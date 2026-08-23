@@ -75,27 +75,35 @@ address = "server-03.example.com"
 user = "deploy"
 host_key_fingerprint = "SHA256:test"
 
+[targets.production]
+rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#;
+
+/// Slots declared inside the `standard` variant file: p1/p2 on server-01/02,
+/// both bound to target `production` (a target's members are derived from the
+/// slots' `target` field).
+const STANDARD_SLOTS: &str = r#"
 [[slots]]
 id = "p1"
 server = "server-01"
-variant = "standard"
+target = "production"
 deploy_dir = "/srv/deploy/example"
 
 [[slots]]
 id = "p2"
 server = "server-02"
-variant = "standard"
+target = "production"
 deploy_dir = "/srv/deploy/example"
+"#;
 
+/// The slot declared inside the `high-capacity` variant file (p3 on
+/// server-03, target `production`).
+const HC_SLOTS: &str = r#"
 [[slots]]
 id = "p3"
 server = "server-03"
-variant = "high-capacity"
+target = "production"
 deploy_dir = "/srv/deploy/example"
-
-[targets.production]
-rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "rollback_changed" }
-slots = ["p1", "p2", "p3"]
 "#;
 
 fn write_file(path: &Path, content: &str) {
@@ -114,8 +122,10 @@ fn write_variant_file(proj: &Path, name: &str, body: &str) {
 
 fn setup(proj: &Path) -> (Config, std::path::PathBuf) {
     write_file(&proj.join("deploy.toml"), CONFIG);
-    write_variant_file(proj, "standard", VARIANT_BODY);
-    write_variant_file(proj, "high-capacity", VARIANT_BODY);
+    // Each variant file declares its own slots (slots live in the variant
+    // files and declare their target).
+    write_variant_file(proj, "standard", &format!("{VARIANT_BODY}{STANDARD_SLOTS}"));
+    write_variant_file(proj, "high-capacity", &format!("{VARIANT_BODY}{HC_SLOTS}"));
     // Artifact sources live beneath the release directory's `artifacts` tree.
     let artifacts = proj.join("releases").join("v1").join("artifacts");
     write_file(&artifacts.join("build/output/app/server"), "server-v1\n");
@@ -367,19 +377,18 @@ id = "server-02"
 address = "local:///srv/s02"
 user = "deploy"
 
-[[slots]]
-id = "p1"
-server = "server-01"
-variant = "standard"
-deploy_dir = "/srv/deploy/rebind"
-
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-slots = ["p1"]
 "#;
     let config_path = proj.join("deploy.toml");
     write_file(&config_path, config_toml);
-    write_variant_file(&proj, "standard", VARIANT_BODY);
+    write_variant_file(
+        &proj,
+        "standard",
+        &format!(
+            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntarget = \"production\"\ndeploy_dir = \"/srv/deploy/rebind\"\n"
+        ),
+    );
     let artifacts = proj.join("releases").join("v1").join("artifacts");
     write_file(&artifacts.join("build/output/app/server"), "server-v1\n");
     write_file(&artifacts.join("deployment/common/README"), "common\n");
@@ -423,11 +432,14 @@ slots = ["p1"]
         "server-01 hosts the deployed slot after f0"
     );
 
-    // REBIND the slot to server-02 in deploy.toml: same slot id, same
+    // REBIND the slot to server-02: the slot is declared in the variant file
+    // (standard.toml), so the binding changes there — same slot id, same
     // deploy_dir, different physical server. The config stays valid (exactly
     // one slot, one server per target).
-    let rebound = config_toml.replace("server = \"server-01\"", "server = \"server-02\"");
-    write_file(&config_path, &rebound);
+    let rebound_variant = format!(
+        "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-02\"\ntarget = \"production\"\ndeploy_dir = \"/srv/deploy/rebind\"\n"
+    );
+    write_variant_file(&proj, "standard", &rebound_variant);
     let config2 = Config::load(&config_path)?;
 
     // Exact rollback to f0 must FAIL with the binding mismatch named, and
@@ -515,7 +527,7 @@ fn fleet_rollback_after_variant_rename_succeeds() -> Result<()> {
     let remotes_base = tmp.path().join("remotes");
     std::fs::create_dir_all(&remotes_base).unwrap();
 
-    fn config_toml(variant: &str) -> String {
+    fn config_toml() -> String {
         format!(
             r#"
 schema_version = 1
@@ -528,22 +540,23 @@ address = "server-01.example.com"
 user = "deploy"
 host_key_fingerprint = "SHA256:test"
 
-[[slots]]
-id = "p1"
-server = "server-01"
-variant = "{variant}"
-deploy_dir = "/srv/deploy/example"
-
 [targets.production]
 rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
-slots = ["p1"]
 "#
         )
     }
 
-    // f0: deploy variant `old`.
-    let config_path = write_string(&proj.join("deploy.toml"), &config_toml("old"));
-    write_variant_file(&proj, "old", VARIANT_BODY);
+    // f0: deploy variant `old`. The slot is declared inside the variant file
+    // that owns the workload (the declaring file is the slot's variant
+    // binding).
+    let config_path = write_string(&proj.join("deploy.toml"), &config_toml());
+    write_variant_file(
+        &proj,
+        "old",
+        &format!(
+            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntarget = \"production\"\ndeploy_dir = \"/srv/deploy/example\"\n"
+        ),
+    );
     let artifacts = proj.join("releases").join("v1").join("artifacts");
     write_file(&artifacts.join("build/output/app/server"), "v1\n");
     write_file(&artifacts.join("deployment/common/README"), "common\n");
@@ -576,9 +589,17 @@ slots = ["p1"]
     let old_release = old_server.artifact.release.clone();
 
     // Rename the variant: the configuration now declares `new`, and the
-    // `old.toml` variant file is removed entirely.
-    write_string(&proj.join("deploy.toml"), &config_toml("new"));
-    write_variant_file(&proj, "new", VARIANT_BODY);
+    // `old.toml` variant file is removed entirely. The slot moves with the
+    // rename: the slot is declared in the variant file, so it is now declared
+    // by `new.toml` (same id, server, target, deploy_dir).
+    write_string(&proj.join("deploy.toml"), &config_toml());
+    write_variant_file(
+        &proj,
+        "new",
+        &format!(
+            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntarget = \"production\"\ndeploy_dir = \"/srv/deploy/example\"\n"
+        ),
+    );
     write_file(&artifacts.join("deployment/variants/new/extra"), "new\n");
     std::fs::remove_file(proj.join("releases").join("v1").join("old.toml")).unwrap();
     let config1 = Config::load(&config_path)?;
@@ -1159,10 +1180,18 @@ impl Remote for ConflictingMarkerRemote {
     }
 }
 
-/// Per-variant policy body for the single-variant helpers.
+/// Per-variant policy body for the single-variant helpers, including the
+/// variant's slot declaration (slots live in the variant files and declare
+/// their target).
 fn single_variant_body(verify_argv: &str) -> String {
     format!(
         r#"
+[[slots]]
+id = "p1"
+server = "server-01"
+target = "production"
+deploy_dir = "/srv/deploy/example"
+
 [[artifact.mappings]]
 from = "artifacts/build/output/"
 to = "app/"
@@ -1187,7 +1216,9 @@ interval_seconds = 0
 }
 
 /// Minimal deploy.toml body with a single `standard` variant and
-/// `activation: none`. Rotation is a top-level setting of `deploy.toml`.
+/// `activation: none`. Rotation is a top-level setting of `deploy.toml`;
+/// targets carry rollout + rotation only (their members are derived from the
+/// slots' `target` field).
 fn single_target_toml(stop_on_failure: bool, batch_size: u32) -> String {
     format!(
         r#"
@@ -1209,15 +1240,8 @@ address = "server-01.example.com"
 user = "deploy"
 host_key_fingerprint = "SHA256:test"
 
-[[slots]]
-id = "p1"
-server = "server-01"
-variant = "standard"
-deploy_dir = "/srv/deploy/example"
-
 [targets.production]
 rollout = {{ batch_size = {batch_size}, stop_on_failure = {stop_on_failure}, failure_policy = "rollback_changed" }}
-slots = ["p1"]
 "#
     )
 }
@@ -1270,17 +1294,16 @@ id = "server-01"
 address = "local:///dev/null/should-not-be-used"
 user = "deploy"
 
+[targets.production]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#;
+    let variant_toml = r#"
 [[slots]]
 id = "p1"
 server = "server-01"
-variant = "standard"
+target = "production"
 deploy_dir = "/srv/deploy/example"
 
-[targets.production]
-rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-slots = ["p1"]
-"#;
-    let variant_toml = r#"
 [[artifact.mappings]]
 from = "artifacts/build/output/"
 to = "app/"
@@ -1803,29 +1826,28 @@ address = "c"
 user = "u"
 host_key_fingerprint = "SHA256:test"
 
+[targets.production]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#;
+    let variant_toml = r#"
 [[slots]]
 id = "p1"
 server = "server-01"
-variant = "standard"
+target = "production"
 deploy_dir = "/srv/deploy/example"
 
 [[slots]]
 id = "p2"
 server = "server-02"
-variant = "standard"
+target = "production"
 deploy_dir = "/srv/deploy/example"
 
 [[slots]]
 id = "p3"
 server = "server-03"
-variant = "standard"
+target = "production"
 deploy_dir = "/srv/deploy/example"
 
-[targets.production]
-rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-slots = ["p1", "p2", "p3"]
-"#;
-    let variant_toml = r#"
 [[artifact.mappings]]
 from = "artifacts/build/output/"
 to = "app/"
@@ -2740,15 +2762,8 @@ address = "server-01.example.com"
 user = "deploy"
 host_key_fingerprint = "SHA256:test"
 
-[[slots]]
-id = "p1"
-server = "server-01"
-variant = "standard"
-deploy_dir = "/srv/deploy/example"
-
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-slots = ["p1"]
 "#;
     let config_path = write_string(&proj.join("deploy.toml"), deploy_toml);
     write_variant_file(&proj, "standard", &single_variant_body("true"));

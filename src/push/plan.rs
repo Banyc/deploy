@@ -41,9 +41,13 @@ pub fn plan_assignments(
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
                 let slot_id = PlacementSlotId::new(slot.id.clone());
-                let variant = VariantName::new(slot.variant.clone());
-                let tree = variant_trees.get(&slot.variant).cloned().ok_or_else(|| {
-                    Error::plan(format!("variant '{}' not materialized", slot.variant))
+                // The slot's variant is the variant file that declares it (the
+                // declaring file is the binding; there is no per-slot `variant`
+                // field).
+                let variant_name = config.slot_variant(&slot.id)?;
+                let variant = VariantName::new(variant_name.to_string());
+                let tree = variant_trees.get(variant_name).cloned().ok_or_else(|| {
+                    Error::plan(format!("variant '{variant_name}' not materialized"))
                 })?;
                 out.push(PlannedAssignment {
                     placement_slot: slot_id,
@@ -117,12 +121,11 @@ pub fn plan_assignments(
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
                 let slot_id = PlacementSlotId::new(slot.id.clone());
-                let variant = VariantName::new(slot.variant.clone());
-                let tree = rec.variants.get(&slot.variant).cloned().ok_or_else(|| {
-                    Error::rollback(format!(
-                        "release {release} lacks variant '{}'",
-                        slot.variant
-                    ))
+                // The variant comes from the slot's declaring variant file.
+                let variant_name = config.slot_variant(&slot.id)?;
+                let variant = VariantName::new(variant_name.to_string());
+                let tree = rec.variants.get(variant_name).cloned().ok_or_else(|| {
+                    Error::rollback(format!("release {release} lacks variant '{variant_name}'"))
                 })?;
                 out.push(PlannedAssignment {
                     placement_slot: slot_id,

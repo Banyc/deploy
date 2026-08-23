@@ -249,7 +249,8 @@ interval_seconds = 0
 
 /// Minimal deploy.toml for one server whose address is `address` and whose
 /// remote deploy dir is `deploy_dir` (both must match the fake remap prefix).
-fn single_target_toml(address: &str, deploy_dir: &str) -> String {
+/// The slot itself is declared inside the variant file (see [`setup_project`]).
+fn single_target_toml(address: &str) -> String {
     format!(
         r#"
 schema_version = 1
@@ -274,28 +275,25 @@ port = 2222
 # validation (an SSH address requires exactly one identity source).
 host_key_fingerprint = "SHA256:placeholder"
 
-[[slots]]
-id = "p1"
-server = "server-01"
-variant = "standard"
-deploy_dir = "{deploy_dir}"
-
 [targets.production]
 rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
-slots = ["p1"]
 "#
     )
 }
 
 /// Set up a single-slot project (deploy.toml + variant file + artifact inputs),
-/// return the loaded config and the config path.
+/// return the loaded config and the config path. The slot is declared inside
+/// the variant file and binds itself to `production` with its `target` field.
 fn setup_project(proj: &Path, address: &str, deploy_dir: &str) -> (Config, PathBuf) {
-    write_file(
-        &proj.join("deploy.toml"),
-        &single_target_toml(address, deploy_dir),
-    );
+    write_file(&proj.join("deploy.toml"), &single_target_toml(address));
     let release_dir = proj.join("releases").join("v1");
-    write_file(&release_dir.join("standard.toml"), variant_body());
+    let slot_toml = format!(
+        "\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntarget = \"production\"\ndeploy_dir = \"{deploy_dir}\"\n"
+    );
+    write_file(
+        &release_dir.join("standard.toml"),
+        &format!("{}{}", variant_body(), slot_toml),
+    );
     let artifacts = release_dir.join("artifacts");
     write_file(&artifacts.join("build/output/app/server"), "server-v1\n");
     write_file(&artifacts.join("deployment/common/README"), "common\n");

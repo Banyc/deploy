@@ -65,7 +65,9 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     let config = Config::load(&config_path)?;
     assert_eq!(config.application, "roundtrip-app");
     assert_eq!(config.release.as_str(), "v1");
-    assert_eq!(config.targets["production"].slots, vec!["app-1"]);
+    // Membership is derived from the slots' `target` field (the slot is
+    // declared inside releases/v1/standard.toml, bound to `production`).
+    assert_eq!(config.target_slot_ids("production")?, vec!["app-1"]);
     assert_eq!(config.targets["production"].rollout.batch_size, 1);
     let variant = config.variant("standard")?;
     assert_eq!(variant.verification.argv, vec!["true"]);
@@ -74,7 +76,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         "activation none is the zero-infrastructure default"
     );
     // The scaffold also ships the `systemd` example variant with a real unit
-    // artifact; it is not bound to any slot, so the real push below stays
+    // artifact; it declares no slots, so the real push below stays
     // adapter-agnostic (no systemctl on the local endpoint).
     let systemd = config.variant("systemd")?;
     assert_eq!(systemd.activation.adapter, "systemd");

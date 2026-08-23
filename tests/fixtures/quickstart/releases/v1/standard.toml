@@ -1,9 +1,26 @@
-# The `standard` variant: its artifact mappings plus deployment policies.
-# `from` paths resolve inside the release directory (`releases/<name>/` — the
-# project structure is forced), so artifact sources live under
-# `releases/v1/artifacts/`. Rotation is not a variant setting: it belongs to
-# the target.
+# The `standard` variant: its artifact mappings plus deployment policies —
+# and its deployment slots. `from` paths resolve inside the release directory
+# (`releases/<name>/` — the project structure is forced), so artifact sources
+# live under `releases/v1/artifacts/`. Rotation is not a variant setting: it
+# belongs to the target.
 description = "Standard deployment"
+
+# This variant's deployment slots. Each slot binds a server (declared in
+# deploy.toml) to this variant under an ID, names the absolute on-server
+# deploy_dir, and declares the ONE target it belongs to — a target's members
+# are derived from the slots' `target` fields (targets no longer list their
+# slots). Both slots belong to `production`.
+[[slots]]
+id = "app-1"
+server = "server-01"
+target = "production"
+deploy_dir = "/srv/deploy/example"
+
+[[slots]]
+id = "app-2"
+server = "server-02"
+target = "production"
+deploy_dir = "/srv/deploy/example"
 
 [[artifact.mappings]]
 from = "artifacts/build/output/"
