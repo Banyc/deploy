@@ -10,8 +10,35 @@ from = "artifacts/build/output/"
 to = "app/"
 recursive = true
 
+# Activation: what happens after `current` is atomically swapped.
+#
+# `adapter = "none"` is a pure file push: the mapped artifacts land under
+# `current/` and nothing else runs. Use it when the service is managed
+# out-of-band or needs no service manager. To manage a service per
+# deployment, switch to the systemd adapter instead (commented out below):
+#
+#   [activation]
+#   adapter = "systemd"
+#   scope = "user"                     # "user" (default) | "system"
+#   reconcile_managed_units = true     # on success, disable and remove
+#                                      # formerly-managed links absent from
+#                                      # the new behavior contract; unrelated
+#                                      # units are never touched
+#   [[activation.units]]               # required: at least one unit
+#   name = "my-app.service"            # unit name to enable and restart
+#   artifact_path = "app/my-app.service"  # unit file inside the release tree
+#   enable = true                      # systemctl enable (default)
+#   restart = true                     # systemctl restart (default)
+#
+# Artifact-controlled unit files are supported by default only with
+# `scope = "user"` (systemctl --user): they hold no more authority than the
+# deployment account, and a host may need one-time admin configuration to keep
+# the user manager running. `scope = "system"` instead requires an
+# admin-installed root-owned wrapper unit: push only verifies that wrapper's
+# identity and restarts that specific unit with a narrowly scoped permission —
+# it never links artifact unit files into /etc/systemd/system.
 [activation]
-adapter = "none"          # or: systemd (scope = "user")
+adapter = "none"
 
 [verification]
 adapter = "command"

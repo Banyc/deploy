@@ -167,7 +167,11 @@ recursive = true
 # mode = "0755"                              (or "preserve")
 
 [activation]
-adapter = "none"                # or: "systemd" (scope = "user")
+adapter = "none"                # pure file push; for per-deployment service management:
+                                # adapter = "systemd", scope = "user" | "system", reconcile_managed_units = true,
+                                # and one or more [[activation.units]] {name, artifact_path, enable, restart}.
+                                # "system" scope needs an admin-installed root-owned wrapper unit; artifact
+                                # unit files are never linked into /etc/systemd/system.
 
 [verification]
 adapter = "command"
