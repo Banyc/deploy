@@ -150,7 +150,7 @@ pub fn append_snapshot(
 
 /// Finalize a successful fleet attempt replay-safely: the single shared
 /// terminal path used by BOTH the normal push success path and recovery
-/// ([`crate::push::engine::reconcile_pending_commits`]).
+/// ([`crate::push::reconcile::reconcile_pending_commits`]).
 ///
 /// The snapshot is built from the attempt's OUTCOMES (`outcomes`: per-slot
 /// actual state observed by the engine — live actuals on the main path,
