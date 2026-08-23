@@ -9,6 +9,12 @@
 //! trust-on-first-use: if no host identity is configured the transport refuses
 //! to connect.
 //!
+//! Host-identity setup is split from layout setup: [`SshTransport::prepare_identity`]
+//! verifies and pins the host key BEFORE any remote request (a dry run still
+//! connects to inspect status, so it needs the pinned key too), while
+//! [`SshTransport::provision_layout`] creates the remote deployment-directory
+//! layout and runs only for non-dry pushes.
+//!
 //! Every operation is performed by sending a single, fully shell-quoted remote
 //! command string. Because OpenSSH joins the arguments it is given into one
 //! space-separated string and the remote login shell re-tokenizes that string,
@@ -42,7 +48,7 @@ pub struct SshTransport {
     /// host key the first time we contact it.
     host_key_fingerprint: Option<String>,
     /// Managed known-hosts file holding the pinned key (used when only a
-    /// fingerprint was configured). Set only by [`SshTransport::provision`],
+    /// fingerprint was configured). Set only by [`SshTransport::prepare_identity`],
     /// never at construction, so building the transport has no side effects.
     pinned_known_hosts: std::sync::Mutex<Option<PathBuf>>,
 }
@@ -81,8 +87,8 @@ impl SshTransport {
         };
         // NOTE: construction is side-effect-free. When a fingerprint was
         // supplied without an explicit known-hosts file, the host key is
-        // verified and pinned by `provision` (before the first mutation), not
-        // here — a dry run must never touch the network or disk.
+        // verified and pinned by `prepare_identity` (before the first remote
+        // request), not here — a dry run must never touch the network or disk.
         Ok(t)
     }
 
@@ -98,7 +104,8 @@ impl SshTransport {
             "-p".into(),
             self.port.to_string(),
         ];
-        // Read the pinned path through the lock; it is set only by `provision`.
+        // Read the pinned path through the lock; it is set only by
+        // `prepare_identity`.
         let pinned = self.pinned_known_hosts.lock().ok().and_then(|g| g.clone());
         match (&self.known_hosts, &pinned) {
             (Some(kh), _) => {
@@ -506,7 +513,18 @@ impl Remote for SshTransport {
         &self.root
     }
 
-    fn provision(&self) -> Result<()> {
+    fn prepare_identity(&self) -> Result<()> {
+        // If a fingerprint was supplied without an explicit known-hosts file,
+        // verify the host key and pin it in a managed file BEFORE any remote
+        // request — including a dry run's status inspection, which still
+        // connects over ssh and therefore needs the pinned key.
+        if self.known_hosts.is_none() && self.host_key_fingerprint.is_some() {
+            self.pin_known_hosts()?;
+        }
+        Ok(())
+    }
+
+    fn provision_layout(&self) -> Result<()> {
         // Create the deployment-directory layout on the remote host. The set of
         // bootstrap directories is owned by `crate::layout::bootstrap_dirs` —
         // the same list LocalTransport provisions — and every path is
@@ -518,14 +536,7 @@ impl Remote for SshTransport {
                 .iter()
                 .map(|d| self.root.join(d).to_string_lossy().into_owned()),
         );
-        self.run_remote_ok(&Self::argv_cmd(&argv))?;
-
-        // If a fingerprint was supplied without an explicit known-hosts file,
-        // verify the host key and pin it in a managed file before any mutation.
-        if self.known_hosts.is_none() && self.host_key_fingerprint.is_some() {
-            self.pin_known_hosts()?;
-        }
-        Ok(())
+        self.run_remote_ok(&Self::argv_cmd(&argv))
     }
 
     fn read(&self, rel: &Path) -> Result<Vec<u8>> {
@@ -1074,5 +1085,305 @@ mod tests {
             vec![stale.file_name().unwrap().to_string_lossy().into_owned()],
             "only the stale temp may remain; the fresh invocation's own temp must be removed"
         );
+    }
+}
+
+/// Fingerprint-only identity tests: a `host_key_fingerprint` with no
+/// `known_hosts` file. These tests run the transport against fake
+/// `ssh`/`ssh-keyscan`/`stat` executables that emulate a remote host on a local
+/// directory, so the real pin-and-connect path is exercised end to end —
+/// including the regression: the identity must be prepared BEFORE any status
+/// request, otherwise a fingerprint-only transport cannot even build its ssh
+/// arguments (and a dry run would be equally broken).
+#[cfg(test)]
+mod fingerprint_ssh_tests {
+    use super::*;
+    use crate::remote::helper::RemoteHelper;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    /// Serializes the fake-environment tests: they mutate the process-wide
+    /// `PATH` (an `unsafe` operation in edition 2024) and share the
+    /// `$TMPDIR/deploy-ssh-knownhosts` pin cache, so they must not overlap.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct FakeSsh {
+        bin: PathBuf,
+        remote_root: PathBuf,
+        fingerprint: String,
+        deploy_dir: PathBuf,
+        address: String,
+        keyscan_log: PathBuf,
+    }
+
+    impl FakeSsh {
+        /// Generate a REAL ed25519 host key (never a hardcoded fake), compute
+        /// its SHA256 fingerprint, and write fake `ssh`/`ssh-keyscan`/`stat`
+        /// executables into `bin` that emulate a remote host rooted at
+        /// `remote_root`.
+        fn new(bin: PathBuf, remote_root: PathBuf, address: &str, deploy_dir: &Path) -> FakeSsh {
+            std::fs::create_dir_all(&bin).unwrap();
+            let keyfile = bin.join("hostkey");
+            let out = std::process::Command::new("ssh-keygen")
+                .args(["-t", "ed25519", "-N", "", "-f"])
+                .arg(&keyfile)
+                .output()
+                .expect("ssh-keygen must be available");
+            assert!(out.status.success(), "ssh-keygen failed");
+            let pubkey = std::fs::read_to_string(keyfile.with_extension("pub"))
+                .expect("read generated pubkey")
+                .trim()
+                .to_string();
+            let fp = std::process::Command::new("ssh-keygen")
+                .args([
+                    "-lf",
+                    keyfile.with_extension("pub").to_str().unwrap(),
+                    "-E",
+                    "sha256",
+                ])
+                .output()
+                .expect("ssh-keygen -lf must run");
+            assert!(fp.status.success());
+            let fingerprint = String::from_utf8_lossy(&fp.stdout)
+                .split_whitespace()
+                .nth(1)
+                .expect("fingerprint field")
+                .to_string();
+
+            let keyscan_log = bin.join("keyscan.log");
+
+            // Fake `ssh`: parse `-o`/`-p`/`--` like OpenSSH, remap every
+            // occurrence of the configured remote deploy dir to the local
+            // emulation root, and run the single (fully shell-quoted) remote
+            // command with `sh -c`.
+            std::fs::write(
+                bin.join("ssh"),
+                r#"#!/bin/sh
+# Fake `ssh` for tests: emulates a remote host whose filesystem is a local
+# directory. `FAKE_SSH_ROOT` is the local dir; `FAKE_SSH_REMOTE_PREFIX` is the
+# configured remote deploy dir (e.g. /srv/deploy/app). Every occurrence of the
+# remote prefix in the (fully shell-quoted) remote command is remapped to
+# $FAKE_SSH_ROOT$FAKE_SSH_REMOTE_PREFIX, then the command runs with `sh -c`.
+FAKE_ROOT="${FAKE_SSH_ROOT:?FAKE_SSH_ROOT not set}"
+REMOTE_PREFIX="${FAKE_SSH_REMOTE_PREFIX:?FAKE_SSH_REMOTE_PREFIX not set}"
+cmd=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) shift 2 ;;
+    -p) shift 2 ;;
+    --) shift; cmd="$*"; break ;;
+    *) shift ;;
+  esac
+done
+[ -n "$cmd" ] || exit 0
+remapped=$(printf '%s' "$cmd" | awk -v old="$REMOTE_PREFIX" -v new="$FAKE_ROOT$REMOTE_PREFIX" '{ gsub(old, new); printf "%s", $0 }')
+exec sh -c "$remapped"
+"#,
+            )
+            .unwrap();
+
+            // Fake ssh-keyscan: record every invocation (so tests can prove the
+            // cached pin is reused) and answer with the generated host key.
+            std::fs::write(
+                bin.join("ssh-keyscan"),
+                format!(
+                    r#"#!/bin/sh
+printf 'keyscan\n' >> '{log}'
+host=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) shift 2 ;;
+    -t) shift 2 ;;
+    *) host="$1" ;;
+  esac
+  shift
+done
+[ -n "$host" ] || host='{address}'
+printf '%s %s\n' "$host" '{pubkey}'
+"#,
+                    log = keyscan_log.display(),
+                    address = address,
+                    pubkey = pubkey,
+                ),
+            )
+            .unwrap();
+
+            // Fake `stat` emulating GNU coreutils `-c` (macOS stat lacks it):
+            // the transport's list/metadata scripts use `stat -c '%f'` (raw
+            // mode in hex) and `stat -c '%s %f'` (size + raw mode hex).
+            std::fs::write(
+                bin.join("stat"),
+                r#"#!/bin/sh
+fmt=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -c) fmt="$2"; shift 2 ;;
+    -L) shift ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+case "$fmt" in
+  "%f")
+    perl -e 'my @s = lstat($ARGV[0]); printf "%x\n", $s[2] & 0xffff;' "$1"
+    ;;
+  "%s %f")
+    perl -e 'my @s = lstat($ARGV[0]); printf "%s %x\n", $s[7], $s[2] & 0xffff;' "$1"
+    ;;
+  *)
+    exec /usr/bin/stat "$@"
+    ;;
+esac
+"#,
+            )
+            .unwrap();
+
+            use std::os::unix::fs::PermissionsExt;
+            for name in ["ssh", "ssh-keyscan", "stat"] {
+                let p = bin.join(name);
+                let mut perms = std::fs::metadata(&p).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&p, perms).unwrap();
+            }
+
+            FakeSsh {
+                bin,
+                remote_root,
+                fingerprint,
+                deploy_dir: deploy_dir.to_path_buf(),
+                address: address.to_string(),
+                keyscan_log,
+            }
+        }
+
+        /// A fingerprint-only `SshTransport` (no `known_hosts`) rooted at
+        /// `self.deploy_dir`.
+        fn transport(&self) -> SshTransport {
+            SshTransport::new(
+                "deploy",
+                &self.address,
+                2222,
+                &self.deploy_dir,
+                None,
+                Some(self.fingerprint.as_str()),
+            )
+            .unwrap()
+        }
+    }
+
+    /// Run `f` with `bin` prepended to `PATH` (restored afterwards).
+    fn with_fake_path<T>(bin: &Path, f: impl FnOnce() -> T) -> T {
+        let old = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths: Vec<_> = std::env::split_paths(&old).collect();
+        paths.insert(0, bin.to_path_buf());
+        let joined = std::env::join_paths(paths).unwrap();
+        // SAFETY: edition 2024 marks `set_var` unsafe. The caller holds
+        // `ENV_LOCK`, and no other test in this binary spawns ssh/ssh-keyscan.
+        unsafe {
+            std::env::set_var("PATH", &joined);
+        }
+        let result = f();
+        unsafe {
+            std::env::set_var("PATH", &old);
+        }
+        result
+    }
+
+    /// Set the fake-ssh environment (`FAKE_SSH_ROOT` / `FAKE_SSH_REMOTE_PREFIX`)
+    /// for the duration of `f`.
+    fn with_fake_root<T>(root: &Path, prefix: &str, f: impl FnOnce() -> T) -> T {
+        unsafe {
+            std::env::set_var("FAKE_SSH_ROOT", root);
+            std::env::set_var("FAKE_SSH_REMOTE_PREFIX", prefix);
+        }
+        let result = f();
+        unsafe {
+            std::env::remove_var("FAKE_SSH_ROOT");
+            std::env::remove_var("FAKE_SSH_REMOTE_PREFIX");
+        }
+        result
+    }
+
+    // Scenario (a): a fingerprint-only configuration can make a STATUS request
+    // once the identity has been prepared. Before preparation it cannot even
+    // build its ssh arguments — the exact regression this feature fixes.
+    #[test]
+    fn status_succeeds_with_fingerprint_only_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = FakeSsh::new(
+            tmp.path().join("bin"),
+            tmp.path().join("remote"),
+            "status-unit.test",
+            Path::new("/srv/deploy/status-unit"),
+        );
+        with_fake_path(&fake.bin, || {
+            with_fake_root(&fake.remote_root, "/srv/deploy/status-unit", || {
+                let t = fake.transport();
+                // Regression: without prepare_identity the transport refuses to
+                // build ssh arguments (no pinned key yet).
+                let err = t.ssh_args().unwrap_err();
+                assert!(
+                    err.to_string().contains("host identity is not configured"),
+                    "got: {err}"
+                );
+                t.prepare_identity().unwrap();
+                let args = t.ssh_args().unwrap();
+                assert!(
+                    args.iter().any(|a| a.starts_with("UserKnownHostsFile=")),
+                    "pinned known-hosts file must be used after prepare_identity"
+                );
+                // A status request now succeeds (the fake remote is empty).
+                let helper = RemoteHelper::new(&t);
+                let status = helper.status().unwrap();
+                assert!(status.current_generation.is_none());
+                assert!(status.inventory.is_empty());
+                assert!(status.lock.is_none());
+                // The pinned cache file was created on the LOCAL host.
+                let pinned = t.pinned_known_hosts.lock().unwrap().clone().unwrap();
+                assert!(pinned.exists(), "pinned file must exist");
+            });
+        });
+    }
+
+    /// Pinning is idempotent: a second `prepare_identity` validates the cached
+    /// pinned file against the configured fingerprint and reuses it WITHOUT
+    /// re-running `ssh-keyscan`; a tampered cache is dropped and re-fetched.
+    #[test]
+    fn fingerprint_pin_is_validated_and_reused() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = FakeSsh::new(
+            tmp.path().join("bin"),
+            tmp.path().join("remote-root"),
+            "pin-unit.test",
+            Path::new("/srv/deploy/pin-unit"),
+        );
+        with_fake_path(&fake.bin, || {
+            with_fake_root(&fake.remote_root, "/srv/deploy/pin-unit", || {
+                let t = fake.transport();
+                t.prepare_identity().unwrap();
+                t.prepare_identity().unwrap();
+                let calls = std::fs::read_to_string(&fake.keyscan_log)
+                    .unwrap_or_default()
+                    .lines()
+                    .count();
+                assert_eq!(calls, 1, "cached pin must be reused without re-keyscan");
+                // A tampered cache is not trusted: dropped and re-pinned.
+                let pinned = t.pinned_known_hosts.lock().unwrap().clone().unwrap();
+                std::fs::write(&pinned, "evil.example.com ssh-ed25519 AAAA\n").unwrap();
+                t.prepare_identity().unwrap();
+                let calls = std::fs::read_to_string(&fake.keyscan_log)
+                    .unwrap_or_default()
+                    .lines()
+                    .count();
+                assert_eq!(calls, 2, "tampered pin must be re-fetched");
+                let text = std::fs::read_to_string(&pinned).unwrap();
+                assert!(
+                    text.contains("ssh-ed25519"),
+                    "repinned file must hold a valid key line"
+                );
+            });
+        });
     }
 }

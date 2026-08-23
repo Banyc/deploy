@@ -1883,7 +1883,7 @@ fn dry_run_leaves_no_trace_fingerprint() -> Result<()> {
 
     let factory = move |s: &deploy::config::ServerDef,
                         _pod: &deploy::config::PodDef|
-              -> Result<Box<dyn Remote>> {
+          -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rb.join(&s.id))?))
     };
 
@@ -1964,7 +1964,9 @@ fn dry_run_factory_failure_mutates_nothing() -> Result<()> {
 
     let factory = |_s: &deploy::config::ServerDef,
                    _pod: &deploy::config::PodDef|
-          -> Result<Box<dyn Remote>> { Err(deploy::error::Error::remote("factory forced failure")) };
+     -> Result<Box<dyn Remote>> {
+        Err(deploy::error::Error::remote("factory forced failure"))
+    };
 
     let before = remote_fingerprint(root);
     let r = push(

@@ -37,8 +37,8 @@ pub const INVENTORY: &str = "inventory.json";
 pub const PARTIAL_SUFFIX: &str = ".partial";
 
 /// The deployment-directory layout created before the first mutation.
-/// `LocalTransport::provision` creates these locally; `SshTransport::provision`
-/// mkdir -p's them remotely.
+/// `LocalTransport::provision_layout` creates these locally;
+/// `SshTransport::provision_layout` mkdir -p's them remotely.
 pub fn bootstrap_dirs() -> Vec<PathBuf> {
     vec![
         Path::new(CONTROL).to_path_buf(),
@@ -55,8 +55,7 @@ pub fn bootstrap_dirs() -> Vec<PathBuf> {
 
 /// Root of the content-addressed object store.
 pub fn objects() -> &'static Path {
-    static OBJECTS_ROOT: LazyLock<PathBuf> =
-        LazyLock::new(|| Path::new(OBJECTS).join(SHA256));
+    static OBJECTS_ROOT: LazyLock<PathBuf> = LazyLock::new(|| Path::new(OBJECTS).join(SHA256));
     &OBJECTS_ROOT
 }
 

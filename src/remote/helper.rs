@@ -686,7 +686,11 @@ mod durability_tests {
             ".{}.tmp.99999.7",
             marker.file_name().unwrap().to_string_lossy()
         ));
-        std::fs::write(root.join(&tmp), b"{ \"deployment_id\": \"deploy-0\", \"commi").unwrap();
+        std::fs::write(
+            root.join(&tmp),
+            b"{ \"deployment_id\": \"deploy-0\", \"commi",
+        )
+        .unwrap();
 
         let helper = RemoteHelper::new(&remote);
         helper

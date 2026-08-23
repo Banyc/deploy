@@ -5,6 +5,12 @@
 //! rotation. It performs a protocol-version handshake before mutation and every
 //! mutating request carries an operation ID and is idempotent.
 //!
+//! Transport setup is split into two phases: [`Remote::prepare_identity`]
+//! (verify/pin the host key) runs before ANY remote request — including a dry
+//! run's status inspection — while [`Remote::provision_layout`] (create the
+//! deployment-directory layout) runs only behind the push engine's non-dry-run
+//! gate.
+//!
 //! `LocalTransport` implements the same surface against a local directory so
 //! the full push transaction can run end-to-end without SSH, faithfully
 //! mirroring the remote layout.
@@ -74,10 +80,22 @@ pub trait Remote {
     /// Available bytes on the filesystem backing the remote root.
     fn available_bytes(&self) -> Result<u64>;
 
+    /// Prepare the host identity (verify/pin the host key) before ANY remote
+    /// request, including read-only status inspection in a dry run. A dry run
+    /// still connects over the transport to inspect status, so the identity
+    /// must be prepared first. Construction is side-effect-free; identity
+    /// preparation happens before the first request that needs to connect.
+    /// Default: no-op (transports without a host-identity concept, like
+    /// `LocalTransport`).
+    fn prepare_identity(&self) -> Result<()> {
+        let _ = self;
+        Ok(())
+    }
+
     /// Create the deployment-directory layout before the first mutation.
-    /// Construction is side-effect-free; provisioning happens only after the
-    /// push engine's non-dry-run gate.
-    fn provision(&self) -> Result<()> {
+    /// Construction is side-effect-free; layout provisioning happens only after
+    /// the push engine's non-dry-run gate.
+    fn provision_layout(&self) -> Result<()> {
         let _ = self;
         Ok(())
     }
@@ -110,8 +128,8 @@ pub struct LocalTransport {
 impl LocalTransport {
     /// Build a transport rooted at `base`. Construction is side-effect-free:
     /// no directories are created and nothing is touched on disk. Call
-    /// [`Remote::provision`] to create the deployment layout before the first
-    /// mutation (the push engine does this behind its non-dry-run gate).
+    /// [`Remote::provision_layout`] to create the deployment layout before the
+    /// first mutation (the push engine does this behind its non-dry-run gate).
     pub fn new(base: PathBuf) -> Result<Self> {
         Ok(LocalTransport { base })
     }
@@ -122,7 +140,7 @@ impl Remote for LocalTransport {
         &self.base
     }
 
-    fn provision(&self) -> Result<()> {
+    fn provision_layout(&self) -> Result<()> {
         if !self.base.exists() {
             std::fs::create_dir_all(&self.base)
                 .map_err(|e| Error::transport(format!("mkdir {}: {e}", self.base.display())))?;

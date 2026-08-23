@@ -326,14 +326,21 @@ fn push_inner(
         let sid = ServerId::new(s.id.clone());
         let r = remotes.get(&sid).unwrap();
         let helper = RemoteHelper::new(r.as_ref());
+        // Prepare the host identity (verify/pin the host key) BEFORE any status
+        // request: a fingerprint-only configuration cannot connect at all
+        // without the pinned key, and a dry run still connects to inspect
+        // status. Pinning writes only to a LOCAL cache, never the remote
+        // layout, so the dry-run "mutates nothing remotely" guarantee holds.
+        r.prepare_identity()?;
         let status = helper.status()?;
         if !opts.dry_run {
-            // First mutation-adjacent act: create the remote layout. A dry run
-            // never reaches this, so an unprovisioned remote stays untouched.
-            remotes.get(&sid).unwrap().provision()?;
-            // Production path: handshake, clear abandoned incoming, check lock,
-            // recover missing local objects.
+            // Production path: protocol handshake FIRST, then create the remote
+            // layout, clear abandoned incoming, check lock, recover missing
+            // local objects. The handshake records `control/protocol.json`
+            // before any other remote layout mutation; a dry run never reaches
+            // this, so an unprovisioned remote stays untouched.
             helper.handshake()?;
+            remotes.get(&sid).unwrap().provision_layout()?;
             for pend in &status.pending_incoming {
                 if pend != deployment_id.as_str() {
                     helper.remove_incoming(pend)?;
