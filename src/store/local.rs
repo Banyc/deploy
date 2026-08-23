@@ -217,7 +217,10 @@ impl LocalStore {
                 digest.as_str()
             )));
         }
-        write_json(&self.object_tree_json(digest), &meta)?;
+        write_atomic_cas(
+            &self.object_tree_json(digest),
+            &serde_json::to_vec(&meta).map_err(|e| Error::store(format!("serialize tree.json: {e}")))?,
+        )?;
         Ok(())
     }
 
@@ -471,13 +474,21 @@ impl LocalStore {
     pub fn write_plan<T: Serialize>(&self, id: &str, plan: &T) -> Result<()> {
         let dir = self.deployment_dir(id);
         ensure_private_dir(&dir)?;
-        write_json(&dir.join("plan.json"), plan)
+        // The recorded plan of an attempt is immutable: deployment IDs are
+        // unique, so a conflicting same-ID rewrite is corruption and must fail
+        // rather than silently rewrite history.
+        let bytes = serde_json::to_vec_pretty(plan)
+            .map_err(|e| Error::store(format!("serialize plan: {e}")))?;
+        write_atomic_cas(&dir.join("plan.json"), &bytes)
     }
 
     pub fn write_results(&self, id: &str, results: &DeploymentResults) -> Result<()> {
         let dir = self.deployment_dir(id);
         ensure_private_dir(&dir)?;
-        write_json(&dir.join("results.json"), results)
+        // Same immutability rule as the plan: recorded once per deployment ID.
+        let bytes = serde_json::to_vec_pretty(results)
+            .map_err(|e| Error::store(format!("serialize results: {e}")))?;
+        write_atomic_cas(&dir.join("results.json"), &bytes)
     }
 
     pub fn read_results(&self, id: &str) -> Result<DeploymentResults> {
@@ -513,6 +524,7 @@ pub fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{DeploymentId, TargetName};
 
     #[test]
     fn release_aux_snapshots_are_immutable_and_atomic() {
@@ -551,5 +563,37 @@ mod tests {
             .unwrap()
             .expect("snapshot exists");
         assert_eq!(read["standard"].capacity.reserve_bytes, 1);
+    }
+
+    /// A recorded attempt's plan and results are immutable: deployment IDs are
+    /// unique, so a same-ID rewrite with different content is corruption and
+    /// must fail instead of silently rewriting history.
+    #[test]
+    fn recorded_plan_and_results_are_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+
+        let plan = serde_json::json!({ "target": "t1" });
+        store.write_plan("deploy-1", &plan).expect("first plan write");
+        store
+            .write_plan("deploy-1", &plan)
+            .expect("identical rewrite is idempotent");
+        let err = store
+            .write_plan("deploy-1", &serde_json::json!({ "target": "t2" }))
+            .expect_err("conflicting plan rewrite must fail");
+        assert!(err.to_string().contains("different content"));
+
+        let results = DeploymentResults {
+            deployment_id: DeploymentId::from("deploy-1".to_string()),
+            target: TargetName::from("t1".to_string()),
+            servers: Default::default(),
+        };
+        store.write_results("deploy-1", &results).expect("first results");
+        let conflicting = DeploymentResults {
+            deployment_id: DeploymentId::from("deploy-1".to_string()),
+            target: TargetName::from("t2".to_string()),
+            servers: Default::default(),
+        };
+        assert!(store.write_results("deploy-1", &conflicting).is_err());
     }
 }

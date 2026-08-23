@@ -238,19 +238,38 @@ impl<'a> RemoteHelper<'a> {
 
     /// Create a generation record and its `root` symlink. Does not move
     /// `current`.
+    ///
+    /// The assignment record is immutable and installed with create-or-compare
+    /// semantics: a generation ID colliding with different content fails
+    /// integrity instead of silently rewriting history. Generation IDs are
+    /// fresh UUIDv7 values minted under the operation lock, so this can only
+    /// fire on corruption or retry-after-crash with divergent state.
     pub fn create_generation(&self, op_id: &str, assignment: &GenerationAssignment) -> Result<()> {
         let gen_dir = Path::new("generations").join(&assignment.generation_id);
         self.remote.create_dir_all(&gen_dir)?;
         let json = serde_json::to_vec_pretty(assignment)
             .map_err(|e| Error::remote(format!("serialize assignment: {e}")))?;
-        self.remote
-            .write(&gen_dir.join("assignment.json"), &json, 0o644)?;
+        let assignment_path = gen_dir.join("assignment.json");
+        if !self.remote.try_write_new(&assignment_path, &json)? {
+            let existing = self.remote.read(&assignment_path)?;
+            if existing != json {
+                return Err(Error::integrity(format!(
+                    "generation {} already exists with different content",
+                    assignment.generation_id
+                )));
+            }
+        }
         // The `root` symlink lives inside `generations/<gen>/`, so it must be
-        // relative to that directory (../../objects/...).
-        let root_link = Path::new("../../objects/sha256")
-            .join(&assignment.tree)
-            .join("root");
-        self.remote.symlink(&root_link, &gen_dir.join("root"))?;
+        // relative to that directory (../../objects/...). Its target is derived
+        // deterministically from the (now-verified) assignment, so recreating
+        // it after a crash is safe.
+        let root_link_path = gen_dir.join("root");
+        if !self.remote.exists(&root_link_path) {
+            let root_link = Path::new("../../objects/sha256")
+                .join(&assignment.tree)
+                .join("root");
+            self.remote.symlink(&root_link, &root_link_path)?;
+        }
         let _ = op_id;
         Ok(())
     }
@@ -541,4 +560,60 @@ impl<'a> Drop for LockGuard<'a> {
 
 pub fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote::transport::LocalTransport;
+
+    fn assignment(gen_id: &str, tree: &str) -> GenerationAssignment {
+        GenerationAssignment {
+            deployment_id: "deploy-1".into(),
+            generation_id: gen_id.into(),
+            release: "rel-sha256-x".into(),
+            variant: "standard".into(),
+            tree: tree.into(),
+            behavior_sha256: "b".into(),
+            prior_generation: None,
+            created_at: "2020-01-01T00:00:00Z".into(),
+        }
+    }
+
+    /// A generation record is immutable: installed with create-or-compare, so
+    /// an ID collision with divergent content fails integrity instead of
+    /// rewriting history, and the original record survives untouched.
+    #[test]
+    fn generation_assignment_is_create_or_compare() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let helper = RemoteHelper::new(&remote);
+
+        helper
+            .create_generation("op", &assignment("gen-1", "tree-a"))
+            .expect("first create");
+        // Identical recreation (retry after crash) is idempotent.
+        helper
+            .create_generation("op", &assignment("gen-1", "tree-a"))
+            .expect("identical recreation is idempotent");
+
+        // Divergent content for the same generation ID fails integrity...
+        let err = helper
+            .create_generation("op", &assignment("gen-1", "tree-TAMPERED"))
+            .expect_err("divergent generation rewrite must fail");
+        assert!(
+            err.to_string().contains("different content"),
+            "error must name the immutability violation, got: {err}"
+        );
+
+        // ...and the original record survives. (The `root` symlink may dangle
+        // here — no object was published in this test — so assert on the link
+        // itself rather than its resolved target.)
+        let a = helper.read_assignment("gen-1").unwrap();
+        assert_eq!(a.tree, "tree-a");
+        assert!(
+            std::fs::symlink_metadata(remote.root().join("generations/gen-1/root")).is_ok(),
+            "generation root symlink must exist"
+        );
+    }
 }

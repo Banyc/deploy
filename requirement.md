@@ -379,6 +379,36 @@ Each server stores only variants it has actually received:
 
 Tree objects, release records, and generation records are immutable. Staging uploads may run concurrently because each uses a deployment-specific incoming path that is invisible to activation and rotation. The remote mutation lock is acquired before a staged tree is published and held through publication, generation creation, activation, verification, state recording, and rotation. Existing objects are reused only after their digest and manifest are verified.
 
+### Immutable datatypes and their guarantees
+Every datatype below carries an immutability semantic. For each one: what must never change, the mechanism that guarantees it, and where that mechanism is enforced.
+
+1. **Tree object** — local `objects/sha256/<digest>/root` + `tree.json`, remote `objects/sha256/<digest>/root`.
+   *Semantic*: bytes at a digest path always hash back to that digest.
+   *Guarantee*: content-addressed identity; an existing object is re-canonicalized before reuse (`store.store_object`), freshly stored content is verified after copy and deleted on mismatch; staged uploads land in deployment-scoped `incoming/<deployment>/<digest>.partial` and become visible via a single same-filesystem rename (`helper.publish_from_incoming`); every activation re-canonicalizes the downloaded tree before `current` moves (`process_server` integrity check).
+2. **Release record** — local `releases/<id>/release.json`.
+   *Semantic*: a release ID permanently denotes one mapping set, behavior-contract set, capacity-policy snapshot, and variant→tree binding set.
+   *Guarantee*: the ID is derived from the canonical identity payload covering all four digests (`release.release_digest`); `store.write_release` refuses to replace an existing ID with different `release_sha256` and treats identical rewrite as idempotent.
+3. **Release snapshots** — `mapping.toml`, `behavior.json`, `policies.json` beside the release record.
+   *Semantic*: the frozen inputs behind a release ID can never be rewritten in place, not even partially.
+   *Guarantee*: atomic create-or-compare writes (`store.write_atomic_cas`: temp file + rename for atomicity; existing content must match byte-for-byte or the write fails); remotely mirrored by `helper.publish_release_file` (exclusive create via `try_write_new`, then semantic-JSON or byte comparison, refuse replace). The policy digest is part of the release identity, so a capacity-only change yields a new release instead of mutating an old snapshot.
+4. **Generation record** — remote `generations/<gen>/assignment.json` + `root` symlink.
+   *Semantic*: once a generation exists, its assignment (deployment, release, variant, tree, behavior digest, prior generation) is fixed forever.
+   *Guarantee*: generation IDs are fresh UUIDv7 values minted under the operation lock; `helper.create_generation` installs `assignment.json` with exclusive create-or-compare — an ID collision with divergent content fails integrity instead of rewriting history — and the `root` symlink target is derived deterministically from the verified assignment, making crash recovery idempotent. `current` moves only through the compare-and-swap rename in `helper.swap_current`.
+5. **Fleet commit marker** — remote `state/commits/<deployment-id>.json`.
+   *Semantic*: a recorded fleet commit is a durable fact of that deployment.
+   *Guarantee*: the filename is scoped to the unique deployment ID and the payload is derived deterministically from the deployment ID, generation, and server set; existence is checked before any rewrite (`helper.write_commit_marker`, `commit_marker_exists`).
+6. **Deployment plan and results** — local `deployments/<id>/plan.json`, `results.json`.
+   *Semantic*: what an attempt intended and produced is fixed once recorded.
+   *Guarantee*: written once per unique deployment ID through `write_atomic_cas`; a same-ID conflicting rewrite fails instead of silently rewriting history (`store.write_plan`, `store.write_results`). The `status` file in the same directory is deliberately mutable — it is a progress marker, not history.
+7. **Attempt history and reflog** — `targets/<target>/attempts.jsonl`, `refs/reflog.jsonl`.
+   *Semantic*: recorded attempts and successful fleet snapshots are append-only facts; entries are never edited or reordered.
+   *Guarantee*: append-mode-only writers under the target lock (`store.append_attempt`, `store.append_reflog`); reflog indices are assigned monotonically from the current entry count.
+8. **Remote operation history** — `state/history.jsonl`.
+   *Semantic*: per-server operation history only grows.
+   *Guarantee*: read-concat-write under the remote mutation lock (`helper.record_history`).
+
+Mutable by design (excluded from these guarantees): observed target state, per-server records, the `last-successful` ref, incoming staging areas, transaction records, and all declarative configuration (`deploy.toml`, variant files), which are versioned through the release identity rather than frozen.
+
 Publishing renames a verified incoming directory into `objects/` on the same filesystem. A generation binds a deployment ID, release ID, `variant`, tree digest, behavior snapshot, and prior generation. After its files and a durable transaction record have been written and synced, activation creates a temporary symlink beside `current`, atomically renames it over `current`, and syncs the parent directory. This single durable pointer replacement is the per-server commit point.
 
 There is no independently updated `previous` symlink. The previous successful generation is derived from the immutable generation chain and history. This avoids pretending that two reference updates can be atomic. On startup or the next connection, the remote helper reconciles any unfinished transaction with the actual `current` target and either completes its record or restores the prior generation before accepting another mutation.
