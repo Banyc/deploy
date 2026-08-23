@@ -17,7 +17,7 @@
 //! tree binding.
 
 use crate::error::{Error, Result};
-use crate::model::SCHEMA_VERSION;
+use crate::model::{PlacementSlotId, SCHEMA_VERSION, ServerId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -570,6 +570,28 @@ impl Config {
             }
         }
 
+        // Ownership invariant: each slot belongs to exactly ONE target. The
+        // slot's REMOTE state (`deploy_dir`) is single — a slot in two targets
+        // would race over the same on-server state, and the per-target records
+        // (attempts, snapshots, observed) cannot attribute it — so scan the
+        // targets' slot lists and reject any id referenced by two or more
+        // targets.
+        let mut slot_owners: std::collections::BTreeMap<&str, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        for (tname, target) in &self.targets {
+            for pid in &target.slots {
+                slot_owners.entry(pid).or_default().push(tname);
+            }
+        }
+        for (pid, owners) in &slot_owners {
+            if owners.len() > 1 {
+                return Err(Error::config(format!(
+                    "slot '{pid}' is referenced by targets '{}' and '{}'; a slot belongs to exactly one target",
+                    owners[0], owners[1]
+                )));
+            }
+        }
+
         Ok(())
     }
 
@@ -657,6 +679,26 @@ impl Config {
             out.push((slot, server));
         }
         Ok(out)
+    }
+
+    /// The slot→server binding map for a target, keyed by placement slot ID:
+    /// the physical [`ServerId`] each slot is currently bound to in the
+    /// configuration. Used to record (and later verify) the physical host a
+    /// fleet snapshot's slots were deployed on.
+    pub fn target_slot_servers(
+        &self,
+        target_name: &str,
+    ) -> Result<BTreeMap<PlacementSlotId, ServerId>> {
+        Ok(self
+            .target_slots(target_name)?
+            .into_iter()
+            .map(|(slot, server)| {
+                (
+                    PlacementSlotId::new(slot.id.clone()),
+                    ServerId::new(server.id.clone()),
+                )
+            })
+            .collect())
     }
 
     /// Discover variant files inside the release directory. The project
@@ -1144,6 +1186,37 @@ slots = ["p1"]
             err.to_string().contains("unknown slot 'ghost'"),
             "error must name the unknown slot reference, got: {err}"
         );
+    }
+
+    /// A slot owns exactly one on-server deployment location (`deploy_dir`)
+    /// and the per-target records (attempts, snapshots, observed) are keyed by
+    /// target, so a slot referenced by two targets would race over the same
+    /// remote state. The model invariant is ONE TARGET PER SLOT: the second
+    /// reference is rejected at validation, naming the slot and both targets.
+    #[test]
+    fn slot_referenced_by_two_targets_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        let p = project.join("deploy.toml");
+        // A second target that also references slot `p1`.
+        let second = "\n[targets.t2]\nrollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }\nslots = [\"p1\"]\n";
+        std::fs::write(&p, format!("{}{}", deploy_toml("v1"), second)).unwrap();
+        let err = Config::load(&p).expect_err("slot in two targets must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("slot 'p1' is referenced by targets 't1' and 't2'")
+                && msg.contains("a slot belongs to exactly one target"),
+            "error must name the slot and both targets, got: {msg}"
+        );
+
+        // Two targets with DISJOINT slot sets remain valid.
+        let disjoint = "\n[[slots]]\nid = \"p2\"\nserver = \"s1\"\nvariant = \"standard\"\ndeploy_dir = \"/srv/forced-2\"\n\n[targets.t2]\nrollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }\nslots = [\"p2\"]\n";
+        std::fs::write(&p, format!("{}{}", deploy_toml("v1"), disjoint)).unwrap();
+        let cfg = Config::load(&p).expect("disjoint slot ownership across targets is valid");
+        assert_eq!(cfg.targets.len(), 2);
+        assert_eq!(cfg.slots.len(), 2);
     }
 
     #[test]

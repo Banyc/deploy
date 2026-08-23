@@ -954,7 +954,14 @@ fn push_inner(
     // transition append; it produces no snapshot entry.
     let mut message = format!("push status: {commit_status:?}");
     if commit_status == DeploymentStatus::Successful {
-        let idx = history::finalize_successful_attempt(store, &attempt, "push completed")?;
+        // The snapshot records each slot's physical server binding so an exact
+        // rollback can verify a slot still lives on the host it was deployed
+        // onto (a rebound slot must refuse rather than deploy to the wrong
+        // host). The binding comes from the CURRENT configuration: it is the
+        // live placement this attempt actually used.
+        let slot_servers = config.target_slot_servers(target_name)?;
+        let idx =
+            history::finalize_successful_attempt(store, &attempt, "push completed", &slot_servers)?;
         message = format!("push successful; fleet ref {}@f{idx}", target_name);
     } else {
         store.append_transition(deployment_id.as_str(), &commit_status, commit_reason)?;
@@ -1107,6 +1114,9 @@ fn reconcile_pending_commits(
         .iter()
         .map(|(slot, _)| slot.id.clone())
         .collect();
+    // The slot→server binding map recorded into snapshots finalized by
+    // recovery (identical to the map the original commit would have recorded).
+    let slot_servers = config.target_slot_servers(target_name)?;
 
     'pending: for attempt in pending {
         // 1. Membership check.
@@ -1245,7 +1255,7 @@ fn reconcile_pending_commits(
         //    steps; once the transition says `Successful`, every earlier step
         //    is already durable. The append-only attempts.jsonl record is
         //    untouched (still the original deployment ID, no status field).
-        history::finalize_successful_attempt(store, &attempt, "recovery finalized")?;
+        history::finalize_successful_attempt(store, &attempt, "recovery finalized", &slot_servers)?;
     }
     Ok(())
 }

@@ -161,10 +161,11 @@ slots = ["app-1", "app-2", "hc-1"]
 ```
 
 Servers are declared exactly once at the top level; a slot binds one server to
-one variant, and each target lists its member slots by ID. A slot may be a member
-of several targets, and two slots may share one server in different targets, but
-within a single target each server appears at most once (one running generation
-per server). Besides `id`, `address`, and `user`, every server accepts an
+one variant, and each target lists its member slots by ID. A slot belongs to
+exactly one target (its on-server `deploy_dir` state is single), and two slots
+may share one server in different targets, but within a single target each
+server appears at most once (one running generation per server). Besides `id`,
+`address`, and `user`, every server accepts an
 optional `port` (default 22), exactly one host-identity source — a dedicated
 `known_hosts` file used with `StrictHostKeyChecking=yes`, or a pre-verified
 `host_key_fingerprint` (`SHA256:...`) that is pinned on first contact — and an
@@ -447,7 +448,7 @@ Atomicity is per server, not across a fleet. Fleet consistency is provided by th
 4. Freeze the mapping, activation, and verification contract; generate or reuse the immutable release record.
 5. Reconcile every server's actual `current`, object inventory, and unfinished transactions. Recovery must complete before planning a new mutation.
 6. Create and durably save a deployment attempt containing the expected pre-push generation and desired assignment for every placement slot.
-7. Before changing any server, prove that every desired tree is available locally. For historical pushes, also require the current target membership to match the historical deployment's stable placement-slot set.
+7. Before changing any server, prove that every desired tree is available locally. For historical pushes, also require the current target membership to match the historical deployment's stable placement-slot set, and each slot's current `[[slots]]` `server` binding to match the binding the snapshot recorded (an unrecorded legacy binding is unverifiable and refused).
 8. Check local and remote capacity with the configured safety headroom (the per-server `capacity` policy read from the caller's current `deploy.toml`). If needed, run the ordinary protected rotation under each remote mutation lock before staging, then recheck. Abort before activation if required space is still unavailable.
 9. Upload and verify missing trees in operation-unique incoming paths on every server before activating the first batch. Uploading and staged verification may be parallel, but incoming content is not installable and rotation ignores it.
 10. Process servers in configured batches. For each server, acquire its remote mutation lock and compare `current` with the plan's expected generation. If it differs, fail that server without mutation. Otherwise publish and reverify the tree and release record, create a generation and transaction record, atomically move `current`, run the activation adapter, and run
@@ -526,7 +527,7 @@ is the LATEST transition. For example:
 {"deployment_id": "deploy-20260821T102000Z", "status": "successful", "recorded_at": "2026-08-21T10:25:00Z"}
 ```
 
-The target snapshot log contains only fully successful fleet snapshots and exposes them as `production@f0`, `production@f1`, and so on. Failed and degraded attempts remain visible through `deploy log production` and `attempts.jsonl`, but are not valid rollback sources.
+The target snapshot log contains only fully successful fleet snapshots and exposes them as `production@f0`, `production@f1`, and so on. Failed and degraded attempts remain visible through `deploy log production` and `attempts.jsonl`, but are not valid rollback sources. Each snapshot entry records every slot's advanced generation AND the physical server it was bound to (`servers`, keyed by slot ID): exact rollback maps generations to slots by slot ID, so the recorded server binding is what proves a slot still lives on the same host it was deployed onto.
 
 A fleet commit is authoritative only when the same deployment ID and placement-slot set are committed on every member. This lets a fresh or repaired local store reconstruct successful fleet history from the servers instead of trusting a stale local ref.
 
@@ -536,7 +537,7 @@ Pushing an older successful reference restores its complete assignment, includin
 deploy push production production@f1
 ```
 
-Exact fleet rollback requires the current target to contain the same stable placement-slot set as the saved deployment. Addresses may change and are taken from the current target definition after host-identity verification. If membership has changed, exact rollback fails during preflight without modifying a server.
+Exact fleet rollback requires the current target to contain the same stable placement-slot set as the saved deployment AND each slot's physical server binding (the `[[slots]]` `server`) to match the binding the snapshot recorded (`servers[slot]`): a slot rebound to a different server would otherwise receive the historical generations on the wrong host. A legacy snapshot entry that never recorded the binding is unverifiable and is refused the same way. Addresses may change and are taken from the current target definition after host-identity verification. If membership has changed or any slot was rebound, exact rollback fails during preflight without modifying a server.
 
 Schema version 1 permits a target-history ref only as a source for that same target; cross-target deployment uses a release ref instead.
 

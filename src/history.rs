@@ -7,7 +7,7 @@
 
 use crate::error::{Error, Result};
 use crate::model::{
-    GenerationRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, TargetName,
+    GenerationRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, ServerId, TargetName,
 };
 use crate::records::{DeploymentAttempt, DeploymentSnapshot, DeploymentStatus};
 use crate::store::local::LocalStore;
@@ -100,6 +100,7 @@ pub fn ensure_snapshot(
     store: &LocalStore,
     target: &TargetName,
     attempt: &DeploymentAttempt,
+    servers: &BTreeMap<PlacementSlotId, ServerId>,
 ) -> Result<u64> {
     let target = target.as_str();
     let entries = store.read_snapshots(target)?;
@@ -111,7 +112,7 @@ pub fn ensure_snapshot(
         return Ok(existing.index);
     }
     let next = entries.len() as u64;
-    let entry = build_snapshot(next, attempt);
+    let entry = build_snapshot(next, attempt, servers);
     store.append_snapshot(target, &entry)?;
     store.write_last_successful(target, attempt.deployment_id.as_str())?;
     Ok(next)
@@ -130,8 +131,9 @@ pub fn append_snapshot(
     store: &LocalStore,
     target: &TargetName,
     attempt: &DeploymentAttempt,
+    servers: &BTreeMap<PlacementSlotId, ServerId>,
 ) -> Result<u64> {
-    ensure_snapshot(store, target, attempt)
+    ensure_snapshot(store, target, attempt, servers)
 }
 
 /// Finalize a successful fleet attempt replay-safely: the single shared
@@ -167,13 +169,14 @@ pub fn finalize_successful_attempt(
     store: &LocalStore,
     attempt: &DeploymentAttempt,
     reason: &str,
+    servers: &BTreeMap<PlacementSlotId, ServerId>,
 ) -> Result<u64> {
     let id = attempt.deployment_id.as_str();
     // Already fully finalized (the eligibility gate normally prevents this):
     // every earlier step is durable by construction; only repair a stale
     // `refs/last-successful` and stop without appending anything.
     if store.latest_status(id)? == Some(DeploymentStatus::Successful) {
-        return ensure_snapshot(store, &attempt.target, attempt);
+        return ensure_snapshot(store, &attempt.target, attempt, servers);
     }
     // 1. Recoverable marker: the attempt must be re-eligible if we crash
     //    before the snapshot lands.
@@ -185,7 +188,7 @@ pub fn finalize_successful_attempt(
         )?;
     }
     // 2. Snapshot entry + `refs/last-successful` (idempotent).
-    let idx = ensure_snapshot(store, &attempt.target, attempt)?;
+    let idx = ensure_snapshot(store, &attempt.target, attempt, servers)?;
     // 3. Terminal status LAST.
     store.append_transition(id, &DeploymentStatus::Successful, Some(reason))?;
     Ok(idx)
@@ -194,7 +197,17 @@ pub fn finalize_successful_attempt(
 /// Build a snapshot entry from a successful attempt. A successful fleet snapshot
 /// carries one complete [`GenerationRef`] per slot; slots without a recorded
 /// generation are not part of a coherent successful snapshot and are dropped.
-pub fn build_snapshot(index: u64, attempt: &DeploymentAttempt) -> DeploymentSnapshot {
+/// `servers` records the physical [`ServerId`] each slot was bound to at the
+/// time the deployment ran (the engine passes the target's current
+/// slot→server binding from `deploy.toml`). It is stored as a separate map so
+/// the `slots` map and its [`GenerationRef`]s stay intact; a legacy entry with
+/// no `servers` map deserializes to an empty one (unverifiable, so rollback
+/// refuses rather than guessing the host).
+pub fn build_snapshot(
+    index: u64,
+    attempt: &DeploymentAttempt,
+    servers: &BTreeMap<PlacementSlotId, ServerId>,
+) -> DeploymentSnapshot {
     DeploymentSnapshot {
         index,
         deployment_id: attempt.deployment_id.clone(),
@@ -218,6 +231,7 @@ pub fn build_snapshot(index: u64, attempt: &DeploymentAttempt) -> DeploymentSnap
                 })
             })
             .collect(),
+        servers: servers.clone(),
     }
 }
 
@@ -265,7 +279,7 @@ pub fn snapshot_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DeploymentId, PlacementSlotId, ReleaseId};
+    use crate::model::{ArtifactRef, DeploymentId, GenerationId, PlacementSlotId, ReleaseId};
     use std::collections::BTreeMap;
 
     #[test]
@@ -309,6 +323,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         let target = TargetName::new("production".to_string());
+        let servers: BTreeMap<PlacementSlotId, ServerId> =
+            BTreeMap::from([(PlacementSlotId::new("p1"), ServerId::new("server-01"))]);
         let attempt = DeploymentAttempt {
             deployment_schema_version: 2,
             deployment_id: DeploymentId::new("deploy-idempotent".to_string()),
@@ -322,7 +338,7 @@ mod tests {
         };
 
         // First call appends the snapshot and advances the ref.
-        let first = append_snapshot(&store, &target, &attempt).unwrap();
+        let first = append_snapshot(&store, &target, &attempt, &servers).unwrap();
         assert_eq!(first, 0);
         let snapshots = store.read_snapshots(target.as_str()).unwrap();
         assert_eq!(snapshots.len(), 1);
@@ -334,13 +350,59 @@ mod tests {
 
         // Second call with the same deployment ID is a no-op: same index, no
         // duplicate entry, and `refs/last-successful` is untouched.
-        let second = append_snapshot(&store, &target, &attempt).unwrap();
+        let second = append_snapshot(&store, &target, &attempt, &servers).unwrap();
         assert_eq!(second, first, "repeated append must return the same index");
         let snapshots = store.read_snapshots(target.as_str()).unwrap();
         assert_eq!(snapshots.len(), 1, "no duplicate snapshot entry");
         assert_eq!(
             store.read_last_successful(target.as_str()).as_deref(),
             Some("deploy-idempotent")
+        );
+    }
+
+    #[test]
+    fn build_snapshot_records_each_slots_physical_server() {
+        let slot = PlacementSlotId::new("p1".to_string());
+        let attempt = DeploymentAttempt {
+            deployment_schema_version: 2,
+            deployment_id: DeploymentId::new("deploy-server-map".to_string()),
+            target: TargetName::new("production".to_string()),
+            slot_ids: vec![slot.clone()],
+            behavior_sha256: "sha256-aa".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            desired: BTreeMap::new(),
+            pre_push: BTreeMap::new(),
+            slots: BTreeMap::from([(
+                slot.clone(),
+                crate::records::AttemptServer {
+                    artifact: ArtifactRef::default(),
+                    generation: Some(GenerationId::new("gen-x".to_string())),
+                },
+            )]),
+        };
+        let servers: BTreeMap<PlacementSlotId, ServerId> =
+            BTreeMap::from([(slot.clone(), ServerId::new("server-01"))]);
+
+        let snapshot = build_snapshot(3, &attempt, &servers);
+        assert_eq!(
+            snapshot.servers.get(&slot),
+            Some(&ServerId::new("server-01")),
+            "the snapshot must record the physical server the slot was bound to"
+        );
+        assert_eq!(snapshot.slots.len(), 1, "generation refs preserved intact");
+        assert_eq!(snapshot.servers.len(), 1);
+    }
+
+    /// A legacy pre-feature snapshot line (no `servers` key) must still
+    /// deserialize; its `servers` map defaults to empty, which rollback treats
+    /// as unverifiable rather than guessing.
+    #[test]
+    fn legacy_snapshot_without_servers_deserializes_with_empty_map() {
+        let line = r#"{"index":0,"deployment_id":"deploy-old","target":"production","behavior_sha256":"sha256-aa","slots":{}}"#;
+        let snapshot: DeploymentSnapshot = serde_json::from_str(line).unwrap();
+        assert!(
+            snapshot.servers.is_empty(),
+            "legacy line yields an empty map"
         );
     }
 }

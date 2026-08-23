@@ -5,7 +5,8 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::history::{PushRef, resolve_snapshot};
 use crate::model::{
-    ArtifactRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, TreeDigest, VariantName,
+    ArtifactRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, ServerId, TreeDigest,
+    VariantName,
 };
 use crate::records::PlanSource;
 use crate::store::local::LocalStore;
@@ -67,6 +68,26 @@ pub fn plan_assignments(
                 return Err(Error::rollback(
                     "target membership changed; exact fleet rollback requires identical stable placement-slot set",
                 ));
+            }
+            // Every member's PHYSICAL server must match the one recorded in
+            // the snapshot: the generation is mapped to a slot by SLOT ID, so
+            // a slot rebound to a different server in `deploy.toml` would
+            // otherwise silently roll the historical assignment onto the wrong
+            // host. A missing recorded binding (legacy pre-feature snapshot)
+            // is unverifiable and refuses for the same reason.
+            for (slot, sdef) in &members {
+                let slot_id = PlacementSlotId::new(slot.id.clone());
+                let current_server = ServerId::new(sdef.id.clone());
+                let recorded_server = entry.servers.get(&slot_id).ok_or_else(|| {
+                    Error::rollback(format!(
+                        "slot '{slot_id}' has no recorded server binding in {ft}@f{index}; exact rollback cannot verify the physical host"
+                    ))
+                })?;
+                if recorded_server != &current_server {
+                    return Err(Error::rollback(format!(
+                        "slot '{slot_id}' was bound to server '{recorded_server}' in {ft}@f{index}, now bound to '{current_server}'; exact rollback would deploy to the wrong host"
+                    )));
+                }
             }
             let mut out = Vec::new();
             // The variant comes from the historical snapshot, not the current

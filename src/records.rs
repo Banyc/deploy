@@ -24,7 +24,11 @@
 //!   the LATEST transition.
 //! * [`DeploymentSnapshot`] — a terminal successful FLEET state used for
 //!   rollback, exposed as `<target>@fN`. Only successful deployments produce
-//!   a snapshot (`refs/snapshots.jsonl` + `refs/last-successful`).
+//!   a snapshot (`refs/snapshots.jsonl` + `refs/last-successful`). It records
+//!   each slot's advanced [`GenerationRef`] keyed by the DEPLOYMENT-LOCATION
+//!   identity AND the physical [`crate::model::ServerId`] each slot was bound
+//!   to (`servers`), so exact rollback can verify a slot still lives on the
+//!   same host.
 
 use crate::model::{
     ArtifactRef, BehaviorContract, DeploymentId, GenerationId, GenerationRef, PlacementSlotId,
@@ -132,6 +136,17 @@ pub struct DeploymentTransition {
 /// (`refs/snapshots.jsonl` + `refs/last-successful`). Each slot's entry is
 /// the complete [`GenerationRef`] it advanced to (a successful snapshot always
 /// has a generation per slot).
+///
+/// `servers` records the PHYSICAL server each slot was bound to when the
+/// snapshot was taken (the deployment-location identity lives in the `slots`
+/// key; the actual-server identity lives here). Exact rollback maps a
+/// snapshot's generation to a slot BY SLOT ID, so without this map a slot
+/// rebound to a different server in `deploy.toml` would silently roll back
+/// onto the wrong host. A MISSING entry means the binding is unverifiable
+/// (legacy pre-feature snapshots never recorded it): rollback refuses rather
+/// than guessing the host. Kept as a separate `#[serde(default)]` field so
+/// the `slots` map and its [`GenerationRef`]s stay intact and pre-feature
+/// snapshot log lines still deserialize.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentSnapshot {
     pub index: u64,
@@ -139,6 +154,12 @@ pub struct DeploymentSnapshot {
     pub target: TargetName,
     pub behavior_sha256: String,
     pub slots: BTreeMap<PlacementSlotId, GenerationRef>,
+    /// The physical server each slot was bound to at snapshot time, keyed by
+    /// [`PlacementSlotId`]. `#[serde(default)]` keeps append-only legacy
+    /// entries (pre-server-binding) readable; a missing entry is
+    /// "unverifiable" and makes exact rollback refuse the slot.
+    #[serde(default)]
+    pub servers: BTreeMap<PlacementSlotId, ServerId>,
 }
 
 /// Observed remote state for one placement slot.
