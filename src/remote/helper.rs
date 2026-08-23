@@ -651,13 +651,14 @@ mod durability_tests {
 
         // Simulate a writer that died after creating its unique temp and
         // writing only a prefix of the payload.
-        std::fs::create_dir_all(root.join("control")).unwrap();
-        std::fs::write(
-            root.join("control/.protocol.json.tmp.99999.7"),
-            b"{ \"protocol_ver",
-        )
-        .unwrap();
-        assert!(!root.join("control/protocol.json").exists());
+        let marker = layout::protocol_marker();
+        let tmp = marker.with_file_name(format!(
+            ".{}.tmp.99999.7",
+            marker.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(root.join(marker.parent().unwrap())).unwrap();
+        std::fs::write(root.join(&tmp), b"{ \"protocol_ver").unwrap();
+        assert!(!root.join(&marker).exists());
 
         let helper = RemoteHelper::new(&remote);
         let agreed = helper.handshake().expect("handshake must recover");
@@ -665,7 +666,7 @@ mod durability_tests {
 
         // The installed marker is complete and correct.
         let recorded: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(root.join("control/protocol.json")).unwrap())
+            serde_json::from_slice(&std::fs::read(root.join(layout::protocol_marker())).unwrap())
                 .expect("installed protocol marker must be valid JSON");
         assert_eq!(
             recorded["protocol_version"],
@@ -679,12 +680,13 @@ mod durability_tests {
     fn interrupted_commit_marker_write_is_recovered() {
         let (_dir, remote, root) = setup();
 
-        std::fs::create_dir_all(root.join("state/commits")).unwrap();
-        std::fs::write(
-            root.join("state/commits/.deploy-0.json.tmp.99999.7"),
-            b"{ \"deployment_id\": \"deploy-0\", \"commi",
-        )
-        .unwrap();
+        std::fs::create_dir_all(root.join(layout::commits_dir())).unwrap();
+        let marker = layout::commit_marker("deploy-0");
+        let tmp = marker.with_file_name(format!(
+            ".{}.tmp.99999.7",
+            marker.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(root.join(&tmp), b"{ \"deployment_id\": \"deploy-0\", \"commi").unwrap();
 
         let helper = RemoteHelper::new(&remote);
         helper
@@ -692,7 +694,7 @@ mod durability_tests {
             .expect("commit marker install must succeed past stale temp");
 
         let marker: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(root.join("state/commits/deploy-0.json")).unwrap(),
+            &std::fs::read(root.join(layout::commit_marker("deploy-0"))).unwrap(),
         )
         .expect("installed commit marker must be valid JSON");
         assert_eq!(marker["committed"], serde_json::json!(true));
@@ -708,7 +710,7 @@ mod durability_tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("remote");
-        let commits_dir = root.join("state/commits");
+        let commits_dir = root.join(layout::commits_dir());
         let done = Arc::new(AtomicBool::new(false));
 
         // Set even if the writer panics (Drop runs during unwind), so the

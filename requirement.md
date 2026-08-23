@@ -372,7 +372,6 @@ Each server stores only variants it has actually received:
     <operation-id>.json
   state/
     inventory.json
-    pins.json
     operation.lock
 ```
 
@@ -521,6 +520,8 @@ For each server, the retained content set is exactly this union:
 ```
 
 An artifact binding is `(release ID, variant, tree digest)`. Repeated repair or restart generations for the same binding consume one retention slot, not many.
+
+Pins are controller-side configuration (top-level `[[pins]]` entries in the project file), never server-stored state. The controller evaluates them from its local store when computing each server's retained set (`rotation::compute_retained`); servers hold no pin records and never learn them remotely.
 Distinct artifacts are ordered by their most recent successful activation. `keep_distinct_artifacts` and `keep_days` are union rules, not conditions that must both match. Age is measured from the binding's most recent successful activation rather than release creation time.
 
 Rotation is a mark-and-sweep operation under the remote mutation lock:

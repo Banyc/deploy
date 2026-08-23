@@ -115,9 +115,14 @@ pub fn operation_lock() -> PathBuf {
     state_file(OPERATION_LOCK)
 }
 
+/// Directory holding fleet-commit markers.
+pub fn commits_dir() -> PathBuf {
+    state_dir().join("commits")
+}
+
 /// Fleet-commit markers, one per deployment.
 pub fn commit_marker(deployment_id: &str) -> PathBuf {
-    state_dir().join("commits").join(format!("{deployment_id}.json"))
+    commits_dir().join(format!("{deployment_id}.json"))
 }
 
 /// Protocol negotiation marker (first-contact version record).
