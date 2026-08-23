@@ -761,16 +761,32 @@ fn push_inner(
                 commit_status = DeploymentStatus::Degraded;
                 continue;
             }
-            if helper
-                .write_commit_marker(deployment_id.as_str(), new_gen[sid].as_str(), &server_ids)
-                .is_err()
-            {
-                // Recoverable metadata failure writing the marker: the attempt
-                // is recorded `PendingCommit` and a later push's
-                // `reconcile_pending_commits` completes the marker set before
-                // its no-op check.
-                commit_status = DeploymentStatus::PendingCommit;
-                continue;
+            match helper.write_commit_marker(
+                deployment_id.as_str(),
+                new_gen[sid].as_str(),
+                &server_ids,
+            ) {
+                Err(Error::Integrity(_)) => {
+                    // A conflicting marker already exists with different
+                    // content: a concurrent controller recorded a different
+                    // fact, or the remote state diverged/corrupted. This is a
+                    // PERMANENT condition — retrying will never fix it, and
+                    // leaving the attempt `PendingCommit` would strand it
+                    // forever (every later push re-hits the same integrity
+                    // error). Finalize as `Degraded` (no reflog entry) rather
+                    // than falsely reporting `Successful`.
+                    commit_status = DeploymentStatus::Degraded;
+                    continue;
+                }
+                Err(_) => {
+                    // Recoverable metadata failure writing the marker: the
+                    // attempt is recorded `PendingCommit` and a later push's
+                    // `reconcile_pending_commits` completes the marker set
+                    // before its no-op check.
+                    commit_status = DeploymentStatus::PendingCommit;
+                    continue;
+                }
+                Ok(_) => {}
             }
             // `_guard` drops here, releasing the lock.
         }
@@ -959,11 +975,17 @@ fn push_inner(
 ///    mutable status to `Successful` and advance the reflog via
 ///    [`history::append_successful_reflog`].
 /// 4. A confirmed membership/generation mismatch finalizes the attempt as
-///    `Degraded` (no reflog entry). A transient remote failure (lock held,
-///    status read error, marker write error) leaves the attempt `PendingCommit`
-///    for a later retry: it is never falsely marked `Successful` (markers are
-///    missing) and never falsely accused of divergence (fail-closed, not
-///    degrade, on errors we cannot attribute to state change).
+///    `Degraded` (no reflog entry). An existing marker whose content differs
+///    from the deterministic payload is an integrity conflict — a concurrent
+///    controller recorded a different fact or the remote state diverged — and
+///    is NOT transient: the conflicting marker is left untouched and the
+///    attempt is finalized `Degraded` (mutable status only, no reflog entry)
+///    instead of being stranded `PendingCommit` forever. Only transient remote
+///    failures (lock held, status read error, transport-level marker write
+///    error) leave the attempt `PendingCommit` for a later retry: it is never
+///    falsely marked `Successful` (markers are missing) and never falsely
+///    accused of divergence (fail-closed, not degrade, on errors we cannot
+///    attribute to state change).
 ///
 /// Recovery only touches markers, the mutable status file, the reflog, and
 /// `refs/last-successful`: no activation, no verification adapters, no
@@ -1006,7 +1028,7 @@ fn reconcile_pending_commits(
         .map(|(_, s)| s.id.clone())
         .collect();
 
-    for attempt in pending {
+    'pending: for attempt in pending {
         // 1. Membership check.
         let membership_ok = attempt
             .server_ids
@@ -1090,17 +1112,27 @@ fn reconcile_pending_commits(
                     break;
                 }
             };
-            if helper
-                .write_commit_marker(
-                    attempt.deployment_id.as_str(),
-                    recorded[sid].as_str(),
-                    &server_ids,
-                )
-                .is_err()
-            {
-                // Marker not durable yet: leave the attempt pending.
-                markers_written = false;
-                break;
+            match helper.write_commit_marker(
+                attempt.deployment_id.as_str(),
+                recorded[sid].as_str(),
+                &server_ids,
+            ) {
+                Err(Error::Integrity(_)) => {
+                    // Conflicting marker already exists with different
+                    // content: a permanent condition, not a transient blip.
+                    // Leave the conflicting marker untouched, finalize THIS
+                    // attempt as `Degraded` (mutable status only, no reflog
+                    // entry) and move on to the next pending attempt — a later
+                    // retry would only hit the same integrity error again.
+                    store.write_status(attempt.deployment_id.as_str(), "Degraded")?;
+                    continue 'pending;
+                }
+                Err(_) => {
+                    // Marker not durable yet: leave the attempt pending.
+                    markers_written = false;
+                    break;
+                }
+                Ok(_) => {}
             }
             // `_guard` drops here, releasing the lock.
         }

@@ -807,6 +807,108 @@ impl Remote for FailOnceMarkerRemote {
     }
 }
 
+/// A remote whose FIRST fleet-commit marker create installs CONFLICTING
+/// content (a concurrent controller's divergent fact, or remote corruption)
+/// instead of the payload the push computed, so `write_commit_marker`'s
+/// read-back compare fails with `Error::Integrity` on the MAIN push path. The
+/// conflicting marker stays installed; the push must report `Degraded` — never
+/// a falsely `Successful` commit, never a forever-`PendingCommit` attempt.
+struct ConflictingMarkerRemote {
+    inner: LocalTransport,
+    armed: Arc<AtomicBool>,
+}
+
+impl ConflictingMarkerRemote {
+    fn build(base: std::path::PathBuf, armed: Arc<AtomicBool>) -> Result<Box<dyn Remote>> {
+        Ok(Box::new(ConflictingMarkerRemote {
+            inner: LocalTransport::new(base)?,
+            armed,
+        }))
+    }
+    fn conflicting_payload() -> Vec<u8> {
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "deployment_id": "deploy-foreign-controller",
+            "committed": true,
+            "generation": "gen-foreign-controller",
+            "servers": ["server-other"],
+        }))
+        .unwrap()
+    }
+    /// Arms only for the first marker-path call (once disarmed it behaves
+    /// like the inner transport).
+    fn conflict_marker(&self, rel: &Path) -> bool {
+        // Prefix check FIRST so unrelated writes do not consume the one-shot.
+        rel.to_string_lossy().starts_with("state/commits/")
+            && self.armed.swap(false, Ordering::SeqCst)
+    }
+}
+
+impl Remote for ConflictingMarkerRemote {
+    fn root(&self) -> &Path {
+        self.inner.root()
+    }
+    fn provision_layout(&self) -> Result<()> {
+        self.inner.provision_layout()
+    }
+    fn read(&self, rel: &Path) -> Result<Vec<u8>> {
+        self.inner.read(rel)
+    }
+    fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
+        if self.conflict_marker(rel) {
+            let conflicting = Self::conflicting_payload();
+            return self.inner.write(rel, &conflicting, mode);
+        }
+        self.inner.write(rel, data, mode)
+    }
+    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+        if self.conflict_marker(rel) {
+            // Install the conflicting payload FIRST so the exclusive create
+            // below reports "already exists" (`Ok(false)`), and
+            // `write_commit_marker`'s read-back compare then fails integrity.
+            let conflicting = Self::conflicting_payload();
+            self.inner.write(rel, &conflicting, 0o644)?;
+            return self.inner.try_write_new(rel, data);
+        }
+        self.inner.try_write_new(rel, data)
+    }
+    fn create_dir(&self, rel: &Path) -> Result<()> {
+        self.inner.create_dir(rel)
+    }
+    fn create_dir_all(&self, rel: &Path) -> Result<()> {
+        self.inner.create_dir_all(rel)
+    }
+    fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
+        self.inner.list(rel)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+        self.inner.symlink(target, link)
+    }
+    fn read_link(&self, rel: &Path) -> Result<std::path::PathBuf> {
+        self.inner.read_link(rel)
+    }
+    fn remove_file(&self, rel: &Path) -> Result<()> {
+        self.inner.remove_file(rel)
+    }
+    fn remove_dir_all(&self, rel: &Path) -> Result<()> {
+        self.inner.remove_dir_all(rel)
+    }
+    fn exists(&self, rel: &Path) -> bool {
+        self.inner.exists(rel)
+    }
+    fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
+        self.inner.metadata(rel)
+    }
+    fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
+        self.inner.exec(argv, timeout)
+    }
+    fn available_bytes(&self) -> Result<u64> {
+        self.inner.available_bytes()
+    }
+}
+
 /// Per-variant policy body for the single-variant helpers.
 fn single_variant_body(verify_argv: &str) -> String {
     format!(
@@ -2020,6 +2122,219 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
     assert_eq!(
         store.read_last_successful("production").as_deref(),
         Some(attempt2.deployment_id.as_str())
+    );
+    Ok(())
+}
+
+// ---- Conflicting-marker classification: a marker that already exists with
+// DIFFERENT content is a permanent integrity conflict (a concurrent controller
+// recorded a different fact, or the remote state diverged), NOT a transient
+// blip. Both the main push path (step 15) and reconciliation must finalize the
+// attempt `Degraded` — never `PendingCommit` forever, never falsely
+// `Successful` — and leave the conflicting marker untouched.
+
+#[test]
+fn conflicting_marker_on_main_push_is_degraded_not_pending() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store = LocalStore::with_base(tmp.path().join("store"))?;
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    let config = setup_single(&proj, "true", true, 1);
+
+    // The wrapper installs a conflicting marker on the FIRST commit-marker
+    // create, so step 15's write_commit_marker read-back compare fails
+    // integrity. Push 1 must report Degraded, not a forever-PendingCommit.
+    let armed = Arc::new(AtomicBool::new(true));
+    let armed_for_factory = armed.clone();
+    let rf = remotes_base.clone();
+    let conflict_factory = move |s: &deploy::config::ServerDef,
+                                 _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
+        ConflictingMarkerRemote::build(rf.join(&s.id), armed_for_factory.clone())
+    };
+    let r = push(
+        &proj.join("deploy.toml"),
+        &store,
+        &conflict_factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+
+    assert_eq!(
+        r.status,
+        Some(DeploymentStatus::Degraded),
+        "a conflicting existing marker must yield Degraded, got {:?}",
+        r.status
+    );
+    let attempt = r.attempt.expect("attempt recorded");
+    let status = std::fs::read_to_string(
+        store
+            .deployment_dir(attempt.deployment_id.as_str())
+            .join("status"),
+    )?;
+    assert_eq!(status, "Degraded", "mutable status must be Degraded");
+    assert_eq!(
+        store.read_reflog("production")?.len(),
+        0,
+        "no reflog entry for a conflicted attempt"
+    );
+    assert!(
+        store.read_last_successful("production").is_none(),
+        "last-successful must not point at a conflicted attempt"
+    );
+    // The conflicting marker (installed by the wrapper) is left untouched.
+    let marker = remotes_base
+        .join("server-01/state/commits")
+        .join(format!("{}.json", attempt.deployment_id.as_str()));
+    assert_eq!(
+        std::fs::read(&marker)?,
+        ConflictingMarkerRemote::conflicting_payload(),
+        "the conflicting marker must remain exactly as the concurrent controller wrote it"
+    );
+    Ok(())
+}
+
+#[test]
+fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store = LocalStore::with_base(tmp.path().join("store"))?;
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    let config = setup_single(&proj, "true", true, 1);
+
+    // Push 1: marker write fails once -> PendingCommit with no markers.
+    let armed = Arc::new(AtomicBool::new(true));
+    let armed_for_factory = armed.clone();
+    let rf = remotes_base.clone();
+    let fault_factory = move |s: &deploy::config::ServerDef,
+                              _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
+        FailOnceMarkerRemote::build(rf.join(&s.id), armed_for_factory.clone())
+    };
+    let r1 = push(
+        &proj.join("deploy.toml"),
+        &store,
+        &fault_factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(
+        r1.status,
+        Some(DeploymentStatus::PendingCommit),
+        "failed marker write must yield PendingCommit"
+    );
+    let attempt1 = r1.attempt.expect("attempt recorded");
+    let marker = remotes_base
+        .join("server-01/state/commits")
+        .join(format!("{}.json", attempt1.deployment_id.as_str()));
+    assert!(!marker.exists(), "marker must be absent after push 1");
+    assert_eq!(store.read_reflog("production")?.len(), 0);
+
+    // Before push 2, install a CONFLICTING marker for attempt 1's deployment
+    // id: a concurrent controller recorded a different fact (foreign
+    // generation, different server set). Any bytes differing from the
+    // deterministic payload make `write_commit_marker`'s read-back compare
+    // fail with `Error::Integrity`.
+    let conflicting_bytes = ConflictingMarkerRemote::conflicting_payload();
+    write_file(
+        &marker,
+        &String::from_utf8(conflicting_bytes.clone()).unwrap(),
+    );
+
+    // Push 2 (healthy remote): reconciliation verifies the generation, tries
+    // to write the missing marker, hits the integrity conflict, and must
+    // finalize attempt 1 as Degraded instead of leaving it pending forever.
+    let rf2 = remotes_base.clone();
+    let clean_factory = move |s: &deploy::config::ServerDef,
+                              _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
+        Ok(Box::new(LocalTransport::new(rf2.join(&s.id))?))
+    };
+    let r2 = push(
+        &proj.join("deploy.toml"),
+        &store,
+        &clean_factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(
+        r2.status, None,
+        "reconciliation must not fabricate a new attempt for an up-to-date push"
+    );
+
+    let status = std::fs::read_to_string(
+        store
+            .deployment_dir(attempt1.deployment_id.as_str())
+            .join("status"),
+    )?;
+    assert_eq!(
+        status, "Degraded",
+        "an integrity-conflicted pending attempt must finalize as Degraded"
+    );
+    assert_eq!(
+        std::fs::read(&marker)?,
+        conflicting_bytes,
+        "the conflicting marker must be left untouched"
+    );
+    assert_eq!(
+        store.read_reflog("production")?.len(),
+        0,
+        "a degraded attempt never enters the reflog"
+    );
+
+    // Push 3: the conflict is permanent, so a retry must NOT flip the attempt
+    // to Successful or grow the reflog — it stays Degraded.
+    let rf3 = remotes_base.clone();
+    let clean_factory3 = move |s: &deploy::config::ServerDef,
+                               _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
+        Ok(Box::new(LocalTransport::new(rf3.join(&s.id))?))
+    };
+    let r3 = push(
+        &proj.join("deploy.toml"),
+        &store,
+        &clean_factory3,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r3.status, None, "push 3 is still an up-to-date no-op");
+    let status = std::fs::read_to_string(
+        store
+            .deployment_dir(attempt1.deployment_id.as_str())
+            .join("status"),
+    )?;
+    assert_eq!(status, "Degraded", "attempt 1 stays Degraded on retry");
+    assert_eq!(
+        std::fs::read(&marker)?,
+        conflicting_bytes,
+        "the conflicting marker stays untouched"
+    );
+    assert_eq!(
+        store.read_reflog("production")?.len(),
+        0,
+        "reflog never grows for a conflicted attempt"
     );
     Ok(())
 }
