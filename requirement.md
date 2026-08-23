@@ -371,7 +371,6 @@ Each server stores only variants it has actually received:
   transactions/
     <operation-id>.json
   state/
-    history.jsonl
     inventory.json
     pins.json
     operation.lock
@@ -396,17 +395,13 @@ Every datatype below carries an immutability semantic. For each one: what must n
    *Guarantee*: generation IDs are fresh UUIDv7 values minted under the operation lock; `helper.create_generation` installs `assignment.json` with exclusive create-or-compare — an ID collision with divergent content fails integrity instead of rewriting history — and the `root` symlink target is derived deterministically from the verified assignment, making crash recovery idempotent. `current` moves only through the compare-and-swap rename in `helper.swap_current`.
 5. **Fleet commit marker** — remote `state/commits/<deployment-id>.json`.
    *Semantic*: a recorded fleet commit is a durable fact of that deployment.
-   *Guarantee*: the filename is scoped to the unique deployment ID and the payload is derived deterministically from the deployment ID, generation, and server set; existence is checked before any rewrite (`helper.write_commit_marker`, `commit_marker_exists`).
+   *Guarantee*: the marker is write-once: `helper.write_commit_marker` installs it by exclusive create, and if a marker already exists it must match byte-for-byte (the payload is deterministic in the deployment ID, generation, and server set) or the rewrite fails integrity. A retried or concurrent commit can therefore never alter a recorded fact. `commit_marker_exists` checks presence before any rewrite.
 6. **Deployment plan and results** — local `deployments/<id>/plan.json`, `results.json`.
    *Semantic*: what an attempt intended and produced is fixed once recorded.
    *Guarantee*: written once per unique deployment ID through `write_atomic_cas`; a same-ID conflicting rewrite fails instead of silently rewriting history (`store.write_plan`, `store.write_results`). The `status` file in the same directory is deliberately mutable — it is a progress marker, not history.
 7. **Attempt history and reflog** — `targets/<target>/attempts.jsonl`, `refs/reflog.jsonl`.
    *Semantic*: recorded attempts and successful fleet snapshots are append-only facts; entries are never edited or reordered.
    *Guarantee*: append-mode-only writers under the target lock (`store.append_attempt`, `store.append_reflog`); reflog indices are assigned monotonically from the current entry count.
-8. **Remote operation history** — `state/history.jsonl`.
-   *Semantic*: per-server operation history only grows.
-   *Guarantee*: read-concat-write under the remote mutation lock (`helper.record_history`).
-
 Mutable by design (excluded from these guarantees): observed target state, per-server records, the `last-successful` ref, incoming staging areas, transaction records, and all declarative configuration (`deploy.toml`, variant files), which are versioned through the release identity rather than frozen.
 
 Publishing renames a verified incoming directory into `objects/` on the same filesystem. A generation binds a deployment ID, release ID, `variant`, tree digest, behavior snapshot, and prior generation. After its files and a durable transaction record have been written and synced, activation creates a temporary symlink beside `current`, atomically renames it over `current`, and syncs the parent directory. This single durable pointer replacement is the per-server commit point.
@@ -432,7 +427,7 @@ verification.
 12. If `stop_on_failure` is enabled, do not start another batch after any failure.
 13. Under the default `failure_policy: rollback_changed`, compensate every server already advanced by this deployment. Compensation uses a compare-and-swap and restores a server only if `current` still names the generation created by this attempt. If all compensation succeeds, mark the attempt `failed_rolled_back`; otherwise mark it `degraded` and retain the actual mixed per-server state. An optional `leave_changed` policy may retain successful advances deliberately; any attempt with failures under that policy is `degraded`.
 14. Record every attempt, not just successful attempts, in `attempts.jsonl` and refresh `observed.json` from the actual server generations.
-15. After every server verifies, write an idempotent fleet-commit marker under each participating server's mutation lock. If this metadata phase is interrupted, mark the attempt `pending_commit`; reconciliation completes
+15. After every server verifies, write an idempotent, write-once fleet-commit marker under each participating server's mutation lock (exclusive create; an existing marker must match byte-for-byte). If this metadata phase is interrupted, mark the attempt `pending_commit`; reconciliation completes
 the markers without reactivating healthy servers when their generations still match. Any mismatch changes the attempt to `degraded`.
 16. Only an attempt whose fleet-commit markers are complete becomes `successful`, advances `refs/last-successful`, and appends to its successful-deployment reflog.
 17. Apply rotation under each server's mutation lock using the protection set defined below.
@@ -529,9 +524,9 @@ An artifact binding is `(release ID, variant, tree digest)`. Repeated repair or 
 Distinct artifacts are ordered by their most recent successful activation. `keep_distinct_artifacts` and `keep_days` are union rules, not conditions that must both match. Age is measured from the binding's most recent successful activation rather than release creation time.
 
 Rotation is a mark-and-sweep operation under the remote mutation lock:
-1. Reconcile `current`, unfinished transactions, history, pins, and fleet commit markers.
+1. Reconcile `current`, unfinished transactions, pins, and fleet commit markers.
 2. Mark tree objects referenced by the retained artifact bindings.
-3. Keep generation, release, fleet-commit, and history metadata by default; metadata is small and continues to explain unavailable historical states.
+3. Keep generation, release, and fleet-commit metadata by default; metadata is small and continues to explain unavailable historical states.
 4. Delete a tree object only when no retained binding or applicable pin on that server references it. A release or generation record may continue to describe a tree that is no longer installed and must report it as unavailable.
 5. Remove abandoned operation-specific incoming directories only after their owner transaction has expired and is known not to be running.
 
@@ -565,7 +560,7 @@ For a system service, an administrator installs a root-owned wrapper unit whose 
 ## Transport and remote helper
 The initial transport is SSH with strict host-key verification (per-server `known_hosts` or pinned `host_key_fingerprint`). An explicit `local://<absolute-path>` server address instead routes the transport to that exact filesystem endpoint; it exists for tests and for local targets. Server IDs, target names, variant names, release IDs, and paths are validated data and are never concatenated into remote shell commands. Bulk tree transfer uses SFTP or an equivalent framed channel.
 
-A small versioned remote helper owns status inspection, locking, object publication, generation switching, transaction recovery, adapter invocation, and rotation. Client and helper perform a protocol-version handshake before mutation (the negotiated version is recorded under `control/`; schema version 1 speaks protocol 1). Every mutating request carries an operation ID and is idempotent, so a disconnected client can reconnect and learn whether the operation prepared, committed, compensated, or never began. Packaging these operations as a single versioned helper binary uploaded beneath each pod's `deploy_dir` is the planned evolution; it does not change this contract.
+A small versioned remote helper owns status inspection, locking, object publication, generation switching, transaction recovery, adapter invocation, and rotation. Client and helper perform a protocol-version handshake before mutation (the negotiated version is recorded under `control/`; schema version 1 speaks protocol 1). Every mutating request carries an operation ID and is idempotent, and each operation's durable per-server transaction record (`transactions/<operation-id>.json`, advanced `prepared` → `committed`/`compensated` by the helper) lets a disconnected client reconnect and learn whether the operation prepared, committed, compensated, or never began. Packaging these operations as a single versioned helper binary uploaded beneath each pod's `deploy_dir` is the planned evolution; it does not change this contract.
 
 If the deployment account cannot create a pod's `deploy_dir`, an administrator must provision that directory once. Privileged systemd control must likewise be provisioned through the fixed, root-owned wrapper and narrowly scoped restart permission described above; `push` does not grant itself privileges.
 

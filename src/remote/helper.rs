@@ -356,7 +356,10 @@ impl<'a> RemoteHelper<'a> {
         Ok(())
     }
 
-    /// Persist a transaction record.
+    /// Persist a transaction record. This is the durable per-operation recovery
+    /// record (`transactions/<op-id>.json`, advanced `prepared` → `committed` →
+    /// `compensated`): a disconnected client learns an operation's outcome by
+    /// reading it, not from any per-server history log.
     pub fn transaction_record(&self, op_id: &str, state: &str) -> Result<()> {
         let p = layout::transaction_record(op_id);
         let payload = serde_json::json!({
