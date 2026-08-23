@@ -6,14 +6,26 @@
 //! * `tree`       = immutable filesystem content, identified only by digest
 //! * `variant`    = a name bound to one tree within a release
 //! * `artifact`   = the release + variant + tree binding
-//! * `release`    = an immutable map of every declared variant to a tree digest
-//! * `target`     = a named group of stable server IDs and its rollout policy
-//! * `deployment` = an attempted push and its exact per-server assignments
-//! * `generation` = one server's durable activation record for one assignment
+//! * `release`    = an immutable map of every variant to a tree digest
+//! * `slot`       = a named deployment location (one server + one variant)
+//! * `target`     = a named group of stable deployment slots and its rollout policy
+//! * `deployment` = an attempted push and its exact per-slot assignments
+//! * `generation` = one slot's durable activation record for one assignment
 //!
 //! Deployment, operation, and generation IDs are opaque collision-resistant
 //! IDs (UUIDv7 in schema version 1). They identify events and are never used
 //! as content identity.
+//!
+//! Identity model: [`PlacementSlotId`] is the DEPLOYMENT-LOCATION identity —
+//! the key of every slot→assignment relationship (plans, attempts, observed
+//! state, fleet snapshots, commit markers). [`ServerId`] is the ACTUAL SERVER
+//! identity used for transport addressing (user@host lives on `ServerDef`).
+//! They are distinct concepts: a server can host slots in multiple targets,
+//! while a slot belongs to exactly one target and carries its own
+//! `deploy_dir`. Today one target runs at most one slot per server, so the
+//! two ID spaces are interchangeable within a target, but the model keys
+//! assignments by [`PlacementSlotId`] and addresses transports by
+//! [`ServerId`].
 
 use crate::config::{ActivationConfig, VerificationConfig};
 use serde::{Deserialize, Serialize};
@@ -81,7 +93,7 @@ pub struct BehaviorContract {
 id_newtype!(ReleaseDigest);
 
 /// Release identifier: `rel-sha256-<release-digest>`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ReleaseId(String);
 
@@ -118,6 +130,7 @@ id_newtype!(DeploymentId);
 id_newtype!(GenerationId);
 id_newtype!(OperationId);
 id_newtype!(ServerId);
+id_newtype!(PlacementSlotId);
 id_newtype!(TargetName);
 id_newtype!(VariantName);
 id_newtype!(TreeDigest);
@@ -227,12 +240,34 @@ pub struct ResolvedVariant {
     pub tree_meta: TreeMetadata,
 }
 
-/// The artifact binding: (release ID, variant, tree digest).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ArtifactBinding {
+/// The canonical artifact reference: the (release, variant, tree) triple that
+/// fully names one deployable artifact. This is the single reusable type for
+/// the artifact relationship — plans, attempts, observed state, generation
+/// records, and fleet snapshots all express it through [`ArtifactRef`] instead
+/// of re-declaring the three fields.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub struct ArtifactRef {
     pub release: ReleaseId,
     pub variant: VariantName,
     pub tree: TreeDigest,
+}
+
+/// The canonical slot→artifact assignment: one placement slot running one
+/// artifact. Reused wherever a slot is bound to an artifact (plans,
+/// [`GenerationRef`] assignments).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementSlotAssignment {
+    pub placement_slot: PlacementSlotId,
+    pub artifact: ArtifactRef,
+}
+
+/// One slot's durable generation for one artifact assignment: the complete,
+/// non-optional record of what a slot advanced to (minted generations in an
+/// attempt, and the per-slot state of a successful fleet snapshot).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationRef {
+    pub generation: GenerationId,
+    pub assignment: PlacementSlotAssignment,
 }
 
 #[cfg(test)]

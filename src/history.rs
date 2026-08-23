@@ -6,7 +6,9 @@
 //! rollback sources.
 
 use crate::error::{Error, Result};
-use crate::model::{ReleaseId, ServerId, TargetName};
+use crate::model::{
+    GenerationRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, TargetName,
+};
 use crate::records::{AttemptRecord, ReflogEntry};
 use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
@@ -130,14 +132,33 @@ pub fn append_successful_reflog(
     ensure_successful_reflog_entry(store, target, attempt)
 }
 
-/// Build a reflog entry from a successful attempt.
+/// Build a reflog entry from a successful attempt. A successful fleet snapshot
+/// carries one complete [`GenerationRef`] per slot; slots without a recorded
+/// generation are not part of a coherent successful snapshot and are dropped.
 pub fn build_reflog_entry(index: u64, attempt: &AttemptRecord) -> ReflogEntry {
     ReflogEntry {
         index,
         deployment_id: attempt.deployment_id.clone(),
         target: attempt.target.clone(),
         behavior_sha256: attempt.behavior_sha256.clone(),
-        servers: attempt.servers.clone(),
+        slots: attempt
+            .slots
+            .iter()
+            .filter_map(|(slot, s)| {
+                s.generation.clone().map(|generation| {
+                    (
+                        slot.clone(),
+                        GenerationRef {
+                            generation,
+                            assignment: PlacementSlotAssignment {
+                                placement_slot: slot.clone(),
+                                artifact: s.artifact.clone(),
+                            },
+                        },
+                    )
+                })
+            })
+            .collect(),
     }
 }
 
@@ -164,9 +185,9 @@ pub fn successful_fleet_history(
     store.read_reflog(target.as_str())
 }
 
-/// Collect the distinct server IDs referenced across a set of attempts.
-pub fn attempt_server_ids(attempt: &AttemptRecord) -> Vec<ServerId> {
-    attempt.server_ids.clone()
+/// Collect the distinct placement slot IDs referenced across a set of attempts.
+pub fn attempt_slot_ids(attempt: &AttemptRecord) -> Vec<PlacementSlotId> {
+    attempt.slot_ids.clone()
 }
 
 /// Build a map of `<target>@fN` -> entry for display.
@@ -184,7 +205,7 @@ pub fn reflog_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DeploymentId, ReleaseId, ServerId};
+    use crate::model::{DeploymentId, PlacementSlotId, ReleaseId};
     use crate::records::DeploymentStatus;
     use std::collections::BTreeMap;
 
@@ -230,16 +251,16 @@ mod tests {
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         let target = TargetName::new("production".to_string());
         let attempt = AttemptRecord {
-            deployment_schema_version: 1,
+            deployment_schema_version: 2,
             deployment_id: DeploymentId::new("deploy-idempotent".to_string()),
             status: DeploymentStatus::Successful,
             target: target.clone(),
-            server_ids: vec![ServerId::new("server-01".to_string())],
+            slot_ids: vec![PlacementSlotId::new("p1".to_string())],
             behavior_sha256: "sha256-aa".to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
             desired: BTreeMap::new(),
             pre_push: BTreeMap::new(),
-            servers: BTreeMap::new(),
+            slots: BTreeMap::new(),
         };
 
         // First call appends the entry and advances the ref.

@@ -1,24 +1,23 @@
-//! Deployment planning: resolve the desired per-server assignment from a push
+//! Deployment planning: resolve the desired per-slot assignment from a push
 //! reference.
 
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::history::{PushRef, resolve_fleet_ref};
-use crate::model::{ReleaseId, ServerId, TreeDigest, VariantName};
+use crate::model::{
+    ArtifactRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, TreeDigest, VariantName,
+};
 use crate::records::PlanSource;
 use crate::store::local::LocalStore;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub struct PlannedAssignment {
-    pub server_id: ServerId,
-    pub variant: VariantName,
-    pub release: ReleaseId,
-    pub tree: TreeDigest,
-}
+/// The plan for one placement slot: exactly the canonical slot→artifact
+/// assignment ([`PlacementSlotAssignment`]), reused rather than re-declared.
+pub type PlannedAssignment = PlacementSlotAssignment;
 
-/// Resolve the desired assignment for each server of `target_name` given the
-/// push reference. Returns the assignments, the release the attempt is bound to,
-/// and the plan source.
+/// Resolve the desired assignment for each slot of `target_name` given the
+/// push reference. Returns the assignments, the release the attempt is bound
+/// to, and the plan source.
 pub fn plan_assignments(
     target_name: &str,
     pref: &PushRef,
@@ -31,25 +30,27 @@ pub fn plan_assignments(
         return Err(Error::not_found(format!("target '{target_name}'")));
     }
     let members = config.target_slots(target_name)?;
-    let server_ids: Vec<ServerId> = members
+    let slot_ids: Vec<PlacementSlotId> = members
         .iter()
-        .map(|(_, s)| ServerId::new(s.id.clone()))
+        .map(|(slot, _)| PlacementSlotId::new(slot.id.clone()))
         .collect();
 
     match pref {
         PushRef::Head => {
             let mut out = Vec::new();
-            for (slot, sdef) in &members {
-                let sid = ServerId::new(sdef.id.clone());
+            for (slot, _sdef) in &members {
+                let slot_id = PlacementSlotId::new(slot.id.clone());
                 let variant = VariantName::new(slot.variant.clone());
                 let tree = variant_trees.get(&slot.variant).cloned().ok_or_else(|| {
                     Error::plan(format!("variant '{}' not materialized", slot.variant))
                 })?;
                 out.push(PlannedAssignment {
-                    server_id: sid,
-                    variant,
-                    release: local_release_id.clone(),
-                    tree,
+                    placement_slot: slot_id,
+                    artifact: ArtifactRef {
+                        release: local_release_id.clone(),
+                        variant,
+                        tree,
+                    },
                 });
             }
             Ok((out, local_release_id.clone(), PlanSource::Head))
@@ -58,38 +59,33 @@ pub fn plan_assignments(
             target: ft, index, ..
         } => {
             let entry = resolve_fleet_ref(store, ft, *index)?;
-            let recorded: BTreeSet<String> = entry
-                .servers
-                .keys()
-                .map(|s| s.as_str().to_string())
-                .collect();
+            let recorded: BTreeSet<String> =
+                entry.slots.keys().map(|s| s.as_str().to_string()).collect();
             let current: BTreeSet<String> =
-                server_ids.iter().map(|s| s.as_str().to_string()).collect();
+                slot_ids.iter().map(|s| s.as_str().to_string()).collect();
             if recorded != current {
                 return Err(Error::rollback(
-                    "target membership changed; exact fleet rollback requires identical stable server-ID set",
+                    "target membership changed; exact fleet rollback requires identical stable placement-slot set",
                 ));
             }
             let mut out = Vec::new();
             // The variant comes from the historical snapshot, not the current
             // slot binding.
-            for (_slot, sdef) in &members {
-                let sid = ServerId::new(sdef.id.clone());
-                let a = entry.servers.get(&sid).ok_or_else(|| {
-                    Error::rollback(format!("server {sid} missing in fleet snapshot"))
+            for (slot, _sdef) in &members {
+                let slot_id = PlacementSlotId::new(slot.id.clone());
+                let g = entry.slots.get(&slot_id).ok_or_else(|| {
+                    Error::rollback(format!("slot {slot_id} missing in fleet snapshot"))
                 })?;
                 out.push(PlannedAssignment {
-                    server_id: sid,
-                    variant: a.variant.clone(),
-                    release: a.release.clone(),
-                    tree: a.tree.clone(),
+                    placement_slot: slot_id,
+                    artifact: g.assignment.artifact.clone(),
                 });
             }
             let desired = entry
-                .servers
+                .slots
                 .values()
                 .next()
-                .map(|a| a.release.clone())
+                .map(|g| g.assignment.artifact.release.clone())
                 .unwrap_or_else(|| local_release_id.clone());
             Ok((out, desired, PlanSource::FleetRef(*index)))
         }
@@ -98,8 +94,8 @@ pub fn plan_assignments(
                 .read_release(release)
                 .map_err(|_| Error::rollback(format!("release {release} not available locally")))?;
             let mut out = Vec::new();
-            for (slot, sdef) in &members {
-                let sid = ServerId::new(sdef.id.clone());
+            for (slot, _sdef) in &members {
+                let slot_id = PlacementSlotId::new(slot.id.clone());
                 let variant = VariantName::new(slot.variant.clone());
                 let tree = rec.variants.get(&slot.variant).cloned().ok_or_else(|| {
                     Error::rollback(format!(
@@ -108,10 +104,12 @@ pub fn plan_assignments(
                     ))
                 })?;
                 out.push(PlannedAssignment {
-                    server_id: sid,
-                    variant,
-                    release: release.clone(),
-                    tree: TreeDigest::new(tree),
+                    placement_slot: slot_id,
+                    artifact: ArtifactRef {
+                        release: release.clone(),
+                        variant,
+                        tree: TreeDigest::new(tree),
+                    },
                 });
             }
             Ok((

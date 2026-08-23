@@ -3,7 +3,7 @@
 
 use deploy::config::Config;
 use deploy::error::Result;
-use deploy::model::{ServerId, TreeDigest};
+use deploy::model::{PlacementSlotId, TreeDigest};
 use deploy::push::engine::{PushOptions, push};
 use deploy::records::DeploymentStatus;
 use deploy::remote::transport::{LocalTransport, Remote};
@@ -164,8 +164,14 @@ fn end_to_end_push_rollback() -> Result<()> {
         "first push should succeed"
     );
     let attempt0 = r0.attempt.expect("attempt recorded");
-    let std_v1: TreeDigest = attempt0.servers[&ServerId::new("server-01")].tree.clone();
-    let hc_v1: TreeDigest = attempt0.servers[&ServerId::new("server-03")].tree.clone();
+    let std_v1: TreeDigest = attempt0.slots[&PlacementSlotId::new("p1")]
+        .artifact
+        .tree
+        .clone();
+    let hc_v1: TreeDigest = attempt0.slots[&PlacementSlotId::new("p3")]
+        .artifact
+        .tree
+        .clone();
     assert_ne!(std_v1, hc_v1, "standard and high-capacity trees differ");
 
     // Up-to-date push should be a no-op (no attempt created).
@@ -206,7 +212,10 @@ fn end_to_end_push_rollback() -> Result<()> {
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
     let attempt1 = r1.attempt.expect("attempt recorded");
-    let std_v2: TreeDigest = attempt1.servers[&ServerId::new("server-01")].tree.clone();
+    let std_v2: TreeDigest = attempt1.slots[&PlacementSlotId::new("p1")]
+        .artifact
+        .tree
+        .clone();
     assert_ne!(
         std_v1, std_v2,
         "standard tree changed after editing content"
@@ -232,14 +241,16 @@ fn end_to_end_push_rollback() -> Result<()> {
         "rollback succeeds"
     );
     let observed = store.read_observed("production")?;
-    let restored = observed.servers[&ServerId::new("server-01")]
-        .tree
-        .clone()
+    let restored = observed.slots[&PlacementSlotId::new("p1")]
+        .artifact
+        .as_ref()
+        .map(|a| a.tree.clone())
         .unwrap();
     assert_eq!(restored, std_v1, "server-01 rolled back to original tree");
-    let hc_restored = observed.servers[&ServerId::new("server-03")]
-        .tree
-        .clone()
+    let hc_restored = observed.slots[&PlacementSlotId::new("p3")]
+        .artifact
+        .as_ref()
+        .map(|a| a.tree.clone())
         .unwrap();
     assert_eq!(
         hc_restored, hc_v1,
@@ -329,9 +340,9 @@ slots = ["p1"]
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
     let attempt0 = r0.attempt.expect("attempt recorded");
-    let old_server = &attempt0.servers[&ServerId::new("server-01")];
-    let old_tree = old_server.tree.clone();
-    let old_release = old_server.release.clone();
+    let old_server = &attempt0.slots[&PlacementSlotId::new("p1")];
+    let old_tree = old_server.artifact.tree.clone();
+    let old_release = old_server.artifact.release.clone();
 
     // Rename the variant: the configuration now declares `new`, and the
     // `old.toml` variant file is removed entirely.
@@ -358,7 +369,8 @@ slots = ["p1"]
         },
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-    let new_tree = r1.attempt.expect("attempt recorded").servers[&ServerId::new("server-01")]
+    let new_tree = r1.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")]
+        .artifact
         .tree
         .clone();
     assert_ne!(
@@ -385,19 +397,19 @@ slots = ["p1"]
         "exact fleet rollback must succeed after the variant was renamed"
     );
     let observed = store.read_observed("production")?;
-    let restored = &observed.servers[&ServerId::new("server-01")];
+    let restored = &observed.slots[&PlacementSlotId::new("p1")];
     assert_eq!(
-        restored.tree.as_ref(),
+        restored.artifact.as_ref().map(|a| &a.tree),
         Some(&old_tree),
         "tree restored from f0"
     );
     assert_eq!(
-        restored.variant.as_ref().map(|v| v.as_str()),
+        restored.artifact.as_ref().map(|a| a.variant.as_str()),
         Some("old"),
         "variant restored from f0"
     );
     assert_eq!(
-        restored.release.as_ref(),
+        restored.artifact.as_ref().map(|a| &a.release),
         Some(&old_release),
         "release restored from f0"
     );
@@ -438,7 +450,7 @@ fn dry_run_reports_plan() -> Result<()> {
     // No remote state should have been created.
     let observed = store.read_observed("production")?;
     assert!(
-        observed.servers.is_empty(),
+        observed.slots.is_empty(),
         "dry-run leaves no observed state"
     );
     Ok(())
@@ -1246,9 +1258,10 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
         .attempt
         .as_ref()
         .unwrap()
-        .servers
-        .get(&ServerId::new("server-01"))
+        .slots
+        .get(&PlacementSlotId::new("p1"))
         .unwrap()
+        .artifact
         .release
         .as_str()
         .to_string();
@@ -1312,9 +1325,10 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
         .attempt
         .as_ref()
         .unwrap()
-        .servers
-        .get(&ServerId::new("server-01"))
+        .slots
+        .get(&PlacementSlotId::new("p1"))
         .unwrap()
+        .artifact
         .release
         .as_str()
         .to_string();
@@ -1429,9 +1443,10 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
         .attempt
         .as_ref()
         .unwrap()
-        .servers
-        .get(&ServerId::new("server-01"))
+        .slots
+        .get(&PlacementSlotId::new("p1"))
         .unwrap()
+        .artifact
         .release
         .as_str()
         .to_string();
@@ -1604,25 +1619,25 @@ interval_seconds = 0
 
     let attempt = r.attempt.expect("attempt must be recorded even on failure");
     let results = store.read_results(attempt.deployment_id.as_str())?;
-    // All three servers appear in the attempt.
-    assert_eq!(attempt.server_ids.len(), 3);
-    for sid in ["server-01", "server-02", "server-03"] {
+    // All three slots appear in the attempt.
+    assert_eq!(attempt.slot_ids.len(), 3);
+    for sid in ["p1", "p2", "p3"] {
         assert!(
-            attempt.servers.contains_key(&ServerId::new(sid)),
-            "server {sid} missing from attempt"
+            attempt.slots.contains_key(&PlacementSlotId::new(sid)),
+            "slot {sid} missing from attempt"
         );
     }
-    // First server failed; later servers were never started (Skipped).
+    // First slot failed; later slots were never started (Skipped).
     assert_eq!(
-        results.servers[&ServerId::new("server-01")].outcome,
+        results.slots[&PlacementSlotId::new("p1")].outcome,
         ServerOutcomeKind::Failed
     );
     assert_eq!(
-        results.servers[&ServerId::new("server-02")].outcome,
+        results.slots[&PlacementSlotId::new("p2")].outcome,
         ServerOutcomeKind::Skipped
     );
     assert_eq!(
-        results.servers[&ServerId::new("server-03")].outcome,
+        results.slots[&PlacementSlotId::new("p3")].outcome,
         ServerOutcomeKind::Skipped
     );
     // Later servers were left untouched (no `current` pointer was ever created).
@@ -1917,10 +1932,7 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
         "marker must carry the ORIGINAL pending attempt's deployment id"
     );
     assert_eq!(marker_json["committed"].as_bool(), Some(true));
-    let recorded_gen = attempt1.desired[&ServerId::new("server-01")]
-        .generation
-        .as_ref()
-        .expect("attempt records the minted generation");
+    let recorded_gen = &attempt1.desired[&PlacementSlotId::new("p1")].generation;
     assert_eq!(
         marker_json["generation"].as_str().unwrap(),
         recorded_gen.as_str(),
@@ -2373,8 +2385,8 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
-    let first = r0.attempt.expect("attempt recorded").servers[&ServerId::new("server-01")].clone();
-    assert_eq!(first.variant.as_str(), "standard");
+    let first = r0.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")].clone();
+    assert_eq!(first.artifact.variant.as_str(), "standard");
 
     // Capacity-only change: identical inputs except the server's `capacity`.
     let body = std::fs::read_to_string(&config_path)?;
@@ -2411,10 +2423,10 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
     );
 
     // The SAME tree bytes at the same release: capacity never entered identity.
-    let after = store.read_release(&first.release)?;
+    let after = store.read_release(&first.artifact.release)?;
     assert_eq!(
         after.release_sha256,
-        first.release.digest().as_str(),
+        first.artifact.release.digest().as_str(),
         "stored release still matches the f0 identity"
     );
 
@@ -2442,11 +2454,13 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
         },
     )?;
     assert_eq!(r2.status, Some(DeploymentStatus::Successful));
-    let third = r2.attempt.expect("attempt recorded").servers[&ServerId::new("server-01")].clone();
+    let third = r2.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")].clone();
+
     assert_ne!(
-        third.release, first.release,
+        third.artifact.release, first.artifact.release,
         "a content change must produce a new release identity"
     );
+
     Ok(())
 }
 
@@ -2522,7 +2536,8 @@ slots = ["p1"]
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
-    let t0 = r0.attempt.expect("attempt recorded").servers[&ServerId::new("server-01")]
+    let t0 = r0.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")]
+        .artifact
         .tree
         .clone();
 
@@ -2617,7 +2632,10 @@ slots = ["p1"]
     );
     let observed = store.read_observed("production")?;
     assert_eq!(
-        observed.servers[&ServerId::new("server-01")].tree.as_ref(),
+        observed.slots[&PlacementSlotId::new("p1")]
+            .artifact
+            .as_ref()
+            .map(|a| &a.tree),
         Some(&t0),
         "f0 tree restored"
     );

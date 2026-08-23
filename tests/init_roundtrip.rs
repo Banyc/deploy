@@ -153,8 +153,8 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         r.message
     );
     let attempt = r.attempt.expect("attempt recorded");
-    assert_eq!(attempt.server_ids.len(), 1);
-    let srv = &attempt.servers[&deploy::model::ServerId::new("server-01")];
+    assert_eq!(attempt.slot_ids.len(), 1);
+    let srv = &attempt.slots[&deploy::model::PlacementSlotId::new("app-1")];
     let generation = srv.generation.as_ref().expect("generation assigned");
 
     // 6. Remote state: the local endpoint now carries the full layout, the
@@ -168,7 +168,9 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         Some(generation.as_str()),
         "current symlink points at the deployed generation"
     );
-    let tree_path = layout::objects().join(srv.tree.as_str()).join("root");
+    let tree_path = layout::objects()
+        .join(srv.artifact.tree.as_str())
+        .join("root");
     assert!(
         endpoint.exists(&tree_path.join("app/hello")),
         "artifact mapped to app/hello"
@@ -192,14 +194,20 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     assert_eq!(reflog[0].index, 0);
 
     let observed = store.read_observed("production")?;
-    let obs = &observed.servers[&deploy::model::ServerId::new("server-01")];
+    let obs = &observed.slots[&deploy::model::PlacementSlotId::new("app-1")];
     assert_eq!(
         obs.generation.as_ref(),
         Some(generation),
         "`deploy status` shows the deployed generation"
     );
-    assert_eq!(obs.variant.as_ref().map(|v| v.as_str()), Some("standard"));
-    assert_eq!(obs.tree.as_ref(), Some(&srv.tree));
+    assert_eq!(
+        obs.artifact.as_ref().map(|a| a.variant.as_str()),
+        Some("standard")
+    );
+    assert_eq!(
+        obs.artifact.as_ref().map(|a| &a.tree),
+        Some(&srv.artifact.tree)
+    );
 
     // A second push with identical content is a no-op (no new attempt).
     let r2 = push(

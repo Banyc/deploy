@@ -449,8 +449,8 @@ fn fingerprint_only_first_push_succeeds() -> Result<()> {
             let attempt = r.attempt.expect("attempt recorded");
             assert!(
                 attempt
-                    .servers
-                    .contains_key(&deploy::model::ServerId::new("server-01"))
+                    .slots
+                    .contains_key(&deploy::model::PlacementSlotId::new("p1"))
             );
 
             // The emulated remote now has the full layout: a generation under

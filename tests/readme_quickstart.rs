@@ -97,7 +97,7 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
     )?;
     assert!(r.dry_run);
     assert!(r.message.contains("dry-run plan"));
-    assert!(r.message.contains("server-01"));
-    assert!(r.message.contains("server-02"));
+    assert!(r.message.contains("app-1"));
+    assert!(r.message.contains("app-2"));
     Ok(())
 }

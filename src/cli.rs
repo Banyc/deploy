@@ -264,10 +264,15 @@ where
         }
         Command::Status { target } => {
             let observed = store.read_observed(&target)?;
-            for (sid, srv) in &observed.servers {
+            for (slot_id, srv) in &observed.slots {
+                let artifact = srv.artifact.as_ref();
                 println!(
                     "{}  generation={:?} release={:?} variant={:?} tree={:?}",
-                    sid, srv.generation, srv.release, srv.variant, srv.tree
+                    slot_id,
+                    srv.generation,
+                    artifact.map(|a| &a.release),
+                    artifact.map(|a| &a.variant),
+                    artifact.map(|a| &a.tree),
                 );
             }
         }
@@ -320,10 +325,10 @@ fn print_report(report: &PushReport) {
     }
     println!("{}", report.message);
     if let Some(attempt) = &report.attempt {
-        for (sid, s) in &attempt.servers {
+        for (slot_id, s) in &attempt.slots {
             println!(
-                "  {sid}  variant={} tree={} generation={:?}",
-                s.variant, s.tree, s.generation
+                "  {slot_id}  variant={} tree={} generation={:?}",
+                s.artifact.variant, s.artifact.tree, s.generation
             );
         }
     }
@@ -331,21 +336,21 @@ fn print_report(report: &PushReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DeploymentId, ServerId, TargetName};
+    use crate::model::{DeploymentId, PlacementSlotId, TargetName};
     use std::collections::BTreeMap;
 
     fn pending_attempt(id: &str) -> AttemptRecord {
         AttemptRecord {
-            deployment_schema_version: 1,
+            deployment_schema_version: 2,
             deployment_id: DeploymentId::new(id.to_string()),
             status: DeploymentStatus::PendingCommit,
             target: TargetName::new("production".to_string()),
-            server_ids: vec![ServerId::new("server-01".to_string())],
+            slot_ids: vec![PlacementSlotId::new("p1".to_string())],
             behavior_sha256: "sha256-aa".to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
             desired: BTreeMap::new(),
             pre_push: BTreeMap::new(),
-            servers: BTreeMap::new(),
+            slots: BTreeMap::new(),
         }
     }
 

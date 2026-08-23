@@ -7,7 +7,7 @@
 
 use crate::error::{Error, Result};
 use crate::layout;
-use crate::model::{BehaviorContract, ReleaseId};
+use crate::model::{ArtifactRef, BehaviorContract, DeploymentId, GenerationId, ReleaseId};
 use crate::remote::transport::Remote;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -15,16 +15,19 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use walkdir::WalkDir;
 
+/// The remote generation record (`generations/<gen>/assignment.json`). The
+/// artifact relationship is expressed via the canonical [`ArtifactRef`]; the
+/// ID fields are the (string-shaped on the wire) typed newtypes so the JSON
+/// stays `{deployment_id, generation_id, artifact: {release, variant, tree},
+/// behavior_sha256, prior_generation, created_at}`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GenerationAssignment {
-    pub deployment_id: String,
-    pub generation_id: String,
-    pub release: String,
-    pub variant: String,
-    pub tree: String,
+    pub deployment_id: DeploymentId,
+    pub generation_id: GenerationId,
+    pub artifact: ArtifactRef,
     pub behavior_sha256: String,
     #[serde(default)]
-    pub prior_generation: Option<String>,
+    pub prior_generation: Option<GenerationId>,
     pub created_at: String,
 }
 
@@ -109,7 +112,7 @@ impl<'a> RemoteHelper<'a> {
             if let Some(genid) = &status.current_generation
                 && let Ok(a) = self.read_assignment(genid)
             {
-                status.current_tree = Some(a.tree);
+                status.current_tree = Some(a.artifact.tree.as_str().to_string());
             }
         }
 
@@ -270,7 +273,7 @@ impl<'a> RemoteHelper<'a> {
     /// fresh UUIDv7 values minted under the operation lock, so this can only
     /// fire on corruption or retry-after-crash with divergent state.
     pub fn create_generation(&self, op_id: &str, assignment: &GenerationAssignment) -> Result<()> {
-        let gen_dir = layout::generation(&assignment.generation_id);
+        let gen_dir = layout::generation(assignment.generation_id.as_str());
         self.remote.create_dir_all(&gen_dir)?;
         let json = serde_json::to_vec_pretty(assignment)
             .map_err(|e| Error::remote(format!("serialize assignment: {e}")))?;
@@ -290,7 +293,7 @@ impl<'a> RemoteHelper<'a> {
         // it after a crash is safe.
         let root_link_path = gen_dir.join("root");
         if !self.remote.exists(&root_link_path) {
-            let root_link = layout::generation_root_link(&assignment.tree);
+            let root_link = layout::generation_root_link(assignment.artifact.tree.as_str());
             self.remote.symlink(&root_link, &root_link_path)?;
         }
         let _ = op_id;
@@ -448,9 +451,9 @@ impl<'a> RemoteHelper<'a> {
     }
 
     /// Write a fleet-commit marker for a deployment under this server. The marker
-    /// records the generation this server committed and the full set of server
-    /// IDs that participate in the fleet commit, so a partial marker can never
-    /// masquerade as a complete commit.
+    /// records the generation this slot committed and the full set of placement
+    /// slot IDs that participate in the fleet commit, so a partial marker can
+    /// never masquerade as a complete commit.
     ///
     /// Markers are immutable and write-once: the file is created exclusively,
     /// and an existing marker must match byte-for-byte (deterministic payload
@@ -460,14 +463,14 @@ impl<'a> RemoteHelper<'a> {
         &self,
         deployment_id: &str,
         generation: &str,
-        server_ids: &[String],
+        slot_ids: &[String],
     ) -> Result<()> {
         let p = layout::commit_marker(deployment_id);
         let payload = serde_json::json!({
             "deployment_id": deployment_id,
             "committed": true,
             "generation": generation,
-            "servers": server_ids,
+            "slots": slot_ids,
         });
         let bytes = serde_json::to_vec_pretty(&payload)
             .map_err(|e| Error::remote(format!("serialize commit: {e}")))?;
@@ -579,14 +582,16 @@ mod tests {
 
     fn assignment(gen_id: &str, tree: &str) -> GenerationAssignment {
         GenerationAssignment {
-            deployment_id: "deploy-1".into(),
-            generation_id: gen_id.into(),
-            release: "rel-sha256-x".into(),
-            variant: "standard".into(),
-            tree: tree.into(),
-            behavior_sha256: "b".into(),
+            deployment_id: DeploymentId::new("deploy-1".to_string()),
+            generation_id: GenerationId::new(gen_id.to_string()),
+            artifact: ArtifactRef {
+                release: ReleaseId::new("rel-sha256-x".to_string()),
+                variant: crate::model::VariantName::new("standard".to_string()),
+                tree: crate::model::TreeDigest::new(tree.to_string()),
+            },
+            behavior_sha256: "b".to_string(),
             prior_generation: None,
-            created_at: "2020-01-01T00:00:00Z".into(),
+            created_at: "2020-01-01T00:00:00Z".to_string(),
         }
     }
 
@@ -620,7 +625,7 @@ mod tests {
         // here — no object was published in this test — so assert on the link
         // itself rather than its resolved target.)
         let a = helper.read_assignment("gen-1").unwrap();
-        assert_eq!(a.tree, "tree-a");
+        assert_eq!(a.artifact.tree.as_str(), "tree-a");
         assert!(
             std::fs::symlink_metadata(remote.root().join("generations/gen-1/root")).is_ok(),
             "generation root symlink must exist"
@@ -694,7 +699,7 @@ mod durability_tests {
 
         let helper = RemoteHelper::new(&remote);
         helper
-            .write_commit_marker("deploy-0", "gen-0", &["server-01".to_string()])
+            .write_commit_marker("deploy-0", "gen-0", &["p1".to_string()])
             .expect("commit marker install must succeed past stale temp");
 
         let marker: serde_json::Value = serde_json::from_slice(
@@ -743,7 +748,7 @@ mod durability_tests {
                     if let Err(e) = h.write_commit_marker(
                         &format!("deploy-{i}"),
                         &format!("gen-{i}"),
-                        &["server-01".to_string()],
+                        &["p1".to_string()],
                     ) {
                         *writer_error_writer.lock().unwrap() = Some(e.to_string());
                         return;

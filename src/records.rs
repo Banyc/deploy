@@ -1,9 +1,18 @@
 //! Shared record structures persisted by the local store, the push engine, and
 //! the fleet history / rollback subsystem.
+//!
+//! Assignment relationships are expressed exclusively through the canonical
+//! model types ([`crate::model::ArtifactRef`],
+//! [`crate::model::PlacementSlotAssignment`], [`crate::model::GenerationRef`])
+//! rather than re-declared per record. Every slot→assignment map (attempt
+//! `desired` / `pre_push` / `servers`, observed state, reflog snapshots) is
+//! keyed by [`crate::model::PlacementSlotId`] — the deployment-location
+//! identity — while [`crate::model::ServerId`] remains the actual-server
+//! identity used for transport addressing (`ServerState`, config `ServerDef`).
 
 use crate::model::{
-    BehaviorContract, DeploymentId, GenerationId, ReleaseId, ServerId, TargetName, TreeDigest,
-    VariantName,
+    ArtifactRef, BehaviorContract, DeploymentId, GenerationId, GenerationRef, PlacementSlotId,
+    ReleaseId, ServerId, TargetName, TreeDigest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -39,57 +48,65 @@ pub enum ServerOutcomeKind {
     Restored,
 }
 
-/// A per-server assignment snapshot (release, variant, tree, generation).
+/// A per-slot assignment snapshot: the artifact a slot runs (or planned to
+/// run) plus the generation it is bound to. `generation` is `None` when the
+/// slot's server was never started (e.g. skipped after an earlier failure
+/// under `stop_on_failure`), or when only the pre-push state is unknown.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptServer {
-    pub release: ReleaseId,
-    pub variant: VariantName,
-    pub tree: TreeDigest,
-    /// The generation this server actually advanced to. `None` when the server
-    /// was never started (e.g. skipped after an earlier failure under
+    pub artifact: ArtifactRef,
+    /// The generation this slot actually advanced to. `None` when the slot's
+    /// server was never started (e.g. skipped after an earlier failure under
     /// `stop_on_failure`).
     pub generation: Option<GenerationId>,
 }
 
 /// A persisted deployment attempt (also the fleet history entry).
+///
+/// Every slot→assignment map is keyed by [`PlacementSlotId`]; `slot_ids` is
+/// the deployment's membership (mirroring the fleet-commit marker `slots`
+/// payload). Schema version 2: v1 keyed these maps by server ID and stored
+/// the artifact triple as flat fields; v2 rekeys to placement slots and nests
+/// the artifact under `artifact` (or `assignment` for [`GenerationRef`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptRecord {
     pub deployment_schema_version: u32,
     pub deployment_id: DeploymentId,
     pub status: DeploymentStatus,
     pub target: TargetName,
-    pub server_ids: Vec<ServerId>,
+    /// The placement slots participating in this deployment, in deployment
+    /// order (the same set the fleet-commit marker `slots` payload records).
+    pub slot_ids: Vec<PlacementSlotId>,
     pub behavior_sha256: String,
     pub attempted_at: String,
-    /// Desired per-server assignment (what the plan intended).
-    pub desired: BTreeMap<ServerId, AttemptServer>,
-    /// Pre-push per-server generation before mutation (None if first deploy).
-    pub pre_push: BTreeMap<ServerId, Option<AttemptServer>>,
-    /// Actual per-server result after the attempt.
-    pub servers: BTreeMap<ServerId, AttemptServer>,
+    /// Desired per-slot assignments (what the plan intended): each slot's
+    /// minted generation for its planned artifact.
+    pub desired: BTreeMap<PlacementSlotId, GenerationRef>,
+    /// Pre-push per-slot state before mutation (`None` if first deployment).
+    pub pre_push: BTreeMap<PlacementSlotId, Option<AttemptServer>>,
+    /// Actual per-slot result after the attempt.
+    pub slots: BTreeMap<PlacementSlotId, AttemptServer>,
 }
 
-/// A fully successful fleet snapshot exposed as `<target>@fN`.
+/// A fully successful fleet snapshot exposed as `<target>@fN`. Each slot's
+/// entry is the complete [`GenerationRef`] it advanced to (a successful
+/// snapshot always has a generation per slot).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReflogEntry {
     pub index: u64,
     pub deployment_id: DeploymentId,
     pub target: TargetName,
     pub behavior_sha256: String,
-    pub servers: BTreeMap<ServerId, AttemptServer>,
+    pub slots: BTreeMap<PlacementSlotId, GenerationRef>,
 }
 
-/// Observed remote state for one server.
+/// Observed remote state for one placement slot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ObservedServer {
     #[serde(default)]
     pub generation: Option<GenerationId>,
     #[serde(default)]
-    pub release: Option<ReleaseId>,
-    #[serde(default)]
-    pub variant: Option<VariantName>,
-    #[serde(default)]
-    pub tree: Option<TreeDigest>,
+    pub artifact: Option<ArtifactRef>,
     #[serde(default)]
     pub last_deployment: Option<DeploymentId>,
 }
@@ -99,10 +116,13 @@ pub struct ObservedServer {
 pub struct ObservedTarget {
     pub target: TargetName,
     #[serde(default)]
-    pub servers: BTreeMap<ServerId, ObservedServer>,
+    pub slots: BTreeMap<PlacementSlotId, ObservedServer>,
 }
 
-/// Persisted per-server local record (`servers/<id>.json`).
+/// Persisted per-server local record (`servers/<id>.json`). Keyed by the
+/// ACTUAL server identity ([`ServerId`], transport addressing); the
+/// slot→assignment maps live in [`ObservedTarget`] keyed by
+/// [`PlacementSlotId`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ServerState {
     pub id: ServerId,
@@ -115,21 +135,21 @@ pub struct ServerState {
 /// Where a plan's desired assignment comes from.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlanSource {
-    /// Materialize the currently mapped local files and assign each server its
+    /// Materialize the currently mapped local files and assign each slot its
     /// target-configured (current) variant.
     Head,
     /// Restore a historical successful fleet snapshot by index (`@fN`).
     FleetRef(u64),
-    /// Assign each current server its configured variant from a named release.
+    /// Assign each current slot its configured variant from a named release.
     ReleaseRef(ReleaseId),
 }
 
+/// Per-slot plan for one placement slot: its slot identity, the artifact it
+/// should run, and the compare-and-swap preconditions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerPlan {
-    pub server_id: ServerId,
-    pub variant: VariantName,
-    pub release: ReleaseId,
-    pub tree: TreeDigest,
+    pub slot_id: PlacementSlotId,
+    pub artifact: ArtifactRef,
     /// Pre-push generation that must match for the compare-and-swap precondition.
     pub expected_generation: Option<GenerationId>,
     pub expected_tree: Option<TreeDigest>,
@@ -145,26 +165,27 @@ pub struct DeploymentPlan {
     /// carry the historical contracts here rather than the caller's current
     /// configuration.
     pub behaviors: BTreeMap<String, BehaviorContract>,
-    pub server_ids: Vec<ServerId>,
-    pub servers: BTreeMap<ServerId, ServerPlan>,
+    pub slot_ids: Vec<PlacementSlotId>,
+    pub slots: BTreeMap<PlacementSlotId, ServerPlan>,
     pub source: PlanSource,
     pub desired_release: ReleaseId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerResult {
-    pub server_id: ServerId,
+    pub slot_id: PlacementSlotId,
     pub outcome: ServerOutcomeKind,
-    /// The generation this server advanced to, or `None` if it never started.
+    /// The generation this slot advanced to, or `None` if it never started.
     pub generation: Option<GenerationId>,
     pub compensated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
+/// Per-slot deployment results (`results.json`), keyed by [`PlacementSlotId`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentResults {
     pub deployment_id: DeploymentId,
     pub target: TargetName,
-    pub servers: BTreeMap<ServerId, ServerResult>,
+    pub slots: BTreeMap<PlacementSlotId, ServerResult>,
 }

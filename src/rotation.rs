@@ -68,10 +68,10 @@ pub fn compute_retained(
                 .unwrap_or_else(|_| Utc::now());
             gens.push(GenRecord {
                 created_at: created,
-                release: a.release,
-                variant: a.variant,
-                tree: a.tree,
-                deployment_id: a.deployment_id,
+                release: a.artifact.release.as_str().to_string(),
+                variant: a.artifact.variant.as_str().to_string(),
+                tree: a.artifact.tree.as_str().to_string(),
+                deployment_id: a.deployment_id.as_str().to_string(),
             });
         }
     }
@@ -81,9 +81,9 @@ pub fn compute_retained(
         && let Some(cur) = &status.current_generation
         && let Ok(a) = helper.read_assignment(cur)
         && let Some(prior) = &a.prior_generation
-        && let Ok(pa) = helper.read_assignment(prior)
+        && let Ok(pa) = helper.read_assignment(prior.as_str())
     {
-        retained.insert(pa.tree);
+        retained.insert(pa.artifact.tree.as_str().to_string());
     }
 
     // Distinct successful artifact bindings, keyed by (release, variant, tree).
@@ -138,7 +138,6 @@ pub fn compute_retained(
             }
         }
     }
-
     // Durable pins. A pin protects the whole release: every variant's tree
     // recorded in the release record is retained, so the pinned release stays
     // fully rollback-able no matter how old it is or how far outside the
@@ -245,11 +244,13 @@ slots = ["p1"]
             .create_generation(
                 "op",
                 &GenerationAssignment {
-                    deployment_id: "d1".into(),
-                    generation_id: "g1".into(),
-                    release: "r".into(),
-                    variant: "standard".into(),
-                    tree: "t1".into(),
+                    deployment_id: "d1".to_string().into(),
+                    generation_id: "g1".to_string().into(),
+                    artifact: crate::model::ArtifactRef {
+                        release: crate::model::ReleaseId::new("r".to_string()),
+                        variant: "standard".to_string().into(),
+                        tree: "t1".to_string().into(),
+                    },
                     behavior_sha256: "b".into(),
                     prior_generation: None,
                     created_at: "2020-01-01T00:00:00Z".into(),
@@ -260,13 +261,15 @@ slots = ["p1"]
             .create_generation(
                 "op",
                 &GenerationAssignment {
-                    deployment_id: "d2".into(),
-                    generation_id: "g2".into(),
-                    release: "r".into(),
-                    variant: "standard".into(),
-                    tree: "t2".into(),
+                    deployment_id: "d2".to_string().into(),
+                    generation_id: "g2".to_string().into(),
+                    artifact: crate::model::ArtifactRef {
+                        release: crate::model::ReleaseId::new("r".to_string()),
+                        variant: "standard".to_string().into(),
+                        tree: "t2".to_string().into(),
+                    },
                     behavior_sha256: "b".into(),
-                    prior_generation: Some("g1".into()),
+                    prior_generation: Some("g1".to_string().into()),
                     created_at: "2020-01-02T00:00:00Z".into(),
                 },
             )

@@ -347,7 +347,7 @@ impl LocalStore {
         } else {
             Ok(ObservedTarget {
                 target: crate::model::TargetName::new(target.to_string()),
-                servers: Default::default(),
+                slots: Default::default(),
             })
         }
     }
@@ -695,7 +695,7 @@ mod tests {
         let results = DeploymentResults {
             deployment_id: DeploymentId::from("deploy-1".to_string()),
             target: TargetName::from("t1".to_string()),
-            servers: Default::default(),
+            slots: Default::default(),
         };
         store
             .write_results("deploy-1", &results)
@@ -703,7 +703,7 @@ mod tests {
         let conflicting = DeploymentResults {
             deployment_id: DeploymentId::from("deploy-1".to_string()),
             target: TargetName::from("t2".to_string()),
-            servers: Default::default(),
+            slots: Default::default(),
         };
         assert!(store.write_results("deploy-1", &conflicting).is_err());
     }

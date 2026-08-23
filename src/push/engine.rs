@@ -14,8 +14,8 @@ use crate::error::{Error, Result};
 use crate::history::{self, PushRef};
 use crate::layout;
 use crate::model::{
-    BehaviorContract, DeploymentId, GenerationId, OperationId, ReleaseId, ServerId, TargetName,
-    TreeDigest, VariantName,
+    ArtifactRef, BehaviorContract, DeploymentId, GenerationId, GenerationRef, OperationId,
+    PlacementSlotId, ReleaseId, TargetName, TreeDigest, VariantName,
 };
 use crate::records::{
     AttemptRecord, AttemptServer, DeploymentPlan, DeploymentResults, DeploymentStatus,
@@ -247,10 +247,10 @@ fn push_inner(
             } => {
                 let entry = history::resolve_fleet_ref(store, ft, *index)?;
                 entry
-                    .servers
+                    .slots
                     .values()
                     .next()
-                    .map(|a| a.release.clone())
+                    .map(|g| g.assignment.artifact.release.clone())
                     .unwrap_or_else(|| ReleaseId::new(String::new()))
             }
             PushRef::Release { release, .. } => release.clone(),
@@ -306,19 +306,20 @@ fn push_inner(
     // preflight with context instead.
     validate_behavior_coverage(&desired_behaviors, &assignments, &desired_release)?;
 
-    // Open a remote handle per server and run reconciliation / recovery.
+    // Open a remote handle per slot and run reconciliation / recovery.
     let members = config.target_slots(target_name)?;
-    let mut remotes: HashMap<ServerId, Box<dyn Remote>> = HashMap::new();
-    let mut helpers: HashMap<ServerId, RemoteHelper> = HashMap::new();
-    let mut statuses: HashMap<ServerId, crate::remote::helper::RemoteStatus> = HashMap::new();
+    let mut remotes: HashMap<PlacementSlotId, Box<dyn Remote>> = HashMap::new();
+    let mut helpers: HashMap<PlacementSlotId, RemoteHelper> = HashMap::new();
+    let mut statuses: HashMap<PlacementSlotId, crate::remote::helper::RemoteStatus> =
+        HashMap::new();
     for (slot, s) in &members {
-        let sid = ServerId::new(s.id.clone());
+        let slot_id = PlacementSlotId::new(slot.id.clone());
         let remote = factory(s, slot)?;
-        remotes.insert(sid.clone(), remote);
+        remotes.insert(slot_id, remote);
     }
-    for (_, s) in &members {
-        let sid = ServerId::new(s.id.clone());
-        let r = remotes.get(&sid).unwrap();
+    for (slot, _s) in &members {
+        let slot_id = PlacementSlotId::new(slot.id.clone());
+        let r = remotes.get(&slot_id).unwrap();
         let helper = RemoteHelper::new(r.as_ref());
         // Prepare the host identity (verify/pin the host key) BEFORE any status
         // request: a fingerprint-only configuration cannot connect at all
@@ -334,7 +335,7 @@ fn push_inner(
             // before any other remote layout mutation; a dry run never reaches
             // this, so an unprovisioned remote stays untouched.
             helper.handshake()?;
-            remotes.get(&sid).unwrap().provision_layout()?;
+            remotes.get(&slot_id).unwrap().provision_layout()?;
             for pend in &status.pending_incoming {
                 if pend != deployment_id.as_str() {
                     helper.remove_incoming(pend)?;
@@ -344,62 +345,57 @@ fn push_inner(
                 && held != op_id.as_str()
             {
                 return Err(Error::preflight(format!(
-                    "server {sid} mutation lock held by '{held}'"
+                    "slot {slot_id} mutation lock held by '{held}'"
                 )));
             }
             for a in &assignments {
-                if a.server_id == sid {
-                    recover_if_missing(helper.remote(), store, &a.tree)?;
+                if a.placement_slot == slot_id {
+                    recover_if_missing(helper.remote(), store, &a.artifact.tree)?;
                 }
             }
         }
-        helpers.insert(sid.clone(), helper);
-        statuses.insert(sid.clone(), status);
+        helpers.insert(slot_id.clone(), helper);
+        statuses.insert(slot_id.clone(), status);
     }
 
-    // Build the per-server plan with expected (pre-push) generation.
-    let mut plan_servers: BTreeMap<ServerId, ServerPlan> = BTreeMap::new();
-    let mut new_gen: HashMap<ServerId, GenerationId> = HashMap::new();
-    let mut pre_push: BTreeMap<ServerId, Option<AttemptServer>> = BTreeMap::new();
+    // Build the per-slot plan with expected (pre-push) generation.
+    let mut plan_servers: BTreeMap<PlacementSlotId, ServerPlan> = BTreeMap::new();
+    let mut new_gen: HashMap<PlacementSlotId, GenerationId> = HashMap::new();
+    let mut pre_push: BTreeMap<PlacementSlotId, Option<AttemptServer>> = BTreeMap::new();
     for a in &assignments {
+        let slot_id = &a.placement_slot;
         let expected = statuses
-            .get(&a.server_id)
+            .get(slot_id)
             .and_then(|st| st.current_generation.clone())
             .map(GenerationId::new);
         let expected_tree = statuses
-            .get(&a.server_id)
+            .get(slot_id)
             .and_then(|st| st.current_tree.clone())
             .map(TreeDigest::new);
         let gid = GenerationId::generate();
-        new_gen.insert(a.server_id.clone(), gid.clone());
+        new_gen.insert(slot_id.clone(), gid.clone());
         plan_servers.insert(
-            a.server_id.clone(),
+            slot_id.clone(),
             ServerPlan {
-                server_id: a.server_id.clone(),
-                variant: a.variant.clone(),
-                release: a.release.clone(),
-                tree: a.tree.clone(),
+                slot_id: slot_id.clone(),
+                artifact: a.artifact.clone(),
                 expected_generation: expected.clone(),
                 expected_tree,
             },
         );
         pre_push.insert(
-            a.server_id.clone(),
+            slot_id.clone(),
             expected.as_ref().map(|g| {
-                // Record the server's *actual* current assignment (read from the
+                // Record the slot's *actual* current assignment (read from the
                 // remote generation), not the desired one.
-                helpers[&a.server_id]
+                helpers[slot_id]
                     .read_assignment(g.as_str())
                     .map(|asn| AttemptServer {
-                        release: ReleaseId::new(asn.release),
-                        variant: VariantName::new(asn.variant),
-                        tree: TreeDigest::new(asn.tree),
+                        artifact: asn.artifact.clone(),
                         generation: Some(g.clone()),
                     })
                     .unwrap_or_else(|_| AttemptServer {
-                        release: a.release.clone(),
-                        variant: a.variant.clone(),
-                        tree: a.tree.clone(),
+                        artifact: a.artifact.clone(),
                         generation: Some(g.clone()),
                     })
             }),
@@ -411,8 +407,11 @@ fn push_inner(
         target: TargetName::new(target_name.to_string()),
         behavior_sha256: desired_behavior_sha.clone(),
         behaviors: desired_behaviors.clone(),
-        server_ids: assignments.iter().map(|a| a.server_id.clone()).collect(),
-        servers: plan_servers.clone(),
+        slot_ids: assignments
+            .iter()
+            .map(|a| a.placement_slot.clone())
+            .collect(),
+        slots: plan_servers.clone(),
         source,
         desired_release: desired_release.clone(),
     };
@@ -421,29 +420,29 @@ fn push_inner(
     if opts.dry_run {
         let mut msg = String::new();
         for a in &assignments {
-            let st = statuses.get(&a.server_id).expect("status present");
+            let st = statuses.get(&a.placement_slot).expect("status present");
             let cur = st.current_generation.clone();
-            let want = new_gen[&a.server_id].as_str().to_string();
-            let missing_locally = !store.object_exists(&a.tree);
+            let want = new_gen[&a.placement_slot].as_str().to_string();
+            let missing_locally = !store.object_exists(&a.artifact.tree);
             let note = match cur {
                 Some(c) if c == want => format!(
-                    "server {}: already at desired generation ({})\n",
-                    a.server_id, c
+                    "slot {}: already at desired generation ({})\n",
+                    a.placement_slot, c
                 ),
                 Some(c) => format!(
-                    "server {}: current {} -> desired {} (tree {})\n",
-                    a.server_id, c, want, a.tree
+                    "slot {}: current {} -> desired {} (tree {})\n",
+                    a.placement_slot, c, want, a.artifact.tree
                 ),
                 None => format!(
-                    "server {}: first deployment (tree {})\n",
-                    a.server_id, a.tree
+                    "slot {}: first deployment (tree {})\n",
+                    a.placement_slot, a.artifact.tree
                 ),
             };
             msg.push_str(&note);
             if missing_locally {
                 msg.push_str(&format!(
                     "  would recover tree {} from a retaining server\n",
-                    a.tree
+                    a.artifact.tree
                 ));
             }
         }
@@ -480,14 +479,17 @@ fn push_inner(
     if matches!(pref, PushRef::Head) {
         let mut all_match = true;
         for a in &assignments {
-            let st = statuses.get(&a.server_id).expect("status present");
+            let st = statuses.get(&a.placement_slot).expect("status present");
             let matches = st
                 .current_generation
                 .as_ref()
                 .map(|g| {
-                    helpers[&a.server_id]
+                    helpers[&a.placement_slot]
                         .read_assignment(g)
-                        .map(|asn| asn.tree == a.tree.as_str() && asn.release == a.release.as_str())
+                        .map(|asn| {
+                            asn.artifact.tree == a.artifact.tree
+                                && asn.artifact.release == a.artifact.release
+                        })
                         .unwrap_or(false)
                 })
                 .unwrap_or(false);
@@ -500,8 +502,9 @@ fn push_inner(
             // Verify the running services to confirm true up-to-date state.
             let mut verified = true;
             for a in &assignments {
-                let remote = remotes[&a.server_id].as_ref();
-                let Some(variant_behavior) = desired_behaviors.get(a.variant.as_str()) else {
+                let remote = remotes[&a.placement_slot].as_ref();
+                let Some(variant_behavior) = desired_behaviors.get(a.artifact.variant.as_str())
+                else {
                     // Coverage was validated before any remote mutation; a miss
                     // means the up-to-date claim cannot be established. Fall
                     // through to a real push rather than panicking.
@@ -545,47 +548,53 @@ fn push_inner(
     )?;
     // Stage every needed tree into operation-unique incoming paths.
     for a in &assignments {
-        let _remote = remotes[&a.server_id].as_ref();
-        let helper = &helpers[&a.server_id];
-        if !helper.tree_exists(a.tree.as_str()) {
-            let host_obj = store.object_root(&a.tree);
-            helper.stage_incoming(deployment_id.as_str(), a.tree.as_str(), &host_obj)?;
+        let _remote = remotes[&a.placement_slot].as_ref();
+        let helper = &helpers[&a.placement_slot];
+        if !helper.tree_exists(a.artifact.tree.as_str()) {
+            let host_obj = store.object_root(&a.artifact.tree);
+            helper.stage_incoming(deployment_id.as_str(), a.artifact.tree.as_str(), &host_obj)?;
         }
     }
 
-    // 10-13. Process servers in batches.
+    // 10-13. Process slots in batches.
     let batch_size = target.rollout.batch_size.max(1) as usize;
     let failure_policy = target.rollout.failure_policy.clone();
     let stop_on_failure = target.rollout.stop_on_failure;
 
-    let mut results: BTreeMap<ServerId, ServerResult> = BTreeMap::new();
-    let mut advanced: Vec<ServerId> = Vec::new();
-    let mut compensated: Vec<ServerId> = Vec::new();
+    let mut results: BTreeMap<PlacementSlotId, ServerResult> = BTreeMap::new();
+    let mut advanced: Vec<PlacementSlotId> = Vec::new();
+    let mut compensated: Vec<PlacementSlotId> = Vec::new();
     let mut had_failure = false;
 
-    let servers_order: Vec<ServerId> = assignments.iter().map(|a| a.server_id.clone()).collect();
+    let servers_order: Vec<PlacementSlotId> = assignments
+        .iter()
+        .map(|a| a.placement_slot.clone())
+        .collect();
     let mut idx = 0;
     'batches: while idx < servers_order.len() {
         let end = (idx + batch_size).min(servers_order.len());
         for sid in &servers_order[idx..end] {
-            let a = assignments.iter().find(|x| &x.server_id == sid).unwrap();
+            let a = assignments
+                .iter()
+                .find(|x| &x.placement_slot == sid)
+                .unwrap();
             // Select the assigned variant's frozen behavior contract (never the
             // caller's current variant file) before activation/verification.
             // Coverage was validated before any remote mutation, so a miss here
-            // is an internal invariant violation: record a per-server failure
+            // is an internal invariant violation: record a per-slot failure
             // instead of panicking.
-            let Some(variant_behavior) = desired_behaviors.get(a.variant.as_str()) else {
+            let Some(variant_behavior) = desired_behaviors.get(a.artifact.variant.as_str()) else {
                 had_failure = true;
                 results.insert(
                     sid.clone(),
                     ServerResult {
-                        server_id: sid.clone(),
+                        slot_id: sid.clone(),
                         outcome: ServerOutcomeKind::Failed,
                         generation: Some(new_gen[sid].clone()),
                         compensated: false,
                         error: Some(format!(
                             "internal: no behavior contract for variant '{}' after coverage check",
-                            a.variant
+                            a.artifact.variant
                         )),
                     },
                 );
@@ -601,10 +610,7 @@ fn push_inner(
                 &helpers[sid],
                 op_id,
                 deployment_id,
-                &a.server_id,
-                &a.release,
-                &a.variant,
-                &a.tree,
+                &a.artifact,
                 &new_gen[sid],
                 plan_servers[sid].expected_generation.as_ref(),
                 variant_behavior,
@@ -628,7 +634,7 @@ fn push_inner(
             results.insert(
                 sid.clone(),
                 ServerResult {
-                    server_id: sid.clone(),
+                    slot_id: sid.clone(),
                     outcome: kind,
                     generation: Some(generation),
                     compensated: did_compensate,
@@ -642,19 +648,19 @@ fn push_inner(
         idx = end;
     }
 
-    // Any server never started (e.g. skipped after an earlier failure under
-    // stop_on_failure) still appears in the attempt, with its reconciled current
-    // assignment rather than a generated desired generation.
+    // Any slot never started (e.g. skipped after an earlier failure under
+    // stop_on_failure) still appears in the attempt, with its reconciled
+    // current assignment rather than a generated desired generation.
     for a in &assignments {
-        if !results.contains_key(&a.server_id) {
+        if !results.contains_key(&a.placement_slot) {
             let cur = statuses
-                .get(&a.server_id)
+                .get(&a.placement_slot)
                 .and_then(|s| s.current_generation.clone())
                 .map(GenerationId::new);
             results.insert(
-                a.server_id.clone(),
+                a.placement_slot.clone(),
                 ServerResult {
-                    server_id: a.server_id.clone(),
+                    slot_id: a.placement_slot.clone(),
                     outcome: ServerOutcomeKind::Skipped,
                     generation: cur,
                     compensated: false,
@@ -671,14 +677,13 @@ fn push_inner(
             // A compensation failure (e.g. prior behavior unavailable, or
             // activation/verification failed during rollback) is reported as a
             // failed compensation rather than aborting the whole push; the
-            // server stays advanced and the attempt is marked Degraded.
+            // slot stays advanced and the attempt is marked Degraded.
             let ok = compensate_server(
                 store,
                 remotes[sid].as_ref(),
                 &helpers[sid],
                 op_id,
                 deployment_id,
-                sid,
                 prior,
                 &new_gen[sid],
                 config,
@@ -711,8 +716,8 @@ fn push_inner(
     // 15. Fleet-commit markers (only for otherwise-successful attempts).
     let mut commit_status = status.clone();
     if status == DeploymentStatus::Successful {
-        // The full server-ID set participating in this fleet commit.
-        let server_ids: Vec<String> = servers_order
+        // The full placement-slot set participating in this fleet commit.
+        let slot_ids: Vec<String> = servers_order
             .iter()
             .map(|s| s.as_str().to_string())
             .collect();
@@ -751,7 +756,7 @@ fn push_inner(
             match helper.write_commit_marker(
                 deployment_id.as_str(),
                 new_gen[sid].as_str(),
-                &server_ids,
+                &slot_ids,
             ) {
                 Err(Error::Integrity(_)) => {
                     // A conflicting marker already exists with different
@@ -796,72 +801,66 @@ fn push_inner(
 
     // 16 & 17. Record attempt, history, rotation.
     //
-    // `actual_servers` reflects each server's *real* final state, read from the
+    // `actual_servers` reflects each slot's *real* final state, read from the
     // remote generation it currently points at, rather than the desired plan
-    // values. Failed/skipped/restored servers therefore report their actual
-    // release/tree/variant instead of the desired ones.
-    let mut actual_servers: BTreeMap<ServerId, AttemptServer> = BTreeMap::new();
+    // values. Failed/skipped/restored slots therefore report their actual
+    // artifact instead of the desired one.
+    let mut actual_servers: BTreeMap<PlacementSlotId, AttemptServer> = BTreeMap::new();
     for a in &assignments {
-        let sid = &a.server_id;
+        let sid = &a.placement_slot;
         let helper = &helpers[sid];
         let final_gen = helper.status().ok().and_then(|s| s.current_generation);
         let actual = match final_gen {
             Some(g) => match helper.read_assignment(&g) {
                 Ok(asn) => AttemptServer {
-                    release: ReleaseId::new(asn.release),
-                    variant: VariantName::new(asn.variant),
-                    tree: TreeDigest::new(asn.tree),
+                    artifact: asn.artifact.clone(),
                     generation: Some(GenerationId::new(g)),
                 },
                 Err(_) => {
                     // The generation is observed (`g`), but its assignment could
                     // not be read. Never substitute the planned (desired)
-                    // release/tree/variant for a failed observation: preserve the
-                    // observed generation and mark the assignment unknown rather
-                    // than fabricating desired state.
+                    // artifact for a failed observation: preserve the observed
+                    // generation and mark the assignment unknown rather than
+                    // fabricating desired state.
                     AttemptServer {
-                        release: ReleaseId::new(String::new()),
-                        variant: VariantName::new(String::new()),
-                        tree: TreeDigest::new(String::new()),
+                        artifact: ArtifactRef::default(),
                         generation: Some(GenerationId::new(g)),
                     }
                 }
             },
             None => AttemptServer {
-                release: a.release.clone(),
-                variant: a.variant.clone(),
-                tree: a.tree.clone(),
+                artifact: a.artifact.clone(),
                 generation: None,
             },
         };
         actual_servers.insert(sid.clone(), actual);
     }
-    let desired_map: BTreeMap<ServerId, AttemptServer> = assignments
+    // `desired` records each slot's minted generation for its planned artifact
+    // as a complete [`GenerationRef`].
+    let desired_map: BTreeMap<PlacementSlotId, GenerationRef> = assignments
         .iter()
         .map(|a| {
             (
-                a.server_id.clone(),
-                AttemptServer {
-                    release: a.release.clone(),
-                    variant: a.variant.clone(),
-                    tree: a.tree.clone(),
-                    generation: Some(new_gen[&a.server_id].clone()),
+                a.placement_slot.clone(),
+                GenerationRef {
+                    generation: new_gen[&a.placement_slot].clone(),
+                    assignment: a.clone(),
                 },
             )
         })
         .collect();
 
     let attempt = AttemptRecord {
-        deployment_schema_version: 1,
+        deployment_schema_version: 2,
         deployment_id: deployment_id.clone(),
         status: commit_status.clone(),
         target: TargetName::new(target_name.to_string()),
-        server_ids: servers_order.clone(),
+        slot_ids: servers_order.clone(),
         behavior_sha256: desired_behavior_sha.clone(),
         attempted_at: crate::remote::helper::now_rfc3339(),
         desired: desired_map,
         pre_push,
-        servers: actual_servers.clone(),
+        slots: actual_servers.clone(),
     };
     store.append_attempt(target_name, &attempt)?;
     store.write_results(
@@ -869,29 +868,33 @@ fn push_inner(
         &DeploymentResults {
             deployment_id: deployment_id.clone(),
             target: TargetName::new(target_name.to_string()),
-            servers: results.clone(),
+            slots: results.clone(),
         },
     )?;
     store.write_status(deployment_id.as_str(), &format!("{:?}", commit_status))?;
 
-    // Refresh observed state.
+    // Refresh observed state. Observed maps are keyed by placement slot (the
+    // deployment-location identity); the per-server record (`servers/<id>.json`)
+    // keeps the actual [`crate::model::ServerId`] for transport identity.
     let mut observed = ObservedTarget {
         target: TargetName::new(target_name.to_string()),
-        servers: Default::default(),
+        slots: Default::default(),
     };
-    for (sid, asv) in &actual_servers {
+    for (slot, sdef) in &members {
+        let slot_id = PlacementSlotId::new(slot.id.clone());
+        let Some(asv) = actual_servers.get(&slot_id) else {
+            continue;
+        };
         let observed_server = ObservedServer {
             generation: asv.generation.clone(),
-            release: Some(asv.release.clone()),
-            variant: Some(asv.variant.clone()),
-            tree: Some(asv.tree.clone()),
+            artifact: Some(asv.artifact.clone()),
             last_deployment: Some(deployment_id.clone()),
         };
         observed
-            .servers
-            .insert(sid.clone(), observed_server.clone());
+            .slots
+            .insert(slot_id.clone(), observed_server.clone());
         store.write_server(&crate::records::ServerState {
-            id: sid.clone(),
+            id: crate::model::ServerId::new(sdef.id.clone()),
             last_seen_target: Some(TargetName::new(target_name.to_string())),
             last_observed: Some(observed_server),
         })?;
@@ -909,12 +912,12 @@ fn push_inner(
         message = format!("push successful; fleet ref {}@f{idx}", target_name);
     }
 
-    // 17. Per-server rotation under each server's mutation lock. Rotation uses
-    // the server's ACTUAL final assignment (read after any compensation), not
-    // the desired plan: a compensated server restored its prior variant. The
+    // 17. Per-slot rotation under each slot's mutation lock. Rotation uses
+    // the slot's ACTUAL final assignment (read after any compensation), not
+    // the desired plan: a compensated slot restored its prior variant. The
     // retention policy is the target's `rotation` configuration from
     // `deploy.toml`, so it applies uniformly regardless of which variant each
-    // server ended up running.
+    // slot ended up running.
     for sid in &servers_order {
         let helper = &helpers[sid];
         if helper.acquire_lock(op_id.as_str(), false).is_ok() {
@@ -993,7 +996,7 @@ fn reconcile_pending_commits(
     config: &Config,
     target_name: &str,
     op_id: &OperationId,
-    helpers: &HashMap<ServerId, RemoteHelper>,
+    helpers: &HashMap<PlacementSlotId, RemoteHelper>,
 ) -> Result<()> {
     // Eligible attempts: the append-only attempts.jsonl record must say
     // `PendingCommit` (a legitimately new pending attempt whose status file is
@@ -1023,13 +1026,13 @@ fn reconcile_pending_commits(
     let members: HashSet<String> = config
         .target_slots(target_name)?
         .iter()
-        .map(|(_, s)| s.id.clone())
+        .map(|(slot, _)| slot.id.clone())
         .collect();
 
     'pending: for attempt in pending {
         // 1. Membership check.
         let membership_ok = attempt
-            .server_ids
+            .slot_ids
             .iter()
             .all(|sid| members.contains(sid.as_str()));
         if !membership_ok {
@@ -1039,18 +1042,18 @@ fn reconcile_pending_commits(
 
         // 2. Generation verification against fresh remote status reads.
         // `recorded` collects the generation the attempt minted for each
-        // server (the same value step 15 compared against when writing the
+        // slot (the same value step 15 compared against when writing the
         // markers), so recovery writes markers identical to what the original
         // commit would have written.
-        let mut recorded: BTreeMap<ServerId, GenerationId> = BTreeMap::new();
+        let mut recorded: BTreeMap<PlacementSlotId, GenerationId> = BTreeMap::new();
         let mut all_match = true;
         let mut unverifiable = false;
-        for sid in &attempt.server_ids {
+        for sid in &attempt.slot_ids {
             let Some(recorded_gen) = attempt
                 .desired
                 .get(sid)
-                .and_then(|d| d.generation.clone())
-                .or_else(|| attempt.servers.get(sid).and_then(|s| s.generation.clone()))
+                .map(|d| d.generation.clone())
+                .or_else(|| attempt.slots.get(sid).and_then(|s| s.generation.clone()))
             else {
                 // No recorded generation for a participant: the attempt is not
                 // a coherent fleet commit; finalize as degraded.
@@ -1066,7 +1069,7 @@ fn reconcile_pending_commits(
                     recorded.insert(sid.clone(), recorded_gen);
                 }
                 Ok(_) => {
-                    // Confirmed divergence: the server no longer points at the
+                    // Confirmed divergence: the slot no longer points at the
                     // generation this attempt minted.
                     all_match = false;
                     break;
@@ -1087,18 +1090,18 @@ fn reconcile_pending_commits(
             continue;
         }
 
-        // 3. Write the missing markers under each server's mutation lock
+        // 3. Write the missing markers under each slot's mutation lock
         // (mirroring step 15's lock discipline: the guard is held for the
         // whole write and released on drop). The marker payload carries the
-        // full participating server set; already-present markers are an
+        // full participating slot set; already-present markers are an
         // idempotent byte-for-byte no-op.
-        let server_ids: Vec<String> = attempt
-            .server_ids
+        let slot_ids: Vec<String> = attempt
+            .slot_ids
             .iter()
             .map(|s| s.as_str().to_string())
             .collect();
         let mut markers_written = true;
-        for sid in &attempt.server_ids {
+        for sid in &attempt.slot_ids {
             let helper = &helpers[sid];
             let _guard = match helper.acquire_lock_guard(op_id.as_str()) {
                 Ok(g) => g,
@@ -1113,7 +1116,7 @@ fn reconcile_pending_commits(
             match helper.write_commit_marker(
                 attempt.deployment_id.as_str(),
                 recorded[sid].as_str(),
-                &server_ids,
+                &slot_ids,
             ) {
                 Err(Error::Integrity(_)) => {
                     // Conflicting marker already exists with different
@@ -1169,17 +1172,14 @@ fn process_server(
     helper: &RemoteHelper,
     op_id: &OperationId,
     deployment_id: &DeploymentId,
-    server_id: &ServerId,
-    release: &ReleaseId,
-    variant: &VariantName,
-    tree: &TreeDigest,
+    artifact: &ArtifactRef,
     new_gen: &GenerationId,
     expected_gen: Option<&GenerationId>,
     behavior: &BehaviorContract,
     behavior_sha256: &str,
     config: &Config,
 ) -> Result<ServerProc> {
-    // Acquire the server mutation lock via an RAII guard so every return path
+    // Acquire the slot's mutation lock via an RAII guard so every return path
     // (including errors) releases it.
     let _guard = match helper.acquire_lock_guard(op_id.as_str()) {
         Ok(g) => g,
@@ -1220,7 +1220,7 @@ fn process_server(
     }
 
     // 1. Publish the staged tree (from incoming), reusing an existing object.
-    if let Err(e) = helper.publish_from_incoming(deployment_id.as_str(), tree.as_str()) {
+    if let Err(e) = helper.publish_from_incoming(deployment_id.as_str(), artifact.tree.as_str()) {
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Failed,
             generation: new_gen.clone(),
@@ -1242,7 +1242,7 @@ fn process_server(
             });
         }
     };
-    let object_rel = layout::tree_root(tree.as_str());
+    let object_rel = layout::tree_root(artifact.tree.as_str());
     if let Err(e) = download_tree_to_host(remote, &object_rel, verify_tmp.path()) {
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Failed,
@@ -1262,14 +1262,14 @@ fn process_server(
             });
         }
     };
-    if meta.tree_sha256 != tree.as_str() {
+    if meta.tree_sha256 != artifact.tree.as_str() {
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Failed,
             generation: new_gen.clone(),
             did_compensate: false,
             error: Some(format!(
                 "integrity: remote tree digest {} does not match requested {}",
-                meta.tree_sha256, tree
+                meta.tree_sha256, artifact.tree
             )),
         });
     }
@@ -1286,8 +1286,9 @@ fn process_server(
 
     // 4. Publish the release record (idempotent) and create the generation.
     if let Some((release_json, behavior_json)) =
-        REMOTE_RELEASE_JSON.with(|c| c.borrow().get(release).cloned())
-        && let Err(e) = helper.publish_release(release.as_str(), &release_json, &behavior_json)
+        REMOTE_RELEASE_JSON.with(|c| c.borrow().get(&artifact.release).cloned())
+        && let Err(e) =
+            helper.publish_release(artifact.release.as_str(), &release_json, &behavior_json)
     {
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Failed,
@@ -1297,13 +1298,11 @@ fn process_server(
         });
     }
     let assignment = crate::remote::helper::GenerationAssignment {
-        deployment_id: deployment_id.as_str().to_string(),
-        generation_id: new_gen.as_str().to_string(),
-        release: release.as_str().to_string(),
-        variant: variant.as_str().to_string(),
-        tree: tree.as_str().to_string(),
+        deployment_id: deployment_id.clone(),
+        generation_id: new_gen.clone(),
+        artifact: artifact.clone(),
         behavior_sha256: behavior_sha256.to_string(),
-        prior_generation: expected_gen.map(|g| g.as_str().to_string()),
+        prior_generation: expected_gen.cloned(),
         created_at: crate::remote::helper::now_rfc3339(),
     };
     if let Err(e) = helper.create_generation(op_id.as_str(), &assignment) {
@@ -1323,7 +1322,7 @@ fn process_server(
         });
     }
 
-    // Atomically move `current` (the per-server commit point).
+    // Atomically move `current` (the per-slot commit point).
     let swap = helper.swap_current(
         expected_gen.map(|g| g.as_str()),
         new_gen.as_str(),
@@ -1359,7 +1358,6 @@ fn process_server(
             helper,
             op_id,
             deployment_id,
-            server_id,
             expected_gen,
             new_gen,
             config,
@@ -1387,7 +1385,6 @@ fn process_server(
             helper,
             op_id,
             deployment_id,
-            server_id,
             expected_gen,
             new_gen,
             config,
@@ -1439,7 +1436,7 @@ fn process_server(
 
 /// Restore the prior generation (or remove `current` on first deploy). Uses the
 /// prior generation's stored behavior contract rather than the caller's current
-/// configuration. `advanced_gen` is the generation this server was just advanced
+/// configuration. `advanced_gen` is the generation this slot was just advanced
 /// to; it is used as the compare-and-swap precondition so a concurrent
 /// controller cannot have its `current` clobbered. Returns true if compensation
 /// restored prior state.
@@ -1450,12 +1447,11 @@ fn compensate_server(
     helper: &RemoteHelper,
     op_id: &OperationId,
     _deployment_id: &DeploymentId,
-    _server_id: &ServerId,
     prior_gen: Option<&GenerationId>,
     advanced_gen: &GenerationId,
     _config: &Config,
 ) -> Result<bool> {
-    // Hold the server mutation lock for the duration of compensation. Re-acquiring
+    // Hold the slot's mutation lock for the duration of compensation. Re-acquiring
     // is idempotent when the same op_id already holds it (process_server holds it
     // via a guard that is still alive on the in-process failure paths).
     let _guard = match helper.acquire_lock_guard(op_id.as_str()) {
@@ -1475,8 +1471,8 @@ fn compensate_server(
             // contract: report the failure so the attempt is marked Degraded.
             let prior_behavior = helper
                 .read_behavior(
-                    &ReleaseId::new(prior_assignment.release.clone()),
-                    &prior_assignment.variant,
+                    &prior_assignment.artifact.release,
+                    prior_assignment.artifact.variant.as_str(),
                 )
                 .map_err(|e| {
                     Error::remote(format!("compensation: prior behavior unavailable: {e}"))
@@ -1599,11 +1595,11 @@ fn validate_behavior_coverage(
 ) -> Result<()> {
     let mut missing: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for a in assignments {
-        if !behaviors.contains_key(a.variant.as_str()) {
+        if !behaviors.contains_key(a.artifact.variant.as_str()) {
             missing
-                .entry(a.variant.as_str())
+                .entry(a.artifact.variant.as_str())
                 .or_default()
-                .push(a.server_id.as_str());
+                .push(a.placement_slot.as_str());
         }
     }
     if missing.is_empty() {
@@ -1611,7 +1607,7 @@ fn validate_behavior_coverage(
     }
     let detail = missing
         .iter()
-        .map(|(variant, servers)| format!("variant '{variant}' (servers: {})", servers.join(", ")))
+        .map(|(variant, slots)| format!("variant '{variant}' (slots: {})", slots.join(", ")))
         .collect::<Vec<_>>()
         .join("; ");
     Err(Error::preflight(format!(
@@ -1634,7 +1630,7 @@ fn validate_behavior_coverage(
 fn capacity_preflight(
     store: &LocalStore,
     assignments: &[crate::push::plan::PlannedAssignment],
-    helpers: &HashMap<ServerId, RemoteHelper>,
+    helpers: &HashMap<PlacementSlotId, RemoteHelper>,
     op_id: &OperationId,
     deployment_id: &DeploymentId,
     config: &Config,
@@ -1642,21 +1638,28 @@ fn capacity_preflight(
 ) -> Result<()> {
     for a in assignments {
         // Resolve the server's CURRENT capacity policy for this assignment.
-        // The server is looked up by ID; the assignment was planned against
-        // this config, so a miss is an internal invariant violation.
+        // Capacity is a per-server policy resolved from the caller's current
+        // config (never a release snapshot). The assignment names a placement
+        // slot; the slot binds one server. A miss is an internal invariant
+        // violation: the assignment was planned against this config.
+        let slot = config
+            .slots
+            .iter()
+            .find(|s| s.id.as_str() == a.placement_slot.as_str())
+            .expect("assignment slot present in config");
         let server = config
             .servers
             .iter()
-            .find(|s| s.id == a.server_id.as_str())
-            .expect("assignment server present in config");
+            .find(|s| s.id == slot.server)
+            .expect("slot's server present in config");
         let capacity = &server.capacity;
         let reserve_bytes = capacity.reserve_bytes;
         let reserve_percent = capacity.reserve_percent as f64 / 100.0;
-        let helper = helpers.get(&a.server_id).expect("helper present");
-        if helper.tree_exists(a.tree.as_str()) {
+        let helper = helpers.get(&a.placement_slot).expect("helper present");
+        if helper.tree_exists(a.artifact.tree.as_str()) {
             continue;
         }
-        let need = tree_size_on_host(&store.object_root(&a.tree));
+        let need = tree_size_on_host(&store.object_root(&a.artifact.tree));
         let avail = helper.remote().available_bytes().unwrap_or(0);
         let total = helper
             .remote()
@@ -1683,8 +1686,8 @@ fn capacity_preflight(
             let avail2 = helper.remote().available_bytes().unwrap_or(0);
             if need + reserve > avail2 {
                 return Err(Error::preflight(format!(
-                    "insufficient capacity on server {}: need {} + reserve {} > avail {}",
-                    a.server_id, need, reserve, avail2
+                    "insufficient capacity on slot {}: need {} + reserve {} > avail {}",
+                    a.placement_slot, need, reserve, avail2
                 )));
             }
         }
@@ -2064,10 +2067,11 @@ slots = ["p1"]
                 &helper,
                 &op_id,
                 &deployment_id,
-                &ServerId::new("s1"),
-                &ReleaseId::new("r1"),
-                &VariantName::new("standard"),
-                &self.tree,
+                &ArtifactRef {
+                    release: ReleaseId::new("r1".to_string()),
+                    variant: VariantName::new("standard".to_string()),
+                    tree: self.tree.clone(),
+                },
                 &new_gen,
                 expected_gen.as_ref(),
                 &behavior,
@@ -2412,7 +2416,8 @@ slots = ["p1"]
             Some(DeploymentStatus::Successful),
             "first push must deploy"
         );
-        let tree = r0.attempt.expect("attempt recorded").servers[&ServerId::new("s1")]
+        let tree = r0.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")]
+            .artifact
             .tree
             .clone();
 
