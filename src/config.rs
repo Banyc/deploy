@@ -51,6 +51,7 @@ pub enum ConflictPolicy {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Mapping {
     /// Source path relative to the release directory (`releases/<release>/`),
     /// where the convention is `artifacts/...`. `{{ variant }}` is the only
@@ -70,11 +71,13 @@ pub struct Mapping {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactConfig {
     pub mappings: Vec<Mapping>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct UnitDef {
     pub name: String,
     pub artifact_path: String,
@@ -97,6 +100,7 @@ pub enum ActivationScope {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ActivationConfig {
     #[serde(default = "default_adapter_none")]
     pub adapter: String,
@@ -113,6 +117,7 @@ fn default_adapter_none() -> String {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationConfig {
     pub adapter: String,
     pub argv: Vec<String>,
@@ -146,6 +151,7 @@ fn default_interval() -> u64 {
 /// capacity = { reserve_bytes = 0, reserve_percent = 0 }
 /// ```
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CapacityConfig {
     /// Keep at least this many bytes free on the server after an upload.
     #[serde(default)]
@@ -156,6 +162,7 @@ pub struct CapacityConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PerServerRotation {
     #[serde(default = "default_keep_distinct")]
     pub keep_distinct_artifacts: u32,
@@ -173,6 +180,7 @@ fn default_keep_days() -> u64 {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct FleetRotation {
     #[serde(default)]
     pub protect_deployments: u32,
@@ -181,6 +189,7 @@ pub struct FleetRotation {
 /// Fleet-wide retention policy, declared once at the top level of
 /// `deploy.toml` (not per variant). Applied on every rotation.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RotationConfig {
     #[serde(default)]
     pub per_server: PerServerRotation,
@@ -195,6 +204,7 @@ pub struct RotationConfig {
 /// per-variant either: it is a per-server policy declared on the server entry
 /// and resolved from the caller's current configuration.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct VariantConfig {
     #[serde(default)]
     pub description: Option<String>,
@@ -207,6 +217,7 @@ pub struct VariantConfig {
 /// Durable protection for one whole release: every variant's artifact in the
 /// pinned release is retained forever; rotation never sweeps it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Pin {
     pub release: String,
     pub reason: String,
@@ -265,6 +276,7 @@ impl<'de> Deserialize<'de> for ReleaseName {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RolloutConfig {
     #[serde(default = "default_batch_size")]
     pub batch_size: u32,
@@ -285,6 +297,7 @@ fn default_ssh_port() -> u16 {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ServerDef {
     pub id: String,
     pub address: String,
@@ -317,6 +330,7 @@ pub struct ServerDef {
 /// top-level `[[servers]]` entry; the workload choice and its on-server
 /// location live here. Targets reference slots by ID.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SlotDef {
     pub id: String,
     /// The ID of the top-level server this slot deploys onto.
@@ -328,6 +342,7 @@ pub struct SlotDef {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TargetDef {
     #[serde(default)]
     pub rollout: RolloutConfig,
@@ -340,6 +355,7 @@ pub struct TargetDef {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub schema_version: u32,
     pub application: String,
@@ -1171,8 +1187,7 @@ slots = ["p1"]
         write_standard_release(&project, "v1");
         let mut toml = deploy_toml("v1");
         // Insert a second [[servers]] entry with the same ID before [targets.t1].
-        let dup =
-            "[[servers]]\nid = \"s1\"\naddress = \"a2\"\nuser = \"u\"\nvariant = \"standard\"\n\n";
+        let dup = "[[servers]]\nid = \"s1\"\naddress = \"a2\"\nuser = \"u\"\n\n";
         toml = toml.replacen("[targets.t1]", &format!("{dup}[targets.t1]"), 1);
         let p = project.join("deploy.toml");
         std::fs::write(&p, toml).unwrap();
@@ -1218,5 +1233,69 @@ slots = ["p1"]
         let cfg = Config::load(&p).expect("inline server capacity parses");
         assert_eq!(cfg.servers[0].capacity.reserve_bytes, 4096);
         assert_eq!(cfg.servers[0].capacity.reserve_percent, 10);
+    }
+
+    /// Every user-written config surface is strict: an unknown key fails at
+    /// load time with serde's standard wording instead of being silently
+    /// ignored (`deny_unknown_fields` on every config struct).
+    #[test]
+    fn unknown_fields_are_rejected_across_all_config_surfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        let p = project.join("deploy.toml");
+        let base = deploy_toml("v1");
+
+        // Unknown top-level key in deploy.toml.
+        std::fs::write(
+            &p,
+            base.replace(
+                "schema_version = 1",
+                "schema_version = 1\nadapterr = \"none\"",
+            ),
+        )
+        .unwrap();
+        let err = Config::load(&p).expect_err("unknown top-level key must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("adapterr") && msg.contains("unknown field"),
+            "error must name the unknown top-level field, got: {msg}"
+        );
+
+        // Unknown field inside a [[servers]] entry.
+        std::fs::write(
+            &p,
+            base.replace("user = \"u\"", "user = \"u\"\nreserve_byts = 1"),
+        )
+        .unwrap();
+        let err = Config::load(&p).expect_err("unknown server field must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reserve_byts") && msg.contains("unknown field"),
+            "error must name the unknown server field, got: {msg}"
+        );
+
+        // Unknown field inside a variant's [activation] table.
+        let bad_variant =
+            MINIMAL_VARIANT.replace("adapter = \"none\"", "adapter = \"none\"\nreserve_byts = 1");
+        std::fs::write(project.join("releases/v1/standard.toml"), bad_variant).unwrap();
+        let err = Config::load(&p).expect_err("unknown activation field must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reserve_byts") && msg.contains("unknown field"),
+            "error must name the unknown activation field, got: {msg}"
+        );
+
+        // Enums reject unknown variants by default (no attribute needed).
+        let err = toml::from_str::<Mapping>("from = \"a\"\nto = \"b\"\nconflict = \"nope\"")
+            .expect_err("unknown conflict variant must fail");
+        assert!(err.to_string().contains("unknown variant"), "got: {err}");
+
+        // The known-good fixtures still load under the strict rules.
+        let fixture = project.join("deploy.toml");
+        std::fs::write(&fixture, base).unwrap();
+        std::fs::write(project.join("releases/v1/standard.toml"), MINIMAL_VARIANT).unwrap();
+        Config::load(&fixture).expect("known-good config still loads");
     }
 }
