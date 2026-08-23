@@ -1837,7 +1837,7 @@ pods = ["p1"]
         let obj_file = h
             .remote
             .root()
-            .join("objects/sha256")
+            .join(crate::layout::objects())
             .join(h.tree.as_str())
             .join("root")
             .join("app")

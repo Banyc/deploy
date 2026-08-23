@@ -127,18 +127,8 @@ impl Remote for LocalTransport {
             std::fs::create_dir_all(&self.base)
                 .map_err(|e| Error::transport(format!("mkdir {}: {e}", self.base.display())))?;
         }
-        // Provision the expected top-level layout.
-        for d in [
-            "control",
-            "helpers",
-            "objects/sha256",
-            "releases",
-            "generations",
-            "incoming",
-            "state",
-            "adapters",
-            "transactions",
-        ] {
+        // Provision the expected top-level layout (owned by `crate::layout`).
+        for d in crate::layout::bootstrap_dirs() {
             let p = self.base.join(d);
             if !p.exists() {
                 std::fs::create_dir_all(&p)

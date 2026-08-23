@@ -11,6 +11,7 @@
 
 use crate::config::VariantPolicy;
 use crate::error::{Error, Result};
+use crate::layout;
 use crate::model::{BehaviorContract, ReleaseId, ReleaseRecord, TreeDigest, TreeMetadata};
 use crate::records::{AttemptRecord, DeploymentResults, ObservedTarget, ReflogEntry, ServerState};
 use serde::Serialize;
@@ -189,8 +190,8 @@ impl LocalStore {
     /// Create a store rooted at an explicit base (used in tests).
     pub fn with_base(base: PathBuf) -> Result<LocalStore> {
         ensure_private_dir(&base)?;
-        ensure_private_dir(&base.join("objects/sha256"))?;
-        ensure_private_dir(&base.join("releases"))?;
+        ensure_private_dir(&base.join(layout::objects()))?;
+        ensure_private_dir(&base.join(layout::RELEASES))?;
         ensure_private_dir(&base.join("targets"))?;
         ensure_private_dir(&base.join("servers"))?;
         ensure_private_dir(&base.join("deployments"))?;
@@ -210,14 +211,14 @@ impl LocalStore {
 
     pub fn object_root(&self, digest: &TreeDigest) -> PathBuf {
         self.base
-            .join("objects/sha256")
+            .join(layout::objects())
             .join(digest.as_str())
             .join("root")
     }
 
     pub fn object_tree_json(&self, digest: &TreeDigest) -> PathBuf {
         self.base
-            .join("objects/sha256")
+            .join(layout::objects())
             .join(digest.as_str())
             .join("tree.json")
     }
@@ -269,7 +270,7 @@ impl LocalStore {
     // ---- releases ---------------------------------------------------------
 
     pub fn release_dir(&self, id: &ReleaseId) -> PathBuf {
-        self.base.join("releases").join(sanitize(id.as_str()))
+        self.base.join(layout::RELEASES).join(sanitize(id.as_str()))
     }
 
     pub fn release_exists(&self, id: &ReleaseId) -> bool {

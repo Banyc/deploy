@@ -448,24 +448,14 @@ impl Remote for SshTransport {
     }
 
     fn provision(&self) -> Result<()> {
-        // Create the deployment-directory layout on the remote host (same list
-        // as LocalTransport::provision) with a single `mkdir -p`; every path is
+        // Create the deployment-directory layout on the remote host. The set of
+        // bootstrap directories is owned by `crate::layout::bootstrap_dirs` —
+        // the same list LocalTransport provisions — and every path is
         // single-quoted by `argv_cmd`/`shell_quote` so it reaches `mkdir`
         // verbatim. This runs only after the push engine's non-dry-run gate.
-        const LAYOUT: [&str; 9] = [
-            "control",
-            "helpers",
-            "objects/sha256",
-            "releases",
-            "generations",
-            "incoming",
-            "state",
-            "adapters",
-            "transactions",
-        ];
         let mut argv: Vec<String> = vec!["mkdir".into(), "-p".into()];
         argv.extend(
-            LAYOUT
+            crate::layout::bootstrap_dirs()
                 .iter()
                 .map(|d| self.root.join(d).to_string_lossy().into_owned()),
         );
@@ -831,7 +821,7 @@ mod tests {
         // Build the command string via the public surface by inspecting the
         // produced remote command through a small proxy: re-create the same
         // logic path used by try_write_new.
-        let rel = Path::new("state/operation.lock");
+        let rel = crate::layout::operation_lock();
         let remote_path = t.root.join(rel);
         let remote_path_str = remote_path.to_string_lossy().into_owned();
         let parent = Path::new(&remote_path_str)
