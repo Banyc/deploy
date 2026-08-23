@@ -346,6 +346,29 @@ impl SshTransport {
 
     /// Build a remote shell command string from an `argv`, quoting every
     /// argument so the remote shell re-tokenizes it back into exactly `argv`.
+    /// Build the remote `mv` command for an atomic path replacement.
+    ///
+    /// `-T` (no-target-directory) is REQUIRED: without it GNU mv treats a
+    /// destination that is a symlink to a directory as the directory itself
+    /// and moves `from` INTO it instead of replacing the symlink. The
+    /// `current` swap depends on replacing a symlink-to-directory in place
+    /// (the atomic per-slot commit point), and a bare `mv` silently pollutes
+    /// the object store with the temp link.
+    fn rename_cmd(root: &Path, from: &Path, to: &Path) -> String {
+        let f = root.join(from).to_string_lossy().into_owned();
+        let t = root.join(to).to_string_lossy().into_owned();
+        let parent = Path::new(&t)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        format!(
+            "mkdir -p {parent} && mv -T {f} {t}",
+            parent = shell_quote(&parent),
+            f = shell_quote(&f),
+            t = shell_quote(&t),
+        )
+    }
+
     fn argv_cmd(argv: &[String]) -> String {
         argv.iter()
             .map(|a| shell_quote(a))
@@ -605,19 +628,7 @@ impl Remote for SshTransport {
     }
 
     fn rename(&self, from: &Path, to: &Path) -> Result<()> {
-        let f = self.root.join(from).to_string_lossy().into_owned();
-        let t = self.root.join(to).to_string_lossy().into_owned();
-        let parent = Path::new(&t)
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| ".".to_string());
-        let cmd = format!(
-            "mkdir -p {parent} && mv {f} {t}",
-            parent = shell_quote(&parent),
-            f = shell_quote(&f),
-            t = shell_quote(&t),
-        );
-        self.run_remote_ok(&cmd)
+        self.run_remote_ok(&SshTransport::rename_cmd(&self.root, from, to))
     }
 
     fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
@@ -941,6 +952,28 @@ mod tests {
         assert!(
             cmd[mkdir_end..].contains("mktemp"),
             "mktemp allocation must follow mkdir -p, got: {cmd}"
+        );
+    }
+
+    // The `current` swap replaces a symlink-to-directory in place; GNU mv
+    // would otherwise treat that destination as the directory itself and move
+    // the temp link INTO it (silently polluting the object store). `-T` is
+    // mandatory.
+    #[test]
+    fn rename_uses_no_target_directory_flag() {
+        let t = transport();
+        let cmd = SshTransport::rename_cmd(
+            t.root(),
+            Path::new(".current.tmp.op-x"),
+            &crate::layout::current(),
+        );
+        assert!(
+            cmd.contains("mv -T"),
+            "rename must use mv -T (no-target-directory) so a symlink-to-dir destination is replaced, got: {cmd}"
+        );
+        assert!(
+            cmd.ends_with("'/srv/app/current'"),
+            "destination is the deployment root's `current` symlink, got: {cmd}"
         );
     }
 

@@ -150,8 +150,29 @@ esac
     )
     .unwrap();
 
+    std::fs::write(
+        bin.join("mv"),
+        r#"#!/bin/sh
+# Emulate GNU coreutils `mv -T` (no-target-directory): macOS BSD mv lacks -T
+# and, like GNU mv without -T, treats a destination that is a symlink to a
+# directory as the directory itself and moves the source INTO it. The deploy
+# tool's `current` swap depends on GNU -T semantics, so strip the flag and
+# remove any existing destination first.
+if [ "$1" = "-T" ]; then
+  shift
+  src="$1"; dst="$2"
+  if [ -n "$src" ] && [ -n "$dst" ]; then
+    rm -f -- "$dst"
+  fi
+  exec /bin/mv -- "$src" "$dst"
+fi
+exec /bin/mv "$@"
+"#,
+    )
+    .unwrap();
+
     use std::os::unix::fs::PermissionsExt;
-    for name in ["ssh", "ssh-keyscan", "stat"] {
+    for name in ["ssh", "ssh-keyscan", "stat", "mv"] {
         let p = bin.join(name);
         let mut perms = std::fs::metadata(&p).unwrap().permissions();
         perms.set_mode(0o755);
