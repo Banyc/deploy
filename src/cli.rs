@@ -57,8 +57,17 @@ Creates (never clobbers; the target must not already contain deploy.toml or a\n\
 releases/ tree):\n\
   deploy.toml                        schema v1 config: one server, one slot, target `production`\n\
   releases/v1/standard.toml          the `standard` variant (mappings + policies)\n\
+  releases/v1/systemd.toml           example `systemd` activation variant with a real unit\n\
   releases/v1/artifacts/build/output/app/hello   placeholder artifact source\n\
+  releases/v1/artifacts/systemd/example.service  the unit shipped by the systemd variant\n\
   .deploy-remote/                    LOCAL deployment endpoint (see below)\n\
+  .gitignore                         ignores the local endpoint in a repo\n\
+\n\
+The generated files are typed TOML serialized from the same config structs\n\
+`Config::load` parses into — not formatted strings. Init validates the flags\n\
+BEFORE creating anything, re-loads the written project through the strict\n\
+loader, and removes the scaffold if that load fails: success always means\n\
+the generated project is valid.\n\
 \n\
 LOCAL-FIRST DEFAULT: the server address is `local://<project>/.deploy-remote`,\n\
 a local-filesystem endpoint, so `deploy push production` runs end-to-end with\n\
@@ -101,7 +110,8 @@ Then, from inside the project:\n\
         /// SSH user (default: "deploy").
         #[arg(long, default_value = "deploy")]
         user: String,
-        /// SSH port (default 22; written into deploy.toml only when set).
+        /// SSH port (default 22; the typed serialization always writes the
+        /// resolved port into deploy.toml).
         #[arg(long)]
         port: Option<u16>,
         /// Absolute path to a known_hosts file (strict host-key checking).

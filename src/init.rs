@@ -9,8 +9,25 @@
 //! The scaffold refuses to clobber: `deploy.toml` (or an existing `releases/`
 //! tree) at the target is an error, and init never writes outside the target
 //! directory.
+//!
+//! The scaffolded files are TYPED TOML, not formatting strings: every file is
+//! built from the same config structs `Config::load` parses into
+//! (`ServerDef`, `SlotDef`, `TargetDef`, `VariantConfig`, ...) and serialized
+//! with `toml::to_string_pretty`, so the emitted keys match the parser's
+//! expectations exactly (`deny_unknown_fields` and all). Init validates the
+//! options and the typed payload BEFORE anything is created, and re-loads the
+//! written project through `Config::load` BEFORE reporting success — a failed
+//! init removes everything it created, so success always means the generated
+//! project is valid.
 
+use crate::config::{
+    ActivationConfig, ActivationScope, ArtifactConfig, CapacityConfig, ConflictPolicy,
+    FleetRotation, Mapping, PerServerRotation, RolloutConfig, RotationConfig, ServerDef, SlotDef,
+    TargetDef, UnitDef, VariantConfig, VerificationConfig,
+};
 use crate::error::{Error, Result};
+use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Options controlling the scaffold.
@@ -23,7 +40,8 @@ pub struct InitOptions {
     pub address: Option<String>,
     /// SSH user (default "deploy").
     pub user: String,
-    /// SSH port (default 22). Written into `deploy.toml` only when set.
+    /// SSH port (default 22). Written into `deploy.toml` (the typed
+    /// serialization always emits the resolved port).
     pub port: Option<u16>,
     /// Absolute `known_hosts` file for the server.
     pub known_hosts: Option<PathBuf>,
@@ -60,48 +78,28 @@ pub struct InitReport {
 
 /// Scaffold a fresh deploy project into `target`.
 ///
-/// Fails closed: refuses to write if `deploy.toml` or a `releases/` tree
-/// already exists at `target`, never writes outside it, and rejects an SSH
-/// `--address` that does not configure EXACTLY ONE host-identity source
-/// (`known_hosts` or `host_key_fingerprint`) — SSH trust-on-first-use is
-/// disabled, and both sources together are ambiguous.
+/// Fails closed, in three stages:
+///
+/// 1. Option validation runs FIRST, before any directory or file exists:
+///    an SSH `--address` must configure EXACTLY ONE host-identity source
+///    (`known_hosts` or `host_key_fingerprint`), `known_hosts` must be
+///    absolute, a fingerprint must be `SHA256:...`, and a `local://` address
+///    must name an absolute path (it doubles as the slot's `deploy_dir`).
+/// 2. The typed scaffold is assembled and serialized; the emitted TOML must
+///    round-trip through the strict parsers `Config::load` uses.
+/// 3. After every file is written, the project is RE-LOADED through
+///    `Config::load` (parse + validate + variant discovery). On failure the
+///    just-created tree is removed (best effort) and the load error returned,
+///    so a failed init never leaves a half-written project.
+///
+/// Refusing to clobber: `deploy.toml` or a `releases/` tree at the target is
+/// an error, and init never writes outside the target directory.
 pub fn init_project(target: &Path, opts: &InitOptions) -> Result<InitReport> {
-    let target = ensure_target_dir(target)?;
-    let name = sanitize_name(&match &opts.name {
-        Some(n) => n.clone(),
-        None => target
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "deploy".to_string()),
-    });
+    // Stage 1: option-level validation, before anything exists on disk.
+    validate_init_options(opts)?;
 
-    // An SSH address (anything that is not an explicit `local://` endpoint)
-    // needs exactly one host-identity source. `clap` already rejects both
-    // flags together; this catches the SSH-address-without-identity case
-    // before anything is written.
-    let has_known_hosts = opts.known_hosts.is_some();
-    let has_fingerprint = opts.host_key_fingerprint.is_some();
-    if let Some(a) = &opts.address
-        && !a.starts_with("local://")
-    {
-        match (has_known_hosts, has_fingerprint) {
-            (false, false) => {
-                return Err(Error::config(format!(
-                    "SSH address '{a}': exactly one of --known-hosts or \
-                     --host-key-fingerprint must be provided (trust-on-first-use is disabled)"
-                )));
-            }
-            (true, true) => {
-                return Err(Error::config(format!(
-                    "--known-hosts and --host-key-fingerprint are mutually exclusive; \
-                     configure exactly one for SSH address '{a}'"
-                )));
-            }
-            _ => {}
-        }
-    }
-
-    // Fail closed: never clobber. Both checks run before the first write.
+    // Fail closed: never clobber. Both checks run before the first write (the
+    // target may not exist yet, in which case the checks trivially pass).
     let deploy_toml_path = target.join("deploy.toml");
     if deploy_toml_path.exists() {
         return Err(Error::config(format!(
@@ -118,6 +116,15 @@ pub fn init_project(target: &Path, opts: &InitOptions) -> Result<InitReport> {
         )));
     }
 
+    // Create/canonicalize the target, then derive the scaffold inputs.
+    let (target, created_target) = ensure_target_dir(target)?;
+    let name = sanitize_name(&match &opts.name {
+        Some(n) => n.clone(),
+        None => target
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "deploy".to_string()),
+    });
     let address = match &opts.address {
         Some(a) => a.clone(),
         None => format!("local://{}", target.join(".deploy-remote").display()),
@@ -125,61 +132,38 @@ pub fn init_project(target: &Path, opts: &InitOptions) -> Result<InitReport> {
     let deploy_dir = match address.strip_prefix("local://") {
         // The local endpoint doubles as the slot's deploy location. The
         // transport is rooted at the `local://` path; the deploy_dir must stay
-        // an absolute path per validation.
+        // an absolute path per validation (enforced in stage 1).
         Some(p) => PathBuf::from(p),
         // Real server: a conventional absolute location the deployment account
         // must be able to create (documented in `deploy init --help`).
         None => PathBuf::from(format!("/srv/deploy/{name}")),
     };
 
-    let mut files = Vec::new();
-    let mut dirs = Vec::new();
-
-    write_project_file(
-        &target,
-        &deploy_toml_path,
-        &deploy_toml(&name, &address, opts, &deploy_dir),
-        &mut files,
-    )?;
-    write_project_file(
-        &target,
-        &target.join("releases/v1/standard.toml"),
-        STANDARD_VARIANT,
-        &mut files,
-    )?;
-    write_project_file(
-        &target,
-        &target.join("releases/v1/systemd.toml"),
-        SYSTEMD_VARIANT,
-        &mut files,
-    )?;
-    write_project_file(
-        &target,
-        &target.join("releases/v1/artifacts/build/output/app/hello"),
-        PLACEHOLDER,
-        &mut files,
-    )?;
-    write_project_file(
-        &target,
-        &target.join("releases/v1/artifacts/systemd/example.service"),
-        &systemd_unit_file(&deploy_dir),
-        &mut files,
-    )?;
-
-    // The `local://` endpoint: created up front so the scaffold is visibly
-    // self-contained. A push would provision it anyway.
-    let endpoint = target.join(".deploy-remote");
-    std::fs::create_dir_all(&endpoint).map_err(Error::Io)?;
-    dirs.push(PathBuf::from(".deploy-remote"));
+    // Stage 2: build the typed scaffold documents and serialize them. The
+    // serialized payloads must already round-trip through the strict schemas
+    // the loader uses, so a serialization mistake fails here — before writing.
+    let mut writes = build_docs(&name, &address, opts, &deploy_dir)?.writes;
 
     // Keep `.deploy-remote/` out of source control when the project sits in a
     // repo. Only created when the project has no `.gitignore` yet.
-    let gitignore = target.join(".gitignore");
-    if !gitignore.exists() {
-        write_project_file(&target, &gitignore, ".deploy-remote/\n", &mut files)?;
+    if !target.join(".gitignore").exists() {
+        writes.push((PathBuf::from(".gitignore"), ".deploy-remote/\n".to_string()));
     }
 
+    // Stage 3: write everything, then require the written project to load.
+    let created = match write_and_verify(&target, &writes, &[".deploy-remote"]) {
+        Ok(created) => created,
+        Err(e) => {
+            if created_target {
+                remove_tree_restoring_write(&target);
+            }
+            return Err(e);
+        }
+    };
+
+    let mut files = created.files;
     files.sort();
+    let mut dirs = vec![PathBuf::from(".deploy-remote")];
     dirs.sort();
     Ok(InitReport {
         target,
@@ -194,109 +178,310 @@ pub fn init_project(target: &Path, opts: &InitOptions) -> Result<InitReport> {
     })
 }
 
-/// Create `target` if missing and canonicalize it to an absolute path. The
-/// parent of `target` must already exist (init creates the project directory
-/// itself, not an arbitrary path chain).
-fn ensure_target_dir(target: &Path) -> Result<PathBuf> {
-    if target.exists() {
-        if !target.is_dir() {
-            return Err(Error::config(format!(
-                "init target '{}' exists and is not a directory",
-                target.display()
-            )));
+/// Reject option combinations the loader would reject, BEFORE any directory
+/// or file is created. This mirrors the rules `Config::validate` applies to
+/// the surfaces the flags expose (SSH identity, `known_hosts`, fingerprint,
+/// `local://` endpoint). The fixed template parts (capacity 0/0, rollout,
+/// variant sanity) are covered by the typed round-trip in [`build_docs`] and,
+/// authoritatively, by the post-write `Config::load`.
+fn validate_init_options(opts: &InitOptions) -> Result<()> {
+    let has_known_hosts = opts.known_hosts.is_some();
+    let has_fingerprint = opts.host_key_fingerprint.is_some();
+    if let Some(a) = &opts.address {
+        if a.starts_with("local://") {
+            // The local endpoint doubles as the slot's deploy_dir, which must
+            // be an absolute path per validation.
+            let p = a.trim_start_matches("local://");
+            if !Path::new(p).is_absolute() {
+                return Err(Error::config(format!(
+                    "local address '{a}': the path after local:// must be absolute \
+                     (it becomes the slot's deploy_dir)"
+                )));
+            }
+        } else {
+            match (has_known_hosts, has_fingerprint) {
+                (false, false) => {
+                    return Err(Error::config(format!(
+                        "SSH address '{a}': exactly one of --known-hosts or \
+                         --host-key-fingerprint must be provided (trust-on-first-use is disabled)"
+                    )));
+                }
+                (true, true) => {
+                    return Err(Error::config(format!(
+                        "--known-hosts and --host-key-fingerprint are mutually exclusive; \
+                         configure exactly one for SSH address '{a}'"
+                    )));
+                }
+                _ => {}
+            }
         }
-        return target.canonicalize().map_err(Error::Io);
     }
-    std::fs::create_dir_all(target)
-        .map_err(|e| Error::config(format!("creating init target '{}': {e}", target.display())))?;
-    target.canonicalize().map_err(Error::Io)
-}
-
-/// Write one file inside `target`, creating parent directories, and record its
-/// target-relative path in `files` for the report.
-fn write_project_file(
-    target: &Path,
-    path: &Path,
-    content: &str,
-    files: &mut Vec<PathBuf>,
-) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(Error::Io)?;
+    if let Some(kh) = &opts.known_hosts
+        && !kh.is_absolute()
+    {
+        return Err(Error::config(format!(
+            "--known-hosts must be an absolute path, got '{}'",
+            kh.display()
+        )));
     }
-    std::fs::write(path, content).map_err(Error::Io)?;
-    let rel = path.strip_prefix(target).unwrap_or(path).to_path_buf();
-    files.push(rel);
+    if let Some(fp) = &opts.host_key_fingerprint
+        && !fp.starts_with("SHA256:")
+    {
+        return Err(Error::config(format!(
+            "--host-key-fingerprint must be a SHA256:... value, got '{fp}'"
+        )));
+    }
     Ok(())
 }
 
-/// Turn a directory name into a safe TOML/application name.
-fn sanitize_name(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for c in raw.trim().chars() {
-        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-            out.push(c);
-        } else {
-            out.push('-');
-        }
-    }
-    if out.is_empty() {
-        "deploy".to_string()
-    } else {
-        out
+/// Every text file the scaffold writes, target-relative.
+struct ScaffoldDocs {
+    writes: Vec<(PathBuf, String)>,
+}
+
+/// The serialized shape of the scaffolded `deploy.toml`. It mirrors the
+/// serializable surface of `config::Config` (schema_version, application,
+/// release, servers, slots, targets; `pins` and the variant map are load-time
+/// only) so the emitted TOML round-trips through `Config::load` — which is
+/// exactly how the written project is re-validated in [`write_and_verify`].
+/// Building it from the typed config structs (never formatting strings)
+/// guarantees the emitted keys match the parser's expectations
+/// (`deny_unknown_fields` included).
+#[derive(Serialize)]
+struct ScaffoldManifest {
+    schema_version: u32,
+    application: String,
+    release: String,
+    servers: Vec<ServerDef>,
+    slots: Vec<SlotDef>,
+    targets: BTreeMap<String, TargetDef>,
+}
+
+/// Build the typed scaffold documents and serialize them with
+/// `toml::to_string_pretty`. The serialized payloads are then re-parsed with
+/// the exact strict schemas `Config::load` uses (`deny_unknown_fields`,
+/// snake_case enums, typed ports/rollout/rotation) as a round-trip backstop:
+/// the emitted TOML must parse back before anything is written.
+fn build_docs(
+    name: &str,
+    address: &str,
+    opts: &InitOptions,
+    deploy_dir: &Path,
+) -> Result<ScaffoldDocs> {
+    let manifest = ScaffoldManifest {
+        schema_version: crate::model::SCHEMA_VERSION,
+        application: name.to_string(),
+        release: "v1".to_string(),
+        servers: vec![ServerDef {
+            id: "server-01".to_string(),
+            address: address.to_string(),
+            user: opts.user.clone(),
+            port: opts.port.unwrap_or(22),
+            known_hosts: opts.known_hosts.clone(),
+            host_key_fingerprint: opts.host_key_fingerprint.clone(),
+            // Capacity is a per-server policy (shared by every deployment
+            // slot on the server), zero by default.
+            capacity: CapacityConfig {
+                reserve_bytes: 0,
+                reserve_percent: 0,
+            },
+        }],
+        slots: vec![SlotDef {
+            id: "app-1".to_string(),
+            server: "server-01".to_string(),
+            variant: "standard".to_string(),
+            deploy_dir: deploy_dir.to_path_buf(),
+        }],
+        targets: BTreeMap::from([(
+            "production".to_string(),
+            TargetDef {
+                rollout: RolloutConfig {
+                    batch_size: 1,
+                    stop_on_failure: true,
+                    failure_policy: "rollback_changed".to_string(),
+                },
+                slots: vec!["app-1".to_string()],
+                rotation: RotationConfig {
+                    per_server: PerServerRotation {
+                        keep_distinct_artifacts: 5,
+                        keep_days: 14,
+                        protect_previous: true,
+                    },
+                    fleet: FleetRotation {
+                        protect_deployments: 2,
+                    },
+                },
+            },
+        )]),
+    };
+    let standard = standard_variant();
+    let systemd = systemd_variant();
+
+    let manifest_toml = toml::to_string_pretty(&manifest)
+        .map_err(|e| Error::internal(format!("serializing scaffolded deploy.toml: {e}")))?;
+    let standard_toml = toml::to_string_pretty(&standard)
+        .map_err(|e| Error::internal(format!("serializing scaffolded standard.toml: {e}")))?;
+    let systemd_toml = toml::to_string_pretty(&systemd)
+        .map_err(|e| Error::internal(format!("serializing scaffolded systemd.toml: {e}")))?;
+
+    // Round-trip backstop: what we are about to write must parse back under
+    // the strict schemas the loader uses. Typed serialization cannot emit
+    // comments, so the educational doc lines are prepended as TOML comments —
+    // legal everywhere, ignored by the parser.
+    let manifest_toml = format!("{MANIFEST_DOC}\n{manifest_toml}");
+    let standard_toml = format!("{STANDARD_DOC}\n{standard_toml}");
+    let systemd_toml = format!("{SYSTEMD_DOC}\n{systemd_toml}");
+    toml::from_str::<crate::config::Config>(&manifest_toml).map_err(|e| {
+        Error::config(format!(
+            "scaffolded deploy.toml failed to round-trip through the strict loader: {e}"
+        ))
+    })?;
+    toml::from_str::<VariantConfig>(&standard_toml).map_err(|e| {
+        Error::config(format!(
+            "scaffolded standard.toml failed to round-trip through the strict loader: {e}"
+        ))
+    })?;
+    toml::from_str::<VariantConfig>(&systemd_toml).map_err(|e| {
+        Error::config(format!(
+            "scaffolded systemd.toml failed to round-trip through the strict loader: {e}"
+        ))
+    })?;
+
+    Ok(ScaffoldDocs {
+        writes: vec![
+            (PathBuf::from("deploy.toml"), manifest_toml),
+            (PathBuf::from("releases/v1/standard.toml"), standard_toml),
+            (PathBuf::from("releases/v1/systemd.toml"), systemd_toml),
+            (
+                PathBuf::from("releases/v1/artifacts/build/output/app/hello"),
+                PLACEHOLDER.to_string(),
+            ),
+            (
+                PathBuf::from("releases/v1/artifacts/systemd/example.service"),
+                systemd_unit_file(deploy_dir),
+            ),
+        ],
+    })
+}
+
+/// The `standard` variant: a pure file push (`adapter = "none"`), the
+/// zero-infrastructure default. The unit artifact and systemd activation live
+/// in the sibling `systemd` variant.
+fn standard_variant() -> VariantConfig {
+    VariantConfig {
+        description: Some("Standard deployment".to_string()),
+        artifact: ArtifactConfig {
+            mappings: vec![mapping("artifacts/build/output/app/", "app/")],
+        },
+        activation: ActivationConfig {
+            adapter: "none".to_string(),
+            scope: ActivationScope::User,
+            reconcile_managed_units: true,
+            units: Vec::new(),
+        },
+        verification: command_verification(),
     }
 }
+
+/// The `systemd` example variant: same artifact mappings as `standard`, but
+/// activation links, enables, and restarts a real user unit shipped as an
+/// artifact (`releases/v1/artifacts/systemd/example.service`).
+fn systemd_variant() -> VariantConfig {
+    VariantConfig {
+        description: Some("Systemd-managed deployment".to_string()),
+        artifact: ArtifactConfig {
+            mappings: vec![
+                mapping("artifacts/build/output/app/", "app/"),
+                mapping("artifacts/systemd/", "app/"),
+            ],
+        },
+        activation: ActivationConfig {
+            adapter: "systemd".to_string(),
+            scope: ActivationScope::User,
+            reconcile_managed_units: true,
+            units: vec![UnitDef {
+                name: "example.service".to_string(),
+                artifact_path: "app/example.service".to_string(),
+                enable: true,
+                restart: true,
+            }],
+        },
+        verification: command_verification(),
+    }
+}
+
+/// One artifact mapping: `from` resolves inside the release directory,
+/// `to` is artifact-relative.
+fn mapping(from: &str, to: &str) -> Mapping {
+    Mapping {
+        from: from.to_string(),
+        to: to.to_string(),
+        recursive: true,
+        conflict: ConflictPolicy::Error,
+        mode: None,
+        optional: false,
+    }
+}
+
+/// The scaffold's verification: a command health check that always succeeds,
+/// run once with a 5s timeout (the user replaces `true` with a real check).
+fn command_verification() -> VerificationConfig {
+    VerificationConfig {
+        adapter: "command".to_string(),
+        argv: vec!["true".to_string()],
+        timeout_seconds: 5,
+        attempts: 1,
+        interval_seconds: 0,
+    }
+}
+
+/// Educational doc header prepended to the serialized `deploy.toml` as TOML
+/// comments (comments are legal TOML and ignored by `Config::load`; typed
+/// serialization itself cannot emit them).
+const MANIFEST_DOC: &str = "\
+# deploy.toml — generated by `deploy init`. Schema version 1.
+# The project structure is forced (see `deploy help`):
+#   releases/<release>/            the release directory named by `release:`
+#   releases/<release>/*.toml      one file per variant (file stem = variant)
+#   releases/<release>/artifacts/  artifact sources mapped by variant files
+#
+# LOCAL-FIRST: `address` is a local:// filesystem endpoint (.deploy-remote/
+# in this project) so `deploy push production` runs with zero SSH. To deploy
+# to a real server, replace `address` with a hostname, set `user`, and add
+# EXACTLY ONE of `known_hosts` (absolute path) or `host_key_fingerprint`
+# (SHA256:...) — SSH trust-on-first-use is refused. `deploy init --help`
+# documents the full flag set.
+";
+
+/// Doc header for `releases/v1/standard.toml`.
+const STANDARD_DOC: &str = "\
+# The `standard` variant — every *.toml file directly inside the release
+# directory is a variant, named by its file stem: add a file to add a variant.
+# `adapter = \"none\"` is a pure file push: the mapped artifacts land under
+# `current/` and nothing else runs. For per-deployment service management,
+# switch the activation adapter to \"systemd\" with [[activation.units]]
+# entries — releases/v1/systemd.toml is a working example. scope = \"user\"
+# (systemctl --user) is the default; \"system\" needs an admin-installed
+# root-owned wrapper unit.
+";
+
+/// The doc for `releases/v1/systemd.toml`.
+const SYSTEMD_DOC: &str = "\
+# The `systemd` example variant — same artifact mappings as `standard`, but
+# activation links, enables, and restarts the shipped user unit
+# (releases/v1/artifacts/systemd/example.service) through the systemd
+# adapter. Artifact-controlled units work by default with scope = \"user\"
+# (systemctl --user); scope = \"system\" needs an admin-installed root-owned
+# wrapper unit. The unit file's ExecStart resolves through the deployment's
+# `current` symlink, so a successful push atomically points the running
+# service at the new generation.
+";
 
 const PLACEHOLDER: &str = "Hello from deploy!\n\
 \n\
 This placeholder is mapped into the artifact as `app/hello` by the\n\
 `standard` variant (see releases/v1/standard.toml). Add or replace files\n\
 under releases/v1/artifacts/ and run `deploy push production` again.\n";
-
-const SYSTEMD_VARIANT: &str = r#"# The `systemd` variant: same artifact mappings as `standard`, but the
-# deployment is activated through a real systemd user unit shipped as an
-# artifact (`artifacts/systemd/example.service`). Every *.toml file directly
-# inside the release directory is a variant, named by its file stem.
-description = "Systemd-managed deployment"
-
-[[artifact.mappings]]
-from = "artifacts/build/output/app/"
-to = "app/"
-recursive = true
-
-# The unit file is an artifact too: it lands at `app/example.service` in the
-# release tree, matching `artifact_path` below.
-[[artifact.mappings]]
-from = "artifacts/systemd/"
-to = "app/"
-recursive = true
-
-# Activation: what happens after `current` is atomically swapped. This is the
-# `standard` variant's commented-out systemd block made live: on push the unit
-# is linked into the user service manager, enabled, and restarted.
-# Artifact-controlled unit files are supported by default only with
-# `scope = "user"` (systemctl --user): they hold no more authority than the
-# deployment account, and a host may need one-time admin configuration to keep
-# the user manager running. `scope = "system"` instead requires an
-# admin-installed root-owned wrapper unit. See releases/v1/standard.toml.
-[activation]
-adapter = "systemd"
-scope = "user"                     # "user" (default) | "system"
-reconcile_managed_units = true     # on success, disable and remove
-                                   # formerly-managed links absent from the
-                                   # new behavior contract
-[[activation.units]]               # required: at least one unit
-name = "example.service"           # unit name to enable and restart
-artifact_path = "app/example.service"  # unit file inside the release tree
-enable = true                      # systemctl enable (default)
-restart = true                     # systemctl restart (default)
-
-[verification]
-adapter = "command"
-argv = ["true"]           # replace with a real health-check command
-timeout_seconds = 5
-attempts = 1
-interval_seconds = 0
-"#;
 
 /// The unit file shipped with the scaffold's `systemd` variant. The
 /// `ExecStart` must point at the artifact's real landing spot under the slot's
@@ -325,133 +510,168 @@ WantedBy=default.target
     )
 }
 
-const STANDARD_VARIANT: &str = r#"# The `standard` variant. Every *.toml file directly inside the release
-# directory is a variant, named by its file stem: add a file to add a variant.
-# `from` paths resolve inside the release directory, so artifact sources live
-# under `artifacts/` (the forced project structure — see `deploy help`).
-description = "Standard deployment"
-
-[[artifact.mappings]]
-from = "artifacts/build/output/app/"
-to = "app/"
-recursive = true
-
-# Activation: what happens after `current` is atomically swapped.
-#
-# `adapter = "none"` is a pure file push: the mapped artifacts land under
-# `current/` and nothing else runs. Use it when the service is managed
-# out-of-band or needs no service manager. To manage a service per
-# deployment, switch to the systemd adapter instead (commented out below):
-#
-#   [activation]
-#   adapter = "systemd"
-#   scope = "user"                     # "user" (default) | "system"
-#   reconcile_managed_units = true     # on success, disable and remove
-#                                      # formerly-managed links absent from
-#                                      # the new behavior contract; unrelated
-#                                      # units are never touched
-#   [[activation.units]]               # required: at least one unit
-#   name = "my-app.service"            # unit name to enable and restart
-#   artifact_path = "app/my-app.service"  # unit file inside the release tree
-#   enable = true                      # systemctl enable (default)
-#   restart = true                     # systemctl restart (default)
-#
-# Artifact-controlled unit files are supported by default only with
-# `scope = "user"` (systemctl --user): they hold no more authority than the
-# deployment account, and a host may need one-time admin configuration to keep
-# the user manager running. `scope = "system"` instead requires an
-# admin-installed root-owned wrapper unit: push only verifies that wrapper's
-# identity and restarts that specific unit with a narrowly scoped permission —
-# it never links artifact unit files into /etc/systemd/system.
-[activation]
-adapter = "none"
-
-[verification]
-adapter = "command"
-argv = ["true"]           # replace with a real health-check command
-timeout_seconds = 5
-attempts = 1
-interval_seconds = 0
-"#;
-
-/// The scaffolded `deploy.toml` (schema version 1), annotated to teach the
-/// forced project structure. Must pass `Config::load` validation as written.
-fn deploy_toml(name: &str, address: &str, opts: &InitOptions, deploy_dir: &Path) -> String {
-    let mut servers = String::new();
-    if let Some(port) = opts.port {
-        servers.push_str(&format!("port = {port}\n"));
+/// Create `target` if missing and canonicalize it to an absolute path. The
+/// parent of `target` must already exist (init creates the project directory
+/// itself, not an arbitrary path chain). Returns whether `target` was created
+/// by this call (used to decide how aggressively a failed init cleans up).
+fn ensure_target_dir(target: &Path) -> Result<(PathBuf, bool)> {
+    if target.exists() {
+        if !target.is_dir() {
+            return Err(Error::config(format!(
+                "init target '{}' exists and is not a directory",
+                target.display()
+            )));
+        }
+        return Ok((target.canonicalize().map_err(Error::Io)?, false));
     }
-    if let Some(kh) = &opts.known_hosts {
-        servers.push_str(&format!("known_hosts = \"{}\"\n", kh.display()));
+    std::fs::create_dir_all(target)
+        .map_err(|e| Error::config(format!("creating init target '{}': {e}", target.display())))?;
+    Ok((target.canonicalize().map_err(Error::Io)?, true))
+}
+
+/// Everything this init created inside `target`: target-relative file paths
+/// and directories that did not exist before (recorded while writing).
+#[derive(Debug, Default)]
+struct CreatedTree {
+    files: Vec<PathBuf>,
+    dirs: Vec<PathBuf>,
+}
+
+/// Write every scaffolded file, then require the generated project to load
+/// through [`Config::load`] (re-parse + re-validate + variant discovery). On a
+/// load failure the just-created tree is removed (best effort — restore
+/// owner-write, then remove, mirroring the engine's cleanup convention) and
+/// the load error is returned: a failed init never leaves a half-written
+/// project, and success is only reported once the written project is known
+/// valid. `extra_dirs` are directories created up front (the `local://`
+/// endpoint).
+fn write_and_verify(
+    target: &Path,
+    writes: &[(PathBuf, String)],
+    extra_dirs: &[&str],
+) -> Result<CreatedTree> {
+    let mut created = CreatedTree::default();
+    for d in extra_dirs {
+        let rel = PathBuf::from(d);
+        let abs = target.join(&rel);
+        let existed = abs.exists();
+        std::fs::create_dir_all(&abs).map_err(Error::Io)?;
+        if !existed {
+            created.dirs.push(rel);
+        }
     }
-    if let Some(fp) = &opts.host_key_fingerprint {
-        servers.push_str(&format!("host_key_fingerprint = \"{fp}\"\n"));
+    for (rel, content) in writes {
+        write_project_file(target, rel, content, &mut created)?;
     }
-    // Capacity is a per-server policy (shared by every deployment slot on the
-    // server), resolved from this file at preflight time — never part of the
-    // release identity.
-    servers.push_str(
-        "capacity = { reserve_bytes = 0, reserve_percent = 0 }  # keep at least this much free\n",
-    );
+    if let Err(e) = crate::config::Config::load(&target.join("deploy.toml")) {
+        cleanup_created(target, &created);
+        return Err(e);
+    }
+    Ok(created)
+}
 
-    format!(
-        r#"# deploy.toml — generated by `deploy init`. Schema version 1.
-# The project structure is forced (see `deploy help`):
-#   releases/<release>/            the release directory named by `release:`
-#   releases/<release>/*.toml      one file per variant (file stem = variant name)
-#   releases/<release>/artifacts/  artifact sources mapped by variants
-schema_version = 1
-application = "{name}"
+/// Write one file inside `target` (target-relative path), creating parent
+/// directories, and record the file plus any directory this call actually
+/// created for the report and for post-failure cleanup.
+fn write_project_file(
+    target: &Path,
+    rel: &Path,
+    content: &str,
+    created: &mut CreatedTree,
+) -> Result<()> {
+    if let Some(parent) = rel.parent() {
+        let mut cur = PathBuf::new();
+        for comp in parent.components() {
+            cur.push(comp);
+            let abs = target.join(&cur);
+            if !abs.exists() {
+                std::fs::create_dir(&abs).map_err(Error::Io)?;
+                created.dirs.push(cur.clone());
+            }
+        }
+    }
+    std::fs::write(target.join(rel), content).map_err(Error::Io)?;
+    created.files.push(rel.to_path_buf());
+    Ok(())
+}
 
-# The active release. Cut a new one by copying `releases/v1` to
-# `releases/v2`, editing the variant files, and bumping this line.
-release = "v1"
+/// Best-effort removal of everything this init created under `target`: files
+/// first, then directories deepest-first, restoring owner-write permission
+/// before removing (POSIX `remove_dir_all` needs write on every directory it
+/// enters). Never touches anything outside `target`; a pre-existing `target`
+/// is left in place. Errors are ignored — cleanup runs on an already-failing
+/// init.
+fn cleanup_created(target: &Path, created: &CreatedTree) {
+    for f in &created.files {
+        let _ = std::fs::remove_file(target.join(f));
+    }
+    let mut dirs = created.dirs.clone();
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    for d in dirs {
+        remove_tree_restoring_write(&target.join(&d));
+    }
+}
 
-# Servers are declared once at the top level; slots bind a server to a variant;
-# targets group slots by ID and carry the rollout policy.
-#
-# LOCAL-FIRST DEFAULT: `local://<abs-path>` makes `deploy push` run against a
-# local filesystem endpoint (`.deploy-remote/` in this project) with zero SSH
-# or server infrastructure. To deploy to a real server, replace `address` with
-# a hostname, set `user`, and add `known_hosts` (or `host_key_fingerprint =
-# "SHA256:...") — SSH trust-on-first-use is refused. See `deploy init --help`.
-[[servers]]
-id = "server-01"          # durable ID; never rename it (history keys on it)
-address = "{address}"
-user = "{user}"
-{servers}
-# A slot binds one server to one variant and names the absolute directory on
-# the server where deployment state (objects, generations, `current`) lives.
-[[slots]]
-id = "app-1"
-server = "server-01"
-variant = "standard"
-deploy_dir = "{deploy_dir}"
+/// Remove a directory tree, restoring owner-write permission on read-only
+/// entries inside it first, so `remove_dir_all` cannot fail with EACCES
+/// (mirrors the engine's cleanup convention). Best-effort: a missing tree is a
+/// no-op and errors are ignored.
+fn remove_tree_restoring_write(root: &Path) {
+    fn restore(dir: &Path) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                restore(&path);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(md) = entry.metadata()
+                    && md.permissions().mode() & 0o200 == 0
+                {
+                    let _ = std::fs::set_permissions(
+                        &path,
+                        std::fs::Permissions::from_mode(md.permissions().mode() | 0o200),
+                    );
+                }
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(md) = std::fs::metadata(dir)
+                && md.permissions().mode() & 0o200 == 0
+            {
+                let _ = std::fs::set_permissions(
+                    dir,
+                    std::fs::Permissions::from_mode(md.permissions().mode() | 0o200),
+                );
+            }
+        }
+    }
+    restore(root);
+    let _ = std::fs::remove_dir_all(root);
+}
 
-# Targets group slots by ID, in rollout order.
-[targets.production]
-slots = ["app-1"]
-
-[targets.production.rollout]
-batch_size = 1
-stop_on_failure = true
-failure_policy = "rollback_changed"
-
-# Retention belongs to the target: how aggressively its servers rotate.
-[targets.production.rotation.per_server]
-keep_distinct_artifacts = 5   # keep the newest 5 distinct artifacts per server
-keep_days = 14                # ...and everything activated in the last 14 days
-protect_previous = true       # never delete the artifact `current` rolls back to
-
-[targets.production.rotation.fleet]
-protect_deployments = 2       # keep each server's artifacts of the newest 2 successful deployments
-"#,
-        name = name,
-        address = address,
-        user = opts.user,
-        servers = servers,
-        deploy_dir = deploy_dir.display(),
-    )
+/// Turn a directory name into a safe TOML/application name.
+fn sanitize_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.trim().chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+            out.push(c);
+        } else {
+            out.push('-');
+        }
+    }
+    if out.is_empty() {
+        "deploy".to_string()
+    } else {
+        out
+    }
 }
 
 #[cfg(test)]
@@ -608,5 +828,190 @@ mod tests {
         // No local endpoint: the slot targets a conventional server path.
         assert!(config.slots[0].deploy_dir.is_absolute());
         assert!(config.slots[0].deploy_dir.starts_with("/srv/deploy/"));
+    }
+
+    // Every option combination that would make the generated config invalid
+    // fails BEFORE any file is written: the target directory is not even
+    // created for a fresh path.
+    #[test]
+    fn invalid_options_fail_before_writing_anything() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // SSH address with neither identity source.
+        let proj = tmp.path().join("ssh-no-identity");
+        let err = init_project(
+            &proj,
+            &InitOptions {
+                address: Some("app.example.com".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exactly one"), "got: {err}");
+        assert!(!proj.exists(), "target must not even be created");
+
+        // A relative known_hosts is rejected (Config::validate requires
+        // absolute).
+        let proj = tmp.path().join("relative-known-hosts");
+        let err = init_project(
+            &proj,
+            &InitOptions {
+                address: Some("app.example.com".to_string()),
+                known_hosts: Some(PathBuf::from("relative/known_hosts")),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("absolute"), "got: {err}");
+        assert!(!proj.exists());
+
+        // A fingerprint that is not SHA256:... is rejected.
+        let proj = tmp.path().join("bad-fingerprint");
+        let err = init_project(
+            &proj,
+            &InitOptions {
+                address: Some("app.example.com".to_string()),
+                host_key_fingerprint: Some("md5:deadbeef".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("SHA256:"), "got: {err}");
+        assert!(!proj.exists());
+
+        // A local:// address must name an absolute path (it becomes the
+        // slot's deploy_dir).
+        let proj = tmp.path().join("relative-local");
+        let err = init_project(
+            &proj,
+            &InitOptions {
+                address: Some("local://relative/path".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("absolute"), "got: {err}");
+        assert!(!proj.exists());
+    }
+
+    // The scaffold is TYPED TOML: serializing the loaded config (and each
+    // variant) again with toml::to_string_pretty must yield a project that
+    // still loads through the strict Config::load with identical semantics.
+    #[test]
+    fn scaffold_is_typed_toml_and_serializes_to_the_same_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("typed-app");
+        let report = init_project(&proj, &opts()).unwrap();
+        let config = crate::config::Config::load(&report.target.join("deploy.toml")).unwrap();
+
+        // Re-serialize every typed payload into a fresh project and load it.
+        let reserialized = tmp.path().join("reserialized-app");
+        let release_dir = reserialized.join("releases/v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        std::fs::write(
+            reserialized.join("deploy.toml"),
+            toml::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+        for name in ["standard", "systemd"] {
+            std::fs::write(
+                release_dir.join(format!("{name}.toml")),
+                toml::to_string_pretty(config.variant(name).unwrap()).unwrap(),
+            )
+            .unwrap();
+        }
+        let reloaded = crate::config::Config::load(&reserialized.join("deploy.toml"))
+            .expect("re-serialized typed payload must load");
+
+        // The re-serialized project carries the same semantics as the
+        // scaffold (same application name and release, same server/slot
+        // bindings, same rollout and variants).
+        assert_eq!(reloaded.application, "typed-app");
+        assert_eq!(reloaded.release.as_str(), "v1");
+        assert_eq!(reloaded.targets["production"].slots, vec!["app-1"]);
+        assert_eq!(reloaded.targets["production"].rollout.batch_size, 1);
+        assert_eq!(reloaded.servers[0].address, config.servers[0].address);
+        assert_eq!(reloaded.servers[0].user, config.servers[0].user);
+        assert_eq!(reloaded.servers[0].capacity, config.servers[0].capacity);
+        assert_eq!(reloaded.slots[0].deploy_dir, config.slots[0].deploy_dir);
+        assert_eq!(
+            reloaded.variant("standard").unwrap().activation.adapter,
+            "none"
+        );
+        assert_eq!(
+            reloaded.variant("systemd").unwrap().activation.adapter,
+            "systemd"
+        );
+        assert_eq!(
+            reloaded.variant("standard").unwrap().artifact.mappings[0].from,
+            "artifacts/build/output/app/"
+        );
+    }
+
+    // A post-write Config::load failure removes the just-created tree: the
+    // factored write+verify helper gets an injected bad config that parses
+    // options but fails the loader, and asserts nothing is left behind.
+    #[test]
+    fn failed_post_write_load_removes_the_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("bad-load");
+
+        // The writes look scaffold-shaped but the deploy.toml is malformed
+        // TOML, so the post-write Config::load must fail and the helper must
+        // remove every file and directory it created.
+        let writes = vec![
+            (
+                PathBuf::from("deploy.toml"),
+                "this is not toml {{{".to_string(),
+            ),
+            (
+                PathBuf::from("releases/v1/standard.toml"),
+                "adapter = \"none\"".to_string(),
+            ),
+        ];
+        let err = write_and_verify(&proj, &writes, &[".deploy-remote"]).unwrap_err();
+        assert!(
+            err.to_string().contains("parsing deploy.toml"),
+            "loader error must surface, got: {err}"
+        );
+        assert!(
+            !proj.join("deploy.toml").exists(),
+            "failed init must not leave deploy.toml"
+        );
+        assert!(
+            !proj.join("releases").exists(),
+            "failed init must not leave the release tree"
+        );
+        assert!(
+            !proj.join(".deploy-remote").exists(),
+            "failed init must not leave the local endpoint"
+        );
+        assert_eq!(
+            std::fs::read_dir(&proj).unwrap().count(),
+            0,
+            "the target must be empty after a failed init"
+        );
+    }
+
+    #[test]
+    fn init_defaults_and_ssh_flags_round_trip_through_loader() {
+        let tmp = tempfile::tempdir().unwrap();
+        // SSH + known_hosts only: exactly one identity.
+        let proj = tmp.path().join("kh-app");
+        let opts = InitOptions {
+            name: Some("kh-app".to_string()),
+            address: Some("app.example.com".to_string()),
+            user: "ops".to_string(),
+            known_hosts: Some(PathBuf::from("/etc/ssh/known_hosts")),
+            ..Default::default()
+        };
+        let report = init_project(&proj, &opts).unwrap();
+        let config = crate::config::Config::load(&report.target.join("deploy.toml")).unwrap();
+        assert_eq!(config.servers[0].user, "ops");
+        assert_eq!(
+            config.servers[0].known_hosts.as_deref(),
+            Some(Path::new("/etc/ssh/known_hosts"))
+        );
+        assert!(config.servers[0].host_key_fingerprint.is_none());
     }
 }

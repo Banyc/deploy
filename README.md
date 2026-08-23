@@ -46,9 +46,17 @@ What it generates (also visible in `deploy init --help`):
 my-app/
   deploy.toml                          # schema v1: one server, one slot, target `production`
   releases/v1/standard.toml            # the `standard` variant (mappings + policies)
+  releases/v1/systemd.toml             # example `systemd` activation variant with a real unit
   releases/v1/artifacts/build/output/app/hello   # placeholder artifact source
+  releases/v1/artifacts/systemd/example.service  # the unit shipped by the systemd variant
   .deploy-remote/                      # local deployment endpoint (git-ignored)
 ```
+
+The generated files are typed TOML serialized from the same config structs
+`Config::load` parses into — not formatted strings. `deploy init` validates
+the flags before creating anything, re-loads the written project through the
+strict loader, and removes the scaffold if that load fails: a reported
+success always means the generated project is valid.
 
 Then deploy:
 
