@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::init::{InitOptions, init_project};
 use crate::push::engine::{PushOptions, PushReport, push};
-use crate::records::{AttemptRecord, DeploymentStatus};
+use crate::records::{DeploymentAttempt, DeploymentStatus};
 use crate::remote::create_remote;
 use crate::remote::transport::Remote;
 use crate::store::local::LocalStore;
@@ -258,8 +258,14 @@ where
                 println!("no deployments for target '{target}'");
             }
             for a in &attempts {
-                let status = effective_status(&store, a)?;
-                println!("{}  {:?}  {}", a.deployment_id, status, a.attempted_at);
+                let (status, reason) = effective_status(&store, a)?;
+                match reason {
+                    Some(r) => println!(
+                        "{}  {:?}  {}  ({r})",
+                        a.deployment_id, status, a.attempted_at
+                    ),
+                    None => println!("{}  {:?}  {}", a.deployment_id, status, a.attempted_at),
+                }
             }
         }
         Command::Status { target } => {
@@ -282,27 +288,18 @@ where
 }
 
 /// Effective status of an attempt for `deploy log`: the append-only
-/// attempts.jsonl record is immutable, but reconciliation finalizes the
-/// MUTABLE status file (`deployments/<id>/status`), so the recorded status is
-/// overlaid with it. When the status file is absent or holds an unrecognized
-/// value, fall back to the recorded status.
-fn effective_status(store: &LocalStore, attempt: &AttemptRecord) -> Result<DeploymentStatus> {
-    match store.read_status(attempt.deployment_id.as_str())? {
-        Some(s) => Ok(parse_status(&s).unwrap_or_else(|| attempt.status.clone())),
-        None => Ok(attempt.status.clone()),
-    }
-}
-
-/// Parse the Debug-string form persisted by `write_status` (e.g.
-/// "Successful", "Degraded") back into a [`DeploymentStatus`].
-fn parse_status(s: &str) -> Option<DeploymentStatus> {
-    match s {
-        "Successful" => Some(DeploymentStatus::Successful),
-        "PendingCommit" => Some(DeploymentStatus::PendingCommit),
-        "FailedPreflight" => Some(DeploymentStatus::FailedPreflight),
-        "FailedRolledBack" => Some(DeploymentStatus::FailedRolledBack),
-        "Degraded" => Some(DeploymentStatus::Degraded),
-        _ => None,
+/// attempts.jsonl record is immutable, but the attempt's status lives in its
+/// per-deployment TRANSITION STREAM (`deployments/<id>/transitions.jsonl`),
+/// so the effective status is the LATEST transition (plus its reason, if
+/// any). When no transition has been recorded yet, the attempt is treated as
+/// still pending.
+fn effective_status(
+    store: &LocalStore,
+    attempt: &DeploymentAttempt,
+) -> Result<(DeploymentStatus, Option<String>)> {
+    match store.latest_transition(attempt.deployment_id.as_str())? {
+        Some(t) => Ok((t.status, t.reason)),
+        None => Ok((DeploymentStatus::PendingCommit, None)),
     }
 }
 fn print_init_report(report: &crate::init::InitReport) {
@@ -339,11 +336,10 @@ mod tests {
     use crate::model::{DeploymentId, PlacementSlotId, TargetName};
     use std::collections::BTreeMap;
 
-    fn pending_attempt(id: &str) -> AttemptRecord {
-        AttemptRecord {
+    fn pending_attempt(id: &str) -> DeploymentAttempt {
+        DeploymentAttempt {
             deployment_schema_version: 2,
             deployment_id: DeploymentId::new(id.to_string()),
-            status: DeploymentStatus::PendingCommit,
             target: TargetName::new("production".to_string()),
             slot_ids: vec![PlacementSlotId::new("p1".to_string())],
             behavior_sha256: "sha256-aa".to_string(),
@@ -355,43 +351,57 @@ mod tests {
     }
 
     #[test]
-    fn log_status_overlays_mutable_status_file() {
+    fn log_status_overlays_latest_transition() {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         let a = pending_attempt("deploy-overlay");
 
-        // No status file yet: fall back to the recorded (attempts.jsonl) status.
+        // No transition recorded yet: the attempt is treated as still pending.
         assert_eq!(
             effective_status(&store, &a).unwrap(),
-            DeploymentStatus::PendingCommit
+            (DeploymentStatus::PendingCommit, None)
         );
 
-        // Reconciliation finalizes the mutable status file: the log overlays
-        // Successful over the still-PendingCommit attempts.jsonl record.
+        // An initial transition records `InProgress`.
         store
-            .write_status(a.deployment_id.as_str(), "Successful")
+            .append_transition(
+                a.deployment_id.as_str(),
+                &DeploymentStatus::InProgress,
+                Some("attempt started"),
+            )
             .unwrap();
         assert_eq!(
             effective_status(&store, &a).unwrap(),
-            DeploymentStatus::Successful
+            (
+                DeploymentStatus::InProgress,
+                Some("attempt started".to_string())
+            )
         );
 
-        // Degraded likewise overlays the recorded status.
+        // Reconciliation finalizes with a Successful transition: the log
+        // overlays Successful over the earlier InProgress transition.
         store
-            .write_status(a.deployment_id.as_str(), "Degraded")
+            .append_transition(
+                a.deployment_id.as_str(),
+                &DeploymentStatus::Successful,
+                Some("recovery finalization"),
+            )
             .unwrap();
         assert_eq!(
             effective_status(&store, &a).unwrap(),
-            DeploymentStatus::Degraded
+            (
+                DeploymentStatus::Successful,
+                Some("recovery finalization".to_string())
+            )
         );
 
-        // An unparseable status file degrades gracefully to the recorded value.
+        // Degraded likewise overlays; the latest transition wins.
         store
-            .write_status(a.deployment_id.as_str(), "NotAStatus")
+            .append_transition(a.deployment_id.as_str(), &DeploymentStatus::Degraded, None)
             .unwrap();
         assert_eq!(
             effective_status(&store, &a).unwrap(),
-            DeploymentStatus::PendingCommit
+            (DeploymentStatus::Degraded, None)
         );
     }
     use clap::{CommandFactory, Parser};

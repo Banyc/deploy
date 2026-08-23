@@ -261,10 +261,11 @@ fn end_to_end_push_rollback() -> Result<()> {
     let attempts = store.read_attempts("production")?;
     assert_eq!(attempts.len(), 3, "three deployment attempts recorded");
 
-    // Reflog should contain the two successful fleet deployments (f0, f1); the
-    // rollback is also successful and appended, but only successful ones count.
-    let reflog = store.read_reflog("production")?;
-    assert_eq!(reflog.len(), 3, "three successful fleet snapshots");
+    // Snapshot log should contain the two successful fleet deployments (f0,
+    // f1); the rollback is also successful and appended, but only successful
+    // ones count.
+    let snapshots = store.read_snapshots("production")?;
+    assert_eq!(snapshots.len(), 3, "three successful fleet snapshots");
 
     Ok(())
 }
@@ -1840,7 +1841,8 @@ fn commit_marker_write_failure_pends_commit() -> Result<()> {
 // markers incomplete records a `PendingCommit` attempt, and the NEXT push must
 // reconcile it BEFORE its no-op path: verify membership + recorded
 // generations, create the missing markers with the original deployment ID, and
-// finalize the mutable status/reflog. A diverged attempt must be `Degraded`.
+// finalize the latest transition / snapshot log. A diverged attempt must be
+// `Degraded`.
 
 #[test]
 fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
@@ -1888,8 +1890,8 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
         "marker must be absent after the failed commit-marker push"
     );
     assert!(
-        store.read_reflog("production")?.is_empty(),
-        "no reflog entry for a pending attempt"
+        store.read_snapshots("production")?.is_empty(),
+        "no snapshot for a pending attempt"
     );
     assert!(
         store.read_last_successful("production").is_none(),
@@ -1939,17 +1941,17 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
         "marker generation must be the attempt's recorded generation"
     );
 
-    // Finalized: mutable status Successful, reflog + last-successful advanced
-    // to attempt 1; the append-only attempts record keeps the original ID.
-    let status = std::fs::read_to_string(
-        store
-            .deployment_dir(attempt1.deployment_id.as_str())
-            .join("status"),
-    )?;
-    assert_eq!(status, "Successful", "mutable status must be finalized");
-    let reflog = store.read_reflog("production")?;
-    assert_eq!(reflog.len(), 1, "exactly one successful fleet snapshot");
-    assert_eq!(reflog[0].deployment_id, attempt1.deployment_id);
+    // Finalized: latest transition Successful, snapshot + last-successful
+    // advanced to attempt 1; the append-only attempts record keeps the
+    // original ID.
+    assert_eq!(
+        store.latest_status(attempt1.deployment_id.as_str())?,
+        Some(DeploymentStatus::Successful),
+        "latest transition must be finalized"
+    );
+    let snapshots = store.read_snapshots("production")?;
+    assert_eq!(snapshots.len(), 1, "exactly one successful fleet snapshot");
+    assert_eq!(snapshots[0].deployment_id, attempt1.deployment_id);
     assert_eq!(
         store.read_last_successful("production").as_deref(),
         Some(attempt1.deployment_id.as_str())
@@ -1959,9 +1961,9 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
     assert_eq!(attempts[0].deployment_id, attempt1.deployment_id);
 
     // Push 3 with the same healthy remote: the attempt was already finalized
-    // on push 2, so reconciliation must SKIP it (eligibility is the MUTABLE
-    // status, now Successful, not the append-only attempts.jsonl record which
-    // still says PendingCommit). No re-reconciliation, no duplicate reflog
+    // on push 2, so reconciliation must SKIP it (eligibility is the LATEST
+    // transition, now Successful, not the append-only attempts.jsonl record).
+    // No re-reconciliation, no duplicate snapshot
     // entry, no ref churn, no marker rewrite.
     let marker_before = std::fs::read(&marker)?;
     let last_successful_before = store.read_last_successful("production").unwrap();
@@ -1978,13 +1980,13 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
     )?;
     assert_eq!(r3.status, None);
     assert_eq!(r3.message, "Everything up to date");
-    let reflog = store.read_reflog("production")?;
+    let snapshots = store.read_snapshots("production")?;
     assert_eq!(
-        reflog.len(),
+        snapshots.len(),
         1,
-        "reconciled attempt must remain eligible for the reflog only once"
+        "reconciled attempt must remain eligible for the snapshot log only once"
     );
-    assert_eq!(reflog[0].deployment_id, attempt1.deployment_id);
+    assert_eq!(snapshots[0].deployment_id, attempt1.deployment_id);
     assert_eq!(
         store.read_last_successful("production").as_deref(),
         Some(last_successful_before.as_str()),
@@ -1995,14 +1997,10 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
         marker_before,
         "marker must be untouched by a redundant push"
     );
-    let status = std::fs::read_to_string(
-        store
-            .deployment_dir(attempt1.deployment_id.as_str())
-            .join("status"),
-    )?;
     assert_eq!(
-        status, "Successful",
-        "mutable status must remain Successful after the redundant push"
+        store.latest_status(attempt1.deployment_id.as_str())?,
+        Some(DeploymentStatus::Successful),
+        "latest transition must remain Successful after the redundant push"
     );
     let attempts = store.read_attempts("production")?;
     assert_eq!(attempts.len(), 1, "no new attempt on a redundant push");
@@ -2065,7 +2063,7 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
 
     // Push 2 with a healthy remote: the recorded generation no longer matches
     // (current points at the foreign generation), so recovery must finalize
-    // attempt 1 as Degraded (no markers, no reflog entry) and the push itself
+    // attempt 1 as Degraded (no markers, no snapshot entry) and the push itself
     // proceeds as a normal deployment of v2.
     let rf2 = remotes_base.clone();
     let clean_factory = move |s: &deploy::config::ServerDef,
@@ -2091,26 +2089,26 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
         "the push itself proceeds after degrading the diverged pending attempt"
     );
 
-    let status = std::fs::read_to_string(
-        store
-            .deployment_dir(attempt1.deployment_id.as_str())
-            .join("status"),
-    )?;
     assert_eq!(
-        status, "Degraded",
+        store.latest_status(attempt1.deployment_id.as_str())?,
+        Some(DeploymentStatus::Degraded),
         "a diverged pending attempt must finalize as Degraded"
     );
     assert!(
         !marker.exists(),
         "no markers may be written for a degraded attempt"
     );
-    let reflog = store.read_reflog("production")?;
-    assert_eq!(reflog.len(), 1, "only the new push is in the reflog");
-    assert_ne!(
-        reflog[0].deployment_id, attempt1.deployment_id,
-        "the diverged attempt must never enter the reflog"
+    let snapshots = store.read_snapshots("production")?;
+    assert_eq!(
+        snapshots.len(),
+        1,
+        "only the new push is in the snapshot log"
     );
-    assert_eq!(reflog[0].deployment_id, attempt2.deployment_id);
+    assert_ne!(
+        snapshots[0].deployment_id, attempt1.deployment_id,
+        "the diverged attempt must never enter the snapshot log"
+    );
+    assert_eq!(snapshots[0].deployment_id, attempt2.deployment_id);
     assert_eq!(
         store.read_last_successful("production").as_deref(),
         Some(attempt2.deployment_id.as_str())
@@ -2166,16 +2164,15 @@ fn conflicting_marker_on_main_push_is_degraded_not_pending() -> Result<()> {
         r.status
     );
     let attempt = r.attempt.expect("attempt recorded");
-    let status = std::fs::read_to_string(
-        store
-            .deployment_dir(attempt.deployment_id.as_str())
-            .join("status"),
-    )?;
-    assert_eq!(status, "Degraded", "mutable status must be Degraded");
     assert_eq!(
-        store.read_reflog("production")?.len(),
+        store.latest_status(attempt.deployment_id.as_str())?,
+        Some(DeploymentStatus::Degraded),
+        "latest transition must be Degraded"
+    );
+    assert_eq!(
+        store.read_snapshots("production")?.len(),
         0,
-        "no reflog entry for a conflicted attempt"
+        "no snapshot for a conflicted attempt"
     );
     assert!(
         store.read_last_successful("production").is_none(),
@@ -2234,7 +2231,7 @@ fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result
         .join("server-01/state/commits")
         .join(format!("{}.json", attempt1.deployment_id.as_str()));
     assert!(!marker.exists(), "marker must be absent after push 1");
-    assert_eq!(store.read_reflog("production")?.len(), 0);
+    assert_eq!(store.read_snapshots("production")?.len(), 0);
 
     // Before push 2, install a CONFLICTING marker for attempt 1's deployment
     // id: a concurrent controller recorded a different fact (foreign
@@ -2272,13 +2269,9 @@ fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result
         "reconciliation must not fabricate a new attempt for an up-to-date push"
     );
 
-    let status = std::fs::read_to_string(
-        store
-            .deployment_dir(attempt1.deployment_id.as_str())
-            .join("status"),
-    )?;
     assert_eq!(
-        status, "Degraded",
+        store.latest_status(attempt1.deployment_id.as_str())?,
+        Some(DeploymentStatus::Degraded),
         "an integrity-conflicted pending attempt must finalize as Degraded"
     );
     assert_eq!(
@@ -2287,13 +2280,13 @@ fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result
         "the conflicting marker must be left untouched"
     );
     assert_eq!(
-        store.read_reflog("production")?.len(),
+        store.read_snapshots("production")?.len(),
         0,
-        "a degraded attempt never enters the reflog"
+        "a degraded attempt never enters the snapshot log"
     );
 
     // Push 3: the conflict is permanent, so a retry must NOT flip the attempt
-    // to Successful or grow the reflog — it stays Degraded.
+    // to Successful or grow the snapshot log — it stays Degraded.
     let rf3 = remotes_base.clone();
     let clean_factory3 = move |s: &deploy::config::ServerDef,
                                _slot: &deploy::config::SlotDef|
@@ -2312,21 +2305,20 @@ fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result
         },
     )?;
     assert_eq!(r3.status, None, "push 3 is still an up-to-date no-op");
-    let status = std::fs::read_to_string(
-        store
-            .deployment_dir(attempt1.deployment_id.as_str())
-            .join("status"),
-    )?;
-    assert_eq!(status, "Degraded", "attempt 1 stays Degraded on retry");
+    assert_eq!(
+        store.latest_status(attempt1.deployment_id.as_str())?,
+        Some(DeploymentStatus::Degraded),
+        "attempt 1 stays Degraded on retry"
+    );
     assert_eq!(
         std::fs::read(&marker)?,
         conflicting_bytes,
         "the conflicting marker stays untouched"
     );
     assert_eq!(
-        store.read_reflog("production")?.len(),
+        store.read_snapshots("production")?.len(),
         0,
-        "reflog never grows for a conflicted attempt"
+        "snapshot log never grows for a conflicted attempt"
     );
     Ok(())
 }

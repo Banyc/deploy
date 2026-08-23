@@ -178,20 +178,28 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     let hello = String::from_utf8(endpoint.read(&tree_path.join("app/hello"))?).unwrap();
     assert_eq!(hello, PLACEHOLDER, "placeholder content round-trips");
 
-    // 7. History, reflog, and observed state back `deploy log` / `deploy status`.
+    // 7. History, snapshot log, and observed state back `deploy log` /
+    // `deploy status`.
     let attempts = store.read_attempts("production")?;
     assert_eq!(attempts.len(), 1, "one attempt in `deploy log production`");
     assert_eq!(
         attempts[0].deployment_id, attempt.deployment_id,
         "attempt is durable"
     );
-    let reflog = store.read_reflog("production")?;
+    // The latest transition is the attempt's status (Successful after a full
+    // push), carried in `deployments/<id>/transitions.jsonl`.
     assert_eq!(
-        reflog.len(),
+        store.latest_status(attempt.deployment_id.as_str())?,
+        Some(DeploymentStatus::Successful),
+        "latest transition must be Successful"
+    );
+    let snapshots = store.read_snapshots("production")?;
+    assert_eq!(
+        snapshots.len(),
         1,
         "one successful fleet snapshot (production@f0)"
     );
-    assert_eq!(reflog[0].index, 0);
+    assert_eq!(snapshots[0].index, 0);
 
     let observed = store.read_observed("production")?;
     let obs = &observed.slots[&deploy::model::PlacementSlotId::new("app-1")];

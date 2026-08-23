@@ -3,7 +3,7 @@
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::history::{PushRef, resolve_fleet_ref};
+use crate::history::{PushRef, resolve_snapshot};
 use crate::model::{
     ArtifactRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, TreeDigest, VariantName,
 };
@@ -58,7 +58,7 @@ pub fn plan_assignments(
         PushRef::Fleet {
             target: ft, index, ..
         } => {
-            let entry = resolve_fleet_ref(store, ft, *index)?;
+            let entry = resolve_snapshot(store, ft, *index)?;
             let recorded: BTreeSet<String> =
                 entry.slots.keys().map(|s| s.as_str().to_string()).collect();
             let current: BTreeSet<String> =

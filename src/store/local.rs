@@ -4,15 +4,20 @@
 //! <base>/
 //!   objects/sha256/<digest>/root/ , tree.json
 //!   releases/<release-id>/mapping.toml, behavior.json, release.json
-//!   targets/<target>/observed.json, attempts.jsonl, refs/last-successful, refs/reflog.jsonl
+//!   targets/<target>/observed.json, attempts.jsonl, refs/last-successful, refs/snapshots.jsonl
 //!   servers/<server-id>.json
-//!   deployments/<deployment-id>/plan.json, results.json, status
+//!   deployments/<deployment-id>/plan.json, results.json, transitions.jsonl
 //! ```
 
 use crate::error::{Error, Result};
 use crate::layout;
-use crate::model::{BehaviorContract, ReleaseId, ReleaseRecord, TreeDigest, TreeMetadata};
-use crate::records::{AttemptRecord, DeploymentResults, ObservedTarget, ReflogEntry, ServerState};
+use crate::model::{
+    BehaviorContract, DeploymentId, ReleaseId, ReleaseRecord, TreeDigest, TreeMetadata,
+};
+use crate::records::{
+    DeploymentAttempt, DeploymentResults, DeploymentSnapshot, DeploymentStatus,
+    DeploymentTransition, ObservedTarget, ServerState,
+};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -352,7 +357,7 @@ impl LocalStore {
         }
     }
 
-    pub fn append_attempt(&self, target: &str, attempt: &AttemptRecord) -> Result<()> {
+    pub fn append_attempt(&self, target: &str, attempt: &DeploymentAttempt) -> Result<()> {
         let dir = self.target_dir(target);
         ensure_private_dir(&dir)?;
         let p = dir.join("attempts.jsonl");
@@ -369,7 +374,7 @@ impl LocalStore {
         set_private(&p)
     }
 
-    pub fn read_attempts(&self, target: &str) -> Result<Vec<AttemptRecord>> {
+    pub fn read_attempts(&self, target: &str) -> Result<Vec<DeploymentAttempt>> {
         let p = self.target_dir(target).join("attempts.jsonl");
         if !p.exists() {
             return Ok(vec![]);
@@ -382,14 +387,14 @@ impl LocalStore {
                 continue;
             }
             out.push(
-                serde_json::from_str::<AttemptRecord>(line)
+                serde_json::from_str::<DeploymentAttempt>(line)
                     .map_err(|e| Error::store(format!("parse attempt: {e}")))?,
             );
         }
         Ok(out)
     }
 
-    // ---- refs -------------------------------------------------------------
+    // ---- rollback snapshots (refs) --------------------------------------
 
     fn refs_dir(&self, target: &str) -> PathBuf {
         self.target_dir(target).join("refs")
@@ -417,47 +422,50 @@ impl LocalStore {
             .filter(|s| !s.trim().is_empty())
     }
 
-    pub fn append_reflog(&self, target: &str, entry: &ReflogEntry) -> Result<()> {
+    /// Append a terminal successful fleet snapshot (`refs/snapshots.jsonl`),
+    /// one JSON line per entry. Snapshots are the immutable rollback source
+    /// (`<target>@fN`); only successful deployments produce them.
+    pub fn append_snapshot(&self, target: &str, entry: &DeploymentSnapshot) -> Result<()> {
         #[cfg(test)]
         if test_faults::consume(
-            &test_faults::FAIL_APPEND_REFLOG,
+            &test_faults::FAIL_APPEND_SNAPSHOT,
             entry.deployment_id.as_str(),
         ) {
             return Err(Error::store(
-                "test fault: append_reflog forced to fail once",
+                "test fault: append_snapshot forced to fail once",
             ));
         }
         let dir = self.refs_dir(target);
         ensure_private_dir(&dir)?;
-        let p = dir.join("reflog.jsonl");
+        let p = dir.join("snapshots.jsonl");
         let mut f = if p.exists() {
             std::fs::OpenOptions::new().append(true).open(&p)
         } else {
             std::fs::File::create(&p)
         }
-        .map_err(|e| Error::store(format!("open reflog: {e}")))?;
+        .map_err(|e| Error::store(format!("open snapshots: {e}")))?;
         let line = serde_json::to_string(entry)
-            .map_err(|e| Error::store(format!("serialize reflog: {e}")))?;
-        writeln!(f, "{line}").map_err(|e| Error::store(format!("write reflog: {e}")))?;
+            .map_err(|e| Error::store(format!("serialize snapshot: {e}")))?;
+        writeln!(f, "{line}").map_err(|e| Error::store(format!("write snapshot: {e}")))?;
         drop(f);
         set_private(&p)
     }
 
-    pub fn read_reflog(&self, target: &str) -> Result<Vec<ReflogEntry>> {
-        let p = self.refs_dir(target).join("reflog.jsonl");
+    pub fn read_snapshots(&self, target: &str) -> Result<Vec<DeploymentSnapshot>> {
+        let p = self.refs_dir(target).join("snapshots.jsonl");
         if !p.exists() {
             return Ok(vec![]);
         }
-        let text =
-            std::fs::read_to_string(&p).map_err(|e| Error::store(format!("read reflog: {e}")))?;
+        let text = std::fs::read_to_string(&p)
+            .map_err(|e| Error::store(format!("read snapshots: {e}")))?;
         let mut out = Vec::new();
         for line in text.lines() {
             if line.trim().is_empty() {
                 continue;
             }
             out.push(
-                serde_json::from_str::<ReflogEntry>(line)
-                    .map_err(|e| Error::store(format!("parse reflog: {e}")))?,
+                serde_json::from_str::<DeploymentSnapshot>(line)
+                    .map_err(|e| Error::store(format!("parse snapshot: {e}")))?,
             );
         }
         Ok(out)
@@ -519,29 +527,77 @@ impl LocalStore {
         read_json(&p)
     }
 
-    pub fn write_status(&self, id: &str, status: &str) -> Result<()> {
+    /// Append one status event to the deployment's append-only transition
+    /// stream (`deployments/<id>/transitions.jsonl`). The current status of a
+    /// deployment is the LATEST transition; this replaces the old single
+    /// mutable `deployments/<id>/status` file. `reason` carries optional
+    /// human context (e.g. "recovery finalization", "metadata phase
+    /// interrupted").
+    pub fn append_transition(
+        &self,
+        id: &str,
+        status: &DeploymentStatus,
+        reason: Option<&str>,
+    ) -> Result<()> {
         #[cfg(test)]
-        if test_faults::consume(&test_faults::FAIL_WRITE_STATUS, id) {
-            return Err(Error::store("test fault: write_status forced to fail once"));
+        if test_faults::consume(&test_faults::FAIL_APPEND_TRANSITION, id) {
+            return Err(Error::store(
+                "test fault: append_transition forced to fail once",
+            ));
         }
         let dir = self.deployment_dir(id);
         ensure_private_dir(&dir)?;
-        let p = dir.join("status");
-        std::fs::write(&p, status).map_err(|e| Error::store(format!("write status: {e}")))?;
+        let p = dir.join("transitions.jsonl");
+        let transition = DeploymentTransition {
+            deployment_id: DeploymentId::new(id.to_string()),
+            status: status.clone(),
+            recorded_at: crate::remote::helper::now_rfc3339(),
+            reason: reason.map(str::to_string),
+        };
+        let mut f = if p.exists() {
+            std::fs::OpenOptions::new().append(true).open(&p)
+        } else {
+            std::fs::File::create(&p)
+        }
+        .map_err(|e| Error::store(format!("open transitions: {e}")))?;
+        let line = serde_json::to_string(&transition)
+            .map_err(|e| Error::store(format!("serialize transition: {e}")))?;
+        writeln!(f, "{line}").map_err(|e| Error::store(format!("write transition: {e}")))?;
+        drop(f);
         set_private(&p)
     }
 
-    /// Read the mutable status file for a deployment. `None` when no status
-    /// file exists yet (e.g. an attempt was just recorded but not finalized);
-    /// the recorded Debug string otherwise ("Successful", "Degraded", ...).
-    pub fn read_status(&self, id: &str) -> Result<Option<String>> {
-        let p = self.deployment_dir(id).join("status");
+    /// Read the full append-only transition stream for a deployment.
+    pub fn read_transitions(&self, id: &str) -> Result<Vec<DeploymentTransition>> {
+        let p = self.deployment_dir(id).join("transitions.jsonl");
         if !p.exists() {
-            return Ok(None);
+            return Ok(vec![]);
         }
-        std::fs::read_to_string(&p)
-            .map(Some)
-            .map_err(|e| Error::store(format!("read status: {e}")))
+        let text = std::fs::read_to_string(&p)
+            .map_err(|e| Error::store(format!("read transitions: {e}")))?;
+        let mut out = Vec::new();
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            out.push(
+                serde_json::from_str::<DeploymentTransition>(line)
+                    .map_err(|e| Error::store(format!("parse transition: {e}")))?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// The latest transition of a deployment, or `None` when no transition
+    /// has been recorded yet.
+    pub fn latest_transition(&self, id: &str) -> Result<Option<DeploymentTransition>> {
+        Ok(self.read_transitions(id)?.pop())
+    }
+
+    /// The current status of a deployment: the status of its LATEST
+    /// transition, or `None` when no transition has been recorded yet.
+    pub fn latest_status(&self, id: &str) -> Result<Option<DeploymentStatus>> {
+        Ok(self.latest_transition(id)?.map(|t| t.status))
     }
 }
 
@@ -561,9 +617,9 @@ pub(crate) mod test_faults {
         *fault.lock().unwrap() = Some(deployment_id.to_string());
     }
 
-    /// Arm the next `append_reflog` call for `deployment_id` to fail once.
-    pub(crate) fn arm_append_reflog(deployment_id: &str) {
-        arm(&FAIL_APPEND_REFLOG, deployment_id);
+    /// Arm the next `append_snapshot` call for `deployment_id` to fail once.
+    pub(crate) fn arm_append_snapshot(deployment_id: &str) {
+        arm(&FAIL_APPEND_SNAPSHOT, deployment_id);
     }
 
     /// Arm the next `write_last_successful` call for `deployment_id` to fail once.
@@ -571,9 +627,9 @@ pub(crate) mod test_faults {
         arm(&FAIL_WRITE_LAST_SUCCESSFUL, deployment_id);
     }
 
-    /// Arm the next `write_status` call for `deployment_id` to fail once.
-    pub(crate) fn arm_write_status(deployment_id: &str) {
-        arm(&FAIL_WRITE_STATUS, deployment_id);
+    /// Arm the next `append_transition` call for `deployment_id` to fail once.
+    pub(crate) fn arm_append_transition(deployment_id: &str) {
+        arm(&FAIL_APPEND_TRANSITION, deployment_id);
     }
 
     /// Consume the one-shot fault for `deployment_id` if armed. Returns `true`
@@ -588,9 +644,9 @@ pub(crate) mod test_faults {
         }
     }
 
-    pub(crate) static FAIL_APPEND_REFLOG: Mutex<Option<String>> = Mutex::new(None);
+    pub(crate) static FAIL_APPEND_SNAPSHOT: Mutex<Option<String>> = Mutex::new(None);
     pub(crate) static FAIL_WRITE_LAST_SUCCESSFUL: Mutex<Option<String>> = Mutex::new(None);
-    pub(crate) static FAIL_WRITE_STATUS: Mutex<Option<String>> = Mutex::new(None);
+    pub(crate) static FAIL_APPEND_TRANSITION: Mutex<Option<String>> = Mutex::new(None);
 }
 
 /// Sanitize a name for use as a directory/file component.
@@ -706,5 +762,56 @@ mod tests {
             slots: Default::default(),
         };
         assert!(store.write_results("deploy-1", &conflicting).is_err());
+    }
+
+    /// The transition stream is append-only JSONL: every appended event is
+    /// preserved in order, the LATEST event is the deployment's current
+    /// status, and the `reason` is carried (or omitted) as recorded.
+    #[test]
+    fn transition_stream_is_append_only_and_latest_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let id = "deploy-transitions";
+
+        assert_eq!(store.latest_status(id).unwrap(), None, "no transitions yet");
+        assert_eq!(store.read_transitions(id).unwrap().len(), 0);
+
+        store
+            .append_transition(id, &DeploymentStatus::InProgress, Some("attempt started"))
+            .unwrap();
+        store
+            .append_transition(id, &DeploymentStatus::Successful, None)
+            .unwrap();
+
+        // Append-only: both events survive, in order.
+        let transitions = store.read_transitions(id).unwrap();
+        assert_eq!(transitions.len(), 2);
+        assert_eq!(transitions[0].status, DeploymentStatus::InProgress);
+        assert_eq!(transitions[0].reason.as_deref(), Some("attempt started"));
+        assert_eq!(transitions[1].status, DeploymentStatus::Successful);
+        assert_eq!(transitions[1].reason, None);
+        assert_eq!(
+            transitions[0].deployment_id,
+            DeploymentId::new(id.to_string())
+        );
+        assert!(!transitions[1].recorded_at.is_empty());
+
+        // Latest transition wins: an append overlays, never rewrites history.
+        assert_eq!(
+            store.latest_status(id).unwrap(),
+            Some(DeploymentStatus::Successful)
+        );
+        store
+            .append_transition(
+                id,
+                &DeploymentStatus::Degraded,
+                Some("marker integrity conflict"),
+            )
+            .unwrap();
+        assert_eq!(
+            store.latest_status(id).unwrap(),
+            Some(DeploymentStatus::Degraded)
+        );
+        assert_eq!(store.read_transitions(id).unwrap().len(), 3);
     }
 }

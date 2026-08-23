@@ -287,7 +287,7 @@ The local store contains the exact immutable trees sent to servers, immutable re
       attempts.jsonl
       refs/
         last-successful
-        reflog.jsonl
+        snapshots.jsonl
   servers/
     server-01.json
     server-02.json
@@ -296,8 +296,16 @@ The local store contains the exact immutable trees sent to servers, immutable re
     <deployment-id>/
       plan.json
       results.json
-      status
+      transitions.jsonl
 ```
+
+The records model splits deployment identity from mutable status:
+`attempts.jsonl` records the immutable attempt (intent + assignments, no
+status); each deployment's status is an append-only transition stream
+(`deployments/<id>/transitions.jsonl`) whose LATEST entry is the deployment's
+current status; and successful deployments additionally produce a rollback
+snapshot (`refs/snapshots.jsonl` + `refs/last-successful`), exposed as
+`<target>@fN`.
 
 Tree metadata is identity-neutral. For example,
 
@@ -402,11 +410,11 @@ Every datatype below carries an immutability semantic. For each one: what must n
    *Guarantee*: the marker is write-once: `helper.write_commit_marker` installs it by exclusive create, and if a marker already exists it must match byte-for-byte (the payload is deterministic in the deployment ID, generation, and participating placement-slot set) or the rewrite fails integrity. A retried or concurrent commit can therefore never alter a recorded fact; a `pending_commit` recovery reusing the original deployment ID either creates the missing marker or confirms the recorded one byte-for-byte.
 6. **Deployment plan and results** — local `deployments/<id>/plan.json`, `results.json`.
    *Semantic*: what an attempt intended and produced is fixed once recorded.
-   *Guarantee*: written once per unique deployment ID through `write_atomic_cas`; a same-ID conflicting rewrite fails instead of silently rewriting history (`store.write_plan`, `store.write_results`). The `status` file in the same directory is deliberately mutable — it is a progress marker, not history.
-7. **Attempt history and reflog** — `targets/<target>/attempts.jsonl`, `refs/reflog.jsonl`.
-   *Semantic*: recorded attempts and successful fleet snapshots are append-only facts; entries are never edited or reordered.
-   *Guarantee*: append-mode-only writers under the target lock (`store.append_attempt`, `store.append_reflog`); reflog indices are assigned monotonically from the current entry count.
-Mutable by design (excluded from these guarantees): observed target state, per-server records, the `last-successful` ref, incoming staging areas, transaction records, and all declarative configuration (`deploy.toml`, variant files), which are versioned through the release identity rather than frozen.
+   *Guarantee*: written once per unique deployment ID through `write_atomic_cas`; a same-ID conflicting rewrite fails instead of silently rewriting history (`store.write_plan`, `store.write_results`). The deployment's status is not part of these immutable records: it is an append-only transition stream (`deployments/<id>/transitions.jsonl`), deliberately NOT a mutable progress marker file, so status history is never rewritten.
+7. **Attempt history and rollback snapshots** — `targets/<target>/attempts.jsonl`, `refs/snapshots.jsonl`.
+   *Semantic*: recorded attempts (immutable intent, no status) and successful fleet snapshots are append-only facts; entries are never edited or reordered.
+   *Guarantee*: append-mode-only writers under the target lock (`store.append_attempt`, `store.append_snapshot`); snapshot indices are assigned monotonically from the current entry count. Each deployment's status is a per-deployment append-only transition stream (`store.append_transition`), one event per line; the LATEST transition is the deployment's current status (`store.latest_status`).
+Mutable by design (excluded from these guarantees): observed target state, per-server records, the `last-successful` ref, the per-deployment transition stream, incoming staging areas, transaction records, and all declarative configuration (`deploy.toml`, variant files), which are versioned through the release identity rather than frozen.
 
 Publishing renames a verified incoming directory into `objects/` on the same filesystem. A generation binds a deployment ID, an artifact (release ID + `variant` + tree digest) for a placement slot, the behavior snapshot, and the prior generation. After its files and a durable transaction record have been written and synced, activation creates a temporary symlink beside `current`, atomically renames it over `current`, and syncs the parent directory. This single durable pointer replacement is the per-slot commit point.
 
@@ -430,9 +438,9 @@ verification.
 11. On per-server activation or verification failure, atomically restore the prior generation, reconcile the prior activation contract, verify the restored service, and record both the failure and compensation result. On a first deployment with no prior generation, compensation removes `current` and reverses only adapter resources created by that attempt.
 12. If `stop_on_failure` is enabled, do not start another batch after any failure.
 13. Under the default `failure_policy: rollback_changed`, compensate every server already advanced by this deployment. Compensation uses a compare-and-swap and restores a server only if `current` still names the generation created by this attempt. If all compensation succeeds, mark the attempt `failed_rolled_back`; otherwise mark it `degraded` and retain the actual mixed per-server state. An optional `leave_changed` policy may retain successful advances deliberately; any attempt with failures under that policy is `degraded`.
-14. Record every attempt, not just successful attempts, in `attempts.jsonl` and refresh `observed.json` from the actual slot generations.
-15. After every slot's server verifies, write an idempotent, write-once fleet-commit marker under each participating server's mutation lock (exclusive create; an existing marker must match byte-for-byte). The marker carries the deployment ID, the generation, and the full placement-slot set of the fleet commit. If this metadata phase is interrupted by a transient failure, mark the attempt `pending_commit`; the next push reconciles it before its own no-op check: it loads the pending attempts (oldest first), verifies that every recorded participant slot still belongs to the target and that each slot's current generation still equals the generation the attempt recorded, and only then writes the missing markers (under each server's mutation lock, with the original deployment ID) and finalizes the attempt as `successful` — mutable status, reflog entry, and `refs/last-successful`. The verification is read-only; recovery never reactivates or restarts healthy servers. Any membership or generation mismatch changes the attempt to `degraded` (no reflog entry). An existing marker whose content differs (an integrity conflict — a concurrent controller recorded a different fact, or the remote state diverged) is likewise NOT transient: the conflicting marker is left untouched and the attempt is finalized `degraded` (mutable status only, no reflog entry), never stranded `pending_commit` forever. Only transient failures — lock acquisition, status reads, or transport-level marker writes — leave the attempt `pending_commit` for a later retry rather than falsely reporting `successful` or `degraded`.
-16. Only an attempt whose fleet-commit markers are complete becomes `successful`, advances `refs/last-successful`, and appends to its successful-deployment reflog.
+14. Record every attempt, not just successful attempts, in `attempts.jsonl` (the immutable identity — intent, membership, and assignments — carrying no status) and refresh `observed.json` from the actual slot generations. The attempt's status is recorded as an append-only transition on the deployment (`deployments/<id>/transitions.jsonl`): an initial `in_progress` transition, then the final status transition (with a reason when the metadata phase demoted it).
+15. After every slot's server verifies, write an idempotent, write-once fleet-commit marker under each participating server's mutation lock (exclusive create; an existing marker must match byte-for-byte). The marker carries the deployment ID, the generation, and the full placement-slot set of the fleet commit. If this metadata phase is interrupted by a transient failure, mark the attempt `pending_commit`; the next push reconciles it before its own no-op check: it loads the pending attempts (oldest first), verifies that every recorded participant slot still belongs to the target and that each slot's current generation still equals the generation the attempt recorded, and only then writes the missing markers (under each server's mutation lock, with the original deployment ID) and finalizes the attempt as `successful` — a `Successful` transition, a snapshot entry, and `refs/last-successful`, in that replay-safe order (snapshot + ref FIRST, `Successful` transition LAST, so a crash mid-finalization leaves the attempt's latest transition still `pending_commit` and therefore re-eligible). The verification is read-only; recovery never reactivates or restarts healthy servers. Any membership or generation mismatch changes the attempt to `degraded` (no snapshot entry). An existing marker whose content differs (an integrity conflict — a concurrent controller recorded a different fact, or the remote state diverged) is likewise NOT transient: the conflicting marker is left untouched and the attempt is finalized `degraded` (transition only, no snapshot entry), never stranded `pending_commit` forever. Only transient failures — lock acquisition, status reads, or transport-level marker writes — leave the attempt `pending_commit` for a later retry rather than falsely reporting `successful` or `degraded`.
+16. Only an attempt whose fleet-commit markers are complete becomes `successful`, advances `refs/last-successful`, and appends to its successful-deployment snapshot log.
 17. Apply rotation under each server's mutation lock using the protection set defined below.
 
 The tool never claims fleet-wide atomicity. It reports `successful`, `pending_commit`, `failed_preflight`, `failed_rolled_back`, or `degraded`, including the actual generation on every server. An attempt that fails before any `current` change is `failed_preflight`. A later push always reconciles first and can finish an incomplete fleet commit (see step 15) or repair an incomplete target.
@@ -445,16 +453,12 @@ content never suppresses required remote repair.
 `--dry-run` materializes and inspects local content and performs read-only remote status queries in disposable staging. It does not publish local objects, recover remote transactions, upload, publish remotely, activate, execute application verification, write history, or rotate. Instead, it reports any recovery that a real push would have to perform.
 
 ## Fleet history and rollback
-Every deployment attempt records its target snapshot, behavior contract, pre-push state, desired state, and actual result. A successful example is:
-
-## Fleet history and rollback
-Every deployment attempt records its target snapshot, behavior contract, pre-push state, desired state, and actual result. Assignment relationships are expressed through the canonical model types (`ArtifactRef` = release+variant+tree, `GenerationRef` = generation + placement-slot assignment); every per-location map is keyed by the deployment slot ID. A successful example (attempt record schema version 2) is:
+Every deployment attempt records its immutable intent: target snapshot, behavior contract, pre-push state, desired state, and actual result — carrying NO status (the status lives in the deployment's transition stream). Assignment relationships are expressed through the canonical model types (`ArtifactRef` = release+variant+tree, `GenerationRef` = generation + placement-slot assignment); every per-location map is keyed by the deployment slot ID. A successful example (attempt record schema version 2) is:
 
 ```json
 {
   "deployment_schema_version": 2,
   "deployment_id": "deploy-20260821T102000Z",
-  "status": "successful",
   "target": "production",
   "slot_ids": ["p1", "p2", "p3"],
   "behavior_sha256": "03df...",
@@ -496,7 +500,16 @@ slot was never deployed before. Schema version 1 keyed these maps by server ID
 and stored the artifact triple as flat fields; version 2 rekeys to placement
 slots and nests the artifact.)
 
-The target reflog contains only fully successful fleet snapshots and exposes them as `production@f0`, `production@f1`, and so on. Failed and degraded attempts remain visible through `deploy log production` and `attempts.jsonl`, but are not valid rollback sources.
+The deployment's status is an append-only transition stream
+(`deployments/<id>/transitions.jsonl`), one event per line; the current status
+is the LATEST transition. For example:
+
+```jsonl
+{"deployment_id": "deploy-20260821T102000Z", "status": "in_progress", "recorded_at": "2026-08-21T10:20:00Z", "reason": "attempt started"}
+{"deployment_id": "deploy-20260821T102000Z", "status": "successful", "recorded_at": "2026-08-21T10:25:00Z"}
+```
+
+The target snapshot log contains only fully successful fleet snapshots and exposes them as `production@f0`, `production@f1`, and so on. Failed and degraded attempts remain visible through `deploy log production` and `attempts.jsonl`, but are not valid rollback sources.
 
 A fleet commit is authoritative only when the same deployment ID and placement-slot set are committed on every member. This lets a fresh or repaired local store reconstruct successful fleet history from the servers instead of trusting a stale local ref.
 
@@ -551,8 +564,8 @@ Rotation is a mark-and-sweep operation under the remote mutation lock:
 
 Local rotation protects the complete set of variants for every release selected by the same count, age, current, prior, fleet-window, pin, remote-inventory, or unfinished-attempt rules across all targets.
 
-Successful reflog metadata may be
-kept indefinitely, but only entries inside the configured protection windows retain release and tree content. An older reflog entry whose content was rotated remains auditable but is reported as unavailable for rollback. A local tree object is deleted only after no retained release or known remote inventory requires it.
+Successful snapshot metadata may be
+kept indefinitely, but only entries inside the configured protection windows retain release and tree content. An older snapshot entry whose content was rotated remains auditable but is reported as unavailable for rollback. A local tree object is deleted only after no retained release or known remote inventory requires it.
 
 Rotation runs automatically after a successful, fully recorded push. It may later be exposed as an explicit maintenance command without changing these safety rules.
 

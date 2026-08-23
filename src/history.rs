@@ -1,15 +1,15 @@
-//! Fleet history, reflog, and rollback reference handling.
+//! Fleet history, rollback snapshots, and rollback reference handling.
 //!
-//! The target reflog contains only fully successful fleet snapshots and exposes
-//! them as `<target>@f0`, `<target>@f1`, and so on. Failed and degraded attempts
-//! remain visible through `deploy log` and `attempts.jsonl` but are not valid
-//! rollback sources.
+//! Only fully successful deployments produce a fleet snapshot
+//! (`refs/snapshots.jsonl`), exposed as `<target>@f0`, `<target>@f1`, and so
+//! on. Failed and degraded attempts remain visible through `deploy log` and
+//! `attempts.jsonl` but are not valid rollback sources.
 
 use crate::error::{Error, Result};
 use crate::model::{
     GenerationRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, TargetName,
 };
-use crate::records::{AttemptRecord, ReflogEntry};
+use crate::records::{DeploymentAttempt, DeploymentSnapshot};
 use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
 
@@ -80,29 +80,29 @@ pub fn ref_name(target: &TargetName, index: u64) -> String {
     format!("{}@f{index}", target.as_str())
 }
 
-/// Ensure the reflog contains exactly one successful fleet snapshot for the
-/// attempt's deployment ID, and that `refs/last-successful` points at it.
-/// Returns the entry's reflog index.
+/// Ensure the snapshot log contains exactly one successful fleet snapshot for
+/// the attempt's deployment ID, and that `refs/last-successful` points at it.
+/// Returns the snapshot's index.
 ///
 /// This is the single idempotent insert used by BOTH the main success path
 /// and pending-commit recovery finalization, and it is replay-safe:
 ///
-/// * If an entry with `deployment_id == attempt.deployment_id` already exists
-///   (a previous finalization crashed after appending the reflog entry but
-///   before finishing), no second entry is appended: the existing entry's
-///   index is returned. The reflog never contains two entries for the same
-///   deployment ID.
+/// * If a snapshot with `deployment_id == attempt.deployment_id` already
+///   exists (a previous finalization crashed after appending the snapshot but
+///   before finishing), no second snapshot is appended: the existing
+///   snapshot's index is returned. The log never contains two snapshots for
+///   the same deployment ID.
 /// * `refs/last-successful` is (re)written to the attempt's deployment ID in
 ///   both cases — idempotent, the same value on every replay — which also
-///   repairs the stale ref left by a crash between the reflog append and the
-///   ref update.
-pub fn ensure_successful_reflog_entry(
+///   repairs the stale ref left by a crash between the snapshot append and
+///   the ref update.
+pub fn ensure_snapshot(
     store: &LocalStore,
     target: &TargetName,
-    attempt: &AttemptRecord,
+    attempt: &DeploymentAttempt,
 ) -> Result<u64> {
     let target = target.as_str();
-    let entries = store.read_reflog(target)?;
+    let entries = store.read_snapshots(target)?;
     if let Some(existing) = entries
         .iter()
         .find(|e| e.deployment_id == attempt.deployment_id)
@@ -111,32 +111,33 @@ pub fn ensure_successful_reflog_entry(
         return Ok(existing.index);
     }
     let next = entries.len() as u64;
-    let entry = build_reflog_entry(next, attempt);
-    store.append_reflog(target, &entry)?;
+    let entry = build_snapshot(next, attempt);
+    store.append_snapshot(target, &entry)?;
     store.write_last_successful(target, attempt.deployment_id.as_str())?;
     Ok(next)
 }
 
-/// Append a successful fleet snapshot to the reflog and return its index.
+/// Append a successful fleet snapshot to the snapshot log and return its
+/// index.
 ///
 /// Idempotent by deployment ID: delegates to
-/// [`ensure_successful_reflog_entry`], so re-running finalization for the same
-/// attempt never duplicates the reflog entry and always repairs
+/// [`ensure_snapshot`], so re-running finalization for the same
+/// attempt never duplicates the snapshot and always repairs
 /// `refs/last-successful`. Kept as the historical name so existing call sites
 /// (and the main success path) read naturally.
-pub fn append_successful_reflog(
+pub fn append_snapshot(
     store: &LocalStore,
     target: &TargetName,
-    attempt: &AttemptRecord,
+    attempt: &DeploymentAttempt,
 ) -> Result<u64> {
-    ensure_successful_reflog_entry(store, target, attempt)
+    ensure_snapshot(store, target, attempt)
 }
 
-/// Build a reflog entry from a successful attempt. A successful fleet snapshot
+/// Build a snapshot entry from a successful attempt. A successful fleet snapshot
 /// carries one complete [`GenerationRef`] per slot; slots without a recorded
 /// generation are not part of a coherent successful snapshot and are dropped.
-pub fn build_reflog_entry(index: u64, attempt: &AttemptRecord) -> ReflogEntry {
-    ReflogEntry {
+pub fn build_snapshot(index: u64, attempt: &DeploymentAttempt) -> DeploymentSnapshot {
+    DeploymentSnapshot {
         index,
         deployment_id: attempt.deployment_id.clone(),
         target: attempt.target.clone(),
@@ -162,14 +163,14 @@ pub fn build_reflog_entry(index: u64, attempt: &AttemptRecord) -> ReflogEntry {
     }
 }
 
-/// Resolve a fleet reflog index to its entry.
-pub fn resolve_fleet_ref(
+/// Resolve a fleet snapshot index to its entry.
+pub fn resolve_snapshot(
     store: &LocalStore,
     target: &TargetName,
     index: u64,
-) -> Result<ReflogEntry> {
+) -> Result<DeploymentSnapshot> {
     let target = target.as_str();
-    let entries = store.read_reflog(target)?;
+    let entries = store.read_snapshots(target)?;
     entries
         .into_iter()
         .find(|e| e.index == index)
@@ -177,26 +178,27 @@ pub fn resolve_fleet_ref(
 }
 
 /// Reconstruct the set of successful fleet deployments for a target from the
-/// reflog (used to rebuild history from servers when the local ref is stale).
-pub fn successful_fleet_history(
+/// snapshot log (used to rebuild history from servers when the local ref is
+/// stale).
+pub fn successful_fleet_snapshots(
     store: &LocalStore,
     target: &TargetName,
-) -> Result<Vec<ReflogEntry>> {
-    store.read_reflog(target.as_str())
+) -> Result<Vec<DeploymentSnapshot>> {
+    store.read_snapshots(target.as_str())
 }
 
 /// Collect the distinct placement slot IDs referenced across a set of attempts.
-pub fn attempt_slot_ids(attempt: &AttemptRecord) -> Vec<PlacementSlotId> {
+pub fn attempt_slot_ids(attempt: &DeploymentAttempt) -> Vec<PlacementSlotId> {
     attempt.slot_ids.clone()
 }
 
-/// Build a map of `<target>@fN` -> entry for display.
-pub fn reflog_index(
+/// Build a map of `<target>@fN` -> snapshot for display.
+pub fn snapshot_index(
     store: &LocalStore,
     target: &TargetName,
-) -> Result<BTreeMap<String, ReflogEntry>> {
+) -> Result<BTreeMap<String, DeploymentSnapshot>> {
     let mut out = BTreeMap::new();
-    for e in store.read_reflog(target.as_str())? {
+    for e in store.read_snapshots(target.as_str())? {
         out.insert(ref_name(target, e.index), e);
     }
     Ok(out)
@@ -206,7 +208,6 @@ pub fn reflog_index(
 mod tests {
     use super::*;
     use crate::model::{DeploymentId, PlacementSlotId, ReleaseId};
-    use crate::records::DeploymentStatus;
     use std::collections::BTreeMap;
 
     #[test]
@@ -246,14 +247,13 @@ mod tests {
     }
 
     #[test]
-    fn append_successful_reflog_is_idempotent_by_deployment_id() {
+    fn append_snapshot_is_idempotent_by_deployment_id() {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         let target = TargetName::new("production".to_string());
-        let attempt = AttemptRecord {
+        let attempt = DeploymentAttempt {
             deployment_schema_version: 2,
             deployment_id: DeploymentId::new("deploy-idempotent".to_string()),
-            status: DeploymentStatus::Successful,
             target: target.clone(),
             slot_ids: vec![PlacementSlotId::new("p1".to_string())],
             behavior_sha256: "sha256-aa".to_string(),
@@ -263,12 +263,12 @@ mod tests {
             slots: BTreeMap::new(),
         };
 
-        // First call appends the entry and advances the ref.
-        let first = append_successful_reflog(&store, &target, &attempt).unwrap();
+        // First call appends the snapshot and advances the ref.
+        let first = append_snapshot(&store, &target, &attempt).unwrap();
         assert_eq!(first, 0);
-        let reflog = store.read_reflog(target.as_str()).unwrap();
-        assert_eq!(reflog.len(), 1);
-        assert_eq!(reflog[0].deployment_id, attempt.deployment_id);
+        let snapshots = store.read_snapshots(target.as_str()).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].deployment_id, attempt.deployment_id);
         assert_eq!(
             store.read_last_successful(target.as_str()).as_deref(),
             Some("deploy-idempotent")
@@ -276,10 +276,10 @@ mod tests {
 
         // Second call with the same deployment ID is a no-op: same index, no
         // duplicate entry, and `refs/last-successful` is untouched.
-        let second = append_successful_reflog(&store, &target, &attempt).unwrap();
+        let second = append_snapshot(&store, &target, &attempt).unwrap();
         assert_eq!(second, first, "repeated append must return the same index");
-        let reflog = store.read_reflog(target.as_str()).unwrap();
-        assert_eq!(reflog.len(), 1, "no duplicate reflog entry");
+        let snapshots = store.read_snapshots(target.as_str()).unwrap();
+        assert_eq!(snapshots.len(), 1, "no duplicate snapshot entry");
         assert_eq!(
             store.read_last_successful(target.as_str()).as_deref(),
             Some("deploy-idempotent")

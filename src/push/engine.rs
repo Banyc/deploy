@@ -18,7 +18,7 @@ use crate::model::{
     PlacementSlotId, ReleaseId, TargetName, TreeDigest, VariantName,
 };
 use crate::records::{
-    AttemptRecord, AttemptServer, DeploymentPlan, DeploymentResults, DeploymentStatus,
+    AttemptServer, DeploymentAttempt, DeploymentPlan, DeploymentResults, DeploymentStatus,
     ObservedServer, ObservedTarget, ServerOutcomeKind, ServerPlan, ServerResult,
 };
 use crate::remote::helper::RemoteHelper;
@@ -39,7 +39,7 @@ pub struct PushOptions {
 pub struct PushReport {
     /// `None` means no attempt was created (dry-run or already up to date).
     pub status: Option<DeploymentStatus>,
-    pub attempt: Option<AttemptRecord>,
+    pub attempt: Option<DeploymentAttempt>,
     pub message: String,
     pub dry_run: bool,
 }
@@ -245,7 +245,7 @@ fn push_inner(
             PushRef::Fleet {
                 target: ft, index, ..
             } => {
-                let entry = history::resolve_fleet_ref(store, ft, *index)?;
+                let entry = history::resolve_snapshot(store, ft, *index)?;
                 entry
                     .slots
                     .values()
@@ -467,10 +467,10 @@ fn push_inner(
 
     // Reconcile `PendingCommit` attempts left by earlier pushes BEFORE the
     // early no-op check: an up-to-date push must complete the missing
-    // fleet-commit markers (and advance the reflog) rather than returning
-    // "Everything up to date" with the metadata still absent. Runs under the
-    // local target lock already held by this push; never reactivates or
-    // restarts services (markers/status/reflog only).
+    // fleet-commit markers (and advance the snapshot log) rather than
+    // returning "Everything up to date" with the metadata still absent. Runs
+    // under the local target lock already held by this push; never reactivates
+    // or restarts services (markers/transition/snapshot only).
     reconcile_pending_commits(store, config, target_name, op_id, &helpers)?;
 
     // Early "Everything up to date" check for HEAD pushes. Run BEFORE persisting
@@ -527,9 +527,17 @@ fn push_inner(
         }
     }
 
-    // Persist the plan before any server mutation (finding 6).
+    // Persist the plan before any server mutation (finding 6), then record the
+    // INITIAL status transition: the attempt is `InProgress`. The per-deployment
+    // transition stream is append-only; later transitions (the final status, or
+    // reconciliation finalization) overlay it, and the LATEST transition is the
+    // deployment's current status.
     store.write_plan(deployment_id.as_str(), &plan)?;
-    store.write_status(deployment_id.as_str(), "in_progress")?;
+    store.append_transition(
+        deployment_id.as_str(),
+        &DeploymentStatus::InProgress,
+        Some("attempt started"),
+    )?;
 
     // 8 & 9. Capacity preflight and staging. Capacity is a per-server policy
     // read from the caller's CURRENT `deploy.toml` (`ServerDef.capacity`), not
@@ -713,8 +721,12 @@ fn push_inner(
         DeploymentStatus::Degraded
     };
 
-    // 15. Fleet-commit markers (only for otherwise-successful attempts).
+    // 15. Fleet-commit markers (only for otherwise-successful attempts). The
+    // demotion reason is recorded alongside the final transition so `deploy
+    // log` can explain why an attempt ended up `PendingCommit` or `Degraded`
+    // (e.g. "recoverable metadata failure", "marker integrity conflict").
     let mut commit_status = status.clone();
+    let mut commit_reason: Option<&'static str> = None;
     if status == DeploymentStatus::Successful {
         // The full placement-slot set participating in this fleet commit.
         let slot_ids: Vec<String> = servers_order
@@ -729,6 +741,7 @@ fn push_inner(
                 Ok(g) => g,
                 Err(_) => {
                     commit_status = DeploymentStatus::PendingCommit;
+                    commit_reason = Some("recoverable metadata failure");
                     continue;
                 }
             };
@@ -743,6 +756,7 @@ fn push_inner(
                     // this `PendingCommit` attempt (see
                     // `reconcile_pending_commits`) before its own no-op check.
                     commit_status = DeploymentStatus::PendingCommit;
+                    commit_reason = Some("recoverable metadata failure");
                     continue;
                 }
             };
@@ -751,6 +765,7 @@ fn push_inner(
                 // controller's view diverged, so this marker would be wrong.
                 // Report Degraded rather than a falsely successful commit.
                 commit_status = DeploymentStatus::Degraded;
+                commit_reason = Some("fleet commit diverged");
                 continue;
             }
             match helper.write_commit_marker(
@@ -765,9 +780,10 @@ fn push_inner(
                     // PERMANENT condition — retrying will never fix it, and
                     // leaving the attempt `PendingCommit` would strand it
                     // forever (every later push re-hits the same integrity
-                    // error). Finalize as `Degraded` (no reflog entry) rather
+                    // error). Finalize as `Degraded` (no snapshot entry) rather
                     // than falsely reporting `Successful`.
                     commit_status = DeploymentStatus::Degraded;
+                    commit_reason = Some("marker integrity conflict");
                     continue;
                 }
                 Err(_) => {
@@ -794,6 +810,7 @@ fn push_inner(
                 && r.error.is_some()
             {
                 commit_status = DeploymentStatus::PendingCommit;
+                commit_reason = Some("recoverable metadata failure");
                 break;
             }
         }
@@ -850,10 +867,9 @@ fn push_inner(
         })
         .collect();
 
-    let attempt = AttemptRecord {
+    let attempt = DeploymentAttempt {
         deployment_schema_version: 2,
         deployment_id: deployment_id.clone(),
-        status: commit_status.clone(),
         target: TargetName::new(target_name.to_string()),
         slot_ids: servers_order.clone(),
         behavior_sha256: desired_behavior_sha.clone(),
@@ -871,7 +887,11 @@ fn push_inner(
             slots: results.clone(),
         },
     )?;
-    store.write_status(deployment_id.as_str(), &format!("{:?}", commit_status))?;
+    // The final transition is the attempt's status. Its append is the last
+    // status persistence of the push; the reconcile eligibility gate reads
+    // the latest transition, so a crash before this append leaves the attempt
+    // at its previous (pending) status and a later push re-eligibilizes it.
+    store.append_transition(deployment_id.as_str(), &commit_status, commit_reason)?;
 
     // Refresh observed state. Observed maps are keyed by placement slot (the
     // deployment-location identity); the per-server record (`servers/<id>.json`)
@@ -901,14 +921,11 @@ fn push_inner(
     }
     store.write_observed(target_name, &observed)?;
 
-    // 16. Advance the reflog only for successful fleet deployments.
+    // 16. Advance the snapshot log only for successful fleet deployments.
     let mut message = format!("push status: {commit_status:?}");
     if commit_status == DeploymentStatus::Successful {
-        let idx = history::append_successful_reflog(
-            store,
-            &TargetName::new(target_name.to_string()),
-            &attempt,
-        )?;
+        let idx =
+            history::append_snapshot(store, &TargetName::new(target_name.to_string()), &attempt)?;
         message = format!("push successful; fleet ref {}@f{idx}", target_name);
     }
 
@@ -946,20 +963,22 @@ fn push_inner(
 
 /// Reconcile `PendingCommit` attempts recorded by earlier pushes (step 15 of
 /// `requirement.md`). A `PendingCommit` attempt means the fleet-commit markers
-/// were not all written before the earlier push gave up; the mutable status
-/// file still says `PendingCommit`, the reflog never advanced, and a naive
-/// "Everything up to date" push would otherwise skip the missing markers.
+/// were not all written before the earlier push gave up; the latest transition
+/// still says `PendingCommit`, the snapshot log never advanced, and a
+/// naive "Everything up to date" push would otherwise skip the missing
+/// markers.
 ///
-/// Eligibility is determined by the MUTABLE status file
-/// (`deployments/<id>/status`), not the append-only `attempts.jsonl` record:
-/// an attempt is reconciled only while its mutable status is `PendingCommit`
-/// (or the status file is momentarily absent for a just-recorded attempt).
-/// Once a push finalizes the mutable status to `Successful` or `Degraded`, the
-/// attempt is skipped on every later push — a finalized attempt is never
-/// re-reconciled and never re-entered into the reflog.
+/// Eligibility is determined by the attempt's LATEST transition
+/// (`deployments/<id>/transitions.jsonl`), not the append-only
+/// `attempts.jsonl` record (which carries no status at all): an attempt is
+/// reconciled only while its latest transition is `PendingCommit` (or no
+/// transition exists yet for a just-recorded attempt). Once a push finalizes
+/// the attempt with a `Successful` or `Degraded` transition, it is skipped on
+/// every later push — a finalized attempt is never re-reconciled and never
+/// re-entered into the snapshot log.
 ///
 /// For each eligible pending attempt, oldest first (attempts.jsonl order, so
-/// reflog indices stay monotonic):
+/// snapshot indices stay monotonic):
 /// 1. Membership: every participating server must still exist in the target.
 /// 2. Generations: each participating server's CURRENT generation (fresh
 ///    `helper.status()`) must equal the generation the attempt recorded for it
@@ -967,20 +986,20 @@ fn push_inner(
 /// 3. If everything matches, write the missing markers under each server's
 ///    mutation lock (idempotent: already-written markers are a byte-for-byte
 ///    no-op) using the attempt's ORIGINAL deployment ID, then finalize
-///    REPLAY-SAFELY: first the idempotent durable steps (ensure the reflog
+///    REPLAY-SAFELY: first the idempotent durable steps (ensure the snapshot
 ///    entry exists and repair `refs/last-successful` via
-///    [`history::ensure_successful_reflog_entry`]), and the mutable status
-///    file LAST. The mutable status is the eligibility gate for recovery: as
+///    [`history::ensure_snapshot`]), and the final `Successful` transition
+///    LAST. The latest transition is the eligibility gate for recovery: as
 ///    long as it still says `PendingCommit`, any crash or error mid-
 ///    finalization leaves the attempt eligible and the next push replays
 ///    exactly the remaining steps; once it says `Successful`, every earlier
 ///    step is already durable, so nothing is lost.
 /// 4. A confirmed membership/generation mismatch finalizes the attempt as
-///    `Degraded` (no reflog entry). An existing marker whose content differs
+///    `Degraded` (no snapshot entry). An existing marker whose content differs
 ///    from the deterministic payload is an integrity conflict — a concurrent
 ///    controller recorded a different fact or the remote state diverged — and
 ///    is NOT transient: the conflicting marker is left untouched and the
-///    attempt is finalized `Degraded` (mutable status only, no reflog entry)
+///    attempt is finalized `Degraded` (transition only, no snapshot entry)
 ///    instead of being stranded `PendingCommit` forever. Only transient remote
 ///    failures (lock held, status read error, transport-level marker write
 ///    error) leave the attempt `PendingCommit` for a later retry: it is never
@@ -988,8 +1007,8 @@ fn push_inner(
 ///    accused of divergence (fail-closed, not degrade, on errors we cannot
 ///    attribute to state change).
 ///
-/// Recovery only touches markers, the mutable status file, the reflog, and
-/// `refs/last-successful`: no activation, no verification adapters, no
+/// Recovery only touches markers, the transition stream, the snapshot log,
+/// and `refs/last-successful`: no activation, no verification adapters, no
 /// `current` changes, no restart of healthy services.
 fn reconcile_pending_commits(
     store: &LocalStore,
@@ -998,22 +1017,20 @@ fn reconcile_pending_commits(
     op_id: &OperationId,
     helpers: &HashMap<PlacementSlotId, RemoteHelper>,
 ) -> Result<()> {
-    // Eligible attempts: the append-only attempts.jsonl record must say
-    // `PendingCommit` (a legitimately new pending attempt whose status file is
-    // momentarily absent is still eligible), but the MUTABLE status file is
-    // authoritative once it exists — a finalized attempt (`Successful` /
-    // `Degraded`) is skipped regardless of what attempts.jsonl says, so an
-    // already-reconciled attempt is never re-reconciled on a later push.
-    let mut pending: Vec<AttemptRecord> = Vec::new();
+    // Eligible attempts: the attempts.jsonl record must exist AND the latest
+    // transition must be `PendingCommit` (or the transition stream is
+    // momentarily absent for a just-recorded attempt). A finalized attempt
+    // (latest transition `Successful` / `Degraded`, or any other non-pending
+    // status such as `InProgress`) is skipped — an already-reconciled attempt
+    // is never re-reconciled on a later push.
+    let mut pending: Vec<DeploymentAttempt> = Vec::new();
     for attempt in store.read_attempts(target_name)? {
-        if attempt.status != DeploymentStatus::PendingCommit {
-            continue;
-        }
-        match store.read_status(attempt.deployment_id.as_str())? {
-            // Status file not written yet: legitimately new pending attempt.
+        match store.latest_status(attempt.deployment_id.as_str())? {
+            // No transition recorded yet: legitimately new pending attempt.
             None => pending.push(attempt),
-            Some(s) if s == "PendingCommit" => pending.push(attempt),
-            // Finalized on an earlier push (Successful/Degraded): skip.
+            Some(DeploymentStatus::PendingCommit) => pending.push(attempt),
+            // Finalized on an earlier push (Successful/Degraded) or still
+            // actively deploying (InProgress): skip.
             Some(_) => {}
         }
     }
@@ -1036,7 +1053,11 @@ fn reconcile_pending_commits(
             .iter()
             .all(|sid| members.contains(sid.as_str()));
         if !membership_ok {
-            store.write_status(attempt.deployment_id.as_str(), "Degraded")?;
+            store.append_transition(
+                attempt.deployment_id.as_str(),
+                &DeploymentStatus::Degraded,
+                Some("membership mismatch"),
+            )?;
             continue;
         }
 
@@ -1086,7 +1107,11 @@ fn reconcile_pending_commits(
             continue;
         }
         if !all_match {
-            store.write_status(attempt.deployment_id.as_str(), "Degraded")?;
+            store.append_transition(
+                attempt.deployment_id.as_str(),
+                &DeploymentStatus::Degraded,
+                Some("generation diverged"),
+            )?;
             continue;
         }
 
@@ -1122,10 +1147,14 @@ fn reconcile_pending_commits(
                     // Conflicting marker already exists with different
                     // content: a permanent condition, not a transient blip.
                     // Leave the conflicting marker untouched, finalize THIS
-                    // attempt as `Degraded` (mutable status only, no reflog
+                    // attempt as `Degraded` (transition only, no snapshot
                     // entry) and move on to the next pending attempt — a later
                     // retry would only hit the same integrity error again.
-                    store.write_status(attempt.deployment_id.as_str(), "Degraded")?;
+                    store.append_transition(
+                        attempt.deployment_id.as_str(),
+                        &DeploymentStatus::Degraded,
+                        Some("marker integrity conflict"),
+                    )?;
                     continue 'pending;
                 }
                 Err(_) => {
@@ -1142,18 +1171,22 @@ fn reconcile_pending_commits(
         }
 
         // 4. Finalize REPLAY-SAFELY: the idempotent durable steps run FIRST
-        // and the mutable status file is written LAST. The mutable status is
-        // the eligibility gate for recovery, so a crash or error at ANY of
-        // these steps leaves the attempt `PendingCommit` and the next push
-        // replays exactly the remaining steps; once the status says
-        // `Successful`, every earlier step is already durable. The reflog
-        // insert is idempotent by deployment ID
-        // ([`history::ensure_successful_reflog_entry`] never appends a second
-        // entry for the same deployment) and also repairs a stale
-        // `refs/last-successful`. The append-only attempts.jsonl record is
-        // untouched (still the original deployment ID and status).
-        history::ensure_successful_reflog_entry(store, &attempt.target, &attempt)?;
-        store.write_status(attempt.deployment_id.as_str(), "Successful")?;
+        // and the final `Successful` transition is appended LAST. The latest
+        // transition is the eligibility gate for recovery, so a crash or
+        // error at ANY of these steps leaves the attempt `PendingCommit` and
+        // the next push replays exactly the remaining steps; once the
+        // transition says `Successful`, every earlier step is already
+        // durable. The snapshot insert is idempotent by deployment ID
+        // ([`history::ensure_snapshot`] never appends a second entry for the
+        // same deployment) and also repairs a stale `refs/last-successful`.
+        // The append-only attempts.jsonl record is untouched (still the
+        // original deployment ID, no status field).
+        history::ensure_snapshot(store, &attempt.target, &attempt)?;
+        store.append_transition(
+            attempt.deployment_id.as_str(),
+            &DeploymentStatus::Successful,
+            Some("recovery finalization"),
+        )?;
     }
     Ok(())
 }
@@ -2609,16 +2642,17 @@ slots = ["p1"]
     // ---- Replay-safe recovery finalization -------------------------------
     //
     // `reconcile_pending_commits` finalizes a recovered attempt with three
-    // persistence steps, ordered ensure-reflog-entry (idempotent by deployment
-    // ID) -> `refs/last-successful` (idempotent) -> mutable status LAST. A
-    // crash at any step must leave the attempt re-eligible, and a follow-up
-    // push must complete exactly the remaining steps without duplicating the
-    // reflog entry. These tests arm a one-shot store fault keyed by the
-    // pending attempt's deployment ID (see `src/store/local.rs::test_faults`)
-    // on each persistence step, run a push that aborts mid-finalization, then
-    // run a clean push and assert exactly-one semantics: one reflog entry,
-    // `refs/last-successful` pointing at the attempt, mutable status
-    // `Successful`, markers present on the remotes.
+    // persistence steps, ordered ensure-snapshot (idempotent by deployment
+    // ID) -> `refs/last-successful` (idempotent) -> final `Successful`
+    // transition LAST. A crash at any step must leave the attempt
+    // re-eligible, and a follow-up push must complete exactly the remaining
+    // steps without duplicating the snapshot. These tests arm a one-shot
+    // store fault keyed by the pending attempt's deployment ID (see
+    // `src/store/local.rs::test_faults`) on each persistence step, run a push
+    // that aborts mid-finalization, then run a clean push and assert
+    // exactly-one semantics: one snapshot entry, `refs/last-successful`
+    // pointing at the attempt, latest transition `Successful`, markers
+    // present on the remotes.
 
     /// A remote that fails fleet-commit marker writes exactly once: the first
     /// write/create under `state/commits/` errors (leaving the marker absent),
@@ -2759,9 +2793,9 @@ slots = ["p1"]
 
     /// Push 1 of the recovery scenarios: the fleet-commit marker write fails
     /// once, so the attempt is recorded `PendingCommit` (activation already
-    /// happened; the mutable status file says `PendingCommit`, no reflog
+    /// happened; the latest transition says `PendingCommit`, no snapshot
     /// entry, no `refs/last-successful`).
-    fn push_pending_attempt(h: &RecoveryHarness) -> AttemptRecord {
+    fn push_pending_attempt(h: &RecoveryHarness) -> DeploymentAttempt {
         let armed = Arc::new(AtomicBool::new(true));
         let armed_for_factory = armed.clone();
         let rf = h.remotes_base.clone();
@@ -2797,8 +2831,8 @@ slots = ["p1"]
             "marker must be absent after the failed push"
         );
         assert!(
-            h.store.read_reflog("t1").unwrap().is_empty(),
-            "no reflog entry for a pending attempt"
+            h.store.read_snapshots("t1").unwrap().is_empty(),
+            "no snapshot for a pending attempt"
         );
         assert!(
             h.store.read_last_successful("t1").is_none(),
@@ -2828,33 +2862,37 @@ slots = ["p1"]
         )
     }
 
-    fn mutable_status(h: &RecoveryHarness, deployment_id: &str) -> String {
-        std::fs::read_to_string(h.store.deployment_dir(deployment_id).join("status")).unwrap()
+    /// The latest recorded transition status for a deployment.
+    fn latest_status(h: &RecoveryHarness, deployment_id: &str) -> DeploymentStatus {
+        h.store
+            .latest_status(deployment_id)
+            .unwrap()
+            .expect("a transition must be recorded")
     }
 
     /// Assert the exactly-one end state of a fully replayed recovery: exactly
-    /// one reflog entry at index 0 for the attempt, `refs/last-successful`
-    /// pointing at it, mutable status `Successful`, and the fleet-commit
+    /// one snapshot entry at index 0 for the attempt, `refs/last-successful`
+    /// pointing at it, latest transition `Successful`, and the fleet-commit
     /// marker present on the remote.
-    fn assert_finalized(h: &RecoveryHarness, attempt: &AttemptRecord) {
-        let reflog = h.store.read_reflog("t1").unwrap();
+    fn assert_finalized(h: &RecoveryHarness, attempt: &DeploymentAttempt) {
+        let snapshots = h.store.read_snapshots("t1").unwrap();
         assert_eq!(
-            reflog.len(),
+            snapshots.len(),
             1,
             "exactly one successful fleet snapshot, got {}",
-            reflog.len()
+            snapshots.len()
         );
-        assert_eq!(reflog[0].index, 0);
-        assert_eq!(reflog[0].deployment_id, attempt.deployment_id);
+        assert_eq!(snapshots[0].index, 0);
+        assert_eq!(snapshots[0].deployment_id, attempt.deployment_id);
         assert_eq!(
             h.store.read_last_successful("t1").as_deref(),
             Some(attempt.deployment_id.as_str()),
             "refs/last-successful must point at the recovered attempt"
         );
         assert_eq!(
-            mutable_status(h, attempt.deployment_id.as_str()),
-            "Successful",
-            "mutable status must be finalized"
+            latest_status(h, attempt.deployment_id.as_str()),
+            DeploymentStatus::Successful,
+            "latest transition must be finalized as Successful"
         );
         let marker = h
             .remotes_base
@@ -2867,28 +2905,28 @@ slots = ["p1"]
     }
 
     #[test]
-    fn recovery_replays_after_reflog_append_failure() {
+    fn recovery_replays_after_snapshot_append_failure() {
         let h = RecoveryHarness::new();
         let attempt = push_pending_attempt(&h);
 
-        // Push 2: the reflog append (first persistence step of finalization)
+        // Push 2: the snapshot append (first persistence step of finalization)
         // fails once -> the push aborts with Err and nothing is durable yet.
-        crate::store::local::test_faults::arm_append_reflog(attempt.deployment_id.as_str());
+        crate::store::local::test_faults::arm_append_snapshot(attempt.deployment_id.as_str());
         let err = push_clean(&h)
             .err()
-            .expect("push must abort when the reflog append fails");
+            .expect("push must abort when the snapshot append fails");
         assert!(
-            err.to_string().contains("append_reflog"),
+            err.to_string().contains("append_snapshot"),
             "error must name the injected fault, got: {err}"
         );
         assert!(
-            h.store.read_reflog("t1").unwrap().is_empty(),
-            "no reflog entry after the failed append"
+            h.store.read_snapshots("t1").unwrap().is_empty(),
+            "no snapshot after the failed append"
         );
         assert!(h.store.read_last_successful("t1").is_none());
         assert_eq!(
-            mutable_status(&h, attempt.deployment_id.as_str()),
-            "PendingCommit"
+            latest_status(&h, attempt.deployment_id.as_str()),
+            DeploymentStatus::PendingCommit
         );
 
         // Push 3: a clean push replays and completes finalization exactly once.
@@ -2902,8 +2940,8 @@ slots = ["p1"]
         let h = RecoveryHarness::new();
         let attempt = push_pending_attempt(&h);
 
-        // Push 2: the reflog append succeeds but `refs/last-successful` (the
-        // second persistence step) fails once -> Err; the reflog entry exists
+        // Push 2: the snapshot append succeeds but `refs/last-successful` (the
+        // second persistence step) fails once -> Err; the snapshot exists
         // but the ref is stale and the attempt stays `PendingCommit`.
         crate::store::local::test_faults::arm_write_last_successful(attempt.deployment_id.as_str());
         let err = push_clean(&h)
@@ -2913,17 +2951,13 @@ slots = ["p1"]
             err.to_string().contains("write_last_successful"),
             "error must name the injected fault, got: {err}"
         );
-        let reflog = h.store.read_reflog("t1").unwrap();
-        assert_eq!(
-            reflog.len(),
-            1,
-            "reflog entry was appended before the crash"
-        );
-        assert_eq!(reflog[0].deployment_id, attempt.deployment_id);
+        let snapshots = h.store.read_snapshots("t1").unwrap();
+        assert_eq!(snapshots.len(), 1, "snapshot was appended before the crash");
+        assert_eq!(snapshots[0].deployment_id, attempt.deployment_id);
         assert!(h.store.read_last_successful("t1").is_none());
         assert_eq!(
-            mutable_status(&h, attempt.deployment_id.as_str()),
-            "PendingCommit"
+            latest_status(&h, attempt.deployment_id.as_str()),
+            DeploymentStatus::PendingCommit
         );
 
         // Push 3: the idempotent ensure must NOT append a second entry; it
@@ -2934,34 +2968,34 @@ slots = ["p1"]
     }
 
     #[test]
-    fn recovery_replays_after_status_write_failure() {
+    fn recovery_replays_after_transition_append_failure() {
         let h = RecoveryHarness::new();
         let attempt = push_pending_attempt(&h);
 
-        // Push 2: the reflog entry and last-successful are durable but the
-        // final mutable-status write fails -> Err; the attempt stays
-        // `PendingCommit`, so it is still eligible for the next push.
-        crate::store::local::test_faults::arm_write_status(attempt.deployment_id.as_str());
+        // Push 2: the snapshot and last-successful are durable but the
+        // final `Successful` transition append fails -> Err; the attempt
+        // stays `PendingCommit`, so it is still eligible for the next push.
+        crate::store::local::test_faults::arm_append_transition(attempt.deployment_id.as_str());
         let err = push_clean(&h)
             .err()
-            .expect("push must abort when the final status write fails");
+            .expect("push must abort when the final transition append fails");
         assert!(
-            err.to_string().contains("write_status"),
+            err.to_string().contains("append_transition"),
             "error must name the injected fault, got: {err}"
         );
-        let reflog = h.store.read_reflog("t1").unwrap();
-        assert_eq!(reflog.len(), 1);
+        let snapshots = h.store.read_snapshots("t1").unwrap();
+        assert_eq!(snapshots.len(), 1);
         assert_eq!(
             h.store.read_last_successful("t1").as_deref(),
             Some(attempt.deployment_id.as_str())
         );
         assert_eq!(
-            mutable_status(&h, attempt.deployment_id.as_str()),
-            "PendingCommit"
+            latest_status(&h, attempt.deployment_id.as_str()),
+            DeploymentStatus::PendingCommit
         );
 
-        // Push 3: the replay completes the final status write; the ensure is a
-        // no-op and no duplicate entry is created.
+        // Push 3: the replay completes the final transition append; the ensure
+        // is a no-op and no duplicate entry is created.
         let r3 = push_clean(&h).unwrap();
         assert_eq!(r3.status, None, "the replaying push is an up-to-date no-op");
         assert_finalized(&h, &attempt);
@@ -2981,8 +3015,9 @@ slots = ["p1"]
         assert_finalized(&h, &attempt);
 
         // Push 3: a further clean push re-runs reconciliation (the attempts
-        // record still says `PendingCommit`) but every step is idempotent: no
-        // duplicate reflog entry, no changed refs, no new attempt.
+        // record is untouched and the transition already says `Successful`)
+        // but every step is idempotent: no duplicate snapshot, no changed
+        // refs, no new attempt.
         let r3 = push_clean(&h).unwrap();
         assert_eq!(r3.status, None);
         assert_eq!(r3.message, "Everything up to date");
