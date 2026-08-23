@@ -157,8 +157,13 @@ impl SshTransport {
 
         // Pinned keys live in a private (0700) cache directory owned by this
         // user, rather than a predictable world-readable temp file name, so a
-        // locally pre-created file cannot be trusted blindly.
-        let cache_dir = std::env::temp_dir().join("deploy-ssh-knownhosts");
+        // locally pre-created file cannot be trusted blindly. Tests may
+        // override the cache root via `DEPLOY_SSH_KNOWNHOSTS_DIR` to give each
+        // test its own isolated cache; production deployments leave it unset
+        // and use the default `$TMPDIR/deploy-ssh-knownhosts`.
+        let cache_dir = std::env::var_os("DEPLOY_SSH_KNOWNHOSTS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("deploy-ssh-knownhosts"));
         std::fs::create_dir_all(&cache_dir).map_err(|e| {
             Error::transport(format!(
                 "create known_hosts cache {}: {e}",
@@ -1103,8 +1108,10 @@ mod fingerprint_ssh_tests {
     use std::sync::Mutex;
 
     /// Serializes the fake-environment tests: they mutate the process-wide
-    /// `PATH` (an `unsafe` operation in edition 2024) and share the
-    /// `$TMPDIR/deploy-ssh-knownhosts` pin cache, so they must not overlap.
+    /// `PATH` (an `unsafe` operation in edition 2024), so they must not
+    /// overlap. Each test also points `DEPLOY_SSH_KNOWNHOSTS_DIR` at its own
+    /// temp dir, so the pin cache is fully isolated per test (never shared
+    /// between tests or between the lib and integration binaries).
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct FakeSsh {
@@ -1271,20 +1278,34 @@ esac
         }
     }
 
-    /// Run `f` with `bin` prepended to `PATH` (restored afterwards).
-    fn with_fake_path<T>(bin: &Path, f: impl FnOnce() -> T) -> T {
-        let old = std::env::var_os("PATH").unwrap_or_default();
-        let mut paths: Vec<_> = std::env::split_paths(&old).collect();
+    /// Run `f` with `bin` prepended to `PATH` and `DEPLOY_SSH_KNOWNHOSTS_DIR`
+    /// pointing at `cache` (both restored afterwards). Pointing the pin cache
+    /// at a per-test dir isolates it from every other fake-ssh test in any
+    /// binary — no two tests ever share cache state, so concurrent runs of
+    /// the lib and integration suites cannot interfere.
+    fn with_fake_path<T>(bin: &Path, cache: &Path, f: impl FnOnce() -> T) -> T {
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let old_cache = std::env::var_os("DEPLOY_SSH_KNOWNHOSTS_DIR");
+        let mut paths: Vec<_> = std::env::split_paths(&old_path).collect();
         paths.insert(0, bin.to_path_buf());
         let joined = std::env::join_paths(paths).unwrap();
         // SAFETY: edition 2024 marks `set_var` unsafe. The caller holds
         // `ENV_LOCK`, and no other test in this binary spawns ssh/ssh-keyscan.
         unsafe {
             std::env::set_var("PATH", &joined);
+            std::env::set_var("DEPLOY_SSH_KNOWNHOSTS_DIR", cache);
         }
         let result = f();
+        match old_cache {
+            Some(v) => unsafe {
+                std::env::set_var("DEPLOY_SSH_KNOWNHOSTS_DIR", v);
+            },
+            None => unsafe {
+                std::env::remove_var("DEPLOY_SSH_KNOWNHOSTS_DIR");
+            },
+        }
         unsafe {
-            std::env::set_var("PATH", &old);
+            std::env::set_var("PATH", &old_path);
         }
         result
     }
@@ -1317,7 +1338,7 @@ esac
             "status-unit.test",
             Path::new("/srv/deploy/status-unit"),
         );
-        with_fake_path(&fake.bin, || {
+        with_fake_path(&fake.bin, &tmp.path().join("knownhosts"), || {
             with_fake_root(&fake.remote_root, "/srv/deploy/status-unit", || {
                 let t = fake.transport();
                 // Regression: without prepare_identity the transport refuses to
@@ -1359,7 +1380,7 @@ esac
             "pin-unit.test",
             Path::new("/srv/deploy/pin-unit"),
         );
-        with_fake_path(&fake.bin, || {
+        with_fake_path(&fake.bin, &tmp.path().join("knownhosts"), || {
             with_fake_root(&fake.remote_root, "/srv/deploy/pin-unit", || {
                 let t = fake.transport();
                 t.prepare_identity().unwrap();

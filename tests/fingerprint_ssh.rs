@@ -17,8 +17,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Serializes the fake-environment tests: they mutate the process-wide `PATH`
-/// (an `unsafe` operation in edition 2024) and share the
-/// `$TMPDIR/deploy-ssh-knownhosts` pin cache, so they must not overlap.
+/// (an `unsafe` operation in edition 2024), so they must not overlap. Each
+/// test also points `DEPLOY_SSH_KNOWNHOSTS_DIR` at its own temp dir, so the
+/// pin cache is fully isolated per test (never shared between tests or
+/// between the lib and integration binaries).
 static SSH_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// A real ed25519 host key plus its SHA256 fingerprint, and the fake-bin dir
@@ -164,20 +166,34 @@ esac
     }
 }
 
-/// Run `f` with `bin` prepended to `PATH` (restored afterwards).
-fn with_fake_path<T>(bin: &Path, f: impl FnOnce() -> T) -> T {
-    let old = std::env::var_os("PATH").unwrap_or_default();
-    let mut paths: Vec<_> = std::env::split_paths(&old).collect();
+/// Run `f` with `bin` prepended to `PATH` and `DEPLOY_SSH_KNOWNHOSTS_DIR`
+/// pointing at `cache` (both restored afterwards). Pointing the pin cache at a
+/// per-test dir isolates it from every other fake-ssh test in any binary — no
+/// two tests ever share cache state, so concurrent runs of the lib and
+/// integration suites cannot interfere.
+fn with_fake_path<T>(bin: &Path, cache: &Path, f: impl FnOnce() -> T) -> T {
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let old_cache = std::env::var_os("DEPLOY_SSH_KNOWNHOSTS_DIR");
+    let mut paths: Vec<_> = std::env::split_paths(&old_path).collect();
     paths.insert(0, bin.to_path_buf());
     let joined = std::env::join_paths(paths).unwrap();
     // SAFETY: edition 2024 marks `set_var` unsafe. The caller holds
     // `SSH_ENV_LOCK`, and this binary contains no other tests.
     unsafe {
         std::env::set_var("PATH", &joined);
+        std::env::set_var("DEPLOY_SSH_KNOWNHOSTS_DIR", cache);
     }
     let result = f();
+    match old_cache {
+        Some(v) => unsafe {
+            std::env::set_var("DEPLOY_SSH_KNOWNHOSTS_DIR", v);
+        },
+        None => unsafe {
+            std::env::remove_var("DEPLOY_SSH_KNOWNHOSTS_DIR");
+        },
+    }
     unsafe {
-        std::env::set_var("PATH", &old);
+        std::env::set_var("PATH", &old_path);
     }
     result
 }
@@ -332,7 +348,7 @@ fn fingerprint_only_dry_run_leaves_remote_untouched() -> Result<()> {
     let fake = make_fake_bin(tmp.path(), "dry.test");
     let deploy_dir = "/srv/deploy/dry-run";
 
-    with_fake_path(&fake.bin, || {
+    with_fake_path(&fake.bin, &tmp.path().join("knownhosts"), || {
         with_fake_root(&fake.remote_root, deploy_dir, || {
             let proj = tmp.path().join("proj");
             std::fs::create_dir_all(&proj).unwrap();
@@ -373,7 +389,7 @@ fn fingerprint_only_dry_run_leaves_remote_untouched() -> Result<()> {
             );
 
             // The emulated REMOTE host is completely untouched: identity
-            // pinning happens in the LOCAL `$TMPDIR/deploy-ssh-knownhosts`
+            // pinning happens in the LOCAL per-test `DEPLOY_SSH_KNOWNHOSTS_DIR`
             // cache, never on the remote layout.
             assert!(
                 remote_fingerprint(&fake.remote_root).is_empty(),
@@ -393,7 +409,7 @@ fn fingerprint_only_first_push_succeeds() -> Result<()> {
     let fake = make_fake_bin(tmp.path(), "first.test");
     let deploy_dir = "/srv/deploy/first-push";
 
-    with_fake_path(&fake.bin, || {
+    with_fake_path(&fake.bin, &tmp.path().join("knownhosts"), || {
         with_fake_root(&fake.remote_root, deploy_dir, || {
             let proj = tmp.path().join("proj");
             std::fs::create_dir_all(&proj).unwrap();
@@ -475,7 +491,7 @@ fn fingerprint_only_repeat_push_is_idempotent() -> Result<()> {
     let fake = make_fake_bin(tmp.path(), "repeat.test");
     let deploy_dir = "/srv/deploy/repeat-push";
 
-    with_fake_path(&fake.bin, || {
+    with_fake_path(&fake.bin, &tmp.path().join("knownhosts"), || {
         with_fake_root(&fake.remote_root, deploy_dir, || {
             let proj = tmp.path().join("proj");
             std::fs::create_dir_all(&proj).unwrap();
