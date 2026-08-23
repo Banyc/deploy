@@ -43,7 +43,7 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
         config.release_root(&config_path).ends_with("releases/v1"),
         "release directory is forced beneath releases/"
     );
-    assert_eq!(config.targets["production"].pods.len(), 2);
+    assert_eq!(config.targets["production"].slots.len(), 2);
     let variant = config.variant("standard")?;
     assert_eq!(
         &variant.artifact.mappings[0].from,
@@ -58,7 +58,7 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
     let remotes_base = tmp.path().join("remotes");
     std::fs::create_dir_all(&remotes_base).unwrap();
     let factory = move |s: &deploy::config::ServerDef,
-                        _pod: &deploy::config::PodDef|
+                        _slot: &deploy::config::SlotDef|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(remotes_base.join(&s.id))?))
     };

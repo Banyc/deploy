@@ -28,8 +28,8 @@ variant     = a name bound to one tree within a release
 artifact    = the immutable release + variant + tree binding
 release     = an immutable map of every declared variant to a tree digest
 server      = a durable machine identity: a stable ID plus its current address
-pod         = a binding of one top-level server to one variant
-target      = a named group of pods plus its rollout and retention policy
+deployment slot = a binding of one top-level server to one variant under an ID, with an absolute deploy_dir
+target      = a named group of slots plus its rollout and retention policy
 deployment  = an attempted push and its exact per-server assignments
 generation  = one server's durable activation record for one assignment
 ```
@@ -116,8 +116,8 @@ protect_previous = true
 [targets.production.rotation.fleet]
 protect_deployments = 2
 
-# Servers are declared once; a pod binds one server to one variant, and
-# targets reference pods by ID.
+# Servers are declared once; a slot binds one server to one variant, and
+# targets reference slots by ID.
 [[servers]]
 id = "server-01"
 address = "server-01.example.com"
@@ -133,31 +133,31 @@ id = "server-03"
 address = "server-03.example.com"
 user = "deploy"
 
-[[pods]]
+[[slots]]
 id = "app-1"
 server = "server-01"
 variant = "standard"
 deploy_dir = "/srv/deploy/example"
 
-[[pods]]
+[[slots]]
 id = "app-2"
 server = "server-02"
 variant = "standard"
 deploy_dir = "/srv/deploy/example"
 
-[[pods]]
+[[slots]]
 id = "hc-1"
 server = "server-03"
 variant = "high-capacity"
 
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-pods = ["app-1", "app-2", "hc-1"]
+slots = ["app-1", "app-2", "hc-1"]
 ```
 
-Servers are declared exactly once at the top level; a pod binds one server to
-one variant, and each target lists its member pods by ID. A pod may be a member
-of several targets, and two pods may share one server in different targets, but
+Servers are declared exactly once at the top level; a slot binds one server to
+one variant, and each target lists its member slots by ID. A slot may be a member
+of several targets, and two slots may share one server in different targets, but
 within a single target each server appears at most once (one running generation
 per server). Besides `id`, `address`, and `user`, every server accepts an
 optional `port` (default 22) and exactly one host-identity source: a dedicated
@@ -411,7 +411,7 @@ Atomicity is per server, not across a fleet. Fleet consistency is provided by th
 
 ## Push transaction
 `deploy push <target>` performs the following:
-1. Validate the configuration, unique stable server IDs, pod-to-variant bindings, paths, adapter settings, and SSH host identities.
+1. Validate the configuration, unique stable server IDs, slot-to-variant bindings, paths, adapter settings, and SSH host identities.
 2. Acquire the local application-store lock and target lock in that order. Application-store publication and local rotation are serialized across targets; target history updates are serialized per target.
 3. Materialize every declared variant, generate canonical tree objects, and reuse any object whose digest already exists and verifies correctly.
 4. Freeze the mapping, activation, and verification contract; generate or reuse the immutable release record.
@@ -560,9 +560,9 @@ For a system service, an administrator installs a root-owned wrapper unit whose 
 ## Transport and remote helper
 The initial transport is SSH with strict host-key verification (per-server `known_hosts` or pinned `host_key_fingerprint`). An explicit `local://<absolute-path>` server address instead routes the transport to that exact filesystem endpoint; it exists for tests and for local targets. Server IDs, target names, variant names, release IDs, and paths are validated data and are never concatenated into remote shell commands. Bulk tree transfer uses SFTP or an equivalent framed channel.
 
-A small versioned remote helper owns status inspection, locking, object publication, generation switching, transaction recovery, adapter invocation, and rotation. Client and helper perform a protocol-version handshake before mutation (the negotiated version is recorded under `control/`; schema version 1 speaks protocol 1). Every mutating request carries an operation ID and is idempotent, and each operation's durable per-server transaction record (`transactions/<operation-id>.json`, advanced `prepared` → `committed`/`compensated` by the helper) lets a disconnected client reconnect and learn whether the operation prepared, committed, compensated, or never began. Packaging these operations as a single versioned helper binary uploaded beneath each pod's `deploy_dir` is the planned evolution; it does not change this contract.
+A small versioned remote helper owns status inspection, locking, object publication, generation switching, transaction recovery, adapter invocation, and rotation. Client and helper perform a protocol-version handshake before mutation (the negotiated version is recorded under `control/`; schema version 1 speaks protocol 1). Every mutating request carries an operation ID and is idempotent, and each operation's durable per-server transaction record (`transactions/<operation-id>.json`, advanced `prepared` → `committed`/`compensated` by the helper) lets a disconnected client reconnect and learn whether the operation prepared, committed, compensated, or never began. Packaging these operations as a single versioned helper binary uploaded beneath each slot's `deploy_dir` is the planned evolution; it does not change this contract.
 
-If the deployment account cannot create a pod's `deploy_dir`, an administrator must provision that directory once. Privileged systemd control must likewise be provisioned through the fixed, root-owned wrapper and narrowly scoped restart permission described above; `push` does not grant itself privileges.
+If the deployment account cannot create a slot's `deploy_dir`, an administrator must provision that directory once. Privileged systemd control must likewise be provisioned through the fixed, root-owned wrapper and narrowly scoped restart permission described above; `push` does not grant itself privileges.
 
 The remote application root and state are writable only by the deployment account. Artifact permissions may make selected files readable by the runtime service account, but state, incoming content, and manifests are not generally readable. Because the core cannot recognize secrets, users must understand that any sensitive bytes mapped into a tree will be retained in multiple local and remote versions. External credential references are preferred when versioned secret retention is undesirable.
 

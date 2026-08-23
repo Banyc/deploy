@@ -63,7 +63,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     let config = Config::load(&config_path)?;
     assert_eq!(config.application, "roundtrip-app");
     assert_eq!(config.release.as_str(), "v1");
-    assert_eq!(config.targets["production"].pods, vec!["app-1"]);
+    assert_eq!(config.targets["production"].slots, vec!["app-1"]);
     assert_eq!(config.targets["production"].rollout.batch_size, 1);
     let variant = config.variant("standard")?;
     assert_eq!(variant.verification.argv, vec!["true"]);
@@ -82,8 +82,8 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     // 4. Dry-run: plans the deployment, touches neither store nor endpoint.
     let store = LocalStore::with_base(tmp.path().join("store"))?;
     let factory = move |s: &deploy::config::ServerDef,
-                        pod: &deploy::config::PodDef|
-          -> Result<Box<dyn Remote>> { create_remote(s, &pod.deploy_dir) };
+                        slot: &deploy::config::SlotDef|
+          -> Result<Box<dyn Remote>> { create_remote(s, &slot.deploy_dir) };
 
     let r_dry = push(
         &config_path,

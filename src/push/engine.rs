@@ -45,7 +45,7 @@ pub struct PushReport {
 }
 
 type RemoteFactory =
-    dyn Fn(&crate::config::ServerDef, &crate::config::PodDef) -> Result<Box<dyn Remote>>;
+    dyn Fn(&crate::config::ServerDef, &crate::config::SlotDef) -> Result<Box<dyn Remote>>;
 
 /// Run a push against `target_name`.
 ///
@@ -316,13 +316,13 @@ fn push_inner(
     validate_behavior_coverage(&desired_behaviors, &assignments, &desired_release)?;
 
     // Open a remote handle per server and run reconciliation / recovery.
-    let members = config.target_pods(target_name)?;
+    let members = config.target_slots(target_name)?;
     let mut remotes: HashMap<ServerId, Box<dyn Remote>> = HashMap::new();
     let mut helpers: HashMap<ServerId, RemoteHelper> = HashMap::new();
     let mut statuses: HashMap<ServerId, crate::remote::helper::RemoteStatus> = HashMap::new();
-    for (pod, s) in &members {
+    for (slot, s) in &members {
         let sid = ServerId::new(s.id.clone());
-        let remote = factory(s, pod)?;
+        let remote = factory(s, slot)?;
         remotes.insert(sid.clone(), remote);
     }
     for (_, s) in &members {
@@ -1034,7 +1034,7 @@ fn reconcile_pending_commits(
     // Current target membership: a pending attempt whose participants were
     // removed from the target can no longer be completed as a fleet commit.
     let members: HashSet<String> = config
-        .target_pods(target_name)?
+        .target_slots(target_name)?
         .iter()
         .map(|(_, s)| s.id.clone())
         .collect();
@@ -1958,7 +1958,7 @@ id = "s1"
 address = "a"
 user = "u"
 
-[[pods]]
+[[slots]]
 id = "p1"
 server = "s1"
 variant = "standard"
@@ -1966,7 +1966,7 @@ deploy_dir = "/srv/eng"
 
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-pods = ["p1"]
+slots = ["p1"]
 "#;
 
     const SYSTEMD_VARIANT: &str = r#"
@@ -2025,7 +2025,7 @@ id = "s1"
 address = "a"
 user = "u"
 
-[[pods]]
+[[slots]]
 id = "p1"
 server = "s1"
 variant = "standard"
@@ -2033,7 +2033,7 @@ deploy_dir = "/srv/eng"
 
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-pods = ["p1"]
+slots = ["p1"]
 "#;
 
     struct Harness {
@@ -2317,7 +2317,7 @@ pods = ["p1"]
         let remotes_base = dir.path().join("remotes");
         std::fs::create_dir_all(&remotes_base).unwrap();
         let factory = move |_s: &crate::config::ServerDef,
-                            _pod: &crate::config::PodDef|
+                            _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(
                 LocalTransport::new(remotes_base.join("s1")).unwrap(),
@@ -2446,7 +2446,7 @@ pods = ["p1"]
         let remote_path = remotes_base.join("s1");
         let factory_path = remote_path.clone();
         let factory = move |_s: &crate::config::ServerDef,
-                            _pod: &crate::config::PodDef|
+                            _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(LocalTransport::new(factory_path.clone()).unwrap()))
         };
@@ -2819,7 +2819,7 @@ pods = ["p1"]
         let armed_for_factory = armed.clone();
         let rf = h.remotes_base.clone();
         let fault_factory = move |s: &crate::config::ServerDef,
-                                  _pod: &crate::config::PodDef|
+                                  _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
             FailOnceMarkerRemote::build(rf.join(&s.id), armed_for_factory.clone())
         };
@@ -2864,7 +2864,7 @@ pods = ["p1"]
     fn push_clean(h: &RecoveryHarness) -> Result<PushReport> {
         let rf = h.remotes_base.clone();
         let clean_factory = move |s: &crate::config::ServerDef,
-                                  _pod: &crate::config::PodDef|
+                                  _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
         };

@@ -215,7 +215,7 @@ id = "s1"
 address = "a"
 user = "u"
 
-[[pods]]
+[[slots]]
 id = "p1"
 server = "s1"
 variant = "standard"
@@ -223,7 +223,7 @@ deploy_dir = "/srv"
 
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-pods = ["p1"]
+slots = ["p1"]
 "#;
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml).unwrap();

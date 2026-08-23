@@ -94,7 +94,7 @@ pub fn init_project(target: &Path, opts: &InitOptions) -> Result<InitReport> {
         None => format!("local://{}", target.join(".deploy-remote").display()),
     };
     let deploy_dir = match address.strip_prefix("local://") {
-        // The local endpoint doubles as the pod's deploy location. The
+        // The local endpoint doubles as the slot's deploy location. The
         // transport is rooted at the `local://` path; the deploy_dir must stay
         // an absolute path per validation.
         Some(p) => PathBuf::from(p),
@@ -264,8 +264,8 @@ application = "{name}"
 # `releases/v2`, editing the variant files, and bumping this line.
 release = "v1"
 
-# Servers are declared once at the top level; pods bind a server to a variant;
-# targets group pods by ID and carry the rollout policy.
+# Servers are declared once at the top level; slots bind a server to a variant;
+# targets group slots by ID and carry the rollout policy.
 #
 # LOCAL-FIRST DEFAULT: `local://<abs-path>` makes `deploy push` run against a
 # local filesystem endpoint (`.deploy-remote/` in this project) with zero SSH
@@ -277,17 +277,17 @@ id = "server-01"          # durable ID; never rename it (history keys on it)
 address = "{address}"
 user = "{user}"
 {servers}
-# A pod binds one server to one variant and names the absolute directory on
+# A slot binds one server to one variant and names the absolute directory on
 # the server where deployment state (objects, generations, `current`) lives.
-[[pods]]
+[[slots]]
 id = "app-1"
 server = "server-01"
 variant = "standard"
 deploy_dir = "{deploy_dir}"
 
-# Targets group pods by ID, in rollout order.
+# Targets group slots by ID, in rollout order.
 [targets.production]
-pods = ["app-1"]
+slots = ["app-1"]
 
 [targets.production.rollout]
 batch_size = 1
@@ -343,7 +343,7 @@ mod tests {
         let config = crate::config::Config::load(&report.target.join("deploy.toml")).unwrap();
         assert_eq!(config.application, "my-app");
         assert_eq!(config.release.as_str(), "v1");
-        assert_eq!(config.targets["production"].pods, vec!["app-1"]);
+        assert_eq!(config.targets["production"].slots, vec!["app-1"]);
         assert_eq!(
             config.variant("standard").unwrap().verification.argv,
             vec!["true"]
@@ -355,7 +355,7 @@ mod tests {
             addr.starts_with("local://") && addr.ends_with("/.deploy-remote"),
             "unexpected address {addr}"
         );
-        assert!(config.pods[0].deploy_dir.is_absolute());
+        assert!(config.slots[0].deploy_dir.is_absolute());
     }
 
     #[test]
@@ -393,8 +393,8 @@ mod tests {
             s.known_hosts.as_deref(),
             Some(Path::new("/etc/ssh/known_hosts"))
         );
-        // No local endpoint: the pod targets a conventional server path.
-        assert!(config.pods[0].deploy_dir.is_absolute());
-        assert!(config.pods[0].deploy_dir.starts_with("/srv/deploy/"));
+        // No local endpoint: the slot targets a conventional server path.
+        assert!(config.slots[0].deploy_dir.is_absolute());
+        assert!(config.slots[0].deploy_dir.starts_with("/srv/deploy/"));
     }
 }

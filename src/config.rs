@@ -6,8 +6,9 @@
 //! stem. Each variant file owns its own artifact mappings and deployment
 //! policies (activation, verification, capacity); artifact sources
 //! conventionally live beneath `releases/<name>/artifacts/`. Servers are
-//! declared once at the top level; a pod binds one server to one variant under
-//! an ID, and targets contain their rollout policy, references to member pods
+//! declared once at the top level; a deployment slot binds one server to one
+//! variant under an ID, and targets contain their rollout policy, references to
+//! member slots
 //! by ID, and their own retention (`rotation`) policy.
 //!
 //! The same local inputs always produce one target-independent release identity
@@ -307,16 +308,17 @@ pub struct ServerDef {
     pub host_key_fingerprint: Option<String>,
 }
 
-/// Binds one server to one variant under an ID. The connection details live on
-/// the top-level `[[servers]]` entry; the workload choice and its on-server
-/// location live here. Targets reference pods by ID.
+/// A deployment slot: binds one server to one variant under an ID, with an
+/// absolute `deploy_dir` on the server. The connection details live on the
+/// top-level `[[servers]]` entry; the workload choice and its on-server
+/// location live here. Targets reference slots by ID.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PodDef {
+pub struct SlotDef {
     pub id: String,
-    /// The ID of the top-level server this pod deploys onto.
+    /// The ID of the top-level server this slot deploys onto.
     pub server: String,
     pub variant: String,
-    /// Absolute directory on the server where this pod's deployment state
+    /// Absolute directory on the server where this slot's deployment state
     /// (objects, releases, generations, `current`) lives.
     pub deploy_dir: PathBuf,
 }
@@ -325,9 +327,9 @@ pub struct PodDef {
 pub struct TargetDef {
     #[serde(default)]
     pub rollout: RolloutConfig,
-    /// The IDs of this target's member pods, in deployment order. Each ID must
-    /// reference a top-level `[[pods]]` declaration.
-    pub pods: Vec<String>,
+    /// The IDs of this target's member slots, in deployment order. Each ID must
+    /// reference a top-level `[[slots]]` declaration.
+    pub slots: Vec<String>,
     /// Retention policy applied to this target's servers on every rotation.
     #[serde(default)]
     pub rotation: RotationConfig,
@@ -344,11 +346,11 @@ pub struct Config {
     #[serde(default)]
     pub pins: Vec<Pin>,
     /// Every deployable server, declared once at the top level of
-    /// `deploy.toml`; pods reference these by ID.
+    /// `deploy.toml`; slots reference these by ID.
     pub servers: Vec<ServerDef>,
-    /// Workload bindings: one pod = one server + one variant, under an ID.
-    /// Targets reference pods by ID.
-    pub pods: Vec<PodDef>,
+    /// Workload bindings: one slot = one server + one variant, under an ID.
+    /// Targets reference slots by ID.
+    pub slots: Vec<SlotDef>,
     pub targets: BTreeMap<String, TargetDef>,
     #[serde(skip)]
     variants: BTreeMap<String, VariantConfig>,
@@ -449,44 +451,44 @@ impl Config {
             }
         }
 
-        // Pods bind one declared server to one declared variant, under a unique
+        // Slots bind one declared server to one declared variant, under a unique
         // ID.
-        let mut pod_by_id = std::collections::BTreeMap::new();
+        let mut slot_by_id = std::collections::BTreeMap::new();
         let mut bound_locations: std::collections::BTreeMap<(&str, &Path), &str> =
             std::collections::BTreeMap::new();
-        for p in &self.pods {
-            if pod_by_id.insert(p.id.clone(), p).is_some() {
+        for p in &self.slots {
+            if slot_by_id.insert(p.id.clone(), p).is_some() {
                 return Err(Error::config(format!(
-                    "duplicate pod id '{}' in top-level pods",
+                    "duplicate slot id '{}' in top-level slots",
                     p.id
                 )));
             }
             if !all_server_ids.contains(&p.server) {
                 return Err(Error::config(format!(
-                    "pod '{}' references unknown server '{}'",
+                    "slot '{}' references unknown server '{}'",
                     p.id, p.server
                 )));
             }
             if !self.variants.contains_key(&p.variant) {
                 return Err(Error::config(format!(
-                    "pod '{}' references unknown variant '{}'",
+                    "slot '{}' references unknown variant '{}'",
                     p.id, p.variant
                 )));
             }
             if p.deploy_dir.is_relative() {
                 return Err(Error::config(format!(
-                    "pod '{}' deploy_dir must be an absolute path on the server",
+                    "slot '{}' deploy_dir must be an absolute path on the server",
                     p.id
                 )));
             }
             // A (server, deploy_dir) pair names one on-server deployment
             // location: its objects, releases, generations, and `current`. Two
-            // pods bound there would race over the same state.
+            // slots bound there would race over the same state.
             if let Some(existing) =
                 bound_locations.get(&(p.server.as_str(), p.deploy_dir.as_path()))
             {
                 return Err(Error::config(format!(
-                    "pods '{existing}' and '{}' bind the same location (server '{}', deploy_dir '{}'); each server+deploy_dir pair must belong to exactly one pod",
+                    "slots '{existing}' and '{}' bind the same location (server '{}', deploy_dir '{}'); each server+deploy_dir pair must belong to exactly one slot",
                     p.id,
                     p.server,
                     p.deploy_dir.display()
@@ -496,22 +498,22 @@ impl Config {
         }
 
         for (tname, target) in &self.targets {
-            if target.pods.is_empty() {
-                return Err(Error::config(format!("target '{tname}' has no pods")));
+            if target.slots.is_empty() {
+                return Err(Error::config(format!("target '{tname}' has no slots")));
             }
-            // One server runs exactly one generation, so two member pods of the
+            // One server runs exactly one generation, so two member slots of the
             // same target can never share a server.
             let mut used_servers = std::collections::HashSet::new();
-            for pid in &target.pods {
-                let Some(pod) = pod_by_id.get(pid) else {
+            for pid in &target.slots {
+                let Some(slot) = slot_by_id.get(pid) else {
                     return Err(Error::config(format!(
-                        "target '{tname}' references unknown pod '{pid}'"
+                        "target '{tname}' references unknown slot '{pid}'"
                     )));
                 };
-                if !used_servers.insert(pod.server.as_str()) {
+                if !used_servers.insert(slot.server.as_str()) {
                     return Err(Error::config(format!(
-                        "target '{tname}' has multiple pods on server '{}'",
-                        pod.server
+                        "target '{tname}' has multiple slots on server '{}'",
+                        slot.server
                     )));
                 }
             }
@@ -581,32 +583,32 @@ impl Config {
             .ok_or_else(|| Error::config(format!("unknown release variant '{name}'")))
     }
 
-    /// Resolve a target's member pods in the order they are listed, pairing
-    /// each pod with its declared server. References are validated at load
+    /// Resolve a target's member slots in the order they are listed, pairing
+    /// each slot with its declared server. References are validated at load
     /// time, so a miss here is a configuration error.
-    pub fn target_pods(&self, target_name: &str) -> Result<Vec<(&PodDef, &ServerDef)>> {
+    pub fn target_slots(&self, target_name: &str) -> Result<Vec<(&SlotDef, &ServerDef)>> {
         let target = self
             .targets
             .get(target_name)
             .ok_or_else(|| Error::not_found(format!("target '{target_name}'")))?;
-        let mut out = Vec::with_capacity(target.pods.len());
-        for pid in &target.pods {
-            let pod = self.pods.iter().find(|p| &p.id == pid).ok_or_else(|| {
+        let mut out = Vec::with_capacity(target.slots.len());
+        for pid in &target.slots {
+            let slot = self.slots.iter().find(|p| &p.id == pid).ok_or_else(|| {
                 Error::config(format!(
-                    "target '{target_name}' references unknown pod '{pid}'"
+                    "target '{target_name}' references unknown slot '{pid}'"
                 ))
             })?;
             let server = self
                 .servers
                 .iter()
-                .find(|s| s.id == pod.server)
+                .find(|s| s.id == slot.server)
                 .ok_or_else(|| {
                     Error::config(format!(
-                        "pod '{}' references unknown server '{}'",
-                        pod.id, pod.server
+                        "slot '{}' references unknown server '{}'",
+                        slot.id, slot.server
                     ))
                 })?;
-            out.push((pod, server));
+            out.push((slot, server));
         }
         Ok(out)
     }
@@ -777,7 +779,7 @@ id = "s1"
 address = "a"
 user = "u"
 
-[[pods]]
+[[slots]]
 id = "p1"
 server = "s1"
 variant = "standard"
@@ -785,7 +787,7 @@ deploy_dir = "/srv/esc"
 
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-pods = ["p1"]
+slots = ["p1"]
 "#;
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml).unwrap();
@@ -870,7 +872,7 @@ id = "s1"
 address = "a"
 user = "u"
 
-[[pods]]
+[[slots]]
 id = "p1"
 server = "s1"
 variant = "standard"
@@ -878,7 +880,7 @@ deploy_dir = "/srv/example"
 
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-pods = ["p1"]
+slots = ["p1"]
 "#;
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml).unwrap();
@@ -953,7 +955,7 @@ id = "s1"
 address = "a"
 user = "u"
 
-[[pods]]
+[[slots]]
 id = "p1"
 server = "s1"
 variant = "standard"
@@ -961,7 +963,7 @@ deploy_dir = "/srv/forced"
 
 [targets.t1]
 rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
-pods = ["p1"]
+slots = ["p1"]
 "#
         )
     }
@@ -1019,7 +1021,7 @@ id = "s1"
 address = "a"
 user = "u"
 
-[[pods]]
+[[slots]]
 id = "p1"
 server = "s1"
 variant = "standard"
@@ -1027,7 +1029,7 @@ deploy_dir = "/srv/legacy"
 
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-pods = ["p1"]
+slots = ["p1"]
 "#;
         let p = project.join("deploy.toml");
         std::fs::write(&p, legacy_toml).unwrap();
@@ -1086,53 +1088,53 @@ pods = ["p1"]
     }
 
     #[test]
-    fn targets_must_reference_declared_pods() {
+    fn targets_must_reference_declared_slots() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         write_standard_release(&project, "v1");
-        // The target references `ghost`, which no [[pods]] entry declares.
+        // The target references `ghost`, which no [[slots]] entry declares.
         let p = project.join("deploy.toml");
         std::fs::write(
             &p,
-            deploy_toml("v1").replace("pods = [\"p1\"]", "pods = [\"ghost\"]"),
+            deploy_toml("v1").replace("slots = [\"p1\"]", "slots = [\"ghost\"]"),
         )
         .unwrap();
-        let err = Config::load(&p).expect_err("unknown pod reference must fail");
+        let err = Config::load(&p).expect_err("unknown slot reference must fail");
         assert!(
-            err.to_string().contains("unknown pod 'ghost'"),
-            "error must name the unknown pod reference, got: {err}"
+            err.to_string().contains("unknown slot 'ghost'"),
+            "error must name the unknown slot reference, got: {err}"
         );
     }
 
     #[test]
-    fn pods_must_reference_known_servers_and_variants() {
+    fn slots_must_reference_known_servers_and_variants() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         write_standard_release(&project, "v1");
 
-        // A pod bound to a server that does not exist.
+        // A slot bound to a server that does not exist.
         let p = project.join("deploy.toml");
         std::fs::write(
             &p,
             deploy_toml("v1").replace("server = \"s1\"", "server = \"ghost\""),
         )
         .unwrap();
-        let err = Config::load(&p).expect_err("pod with unknown server must fail");
+        let err = Config::load(&p).expect_err("slot with unknown server must fail");
         assert!(
             err.to_string()
                 .contains("references unknown server 'ghost'"),
             "got: {err}"
         );
 
-        // A pod bound to a variant the release directory does not declare.
+        // A slot bound to a variant the release directory does not declare.
         std::fs::write(
             &p,
             deploy_toml("v1").replace("variant = \"standard\"", "variant = \"ghost\""),
         )
         .unwrap();
-        let err = Config::load(&p).expect_err("pod with unknown variant must fail");
+        let err = Config::load(&p).expect_err("slot with unknown variant must fail");
         assert!(
             err.to_string()
                 .contains("references unknown variant 'ghost'"),
@@ -1141,28 +1143,28 @@ pods = ["p1"]
     }
 
     #[test]
-    fn pods_on_the_same_server_never_share_a_deploy_dir() {
+    fn slots_on_the_same_server_never_share_a_deploy_dir() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         write_standard_release(&project, "v1");
         let p = project.join("deploy.toml");
 
-        // Second pod, same server, SAME deploy_dir: rejected.
-        let dup = "\n[[pods]]\nid = \"p2\"\nserver = \"s1\"\nvariant = \"standard\"\ndeploy_dir = \"/srv/forced\"\n\n[targets.t1]";
+        // Second slot, same server, SAME deploy_dir: rejected.
+        let dup = "\n[[slots]]\nid = \"p2\"\nserver = \"s1\"\nvariant = \"standard\"\ndeploy_dir = \"/srv/forced\"\n\n[targets.t1]";
         std::fs::write(&p, deploy_toml("v1").replace("\n[targets.t1]", dup)).unwrap();
         let err = Config::load(&p).expect_err("shared server+deploy_dir must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("same location") && msg.contains("p1") && msg.contains("p2"),
-            "error must name the colliding pods, got: {msg}"
+            "error must name the colliding slots, got: {msg}"
         );
 
-        // Second pod, same server, DIFFERENT deploy_dir: accepted.
-        let ok = "\n[[pods]]\nid = \"p2\"\nserver = \"s1\"\nvariant = \"standard\"\ndeploy_dir = \"/srv/other\"\n\n[targets.t1]";
+        // Second slot, same server, DIFFERENT deploy_dir: accepted.
+        let ok = "\n[[slots]]\nid = \"p2\"\nserver = \"s1\"\nvariant = \"standard\"\ndeploy_dir = \"/srv/other\"\n\n[targets.t1]";
         std::fs::write(&p, deploy_toml("v1").replace("\n[targets.t1]", ok)).unwrap();
         let cfg = Config::load(&p).expect("distinct deploy_dir on the same server is valid");
-        assert_eq!(cfg.pods.len(), 2);
+        assert_eq!(cfg.slots.len(), 2);
     }
 
     #[test]

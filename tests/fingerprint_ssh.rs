@@ -196,7 +196,7 @@ fn with_fake_root<T>(root: &Path, prefix: &str, f: impl FnOnce() -> T) -> T {
     result
 }
 
-// ---- project fixtures (single pod, one standard variant) -------------------
+// ---- project fixtures (single slot, one standard variant) -------------------
 
 fn write_file(path: &Path, content: &str) {
     if let Some(parent) = path.parent() {
@@ -258,7 +258,7 @@ address = "{address}"
 user = "deploy"
 port = 2222
 
-[[pods]]
+[[slots]]
 id = "p1"
 server = "server-01"
 variant = "standard"
@@ -266,12 +266,12 @@ deploy_dir = "{deploy_dir}"
 
 [targets.production]
 rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
-pods = ["p1"]
+slots = ["p1"]
 "#
     )
 }
 
-/// Set up a single-pod project (deploy.toml + variant file + artifact inputs),
+/// Set up a single-slot project (deploy.toml + variant file + artifact inputs),
 /// return the loaded config and the config path.
 fn setup_project(proj: &Path, address: &str, deploy_dir: &str) -> (Config, PathBuf) {
     write_file(
@@ -345,13 +345,13 @@ fn fingerprint_only_dry_run_leaves_remote_untouched() -> Result<()> {
 
             let fp = fake.fingerprint.clone();
             let factory = move |s: &deploy::config::ServerDef,
-                                pod: &deploy::config::PodDef|
+                                slot: &deploy::config::SlotDef|
                   -> Result<Box<dyn Remote>> {
                 Ok(Box::new(SshTransport::new(
                     &s.user,
                     &s.address,
                     s.port,
-                    &pod.deploy_dir,
+                    &slot.deploy_dir,
                     None,
                     Some(&fp),
                 )?))
@@ -406,13 +406,13 @@ fn fingerprint_only_first_push_succeeds() -> Result<()> {
 
             let fp = fake.fingerprint.clone();
             let factory = move |s: &deploy::config::ServerDef,
-                                pod: &deploy::config::PodDef|
+                                slot: &deploy::config::SlotDef|
                   -> Result<Box<dyn Remote>> {
                 Ok(Box::new(SshTransport::new(
                     &s.user,
                     &s.address,
                     s.port,
-                    &pod.deploy_dir,
+                    &slot.deploy_dir,
                     None,
                     Some(&fp),
                 )?))
@@ -488,13 +488,13 @@ fn fingerprint_only_repeat_push_is_idempotent() -> Result<()> {
 
             let fp = fake.fingerprint.clone();
             let factory = move |s: &deploy::config::ServerDef,
-                                pod: &deploy::config::PodDef|
+                                slot: &deploy::config::SlotDef|
                   -> Result<Box<dyn Remote>> {
                 Ok(Box::new(SshTransport::new(
                     &s.user,
                     &s.address,
                     s.port,
-                    &pod.deploy_dir,
+                    &slot.deploy_dir,
                     None,
                     Some(&fp),
                 )?))

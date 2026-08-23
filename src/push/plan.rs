@@ -30,7 +30,7 @@ pub fn plan_assignments(
     if !config.targets.contains_key(target_name) {
         return Err(Error::not_found(format!("target '{target_name}'")));
     }
-    let members = config.target_pods(target_name)?;
+    let members = config.target_slots(target_name)?;
     let server_ids: Vec<ServerId> = members
         .iter()
         .map(|(_, s)| ServerId::new(s.id.clone()))
@@ -39,11 +39,11 @@ pub fn plan_assignments(
     match pref {
         PushRef::Head => {
             let mut out = Vec::new();
-            for (pod, sdef) in &members {
+            for (slot, sdef) in &members {
                 let sid = ServerId::new(sdef.id.clone());
-                let variant = VariantName::new(pod.variant.clone());
-                let tree = variant_trees.get(&pod.variant).cloned().ok_or_else(|| {
-                    Error::plan(format!("variant '{}' not materialized", pod.variant))
+                let variant = VariantName::new(slot.variant.clone());
+                let tree = variant_trees.get(&slot.variant).cloned().ok_or_else(|| {
+                    Error::plan(format!("variant '{}' not materialized", slot.variant))
                 })?;
                 out.push(PlannedAssignment {
                     server_id: sid,
@@ -72,8 +72,8 @@ pub fn plan_assignments(
             }
             let mut out = Vec::new();
             // The variant comes from the historical snapshot, not the current
-            // pod binding.
-            for (_pod, sdef) in &members {
+            // slot binding.
+            for (_slot, sdef) in &members {
                 let sid = ServerId::new(sdef.id.clone());
                 let a = entry.servers.get(&sid).ok_or_else(|| {
                     Error::rollback(format!("server {sid} missing in fleet snapshot"))
@@ -98,11 +98,14 @@ pub fn plan_assignments(
                 .read_release(release)
                 .map_err(|_| Error::rollback(format!("release {release} not available locally")))?;
             let mut out = Vec::new();
-            for (pod, sdef) in &members {
+            for (slot, sdef) in &members {
                 let sid = ServerId::new(sdef.id.clone());
-                let variant = VariantName::new(pod.variant.clone());
-                let tree = rec.variants.get(&pod.variant).cloned().ok_or_else(|| {
-                    Error::rollback(format!("release {release} lacks variant '{}'", pod.variant))
+                let variant = VariantName::new(slot.variant.clone());
+                let tree = rec.variants.get(&slot.variant).cloned().ok_or_else(|| {
+                    Error::rollback(format!(
+                        "release {release} lacks variant '{}'",
+                        slot.variant
+                    ))
                 })?;
                 out.push(PlannedAssignment {
                     server_id: sid,

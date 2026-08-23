@@ -6,8 +6,8 @@ application = "example"
 # (e.g. `standard`); artifact sources live beneath its `artifacts/` tree.
 release = "v1"
 
-# Servers are declared once; a pod binds one server to one variant, and
-# targets reference pods by ID.
+# Servers are declared once; a slot binds one server to one variant, and
+# targets reference slots by ID.
 [[servers]]
 id = "server-01"            # durable ID; never rename it
 address = "server-01.example.com"
@@ -18,13 +18,13 @@ id = "server-02"
 address = "server-02.example.com"
 user = "deploy"
 
-[[pods]]
+[[slots]]
 id = "app-1"
 server = "server-01"
 variant = "standard"
 deploy_dir = "/srv/deploy/example"
 
-[[pods]]
+[[slots]]
 id = "app-2"
 server = "server-02"
 variant = "standard"
@@ -32,7 +32,7 @@ deploy_dir = "/srv/deploy/example"
 
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-pods = ["app-1", "app-2"]
+slots = ["app-1", "app-2"]
 
 # Retention belongs to the target: how aggressively its servers rotate.
 [targets.production.rotation.per_server]

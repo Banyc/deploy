@@ -11,7 +11,7 @@ use crate::remote::transport::{LocalTransport, Remote};
 /// Build the remote handle for one server from the configuration.
 ///
 /// Production pushes use the SSH transport keyed by `ServerDef.address`,
-/// `ServerDef.user`, and the pod's absolute `deploy_dir`, with strict host-key
+/// `ServerDef.user`, and the slot's absolute `deploy_dir`, with strict host-key
 /// verification. The local transport is reserved for tests and for servers whose
 /// `address` is an explicit `local://` path, which routes the transport to that
 /// exact filesystem location (an explicit local endpoint) rather than the

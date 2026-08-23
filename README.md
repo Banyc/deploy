@@ -8,7 +8,7 @@ deploy push production
 
 Configure a named target once, then push your local files to every server in
 that target with one command. Each server gets an immutable release stored
-under each pod's `deploy_dir`, activation is atomic per server (an atomically
+under each deployment slot's `deploy_dir`, activation is atomic per server (an atomically
 swapped `current` symlink), verification runs after activation, and old
 artifacts are rotated automatically.
 
@@ -44,7 +44,7 @@ What it generates (also visible in `deploy init --help`):
 
 ```text
 my-app/
-  deploy.toml                          # schema v1: one server, one pod, target `production`
+  deploy.toml                          # schema v1: one server, one slot, target `production`
   releases/v1/standard.toml            # the `standard` variant (mappings + policies)
   releases/v1/artifacts/build/output/app/hello   # placeholder artifact source
   .deploy-remote/                      # local deployment endpoint (git-ignored)
@@ -105,7 +105,7 @@ deploy push production release/rel-41da2f63:current   # same, but keep each serv
 ## Project structure (forced)
 
 ```text
-deploy.toml                    # names the active release, servers, pods, targets
+deploy.toml                    # names the active release, servers, slots, targets
 releases/<name>/              # the release directory named by `release:`
 releases/<name>/<variant>.toml  # every *.toml file here is a variant (file stem = name)
 releases/<name>/artifacts/    # artifact sources referenced by variant mappings
@@ -116,8 +116,8 @@ releases/<name>/artifacts/    # artifact sources referenced by variant mappings
 - A **variant** is a `*.toml` file directly inside the release directory,
   named by its file stem. It owns its artifact mappings and deployment
   policies (activation, verification, capacity).
-- A **pod** binds one server to one variant under an ID and names the
-  absolute `deploy_dir` on the server. A **target** groups pods (in rollout
+- A **deployment slot** binds one server to one variant under an ID and names
+  the absolute `deploy_dir` on the server. A **target** groups slots (in rollout
   order) and carries the rollout and rotation policy.
 - Retention (`rotation`) belongs to the target, not the variant.
 
@@ -128,7 +128,7 @@ schema_version = 1
 application = "my-app"
 release = "v1"               # active release dir under releases/
 
-[[servers]]                  # declared once; pods reference by id
+[[servers]]                  # declared once; slots reference by id
 id = "server-01"             # durable ID; never rename it
 address = "local:///abs/path"   # or a hostname for SSH
 user = "deploy"
@@ -136,15 +136,15 @@ user = "deploy"
 # known_hosts = "/etc/ssh/known_hosts"   # absolute path
 # host_key_fingerprint = "SHA256:..."
 
-[[pods]]                     # one server + one variant under an id
+[[slots]]                     # one server + one variant under an id
 id = "app-1"
 server = "server-01"
 variant = "standard"
 deploy_dir = "/srv/deploy/my-app"   # absolute path on the server
 
-[targets.production]         # targets group pods and set policy
+[targets.production]         # targets group slots and set policy
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-pods = ["app-1"]
+slots = ["app-1"]
 
 [targets.production.rotation.per_server]   # retention is per target
 keep_distinct_artifacts = 5
@@ -180,16 +180,16 @@ reserve_percent = 0
 ```
 
 Validation is strict: `deploy_dir` and `known_hosts` must be absolute paths,
-server/pod IDs must be unique, targets must reference declared pods, and each
-pod's variant must exist. A config that fails validation is rejected at load
+server/slot IDs must be unique, targets must reference declared slots, and each
+slot's variant must exist. A config that fails validation is rejected at load
 time, before anything is touched.
 
 ## Maintenance
 
-- **Add a variant**: add `releases/<release>/<new-name>.toml` and bind a pod
+- **Add a variant**: add `releases/<release>/<new-name>.toml` and bind a slot
   to it (`variant = "<new-name>"`).
-- **Add a server**: add a `[[servers]]` entry, a `[[pods]]` entry binding it to
-  a variant and absolute `deploy_dir`, and add the pod ID to the target(s).
+- **Add a server**: add a `[[servers]]` entry, a `[[slots]]` entry binding it to
+  a variant and absolute `deploy_dir`, and add the slot ID to the target(s).
 - **Cut a release**: copy the release directory (e.g. `releases/v1` →
   `releases/v2`), edit the variant files (new mappings, verification, etc.),
   and set `release = "v2"` in `deploy.toml`. Old releases stay deployable via
@@ -203,7 +203,7 @@ time, before anything is touched.
 ## Requirements on servers (SSH)
 
 - SSH access as the configured `user` with strict host-key checking.
-- The deployment account must be able to create each pod's `deploy_dir`
+- The deployment account must be able to create each slot's `deploy_dir`
   (e.g. `/srv/deploy/my-app`) — provision it once if not.
 
 ## Where things live locally

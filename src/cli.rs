@@ -25,7 +25,7 @@ use std::path::PathBuf;
     long_about = "Deploy your local files to every server in a named target with one command.\n\
 \n\
 PROJECT STRUCTURE (forced):\n\
-  deploy.toml                    names the active release, servers, pods, targets\n\
+  deploy.toml                    names the active release, servers, slots, targets\n\
   releases/<name>/              the release directory named by `release:` in deploy.toml\n\
   releases/<name>/<variant>.toml   every *.toml file here is a variant (file stem = name)\n\
   releases/<name>/artifacts/    artifact sources referenced by variant mappings\n\
@@ -55,7 +55,7 @@ enum Command {
 \n\
 Creates (never clobbers; the target must not already contain deploy.toml or a\n\
 releases/ tree):\n\
-  deploy.toml                        schema v1 config: one server, one pod, target `production`\n\
+  deploy.toml                        schema v1 config: one server, one slot, target `production`\n\
   releases/v1/standard.toml          the `standard` variant (mappings + policies)\n\
   releases/v1/artifacts/build/output/app/hello   placeholder artifact source\n\
   .deploy-remote/                    LOCAL deployment endpoint (see below)\n\
@@ -230,8 +230,8 @@ where
     std::fs::create_dir_all(&remotes_base).ok();
 
     let factory = move |s: &crate::config::ServerDef,
-                        pod: &crate::config::PodDef|
-          -> Result<Box<dyn Remote>> { create_remote(s, &pod.deploy_dir) };
+                        slot: &crate::config::SlotDef|
+          -> Result<Box<dyn Remote>> { create_remote(s, &slot.deploy_dir) };
 
     match cli.command {
         Command::Push {
