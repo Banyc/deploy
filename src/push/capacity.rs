@@ -99,3 +99,256 @@ fn tree_size_on_host(root: &Path) -> u64 {
         .filter_map(|e| e.metadata().ok().filter(|m| m.is_file()).map(|m| m.len()))
         .sum()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{
+        ArtifactRef, DeploymentId, OperationId, PlacementSlotId, ReleaseId, TreeDigest, VariantName,
+    };
+    use crate::push::plan::PlannedAssignment;
+    use crate::remote::helper::RemoteHelper;
+    use crate::remote::transport::{ExecOutcome, LocalTransport, Remote, RemoteEntry, RemoteMeta};
+    use crate::store::local::LocalStore;
+    use std::path::{Path, PathBuf};
+
+    /// A transport wrapper that reports a FIXED number of available bytes,
+    /// letting a test control the headroom the capacity check sees
+    /// deterministically.
+    struct FakeCapacityRemote {
+        inner: LocalTransport,
+        avail: u64,
+    }
+
+    impl FakeCapacityRemote {
+        fn build(base: PathBuf, avail: u64) -> Result<Box<dyn Remote>> {
+            Ok(Box::new(FakeCapacityRemote {
+                inner: LocalTransport::new(base)?,
+                avail,
+            }))
+        }
+    }
+
+    impl Remote for FakeCapacityRemote {
+        fn root(&self) -> &Path {
+            self.inner.root()
+        }
+        fn read(&self, rel: &Path) -> Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &Path) -> Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &Path) -> Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &Path) -> Result<PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &Path) -> Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &Path) -> Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &Path) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn exec(&self, argv: &[String], timeout: std::time::Duration) -> Result<ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+        fn available_bytes(&self) -> Result<u64> {
+            Ok(self.avail)
+        }
+    }
+
+    fn cfg() -> Config {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        let variant_toml = r#"
+[artifact]
+mappings = []
+
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+deploy_dir = "/srv"
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+        std::fs::write(release_dir.join("standard.toml"), variant_toml).unwrap();
+        let deploy_toml = r#"
+schema_version = 1
+application = "cap"
+release = "v1"
+
+[targets.t1.rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[targets.t1.rotation.fleet]
+protect_deployments = 1
+
+[[servers]]
+id = "s1"
+address = "a"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#;
+        let p = project.join("deploy.toml");
+        std::fs::write(&p, deploy_toml).unwrap();
+        Config::load(&p).unwrap()
+    }
+
+    /// The capacity headroom is the LARGER of `reserve_bytes` and
+    /// `reserve_percent` of the available space (requirement.md: "reserves the
+    /// larger of capacity.reserve_bytes and capacity.reserve_percent"). With a
+    /// 6000-byte tree on a 10000-byte filesystem, 4500 bytes of headroom
+    /// fails while the equivalent 20% (2000 bytes) would pass; 45% (4500
+    /// bytes) fails while 1000 bytes would pass — pinning that BOTH halves of
+    /// the max() participate and neither is ignored.
+    #[test]
+    fn capacity_reserves_the_larger_of_bytes_and_percent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        // Fabricate a local object whose tree totals exactly 6000 bytes.
+        let tree = TreeDigest::new("tree-6000".to_string());
+        let obj_root = store.object_root(&tree);
+        std::fs::create_dir_all(obj_root.join("app")).unwrap();
+        std::fs::write(obj_root.join("app/file"), vec![b'x'; 6000]).unwrap();
+
+        // A remote reporting exactly 10000 bytes available; provisioned so the
+        // protected-rotation pass inside the failing branch can run.
+        let remote = FakeCapacityRemote::build(dir.path().join("remote"), 10000).unwrap();
+        remote.provision_layout().unwrap();
+        let helper = RemoteHelper::new(remote.as_ref());
+        let helpers = HashMap::from([(PlacementSlotId::new("p1".to_string()), helper)]);
+
+        let mut config = cfg();
+        let rotation = config.targets["t1"].rotation.clone();
+        let assignment = PlannedAssignment {
+            placement_slot: PlacementSlotId::new("p1".to_string()),
+            artifact: ArtifactRef {
+                release: ReleaseId::new("rel-sha256-cap".to_string()),
+                variant: VariantName::new("standard".to_string()),
+                tree: tree.clone(),
+            },
+        };
+        let op_id = OperationId::generate();
+        let deployment_id = DeploymentId::generate();
+
+        // Comfortable: 1000 bytes / 10% -> reserve 1000 -> 7000 <= 10000.
+        config.servers[0].capacity = crate::config::CapacityConfig {
+            reserve_bytes: 1000,
+            reserve_percent: 10,
+        };
+        capacity_preflight(
+            &store,
+            &[assignment.clone()],
+            &helpers,
+            &op_id,
+            &deployment_id,
+            &config,
+            &rotation,
+        )
+        .expect("small reserve fits");
+
+        // reserve_bytes dominates: 4500 bytes -> 10500 > 10000 fails, while
+        // the 20% (2000 bytes) alone would fit.
+        config.servers[0].capacity = crate::config::CapacityConfig {
+            reserve_bytes: 4500,
+            reserve_percent: 20,
+        };
+        let err = capacity_preflight(
+            &store,
+            &[assignment.clone()],
+            &helpers,
+            &op_id,
+            &deployment_id,
+            &config,
+            &rotation,
+        )
+        .expect_err("bytes-half must be honored");
+        assert!(
+            err.to_string().contains("insufficient capacity"),
+            "expected a capacity preflight failure, got: {err}"
+        );
+
+        // reserve_percent dominates: 45% (4500 bytes) -> fails, while the
+        // 1000 bytes alone would fit.
+        config.servers[0].capacity = crate::config::CapacityConfig {
+            reserve_bytes: 1000,
+            reserve_percent: 45,
+        };
+        let err = capacity_preflight(
+            &store,
+            &[assignment.clone()],
+            &helpers,
+            &op_id,
+            &deployment_id,
+            &config,
+            &rotation,
+        )
+        .expect_err("percent-half must be honored");
+        assert!(
+            err.to_string().contains("insufficient capacity"),
+            "expected a capacity preflight failure, got: {err}"
+        );
+
+        // A tree ALREADY on the server skips the headroom check entirely.
+        remote
+            .create_dir_all(&crate::layout::tree_root(tree.as_str()))
+            .unwrap();
+        config.servers[0].capacity = crate::config::CapacityConfig {
+            reserve_bytes: u64::MAX,
+            reserve_percent: 100,
+        };
+        capacity_preflight(
+            &store,
+            &[assignment.clone()],
+            &helpers,
+            &op_id,
+            &deployment_id,
+            &config,
+            &rotation,
+        )
+        .expect("an already-present tree skips the headroom check");
+    }
+}

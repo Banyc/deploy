@@ -1513,6 +1513,58 @@ slots = ["p1"]
         assert!(cfg.servers[0].host_key_fingerprint.is_none());
     }
 
+    /// `local://` addresses never perform host verification, so they are
+    /// EXEMPT from the exactly-one host-identity rule in BOTH directions:
+    /// an identity source may be absent (already pinned above) or present.
+    /// A local endpoint with `known_hosts`, `host_key_fingerprint`, or BOTH
+    /// configured still loads — the local exemption applies regardless of
+    /// what identity fields the server entry carries.
+    #[test]
+    fn local_address_with_identity_configured_is_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        let p = project.join("deploy.toml");
+        let local = deploy_toml("v1")
+            .replace("address = \"a\"", "address = \"local:///srv/forced\"")
+            .replace("host_key_fingerprint = \"SHA256:test\"\n", "");
+
+        // local:// + known_hosts: allowed (the local exemption swallows the
+        // otherwise-valid identity source).
+        let with_kh = local.replace(
+            "user = \"u\"",
+            "user = \"u\"\nknown_hosts = \"/etc/ssh/known_hosts\"",
+        );
+        std::fs::write(&p, with_kh).unwrap();
+        let cfg = Config::load(&p).expect("local:// + known_hosts is allowed");
+        assert!(cfg.servers[0].address.starts_with("local://"));
+        assert!(cfg.servers[0].known_hosts.is_some());
+
+        // local:// + host_key_fingerprint: allowed.
+        let with_fp = local.replace(
+            "user = \"u\"",
+            "user = \"u\"\nhost_key_fingerprint = \"SHA256:test\"",
+        );
+        std::fs::write(&p, with_fp).unwrap();
+        let cfg = Config::load(&p).expect("local:// + fingerprint is allowed");
+        assert!(cfg.servers[0].host_key_fingerprint.is_some());
+
+        // local:// + BOTH: still allowed — the ambiguity rule is scoped to
+        // SSH addresses only (the exact same pair is rejected above for an
+        // SSH address).
+        let with_both = deploy_toml("v1")
+            .replace("address = \"a\"", "address = \"local:///srv/forced\"")
+            .replace(
+                "host_key_fingerprint = \"SHA256:test\"",
+                "host_key_fingerprint = \"SHA256:test\"\nknown_hosts = \"/etc/ssh/known_hosts\"",
+            );
+        std::fs::write(&p, with_both).unwrap();
+        let cfg = Config::load(&p).expect("local:// + both identities is allowed");
+        assert!(cfg.servers[0].known_hosts.is_some());
+        assert!(cfg.servers[0].host_key_fingerprint.is_some());
+    }
+
     /// Every user-written config surface is strict: an unknown key fails at
     /// load time with serde's standard wording instead of being silently
     /// ignored (`deny_unknown_fields` on every config struct).

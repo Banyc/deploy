@@ -2968,4 +2968,412 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(h.store.read_attempts("t1").unwrap().len(), 1);
         assert_eq!(h.store.read_snapshots("t1").unwrap().len(), 1);
     }
+
+    // ---- Verification-failure rollback + observed refresh -----------------
+    //
+    // An attempt whose ACTIVATION succeeds but whose VERIFICATION fails must
+    // compensate back to the PRIOR generation (restoring the prior behavior
+    // contract), report `FailedRolledBack`, and refresh `observed.json` with
+    // the ACTUAL restored state — the prior generation and artifact — never
+    // the desired (failed) artifact. This is the dedicated verification-
+    // failure variant the integration `end_to_end_push_rollback` does NOT
+    // exercise (that test only pushes/rolls back successful states).
+
+    #[test]
+    fn verification_failure_compensates_prior_and_observed_reflects_actual() {
+        let h = RecoveryHarness::new();
+        let id1 = DeploymentId::new("deploy-verify-fail-baseline".to_string());
+        let r1 = push_main_with_id(&h, &id1).unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+        let prior = r1.attempt.as_ref().expect("attempt recorded").slots
+            [&PlacementSlotId::new("p1")]
+            .clone();
+        let prior_gen = prior.generation.clone().expect("prior generation");
+        let prior_tree = prior.artifact.tree.clone();
+        let prior_release = prior.artifact.release.clone();
+        // Behavior digest A (verification argv "true") frozen into f0.
+        let var_a = h.config.variant("standard").unwrap();
+        let a_digest = crate::release::behavior_contract_digest(&crate::model::BehaviorContract {
+            activation: var_a.activation.clone(),
+            verification: var_a.verification.clone(),
+        });
+
+        // v2: verification argv flips to "false" AND the artifact content
+        // changes, so the desired tree + release differ from the prior state
+        // and the push is not an up-to-date no-op.
+        let project_root = h.config.project_root(&h.cfg_path);
+        let variant_path = project_root
+            .join("releases")
+            .join("v1")
+            .join("standard.toml");
+        let new_variant = std::fs::read_to_string(&variant_path)
+            .unwrap()
+            .replace("argv = [\"true\"]", "argv = [\"false\"]");
+        assert_ne!(new_variant, std::fs::read_to_string(&variant_path).unwrap());
+        std::fs::write(&variant_path, new_variant).unwrap();
+        std::fs::write(
+            project_root
+                .join("releases")
+                .join("v1")
+                .join("artifacts")
+                .join("build/output/app/server"),
+            "v2\n",
+        )
+        .unwrap();
+        let config2 = Config::load(&h.cfg_path).unwrap();
+        let var_b = config2.variant("standard").unwrap();
+        let b_digest = crate::release::behavior_contract_digest(&crate::model::BehaviorContract {
+            activation: var_b.activation.clone(),
+            verification: var_b.verification.clone(),
+        });
+        assert_ne!(a_digest, b_digest, "behaviors must differ");
+
+        let id2 = DeploymentId::new("deploy-verify-fail".to_string());
+        let target = config2.targets.get("t1").expect("harness target");
+        let op_id = OperationId::new(format!("op-{}", id2.as_str()));
+        let rf = h.remotes_base.clone();
+        let factory = move |s: &crate::config::ServerDef,
+                            _slot: &crate::config::SlotDef|
+              -> Result<Box<dyn Remote>> {
+            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        };
+        let r2 = push_inner(
+            &config2.project_root(&h.cfg_path),
+            &h.store,
+            &factory,
+            "t1",
+            &PushRef::Head,
+            &id2,
+            &op_id,
+            &config2,
+            target,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            r2.status,
+            Some(DeploymentStatus::FailedRolledBack),
+            "a verification failure after activation must roll the whole attempt back, got {:?}",
+            r2.status
+        );
+
+        // The report's ACTUAL per-slot state reflects the restored PRIOR
+        // generation and artifact, never the desired v2 tree.
+        let actual =
+            &r2.attempt.as_ref().expect("attempt recorded").slots[&PlacementSlotId::new("p1")];
+        assert_eq!(actual.generation, Some(prior_gen.clone()));
+        assert_eq!(
+            actual.artifact.tree, prior_tree,
+            "the actual artifact must be the restored prior tree, not the desired v2 tree"
+        );
+
+        // results.json records the compensation: the slot FAILED (verification)
+        // and was compensated inside the per-server pipeline — outcome `Failed`
+        // with `compensated: true`, at the PRIOR generation. (`Restored` is
+        // reserved for Activated slots compensated by the failure-policy pass.)
+        let results = h.store.read_results(id2.as_str()).unwrap();
+        let res = &results.slots[&PlacementSlotId::new("p1")];
+        assert_eq!(res.outcome, ServerOutcomeKind::Failed);
+        assert!(res.compensated);
+        assert_eq!(res.generation, Some(prior_gen.clone()));
+
+        // The remote `current` points at the PRIOR generation, whose stored
+        // assignment carries the PRIOR behavior digest (A), never B: the
+        // prior behavior contract was restored, not the desired one.
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let status = RemoteHelper::new(&remote).status().unwrap();
+        let cur = status
+            .current_generation
+            .expect("compensation must restore current");
+        assert_eq!(cur.as_str(), prior_gen.as_str());
+        let assignment: crate::remote::helper::GenerationAssignment = serde_json::from_slice(
+            &remote
+                .read(
+                    &crate::layout::generations()
+                        .join(&cur)
+                        .join("assignment.json"),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(assignment.behavior_sha256, a_digest);
+        assert_ne!(
+            assignment.behavior_sha256, b_digest,
+            "the restored generation must carry the PRIOR behavior, not the desired one"
+        );
+
+        // OBSERVED REFRESH: observed.json carries the ACTUAL per-slot state —
+        // the restored prior generation/artifact — and attributes the failed
+        // attempt as the last deployment. It must NOT reflect the desired
+        // (failed) v2 tree.
+        let observed = h.store.read_observed("t1").unwrap();
+        let os = &observed.slots[&PlacementSlotId::new("p1")];
+        assert_eq!(os.generation, Some(prior_gen.clone()));
+        let oa = os.artifact.as_ref().expect("observed artifact");
+        assert_eq!(
+            oa.tree, prior_tree,
+            "observed tree must be the restored prior tree"
+        );
+        assert_eq!(oa.release, prior_release);
+        let desired_tree = r2.attempt.as_ref().unwrap().desired[&PlacementSlotId::new("p1")]
+            .assignment
+            .artifact
+            .tree
+            .clone();
+        assert_ne!(
+            oa.tree, desired_tree,
+            "observed must NOT reflect the desired (failed) v2 tree"
+        );
+        assert_eq!(os.last_deployment, Some(id2.clone()));
+        // The per-server record mirrors the observed slot state.
+        let server_state = h.store.read_server("s1").unwrap();
+        assert_eq!(
+            server_state
+                .last_observed
+                .as_ref()
+                .and_then(|o| o.generation.clone()),
+            Some(prior_gen.clone())
+        );
+
+        // The failed attempt is terminal FailedRolledBack, produced no
+        // snapshot, and the f0 snapshot/ref are untouched.
+        assert_eq!(
+            latest_status(&h, id2.as_str()),
+            DeploymentStatus::FailedRolledBack
+        );
+        let snapshots = h.store.read_snapshots("t1").unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].deployment_id, id1);
+        assert_eq!(
+            h.store.read_last_successful("t1").as_deref(),
+            Some(id1.as_str())
+        );
+        assert_eq!(h.store.read_attempts("t1").unwrap().len(), 2);
+    }
+
+    // ---- Batched stop_on_failure with batch_size > 1 ---------------------
+    //
+    // The integration `stop_on_failure_records_all_servers` test uses
+    // batch_size = 1 and fails the FIRST server. Here the FIRST batch
+    // advances successfully, a LATER batch fails, and stop_on_failure must
+    // not start any subsequent batch — while the attempt still records EVERY
+    // server (advanced, failed, and skipped alike).
+
+    #[test]
+    fn batched_stop_on_failure_stops_after_failing_batch() {
+        const BATCHED_TOML: &str = r#"
+schema_version = 1
+application = "batched"
+release = "v1"
+
+[targets.t1.rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[targets.t1.rotation.fleet]
+protect_deployments = 2
+
+[[servers]]
+id = "s1"
+address = "a"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s2"
+address = "b"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s3"
+address = "c"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s4"
+address = "d"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[targets.t1]
+rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        // Variant `good` (sorts first, so its slots come first in the plan)
+        // declares p1/p2 with PASSING verification; variant `z-failing`
+        // declares p3/p4 with FAILING verification.
+        let good = r#"
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+deploy_dir = "/srv/p1"
+
+[[slots]]
+id = "p2"
+server = "s2"
+target = "t1"
+deploy_dir = "/srv/p2"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+        let z_failing = r#"
+[[slots]]
+id = "p3"
+server = "s3"
+target = "t1"
+deploy_dir = "/srv/p3"
+
+[[slots]]
+id = "p4"
+server = "s4"
+target = "t1"
+deploy_dir = "/srv/p4"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["false"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+        std::fs::write(release_dir.join("good.toml"), good).unwrap();
+        std::fs::write(release_dir.join("z-failing.toml"), z_failing).unwrap();
+        let artifacts = release_dir.join("artifacts");
+        std::fs::create_dir_all(artifacts.join("build/output/app")).unwrap();
+        std::fs::write(artifacts.join("build/output/app/server"), "v1\n").unwrap();
+
+        let cfg_path = project.join("deploy.toml");
+        std::fs::write(&cfg_path, BATCHED_TOML).unwrap();
+        let config = Config::load(&cfg_path).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let remotes_base = dir.path().join("remotes");
+        std::fs::create_dir_all(&remotes_base).unwrap();
+
+        let id = DeploymentId::new("deploy-batched-stop".to_string());
+        let project_root = config.project_root(&cfg_path);
+        let target = config.targets.get("t1").expect("target t1");
+        let op_id = OperationId::new(format!("op-{}", id.as_str()));
+        let rf = remotes_base.clone();
+        let factory = move |s: &crate::config::ServerDef,
+                            _slot: &crate::config::SlotDef|
+              -> Result<Box<dyn Remote>> {
+            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        };
+        let r = push_inner(
+            &project_root,
+            &store,
+            &factory,
+            "t1",
+            &PushRef::Head,
+            &id,
+            &op_id,
+            &config,
+            target,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            r.status,
+            Some(DeploymentStatus::FailedRolledBack),
+            "a failing later batch under stop_on_failure must roll the attempt back, got {:?}",
+            r.status
+        );
+
+        // The attempt records ALL four servers (advanced, failed, skipped).
+        let attempt = r.attempt.expect("attempt recorded on failure");
+        assert_eq!(attempt.slot_ids.len(), 4);
+        for sid in ["p1", "p2", "p3", "p4"] {
+            assert!(
+                attempt.slots.contains_key(&PlacementSlotId::new(sid)),
+                "slot {sid} missing from attempt"
+            );
+        }
+        let results = store.read_results(id.as_str()).unwrap();
+        assert_eq!(results.slots.len(), 4);
+        // The first batch advanced, then compensated back (no prior state ->
+        // `current` removed): Restored.
+        assert_eq!(
+            results.slots[&PlacementSlotId::new("p1")].outcome,
+            ServerOutcomeKind::Restored
+        );
+        assert_eq!(
+            results.slots[&PlacementSlotId::new("p2")].outcome,
+            ServerOutcomeKind::Restored
+        );
+        // The failing slot of the second batch.
+        assert_eq!(
+            results.slots[&PlacementSlotId::new("p3")].outcome,
+            ServerOutcomeKind::Failed
+        );
+        // The slot after the failing one in the same/later batch was never
+        // started.
+        assert_eq!(
+            results.slots[&PlacementSlotId::new("p4")].outcome,
+            ServerOutcomeKind::Skipped
+        );
+
+        // The never-started server (p4) was left untouched: no `current`
+        // pointer, no generation record.
+        let remote4 = LocalTransport::new(remotes_base.join("s4")).unwrap();
+        assert!(
+            !remote4.exists(crate::layout::current()),
+            "p4's server must never receive a current pointer"
+        );
+        assert_eq!(
+            remote4.list(crate::layout::generations()).unwrap().len(),
+            0,
+            "p4's server must never receive a generation record"
+        );
+        // The failed slot's server was compensated back to no prior state.
+        let remote3 = LocalTransport::new(remotes_base.join("s3")).unwrap();
+        assert!(
+            !remote3.exists(crate::layout::current()),
+            "a compensated first-deploy slot has no current"
+        );
+
+        assert_eq!(store.read_attempts("t1").unwrap().len(), 1);
+        assert_eq!(
+            store.latest_status(id.as_str()).unwrap(),
+            Some(DeploymentStatus::FailedRolledBack)
+        );
+        assert!(
+            store.read_snapshots("t1").unwrap().is_empty(),
+            "a failed attempt must produce no snapshot"
+        );
+    }
 }
