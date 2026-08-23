@@ -971,9 +971,15 @@ fn push_inner(
 ///    (`desired[server].generation`, falling back to `servers[server].generation`).
 /// 3. If everything matches, write the missing markers under each server's
 ///    mutation lock (idempotent: already-written markers are a byte-for-byte
-///    no-op) using the attempt's ORIGINAL deployment ID, then finalize the
-///    mutable status to `Successful` and advance the reflog via
-///    [`history::append_successful_reflog`].
+///    no-op) using the attempt's ORIGINAL deployment ID, then finalize
+///    REPLAY-SAFELY: first the idempotent durable steps (ensure the reflog
+///    entry exists and repair `refs/last-successful` via
+///    [`history::ensure_successful_reflog_entry`]), and the mutable status
+///    file LAST. The mutable status is the eligibility gate for recovery: as
+///    long as it still says `PendingCommit`, any crash or error mid-
+///    finalization leaves the attempt eligible and the next push replays
+///    exactly the remaining steps; once it says `Successful`, every earlier
+///    step is already durable, so nothing is lost.
 /// 4. A confirmed membership/generation mismatch finalizes the attempt as
 ///    `Degraded` (no reflog entry). An existing marker whose content differs
 ///    from the deterministic payload is an integrity conflict — a concurrent
@@ -1140,12 +1146,19 @@ fn reconcile_pending_commits(
             continue;
         }
 
-        // 4. Finalize: mutable status -> Successful, then advance the reflog
-        // and `refs/last-successful` exactly like the main success path. The
-        // append-only attempts.jsonl record is untouched (still the original
-        // deployment ID and status); the mutable status file is the live marker.
+        // 4. Finalize REPLAY-SAFELY: the idempotent durable steps run FIRST
+        // and the mutable status file is written LAST. The mutable status is
+        // the eligibility gate for recovery, so a crash or error at ANY of
+        // these steps leaves the attempt `PendingCommit` and the next push
+        // replays exactly the remaining steps; once the status says
+        // `Successful`, every earlier step is already durable. The reflog
+        // insert is idempotent by deployment ID
+        // ([`history::ensure_successful_reflog_entry`] never appends a second
+        // entry for the same deployment) and also repairs a stale
+        // `refs/last-successful`. The append-only attempts.jsonl record is
+        // untouched (still the original deployment ID and status).
+        history::ensure_successful_reflog_entry(store, &attempt.target, &attempt)?;
         store.write_status(attempt.deployment_id.as_str(), "Successful")?;
-        history::append_successful_reflog(store, &attempt.target, &attempt)?;
     }
     Ok(())
 }
@@ -1855,6 +1868,8 @@ mod tests {
     use super::*;
     use crate::remote::transport::LocalTransport;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     const NONE_VARIANT: &str = r#"
 [[artifact.mappings]]
@@ -2422,6 +2437,394 @@ pods = ["p1"]
         assert_eq!(
             content, "RELEASE-LOCAL\n",
             "materialization must read from the release directory, not the project root"
+        );
+    }
+
+    // ---- Replay-safe recovery finalization -------------------------------
+    //
+    // `reconcile_pending_commits` finalizes a recovered attempt with three
+    // persistence steps, ordered ensure-reflog-entry (idempotent by deployment
+    // ID) -> `refs/last-successful` (idempotent) -> mutable status LAST. A
+    // crash at any step must leave the attempt re-eligible, and a follow-up
+    // push must complete exactly the remaining steps without duplicating the
+    // reflog entry. These tests arm a one-shot store fault keyed by the
+    // pending attempt's deployment ID (see `src/store/local.rs::test_faults`)
+    // on each persistence step, run a push that aborts mid-finalization, then
+    // run a clean push and assert exactly-one semantics: one reflog entry,
+    // `refs/last-successful` pointing at the attempt, mutable status
+    // `Successful`, markers present on the remotes.
+
+    /// A remote that fails fleet-commit marker writes exactly once: the first
+    /// write/create under `state/commits/` errors (leaving the marker absent),
+    /// then the wrapper behaves normally. Lets a test record a `PendingCommit`
+    /// attempt on the first push and observe the next push's reconciliation
+    /// completing the markers with the ORIGINAL deployment ID. Mirror of the
+    /// integration-test `FailOnceMarkerRemote`, kept in-crate because the
+    /// store fault hooks are `#[cfg(test)]` crate-internal.
+    struct FailOnceMarkerRemote {
+        inner: LocalTransport,
+        armed: Arc<AtomicBool>,
+    }
+
+    impl FailOnceMarkerRemote {
+        fn build(base: PathBuf, armed: Arc<AtomicBool>) -> Result<Box<dyn Remote>> {
+            Ok(Box::new(FailOnceMarkerRemote {
+                inner: LocalTransport::new(base)?,
+                armed,
+            }))
+        }
+        fn fail_marker(&self, rel: &std::path::Path) -> bool {
+            self.armed.load(Ordering::SeqCst) && rel.to_string_lossy().starts_with("state/commits/")
+        }
+    }
+
+    impl Remote for FailOnceMarkerRemote {
+        fn root(&self) -> &std::path::Path {
+            self.inner.root()
+        }
+        fn read(&self, rel: &std::path::Path) -> Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
+            if self.fail_marker(rel) {
+                self.armed.store(false, Ordering::SeqCst);
+                return Err(Error::remote(
+                    "FailOnceMarkerRemote: commit marker write forced to fail (once)",
+                ));
+            }
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<bool> {
+            if self.fail_marker(rel) {
+                self.armed.store(false, Ordering::SeqCst);
+                return Err(Error::remote(
+                    "FailOnceMarkerRemote: commit marker create forced to fail (once)",
+                ));
+            }
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn list(
+            &self,
+            rel: &std::path::Path,
+        ) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &std::path::Path) -> Result<std::path::PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &std::path::Path) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &std::path::Path) -> Result<crate::remote::transport::RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn exec(
+            &self,
+            argv: &[String],
+            timeout: std::time::Duration,
+        ) -> Result<crate::remote::transport::ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+        fn available_bytes(&self) -> Result<u64> {
+            self.inner.available_bytes()
+        }
+    }
+
+    /// A single-server (`s1`/`t1`) project + store + remote base for the
+    /// full-push recovery scenarios, mirroring the integration-test setup.
+    struct RecoveryHarness {
+        _dir: tempfile::TempDir,
+        cfg_path: PathBuf,
+        config: Config,
+        store: LocalStore,
+        remotes_base: PathBuf,
+    }
+
+    impl RecoveryHarness {
+        fn new() -> RecoveryHarness {
+            let dir = tempfile::tempdir().unwrap();
+            let project = dir.path().join("proj");
+            std::fs::create_dir_all(&project).unwrap();
+            let release_dir = project.join("releases").join("v1");
+            std::fs::create_dir_all(&release_dir).unwrap();
+            std::fs::write(release_dir.join("standard.toml"), NONE_VARIANT).unwrap();
+            std::fs::write(project.join("deploy.toml"), NONE_TOML).unwrap();
+            let artifacts_dir = release_dir.join("artifacts");
+            for (p, c) in [
+                ("build/output/app/server", "v1\n"),
+                ("deployment/common/README", "common\n"),
+            ] {
+                let fp = artifacts_dir.join(p);
+                std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
+                std::fs::write(&fp, c).unwrap();
+            }
+            let cfg_path = project.join("deploy.toml");
+            let config = Config::load(&cfg_path).unwrap();
+            let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+            let remotes_base = dir.path().join("remotes");
+            std::fs::create_dir_all(&remotes_base).unwrap();
+            RecoveryHarness {
+                _dir: dir,
+                cfg_path,
+                config,
+                store,
+                remotes_base,
+            }
+        }
+    }
+
+    /// Push 1 of the recovery scenarios: the fleet-commit marker write fails
+    /// once, so the attempt is recorded `PendingCommit` (activation already
+    /// happened; the mutable status file says `PendingCommit`, no reflog
+    /// entry, no `refs/last-successful`).
+    fn push_pending_attempt(h: &RecoveryHarness) -> AttemptRecord {
+        let armed = Arc::new(AtomicBool::new(true));
+        let armed_for_factory = armed.clone();
+        let rf = h.remotes_base.clone();
+        let fault_factory = move |s: &crate::config::ServerDef,
+                                  _pod: &crate::config::PodDef|
+              -> Result<Box<dyn Remote>> {
+            FailOnceMarkerRemote::build(rf.join(&s.id), armed_for_factory.clone())
+        };
+        let r1 = push(
+            &h.cfg_path,
+            &h.store,
+            &fault_factory,
+            "t1",
+            &h.config,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            r1.status,
+            Some(DeploymentStatus::PendingCommit),
+            "failed marker write must yield PendingCommit"
+        );
+        let attempt = r1.attempt.expect("attempt recorded");
+        let marker = h
+            .remotes_base
+            .join("s1")
+            .join(crate::layout::commit_marker(attempt.deployment_id.as_str()));
+        assert!(
+            !marker.exists(),
+            "marker must be absent after the failed push"
+        );
+        assert!(
+            h.store.read_reflog("t1").unwrap().is_empty(),
+            "no reflog entry for a pending attempt"
+        );
+        assert!(
+            h.store.read_last_successful("t1").is_none(),
+            "last-successful must not point at a pending attempt"
+        );
+        attempt
+    }
+
+    /// A push with a healthy `LocalTransport` remote.
+    fn push_clean(h: &RecoveryHarness) -> Result<PushReport> {
+        let rf = h.remotes_base.clone();
+        let clean_factory = move |s: &crate::config::ServerDef,
+                                  _pod: &crate::config::PodDef|
+              -> Result<Box<dyn Remote>> {
+            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        };
+        push(
+            &h.cfg_path,
+            &h.store,
+            &clean_factory,
+            "t1",
+            &h.config,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+    }
+
+    fn mutable_status(h: &RecoveryHarness, deployment_id: &str) -> String {
+        std::fs::read_to_string(h.store.deployment_dir(deployment_id).join("status")).unwrap()
+    }
+
+    /// Assert the exactly-one end state of a fully replayed recovery: exactly
+    /// one reflog entry at index 0 for the attempt, `refs/last-successful`
+    /// pointing at it, mutable status `Successful`, and the fleet-commit
+    /// marker present on the remote.
+    fn assert_finalized(h: &RecoveryHarness, attempt: &AttemptRecord) {
+        let reflog = h.store.read_reflog("t1").unwrap();
+        assert_eq!(
+            reflog.len(),
+            1,
+            "exactly one successful fleet snapshot, got {}",
+            reflog.len()
+        );
+        assert_eq!(reflog[0].index, 0);
+        assert_eq!(reflog[0].deployment_id, attempt.deployment_id);
+        assert_eq!(
+            h.store.read_last_successful("t1").as_deref(),
+            Some(attempt.deployment_id.as_str()),
+            "refs/last-successful must point at the recovered attempt"
+        );
+        assert_eq!(
+            mutable_status(h, attempt.deployment_id.as_str()),
+            "Successful",
+            "mutable status must be finalized"
+        );
+        let marker = h
+            .remotes_base
+            .join("s1")
+            .join(crate::layout::commit_marker(attempt.deployment_id.as_str()));
+        assert!(
+            marker.exists(),
+            "commit marker must be present on the remote"
+        );
+    }
+
+    #[test]
+    fn recovery_replays_after_reflog_append_failure() {
+        let h = RecoveryHarness::new();
+        let attempt = push_pending_attempt(&h);
+
+        // Push 2: the reflog append (first persistence step of finalization)
+        // fails once -> the push aborts with Err and nothing is durable yet.
+        crate::store::local::test_faults::arm_append_reflog(attempt.deployment_id.as_str());
+        let err = push_clean(&h)
+            .err()
+            .expect("push must abort when the reflog append fails");
+        assert!(
+            err.to_string().contains("append_reflog"),
+            "error must name the injected fault, got: {err}"
+        );
+        assert!(
+            h.store.read_reflog("t1").unwrap().is_empty(),
+            "no reflog entry after the failed append"
+        );
+        assert!(h.store.read_last_successful("t1").is_none());
+        assert_eq!(
+            mutable_status(&h, attempt.deployment_id.as_str()),
+            "PendingCommit"
+        );
+
+        // Push 3: a clean push replays and completes finalization exactly once.
+        let r3 = push_clean(&h).unwrap();
+        assert_eq!(r3.status, None, "the replaying push is an up-to-date no-op");
+        assert_finalized(&h, &attempt);
+    }
+
+    #[test]
+    fn recovery_replays_after_last_successful_failure() {
+        let h = RecoveryHarness::new();
+        let attempt = push_pending_attempt(&h);
+
+        // Push 2: the reflog append succeeds but `refs/last-successful` (the
+        // second persistence step) fails once -> Err; the reflog entry exists
+        // but the ref is stale and the attempt stays `PendingCommit`.
+        crate::store::local::test_faults::arm_write_last_successful(attempt.deployment_id.as_str());
+        let err = push_clean(&h)
+            .err()
+            .expect("push must abort when the last-successful write fails");
+        assert!(
+            err.to_string().contains("write_last_successful"),
+            "error must name the injected fault, got: {err}"
+        );
+        let reflog = h.store.read_reflog("t1").unwrap();
+        assert_eq!(
+            reflog.len(),
+            1,
+            "reflog entry was appended before the crash"
+        );
+        assert_eq!(reflog[0].deployment_id, attempt.deployment_id);
+        assert!(h.store.read_last_successful("t1").is_none());
+        assert_eq!(
+            mutable_status(&h, attempt.deployment_id.as_str()),
+            "PendingCommit"
+        );
+
+        // Push 3: the idempotent ensure must NOT append a second entry; it
+        // repairs last-successful and finishes. Exactly one entry remains.
+        let r3 = push_clean(&h).unwrap();
+        assert_eq!(r3.status, None, "the replaying push is an up-to-date no-op");
+        assert_finalized(&h, &attempt);
+    }
+
+    #[test]
+    fn recovery_replays_after_status_write_failure() {
+        let h = RecoveryHarness::new();
+        let attempt = push_pending_attempt(&h);
+
+        // Push 2: the reflog entry and last-successful are durable but the
+        // final mutable-status write fails -> Err; the attempt stays
+        // `PendingCommit`, so it is still eligible for the next push.
+        crate::store::local::test_faults::arm_write_status(attempt.deployment_id.as_str());
+        let err = push_clean(&h)
+            .err()
+            .expect("push must abort when the final status write fails");
+        assert!(
+            err.to_string().contains("write_status"),
+            "error must name the injected fault, got: {err}"
+        );
+        let reflog = h.store.read_reflog("t1").unwrap();
+        assert_eq!(reflog.len(), 1);
+        assert_eq!(
+            h.store.read_last_successful("t1").as_deref(),
+            Some(attempt.deployment_id.as_str())
+        );
+        assert_eq!(
+            mutable_status(&h, attempt.deployment_id.as_str()),
+            "PendingCommit"
+        );
+
+        // Push 3: the replay completes the final status write; the ensure is a
+        // no-op and no duplicate entry is created.
+        let r3 = push_clean(&h).unwrap();
+        assert_eq!(r3.status, None, "the replaying push is an up-to-date no-op");
+        assert_finalized(&h, &attempt);
+    }
+
+    #[test]
+    fn recovery_plain_replay_is_idempotent() {
+        let h = RecoveryHarness::new();
+        let attempt = push_pending_attempt(&h);
+
+        // Push 2: a clean push completes finalization fully (no faults).
+        let r2 = push_clean(&h).unwrap();
+        assert_eq!(
+            r2.status, None,
+            "the reconciling push is an up-to-date no-op"
+        );
+        assert_finalized(&h, &attempt);
+
+        // Push 3: a further clean push re-runs reconciliation (the attempts
+        // record still says `PendingCommit`) but every step is idempotent: no
+        // duplicate reflog entry, no changed refs, no new attempt.
+        let r3 = push_clean(&h).unwrap();
+        assert_eq!(r3.status, None);
+        assert_eq!(r3.message, "Everything up to date");
+        assert_finalized(&h, &attempt);
+        assert_eq!(
+            h.store.read_attempts("t1").unwrap().len(),
+            1,
+            "no new attempt may be recorded by the replays"
         );
     }
 }

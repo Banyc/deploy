@@ -78,14 +78,23 @@ pub fn ref_name(target: &TargetName, index: u64) -> String {
     format!("{}@f{index}", target.as_str())
 }
 
-/// Append a successful fleet snapshot to the reflog and return its index.
+/// Ensure the reflog contains exactly one successful fleet snapshot for the
+/// attempt's deployment ID, and that `refs/last-successful` points at it.
+/// Returns the entry's reflog index.
 ///
-/// Idempotent by deployment ID: deployment IDs are unique per attempt, so a
-/// deployment must appear in the reflog exactly once. If an entry for
-/// `attempt.deployment_id` already exists, this returns that entry's index
-/// WITHOUT appending a duplicate and WITHOUT rewriting `refs/last-successful`
-/// (the entry already advanced the ref when it was first appended).
-pub fn append_successful_reflog(
+/// This is the single idempotent insert used by BOTH the main success path
+/// and pending-commit recovery finalization, and it is replay-safe:
+///
+/// * If an entry with `deployment_id == attempt.deployment_id` already exists
+///   (a previous finalization crashed after appending the reflog entry but
+///   before finishing), no second entry is appended: the existing entry's
+///   index is returned. The reflog never contains two entries for the same
+///   deployment ID.
+/// * `refs/last-successful` is (re)written to the attempt's deployment ID in
+///   both cases — idempotent, the same value on every replay — which also
+///   repairs the stale ref left by a crash between the reflog append and the
+///   ref update.
+pub fn ensure_successful_reflog_entry(
     store: &LocalStore,
     target: &TargetName,
     attempt: &AttemptRecord,
@@ -96,6 +105,7 @@ pub fn append_successful_reflog(
         .iter()
         .find(|e| e.deployment_id == attempt.deployment_id)
     {
+        store.write_last_successful(target, attempt.deployment_id.as_str())?;
         return Ok(existing.index);
     }
     let next = entries.len() as u64;
@@ -103,6 +113,21 @@ pub fn append_successful_reflog(
     store.append_reflog(target, &entry)?;
     store.write_last_successful(target, attempt.deployment_id.as_str())?;
     Ok(next)
+}
+
+/// Append a successful fleet snapshot to the reflog and return its index.
+///
+/// Idempotent by deployment ID: delegates to
+/// [`ensure_successful_reflog_entry`], so re-running finalization for the same
+/// attempt never duplicates the reflog entry and always repairs
+/// `refs/last-successful`. Kept as the historical name so existing call sites
+/// (and the main success path) read naturally.
+pub fn append_successful_reflog(
+    store: &LocalStore,
+    target: &TargetName,
+    attempt: &AttemptRecord,
+) -> Result<u64> {
+    ensure_successful_reflog_entry(store, target, attempt)
 }
 
 /// Build a reflog entry from a successful attempt.

@@ -427,6 +427,12 @@ impl LocalStore {
     }
 
     pub fn write_last_successful(&self, target: &str, deployment_id: &str) -> Result<()> {
+        #[cfg(test)]
+        if test_faults::consume(&test_faults::FAIL_WRITE_LAST_SUCCESSFUL, deployment_id) {
+            return Err(Error::store(
+                "test fault: write_last_successful forced to fail once",
+            ));
+        }
         let dir = self.refs_dir(target);
         ensure_private_dir(&dir)?;
         let p = dir.join("last-successful");
@@ -443,6 +449,15 @@ impl LocalStore {
     }
 
     pub fn append_reflog(&self, target: &str, entry: &ReflogEntry) -> Result<()> {
+        #[cfg(test)]
+        if test_faults::consume(
+            &test_faults::FAIL_APPEND_REFLOG,
+            entry.deployment_id.as_str(),
+        ) {
+            return Err(Error::store(
+                "test fault: append_reflog forced to fail once",
+            ));
+        }
         let dir = self.refs_dir(target);
         ensure_private_dir(&dir)?;
         let p = dir.join("reflog.jsonl");
@@ -536,6 +551,10 @@ impl LocalStore {
     }
 
     pub fn write_status(&self, id: &str, status: &str) -> Result<()> {
+        #[cfg(test)]
+        if test_faults::consume(&test_faults::FAIL_WRITE_STATUS, id) {
+            return Err(Error::store("test fault: write_status forced to fail once"));
+        }
         let dir = self.deployment_dir(id);
         ensure_private_dir(&dir)?;
         let p = dir.join("status");
@@ -555,6 +574,54 @@ impl LocalStore {
             .map(Some)
             .map_err(|e| Error::store(format!("read status: {e}")))
     }
+}
+
+/// Test-only one-shot fault injection for crash-mid-finalization tests.
+///
+/// Arm a fault keyed by the DEPLOYMENT ID of the attempt under test; the NEXT
+/// matching store call fails exactly once (and disarms itself), while every
+/// other call — including identical methods for different deployment IDs from
+/// concurrently running tests — passes through untouched. Keying by deployment
+/// ID keeps the in-crate engine tests deterministic under parallel `cargo test`
+/// execution: no other test can consume a fault armed for a specific attempt.
+#[cfg(test)]
+pub(crate) mod test_faults {
+    use std::sync::Mutex;
+
+    fn arm(fault: &Mutex<Option<String>>, deployment_id: &str) {
+        *fault.lock().unwrap() = Some(deployment_id.to_string());
+    }
+
+    /// Arm the next `append_reflog` call for `deployment_id` to fail once.
+    pub(crate) fn arm_append_reflog(deployment_id: &str) {
+        arm(&FAIL_APPEND_REFLOG, deployment_id);
+    }
+
+    /// Arm the next `write_last_successful` call for `deployment_id` to fail once.
+    pub(crate) fn arm_write_last_successful(deployment_id: &str) {
+        arm(&FAIL_WRITE_LAST_SUCCESSFUL, deployment_id);
+    }
+
+    /// Arm the next `write_status` call for `deployment_id` to fail once.
+    pub(crate) fn arm_write_status(deployment_id: &str) {
+        arm(&FAIL_WRITE_STATUS, deployment_id);
+    }
+
+    /// Consume the one-shot fault for `deployment_id` if armed. Returns `true`
+    /// when the fault fired (and is now disarmed).
+    pub(crate) fn consume(fault: &Mutex<Option<String>>, deployment_id: &str) -> bool {
+        let mut guard = fault.lock().unwrap();
+        if guard.as_deref() == Some(deployment_id) {
+            *guard = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) static FAIL_APPEND_REFLOG: Mutex<Option<String>> = Mutex::new(None);
+    pub(crate) static FAIL_WRITE_LAST_SUCCESSFUL: Mutex<Option<String>> = Mutex::new(None);
+    pub(crate) static FAIL_WRITE_STATUS: Mutex<Option<String>> = Mutex::new(None);
 }
 
 /// Sanitize a name for use as a directory/file component.
