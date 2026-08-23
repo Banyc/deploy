@@ -20,3 +20,6 @@ pub mod rotation;
 pub mod store;
 pub mod template;
 pub mod tree;
+
+#[cfg(test)]
+pub(crate) mod testutil;

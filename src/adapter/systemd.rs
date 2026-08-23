@@ -332,13 +332,12 @@ pub(crate) mod tests {
     use crate::model::{DeploymentId, GenerationId, TreeDigest};
     use crate::remote::transport::LocalTransport;
 
-    /// Serializes every test that mutates the process-wide `PATH` or
-    /// `XDG_CONFIG_HOME` (the fake-`systemctl` end-to-end test here and the
-    /// engine-level systemd push regression in `push/engine.rs`): all lib
-    /// tests share one process, and `run_activation` resolves the unit
-    /// directory base from the process environment, so two env-mutating tests
-    /// must never overlap.
-    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // THE single shared env lock (see `crate::testutil`): the fake-`systemctl`
+    // tests here, the engine-level systemd push regression in
+    // `push/engine.rs`, and the fake-`ssh` fingerprint suite in
+    // `remote/ssh.rs` ALL mutate the same process-global `PATH` — two separate
+    // locks would let them run concurrently and corrupt each other's PATH.
+    use crate::testutil::ENV_LOCK;
 
     fn cfg(scope: ActivationScope, units: Vec<&str>) -> ActivationConfig {
         ActivationConfig {

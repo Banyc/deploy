@@ -1175,15 +1175,16 @@ mod tests {
 mod fingerprint_ssh_tests {
     use super::*;
     use crate::remote::helper::RemoteHelper;
+    use crate::testutil::ENV_LOCK;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
 
-    /// Serializes the fake-environment tests: they mutate the process-wide
-    /// `PATH` (an `unsafe` operation in edition 2024), so they must not
-    /// overlap. Each test also points `DEPLOY_SSH_KNOWNHOSTS_DIR` at its own
-    /// temp dir, so the pin cache is fully isolated per test (never shared
-    /// between tests or between the lib and integration binaries).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // THE single shared env lock (see `crate::testutil`): every test that
+    // mutates the process-global environment — this fake-ssh suite (PATH,
+    // DEPLOY_SSH_KNOWNHOSTS_DIR, FAKE_SSH_ROOT/FAKE_SSH_REMOTE_PREFIX) and the
+    // systemd fake-`systemctl` suite (PATH, XDG_CONFIG_HOME) — holds this one
+    // lock, so a fake `ssh-keyscan` can never race a fake `systemctl`
+    // rewriting the same global PATH. Per-test `DEPLOY_SSH_KNOWNHOSTS_DIR`
+    // temp dirs keep the pin cache isolated as before.
 
     struct FakeSsh {
         bin: PathBuf,
@@ -1360,8 +1361,10 @@ esac
         let mut paths: Vec<_> = std::env::split_paths(&old_path).collect();
         paths.insert(0, bin.to_path_buf());
         let joined = std::env::join_paths(paths).unwrap();
-        // SAFETY: edition 2024 marks `set_var` unsafe. The caller holds
-        // `ENV_LOCK`, and no other test in this binary spawns ssh/ssh-keyscan.
+        // SAFETY: edition 2024 marks `set_var` unsafe. The caller holds the
+        // single shared `ENV_LOCK` (crate::testutil), so no other
+        // env-mutating test can overlap and swap PATH out from under a
+        // spawned fake binary.
         unsafe {
             std::env::set_var("PATH", &joined);
             std::env::set_var("DEPLOY_SSH_KNOWNHOSTS_DIR", cache);

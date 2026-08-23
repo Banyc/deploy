@@ -2458,7 +2458,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// shared `ENV_LOCK` serializes env-mutating tests).
     #[test]
     fn systemd_push_activation_uses_generation_root_not_nested() {
-        let _lock = crate::adapter::systemd::tests::ENV_LOCK.lock().unwrap();
+        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
         // Fake systemctl (daemon-reload/enable/restart all succeed) and a temp
