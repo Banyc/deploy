@@ -210,8 +210,10 @@ interval_seconds = 0
 `argv` (and, for the systemd adapter, unit-file content) is rendered through a
 strict Jinja-style template module with a fixed set of elected variables
 before anything is executed: `{{ deploy_dir }}` (the slot's absolute on-server
-directory), `{{ variant }}`, `{{ application }}`, `{{ release }}`,
-`{{ target }}`, `{{ server }}`. Only these names are recognized — no
+directory), `{{ variant }}`, `{{ application }}`, `{{ release }}` (the
+immutable `ReleaseId` of the artifact actually being deployed, e.g.
+`rel-sha256-…` — never the caller's current release name), `{{ target }}`,
+`{{ server }}`. Only these names are recognized — no
 expressions, filters, or control flow; an unknown or malformed template fails
 the push loudly. Mapping `from` paths use only `{{ variant }}` (trees are
 content-addressed and shared across slots), while activation/verification

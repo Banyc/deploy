@@ -47,24 +47,26 @@ pub struct PushReport {
 type RemoteFactory =
     dyn Fn(&crate::config::ServerDef, &crate::config::SlotDef) -> Result<Box<dyn Remote>>;
 
-/// Build the template context for one placement slot from the live
-/// configuration. `variant` is the variant whose contract is being rendered —
-/// the desired variant during activation, or the PRIOR variant when
-/// compensating (compensation overrides it via `TemplateVars::with_variant`).
+/// Build the template context for one placement slot from the ARTIFACT being
+/// processed: `release`/`variant`/`tree` are the assigned artifact's own
+/// immutable `ReleaseId`, `VariantName`, and `TreeDigest` — never the caller's
+/// current release name — so a historical/rollback push renders the release id
+/// it actually deploys, and a template never sees a torn (desired-variant,
+/// current-release) combination. Compensation overrides the triple again with
+/// the PRIOR artifact via [`crate::template::TemplateVars::with_artifact`].
 ///
-/// `deployment_id`/`generation`/`tree` are the per-deployment identity,
-/// available only in the per-server activation/verification path; sites that
-/// do not know them (e.g. the reconciliation loop) pass `None`, and a
-/// template referencing such a variable there fails loudly.
+/// `deployment_id`/`generation` are the per-deployment identity, available
+/// only in the per-server activation/verification path; sites that do not know
+/// them (e.g. the reconciliation loop) pass `None`, and a template referencing
+/// such a variable there fails loudly.
 fn slot_vars(
     members: &[(&crate::config::SlotDef, &crate::config::ServerDef)],
     config: &Config,
     target_name: &str,
     slot_id: &PlacementSlotId,
-    variant: &str,
+    artifact: &ArtifactRef,
     deployment_id: Option<&DeploymentId>,
     generation: Option<&GenerationId>,
-    tree: Option<&TreeDigest>,
 ) -> Result<crate::template::TemplateVars> {
     let (slot, server) = members
         .iter()
@@ -77,15 +79,15 @@ fn slot_vars(
         })?;
     Ok(crate::template::TemplateVars::slot(
         &slot.deploy_dir,
-        variant,
+        artifact.variant.as_str(),
         &config.application,
-        config.release.as_str(),
+        artifact.release.as_str(),
         target_name,
         &server.id,
     )
     .with_server(&server.user, &server.address, server.port)
     .with_slot_id(&slot.id)
-    .with_deployment(deployment_id, generation, tree))
+    .with_deployment(deployment_id, generation, Some(&artifact.tree)))
 }
 
 /// Run a push against `target_name`.
@@ -571,10 +573,9 @@ fn push_inner(
                     config,
                     target_name,
                     &a.placement_slot,
-                    a.artifact.variant.as_str(),
+                    &a.artifact,
                     Some(deployment_id),
                     Some(&new_gen[&a.placement_slot]),
-                    Some(&a.artifact.tree),
                 )?;
                 if run_verification(remote, &variant_behavior.verification, &vars).is_err() {
                     verified = false;
@@ -723,10 +724,9 @@ fn push_inner(
                 config,
                 target_name,
                 sid,
-                a.artifact.variant.as_str(),
+                &a.artifact,
                 Some(deployment_id),
                 Some(&new_gen[sid]),
-                Some(&a.artifact.tree),
             )?;
             let outcome = process_server(
                 store,
@@ -808,10 +808,9 @@ fn push_inner(
                 config,
                 target_name,
                 sid,
-                plan_servers[sid].artifact.variant.as_str(),
+                &plan_servers[sid].artifact,
                 Some(deployment_id),
                 Some(&new_gen[sid]),
-                Some(&plan_servers[sid].artifact.tree),
             )?;
             let ok = compensate_server(
                 store,
@@ -1711,10 +1710,12 @@ fn compensate_server(
             // Re-run prior activation contract + verification. A failure means the
             // service was not actually restored to prior behavior, so propagate
             // it as a compensation failure (the attempt is marked Degraded).
-            // The prior contract is rendered with the PRIOR variant (a restored
-            // slot may switch variants, and its unit content/argv must resolve
-            // for the variant that is actually being restored).
-            let prior_vars = template_vars.with_variant(prior_assignment.artifact.variant.as_str());
+            // The prior contract is rendered with the PRIOR artifact: its own
+            // release (the immutable ReleaseId), variant, and tree move
+            // together via `with_artifact`, so a restored slot that switches
+            // variants never renders a torn combination (e.g. the prior
+            // variant with the desired release/tree).
+            let prior_vars = template_vars.with_artifact(&prior_assignment.artifact);
             run_activation(remote, &root, &prior_behavior.activation, &prior_vars)
                 .map_err(|e| Error::remote(format!("compensation activation failed: {e}")))?;
             run_verification(remote, &prior_behavior.verification, &prior_vars)
@@ -2287,31 +2288,38 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let new_gen = GenerationId::generate();
             let helper = self.helper();
             // Slot context from the harness config (one slot p1 on server s1,
-            // target t1, deploy_dir /srv/eng).
+            // target t1, deploy_dir /srv/eng), built from the artifact being
+            // processed like the engine's `slot_vars`: release/variant/tree
+            // come from the ArtifactRef, never the config release name.
+            let artifact = ArtifactRef {
+                release: ReleaseId::new("rel-sha256-r1"),
+                variant: VariantName::new("standard"),
+                tree: self.tree.clone(),
+            };
             let members = self.config.target_slots("t1").unwrap();
             let (slot, server) = members[0];
             let vars = crate::template::TemplateVars::slot(
                 &slot.deploy_dir,
-                "standard",
+                artifact.variant.as_str(),
                 &self.config.application,
-                self.config.release.as_str(),
+                artifact.release.as_str(),
                 "t1",
                 &server.id,
             )
             .with_server(&server.user, &server.address, server.port)
             .with_slot_id(&slot.id)
-            .with_deployment(Some(&deployment_id), Some(&new_gen), Some(&self.tree));
+            .with_deployment(
+                Some(&deployment_id),
+                Some(&new_gen),
+                Some(&artifact.tree),
+            );
             process_server(
                 &self.store,
                 &self.remote,
                 &helper,
                 &op_id,
                 &deployment_id,
-                &ArtifactRef {
-                    release: ReleaseId::new("r1".to_string()),
-                    variant: VariantName::new("standard".to_string()),
-                    tree: self.tree.clone(),
-                },
+                &artifact,
                 &new_gen,
                 expected_gen.as_ref(),
                 &behavior,
@@ -2561,6 +2569,148 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             assert_eq!(
                 std::fs::read_to_string(&installed).unwrap(),
                 "[Service]\nExecStart=/srv/eng/current/app/server\n"
+            );
+            Ok::<(), String>(())
+        })();
+        match old_path {
+            Some(p) => unsafe { std::env::set_var("PATH", p) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        match old_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        outcome.unwrap();
+    }
+
+    /// Compensation re-runs the PRIOR generation's activation contract with the
+    /// PRIOR artifact's identity: the unit it installs renders the PRIOR
+    /// immutable release id (`{{ release }}`), variant, and tree — never a torn
+    /// mix of the desired release with the prior variant. This pins the
+    /// `TemplateVars::with_artifact` path through the real systemd adapter.
+    #[test]
+    fn compensation_renders_prior_artifact_release_id() {
+        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bindir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let fake = bindir.join("systemctl");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config_home = tmp.path().join("xdg");
+        let old_path = std::env::var_os("PATH");
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bindir.display(),
+                    old_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ),
+            );
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        }
+
+        let outcome = (|| {
+            let h = Harness::new(
+                SYSTEMD_TOML,
+                SYSTEMD_VARIANT,
+                &[
+                    ("build/output/app/server", "v1"),
+                    ("deployment/common/README", "common"),
+                    (
+                        "units/example.service",
+                        "[Service]\nExecStart=/srv/eng/bin/server --release={{ release }} --variant={{ variant }} --tree={{ tree }}\n",
+                    ),
+                ],
+            );
+            // First deploy: establishes the PRIOR generation whose artifact
+            // carries the immutable release id `rel-sha256-r1`.
+            let first = h.run(None);
+            assert_eq!(
+                first.kind,
+                ServerOutcomeKind::Activated,
+                "first deploy must activate: {:?}",
+                first.error
+            );
+
+            // A subsequent (desired) push fails activation and the engine
+            // compensates back to the prior generation. Drive the same
+            // compensation directly: the desired artifact's vars carry a
+            // DIFFERENT release/tree than the prior artifact.
+            let op_id = OperationId::generate();
+            let deployment_id = DeploymentId::generate();
+            let members = h.config.target_slots("t1").unwrap();
+            let (slot, server) = members[0];
+            let desired = ArtifactRef {
+                release: ReleaseId::new("rel-sha256-desired"),
+                variant: VariantName::new("standard"),
+                tree: TreeDigest::new("desired-tree"),
+            };
+            let desired_vars = crate::template::TemplateVars::slot(
+                &slot.deploy_dir,
+                desired.variant.as_str(),
+                &h.config.application,
+                desired.release.as_str(),
+                "t1",
+                &server.id,
+            )
+            .with_server(&server.user, &server.address, server.port)
+            .with_slot_id(&slot.id)
+            .with_deployment(
+                Some(&deployment_id),
+                Some(&GenerationId::generate()),
+                Some(&desired.tree),
+            );
+            let helper = h.helper();
+            // The prior generation's behavior must be readable from the remote
+            // (in a real push, push_inner publishes it; the harness bypasses
+            // push_inner, so publish it the same way).
+            let behaviors =
+                std::collections::BTreeMap::from([("standard".to_string(), h.behave())]);
+            helper
+                .publish_release(
+                    "rel-sha256-r1",
+                    "{}",
+                    &serde_json::to_string(&behaviors).unwrap(),
+                )
+                .unwrap();
+            let ok = compensate_server(
+                &h.store,
+                &h.remote,
+                &helper,
+                &op_id,
+                &deployment_id,
+                Some(&first.generation),
+                &first.generation, // current still points at the first generation
+                &h.config,
+                &desired_vars,
+            )
+            .map_err(|e| e.to_string())?;
+            assert!(ok, "compensation must restore the prior generation");
+
+            // The installed unit was re-rendered with the PRIOR artifact: its
+            // own immutable release id, variant, and tree — never the desired
+            // release/tree the failed push would have rendered.
+            let installed =
+                std::fs::read_to_string(config_home.join("systemd/user/example.service")).unwrap();
+            assert!(
+                installed.contains("--release=rel-sha256-r1"),
+                "compensated unit must render the PRIOR release id, got: {installed}"
+            );
+            assert!(
+                !installed.contains("rel-sha256-desired"),
+                "compensated unit must not render the desired release, got: {installed}"
+            );
+            assert!(
+                installed.contains("--variant=standard")
+                    && installed.contains(&format!("--tree={}", h.tree.as_str())),
+                "compensated unit must render the prior variant/tree, got: {installed}"
             );
             Ok::<(), String>(())
         })();

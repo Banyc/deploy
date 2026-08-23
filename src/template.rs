@@ -10,7 +10,7 @@
 //! | `deploy_dir`    | absolute on-server deployment directory of the slot                  |
 //! | `variant`       | the release variant being materialized / activated                   |
 //! | `application`   | `application` from `deploy.toml`                                     |
-//! | `release`       | the active release name (`release:` in `deploy.toml`)                |
+//! | `release`       | the immutable `ReleaseId` of the deployed artifact (`rel-sha256-…`)  |
 //! | `target`        | the target being pushed                                              |
 //! | `server`        | the server ID of the slot (`[[servers]].id`)                         |
 //! | `user`          | the server's deployment account (`[[servers]].user`)                 |
@@ -33,12 +33,19 @@
 //! | slot + [`TemplateVars::with_server`]                | ... + `user`, `address`, `port`                            |
 //! | slot + [`TemplateVars::with_slot_id`]               | ... + `slot`                                               |
 //! | slot + [`TemplateVars::with_deployment`]            | ... + `deployment_id`, `generation`, `tree`                |
+//! | slot + [`TemplateVars::with_artifact`]              | replaces `release`, `variant`, `tree` from one `ArtifactRef` |
 //!
 //! Materialization is the constrained case: trees are content-addressed and
 //! shared across slots, so mapping paths may only use per-variant values
 //! (`variant`, `application`, `release`) — never per-slot or per-server
 //! values such as `deploy_dir`, `user`, or `address` (two slots with
-//! different `deploy_dir`s must still produce the same tree digest).
+//! different `deploy_dir`s must still produce the same tree digest). The
+//! mapping `release` is the release NAME from `deploy.toml`, not the
+//! `ReleaseId`: the immutable `ReleaseId` is derived from the materialized
+//! trees, so it cannot be known — and must not be rendered — into a tree
+//! without creating a circular digest. Activation/verification, where the
+//! deployed [`ArtifactRef`](crate::model::ArtifactRef) is known, always
+//! render the artifact's own `ReleaseId`.
 //!
 //! The three deployment-scoped variables (`deployment_id`, `generation`,
 //! `tree`) are only filled by the engine's per-server activation/verification
@@ -113,11 +120,14 @@ pub struct TemplateVars {
 
 impl TemplateVars {
     /// Context for mapping materialization: per-variant values only
-    /// (`variant`, `application`, `release`). Trees are content-addressed and
-    /// shared across slots, so slot/server/deployment variables
-    /// (`deploy_dir`, `server`, `target`, `user`, `address`, `port`, `slot`,
-    /// `deployment_id`, `generation`, `tree`) must never be rendered into a
-    /// tree; a mapping that references them fails loudly.
+    /// (`variant`, `application`, `release`). `release` is the release NAME
+    /// from `deploy.toml` — the immutable `ReleaseId` is derived from the
+    /// materialized trees, so at materialization time it is not yet knowable
+    /// (rendering it into a tree would be a circular dependency). Trees are
+    /// content-addressed and shared across slots, so slot/server/deployment
+    /// variables (`deploy_dir`, `server`, `target`, `user`, `address`,
+    /// `port`, `slot`, `deployment_id`, `generation`, `tree`) must never be
+    /// rendered into a tree; a mapping that references them fails loudly.
     pub fn mapping(application: &str, release: &str, variant: &str) -> TemplateVars {
         TemplateVars {
             deploy_dir: None,
@@ -137,10 +147,12 @@ impl TemplateVars {
     }
 
     /// Base slot context available at activation/verification time: the
-    /// per-slot deployment location plus the configuration-level values. The
-    /// server-level (`user`/`address`/`port`), slot ID, and
-    /// deployment-scoped variables start unset — fill them with
-    /// [`TemplateVars::with_server`], [`TemplateVars::with_slot_id`], and
+    /// per-slot deployment location plus the artifact's identity — `variant`
+    /// and the immutable `release` `ReleaseId` of the artifact actually being
+    /// deployed (never the caller's current release name). The server-level
+    /// (`user`/`address`/`port`), slot ID, and deployment-scoped variables
+    /// start unset — fill them with [`TemplateVars::with_server`],
+    /// [`TemplateVars::with_slot_id`], and
     /// [`TemplateVars::with_deployment`] at sites that have them.
     pub fn slot(
         deploy_dir: &Path,
@@ -202,13 +214,20 @@ impl TemplateVars {
         self
     }
 
-    /// Same context with a different `variant`. Compensation re-runs the
-    /// PRIOR generation's contract, whose variant can differ from the desired
-    /// one; everything else (deploy_dir, application, server metadata,
-    /// deployment identity, ...) is unchanged.
-    pub fn with_variant(&self, variant: &str) -> TemplateVars {
+    /// Same context with the artifact-scoped variables replaced from ONE
+    /// [`crate::model::ArtifactRef`]: `variant`, the immutable `release`
+    /// `ReleaseId`, and `tree` are all taken from the same artifact.
+    /// Compensation re-runs the PRIOR generation's contract, whose
+    /// release/variant/tree can all differ from the desired artifact; setting
+    /// the triple together never leaves a torn combination (e.g. a prior
+    /// variant rendered with the desired release). Everything else
+    /// (deploy_dir, application, server metadata, deployment identity, ...)
+    /// is unchanged.
+    pub fn with_artifact(&self, artifact: &crate::model::ArtifactRef) -> TemplateVars {
         let mut out = self.clone();
-        out.variant = Some(variant.to_string());
+        out.variant = Some(artifact.variant.as_str().to_string());
+        out.release = Some(artifact.release.as_str().to_string());
+        out.tree = Some(artifact.tree.as_str().to_string());
         out
     }
 
@@ -291,14 +310,16 @@ pub fn render_argv(argv: &[String], vars: &TemplateVars) -> Result<Vec<String>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DeploymentId, GenerationId, TreeDigest};
+    use crate::model::{
+        ArtifactRef, DeploymentId, GenerationId, ReleaseId, TreeDigest, VariantName,
+    };
 
     fn slot_vars() -> TemplateVars {
         TemplateVars::slot(
             Path::new("/srv/deploy/example"),
             "standard",
             "example",
-            "v1",
+            "rel-sha256-7b278acf5041d50a9704392ac9fac4c6c02ca2cf3be9e5aee61668c8070526d2",
             "production",
             "server-01",
         )
@@ -339,7 +360,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             all,
-            "/srv/deploy/example|standard|example|v1|production|server-01|deploy|10.0.0.5|22|app-1|deploy-1|gen-1|abc123"
+            "/srv/deploy/example|standard|example|rel-sha256-7b278acf5041d50a9704392ac9fac4c6c02ca2cf3be9e5aee61668c8070526d2|production|server-01|deploy|10.0.0.5|22|app-1|deploy-1|gen-1|abc123"
+        );
+        // `release` renders the immutable ReleaseId of the deployed artifact,
+        // not the human release name from deploy.toml.
+        assert_ne!(
+            render_template("{{ release }}", &v).unwrap(),
+            "v1",
+            "the ReleaseId must not be confused with the short label"
         );
     }
 
@@ -456,23 +484,82 @@ mod tests {
     }
 
     #[test]
-    fn with_variant_replaces_only_the_variant() {
-        let v = TemplateVars::slot(Path::new("/srv/a"), "standard", "app", "v2", "prod", "s1")
-            .with_server("deploy", "10.0.0.5", 22)
-            .with_slot_id("app-1")
-            .with_deployment(
-                Some(&DeploymentId::new("d1")),
-                Some(&GenerationId::new("g1")),
-                Some(&TreeDigest::new("t1")),
-            );
-        let prior = v.with_variant("old");
+    fn with_artifact_replaces_artifact_vars_together() {
+        let v = TemplateVars::slot(
+            Path::new("/srv/a"),
+            "standard",
+            "app",
+            "rel-sha256-111",
+            "prod",
+            "s1",
+        )
+        .with_server("deploy", "10.0.0.5", 22)
+        .with_slot_id("app-1")
+        .with_deployment(
+            Some(&DeploymentId::new("d1")),
+            Some(&GenerationId::new("g1")),
+            Some(&TreeDigest::new("t1")),
+        );
+        // The prior artifact differs in every artifact-scoped variable: a
+        // historical release, a different variant, a different tree.
+        let prior = v.with_artifact(&ArtifactRef {
+            release: ReleaseId::new("rel-sha256-999"),
+            variant: VariantName::new("legacy"),
+            tree: TreeDigest::new("t9"),
+        });
+        // release + variant + tree move TOGETHER to the prior artifact: never
+        // a torn combination (prior variant with the desired release/tree).
         assert_eq!(
             render_template(
-                "{{ variant }}|{{ deploy_dir }}|{{ release }}|{{ user }}|{{ slot }}|{{ generation }}",
+                "{{ variant }}|{{ deploy_dir }}|{{ release }}|{{ user }}|{{ slot }}|{{ generation }}|{{ tree }}",
                 &prior
             )
             .unwrap(),
-            "old|/srv/a|v2|deploy|app-1|g1"
+            "legacy|/srv/a|rel-sha256-999|deploy|app-1|g1|t9"
         );
+        // The source context is unchanged (with_artifact clones).
+        assert_eq!(
+            render_template("{{ release }}", &v).unwrap(),
+            "rel-sha256-111"
+        );
+        assert_eq!(render_template("{{ variant }}", &v).unwrap(), "standard");
+    }
+
+    #[test]
+    fn historical_artifact_renders_its_own_release_id() {
+        // A historical/rollback push deploys an artifact whose release is the
+        // stored, immutable ReleaseId — the template must render that id, not
+        // the caller's current release name (e.g. "v1").
+        let artifact = ArtifactRef {
+            release: ReleaseId::new(
+                "rel-sha256-9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            ),
+            variant: VariantName::new("standard"),
+            tree: TreeDigest::new("abc123"),
+        };
+        let v = TemplateVars::slot(
+            Path::new("/srv/deploy/example"),
+            artifact.variant.as_str(),
+            "example",
+            artifact.release.as_str(),
+            "production",
+            "server-01",
+        )
+        .with_deployment(
+            Some(&DeploymentId::new("deploy-1")),
+            Some(&GenerationId::new("gen-1")),
+            Some(&artifact.tree),
+        );
+        assert_eq!(
+            render_template("{{ release }}", &v).unwrap(),
+            artifact.release.as_str()
+        );
+        assert_eq!(
+            render_template("{{ variant }}", &v).unwrap(),
+            artifact.variant.as_str()
+        );
+        assert_eq!(render_template("{{ tree }}", &v).unwrap(), "abc123");
+        // The ReleaseId is the immutable id, never the short label.
+        assert_ne!(render_template("{{ release }}", &v).unwrap(), "v1");
     }
 }
