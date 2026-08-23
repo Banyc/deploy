@@ -228,10 +228,6 @@ argv = ["true"]
 timeout_seconds = 5
 attempts = 1
 interval_seconds = 0
-
-[capacity]
-reserve_bytes = 0
-reserve_percent = 0
 "#
 }
 

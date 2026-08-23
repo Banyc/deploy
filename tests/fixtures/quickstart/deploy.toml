@@ -7,16 +7,20 @@ application = "example"
 release = "v1"
 
 # Servers are declared once; a slot binds one server to one variant, and
-# targets reference slots by ID.
+# targets reference slots by ID. Capacity is a per-server policy (shared by
+# every deployment slot on the server), resolved from the caller's current
+# configuration — never part of the release identity.
 [[servers]]
 id = "server-01"            # durable ID; never rename it
 address = "server-01.example.com"
 user = "deploy"
+capacity = { reserve_bytes = 1073741824, reserve_percent = 0 }  # keep at least 1 GiB free
 
 [[servers]]
 id = "server-02"
 address = "server-02.example.com"
 user = "deploy"
+capacity = { reserve_bytes = 1073741824, reserve_percent = 0 }  # keep at least 1 GiB free
 
 [[slots]]
 id = "app-1"

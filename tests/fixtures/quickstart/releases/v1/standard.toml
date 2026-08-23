@@ -19,7 +19,3 @@ argv = ["/srv/deploy/example/current/app/server", "health-check"]
 timeout_seconds = 15
 attempts = 3
 interval_seconds = 2
-
-[capacity]
-reserve_bytes = 1073741824   # keep at least 1 GiB free on servers
-reserve_percent = 0

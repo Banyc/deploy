@@ -183,15 +183,17 @@ pub struct CanonicalBehavior {
 /// The canonical release identity payload. It deliberately excludes the
 /// resulting release ID, creation time, display name, and provenance to avoid
 /// a circular hash.
+///
+/// The payload covers the name-sorted per-variant mapping digest, the
+/// name-sorted per-variant behavior (activation + verification) digest, and
+/// the `variant -> tree digest` bindings. Capacity is NOT part of the release
+/// identity: it is a per-server policy resolved from the caller's current
+/// configuration, so a server-capacity change does NOT produce a new release.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalReleasePayload {
     pub schema_version: u32,
     pub mapping_sha256: String,
     pub behavior_sha256: String,
-    /// Canonical digest of the name-sorted per-variant capacity-policy
-    /// snapshot. Capacity headroom is part of the release identity: a
-    /// capacity-only configuration change produces a new release.
-    pub policies_sha256: String,
     /// Sorted `variant -> tree digest` bindings.
     pub variants: std::collections::BTreeMap<String, String>,
 }

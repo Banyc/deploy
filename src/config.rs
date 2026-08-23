@@ -4,12 +4,12 @@
 //! (`release: <name>`), and every regular `*.toml` file directly inside
 //! `<project>/releases/<name>/` is discovered as a variant named by its file
 //! stem. Each variant file owns its own artifact mappings and deployment
-//! policies (activation, verification, capacity); artifact sources
-//! conventionally live beneath `releases/<name>/artifacts/`. Servers are
-//! declared once at the top level; a deployment slot binds one server to one
-//! variant under an ID, and targets contain their rollout policy, references to
-//! member slots
-//! by ID, and their own retention (`rotation`) policy.
+//! policies (activation, verification); artifact sources conventionally live
+//! beneath `releases/<name>/artifacts/`. Capacity is a per-server policy
+//! declared on the server entry. Servers are declared once at the top level; a
+//! deployment slot binds one server to one variant under an ID, and targets
+//! contain their rollout policy, references to member slots by ID, and their
+//! own retention (`rotation`) policy.
 //!
 //! The same local inputs always produce one target-independent release identity
 //! (see `model::ReleaseDigest`): the name-sorted per-variant mappings, the
@@ -130,10 +130,27 @@ fn default_interval() -> u64 {
     0
 }
 
+/// A server's capacity headroom policy, declared once per `[[servers]]` entry
+/// and shared by every deployment slot on that server. It is LIVE
+/// configuration resolved from the caller's current `deploy.toml` at preflight
+/// time — servers have no per-release history — and it is NOT part of the
+/// release identity: changing a server's capacity never produces a new release
+/// and never touches any stored snapshot.
+///
+/// TOML form (inline table under `[[servers]]`; the field defaults to 0/0 when
+/// omitted):
+///
+/// ```toml
+/// [[servers]]
+/// id = "server-01"
+/// capacity = { reserve_bytes = 0, reserve_percent = 0 }
+/// ```
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CapacityConfig {
+    /// Keep at least this many bytes free on the server after an upload.
     #[serde(default)]
     pub reserve_bytes: u64,
+    /// Keep at least this percentage of the free space available (0..=100).
     #[serde(default)]
     pub reserve_percent: u8,
 }
@@ -171,22 +188,12 @@ pub struct RotationConfig {
     pub fleet: FleetRotation,
 }
 
-/// A variant's capacity policy. This is persisted alongside the immutable
-/// release record so historical deployments (fleet and release rollbacks)
-/// resolve capacity headroom from the release snapshot rather than the caller's
-/// current configuration, where the variant may since have been renamed or
-/// removed. Rotation is not snapshotted per variant: it is fleet-wide
-/// configuration declared once in `deploy.toml` and read from there.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct VariantPolicy {
-    #[serde(default)]
-    pub capacity: CapacityConfig,
-}
-
 /// A per-release variant's own artifact and deployment policy. Each variant is
 /// described by a `*.toml` file directly inside the release directory named by
 /// `deploy.toml` (`releases/<name>/<variant>.toml`). Rotation is not
-/// per-variant: it lives at the top level of `deploy.toml`.
+/// per-variant: it lives at the top level of `deploy.toml`. Capacity is not
+/// per-variant either: it is a per-server policy declared on the server entry
+/// and resolved from the caller's current configuration.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VariantConfig {
     #[serde(default)]
@@ -195,16 +202,6 @@ pub struct VariantConfig {
     #[serde(default)]
     pub activation: ActivationConfig,
     pub verification: VerificationConfig,
-    #[serde(default)]
-    pub capacity: CapacityConfig,
-}
-
-impl From<&VariantConfig> for VariantPolicy {
-    fn from(v: &VariantConfig) -> Self {
-        VariantPolicy {
-            capacity: v.capacity.clone(),
-        }
-    }
 }
 
 /// Durable protection for one whole release: every variant's artifact in the
@@ -306,6 +303,13 @@ pub struct ServerDef {
     /// only if its fingerprint matches this value.
     #[serde(default)]
     pub host_key_fingerprint: Option<String>,
+    /// Per-server capacity headroom policy (defaults to 0/0 when omitted),
+    /// shared by every deployment slot on this server and resolved from the
+    /// caller's current configuration at preflight time. Not part of the
+    /// release identity. TOML form: `capacity = { reserve_bytes = 0,
+    /// reserve_percent = 0 }`.
+    #[serde(default)]
+    pub capacity: CapacityConfig,
 }
 
 /// A deployment slot: binds one server to one variant under an ID, with an
@@ -414,18 +418,25 @@ impl Config {
             return Err(Error::config("at least one target must be declared"));
         }
 
-        // Each loaded variant carries its own artifact/activation/verification/
-        // capacity policy; validate each one.
+        // Each loaded variant carries its own artifact/activation/verification
+        // policy; validate each one.
         for (name, variant) in &self.variants {
             self.validate_variant(name, variant)?;
         }
 
-        // Server declarations are unique and well-formed.
+        // Server declarations are unique and well-formed; capacity is a
+        // per-server policy, so its validation lives here.
         let mut all_server_ids = std::collections::HashSet::new();
         for s in &self.servers {
             if !all_server_ids.insert(s.id.clone()) {
                 return Err(Error::config(format!(
                     "duplicate server id '{}' in top-level servers",
+                    s.id
+                )));
+            }
+            if s.capacity.reserve_percent > 100 {
+                return Err(Error::config(format!(
+                    "server '{}': reserve_percent must not exceed 100",
                     s.id
                 )));
             }
@@ -545,11 +556,6 @@ impl Config {
         if variant.activation.adapter == "systemd" && variant.activation.units.is_empty() {
             return Err(Error::config(format!(
                 "variant '{name}': systemd activation requires at least one unit"
-            )));
-        }
-        if variant.capacity.reserve_percent > 100 {
-            return Err(Error::config(format!(
-                "variant '{name}': reserve_percent must not exceed 100"
             )));
         }
 
@@ -755,10 +761,6 @@ argv = ["true"]
 timeout_seconds = 5
 attempts = 1
 interval_seconds = 0
-
-[capacity]
-reserve_bytes = 0
-reserve_percent = 0
 "#;
         std::fs::write(release_dir.join("standard.toml"), variant_toml).unwrap();
         let deploy_toml = r#"
@@ -822,10 +824,6 @@ argv = ["true"]
 timeout_seconds = 5
 attempts = 1
 interval_seconds = 0
-
-[capacity]
-reserve_bytes = 0
-reserve_percent = 0
 "#;
         let hc_toml = r#"
 description = "High capacity deployment"
@@ -846,10 +844,6 @@ argv = ["false"]
 timeout_seconds = 5
 attempts = 1
 interval_seconds = 0
-
-[capacity]
-reserve_bytes = 1073741824
-reserve_percent = 5
 "#;
         std::fs::write(release_dir.join("standard.toml"), standard_toml).unwrap();
         std::fs::write(release_dir.join("high-capacity.toml"), hc_toml).unwrap();
@@ -871,6 +865,7 @@ protect_deployments = 2
 id = "s1"
 address = "a"
 user = "u"
+capacity = { reserve_bytes = 1073741824, reserve_percent = 5 }
 
 [[slots]]
 id = "p1"
@@ -902,7 +897,6 @@ slots = ["p1"]
         let std = cfg.variant("standard").expect("standard variant present");
         assert_eq!(std.verification.argv, vec!["true".to_string()]);
         assert_eq!(std.activation.adapter, "none");
-        assert_eq!(std.capacity.reserve_percent, 0);
 
         let hc = cfg
             .variant("high-capacity")
@@ -910,7 +904,13 @@ slots = ["p1"]
         assert_eq!(hc.verification.argv, vec!["false".to_string()]);
         assert_eq!(hc.activation.adapter, "systemd");
         assert!(!hc.activation.units.is_empty());
-        assert_eq!(hc.capacity.reserve_bytes, 1073741824);
+
+        // Capacity is per-server, not per-variant: the single server carries
+        // the policy and the variant files parse without any `[capacity]` block.
+        assert_eq!(cfg.servers.len(), 1);
+        assert_eq!(cfg.servers[0].capacity.reserve_bytes, 1073741824);
+        assert_eq!(cfg.servers[0].capacity.reserve_percent, 5);
+        assert_eq!(cfg.variant("standard").unwrap().artifact.mappings.len(), 1);
 
         // Unknown variant name is rejected.
         assert!(cfg.variant("missing").is_err());
@@ -929,10 +929,6 @@ argv = ["true"]
 timeout_seconds = 5
 attempts = 1
 interval_seconds = 0
-
-[capacity]
-reserve_bytes = 0
-reserve_percent = 0
 "#;
 
     fn deploy_toml(release_value: &str) -> String {
@@ -1185,5 +1181,42 @@ slots = ["p1"]
             err.to_string().contains("duplicate server id 's1'"),
             "error must name the duplicated id, got: {err}"
         );
+    }
+
+    #[test]
+    fn server_capacity_is_validated_and_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        let p = project.join("deploy.toml");
+
+        // Omitted capacity defaults to 0/0.
+        std::fs::write(&p, deploy_toml("v1")).unwrap();
+        let cfg = Config::load(&p).expect("server without capacity loads");
+        assert_eq!(cfg.servers[0].capacity, CapacityConfig::default());
+
+        // reserve_percent above 100 is rejected at load time.
+        let bad = deploy_toml("v1").replace(
+            "user = \"u\"",
+            "user = \"u\"\ncapacity = { reserve_bytes = 1, reserve_percent = 101 }",
+        );
+        std::fs::write(&p, bad).unwrap();
+        let err = Config::load(&p).expect_err("reserve_percent > 100 must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reserve_percent must not exceed 100") && msg.contains("server 's1'"),
+            "error must name the server and the violation, got: {msg}"
+        );
+
+        // A valid inline capacity table parses into the server policy.
+        let ok = deploy_toml("v1").replace(
+            "\n[[slots]]",
+            "\ncapacity = { reserve_bytes = 4096, reserve_percent = 10 }\n[[slots]]",
+        );
+        std::fs::write(&p, ok).unwrap();
+        let cfg = Config::load(&p).expect("inline server capacity parses");
+        assert_eq!(cfg.servers[0].capacity.reserve_bytes, 4096);
+        assert_eq!(cfg.servers[0].capacity.reserve_percent, 10);
     }
 }

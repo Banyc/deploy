@@ -3,13 +3,12 @@
 //! ```text
 //! <base>/
 //!   objects/sha256/<digest>/root/ , tree.json
-//!   releases/<release-id>/mapping.toml, behavior.json, policies.json, release.json
+//!   releases/<release-id>/mapping.toml, behavior.json, release.json
 //!   targets/<target>/observed.json, attempts.jsonl, refs/last-successful, refs/reflog.jsonl
 //!   servers/<server-id>.json
 //!   deployments/<deployment-id>/plan.json, results.json, status
 //! ```
 
-use crate::config::VariantPolicy;
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::model::{BehaviorContract, ReleaseId, ReleaseRecord, TreeDigest, TreeMetadata};
@@ -59,7 +58,7 @@ fn set_private(path: &Path) -> Result<()> {
 }
 
 /// Install immutable content-addressed file bytes (release records, mapping,
-/// behavior, and policy snapshots) with create-or-compare semantics.
+/// and behavior snapshots) with create-or-compare semantics.
 ///
 /// * If the file does not exist yet, the bytes are written to a temporary file
 ///   in the same directory and atomically renamed into place, so a reader never
@@ -306,7 +305,6 @@ impl LocalStore {
         id: &ReleaseId,
         mapping_toml: &str,
         behavior_json: &serde_json::Value,
-        policies_json: &serde_json::Value,
     ) -> Result<()> {
         let dir = self.release_dir(id);
         ensure_private_dir(&dir)?;
@@ -314,16 +312,6 @@ impl LocalStore {
         let bytes = serde_json::to_vec_pretty(behavior_json)
             .map_err(|e| Error::store(format!("serialize behavior: {e}")))?;
         write_atomic_cas(&dir.join("behavior.json"), &bytes)?;
-        // Persist each variant's capacity policy with the release. A historical
-        // deployment must resolve it from this snapshot, because the caller's
-        // current configuration may have renamed or removed the variant since
-        // the release was created. The snapshot is immutable (create-or-compare
-        // via `write_atomic_cas`) and its canonical digest is part of the
-        // release identity, so it can never be rewritten in place. (Rotation is
-        // target-level configuration and is not part of the snapshot.)
-        let bytes = serde_json::to_vec_pretty(policies_json)
-            .map_err(|e| Error::store(format!("serialize policies: {e}")))?;
-        write_atomic_cas(&dir.join("policies.json"), &bytes)?;
         Ok(())
     }
 
@@ -338,25 +326,6 @@ impl LocalStore {
             .map_err(|e| Error::store(format!("read behavior {}: {e}", p.display())))?;
         crate::release::behavior_contracts_from_json(&bytes)
             .map_err(|e| Error::store(format!("parse behavior {}: {e}", p.display())))
-    }
-
-    /// Read the name-keyed per-variant capacity policies stored alongside a
-    /// release record. Returns `None` when the release predates
-    /// policy persistence; callers then fall back to the current configuration
-    /// for variants that still exist there.
-    pub fn read_release_policies(
-        &self,
-        id: &ReleaseId,
-    ) -> Result<Option<BTreeMap<String, VariantPolicy>>> {
-        let p = self.release_dir(id).join("policies.json");
-        if !p.exists() {
-            return Ok(None);
-        }
-        let bytes = std::fs::read(&p)
-            .map_err(|e| Error::store(format!("read policies {}: {e}", p.display())))?;
-        let map = crate::release::variant_policies_from_json(&bytes)
-            .map_err(|e| Error::store(format!("parse policies {}: {e}", p.display())))?;
-        Ok(Some(map))
     }
 
     // ---- targets ----------------------------------------------------------
@@ -650,26 +619,48 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let id = ReleaseId::new("rel-sha256-aa".to_string());
-        let behavior = serde_json::json!({});
-        let policies = serde_json::json!({
-            "standard": { "capacity": { "reserve_bytes": 1, "reserve_percent": 0 } }
+        let behavior = serde_json::json!({
+            "standard": {
+                "activation": {
+                    "adapter": "none",
+                    "scope": "user",
+                    "reconcile_managed_units": true,
+                    "units": []
+                },
+                "verification": {
+                    "adapter": "command",
+                    "argv": ["true"],
+                    "timeout_seconds": 5,
+                    "attempts": 1,
+                    "interval_seconds": 0
+                }
+            }
         });
 
         store
-            .write_release_aux(&id, "mapping", &behavior, &policies)
+            .write_release_aux(&id, "mapping", &behavior)
             .expect("first write creates the snapshot");
 
         // Identical rewrite is an idempotent success.
         store
-            .write_release_aux(&id, "mapping", &behavior, &policies)
+            .write_release_aux(&id, "mapping", &behavior)
             .expect("identical rewrite must succeed");
 
-        // Replacing the policy snapshot with different content fails...
+        // Replacing the behavior snapshot with different content fails...
         let conflicting = serde_json::json!({
-            "standard": { "capacity": { "reserve_bytes": 2, "reserve_percent": 0 } }
+            "standard": {
+                "activation": { "adapter": "systemd", "scope": "user", "reconcile_managed_units": true, "units": [] },
+                "verification": {
+                    "adapter": "command",
+                    "argv": ["true"],
+                    "timeout_seconds": 5,
+                    "attempts": 1,
+                    "interval_seconds": 0
+                }
+            }
         });
         let err = store
-            .write_release_aux(&id, "mapping", &behavior, &conflicting)
+            .write_release_aux(&id, "mapping", &conflicting)
             .expect_err("conflicting rewrite must fail");
         assert!(
             err.to_string().contains("different content"),
@@ -677,11 +668,8 @@ mod tests {
         );
 
         // ...and the stored snapshot is untouched (no torn write).
-        let read = store
-            .read_release_policies(&id)
-            .unwrap()
-            .expect("snapshot exists");
-        assert_eq!(read["standard"].capacity.reserve_bytes, 1);
+        let read = store.read_release_behaviors(&id).expect("snapshot exists");
+        assert_eq!(read["standard"].activation.adapter, "none");
     }
 
     /// A recorded attempt's plan and results are immutable: deployment IDs are

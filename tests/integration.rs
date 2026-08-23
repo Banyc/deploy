@@ -40,10 +40,6 @@ argv = ["true"]
 timeout_seconds = 5
 attempts = 1
 interval_seconds = 0
-
-[capacity]
-reserve_bytes = 0
-reserve_percent = 0
 "#;
 
 const CONFIG: &str = r#"
@@ -264,8 +260,11 @@ fn end_to_end_push_rollback() -> Result<()> {
 
 /// Deploy variant `old`, replace it with `new` in the configuration (the old
 /// variant file is removed entirely), then restore the `@f0` fleet snapshot.
-/// Historical capacity policies must resolve from the immutable
-/// release record, not the caller's current configuration.
+/// The historical deployment restores variant `old` from the immutable release
+/// record even though the caller's current configuration no longer declares it.
+/// Capacity is NOT part of that snapshot: it is a per-server policy resolved
+/// from the caller's current `deploy.toml`, so the rollback succeeds with the
+/// server's current (changed) capacity applied.
 #[test]
 fn fleet_rollback_after_variant_rename_succeeds() -> Result<()> {
     let tmp = tempfile::tempdir().unwrap();
@@ -333,13 +332,6 @@ slots = ["p1"]
     let old_server = &attempt0.servers[&ServerId::new("server-01")];
     let old_tree = old_server.tree.clone();
     let old_release = old_server.release.clone();
-
-    // The old release persists its per-variant capacity policies.
-    let policies = store.read_release_policies(&old_release)?;
-    assert!(
-        policies.as_ref().is_some_and(|p| p.contains_key("old")),
-        "release record carries the `old` variant policy snapshot"
-    );
 
     // Rename the variant: the configuration now declares `new`, and the
     // `old.toml` variant file is removed entirely.
@@ -932,10 +924,6 @@ argv = ["{verify_argv}"]
 timeout_seconds = 5
 attempts = 1
 interval_seconds = 0
-
-[capacity]
-reserve_bytes = 0
-reserve_percent = 0
 "#
     )
 }
@@ -1048,10 +1036,6 @@ argv = ["true"]
 timeout_seconds = 5
 attempts = 1
 interval_seconds = 0
-
-[capacity]
-reserve_bytes = 0
-reserve_percent = 0
 "#;
     write_file(&proj.join("deploy.toml"), config_toml);
     write_variant_file(&proj, "standard", variant_toml);
@@ -1591,10 +1575,6 @@ argv = ["false"]
 timeout_seconds = 5
 attempts = 1
 interval_seconds = 0
-
-[capacity]
-reserve_bytes = 0
-reserve_percent = 0
 "#;
     write_file(&proj.join("deploy.toml"), deploy_toml);
     write_variant_file(&proj, "standard", variant_toml);
@@ -2347,14 +2327,16 @@ fn write_string(path: &Path, content: &str) -> std::path::PathBuf {
     path.to_path_buf()
 }
 
-// ---- Capacity policy snapshots: identity binding + fail-closed resolution --
+// ---- Capacity: a per-server policy resolved from current config -------------
 
-/// Changing ONLY `[capacity]` in a variant file must produce a NEW release
-/// identity (the canonical policy digest is part of the release payload) while
-/// keeping the tree bytes identical, and both releases must retain their own
-/// immutable capacity snapshots.
+/// Changing ONLY a server's capacity must NOT change the release identity:
+/// capacity is live per-server configuration resolved from the caller's current
+/// `deploy.toml` at preflight time, and is not part of the release payload
+/// (which covers mappings, behavior, and trees). A capacity-only change is
+/// therefore an up-to-date no-op with the SAME release id; a later content
+/// change still produces a new release — from the tree inputs, not capacity.
 #[test]
-fn capacity_only_change_produces_new_release_identity() -> Result<()> {
+fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
@@ -2378,7 +2360,7 @@ fn capacity_only_change_produces_new_release_identity() -> Result<()> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
     };
 
-    // f0: deploy with reserve_bytes = 0.
+    // f0: deploy with default (0/0) server capacity.
     let r0 = push(
         &config_path,
         &store,
@@ -2394,16 +2376,16 @@ fn capacity_only_change_produces_new_release_identity() -> Result<()> {
     let first = r0.attempt.expect("attempt recorded").servers[&ServerId::new("server-01")].clone();
     assert_eq!(first.variant.as_str(), "standard");
 
-    // Capacity-only change: identical bytes except `reserve_bytes`.
-    let variant_path = proj.join("releases").join("v1").join("standard.toml");
-    let body = std::fs::read_to_string(&variant_path)?;
+    // Capacity-only change: identical inputs except the server's `capacity`.
+    let body = std::fs::read_to_string(&config_path)?;
     let changed = body.replace(
-        "[capacity]\nreserve_bytes = 0",
-        "[capacity]\nreserve_bytes = 4096",
+        "user = \"deploy\"",
+        "user = \"deploy\"\ncapacity = { reserve_bytes = 4096, reserve_percent = 0 }",
     );
-    assert_ne!(body, changed, "capacity line must exist in fixture");
-    std::fs::write(&variant_path, changed).unwrap();
+    assert_ne!(body, changed, "capacity line must be insertable");
+    std::fs::write(&config_path, changed).unwrap();
     let config2 = Config::load(&config_path)?;
+    assert_eq!(config2.servers[0].capacity.reserve_bytes, 4096);
 
     let r1 = push(
         &config_path,
@@ -2416,77 +2398,29 @@ fn capacity_only_change_produces_new_release_identity() -> Result<()> {
             ref_token: None,
         },
     )?;
-    assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-    let second = r1.attempt.expect("attempt recorded").servers[&ServerId::new("server-01")].clone();
-
-    // New release identity, same tree bytes.
-    assert_ne!(
-        second.release, first.release,
-        "a capacity-only change must produce a new release id"
+    assert!(
+        r1.status.is_none() && r1.attempt.is_none(),
+        "capacity-only change must be an up-to-date no-op, got: {}",
+        r1.message
     );
+    assert_eq!(r1.message, "Everything up to date");
     assert_eq!(
-        second.tree, first.tree,
-        "tree bytes must be unchanged by a capacity-only change"
+        std::fs::read_dir(store_base.join("releases"))?.count(),
+        1,
+        "no new release may be created by a capacity-only change"
     );
 
-    // Each release retains its own immutable snapshot.
-    let old_policies = store
-        .read_release_policies(&first.release)?
-        .expect("old release keeps its snapshot");
-    assert_eq!(old_policies["standard"].capacity.reserve_bytes, 0);
-    let new_policies = store
-        .read_release_policies(&second.release)?
-        .expect("new release persists its snapshot");
-    assert_eq!(new_policies["standard"].capacity.reserve_bytes, 4096);
-    Ok(())
-}
+    // The SAME tree bytes at the same release: capacity never entered identity.
+    let after = store.read_release(&first.release)?;
+    assert_eq!(
+        after.release_sha256,
+        first.release.digest().as_str(),
+        "stored release still matches the f0 identity"
+    );
 
-/// A corrupt historical policies.json must fail the attempt during preflight —
-/// never fall back to current configuration or defaults — and must leave every
-/// server untouched.
-#[test]
-fn corrupt_historical_policies_fail_preflight_without_remote_mutation() -> Result<()> {
-    let tmp = tempfile::tempdir().unwrap();
-    let proj = tmp.path().join("proj");
-    std::fs::create_dir_all(&proj).unwrap();
-    let store_base = tmp.path().join("store");
-    let remotes_base = tmp.path().join("remotes");
-    std::fs::create_dir_all(&remotes_base).unwrap();
-
-    let (config, config_path) = {
-        let p = write_string(&proj.join("deploy.toml"), &single_target_toml(true, 1));
-        write_variant_file(&proj, "standard", &single_variant_body("true"));
-        let artifacts = proj.join("releases").join("v1").join("artifacts");
-        write_file(&artifacts.join("build/output/app/server"), "v1\n");
-        write_file(&artifacts.join("deployment/common/README"), "common\n");
-        (Config::load(&p).unwrap(), p)
-    };
-    let store = LocalStore::with_base(store_base.clone())?;
-    let rf = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
-          -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
-    };
-
-    let r0 = push(
-        &config_path,
-        &store,
-        &factory,
-        "production",
-        &config,
-        &PushOptions {
-            dry_run: false,
-            ref_token: None,
-        },
-    )?;
-    assert_eq!(r0.status, Some(DeploymentStatus::Successful));
-    let release = r0.attempt.expect("attempt recorded").servers[&ServerId::new("server-01")]
-        .release
-        .clone();
-
-    // Deploy different content so the fleet advances to f1 and a rollback to
-    // f0 becomes real work instead of an up-to-date no-op.
+    // A later CONTENT change still produces a new release (capacity 4096 stays
+    // in force but does not block a modest upload), and the capacity-only edit
+    // never altered the stored release.
     write_file(
         &proj
             .join("releases")
@@ -2495,60 +2429,197 @@ fn corrupt_historical_policies_fail_preflight_without_remote_mutation() -> Resul
             .join("build/output/app/server"),
         "v2\n",
     );
-    let config_v2 = Config::load(&config_path)?;
+    let config3 = Config::load(&config_path)?;
+    let r2 = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config3,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r2.status, Some(DeploymentStatus::Successful));
+    let third = r2.attempt.expect("attempt recorded").servers[&ServerId::new("server-01")].clone();
+    assert_ne!(
+        third.release, first.release,
+        "a content change must produce a new release identity"
+    );
+    Ok(())
+}
+
+/// Capacity headroom is ALWAYS resolved from the caller's current server
+/// configuration — even for a historical rollback push, because servers have no
+/// per-release history. Here the f0 tree is rotated off the server, then a
+/// rollback to @f0 with a huge CURRENT reserve fails preflight before any
+/// remote mutation; lowering the reserve lets the same rollback succeed.
+#[test]
+fn rollback_preflight_uses_current_server_capacity() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store_base = tmp.path().join("store");
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    // Aggressive rotation: after f1 only the newest tree stays on the server,
+    // so the f0 rollback below must re-upload T0 and pass through preflight.
+    let deploy_toml = r#"
+schema_version = 1
+application = "example"
+release = "v1"
+
+[targets.production.rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = false
+
+[targets.production.rotation.fleet]
+protect_deployments = 1
+
+[[servers]]
+id = "server-01"
+address = "server-01.example.com"
+user = "deploy"
+
+[[slots]]
+id = "p1"
+server = "server-01"
+variant = "standard"
+deploy_dir = "/srv/deploy/example"
+
+[targets.production]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+slots = ["p1"]
+"#;
+    let config_path = write_string(&proj.join("deploy.toml"), deploy_toml);
+    write_variant_file(&proj, "standard", &single_variant_body("true"));
+    let artifacts = proj.join("releases").join("v1").join("artifacts");
+    write_file(&artifacts.join("build/output/app/server"), "v1\n");
+    write_file(&artifacts.join("deployment/common/README"), "common\n");
+
+    let config0 = Config::load(&config_path)?;
+    let store = LocalStore::with_base(store_base.clone())?;
+    let rf = remotes_base.clone();
+    let factory = move |s: &deploy::config::ServerDef,
+                        _slot: &deploy::config::SlotDef|
+          -> Result<Box<dyn Remote>> {
+        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+    };
+
+    // f0: deploy T0.
+    let r0 = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config0,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r0.status, Some(DeploymentStatus::Successful));
+    let t0 = r0.attempt.expect("attempt recorded").servers[&ServerId::new("server-01")]
+        .tree
+        .clone();
+
+    // f1: new content -> T1; the f0 tree is rotated out of the remote.
+    write_file(
+        &proj
+            .join("releases")
+            .join("v1")
+            .join("artifacts")
+            .join("build/output/app/server"),
+        "v2\n",
+    );
+    let config1 = Config::load(&config_path)?;
     let r1 = push(
         &config_path,
         &store,
         &factory,
         "production",
-        &config_v2,
+        &config1,
         &PushOptions {
             dry_run: false,
             ref_token: None,
         },
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-    assert_ne!(
-        r1.attempt.expect("attempt recorded").servers[&ServerId::new("server-01")].release,
-        release,
-        "changed inputs must produce a new release"
+    assert!(
+        !remotes_base
+            .join("server-01/objects/sha256")
+            .join(t0.as_str())
+            .exists(),
+        "aggressive rotation must drop T0 from the server so the rollback re-uploads it"
     );
-
-    // Snapshot of healthy remote state before corruption.
     let current_before = std::fs::read_link(remotes_base.join("server-01/current"))?;
 
-    // Corrupt the historical snapshot.
-    let policies_path = store_base
-        .join("releases")
-        .join(release.as_str())
-        .join("policies.json");
-    std::fs::write(&policies_path, b"{ this is not json").unwrap();
+    // Raise the server's CURRENT reserve to a huge value: the @f0 rollback must
+    // now fail preflight (it has to re-upload T0) — proving the headroom came
+    // from today's server config, not from any per-release snapshot.
+    let body = std::fs::read_to_string(&config_path)?;
+    let huge = body.replace(
+        "user = \"deploy\"",
+        "user = \"deploy\"\ncapacity = { reserve_bytes = 1099511627776, reserve_percent = 0 }",
+    );
+    std::fs::write(&config_path, huge).unwrap();
+    let config_huge = Config::load(&config_path)?;
 
-    // Rollback to @f0 now fails during preflight...
     let err = push(
         &config_path,
         &store,
         &factory,
         "production",
-        &config,
+        &config_huge,
         &PushOptions {
             dry_run: false,
             ref_token: Some("production@f0".to_string()),
         },
     )
     .err()
-    .expect("corrupt policy snapshot must fail the push");
-    let msg = err.to_string();
+    .expect("huge current reserve must fail the historical rollback");
     assert!(
-        msg.contains("polic") && msg.to_lowercase().contains("preflight"),
-        "error must name the policy preflight failure, got: {msg}"
+        err.to_string().contains("insufficient capacity"),
+        "error must be a capacity preflight failure, got: {err}"
+    );
+    assert_eq!(
+        std::fs::read_link(remotes_base.join("server-01/current"))?,
+        current_before,
+        "`current` must be unchanged by the failed attempt"
     );
 
-    // ...and no server was touched.
-    let current_after = std::fs::read_link(remotes_base.join("server-01/current"))?;
+    // Lower the reserve back to zero: the same rollback to @f0 now succeeds.
+    let body = std::fs::read_to_string(&config_path)?;
+    let low = body.replace(
+        "capacity = { reserve_bytes = 1099511627776, reserve_percent = 0 }",
+        "capacity = { reserve_bytes = 0, reserve_percent = 0 }",
+    );
+    std::fs::write(&config_path, low).unwrap();
+    let config_low = Config::load(&config_path)?;
+    let r2 = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config_low,
+        &PushOptions {
+            dry_run: false,
+            ref_token: Some("production@f0".to_string()),
+        },
+    )?;
     assert_eq!(
-        current_before, current_after,
-        "`current` must be unchanged by the failed attempt"
+        r2.status,
+        Some(DeploymentStatus::Successful),
+        "rollback must succeed once the current reserve is lowered"
+    );
+    let observed = store.read_observed("production")?;
+    assert_eq!(
+        observed.servers[&ServerId::new("server-01")].tree.as_ref(),
+        Some(&t0),
+        "f0 tree restored"
     );
     Ok(())
 }

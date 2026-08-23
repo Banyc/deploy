@@ -32,9 +32,11 @@ struct GenRecord {
 
 /// Compute the set of retained tree digests for one server, using the
 /// fleet-wide rotation policy supplied by the caller and the durable pins
-/// declared in `deploy.toml`. The policy is read from the caller's current
-/// configuration; capacity headroom, by contrast, resolves per variant from the
-/// release's immutable policy snapshot.
+/// declared in `deploy.toml`. The rotation policy is read from the caller's
+/// current configuration; capacity headroom, by contrast, is a per-server
+/// policy declared on the server entry (`ServerDef.capacity`) and likewise
+/// resolved from the caller's current configuration — it is never part of a
+/// release snapshot.
 pub fn compute_retained(
     helper: &RemoteHelper,
     pins: &[Pin],
@@ -191,10 +193,6 @@ argv = ["true"]
 timeout_seconds = 5
 attempts = 1
 interval_seconds = 0
-
-[capacity]
-reserve_bytes = 0
-reserve_percent = 0
 "#;
         std::fs::write(release_dir.join("standard.toml"), variant_toml).unwrap();
         let deploy_toml = r#"

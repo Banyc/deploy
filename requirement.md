@@ -38,9 +38,9 @@ Deployment, operation, and generation IDs are opaque collision-resistant IDs (UU
 
 Tree objects contain no release- or variant-specific metadata, so identical trees can be deduplicated safely. Release records bind variants to trees.
 
-The canonical release ID is derived from a versioned canonical identity payload covering the name-sorted per-variant mapping digests, all declared `variant → tree digest` bindings, the name-sorted per-variant activation and verification behavior-contract digest, and the canonical per-variant capacity-policy digest. It explicitly excludes the resulting release ID, creation time, display name, and provenance, avoiding a circular hash. Two variants may share tree bytes while still requiring different activation and verification behavior, so behavior is captured per variant rather than once per release, and a capacity-only configuration change produces a new release identity instead of rewriting an existing snapshot. Its stored form is `rel-sha256-<release-digest>`; the CLI may display and accept an unambiguous digest prefix. Git revision and creation time are provenance only because mapped inputs can include generated or untracked files.
+The canonical release ID is derived from a versioned canonical identity payload covering the name-sorted per-variant mapping digests, all declared `variant → tree digest` bindings, and the name-sorted per-variant activation and verification behavior-contract digest. It explicitly excludes the resulting release ID, creation time, display name, and provenance, avoiding a circular hash. Two variants may share tree bytes while still requiring different activation and verification behavior, so behavior is captured per variant rather than once per release. Capacity is NOT part of the release identity: it is a per-server policy declared on the server entry and resolved from the caller's current configuration at preflight time, so a server-capacity change never produces a new release. Its stored form is `rel-sha256-<release-digest>`; the CLI may display and accept an unambiguous digest prefix. Git revision and creation time are provenance only because mapped inputs can include generated or untracked files.
 
-Mapping and behavior digests are computed from versioned canonical data after schema defaults, path normalization, and validation, not from TOML formatting, comments, or key order. The original configuration remains available as provenance, while `behavior.json` records the canonical behavior contract. Each variant's capacity policy is likewise persisted with the release record in `policies.json`; historical deployments resolve capacity headroom from that snapshot rather than the caller's current configuration, so a variant that was renamed or removed after the release was created still rolls back exactly. Snapshot files are written atomically and immutably with create-or-compare semantics: an identical rewrite is an idempotent no-op, and replacing an existing release's `policies.json` with different content fails. Resolution fails closed: a missing or corrupt assigned policy snapshot aborts the attempt during preflight rather than silently substituting current configuration or defaults (the one exception is the release materialized by the current push itself, whose just-frozen in-memory snapshot is authoritative). Retention (`rotation`) is target-level configuration declared within each target of the project file, not a per-variant or global setting, and is read from the caller's current configuration on every push.
+Mapping and behavior digests are computed from versioned canonical data after schema defaults, path normalization, and validation, not from TOML formatting, comments, or key order. The original configuration remains available as provenance, while `behavior.json` records the canonical behavior contract. Snapshot files are written atomically and immutably with create-or-compare semantics: an identical rewrite is an idempotent no-op, and replacing an existing release's `behavior.json` with different content fails. A historical deployment restores the variant's original activation and verification behavior from this snapshot (so a variant renamed or removed after the release was created still rolls back exactly), and resolution fails closed: a missing or corrupt historical behavior snapshot aborts the attempt during preflight rather than silently substituting the caller's current configuration or defaults. Capacity headroom, by contrast, is a per-server policy that is never snapshotted: servers have no per-release history, so every push — HEAD or historical — resolves it from the caller's current `deploy.toml`. Retention (`rotation`) is target-level configuration declared within each target of the project file, not a per-variant or global setting, and is read from the caller's current configuration on every push.
 
 The first materialization fixes the immutable release record's `created_at` and first-seen provenance. Reusing the same release later does not rewrite that record; the new deployment attempt records its own current provenance.
 
@@ -117,21 +117,26 @@ protect_previous = true
 protect_deployments = 2
 
 # Servers are declared once; a slot binds one server to one variant, and
-# targets reference slots by ID.
+# targets reference slots by ID. Capacity is a per-server policy, shared by
+# every deployment slot on the server and resolved from this file at preflight
+# time — it is never part of a release.
 [[servers]]
 id = "server-01"
 address = "server-01.example.com"
 user = "deploy"
+capacity = { reserve_bytes = 1073741824, reserve_percent = 5 }
 
 [[servers]]
 id = "server-02"
 address = "server-02.example.com"
 user = "deploy"
+capacity = { reserve_bytes = 1073741824, reserve_percent = 5 }
 
 [[servers]]
 id = "server-03"
 address = "server-03.example.com"
 user = "deploy"
+capacity = { reserve_bytes = 1073741824, reserve_percent = 5 }
 
 [[slots]]
 id = "app-1"
@@ -160,15 +165,20 @@ one variant, and each target lists its member slots by ID. A slot may be a membe
 of several targets, and two slots may share one server in different targets, but
 within a single target each server appears at most once (one running generation
 per server). Besides `id`, `address`, and `user`, every server accepts an
-optional `port` (default 22) and exactly one host-identity source: a dedicated
+optional `port` (default 22), exactly one host-identity source — a dedicated
 `known_hosts` file used with `StrictHostKeyChecking=yes`, or a pre-verified
-`host_key_fingerprint` (`SHA256:...`) that is pinned on first contact.
+`host_key_fingerprint` (`SHA256:...`) that is pinned on first contact — and an
+optional per-server capacity policy (`capacity = { reserve_bytes = ...,
+reserve_percent = ... }`, defaulting to 0/0). The capacity policy is shared by
+every deployment slot on that server and is resolved from the caller's CURRENT
+configuration at preflight time; servers have no per-release history, so it is
+not part of any release snapshot.
 Trust-on-first-use without a configured identity source is disabled.
 
 Each variant is described by its own file inside the release directory (e.g.
 `releases/v1/standard.toml`); there is no explicit variant list to keep in
 sync. A variant file owns its artifact mappings and its deployment policies
-(capacity, activation, verification); rotation is declared once per target:
+(activation, verification); rotation is declared once per target:
 
 ```toml
 # releases/v1/standard.toml
@@ -214,10 +224,6 @@ argv = ["/srv/deploy/example/current/app/server", "health-check"]
 timeout_seconds = 15
 attempts = 3
 interval_seconds = 2
-
-[capacity]
-reserve_bytes = 1073741824
-reserve_percent = 5
 ```
 
 Server IDs are durable identities and cannot be inferred from mutable network addresses. Deployment history is keyed by server ID. A rollback connects using the server's current address and verifies its configured SSH host identity; it never silently connects to a historical address.
@@ -274,7 +280,6 @@ The local store contains the exact immutable trees sent to servers, immutable re
     <release-id>/
       mapping.toml
       behavior.json
-      policies.json
       release.json
   targets/
     production/
@@ -384,11 +389,11 @@ Every datatype below carries an immutability semantic. For each one: what must n
    *Semantic*: bytes at a digest path always hash back to that digest.
    *Guarantee*: content-addressed identity; an existing object is re-canonicalized before reuse (`store.store_object`), freshly stored content is verified after copy and deleted on mismatch; staged uploads land in deployment-scoped `incoming/<deployment>/<digest>.partial` and become visible via a single same-filesystem rename (`helper.publish_from_incoming`); every activation re-canonicalizes the downloaded tree before `current` moves (`process_server` integrity check).
 2. **Release record** — local `releases/<id>/release.json`.
-   *Semantic*: a release ID permanently denotes one mapping set, behavior-contract set, capacity-policy snapshot, and variant→tree binding set.
-   *Guarantee*: the ID is derived from the canonical identity payload covering all four digests (`release.release_digest`); `store.write_release` refuses to replace an existing ID with different `release_sha256` and treats identical rewrite as idempotent.
-3. **Release snapshots** — `mapping.toml`, `behavior.json`, `policies.json` beside the release record.
+   *Semantic*: a release ID permanently denotes one mapping set, behavior-contract set, and variant→tree binding set.
+   *Guarantee*: the ID is derived from the canonical identity payload covering the mapping, behavior, and binding digests (`release.release_digest`); `store.write_release` refuses to replace an existing ID with different `release_sha256` and treats identical rewrite as idempotent. Capacity is deliberately excluded: it is per-server live configuration, not a release property.
+3. **Release snapshots** — `mapping.toml`, `behavior.json` beside the release record.
    *Semantic*: the frozen inputs behind a release ID can never be rewritten in place, not even partially.
-   *Guarantee*: atomic create-or-compare writes (`store.write_atomic_cas`: temp file + rename for atomicity; existing content must match byte-for-byte or the write fails); remotely mirrored by `helper.publish_release_file` (exclusive create via `try_write_new`, then semantic-JSON or byte comparison, refuse replace). The policy digest is part of the release identity, so a capacity-only change yields a new release instead of mutating an old snapshot.
+   *Guarantee*: atomic create-or-compare writes (`store.write_atomic_cas`: temp file + rename for atomicity; existing content must match byte-for-byte or the write fails); remotely mirrored by `helper.publish_release_file` (exclusive create via `try_write_new`, then semantic-JSON or byte comparison, refuse replace). There is no capacity snapshot: capacity headroom is live per-server configuration read from the caller's current `deploy.toml`.
 4. **Generation record** — remote `generations/<gen>/assignment.json` + `root` symlink.
    *Semantic*: once a generation exists, its assignment (deployment, release, variant, tree, behavior digest, prior generation) is fixed forever.
    *Guarantee*: generation IDs are fresh UUIDv7 values minted under the operation lock; `helper.create_generation` installs `assignment.json` with exclusive create-or-compare — an ID collision with divergent content fails integrity instead of rewriting history — and the `root` symlink target is derived deterministically from the verified assignment, making crash recovery idempotent. `current` moves only through the compare-and-swap rename in `helper.swap_current`.
@@ -418,7 +423,7 @@ Atomicity is per server, not across a fleet. Fleet consistency is provided by th
 5. Reconcile every server's actual `current`, object inventory, and unfinished transactions. Recovery must complete before planning a new mutation.
 6. Create and durably save a deployment attempt containing the expected pre-push generation and desired assignment for every server.
 7. Before changing any server, prove that every desired tree is available locally. For historical pushes, also require the current target membership to match the historical deployment's stable server-ID set.
-8. Check local and remote capacity with configured safety headroom. If needed, run the ordinary protected rotation under each remote mutation lock before staging, then recheck. Abort before activation if required space is still unavailable.
+8. Check local and remote capacity with the configured safety headroom (the per-server `capacity` policy read from the caller's current `deploy.toml`). If needed, run the ordinary protected rotation under each remote mutation lock before staging, then recheck. Abort before activation if required space is still unavailable.
 9. Upload and verify missing trees in operation-unique incoming paths on every server before activating the first batch. Uploading and staged verification may be parallel, but incoming content is not installable and rotation ignores it.
 10. Process servers in configured batches. For each server, acquire its remote mutation lock and compare `current` with the plan's expected generation. If it differs, fail that server without mutation. Otherwise publish and reverify the tree and release record, create a generation and transaction record, atomically move `current`, run the activation adapter, and run
 verification.
@@ -504,7 +509,7 @@ Rollback never rebuilds a tree. It uses the retained immutable object with the r
 ## Protection and rotation
 The retention policy comes from the pushed target's own `rotation` configuration, so different targets can retain differently (a canary target may retain more than production). Retention is evaluated per server because servers may have different release and variant histories. A successful fleet deployment is committed back to each participating server before rotation, allowing its generation history to record the fleet deployment ID. Rotation does not run if those commit markers cannot be reconciled.
 
-Capacity preflight reserves the larger of `capacity.reserve_bytes` and `capacity.reserve_percent` of the destination filesystem after the upload. It may invoke the same protected rotation before staging, but never weakens the retained set merely to make a deployment fit.
+Capacity preflight reserves the larger of `capacity.reserve_bytes` and `capacity.reserve_percent` of the destination filesystem after the upload. Capacity is a per-server policy declared on the server entry (`capacity = { reserve_bytes = ..., reserve_percent = ... }`) and resolved from the caller's CURRENT configuration on every push — HEAD and historical alike, because servers have no per-release history; it is never part of a release snapshot. The check may invoke the same protected rotation before staging, but never weakens the retained set merely to make a deployment fit.
 
 For each server, the retained content set is exactly this union:
 
@@ -578,6 +583,6 @@ The remote application root and state are writable only by the deployment accoun
 - Never infer fleet success from the local plan; reconcile actual generations and fleet-commit markers, and record successful, pending, failed, compensated, and degraded results.
 - Never describe fleet rollout as atomic; expose partial state explicitly.
 - Ensure a release variant always resolves to one canonical tree digest, independent of target or server.
-- Snapshot mappings, variant bindings, behavior contract, capacity policies, target server IDs, pre-push generations, desired generations, timestamps, and actual results.
-- Never fail open: a missing or corrupt assigned policy snapshot fails the attempt in preflight instead of falling back to current configuration or defaults.
+- Snapshot mappings, variant bindings, behavior contract, target server IDs, pre-push generations, desired generations, timestamps, and actual results.
+- Never fail open: a missing or corrupt historical behavior snapshot fails the attempt in preflight instead of falling back to the caller's current configuration or defaults. (Capacity is never snapshotted: it is live per-server configuration read from the caller's current `deploy.toml`, for HEAD and historical pushes alike.)
 - Treat all artifact bytes as confidential and never log their contents.

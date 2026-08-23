@@ -49,7 +49,9 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
         &variant.artifact.mappings[0].from,
         "artifacts/build/output/"
     );
-    assert_eq!(variant.capacity.reserve_bytes, 1_073_741_824);
+    // Capacity is a per-server policy, not a variant one.
+    assert_eq!(config.servers[0].capacity.reserve_bytes, 1_073_741_824);
+    assert_eq!(config.servers[1].capacity.reserve_bytes, 1_073_741_824);
 
     // A dry-run materializes the release's artifacts and builds the full plan:
     // the documented example stays a working configuration, not merely

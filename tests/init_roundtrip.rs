@@ -67,11 +67,14 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     assert_eq!(config.targets["production"].rollout.batch_size, 1);
     let variant = config.variant("standard")?;
     assert_eq!(variant.verification.argv, vec!["true"]);
-    assert_eq!(variant.capacity.reserve_bytes, 0);
     assert_eq!(
         variant.activation.adapter, "none",
         "activation none is the zero-infrastructure default"
     );
+    // Capacity is a per-server policy: the scaffold puts it on the server
+    // entry (0/0 by default), and the variant file has no `[capacity]` block.
+    assert_eq!(config.servers[0].capacity.reserve_bytes, 0);
+    assert_eq!(config.servers[0].capacity.reserve_percent, 0);
     let addr = &config.servers[0].address;
     assert!(
         addr.starts_with("local://")

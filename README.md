@@ -115,8 +115,9 @@ releases/<name>/artifacts/    # artifact sources referenced by variant mappings
   active one with `release: <name>`.
 - A **variant** is a `*.toml` file directly inside the release directory,
   named by its file stem. It owns its artifact mappings and deployment
-  policies (activation, verification, capacity).
-- A **deployment slot** binds one server to one variant under an ID and names
+  policies (activation, verification). Capacity is a per-server policy
+  declared on the server entry.
+  A **deployment slot** binds one server to one variant under an ID and names
   the absolute `deploy_dir` on the server. A **target** groups slots (in rollout
   order) and carries the rollout and rotation policy.
 - Retention (`rotation`) belongs to the target, not the variant.
@@ -132,6 +133,7 @@ release = "v1"               # active release dir under releases/
 id = "server-01"             # durable ID; never rename it
 address = "local:///abs/path"   # or a hostname for SSH
 user = "deploy"
+capacity = { reserve_bytes = 0, reserve_percent = 0 }  # per-server headroom, zero by default
 # port = 22
 # known_hosts = "/etc/ssh/known_hosts"   # absolute path
 # host_key_fingerprint = "SHA256:..."
@@ -173,11 +175,12 @@ argv = ["true"]                 # replace with a real health-check
 timeout_seconds = 5
 attempts = 1
 interval_seconds = 0
-
-[capacity]                      # capacity headroom, zero by default
-reserve_bytes = 0
-reserve_percent = 0
 ```
+
+Capacity headroom is a per-server policy, not a variant one: it lives on the
+`[[servers]]` entry (`capacity = { reserve_bytes = ..., reserve_percent = ... }`,
+zero by default), is shared by every deployment slot on that server, and is
+resolved from this file at preflight time — it is never part of a release.
 
 Validation is strict: `deploy_dir` and `known_hosts` must be absolute paths,
 server/slot IDs must be unique, targets must reference declared slots, and each
