@@ -38,7 +38,9 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     let expected_files = [
         "deploy.toml",
         "releases/v1/standard.toml",
+        "releases/v1/systemd.toml",
         "releases/v1/artifacts/build/output/app/hello",
+        "releases/v1/artifacts/systemd/example.service",
         ".gitignore",
     ];
     for f in expected_files {
@@ -70,6 +72,26 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     assert_eq!(
         variant.activation.adapter, "none",
         "activation none is the zero-infrastructure default"
+    );
+    // The scaffold also ships the `systemd` example variant with a real unit
+    // artifact; it is not bound to any slot, so the real push below stays
+    // adapter-agnostic (no systemctl on the local endpoint).
+    let systemd = config.variant("systemd")?;
+    assert_eq!(systemd.activation.adapter, "systemd");
+    assert_eq!(
+        systemd.activation.scope,
+        deploy::config::ActivationScope::User
+    );
+    assert_eq!(systemd.activation.units.len(), 1);
+    assert_eq!(systemd.activation.units[0].name, "example.service");
+    assert_eq!(
+        systemd.activation.units[0].artifact_path,
+        "app/example.service"
+    );
+    assert!(
+        proj.join("releases/v1/artifacts/systemd/example.service")
+            .is_file(),
+        "the unit artifact is scaffolded"
     );
     // Capacity is a per-server policy: the scaffold puts it on the server
     // entry (0/0 by default), and the variant file has no `[capacity]` block.

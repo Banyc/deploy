@@ -49,6 +49,26 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
         &variant.artifact.mappings[0].from,
         "artifacts/build/output/"
     );
+    // The `systemd` example variant ships a real unit file as an artifact; it
+    // is not bound to any slot, so the dry-run push stays adapter-agnostic.
+    let systemd = config.variant("systemd")?;
+    assert_eq!(systemd.activation.adapter, "systemd");
+    assert_eq!(
+        systemd.activation.scope,
+        deploy::config::ActivationScope::User
+    );
+    assert_eq!(systemd.activation.reconcile_managed_units, true);
+    assert_eq!(systemd.activation.units.len(), 1, "one managed unit");
+    assert_eq!(systemd.activation.units[0].name, "example.service");
+    assert_eq!(
+        systemd.activation.units[0].artifact_path,
+        "app/example.service"
+    );
+    assert!(
+        proj.join("releases/v1/artifacts/systemd/example.service")
+            .is_file(),
+        "the unit artifact ships with the fixture"
+    );
     // Capacity is a per-server policy, not a variant one.
     assert_eq!(config.servers[0].capacity.reserve_bytes, 1_073_741_824);
     assert_eq!(config.servers[1].capacity.reserve_bytes, 1_073_741_824);

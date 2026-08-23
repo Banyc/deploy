@@ -120,8 +120,20 @@ pub fn init_project(target: &Path, opts: &InitOptions) -> Result<InitReport> {
     )?;
     write_project_file(
         &target,
+        &target.join("releases/v1/systemd.toml"),
+        SYSTEMD_VARIANT,
+        &mut files,
+    )?;
+    write_project_file(
+        &target,
         &target.join("releases/v1/artifacts/build/output/app/hello"),
         PLACEHOLDER,
+        &mut files,
+    )?;
+    write_project_file(
+        &target,
+        &target.join("releases/v1/artifacts/systemd/example.service"),
+        &systemd_unit_file(&deploy_dir),
         &mut files,
     )?;
 
@@ -210,6 +222,79 @@ const PLACEHOLDER: &str = "Hello from deploy!\n\
 This placeholder is mapped into the artifact as `app/hello` by the\n\
 `standard` variant (see releases/v1/standard.toml). Add or replace files\n\
 under releases/v1/artifacts/ and run `deploy push production` again.\n";
+
+const SYSTEMD_VARIANT: &str = r#"# The `systemd` variant: same artifact mappings as `standard`, but the
+# deployment is activated through a real systemd user unit shipped as an
+# artifact (`artifacts/systemd/example.service`). Every *.toml file directly
+# inside the release directory is a variant, named by its file stem.
+description = "Systemd-managed deployment"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/app/"
+to = "app/"
+recursive = true
+
+# The unit file is an artifact too: it lands at `app/example.service` in the
+# release tree, matching `artifact_path` below.
+[[artifact.mappings]]
+from = "artifacts/systemd/"
+to = "app/"
+recursive = true
+
+# Activation: what happens after `current` is atomically swapped. This is the
+# `standard` variant's commented-out systemd block made live: on push the unit
+# is linked into the user service manager, enabled, and restarted.
+# Artifact-controlled unit files are supported by default only with
+# `scope = "user"` (systemctl --user): they hold no more authority than the
+# deployment account, and a host may need one-time admin configuration to keep
+# the user manager running. `scope = "system"` instead requires an
+# admin-installed root-owned wrapper unit. See releases/v1/standard.toml.
+[activation]
+adapter = "systemd"
+scope = "user"                     # "user" (default) | "system"
+reconcile_managed_units = true     # on success, disable and remove
+                                   # formerly-managed links absent from the
+                                   # new behavior contract
+[[activation.units]]               # required: at least one unit
+name = "example.service"           # unit name to enable and restart
+artifact_path = "app/example.service"  # unit file inside the release tree
+enable = true                      # systemctl enable (default)
+restart = true                     # systemctl restart (default)
+
+[verification]
+adapter = "command"
+argv = ["true"]           # replace with a real health-check command
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+
+/// The unit file shipped with the scaffold's `systemd` variant. The
+/// `ExecStart` must point at the artifact's real landing spot under the slot's
+/// `deploy_dir` (`current/app/hello`), so it is interpolated from the
+/// scaffold's deploy_dir — for the default `local://` project that is the
+/// absolute `.deploy-remote` path.
+fn systemd_unit_file(deploy_dir: &Path) -> String {
+    format!(
+        r#"# systemd user unit for the scaffold's `systemd` example variant
+# (releases/v1/systemd.toml). `deploy push` links this file into the user
+# service manager (`~/.config/systemd/user/`) and enables/restarts it.
+# `ExecStart` resolves through the deployment's `current` symlink, so a
+# successful push atomically points the running service at the new generation.
+[Unit]
+Description=Example service (managed by deploy)
+
+[Service]
+ExecStart={}/current/app/hello
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+"#,
+        deploy_dir.display()
+    )
+}
 
 const STANDARD_VARIANT: &str = r#"# The `standard` variant. Every *.toml file directly inside the release
 # directory is a variant, named by its file stem: add a file to add a variant.
@@ -360,7 +445,9 @@ mod tests {
                 PathBuf::from(".gitignore"),
                 PathBuf::from("deploy.toml"),
                 PathBuf::from("releases/v1/artifacts/build/output/app/hello"),
+                PathBuf::from("releases/v1/artifacts/systemd/example.service"),
                 PathBuf::from("releases/v1/standard.toml"),
+                PathBuf::from("releases/v1/systemd.toml"),
             ]
         );
         assert_eq!(report.dirs, vec![PathBuf::from(".deploy-remote")]);
@@ -376,6 +463,28 @@ mod tests {
         assert_eq!(
             config.variant("standard").unwrap().verification.argv,
             vec!["true"]
+        );
+
+        // The scaffold also ships the `systemd` example variant with a real
+        // unit artifact; it is not bound to any slot, so pushes stay
+        // adapter-agnostic.
+        let systemd = config.variant("systemd").unwrap();
+        assert_eq!(systemd.activation.adapter, "systemd");
+        assert_eq!(
+            systemd.activation.scope,
+            crate::config::ActivationScope::User
+        );
+        assert_eq!(systemd.activation.units.len(), 1);
+        assert_eq!(systemd.activation.units[0].name, "example.service");
+        assert_eq!(
+            systemd.activation.units[0].artifact_path,
+            "app/example.service"
+        );
+        assert!(
+            report
+                .target
+                .join("releases/v1/artifacts/systemd/example.service")
+                .is_file()
         );
 
         // The local-first address routes the transport into the project.

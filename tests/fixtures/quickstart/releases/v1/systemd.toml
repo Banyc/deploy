@@ -1,0 +1,44 @@
+# The `systemd` variant: the same artifact mappings as `standard`, but with a
+# REAL systemd unit instead of a commented-out block. The unit file is an
+# artifact (`artifacts/systemd/example.service`); on push it is linked into
+# the user service manager (`~/.config/systemd/user/`), enabled, and restarted
+# after `current` is swapped.
+#
+# `standard.toml` documents every setting made live here, including the
+# caveats: artifact-controlled unit files assume `scope = "user"`
+# (systemctl --user), which holds no more authority than the deployment
+# account; `scope = "system"` instead requires an admin-installed root-owned
+# wrapper unit and never links artifact unit files into /etc/systemd/system.
+description = "Systemd-managed deployment"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+# The unit file is an artifact too: it lands at `app/example.service` in the
+# release tree, matching `artifact_path` below.
+[[artifact.mappings]]
+from = "artifacts/systemd/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "systemd"
+scope = "user"                     # "user" (default) | "system"
+reconcile_managed_units = true     # on success, disable and remove
+                                   # formerly-managed links absent from the
+                                   # new behavior contract
+
+[[activation.units]]               # required: at least one unit
+name = "example.service"           # unit name to enable and restart
+artifact_path = "app/example.service"  # unit file inside the release tree
+enable = true                      # systemctl enable (default)
+restart = true                     # systemctl restart (default)
+
+[verification]
+adapter = "command"
+argv = ["/srv/deploy/example/current/app/server", "health-check"]
+timeout_seconds = 15
+attempts = 3
+interval_seconds = 2

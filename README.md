@@ -181,6 +181,10 @@ attempts = 1
 interval_seconds = 0
 ```
 
+A complete `adapter = "systemd"` variant with a real, copy-paste-usable unit
+file ships in `tests/fixtures/quickstart/releases/v1/systemd.toml` (and is
+scaffolded by `deploy init` as `releases/v1/systemd.toml`).
+
 Capacity headroom is a per-server policy, not a variant one: it lives on the
 `[[servers]]` entry (`capacity = { reserve_bytes = ..., reserve_percent = ... }`,
 zero by default), is shared by every deployment slot on that server, and is
