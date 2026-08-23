@@ -1,5 +1,12 @@
 //! Filesystem-backed local store.
 //!
+//! Record contract: `targets/<target>/attempts.jsonl` holds the IMMUTABLE
+//! attempt INTENT (persisted before any remote mutation; no status, no
+//! outcomes); `deployments/<id>/results.json` holds the per-slot OUTCOMES
+//! (written once after the mutation loop); `deployments/<id>/transitions.jsonl`
+//! is the append-only STATUS lifecycle (the latest transition is the current
+//! status).
+//!
 //! ```text
 //! <base>/
 //!   objects/sha256/<digest>/root/ , tree.json
@@ -358,6 +365,15 @@ impl LocalStore {
     }
 
     pub fn append_attempt(&self, target: &str, attempt: &DeploymentAttempt) -> Result<()> {
+        #[cfg(test)]
+        if test_faults::consume(
+            &test_faults::FAIL_APPEND_ATTEMPT,
+            attempt.deployment_id.as_str(),
+        ) {
+            return Err(Error::store(
+                "test fault: append_attempt forced to fail once",
+            ));
+        }
         let dir = self.target_dir(target);
         ensure_private_dir(&dir)?;
         let p = dir.join("attempts.jsonl");
@@ -514,6 +530,12 @@ impl LocalStore {
     }
 
     pub fn write_results(&self, id: &str, results: &DeploymentResults) -> Result<()> {
+        #[cfg(test)]
+        if test_faults::consume(&test_faults::FAIL_WRITE_RESULTS, id) {
+            return Err(Error::store(
+                "test fault: write_results forced to fail once",
+            ));
+        }
         let dir = self.deployment_dir(id);
         ensure_private_dir(&dir)?;
         // Same immutability rule as the plan: recorded once per deployment ID.
@@ -551,6 +573,14 @@ impl LocalStore {
         {
             return Err(Error::store(
                 "test fault: append_transition(Successful) forced to fail once",
+            ));
+        }
+        #[cfg(test)]
+        if status == &DeploymentStatus::PendingCommit
+            && test_faults::consume(&test_faults::FAIL_APPEND_TRANSITION_PENDING, id)
+        {
+            return Err(Error::store(
+                "test fault: append_transition(PendingCommit) forced to fail once",
             ));
         }
         let dir = self.deployment_dir(id);
@@ -617,6 +647,11 @@ impl LocalStore {
 /// concurrently running tests — passes through untouched. Keying by deployment
 /// ID keeps the in-crate engine tests deterministic under parallel `cargo test`
 /// execution: no other test can consume a fault armed for a specific attempt.
+///
+/// Faults exist for the intent persist (`arm_append_attempt`), the outcomes
+/// store (`arm_write_results`), the snapshot append, `refs/last-successful`,
+/// and status-qualified transition appends (`arm_append_transition`,
+/// `arm_append_transition_successful`, `arm_append_transition_pending`).
 #[cfg(test)]
 pub(crate) mod test_faults {
     use std::sync::Mutex;
@@ -651,6 +686,34 @@ pub(crate) mod test_faults {
         arm(&FAIL_APPEND_TRANSITION_SUCCESSFUL, deployment_id);
     }
 
+    /// Arm the next `append_attempt` call for `deployment_id` to fail once.
+    /// The attempt intent is persisted BEFORE any remote mutation, so a
+    /// one-shot failure here leaves the remote untouched (no generation, no
+    /// `current` change).
+    pub(crate) fn arm_append_attempt(deployment_id: &str) {
+        arm(&FAIL_APPEND_ATTEMPT, deployment_id);
+    }
+
+    /// Arm the next `write_results` call for `deployment_id` to fail once.
+    /// The outcomes store (`deployments/<id>/results.json`) is then absent; a
+    /// later recovery finalizes from the verified desired state instead.
+    pub(crate) fn arm_write_results(deployment_id: &str) {
+        arm(&FAIL_WRITE_RESULTS, deployment_id);
+    }
+
+    /// Arm the next `append_transition` call recording a `PendingCommit`
+    /// status for `deployment_id` to fail once. Qualifies on the recorded
+    /// status, mirroring [`arm_append_transition_successful`]: the earlier
+    /// `InProgress` transition (and every non-pending transition) passes
+    /// through untouched, and the one-shot fires ONLY at the recoverable
+    /// `PendingCommit` marker — the first step of the shared finalizer
+    /// ([`crate::history::finalize_successful_attempt`]) — leaving the
+    /// attempt's latest transition `InProgress` with intent + outcomes
+    /// durable.
+    pub(crate) fn arm_append_transition_pending(deployment_id: &str) {
+        arm(&FAIL_APPEND_TRANSITION_PENDING, deployment_id);
+    }
+
     /// Consume the one-shot fault for `deployment_id` if armed. Returns `true`
     /// when the fault fired (and is now disarmed).
     pub(crate) fn consume(fault: &Mutex<Option<String>>, deployment_id: &str) -> bool {
@@ -667,6 +730,9 @@ pub(crate) mod test_faults {
     pub(crate) static FAIL_WRITE_LAST_SUCCESSFUL: Mutex<Option<String>> = Mutex::new(None);
     pub(crate) static FAIL_APPEND_TRANSITION: Mutex<Option<String>> = Mutex::new(None);
     pub(crate) static FAIL_APPEND_TRANSITION_SUCCESSFUL: Mutex<Option<String>> = Mutex::new(None);
+    pub(crate) static FAIL_APPEND_ATTEMPT: Mutex<Option<String>> = Mutex::new(None);
+    pub(crate) static FAIL_WRITE_RESULTS: Mutex<Option<String>> = Mutex::new(None);
+    pub(crate) static FAIL_APPEND_TRANSITION_PENDING: Mutex<Option<String>> = Mutex::new(None);
 }
 
 /// Sanitize a name for use as a directory/file component.
@@ -782,6 +848,66 @@ mod tests {
             slots: Default::default(),
         };
         assert!(store.write_results("deploy-1", &conflicting).is_err());
+    }
+
+    /// The one-shot intent/outcomes faults are deployment-id keyed and
+    /// status-qualified: `arm_append_attempt` fails the NEXT `append_attempt`
+    /// for that id exactly once; `arm_write_results` fails the next
+    /// `write_results`; `arm_append_transition_pending` fails ONLY the first
+    /// `PendingCommit` transition append (the recoverable finalize marker) —
+    /// an earlier `InProgress` (or any other status) append passes through.
+    #[test]
+    fn new_fault_arms_are_one_shot_and_status_qualified() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let target = "t1";
+        let id = "deploy-fault-arms";
+        let attempt = DeploymentAttempt {
+            deployment_schema_version: 2,
+            deployment_id: DeploymentId::new(id.to_string()),
+            target: TargetName::new(target.to_string()),
+            slot_ids: vec![],
+            behavior_sha256: "sha256-aa".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            desired: BTreeMap::new(),
+            pre_push: BTreeMap::new(),
+            slots: BTreeMap::new(),
+        };
+
+        // arm_append_attempt: one-shot, fails once, then passes.
+        test_faults::arm_append_attempt(id);
+        let err = store.append_attempt(target, &attempt).unwrap_err();
+        assert!(err.to_string().contains("append_attempt"));
+        store.append_attempt(target, &attempt).expect("disarmed");
+
+        // arm_write_results: one-shot.
+        test_faults::arm_write_results(id);
+        let results = DeploymentResults {
+            deployment_id: DeploymentId::from(id.to_string()),
+            target: TargetName::from(target.to_string()),
+            slots: Default::default(),
+        };
+        let err = store.write_results(id, &results).unwrap_err();
+        assert!(err.to_string().contains("write_results"));
+        store.write_results(id, &results).expect("disarmed");
+
+        // arm_append_transition_pending: status-qualified — an InProgress
+        // append passes through; the first PendingCommit append fails once.
+        test_faults::arm_append_transition_pending(id);
+        store
+            .append_transition(id, &DeploymentStatus::InProgress, Some("attempt started"))
+            .expect("InProgress append passes through untouched");
+        let err = store
+            .append_transition(
+                id,
+                &DeploymentStatus::PendingCommit,
+                Some("finalization started"),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("append_transition"));
+        store
+            .append_transition(id, &DeploymentStatus::PendingCommit, None)
+            .expect("disarmed");
     }
 
     /// The transition stream is append-only JSONL: every appended event is

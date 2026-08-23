@@ -576,6 +576,47 @@ fn push_inner(
         Some("attempt started"),
     )?;
 
+    // PERSIST THE ATTEMPT INTENT BEFORE ANY REMOTE MUTATION. The attempt
+    // record is the IMMUTABLE INTENT of the deployment: deployment_id, target,
+    // membership, behavior digest, attempted_at, the planned (`desired`)
+    // generations, and the observed pre-push state. It must be durable BEFORE
+    // any server's `current`/generation changes, so a crash can never lose a
+    // deployment whose servers already advanced: without the record the next
+    // push would see every server at the desired generation and report
+    // "Everything up to date" with no attempt/snapshot/ref ever recorded.
+    // The record carries NO outcomes — the `slots` (actual) map is persisted
+    // empty; the actual per-slot outcomes are recorded separately in
+    // `deployments/<id>/results.json` after the mutation loop, and the status
+    // lifecycle lives in the per-deployment transition stream.
+    let slot_ids: Vec<PlacementSlotId> = assignments
+        .iter()
+        .map(|a| a.placement_slot.clone())
+        .collect();
+    let desired_map: BTreeMap<PlacementSlotId, GenerationRef> = assignments
+        .iter()
+        .map(|a| {
+            (
+                a.placement_slot.clone(),
+                GenerationRef {
+                    generation: new_gen[&a.placement_slot].clone(),
+                    assignment: a.clone(),
+                },
+            )
+        })
+        .collect();
+    let attempt_intent = DeploymentAttempt {
+        deployment_schema_version: 2,
+        deployment_id: deployment_id.clone(),
+        target: TargetName::new(target_name.to_string()),
+        slot_ids,
+        behavior_sha256: desired_behavior_sha.clone(),
+        attempted_at: crate::remote::helper::now_rfc3339(),
+        desired: desired_map,
+        pre_push,
+        slots: BTreeMap::new(),
+    };
+    store.append_attempt(target_name, &attempt_intent)?;
+
     // 8 & 9. Capacity preflight and staging. Capacity is a per-server policy
     // read from the caller's CURRENT `deploy.toml` (`ServerDef.capacity`), not
     // from any release snapshot: servers have no per-release history, so a
@@ -905,33 +946,22 @@ fn push_inner(
         };
         actual_servers.insert(sid.clone(), actual);
     }
-    // `desired` records each slot's minted generation for its planned artifact
-    // as a complete [`GenerationRef`].
-    let desired_map: BTreeMap<PlacementSlotId, GenerationRef> = assignments
-        .iter()
-        .map(|a| {
-            (
-                a.placement_slot.clone(),
-                GenerationRef {
-                    generation: new_gen[&a.placement_slot].clone(),
-                    assignment: a.clone(),
-                },
-            )
-        })
-        .collect();
+    // `desired` (each slot's minted generation for its planned artifact, as a
+    // complete [`GenerationRef`]) was computed BEFORE the mutation loop and
+    // persisted as part of the immutable intent (`attempt_intent`); it is not
+    // recomputed here.
 
+    // 16 & 17. Record outcomes, finalize, history, rotation. The append-only
+    // attempts.jsonl record (persisted BEFORE the mutation loop) keeps only
+    // the immutable intent; the ACTUAL per-slot outcomes are recorded
+    // separately in `deployments/<id>/results.json` — the outcomes store the
+    // snapshot and observed state are built from. The REPORT's attempt also
+    // carries the actuals (for display / rollback); the persisted record does
+    // not.
     let attempt = DeploymentAttempt {
-        deployment_schema_version: 2,
-        deployment_id: deployment_id.clone(),
-        target: TargetName::new(target_name.to_string()),
-        slot_ids: servers_order.clone(),
-        behavior_sha256: desired_behavior_sha.clone(),
-        attempted_at: crate::remote::helper::now_rfc3339(),
-        desired: desired_map,
-        pre_push,
         slots: actual_servers.clone(),
+        ..attempt_intent.clone()
     };
-    store.append_attempt(target_name, &attempt)?;
     store.write_results(
         deployment_id.as_str(),
         &DeploymentResults {
@@ -942,26 +972,34 @@ fn push_inner(
     )?;
 
     // Finalize the attempt's terminal status REPLAY-SAFELY. A SUCCESSFUL
-    // attempt goes through the SAME shared finalizer as pending-commit
-    // recovery ([`history::finalize_successful_attempt`]): first the
+    // attempt goes through the SAME shared finalizer as recovery
+    // ([`history::finalize_successful_attempt`]): first the
     // recoverable `PendingCommit` marker is persisted (so a crash
     // mid-finalization leaves the attempt re-eligible — its latest
     // transition is `PendingCommit`, never a prematurely-written
     // `Successful`), then the idempotent snapshot append and
     // `refs/last-successful`, and the terminal `Successful` transition is
-    // written LAST. A non-successful final status (`Degraded` /
-    // `PendingCommit` demoted by the fleet-commit step) is a plain
-    // transition append; it produces no snapshot entry.
+    // written LAST. The snapshot is built from the actual per-slot OUTCOMES
+    // (`actual_servers`), not from the intent record. A non-successful final
+    // status (`Degraded` / `PendingCommit` demoted by the fleet-commit step)
+    // is a plain transition append; it produces no snapshot entry.
     let mut message = format!("push status: {commit_status:?}");
     if commit_status == DeploymentStatus::Successful {
         // The snapshot records each slot's physical server binding so an exact
         // rollback can verify a slot still lives on the host it was deployed
         // onto (a rebound slot must refuse rather than deploy to the wrong
         // host). The binding comes from the CURRENT configuration: it is the
-        // live placement this attempt actually used.
+        // live placement this attempt actually used. The snapshot itself is
+        // built from the actual per-slot OUTCOMES (`actual_servers`), never
+        // from the intent record.
         let slot_servers = config.target_slot_servers(target_name)?;
-        let idx =
-            history::finalize_successful_attempt(store, &attempt, "push completed", &slot_servers)?;
+        let idx = history::finalize_successful_attempt(
+            store,
+            &attempt_intent,
+            &actual_servers,
+            "push completed",
+            &slot_servers,
+        )?;
         message = format!("push successful; fleet ref {}@f{idx}", target_name);
     } else {
         store.append_transition(deployment_id.as_str(), &commit_status, commit_reason)?;
@@ -1027,23 +1065,26 @@ fn push_inner(
     })
 }
 
-/// Reconcile `PendingCommit` attempts recorded by earlier pushes (step 15 of
-/// `requirement.md`). A `PendingCommit` attempt means the fleet-commit markers
-/// were not all written before the earlier push gave up; the latest transition
-/// still says `PendingCommit`, the snapshot log never advanced, and a
-/// naive "Everything up to date" push would otherwise skip the missing
-/// markers.
+/// Reconcile incomplete attempts recorded by earlier pushes (steps 15 of
+/// `requirement.md`). An attempt is eligible when its fleet-commit markers
+/// were not all durable and/or its finalization never completed — the latest
+/// transition is `PendingCommit` (markers missing: the earlier push gave up
+/// during the metadata phase) OR `InProgress` (the intent was persisted before
+/// mutation but finalization never started/completed — e.g. a crash between
+/// `append_attempt` and the finalize marker, or a faulted `write_results`);
+/// the snapshot log never advanced, and a naive "Everything up to date" push
+/// would otherwise skip the missing markers/finalization.
 ///
 /// Eligibility is determined by the attempt's LATEST transition
 /// (`deployments/<id>/transitions.jsonl`), not the append-only
 /// `attempts.jsonl` record (which carries no status at all): an attempt is
-/// reconciled only while its latest transition is `PendingCommit` (or no
-/// transition exists yet for a just-recorded attempt). Once a push finalizes
-/// the attempt with a `Successful` or `Degraded` transition, it is skipped on
-/// every later push — a finalized attempt is never re-reconciled and never
-/// re-entered into the snapshot log.
+/// reconciled only while its latest transition is `PendingCommit` or
+/// `InProgress` (or no transition exists yet for a just-recorded attempt).
+/// Once a push finalizes the attempt with a `Successful` or `Degraded`
+/// transition, it is skipped on every later push — a finalized attempt is
+/// never re-reconciled and never re-entered into the snapshot log.
 ///
-/// For each eligible pending attempt, oldest first (attempts.jsonl order, so
+/// For each eligible attempt, oldest first (attempts.jsonl order, so
 /// snapshot indices stay monotonic):
 /// 1. Membership: every participating server must still exist in the target.
 /// 2. Generations: each participating server's CURRENT generation (fresh
@@ -1054,12 +1095,16 @@ fn push_inner(
 ///    no-op) using the attempt's ORIGINAL deployment ID, then finalize
 ///    REPLAY-SAFELY through the SAME shared finalizer as the main success
 ///    path ([`history::finalize_successful_attempt`]): the recoverable
-///    `PendingCommit` marker step is a no-op here (the latest transition is
-///    already `PendingCommit`), then the idempotent snapshot entry +
-///    `refs/last-successful` repair ([`history::ensure_snapshot`]), and the
-///    final `Successful` transition LAST. The latest transition is the
-///    eligibility gate for recovery: as long as it still says
-///    `PendingCommit`, any crash or error mid-finalization leaves the attempt
+///    `PendingCommit` marker step is a no-op here when the latest transition
+///    is already `PendingCommit` (for an `InProgress` attempt it appends the
+///    marker — the attempt becomes re-eligible), then the idempotent snapshot
+///    entry + `refs/last-successful` repair ([`history::ensure_snapshot`]),
+///    and the final `Successful` transition LAST. The snapshot is built from
+///    the attempt's OUTCOMES — `deployments/<id>/results.json` when present,
+///    else the verified desired state
+///    ([`history::resolve_attempt_outcomes`]). The latest transition is the
+///    eligibility gate for recovery: as long as it still says `PendingCommit`
+///    (or `InProgress`), any crash or error mid-finalization leaves the attempt
 ///    eligible and the next push replays exactly the remaining steps; once it
 ///    says `Successful`, every earlier step is already durable, so nothing is
 ///    lost.
@@ -1087,19 +1132,28 @@ fn reconcile_pending_commits(
     helpers: &HashMap<PlacementSlotId, RemoteHelper>,
 ) -> Result<()> {
     // Eligible attempts: the attempts.jsonl record must exist AND the latest
-    // transition must be `PendingCommit` (or the transition stream is
-    // momentarily absent for a just-recorded attempt). A finalized attempt
-    // (latest transition `Successful` / `Degraded`, or any other non-pending
-    // status such as `InProgress`) is skipped — an already-reconciled attempt
-    // is never re-reconciled on a later push.
+    // transition must be `PendingCommit` or `InProgress` (or the transition
+    // stream is momentarily absent for a just-recorded attempt). A finalized
+    // attempt (latest transition `Successful` / `Degraded`, or any other
+    // non-eligible status) is skipped — an already-reconciled attempt is
+    // never re-reconciled on a later push. `InProgress` is eligible because
+    // the intent is now persisted BEFORE any remote mutation: a crash after
+    // the mutation phase but before finalization leaves the latest transition
+    // `InProgress` with the servers already at the desired generations, and
+    // skipping it would strand the deployment unrecoverable (the next push
+    // would see everything up to date but never record a snapshot/ref).
     let mut pending: Vec<DeploymentAttempt> = Vec::new();
     for attempt in store.read_attempts(target_name)? {
         match store.latest_status(attempt.deployment_id.as_str())? {
             // No transition recorded yet: legitimately new pending attempt.
             None => pending.push(attempt),
             Some(DeploymentStatus::PendingCommit) => pending.push(attempt),
-            // Finalized on an earlier push (Successful/Degraded) or still
-            // actively deploying (InProgress): skip.
+            // Intent persisted but finalization never completed: recover it
+            // exactly like a pending attempt (the finalizer appends the
+            // recoverable `PendingCommit` marker first, since the latest
+            // transition is not yet `PendingCommit`).
+            Some(DeploymentStatus::InProgress) => pending.push(attempt),
+            // Finalized on an earlier push (Successful/Degraded): skip.
             Some(_) => {}
         }
     }
@@ -1244,18 +1298,33 @@ fn reconcile_pending_commits(
 
         // 4. Finalize REPLAY-SAFELY through the SAME shared finalizer as the
         //    main success path ([`history::finalize_successful_attempt`]):
-        //    the recoverable `PendingCommit` marker step is a no-op here (the
-        //    attempt's latest transition is already `PendingCommit` — the
-        //    eligibility gate for recovery), then the idempotent snapshot
+        //    the recoverable `PendingCommit` marker step is a no-op here when
+        //    the attempt's latest transition is already `PendingCommit` (for
+        //    an `InProgress` attempt it appends the marker — the eligibility
+        //    gate for recovery), then the idempotent snapshot
         //    insert + `refs/last-successful` repair
         //    ([`history::ensure_snapshot`] never appends a second entry for
         //    the same deployment), and the terminal `Successful` transition
         //    LAST. A crash or error at ANY of these steps leaves the attempt
-        //    `PendingCommit` and the next push replays exactly the remaining
-        //    steps; once the transition says `Successful`, every earlier step
-        //    is already durable. The append-only attempts.jsonl record is
-        //    untouched (still the original deployment ID, no status field).
-        history::finalize_successful_attempt(store, &attempt, "recovery finalized", &slot_servers)?;
+        //    eligible (`PendingCommit` / `InProgress`) and the next push
+        //    replays exactly the remaining steps; once the transition says
+        //    `Successful`, every earlier step is already durable. The
+        //    append-only attempts.jsonl record is untouched (still the
+        //    original deployment ID, no status field, no outcomes). The
+        //    snapshot is built from the attempt's OUTCOMES —
+        //    `deployments/<id>/results.json` when present, else the verified
+        //    desired state ([`history::resolve_attempt_outcomes`]) — and
+        //    records each slot's physical server binding from the current
+        //    config (`slot_servers`), so rollback can verify a slot still
+        //    lives on the host it was deployed onto.
+        let outcomes = history::resolve_attempt_outcomes(store, &attempt)?;
+        history::finalize_successful_attempt(
+            store,
+            &attempt,
+            &outcomes,
+            "recovery finalized",
+            &slot_servers,
+        )?;
     }
     Ok(())
 }
@@ -3335,5 +3404,280 @@ slots = ["p1"]
             1,
             "no new attempt may be recorded by the no-op push"
         );
+    }
+
+    // ---- Intent persisted BEFORE remote mutation; InProgress recovery -----
+    //
+    // The attempt INTENT is now persisted BEFORE any server mutation (a crash
+    // after servers advanced can never lose the deployment: the intent is
+    // already durable and the next push reconciles it), outcomes are recorded
+    // separately in `deployments/<id>/results.json`, and recovery reconciles
+    // attempts whose latest transition is `InProgress` (intent durable,
+    // finalization never completed) through the SAME verification, marker, and
+    // replay-safe finalizer path as `PendingCommit` attempts.
+    //
+    // Each of the one-shot store faults below is armed by EXACTLY ONE test: the
+    // fault statics are process-global keyed by deployment id, so two tests
+    // arming the same fault (with different ids) would clobber each other
+    // under parallel `cargo test` execution.
+
+    /// Faulting the intent persist (`append_attempt`) must abort the push
+    /// BEFORE any remote mutation: no generation is created and `current` is
+    /// never touched (the per-server mutation loop cannot start), and no
+    /// attempt record leaks.
+    #[test]
+    fn intent_persist_fault_leaves_remote_untouched() {
+        let h = RecoveryHarness::new();
+        let id = DeploymentId::new("deploy-intent-fault".to_string());
+        crate::store::local::test_faults::arm_append_attempt(id.as_str());
+
+        let err = push_main_with_id(&h, &id)
+            .err()
+            .expect("push must abort when the intent persist fails");
+        assert!(
+            err.to_string().contains("append_attempt"),
+            "error must name the injected fault, got: {err}"
+        );
+
+        // Nothing recorded locally...
+        assert_eq!(
+            h.store.read_attempts("t1").unwrap().len(),
+            0,
+            "no attempt record when the intent persist failed"
+        );
+        assert!(h.store.read_results(id.as_str()).is_err(), "no results");
+        // ...and NOTHING on the remote mutated: no `current`, no generation.
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        assert!(
+            !remote.exists(crate::layout::current()),
+            "current must not exist before the intent is durable"
+        );
+        assert_eq!(
+            remote.list(crate::layout::generations()).unwrap().len(),
+            0,
+            "no generation may be created before the intent is durable"
+        );
+
+        // A clean push with a fresh id proceeds normally: remote advances.
+        let id2 = DeploymentId::new("deploy-intent-fault-clean".to_string());
+        let r2 = push_main_with_id(&h, &id2).unwrap();
+        assert_eq!(
+            r2.status,
+            Some(DeploymentStatus::Successful),
+            "a clean follow-up push succeeds"
+        );
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        assert!(remote.exists(crate::layout::current()), "remote advanced");
+        assert_finalized(&h, &single_attempt(&h));
+    }
+
+    /// The inverse guarantee plus crash window (b): when the outcomes store
+    /// (`write_results`) is faulted, push 1 fails with the servers ALREADY
+    /// advanced but no results.json — yet the intent record exists (immutable
+    /// intent, EMPTY `slots`, latest transition `InProgress`, never
+    /// `Successful` anywhere). Push 2 reconciles the `InProgress` attempt and
+    /// builds the snapshot from the verified desired state — exactly one
+    /// snapshot, ref, marker, and terminal `Successful` transition.
+    #[test]
+    fn write_results_fault_leaves_intent_durable_and_recovers_from_verified_desired() {
+        let h = RecoveryHarness::new();
+        let id = DeploymentId::new("deploy-inprogress-no-results".to_string());
+        crate::store::local::test_faults::arm_write_results(id.as_str());
+
+        let err = push_main_with_id(&h, &id)
+            .err()
+            .expect("push must abort when write_results fails");
+        assert!(err.to_string().contains("write_results"));
+
+        // The intent record is durable even though a later step failed; it
+        // carries the planned (desired) and observed (pre_push) maps but NO
+        // outcomes (empty `slots`), and the attempt never appears Successful
+        // anywhere (no snapshot, no ref, latest transition `InProgress`).
+        let attempts = h.store.read_attempts("t1").unwrap();
+        assert_eq!(attempts.len(), 1, "intent must be recorded before mutation");
+        let intent = &attempts[0];
+        assert_eq!(intent.deployment_id, id);
+        assert!(
+            intent.slots.is_empty(),
+            "persisted intent carries NO outcomes (they live in results.json)"
+        );
+        assert!(
+            intent.desired.contains_key(&PlacementSlotId::new("p1"))
+                && intent.pre_push.contains_key(&PlacementSlotId::new("p1")),
+            "intent carries the planned (desired) and observed (pre_push) maps"
+        );
+        assert!(
+            h.store.read_results(id.as_str()).is_err(),
+            "no results.json"
+        );
+        assert_eq!(
+            latest_status(&h, id.as_str()),
+            DeploymentStatus::InProgress,
+            "the crash window leaves the latest transition InProgress"
+        );
+        assert!(h.store.read_snapshots("t1").unwrap().is_empty());
+        assert!(h.store.read_last_successful("t1").is_none());
+        // Servers DID advance (the mutation loop ran before write_results).
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        assert!(remote.exists(crate::layout::current()), "remote advanced");
+
+        // Push 2: recovery verifies every slot is at the intent's desired
+        // generation, then finalizes; the snapshot is built from the verified
+        // desired state (results.json absent).
+        let r2 = push_clean(&h).unwrap();
+        assert_eq!(r2.status, None, "the replaying push is an up-to-date no-op");
+        assert_eq!(r2.message, "Everything up to date");
+        let intent = single_attempt(&h);
+        assert_finalized(&h, &intent);
+        let snap = h.store.read_snapshots("t1").unwrap();
+        assert_eq!(snap.len(), 1);
+        let g = &snap[0].slots[&PlacementSlotId::new("p1")];
+        let desired = &intent.desired[&PlacementSlotId::new("p1")];
+        assert_eq!(
+            g.generation.as_str(),
+            desired.generation.as_str(),
+            "snapshot generation comes from the verified desired state"
+        );
+        assert_eq!(g.assignment.artifact.tree, desired.assignment.artifact.tree);
+        assert_eq!(h.store.read_attempts("t1").unwrap().len(), 1);
+    }
+
+    /// Crash window (a)/(c): intent + outcomes durable, but the finalize
+    /// marker — the recoverable `PendingCommit` transition, first step of the
+    /// shared finalizer — is faulted by the status-qualified
+    /// `arm_append_transition_pending` (the earlier `InProgress` transition
+    /// passes through). The attempt's latest transition is `InProgress` —
+    /// never `Successful` — and the NEXT push reconciles it to exactly-once
+    /// success: one snapshot, `refs/last-successful`, the marker, and the
+    /// terminal `Successful` transition.
+    #[test]
+    fn inprogress_crash_window_reconciles_to_exactly_once_success() {
+        let h = RecoveryHarness::new();
+        let id = DeploymentId::new("deploy-inprogress-window".to_string());
+        crate::store::local::test_faults::arm_append_transition_pending(id.as_str());
+
+        // Push 1: mutation completes, outcomes are durable, but the first
+        // PendingCommit append (the finalize marker) fails once -> Err.
+        let err = push_main_with_id(&h, &id)
+            .err()
+            .expect("push must abort when the finalize marker append fails");
+        assert!(
+            err.to_string().contains("append_transition"),
+            "error must name the injected fault, got: {err}"
+        );
+        let results = h.store.read_results(id.as_str()).unwrap();
+        assert_eq!(
+            results.slots[&PlacementSlotId::new("p1")].outcome,
+            ServerOutcomeKind::Activated,
+            "outcomes durable before the finalize marker"
+        );
+        assert_eq!(
+            h.store.read_transitions(id.as_str()).unwrap().len(),
+            1,
+            "only the in_progress transition exists before finalization"
+        );
+        assert_eq!(
+            latest_status(&h, id.as_str()),
+            DeploymentStatus::InProgress,
+            "crash window must leave the attempt InProgress, never Successful"
+        );
+        assert!(h.store.read_snapshots("t1").unwrap().is_empty());
+        assert!(h.store.read_last_successful("t1").is_none());
+
+        // Push 2: a clean push reconciles the `InProgress` attempt (servers
+        // are already at the desired generation) and completes finalization
+        // exactly once; the finalizer's marker step now appends
+        // `PendingCommit` and the terminal `Successful` transition is LAST.
+        let r2 = push_clean(&h).unwrap();
+        assert_eq!(r2.status, None, "the replaying push is an up-to-date no-op");
+        assert_eq!(r2.message, "Everything up to date");
+        assert_finalized(&h, &single_attempt(&h));
+        assert_eq!(
+            h.store.read_attempts("t1").unwrap().len(),
+            1,
+            "the replay must not record a new attempt"
+        );
+        assert_eq!(latest_status(&h, id.as_str()), DeploymentStatus::Successful);
+        assert_eq!(h.store.read_snapshots("t1").unwrap().len(), 1);
+    }
+
+    /// Crash window (d): an `InProgress` attempt whose generation NO LONGER
+    /// matches (the remote advanced elsewhere) finalizes `Degraded` — no
+    /// snapshot entry for it — and the up-to-date no-op still reports
+    /// correctly. The `InProgress` attempt is crafted directly: its intent
+    /// (desired generation) is a FRESH minted generation the remote never
+    /// reached, while the remote already advanced to push 1's generation —
+    /// the exact state a pre-mutation-persisted intent leaves behind after a
+    /// crash plus a concurrent controller. Crafting the record (rather than
+    /// arming a second fault) also keeps each one-shot fault armed by exactly
+    /// one test.
+    #[test]
+    fn inprogress_attempt_diverged_generation_finalizes_degraded() {
+        let h = RecoveryHarness::new();
+        // Push 1: a real successful deployment advances the remote.
+        let id_b = DeploymentId::new("deploy-diverged-baseline".to_string());
+        let r1 = push_main_with_id(&h, &id_b).unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+        let baseline = r1.attempt.as_ref().expect("attempt recorded");
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        assert!(remote.exists(crate::layout::current()), "remote advanced");
+
+        // Craft an InProgress intent (id A) whose desired generation the
+        // remote never minted: intent durable, finalization never started,
+        // and the remote's current points elsewhere.
+        let target_a = GenerationId::generate();
+        let id_a = DeploymentId::new("deploy-inprogress-diverged".to_string());
+        let desired_ref = baseline.desired[&PlacementSlotId::new("p1")].clone();
+        let intent = DeploymentAttempt {
+            deployment_schema_version: 2,
+            deployment_id: id_a.clone(),
+            target: TargetName::new("t1".to_string()),
+            slot_ids: vec![PlacementSlotId::new("p1".to_string())],
+            behavior_sha256: baseline.behavior_sha256.clone(),
+            attempted_at: crate::remote::helper::now_rfc3339(),
+            desired: BTreeMap::from([(
+                PlacementSlotId::new("p1".to_string()),
+                GenerationRef {
+                    generation: target_a,
+                    assignment: desired_ref.assignment,
+                },
+            )]),
+            pre_push: BTreeMap::new(),
+            slots: BTreeMap::new(),
+        };
+        h.store.append_attempt("t1", &intent).unwrap();
+        h.store
+            .append_transition(
+                id_a.as_str(),
+                &DeploymentStatus::InProgress,
+                Some("attempt started"),
+            )
+            .unwrap();
+        assert_eq!(
+            latest_status(&h, id_a.as_str()),
+            DeploymentStatus::InProgress
+        );
+
+        // Push 2: recovery verifies the InProgress attempt; the slot's current
+        // generation no longer matches the intent's desired generation, so it
+        // finalizes Degraded — no snapshot entry for it, no last-successful
+        // change — and the up-to-date check (same artifact) reports a no-op.
+        let r2 = push_clean(&h).unwrap();
+        assert_eq!(r2.status, None, "the replaying push is an up-to-date no-op");
+        assert_eq!(r2.message, "Everything up to date");
+        assert_eq!(
+            latest_status(&h, id_a.as_str()),
+            DeploymentStatus::Degraded,
+            "the diverged attempt must finalize Degraded"
+        );
+        let snapshots = h.store.read_snapshots("t1").unwrap();
+        assert_eq!(snapshots.len(), 1, "only the baseline snapshot exists");
+        assert_eq!(snapshots[0].deployment_id, id_b);
+        assert_eq!(
+            h.store.read_last_successful("t1").as_deref(),
+            Some(id_b.as_str()),
+            "last-successful still points at the baseline deployment"
+        );
+        assert_eq!(h.store.read_attempts("t1").unwrap().len(), 2);
     }
 }

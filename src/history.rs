@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::model::{
     GenerationRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, ServerId, TargetName,
 };
-use crate::records::{DeploymentAttempt, DeploymentSnapshot, DeploymentStatus};
+use crate::records::{AttemptServer, DeploymentAttempt, DeploymentSnapshot, DeploymentStatus};
 use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
 
@@ -85,7 +85,7 @@ pub fn ref_name(target: &TargetName, index: u64) -> String {
 /// Returns the snapshot's index.
 ///
 /// This is the single idempotent insert used by BOTH the main success path
-/// and pending-commit recovery finalization, and it is replay-safe:
+/// and recovery finalization, and it is replay-safe:
 ///
 /// * If a snapshot with `deployment_id == attempt.deployment_id` already
 ///   exists (a previous finalization crashed after appending the snapshot but
@@ -96,10 +96,17 @@ pub fn ref_name(target: &TargetName, index: u64) -> String {
 ///   both cases — idempotent, the same value on every replay — which also
 ///   repairs the stale ref left by a crash between the snapshot append and
 ///   the ref update.
+///
+/// The snapshot is built from the attempt's OUTCOMES (`outcomes`: the
+/// per-slot actual state the engine observed — results.json on the main path,
+/// or the verified desired state during recovery), NOT from the attempt
+/// record itself: the persisted attempt is the immutable intent and its
+/// `slots` map is empty.
 pub fn ensure_snapshot(
     store: &LocalStore,
     target: &TargetName,
     attempt: &DeploymentAttempt,
+    outcomes: &BTreeMap<PlacementSlotId, AttemptServer>,
     servers: &BTreeMap<PlacementSlotId, ServerId>,
 ) -> Result<u64> {
     let target = target.as_str();
@@ -112,7 +119,7 @@ pub fn ensure_snapshot(
         return Ok(existing.index);
     }
     let next = entries.len() as u64;
-    let entry = build_snapshot(next, attempt, servers);
+    let entry = build_snapshot(next, attempt, outcomes, servers);
     store.append_snapshot(target, &entry)?;
     store.write_last_successful(target, attempt.deployment_id.as_str())?;
     Ok(next)
@@ -126,25 +133,34 @@ pub fn ensure_snapshot(
 /// attempt never duplicates the snapshot and always repairs
 /// `refs/last-successful`. Kept as the historical name; the main success
 /// path now finalizes through the shared
-/// [`finalize_successful_attempt`], which calls this.
+/// [`finalize_successful_attempt`], which calls this. The snapshot is built
+/// from the attempt's OUTCOMES map, not the attempt record (see
+/// [`ensure_snapshot`]).
 pub fn append_snapshot(
     store: &LocalStore,
     target: &TargetName,
     attempt: &DeploymentAttempt,
+    outcomes: &BTreeMap<PlacementSlotId, AttemptServer>,
     servers: &BTreeMap<PlacementSlotId, ServerId>,
 ) -> Result<u64> {
-    ensure_snapshot(store, target, attempt, servers)
+    ensure_snapshot(store, target, attempt, outcomes, servers)
 }
 
 /// Finalize a successful fleet attempt replay-safely: the single shared
-/// terminal path used by BOTH the normal push success path and pending-commit
-/// recovery ([`crate::push::engine::reconcile_pending_commits`]).
+/// terminal path used by BOTH the normal push success path and recovery
+/// ([`crate::push::engine::reconcile_pending_commits`]).
+///
+/// The snapshot is built from the attempt's OUTCOMES (`outcomes`: per-slot
+/// actual state observed by the engine — live actuals on the main path,
+/// results.json or the verified desired state during recovery), never from
+/// the attempt record itself (the persisted attempt is the immutable intent;
+/// its `slots` map is empty).
 ///
 /// Persistence order:
 /// 1. RECOVERABLE MARKER: ensure the attempt's LATEST transition is
 ///    `PendingCommit`, appending a `PendingCommit` transition (reason
 ///    "finalization started") only when the latest is not already
-///    `PendingCommit`. The latest transition is reconciliation's eligibility
+///    `PendingCommit`. The latest transition is recovery's eligibility
 ///    gate, so a crash at any later point leaves the attempt re-eligible and
 ///    the next push replays exactly the remaining steps. On the main path the
 ///    attempt's latest is `InProgress` here (this appends `PendingCommit`);
@@ -168,6 +184,7 @@ pub fn append_snapshot(
 pub fn finalize_successful_attempt(
     store: &LocalStore,
     attempt: &DeploymentAttempt,
+    outcomes: &BTreeMap<PlacementSlotId, AttemptServer>,
     reason: &str,
     servers: &BTreeMap<PlacementSlotId, ServerId>,
 ) -> Result<u64> {
@@ -176,7 +193,7 @@ pub fn finalize_successful_attempt(
     // every earlier step is durable by construction; only repair a stale
     // `refs/last-successful` and stop without appending anything.
     if store.latest_status(id)? == Some(DeploymentStatus::Successful) {
-        return ensure_snapshot(store, &attempt.target, attempt, servers);
+        return ensure_snapshot(store, &attempt.target, attempt, outcomes, servers);
     }
     // 1. Recoverable marker: the attempt must be re-eligible if we crash
     //    before the snapshot lands.
@@ -188,24 +205,72 @@ pub fn finalize_successful_attempt(
         )?;
     }
     // 2. Snapshot entry + `refs/last-successful` (idempotent).
-    let idx = ensure_snapshot(store, &attempt.target, attempt, servers)?;
+    let idx = ensure_snapshot(store, &attempt.target, attempt, outcomes, servers)?;
     // 3. Terminal status LAST.
     store.append_transition(id, &DeploymentStatus::Successful, Some(reason))?;
     Ok(idx)
 }
 
-/// Build a snapshot entry from a successful attempt. A successful fleet snapshot
-/// carries one complete [`GenerationRef`] per slot; slots without a recorded
-/// generation are not part of a coherent successful snapshot and are dropped.
-/// `servers` records the physical [`ServerId`] each slot was bound to at the
-/// time the deployment ran (the engine passes the target's current
-/// slot→server binding from `deploy.toml`). It is stored as a separate map so
-/// the `slots` map and its [`GenerationRef`]s stay intact; a legacy entry with
-/// no `servers` map deserializes to an empty one (unverifiable, so rollback
-/// refuses rather than guessing the host).
+/// Resolve the per-slot outcomes used to build a successful fleet snapshot
+/// when the engine no longer has the live outcomes at hand (recovery): the
+/// persisted results (`deployments/<id>/results.json`) when present — a
+/// crash after the mutation loop but before/within finalization — otherwise
+/// the attempt's verified desired state (a crash before outcomes were
+/// persisted, e.g. a faulted `write_results`).
+///
+/// The per-slot ARTIFACT always resolves from the attempt's desired
+/// assignment: results.json records outcomes (generation, status) but not
+/// artifacts, and recovery already verified each slot's current generation
+/// equals the desired generation. Slots without a recorded generation are
+/// not part of a coherent successful snapshot and are dropped by
+/// [`build_snapshot`].
+pub fn resolve_attempt_outcomes(
+    store: &LocalStore,
+    attempt: &DeploymentAttempt,
+) -> Result<BTreeMap<PlacementSlotId, AttemptServer>> {
+    // `read_results` fails when `results.json` is absent (crash before the
+    // outcomes were persisted); treat that as "verified desired state only".
+    let results = store.read_results(attempt.deployment_id.as_str()).ok();
+    let mut outcomes = BTreeMap::new();
+    for sid in &attempt.slot_ids {
+        let Some(desired) = attempt.desired.get(sid) else {
+            continue;
+        };
+        let generation = results
+            .as_ref()
+            .and_then(|r| r.slots.get(sid).and_then(|sr| sr.generation.clone()))
+            .or_else(|| Some(desired.generation.clone()));
+        outcomes.insert(
+            sid.clone(),
+            AttemptServer {
+                artifact: desired.assignment.artifact.clone(),
+                generation,
+            },
+        );
+    }
+    Ok(outcomes)
+}
+
+/// Build a snapshot entry from the attempt's OUTCOMES (per-slot actual
+/// state), not from the attempt record: the persisted attempt is the
+/// immutable intent (its `slots` map is empty), so the snapshot must be
+/// built from the outcomes the engine observed — live per-slot actuals on
+/// the main path, or results.json / the verified desired state during
+/// recovery ([`resolve_attempt_outcomes`]). A successful fleet snapshot
+/// carries one complete [`GenerationRef`] per slot; slots without a
+/// recorded generation are not part of a coherent successful snapshot and
+/// are dropped.
+///
+/// `servers` records the physical [`ServerId`] each slot was bound to at
+/// the time the deployment ran (the engine passes the target's current
+/// slot→server binding from `deploy.toml`). It is stored as a separate map
+/// so the `slots` map and its [`GenerationRef`]s stay intact; a legacy
+/// entry with no `servers` map deserializes to an empty one (unverifiable,
+/// so rollback refuses rather than guessing the host).
 pub fn build_snapshot(
     index: u64,
     attempt: &DeploymentAttempt,
+    outcomes: &BTreeMap<PlacementSlotId, AttemptServer>,
     servers: &BTreeMap<PlacementSlotId, ServerId>,
 ) -> DeploymentSnapshot {
     DeploymentSnapshot {
@@ -213,8 +278,7 @@ pub fn build_snapshot(
         deployment_id: attempt.deployment_id.clone(),
         target: attempt.target.clone(),
         behavior_sha256: attempt.behavior_sha256.clone(),
-        slots: attempt
-            .slots
+        slots: outcomes
             .iter()
             .filter_map(|(slot, s)| {
                 s.generation.clone().map(|generation| {
@@ -337,8 +401,11 @@ mod tests {
             slots: BTreeMap::new(),
         };
 
-        // First call appends the snapshot and advances the ref.
-        let first = append_snapshot(&store, &target, &attempt, &servers).unwrap();
+        // First call appends the snapshot and advances the ref. The snapshot
+        // is built from the attempt's OUTCOMES map (the attempt record
+        // itself carries only intent; its `slots` map is empty), and records
+        // the slot→server binding from `servers`.
+        let first = append_snapshot(&store, &target, &attempt, &attempt.slots, &servers).unwrap();
         assert_eq!(first, 0);
         let snapshots = store.read_snapshots(target.as_str()).unwrap();
         assert_eq!(snapshots.len(), 1);
@@ -350,7 +417,7 @@ mod tests {
 
         // Second call with the same deployment ID is a no-op: same index, no
         // duplicate entry, and `refs/last-successful` is untouched.
-        let second = append_snapshot(&store, &target, &attempt, &servers).unwrap();
+        let second = append_snapshot(&store, &target, &attempt, &attempt.slots, &servers).unwrap();
         assert_eq!(second, first, "repeated append must return the same index");
         let snapshots = store.read_snapshots(target.as_str()).unwrap();
         assert_eq!(snapshots.len(), 1, "no duplicate snapshot entry");
@@ -383,7 +450,7 @@ mod tests {
         let servers: BTreeMap<PlacementSlotId, ServerId> =
             BTreeMap::from([(slot.clone(), ServerId::new("server-01"))]);
 
-        let snapshot = build_snapshot(3, &attempt, &servers);
+        let snapshot = build_snapshot(3, &attempt, &attempt.slots, &servers);
         assert_eq!(
             snapshot.servers.get(&slot),
             Some(&ServerId::new("server-01")),

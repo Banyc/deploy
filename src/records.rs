@@ -10,18 +10,28 @@
 //! identity — while [`crate::model::ServerId`] remains the actual-server
 //! identity used for transport addressing (`ServerState`, config `ServerDef`).
 //!
-//! The records model separates the IMMUTABLE attempt identity from MUTABLE
-//! status, and freezes the terminal successful fleet state for rollback:
+//! The records model separates the IMMUTABLE attempt INTENT from MUTABLE
+//! status and per-slot OUTCOMES, and freezes the terminal successful fleet
+//! state for rollback:
 //!
-//! * [`DeploymentAttempt`] — the immutable intent and assignments of one
-//!   deployment (deployment_id, target, behavior, membership, desired /
-//!   pre_push / slots maps). It carries NO status: attempts are appended
-//!   once to `attempts.jsonl` and never edited.
+//! * [`DeploymentAttempt`] — the immutable INTENT of one deployment
+//!   (deployment_id, target, behavior, membership, `desired` / `pre_push`
+//!   maps). It is appended once to `attempts.jsonl`, BEFORE any server
+//!   mutation, and never edited. It carries NO status and NO outcomes: the
+//!   actual per-slot state lives in `deployments/<id>/results.json`
+//!   ([`DeploymentResults`]), and the status lifecycle lives in the
+//!   per-deployment transition stream.
+//! * [`DeploymentResults`] — the actual per-slot OUTCOMES of one deployment
+//!   (per-slot [`ServerResult`]), written once per deployment ID
+//!   (`deployments/<id>/results.json`) after the mutation loop. This is the
+//!   outcomes store: snapshots and observed state are built from it (or from
+//!   the verified desired state during recovery when it is absent), never
+//!   from the intent record.
 //! * [`DeploymentTransition`] — an append-only status event for one
 //!   deployment (deployment_id, status, recorded_at, optional reason). The
 //!   per-deployment transition stream (`deployments/<id>/transitions.jsonl`)
-//!   is the deployment's mutable status: the current status of an attempt is
-//!   the LATEST transition.
+//!   is the deployment's mutable status lifecycle: the current status of an
+//!   attempt is the LATEST transition.
 //! * [`DeploymentSnapshot`] — a terminal successful FLEET state used for
 //!   rollback, exposed as `<target>@fN`. Only successful deployments produce
 //!   a snapshot (`refs/snapshots.jsonl` + `refs/last-successful`). It records
@@ -86,10 +96,15 @@ pub struct AttemptServer {
     pub generation: Option<GenerationId>,
 }
 
-/// The immutable intent and assignments of one deployment attempt. Appended
-/// once to `attempts.jsonl` and never edited; the attempt's status is derived
-/// from its per-deployment transition stream (the latest
-/// [`DeploymentTransition`]), never stored here.
+/// The immutable INTENT of one deployment attempt: what was planned and
+/// observed BEFORE any server mutation. Appended once to `attempts.jsonl`
+/// BEFORE the remote mutation phase (a crash after servers advanced to new
+/// generations can never lose the deployment: the intent is already durable
+/// and the next push reconciles it) and never edited. The attempt's STATUS
+/// derives from its per-deployment transition stream (the latest
+/// [`DeploymentTransition`]), never stored here; its actual per-slot OUTCOMES
+/// live in `deployments/<id>/results.json` ([`DeploymentResults`]), never in
+/// this record — the persisted `slots` map is empty.
 ///
 /// Every slot→assignment map is keyed by [`PlacementSlotId`]; `slot_ids` is
 /// the deployment's membership (mirroring the fleet-commit marker `slots`
@@ -111,7 +126,12 @@ pub struct DeploymentAttempt {
     pub desired: BTreeMap<PlacementSlotId, GenerationRef>,
     /// Pre-push per-slot state before mutation (`None` if first deployment).
     pub pre_push: BTreeMap<PlacementSlotId, Option<AttemptServer>>,
-    /// Actual per-slot result after the attempt.
+    /// Actual per-slot result after the attempt. INTENT vs OUTCOME: the
+    /// `attempts.jsonl` intent record persists this map EMPTY (outcomes are
+    /// recorded separately in `deployments/<id>/results.json`); in memory
+    /// (the push report) it carries the observed actuals for display, and
+    /// recovery reads outcomes from results.json (or the verified desired
+    /// state) instead of this field.
     pub slots: BTreeMap<PlacementSlotId, AttemptServer>,
 }
 
@@ -244,7 +264,11 @@ pub struct ServerResult {
     pub error: Option<String>,
 }
 
-/// Per-slot deployment results (`results.json`), keyed by [`PlacementSlotId`].
+/// Per-slot deployment OUTCOMES (`deployments/<id>/results.json`), keyed by
+/// [`PlacementSlotId`]. Written once per deployment ID after the mutation
+/// loop: this is the outcomes store for the attempt — the source the
+/// successful snapshot and observed state are built from (the immutable
+/// `attempts.jsonl` record carries only intent).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentResults {
     pub deployment_id: DeploymentId,
