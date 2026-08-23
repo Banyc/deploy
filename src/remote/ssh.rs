@@ -401,9 +401,6 @@ impl SshTransport {
     /// for an immutable record at `root.join(rel)`. Extracted so tests can
     /// assert on the exact command shape without spawning ssh.
     fn write_new_cmd(root: &Path, rel: &Path, payload: &str) -> String {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
         let remote_path = root.join(rel);
         let remote_path_str = remote_path.to_string_lossy().into_owned();
         let parent = Path::new(&remote_path_str)
@@ -412,17 +409,33 @@ impl SshTransport {
             .unwrap_or_else(|| ".".to_string());
         // Durability protocol (mirrors LocalTransport::try_write_new):
         //
-        // 1. Write the payload into a UNIQUE, dot-prefixed temporary file in
-        //    the destination directory, so a concurrent reader never sees a
-        //    partial record and listing-based observers skip the temp name.
-        // 2. Install atomically WITHOUT replacement via `ln` -- it fails if
-        //    the destination exists, so no loser can clobber a winner.
-        // 3. Remove the temporary name and best-effort `sync` so the
-        //    installation survives a crash.
+        // 1. Allocate the temporary file REMOTELY with `mktemp` (exclusive
+        //    create, O_EXCL), so the name cannot collide with another
+        //    controller's temp no matter its pid or host: no two invocations
+        //    are ever handed the same name, and a stale temp left behind by a
+        //    crashed controller is never selected — and therefore never
+        //    truncated. The name is dot-prefixed and lives INSIDE the
+        //    destination's parent directory, so a concurrent reader never sees
+        //    a partial record and listing-based observers skip the temp name.
+        // 2. Write the payload, sync the file, then install atomically WITHOUT
+        //    replacement via `ln` — it fails if the destination exists, so no
+        //    loser can clobber a winner. Syncing BEFORE the install means a
+        //    reader can never observe an empty/partial hard link.
+        // 3. Remove only the temporary file THIS invocation created, then
+        //    best-effort `sync` so the installation survives a crash.
         //
         // The parent directory is created first (the remote layout is not
         // provisioned by SSH the way LocalTransport does it), so a fresh remote
-        // root still allows the first lock acquisition.
+        // root still allows the first lock acquisition. The whole chain is
+        // `&&`-connected: if `mktemp` (or anything else) fails, the command
+        // exits non-zero without installing anything (fail closed).
+        //
+        // Portability notes: `mktemp TEMPLATE` accepts a template argument on
+        // both GNU and BSD/macOS, provided `XXXXXX` ends the final component
+        // (kept here), and `sync FILE` is accepted on Linux (coreutils >= 8.24
+        // fsyncs that file) and macOS (forces pending writes); the trailing
+        // bare `sync 2>/dev/null` remains the best-effort directory sync, bare
+        // because `sync <dir>` is not portable.
         let basename = Path::new(&remote_path_str)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -430,19 +443,15 @@ impl SshTransport {
         // The temp lives INSIDE the destination's parent directory and is
         // dot-prefixed, exactly like LocalTransport::try_write_new. A sibling
         // name (`{parent}.{basename}.tmp...`) would escape the managed remote
-        // root whenever the destination's parent IS the deployment root.
-        let tmp = format!(
-            "{}/.{}.tmp.{}.{}",
-            parent.trim_end_matches('/'),
-            basename,
-            std::process::id(),
-            TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
-        );
+        // root whenever the destination's parent IS the deployment root. The
+        // `XXXXXX` suffix is the mktemp template; it must survive shell quoting
+        // verbatim (single quotes are fine) so GNU and BSD mktemp both accept it.
+        let tmp_template = format!("{}/.{}.tmp.XXXXXX", parent.trim_end_matches('/'), basename,);
         format!(
-            "mkdir -p {p} && printf '%s' {payload} > {tmp} && ln {tmp} {d}; rc=$?; rm -f {tmp}; test \"$rc\" -eq 0 && sync 2>/dev/null || true; exit $rc",
+            "mkdir -p {p} && tmp=$(mktemp {tpl}) && printf '%s' {payload} > \"$tmp\" && sync \"$tmp\" && ln \"$tmp\" {d}; rc=$?; rm -f \"$tmp\"; test \"$rc\" -eq 0 && sync 2>/dev/null || true; exit $rc",
             p = shell_quote(&parent),
+            tpl = shell_quote(&tmp_template),
             payload = shell_quote(payload),
-            tmp = shell_quote(&tmp),
             d = shell_quote(&remote_path_str),
         )
     }
@@ -754,6 +763,7 @@ impl Remote for SshTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
     fn transport() -> SshTransport {
@@ -839,21 +849,28 @@ mod tests {
             cmd.starts_with("mkdir -p '/srv/app/state'"),
             "parent directory is created first, got: {cmd}"
         );
+        // ... and the remote allocation happens only after the parent exists.
+        let mkdir_end = cmd.find("&&").unwrap();
+        assert!(
+            cmd[mkdir_end..].contains("mktemp"),
+            "mktemp allocation must follow mkdir -p, got: {cmd}"
+        );
     }
 
     // The unique temp file for the durability protocol must live INSIDE the
     // destination's parent directory and be dot-prefixed (mirroring
     // LocalTransport), never a sibling of the parent: a sibling name would
     // escape the managed remote root whenever the destination's parent IS the
-    // deployment root.
+    // deployment root. The name is allocated remotely by `mktemp`, so the
+    // XXXXXX template suffix must survive quoting verbatim.
     #[test]
     fn try_write_new_temp_is_dot_prefixed_inside_destination_parent() {
         let t = transport();
         let cmd =
             SshTransport::write_new_cmd(t.root(), &crate::layout::operation_lock(), "op-proc");
         assert!(
-            cmd.contains("/srv/app/state/.operation.lock.tmp."),
-            "temp must be inside the destination parent and dot-prefixed, got: {cmd}"
+            cmd.contains("mktemp '/srv/app/state/.operation.lock.tmp.XXXXXX'"),
+            "temp must be inside the destination parent, dot-prefixed, and mktemp-allocated, got: {cmd}"
         );
         assert!(
             !cmd.contains("/srv/app.state.operation.lock"),
@@ -862,6 +879,10 @@ mod tests {
         assert!(
             !cmd.contains("/srv/app/.state.operation.lock"),
             "temp must not leak above the destination parent, got: {cmd}"
+        );
+        assert!(
+            cmd.contains(".tmp.XXXXXX"),
+            "mktemp template must carry XXXXXX at the end of the last component, got: {cmd}"
         );
     }
 
@@ -873,12 +894,185 @@ mod tests {
         let t = transport();
         let cmd = SshTransport::write_new_cmd(t.root(), Path::new("files"), "payload-data");
         assert!(
-            cmd.contains("/srv/app/.files.tmp."),
+            cmd.contains("mktemp '/srv/app/.files.tmp.XXXXXX'"),
             "temp for a root-level destination must stay inside the root, got: {cmd}"
         );
         assert!(
             !cmd.contains("/srv.files.tmp."),
             "temp must not escape the managed root, got: {cmd}"
+        );
+    }
+
+    /// Execute a generated `write_new_cmd` string locally with `sh -c`. The
+    /// command is self-contained shell operating on absolute paths, so running
+    /// it against a local temp dir is a faithful execution of the remote
+    /// protocol (the remote login shell would run the same bytes).
+    fn run_sh(cmd: &str) -> std::process::Output {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .output()
+            .expect("spawn sh -c")
+    }
+
+    // The old temp name derived from the LOCAL pid + a per-process counter, so
+    // two controllers on different hosts could share a pid and collide on the
+    // same remote temp name; `printf ... > tmp` then truncated the collided
+    // path, and the no-clobber `ln` could install the WRONG payload. With
+    // remote `mktemp` allocation, concurrent controllers can never be handed
+    // the same name: exactly one install wins, every loser reports failure,
+    // and no reader ever observes torn/mixed content.
+    #[test]
+    fn try_write_new_concurrent_controllers_never_collide() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let rel = Path::new("state/op.json");
+        let dest = root.join(rel);
+        let payloads: Vec<String> = (0..8)
+            .map(|i| format!("payload-{i}:{}", "x".repeat(64 + i * 7)))
+            .collect();
+
+        std::thread::scope(|s| {
+            let done = Arc::new(AtomicBool::new(false));
+
+            // Writers: every controller runs the exact generated command for
+            // the same destination with a different payload.
+            let mut writers = Vec::new();
+            for payload in &payloads {
+                let cmd = SshTransport::write_new_cmd(&root, rel, payload);
+                writers.push(s.spawn(move || run_sh(&cmd)));
+            }
+
+            // Readers: while the writers race, any observation of the
+            // destination must be a complete payload — never torn, empty, or
+            // mixed. Dot-prefixed temp names are what listing-based observers
+            // skip, exactly as in LocalTransport::try_write_new.
+            let done2 = done.clone();
+            let parent = dest.parent().unwrap().to_path_buf();
+            let payloads2 = payloads.clone();
+            let dest3 = dest.clone();
+            s.spawn(move || {
+                while !done2.load(Ordering::SeqCst) {
+                    let Ok(entries) = std::fs::read_dir(&parent) else {
+                        continue;
+                    };
+                    for e in entries.flatten() {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        if name != "op.json" {
+                            assert!(
+                                name.starts_with('.'),
+                                "observer must only ever see the final name or dot-prefixed temps, got {name}"
+                            );
+                            continue;
+                        }
+                        let data = std::fs::read(&dest3).unwrap_or_default();
+                        assert!(
+                            payloads2.iter().any(|p| p.as_bytes() == data),
+                            "reader observed a torn/mixed/partial record: {:?}",
+                            String::from_utf8_lossy(&data)
+                        );
+                    }
+                }
+            });
+
+            let results: Vec<std::process::Output> =
+                writers.into_iter().map(|h| h.join().unwrap()).collect();
+            done.store(true, Ordering::SeqCst);
+
+            // Exactly one controller installs; every other reports failure.
+            let wins = results.iter().filter(|r| r.status.success()).count();
+            assert_eq!(
+                wins, 1,
+                "exactly one concurrent controller must win the no-clobber install"
+            );
+            let data = std::fs::read(&dest).unwrap();
+            assert!(
+                payloads.iter().any(|p| p.as_bytes() == data),
+                "installed content must be one complete payload, got {:?}",
+                String::from_utf8_lossy(&data)
+            );
+        });
+    }
+
+    // Recovery: a controller crashed AFTER `ln` but BEFORE `rm -f "$tmp"`,
+    // leaving the destination installed plus a stale hard-linked temp (nlink
+    // 2) in the same name space. A fresh invocation must allocate a DIFFERENT
+    // temp name, never touch the stale temp or the installed destination, and
+    // remove only its own temp.
+    #[test]
+    fn try_write_new_recovers_from_stale_hardlinked_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let rel = Path::new("state/op.json");
+        let dest = root.join(rel);
+        let parent = dest.parent().unwrap();
+
+        // First invocation: installs the record and cleans up its own temp.
+        let cmd1 = SshTransport::write_new_cmd(&root, rel, "gen-1");
+        let out1 = run_sh(&cmd1);
+        assert!(
+            out1.status.success(),
+            "first install failed: {}",
+            String::from_utf8_lossy(&out1.stderr)
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"gen-1");
+        let temps = || {
+            std::fs::read_dir(parent)
+                .unwrap()
+                .flatten()
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    n != "op.json"
+                })
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(temps().is_empty(), "first invocation left temps behind");
+
+        // Crash AFTER `ln` but BEFORE `rm -f "$tmp"`: the stale temp is a
+        // second hard link to the installed inode (nlink 2), sitting in the
+        // same name space a future mktemp draws from.
+        let stale = parent.join(".op.json.tmp.crashed");
+        std::fs::hard_link(&dest, &stale).unwrap();
+        let stale_meta = std::fs::metadata(&stale).unwrap();
+        assert_eq!(
+            stale_meta.nlink(),
+            2,
+            "stale temp must hard-link the installed inode"
+        );
+
+        // Fresh invocation with a different payload: must fail (already
+        // exists), leave dest and stale untouched, and clean up its own temp.
+        let cmd2 = SshTransport::write_new_cmd(&root, rel, "gen-2");
+        let out2 = run_sh(&cmd2);
+        assert!(
+            !out2.status.success(),
+            "reinstall after a winner must report already-exists"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"gen-1",
+            "installed destination must stay intact"
+        );
+        let stale_after = std::fs::metadata(&stale).unwrap();
+        assert_eq!(
+            stale_after.nlink(),
+            2,
+            "stale temp must not have been truncated or removed"
+        );
+        assert_eq!(
+            std::fs::read(&stale).unwrap(),
+            b"gen-1",
+            "stale temp content must be untouched"
+        );
+        let left = temps();
+        assert_eq!(
+            left,
+            vec![stale.file_name().unwrap().to_string_lossy().into_owned()],
+            "only the stale temp may remain; the fresh invocation's own temp must be removed"
         );
     }
 }
