@@ -18,4 +18,5 @@ pub mod release;
 pub mod remote;
 pub mod rotation;
 pub mod store;
+pub mod template;
 pub mod tree;

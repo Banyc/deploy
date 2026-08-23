@@ -2,7 +2,11 @@
 //! variant to assemble a staging tree directory.
 //!
 //! * `from` is relative to the project root and must stay beneath it.
-//! * `{{ variant }}` is the only interpolation variable.
+//! * `from` is rendered through the template module
+//!   ([`crate::template`]) with the mapping context, which exposes
+//!   `{{ variant }}` only — trees are content-addressed and shared across
+//!   slots, so slot-level variables (`deploy_dir`, `server`, `target`) are
+//!   never available here and fail loudly if referenced.
 //! * Mappings are applied in declaration order.
 //! * Recursive directory mappings merge; their conflict policy applies to
 //!   colliding descendant entries rather than deleting unrelated entries.
@@ -148,7 +152,10 @@ pub fn materialize_variant(
     set_mode(dest, Some(0o755))?;
 
     for (idx, m) in mappings.iter().enumerate() {
-        let from = m.from.replace("{{ variant }}", variant);
+        let from = crate::template::render_template(
+            &m.from,
+            &crate::template::TemplateVars::mapping(variant),
+        )?;
         let src = root.join(&from);
         let mode_override = resolved_mode(&m.mode)?;
         if !src.exists() {

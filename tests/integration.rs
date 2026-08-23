@@ -10,10 +10,12 @@ use deploy::remote::transport::{LocalTransport, Remote};
 use deploy::store::local::LocalStore;
 use std::path::Path;
 
-/// Shared per-variant policy body. It uses only `{{ variant }}` interpolation,
-/// so the same file content describes both the `standard` and `high-capacity`
-/// variants; their trees differ via `deployment/variants/<variant>/`. Rotation
-/// is not a variant setting: it lives at the top level of `deploy.toml`.
+/// Shared per-variant policy body. Its mappings use only `{{ variant }}` — the
+/// only variable the template module exposes at materialization (trees are
+/// content-addressed and shared across slots) — so the same file content
+/// describes both the `standard` and `high-capacity` variants; their trees
+/// differ via `deployment/variants/<variant>/`. Rotation is not a variant
+/// setting: it lives at the top level of `deploy.toml`.
 const VARIANT_BODY: &str = r#"
 [[artifact.mappings]]
 from = "artifacts/build/output/"

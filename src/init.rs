@@ -358,7 +358,7 @@ fn build_docs(
             ),
             (
                 PathBuf::from("releases/v1/artifacts/systemd/example.service"),
-                systemd_unit_file(deploy_dir),
+                systemd_unit_file(),
             ),
         ],
     })
@@ -468,13 +468,15 @@ const STANDARD_DOC: &str = "\
 /// The doc for `releases/v1/systemd.toml`.
 const SYSTEMD_DOC: &str = "\
 # The `systemd` example variant — same artifact mappings as `standard`, but
-# activation links, enables, and restarts the shipped user unit
+# activation renders, installs, enables, and restarts the shipped user unit
 # (releases/v1/artifacts/systemd/example.service) through the systemd
-# adapter. Artifact-controlled units work by default with scope = \"user\"
-# (systemctl --user); scope = \"system\" needs an admin-installed root-owned
-# wrapper unit. The unit file's ExecStart resolves through the deployment's
-# `current` symlink, so a successful push atomically points the running
-# service at the new generation.
+# adapter. The unit file is rendered per slot at activation time with the
+# template module: `{{ deploy_dir }}` resolves to the slot's deploy_dir (the
+# tree itself stays slot-independent), so `ExecStart` points through the
+# deployment's `current` symlink and a successful push atomically points the
+# running service at the new generation. Artifact-controlled units work by
+# default with scope = \"user\" (systemctl --user); scope = \"system\" needs
+# an admin-installed root-owned wrapper unit.
 ";
 
 const PLACEHOLDER: &str = "Hello from deploy!\n\
@@ -483,31 +485,32 @@ This placeholder is mapped into the artifact as `app/hello` by the\n\
 `standard` variant (see releases/v1/standard.toml). Add or replace files\n\
 under releases/v1/artifacts/ and run `deploy push production` again.\n";
 
-/// The unit file shipped with the scaffold's `systemd` variant. The
-/// `ExecStart` must point at the artifact's real landing spot under the slot's
-/// `deploy_dir` (`current/app/hello`), so it is interpolated from the
-/// scaffold's deploy_dir — for the default `local://` project that is the
-/// absolute `.deploy-remote` path.
-fn systemd_unit_file(deploy_dir: &Path) -> String {
-    format!(
-        r#"# systemd user unit for the scaffold's `systemd` example variant
-# (releases/v1/systemd.toml). `deploy push` links this file into the user
-# service manager (`~/.config/systemd/user/`) and enables/restarts it.
-# `ExecStart` resolves through the deployment's `current` symlink, so a
-# successful push atomically points the running service at the new generation.
+/// The unit file shipped with the scaffold's `systemd` variant. It uses the
+/// template module's `{{ deploy_dir }}` variable (see [`crate::template`]):
+/// the tree is content-addressed and shared across slots, so the unit's
+/// `ExecStart` is rendered per slot at activation time — for the default
+/// `local://` project the slot's `deploy_dir` is the absolute
+/// `.deploy-remote` path.
+fn systemd_unit_file() -> String {
+    r#"# systemd user unit for the scaffold's `systemd` example variant
+# (releases/v1/systemd.toml). `deploy push` renders this file with the slot's
+# template context ({{ deploy_dir }} -> the slot's deploy_dir) and installs
+# the rendered copy into the user service manager
+# (`~/.config/systemd/user/`), then enables/restarts it. `ExecStart` resolves
+# through the deployment's `current` symlink, so a successful push atomically
+# points the running service at the new generation.
 [Unit]
 Description=Example service (managed by deploy)
 
 [Service]
-ExecStart={}/current/app/hello
+ExecStart={{ deploy_dir }}/current/app/hello
 Restart=on-failure
 RestartSec=2
 
 [Install]
 WantedBy=default.target
-"#,
-        deploy_dir.display()
-    )
+"#
+    .to_string()
 }
 
 /// Create `target` if missing and canonicalize it to an absolute path. The

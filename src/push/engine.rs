@@ -47,6 +47,36 @@ pub struct PushReport {
 type RemoteFactory =
     dyn Fn(&crate::config::ServerDef, &crate::config::SlotDef) -> Result<Box<dyn Remote>>;
 
+/// Build the template context for one placement slot from the live
+/// configuration. `variant` is the variant whose contract is being rendered —
+/// the desired variant during activation, or the PRIOR variant when
+/// compensating (compensation overrides it via `TemplateVars::with_variant`).
+fn slot_vars(
+    members: &[(&crate::config::SlotDef, &crate::config::ServerDef)],
+    config: &Config,
+    target_name: &str,
+    slot_id: &PlacementSlotId,
+    variant: &str,
+) -> Result<crate::template::TemplateVars> {
+    let (slot, server) = members
+        .iter()
+        .find(|(s, _)| s.id == slot_id.as_str())
+        .ok_or_else(|| {
+            Error::internal(format!(
+                "slot '{}' not found among target members",
+                slot_id.as_str()
+            ))
+        })?;
+    Ok(crate::template::TemplateVars::slot(
+        &slot.deploy_dir,
+        variant,
+        &config.application,
+        config.release.as_str(),
+        target_name,
+        &server.id,
+    ))
+}
+
 /// Run a push against `target_name`.
 ///
 /// Dry-run gating: `opts.dry_run` short-circuits every mutating stage of
@@ -511,7 +541,14 @@ fn push_inner(
                     verified = false;
                     break;
                 };
-                if run_verification(remote, &variant_behavior.verification).is_err() {
+                let vars = slot_vars(
+                    &members,
+                    config,
+                    target_name,
+                    &a.placement_slot,
+                    a.artifact.variant.as_str(),
+                )?;
+                if run_verification(remote, &variant_behavior.verification, &vars).is_err() {
                     verified = false;
                     break;
                 }
@@ -612,6 +649,13 @@ fn push_inner(
                 continue;
             };
             let variant_behavior_sha = crate::release::behavior_contract_digest(variant_behavior);
+            let vars = slot_vars(
+                &members,
+                config,
+                target_name,
+                sid,
+                a.artifact.variant.as_str(),
+            )?;
             let outcome = process_server(
                 store,
                 remotes[sid].as_ref(),
@@ -623,6 +667,7 @@ fn push_inner(
                 plan_servers[sid].expected_generation.as_ref(),
                 variant_behavior,
                 &variant_behavior_sha,
+                &vars,
                 config,
             )?;
             let ServerProc {
@@ -686,6 +731,13 @@ fn push_inner(
             // activation/verification failed during rollback) is reported as a
             // failed compensation rather than aborting the whole push; the
             // slot stays advanced and the attempt is marked Degraded.
+            let vars = slot_vars(
+                &members,
+                config,
+                target_name,
+                sid,
+                plan_servers[sid].artifact.variant.as_str(),
+            )?;
             let ok = compensate_server(
                 store,
                 remotes[sid].as_ref(),
@@ -695,6 +747,7 @@ fn push_inner(
                 prior,
                 &new_gen[sid],
                 config,
+                &vars,
             )
             .unwrap_or_default();
             if ok {
@@ -1216,6 +1269,7 @@ fn process_server(
     expected_gen: Option<&GenerationId>,
     behavior: &BehaviorContract,
     behavior_sha256: &str,
+    template_vars: &crate::template::TemplateVars,
     config: &Config,
 ) -> Result<ServerProc> {
     // Acquire the slot's mutation lock via an RAII guard so every return path
@@ -1378,18 +1432,20 @@ fn process_server(
             });
         }
     };
+    // The generation's tree content root: `generations/<gen>/root` is a
+    // symlink to `objects/sha256/<tree>/root`, the same directory `current`
+    // points at (it is the tree content root, not a nested `root/root`).
     let generation_root = remote
         .root()
         .join(layout::generation(new_gen.as_str()))
-        .join("root")
         .join("root");
 
     // Activation adapter. On failure, compensate (current was advanced).
     if let Err(e) = run_activation(
         remote,
-        remote.root(),
         &generation_root,
         &behavior.activation,
+        template_vars,
     ) {
         let comp = compensate_server(
             store,
@@ -1400,6 +1456,7 @@ fn process_server(
             expected_gen,
             new_gen,
             config,
+            template_vars,
         );
         let _ = helper.transaction_record(op_id.as_str(), "compensated");
         let did_comp = matches!(comp, Ok(true));
@@ -1417,7 +1474,7 @@ fn process_server(
     }
 
     // Verification adapter. On failure, compensate.
-    if let Err(e) = run_verification(remote, &behavior.verification) {
+    if let Err(e) = run_verification(remote, &behavior.verification, template_vars) {
         let comp = compensate_server(
             store,
             remote,
@@ -1427,6 +1484,7 @@ fn process_server(
             expected_gen,
             new_gen,
             config,
+            template_vars,
         );
         let _ = helper.transaction_record(op_id.as_str(), "compensated");
         let did_comp = matches!(comp, Ok(true));
@@ -1477,8 +1535,10 @@ fn process_server(
 /// prior generation's stored behavior contract rather than the caller's current
 /// configuration. `advanced_gen` is the generation this slot was just advanced
 /// to; it is used as the compare-and-swap precondition so a concurrent
-/// controller cannot have its `current` clobbered. Returns true if compensation
-/// restored prior state.
+/// controller cannot have its `current` clobbered. `template_vars` supplies the
+/// slot context (deploy_dir, application, ...); the VARIANT is overridden with
+/// the prior assignment's variant, because compensation re-runs the PRIOR
+/// generation's contract. Returns true if compensation restored prior state.
 #[allow(clippy::too_many_arguments)]
 fn compensate_server(
     _store: &LocalStore,
@@ -1489,6 +1549,7 @@ fn compensate_server(
     prior_gen: Option<&GenerationId>,
     advanced_gen: &GenerationId,
     _config: &Config,
+    template_vars: &crate::template::TemplateVars,
 ) -> Result<bool> {
     // Hold the slot's mutation lock for the duration of compensation. Re-acquiring
     // is idempotent when the same op_id already holds it (process_server holds it
@@ -1528,14 +1589,17 @@ fn compensate_server(
             let root = remote
                 .root()
                 .join(layout::generation(prior.as_str()))
-                .join("root")
                 .join("root");
             // Re-run prior activation contract + verification. A failure means the
             // service was not actually restored to prior behavior, so propagate
             // it as a compensation failure (the attempt is marked Degraded).
-            run_activation(remote, remote.root(), &root, &prior_behavior.activation)
+            // The prior contract is rendered with the PRIOR variant (a restored
+            // slot may switch variants, and its unit content/argv must resolve
+            // for the variant that is actually being restored).
+            let prior_vars = template_vars.with_variant(prior_assignment.artifact.variant.as_str());
+            run_activation(remote, &root, &prior_behavior.activation, &prior_vars)
                 .map_err(|e| Error::remote(format!("compensation activation failed: {e}")))?;
-            run_verification(remote, &prior_behavior.verification)
+            run_verification(remote, &prior_behavior.verification, &prior_vars)
                 .map_err(|e| Error::remote(format!("compensation verification failed: {e}")))?;
             Ok(true)
         }
@@ -2102,6 +2166,18 @@ slots = ["p1"]
             let sha = crate::release::behavior_contract_digest(&behavior);
             let new_gen = GenerationId::generate();
             let helper = self.helper();
+            // Slot context from the harness config (one slot p1 on server s1,
+            // target t1, deploy_dir /srv/eng).
+            let members = self.config.target_slots("t1").unwrap();
+            let (slot, server) = members[0];
+            let vars = crate::template::TemplateVars::slot(
+                &slot.deploy_dir,
+                "standard",
+                &self.config.application,
+                self.config.release.as_str(),
+                "t1",
+                &server.id,
+            );
             process_server(
                 &self.store,
                 &self.remote,
@@ -2117,6 +2193,7 @@ slots = ["p1"]
                 expected_gen.as_ref(),
                 &behavior,
                 &sha,
+                &vars,
                 &self.config,
             )
             .unwrap()

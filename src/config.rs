@@ -54,8 +54,11 @@ pub enum ConflictPolicy {
 #[serde(deny_unknown_fields)]
 pub struct Mapping {
     /// Source path relative to the release directory (`releases/<release>/`),
-    /// where the convention is `artifacts/...`. `{{ variant }}` is the only
-    /// allowed interpolation variable.
+    /// where the convention is `artifacts/...`. The path is rendered with the
+    /// template module (`crate::template`): `{{ variant }}` is available at
+    /// materialization; slot-level variables such as `deploy_dir` are not
+    /// (trees are content-addressed and shared across slots) and referencing
+    /// them fails loudly.
     pub from: String,
     /// Artifact-relative destination path.
     pub to: String,

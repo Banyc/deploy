@@ -13,6 +13,9 @@ pub enum Error {
     #[error("configuration error: {0}")]
     Config(String),
 
+    #[error("template error: {0}")]
+    Template(String),
+
     #[error("path error: {0}")]
     Path(String),
 
@@ -64,6 +67,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl Error {
     pub fn config(msg: impl Into<String>) -> Self {
         Error::Config(msg.into())
+    }
+    pub fn template(msg: impl Into<String>) -> Self {
+        Error::Template(msg.into())
     }
     pub fn path(msg: impl Into<String>) -> Self {
         Error::Path(msg.into())

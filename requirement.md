@@ -229,11 +229,21 @@ restart = true
 
 [verification]
 adapter = "command"
-argv = ["/srv/deploy/example/current/app/server", "health-check"]
+argv = ["{{ deploy_dir }}/current/app/server", "health-check"]
 timeout_seconds = 15
 attempts = 3
 interval_seconds = 2
 ```
+
+The `argv` above is rendered with the slot's template context before exec:
+`{{ deploy_dir }}` resolves to the slot's absolute on-server deployment
+directory. The same rendering applies to systemd unit-file content at
+activation time (unit files like `ExecStart={{ deploy_dir }}/current/app/server`
+stay slot-independent in the tree and are rendered per slot when installed).
+The elected variables are `deploy_dir`, `variant`, `application`, `release`,
+`target`, and `server`; only these exact names are substituted — no
+arbitrary expressions or filters, and unknown/malformed templates fail the
+push loudly.
 
 Server IDs are durable identities and cannot be inferred from mutable network addresses. Deployment history is keyed by server ID. A rollback connects using the server's current address and verifies its configured SSH host identity; it never silently connects to a historical address.
 
@@ -260,9 +270,7 @@ optional = false
 # mode: "preserve" or an explicit octal mode
 ```
 
-Mappings are applied in declaration order. A collision fails unless the mapping explicitly selects another conflict behavior. In schema version 1, `{{ variant }}` is the only interpolation variable. Target name and server, environment variables, and machine state cannot influence a tree; all servers assigned the same release variant must receive the same digest.
-
-The mapper does not implicitly template file contents.
+Mappings are applied in declaration order. A collision fails unless the mapping explicitly selects another conflict behavior. Mapping `from` paths are rendered through the template module (`src/template.rs`) with a fixed set of elected variables: `deploy_dir`, `variant`, `application`, `release`, `target`, `server`. At materialization only `{{ variant }}` is available — target name and server, environment variables, and machine state cannot influence a tree; all servers assigned the same release variant must receive the same digest. Activation (unit-file content) and verification (`argv`) render with the full slot context (see below). Unknown variables, expressions, filters, and malformed templates fail loudly; the mapper does not implicitly template file contents — unit files and argv are rendered explicitly at activation/verification time.
 
 Materialization uses a canonical tree format:
 - paths must be valid UTF-8, Unicode NFC-normalized relative paths;
@@ -579,16 +587,16 @@ kept indefinitely, but only entries inside the configured protection windows ret
 Rotation runs automatically after a successful, fully recorded push. It may later be exposed as an explicit maintenance command without changing these safety rules.
 
 ## systemd adapter
-Systemd support is an optional adapter outside the generic artifact engine. The mapped unit remains an ordinary artifact file. The adapter alone knows how to register and activate it. The activation and verification definitions are canonicalized, hashed into the release identity, and copied into each deployment and generation record. A historical push therefore uses its historical behavior contract rather than the caller's current configuration.
+Systemd support is an optional adapter outside the generic artifact engine. The mapped unit remains an ordinary artifact file whose CONTENT is rendered through the template module (see “Mapping semantics” and “Activation”) with the slot's template context at activation time — `ExecStart={{ deploy_dir }}/current/app/server` resolves per slot, and the tree itself stays slot-independent (content-addressed and shared across slots). The adapter alone knows how to register and activate it. The activation and verification definitions are canonicalized, hashed into the release identity, and copied into each deployment and generation record. A historical push therefore uses its historical behavior contract rather than the caller's current configuration.
 
 Before changing `current`, the helper validates that every declared `artifact_path` exists with the required type in the desired tree. Command verification is executed directly as an argument vector, never through a shell, with the configured deployment identity, timeout, attempt count, and
-interval. Success requires a zero exit status within the timeout.
+interval. Success requires a zero exit status within the timeout. Both the unit content and the verification `argv` are rendered with the slot context (elected variables: `deploy_dir`, `variant`, `application`, `release`, `target`, `server`) before they are executed; an unknown or malformed template fails activation/verification loudly.
 
-Registration creates a stable link such as:
+Registration stages the rendered unit as a REGULAR FILE under the deployment root (`adapters/systemd/<unit>`) and copies it into the user service manager directory, so the installed unit reflects the slot context (a rendered unit can no longer be a symlink into the generation tree):
 
 ```text
-~/.config/systemd/user/example.service
-  → /srv/deploy/example/current/integration/systemd/example.service
+~/.config/systemd/user/example.service   (regular file, rendered from the unit artifact)
+  content: ExecStart=/srv/deploy/example/current/integration/systemd/example.service
 ```
 
 The first push moves `current` to the prepared generation and then registers and enables missing units idempotently as part of the recoverable activation transaction. Every activation or rollback performs the declared `daemon-reload`, enable, restart, and verification operations.

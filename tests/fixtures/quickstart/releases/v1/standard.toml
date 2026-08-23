@@ -41,8 +41,11 @@ recursive = true
 adapter = "none"
 
 [verification]
+# argv is rendered with the slot's template context before exec
+# (`{{ deploy_dir }}` resolves to the slot's deploy_dir; the other elected
+# variables are `variant`, `application`, `release`, `target`, `server`).
 adapter = "command"
-argv = ["/srv/deploy/example/current/app/server", "health-check"]
+argv = ["{{ deploy_dir }}/current/app/server", "health-check"]
 timeout_seconds = 15
 attempts = 3
 interval_seconds = 2

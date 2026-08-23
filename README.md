@@ -187,15 +187,27 @@ adapter = "none"                # pure file push; for per-deployment service man
 
 [verification]
 adapter = "command"
-argv = ["true"]                 # replace with a real health-check
+argv = ["{{ deploy_dir }}/current/app/server", "health-check"]  # rendered per slot before exec
 timeout_seconds = 5
 attempts = 1
 interval_seconds = 0
 ```
 
+`argv` (and, for the systemd adapter, unit-file content) is rendered through a
+strict Jinja-style template module with a fixed set of elected variables
+before anything is executed: `{{ deploy_dir }}` (the slot's absolute on-server
+directory), `{{ variant }}`, `{{ application }}`, `{{ release }}`,
+`{{ target }}`, `{{ server }}`. Only these names are recognized — no
+expressions, filters, or control flow; an unknown or malformed template fails
+the push loudly. Mapping `from` paths use only `{{ variant }}` (trees are
+content-addressed and shared across slots), while activation/verification
+render with the full slot context.
+
 A complete `adapter = "systemd"` variant with a real, copy-paste-usable unit
 file ships in `tests/fixtures/quickstart/releases/v1/systemd.toml` (and is
-scaffolded by `deploy init` as `releases/v1/systemd.toml`).
+scaffolded by `deploy init` as `releases/v1/systemd.toml`). The unit file is
+rendered per slot at activation time (`ExecStart={{ deploy_dir }}/current/app/server`),
+so the tree itself stays slot-independent.
 
 Capacity headroom is a per-server policy, not a variant one: it lives on the
 `[[servers]]` entry (`capacity = { reserve_bytes = ..., reserve_percent = ... }`,

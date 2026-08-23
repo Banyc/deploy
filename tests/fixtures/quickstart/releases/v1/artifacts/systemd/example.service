@@ -1,13 +1,15 @@
 # systemd user unit for the quickstart example. It ships as an artifact and is
-# linked into the user service manager (`~/.config/systemd/user/`) by the
-# `systemd` variant (releases/v1/systemd.toml). `ExecStart` resolves through
-# the deployment's `current` symlink, so a successful push atomically points
-# the running service at the new generation.
+# rendered per slot at activation time by the `systemd` variant
+# (releases/v1/systemd.toml): `{{ deploy_dir }}` resolves to the slot's
+# deploy_dir, and the rendered copy is installed into the user service manager
+# (`~/.config/systemd/user/`). `ExecStart` resolves through the deployment's
+# `current` symlink, so a successful push atomically points the running
+# service at the new generation.
 [Unit]
 Description=Example web service (managed by deploy)
 
 [Service]
-ExecStart=/srv/deploy/example/current/app/server
+ExecStart={{ deploy_dir }}/current/app/server
 Restart=on-failure
 RestartSec=2
 
