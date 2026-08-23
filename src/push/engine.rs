@@ -749,6 +749,7 @@ fn push_inner(
             let ServerProc {
                 kind,
                 generation,
+                did_advance,
                 did_compensate,
                 error,
             } = outcome;
@@ -757,7 +758,13 @@ fn push_inner(
             }
             if did_compensate {
                 compensated.push(sid.clone());
-            } else if kind == ServerOutcomeKind::Activated {
+            } else if did_advance {
+                // Any slot this deployment advanced — Activated, or a
+                // post-swap failure whose compensation failed — remains a
+                // "still-advanced" server for the failure-policy pass and the
+                // status decision. Pre-swap failures (never advanced) are NOT
+                // included: for them `advanced.is_empty()` correctly yields
+                // `FailedRolledBack` (nothing to roll back).
                 advanced.push(sid.clone());
             }
             results.insert(
@@ -3371,9 +3378,719 @@ interval_seconds = 0
             store.latest_status(id.as_str()).unwrap(),
             Some(DeploymentStatus::FailedRolledBack)
         );
+
+        // OBSERVED REFRESH FOR SKIPPED SLOTS: `observed.json` is refreshed
+        // for EVERY member slot, including the never-started p4. The refresh
+        // loop reads each slot's ACTUAL state from the remote `current` and
+        // falls back to `{artifact: desired, generation: None}` when the
+        // server has no live `current` — the contract for a Skipped slot (and
+        // for a first-deploy slot compensated back to no prior state). The
+        // observed entry must carry the DESIRED artifact (never a fabricated
+        // generation, never a stale pre-push state).
+        let observed = store.read_observed("t1").unwrap();
+        assert_eq!(
+            observed.slots.len(),
+            4,
+            "every member slot is refreshed in observed.json"
+        );
+        for sid in ["p1", "p2", "p3", "p4"] {
+            let os = &observed.slots[&PlacementSlotId::new(sid)];
+            assert_eq!(
+                os.generation, None,
+                "slot {sid} has no live generation after the failed push (Skipped or compensated first-deploy)"
+            );
+            let desired_art = &attempt.desired[&PlacementSlotId::new(sid)]
+                .assignment
+                .artifact;
+            let oa = os.artifact.as_ref().expect("observed artifact present");
+            assert_eq!(
+                oa.tree, desired_art.tree,
+                "slot {sid}'s observed artifact must be the DESIRED tree (no live generation to read)"
+            );
+            assert_eq!(oa.variant, desired_art.variant);
+            assert_eq!(oa.release, desired_art.release);
+            assert_eq!(os.last_deployment, Some(id.clone()));
+        }
+
         assert!(
             store.read_snapshots("t1").unwrap().is_empty(),
             "a failed attempt must produce no snapshot"
+        );
+    }
+
+    // ---- Fleet-ref membership-change refusal ------------------------------
+    //
+    // Exact fleet rollback requires the current target's placement-slot SET to
+    // be identical to the snapshot's recorded set (in addition to each slot's
+    // physical binding). When the variant file declares a DIFFERENT slot, the
+    // refusal must fire in planning — before any remote connection or store
+    // write — and leave every byte of store + remote state untouched.
+
+    #[test]
+    fn fleet_ref_membership_change_refuses_and_mutates_nothing() {
+        let h = RecoveryHarness::new();
+        let id1 = DeploymentId::new("deploy-membership-baseline".to_string());
+        let r1 = push_main_with_id(&h, &id1).unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+        assert_eq!(
+            h.store.read_snapshots("t1").unwrap().len(),
+            1,
+            "f0 exists for the p1 membership"
+        );
+
+        // Change the target's placement-slot set: the variant file now
+        // declares slot `p2` instead of `p1` (same server, same target). The
+        // snapshot's recorded set ({p1}) then differs from the current
+        // target's ({p2}) — membership CHANGED, unlike every other rollback
+        // test which keeps the membership identical.
+        let project_root = h.config.project_root(&h.cfg_path);
+        let variant_path = project_root
+            .join("releases")
+            .join("v1")
+            .join("standard.toml");
+        let rebind_variant = std::fs::read_to_string(&variant_path)
+            .unwrap()
+            .replace("id = \"p1\"", "id = \"p2\"");
+        assert_ne!(
+            rebind_variant,
+            std::fs::read_to_string(&variant_path).unwrap(),
+            "fixture must actually change the declared slot"
+        );
+        std::fs::write(&variant_path, rebind_variant).unwrap();
+        let config2 = Config::load(&h.cfg_path).unwrap();
+        let members2 = config2.target_slots("t1").unwrap();
+        assert_eq!(members2.len(), 1);
+        assert_eq!(members2[0].0.id, "p2", "current membership is now p2");
+
+        // The exact fleet rollback must be refused with the membership error
+        // and must not mutate ANY deployment state. The refusal fires in
+        // `plan_assignments` (before the remote phase opens a connection);
+        // `push()`'s advisory lock files are the only bytes created.
+        let remotes_before = snapshot_files(&h.remotes_base);
+        let observed_before = h.store.read_observed("t1").unwrap();
+        let rf = h.remotes_base.clone();
+        let factory = move |s: &crate::config::ServerDef,
+                            _slot: &crate::config::SlotDef|
+              -> Result<Box<dyn Remote>> {
+            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        };
+        let err = push(
+            &h.cfg_path,
+            &h.store,
+            &factory,
+            "t1",
+            &config2,
+            &PushOptions {
+                dry_run: false,
+                ref_token: Some("t1@f0".to_string()),
+            },
+        )
+        .err()
+        .expect("membership change must refuse exact fleet rollback");
+        assert!(
+            err.to_string().contains("target membership changed"),
+            "error must state the membership-change refusal, got: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("identical stable placement-slot set"),
+            "error must state the identical-slot-set requirement, got: {err}"
+        );
+
+        // Nothing mutated: no attempt, no snapshot, no observed change, and
+        // the remote roots are byte-for-byte identical.
+        assert_eq!(h.store.read_attempts("t1").unwrap().len(), 1);
+        assert_eq!(h.store.read_snapshots("t1").unwrap().len(), 1);
+        assert_eq!(
+            h.store.read_last_successful("t1").as_deref(),
+            Some(id1.as_str())
+        );
+        assert_eq!(h.store.read_observed("t1").unwrap(), observed_before);
+        assert_eq!(
+            remotes_before,
+            snapshot_files(&h.remotes_base),
+            "the refused rollback must not touch a single remote byte"
+        );
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        assert!(
+            remote.exists(crate::layout::current()),
+            "the baseline f0 deployment on the remote is untouched"
+        );
+    }
+
+    // ---- Historical dry runs (@fN and release/<id> refs) ------------------
+    //
+    // Every earlier dry-run test uses HEAD. A dry run against a HISTORICAL ref
+    // must report exactly what a real push would do (the plan built from the
+    // snapshot/release) while persisting NOTHING and touching no remote: no
+    // attempt/transition/snapshot/store change, no generation/current change.
+
+    #[test]
+    fn historical_dry_run_fleet_ref_plans_without_mutating() {
+        let h = RecoveryHarness::new();
+        let id1 = DeploymentId::new("deploy-hist-dry-f0".to_string());
+        let r1 = push_main_with_id(&h, &id1).unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+        let f0 = &r1.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")];
+        let f0_tree = f0.artifact.tree.clone();
+        let f0_gen = f0.generation.clone().expect("f0 generation");
+
+        let store_before = snapshot_files(&h.store.base());
+        let remotes_before = snapshot_files(&h.remotes_base);
+        let rf = h.remotes_base.clone();
+        let factory = move |s: &crate::config::ServerDef,
+                            _slot: &crate::config::SlotDef|
+              -> Result<Box<dyn Remote>> {
+            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        };
+        let r = push(
+            &h.cfg_path,
+            &h.store,
+            &factory,
+            "t1",
+            &h.config,
+            &PushOptions {
+                dry_run: true,
+                ref_token: Some("t1@f0".to_string()),
+            },
+        )
+        .unwrap();
+        assert!(r.dry_run, "report flags the dry run");
+        assert_eq!(r.status, None, "a dry run creates no attempt");
+        assert!(r.attempt.is_none());
+        assert!(
+            r.message.contains("dry-run plan"),
+            "reports a plan, got: {}",
+            r.message
+        );
+        assert!(
+            r.message.contains(f0_tree.as_str()),
+            "the plan names the historical f0 tree, got: {}",
+            r.message
+        );
+
+        // Persists NOTHING (byte-for-byte store) and touches no remote
+        // (byte-for-byte remotes; the live `current` still names f0's
+        // generation, no new generation was minted remotely).
+        assert_eq!(
+            store_before,
+            snapshot_files(&h.store.base()),
+            "a historical dry run must not write a single store byte"
+        );
+        assert_eq!(
+            remotes_before,
+            snapshot_files(&h.remotes_base),
+            "a historical dry run must not touch a single remote byte"
+        );
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let status = RemoteHelper::new(&remote).status().unwrap();
+        assert_eq!(
+            status.current_generation.as_deref(),
+            Some(f0_gen.as_str()),
+            "the remote current still points at f0's generation"
+        );
+        assert_eq!(h.store.read_attempts("t1").unwrap().len(), 1);
+        assert_eq!(h.store.read_snapshots("t1").unwrap().len(), 1);
+        assert_eq!(
+            h.store.read_observed("t1").unwrap().slots[&PlacementSlotId::new("p1")].generation,
+            Some(f0_gen),
+            "observed state untouched by the dry run"
+        );
+    }
+
+    #[test]
+    fn historical_dry_run_release_ref_plans_without_mutating() {
+        let h = RecoveryHarness::new();
+        let id1 = DeploymentId::new("deploy-hist-dry-rel".to_string());
+        let r1 = push_main_with_id(&h, &id1).unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+        let f0 = &r1.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")];
+        let release = f0.artifact.release.clone();
+        let tree = f0.artifact.tree.clone();
+
+        let store_before = snapshot_files(&h.store.base());
+        let remotes_before = snapshot_files(&h.remotes_base);
+        let rf = h.remotes_base.clone();
+        let factory = move |s: &crate::config::ServerDef,
+                            _slot: &crate::config::SlotDef|
+              -> Result<Box<dyn Remote>> {
+            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        };
+        let r = push(
+            &h.cfg_path,
+            &h.store,
+            &factory,
+            "t1",
+            &h.config,
+            &PushOptions {
+                dry_run: true,
+                ref_token: Some(format!("release/{}", release.as_str())),
+            },
+        )
+        .unwrap();
+        assert!(r.dry_run);
+        assert_eq!(r.status, None);
+        assert!(r.attempt.is_none());
+        assert!(
+            r.message.contains("dry-run plan"),
+            "reports a plan, got: {}",
+            r.message
+        );
+        assert!(
+            r.message.contains(tree.as_str()),
+            "the plan names the release's tree, got: {}",
+            r.message
+        );
+        assert_eq!(
+            store_before,
+            snapshot_files(&h.store.base()),
+            "a historical release dry run must not write a single store byte"
+        );
+        assert_eq!(
+            remotes_before,
+            snapshot_files(&h.remotes_base),
+            "a historical release dry run must not touch a single remote byte"
+        );
+        assert_eq!(h.store.read_attempts("t1").unwrap().len(), 1);
+        assert_eq!(h.store.read_snapshots("t1").unwrap().len(), 1);
+    }
+
+    // ---- Engine-level activation-failure compensation ---------------------
+    //
+    // The end-to-end rollback tests cover VERIFICATION failure; here the
+    // systemd ACTIVATION fails mid-push (after `current` advanced) via a fake
+    // `systemctl` shim that errors on `restart`. The attempt must compensate
+    // back to the prior generation + prior behavior contract, end
+    // `FailedRolledBack`, and refresh `observed.json` with the restored prior
+    // state. The second test pins the compensation-FAILURE contract: the
+    // attempt must be `Degraded` (requirement.md step 13: "If all compensation
+    // succeeds, mark the attempt failed_rolled_back; otherwise mark it
+    // degraded"), never a falsely clean `FailedRolledBack`.
+    //
+    // The fake systemctl is installed on PATH and `XDG_CONFIG_HOME` is pointed
+    // at a hermetic temp dir (the unit gets installed there), under
+    // `crate::testutil::ENV_LOCK` per the env-mutation invariant.
+
+    const SYSD_VARIANT: &str = r#"
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+deploy_dir = "/srv/sysd"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "systemd"
+scope = "user"
+units = [{ name = "svc.service", artifact_path = "app/svc.service", enable = true, restart = true }]
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+
+    /// Restore the process env on drop, so a test that panics mid-way cannot
+    /// leak a mutated PATH/XDG_CONFIG_HOME into a later test.
+    struct EnvGuard {
+        old_path: Option<std::ffi::OsString>,
+        old_xdg: Option<std::ffi::OsString>,
+        fail_marker: Option<std::ffi::OsString>,
+        once: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.old_path {
+                    Some(p) => std::env::set_var("PATH", p),
+                    None => std::env::remove_var("PATH"),
+                }
+                match &self.old_xdg {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+                match &self.fail_marker {
+                    Some(v) => std::env::set_var("FAKE_SYSTEMCTL_FAIL", v),
+                    None => std::env::remove_var("FAKE_SYSTEMCTL_FAIL"),
+                }
+                match &self.once {
+                    Some(v) => std::env::set_var("FAKE_SYSTEMCTL_ONCE", v),
+                    None => std::env::remove_var("FAKE_SYSTEMCTL_ONCE"),
+                }
+            }
+        }
+    }
+
+    /// Install a fake `systemctl` shim on PATH and point `XDG_CONFIG_HOME` at
+    /// a hermetic temp dir (the installed unit lands there). The shim fails
+    /// `restart` (exit 1) while the marker file exists; with `once` it
+    /// CONSUMES the marker on the first failure, so a later restart (e.g. the
+    /// compensation's prior-activation restart) succeeds.
+    fn install_fake_systemctl(
+        base: &std::path::Path,
+        marker: &std::path::Path,
+        once: bool,
+    ) -> EnvGuard {
+        let bindir = base.join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let fake = bindir.join("systemctl");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nif [ \"$1\" = \"--user\" ]; then shift; fi\ncase \"$1\" in\nrestart)\n  if [ -n \"$FAKE_SYSTEMCTL_FAIL\" ] && [ -f \"$FAKE_SYSTEMCTL_FAIL\" ]; then\n    if [ \"$FAKE_SYSTEMCTL_ONCE\" = \"1\" ]; then rm -f \"$FAKE_SYSTEMCTL_FAIL\"; fi\n    echo \"fake systemctl: forced restart failure\" >&2\n    exit 1\n  fi\n  exit 0\n  ;;\n*)\n  exit 0\n  ;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let old_path = std::env::var_os("PATH");
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let old_fail = std::env::var_os("FAKE_SYSTEMCTL_FAIL");
+        let old_once = std::env::var_os("FAKE_SYSTEMCTL_ONCE");
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bindir.display(),
+                    old_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ),
+            );
+            std::env::set_var("XDG_CONFIG_HOME", base.join("xdg"));
+            std::env::set_var("FAKE_SYSTEMCTL_FAIL", marker);
+            std::env::set_var("FAKE_SYSTEMCTL_ONCE", if once { "1" } else { "0" });
+        }
+        EnvGuard {
+            old_path,
+            old_xdg,
+            fail_marker: old_fail,
+            once: old_once,
+        }
+    }
+
+    /// A single-slot (`s1`/`t1`) project whose variant uses SYSTEMD
+    /// activation with a `restart` unit, plus the artifact files.
+    struct SysdHarness {
+        _dir: tempfile::TempDir,
+        cfg_path: PathBuf,
+        config: Config,
+        store: LocalStore,
+        remotes_base: PathBuf,
+    }
+
+    impl SysdHarness {
+        fn new() -> SysdHarness {
+            let dir = tempfile::tempdir().unwrap();
+            let project = dir.path().join("proj");
+            std::fs::create_dir_all(&project).unwrap();
+            let release_dir = project.join("releases").join("v1");
+            std::fs::create_dir_all(&release_dir).unwrap();
+            std::fs::write(release_dir.join("standard.toml"), SYSD_VARIANT).unwrap();
+            std::fs::write(project.join("deploy.toml"), NONE_TOML).unwrap();
+            let artifacts = release_dir.join("artifacts");
+            for (p, c) in [
+                ("build/output/app/server", "v1\n"),
+                (
+                    "build/output/svc.service",
+                    "[Unit]\nDescription=svc ({{ user }})\n\n[Service]\nExecStart={{ deploy_dir }}/current/app/server\n",
+                ),
+            ] {
+                let fp = artifacts.join(p);
+                std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
+                std::fs::write(&fp, c).unwrap();
+            }
+            let cfg_path = project.join("deploy.toml");
+            let config = Config::load(&cfg_path).unwrap();
+            let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+            let remotes_base = dir.path().join("remotes");
+            std::fs::create_dir_all(&remotes_base).unwrap();
+            SysdHarness {
+                _dir: dir,
+                cfg_path,
+                config,
+                store,
+                remotes_base,
+            }
+        }
+
+        fn push_head(&self, deployment_id: &DeploymentId) -> Result<PushReport> {
+            let project_root = self.config.project_root(&self.cfg_path);
+            let target = self.config.targets.get("t1").expect("harness target");
+            let op_id = OperationId::new(format!("op-{}", deployment_id.as_str()));
+            let rf = self.remotes_base.clone();
+            let factory = move |s: &crate::config::ServerDef,
+                                _slot: &crate::config::SlotDef|
+                  -> Result<Box<dyn Remote>> {
+                Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+            };
+            push_inner(
+                &project_root,
+                &self.store,
+                &factory,
+                "t1",
+                &PushRef::Head,
+                deployment_id,
+                &op_id,
+                &self.config,
+                target,
+                &PushOptions {
+                    dry_run: false,
+                    ref_token: None,
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn activation_failure_compensates_prior_and_observed_reflects_actual() {
+        // The env-lock invariant: PATH/XDG_CONFIG_HOME/FAKE_SYSTEMCTL_* are
+        // process-global, and the fake-ssh fingerprint suite mutates PATH too.
+        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
+        let h = SysdHarness::new();
+        let marker = h._dir.path().join("fail-restart");
+        let _env = install_fake_systemctl(h._dir.path(), &marker, true);
+
+        // Push 1: baseline. The fake systemctl succeeds (no marker), so
+        // activation completes; f0 records the prior generation/artifact and
+        // the remote publishes the prior behavior contract.
+        let id1 = DeploymentId::new("deploy-act-fail-baseline".to_string());
+        let r1 = h.push_head(&id1).unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+        let prior = r1.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")].clone();
+        let prior_gen = prior.generation.clone().expect("prior generation");
+        let prior_tree = prior.artifact.tree.clone();
+        let prior_release = prior.artifact.release.clone();
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let prior_assignment: crate::remote::helper::GenerationAssignment = serde_json::from_slice(
+            &remote
+                .read(
+                    &crate::layout::generations()
+                        .join(prior_gen.as_str())
+                        .join("assignment.json"),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let prior_behavior_sha = prior_assignment.behavior_sha256.clone();
+
+        // Push 2: the artifact content changes (so the push is not a no-op)
+        // and the activation-failure marker is armed. The fake systemctl fails
+        // the FIRST restart (the desired generation's activation) and consumes
+        // the marker, so the compensation's prior-activation restart succeeds.
+        let project_root = h.config.project_root(&h.cfg_path);
+        std::fs::write(
+            project_root
+                .join("releases")
+                .join("v1")
+                .join("artifacts")
+                .join("build/output/app/server"),
+            "v2\n",
+        )
+        .unwrap();
+        std::fs::write(&marker, "fail").unwrap();
+        let id2 = DeploymentId::new("deploy-act-fail".to_string());
+        let r2 = h.push_head(&id2).unwrap();
+        // Restore the environment and release the env lock BEFORE any
+        // assertion: a failing assertion must never poison the shared
+        // `ENV_LOCK` for the fingerprint/systemd env suites.
+        drop(_env);
+        drop(_lock);
+        assert_eq!(
+            r2.status,
+            Some(DeploymentStatus::FailedRolledBack),
+            "an activation failure after the swap with successful compensation must end FailedRolledBack, got {:?}",
+            r2.status
+        );
+        assert!(
+            !marker.exists(),
+            "the one-shot marker was consumed by the desired activation's failed restart"
+        );
+
+        // The report's ACTUAL per-slot state reflects the restored PRIOR
+        // generation and artifact, never the desired v2 tree.
+        let actual =
+            &r2.attempt.as_ref().expect("attempt recorded").slots[&PlacementSlotId::new("p1")];
+        assert_eq!(actual.generation, Some(prior_gen.clone()));
+        assert_eq!(
+            actual.artifact.tree, prior_tree,
+            "the actual artifact must be the restored prior tree, not the desired v2 tree"
+        );
+
+        // results.json records the compensation: the slot FAILED (activation)
+        // and was compensated inside the per-server pipeline at the PRIOR
+        // generation.
+        let results = h.store.read_results(id2.as_str()).unwrap();
+        let res = &results.slots[&PlacementSlotId::new("p1")];
+        assert_eq!(res.outcome, ServerOutcomeKind::Failed);
+        assert!(res.compensated, "activation failure must be compensated");
+        assert_eq!(res.generation, Some(prior_gen.clone()));
+
+        // The remote `current` points at the PRIOR generation, whose stored
+        // assignment carries the PRIOR behavior digest: the prior behavior
+        // contract was restored, not the desired one.
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let status = RemoteHelper::new(&remote).status().unwrap();
+        let cur = status
+            .current_generation
+            .expect("compensation must restore current");
+        assert_eq!(cur.as_str(), prior_gen.as_str());
+        let assignment: crate::remote::helper::GenerationAssignment = serde_json::from_slice(
+            &remote
+                .read(
+                    &crate::layout::generations()
+                        .join(&cur)
+                        .join("assignment.json"),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            assignment.behavior_sha256, prior_behavior_sha,
+            "the restored generation must carry the PRIOR behavior contract"
+        );
+
+        // OBSERVED REFRESH: observed.json carries the ACTUAL per-slot state —
+        // the restored prior generation/artifact — and attributes the failed
+        // attempt as the last deployment. It must NOT reflect the desired
+        // (failed) v2 tree.
+        let observed = h.store.read_observed("t1").unwrap();
+        let os = &observed.slots[&PlacementSlotId::new("p1")];
+        assert_eq!(os.generation, Some(prior_gen.clone()));
+        let oa = os.artifact.as_ref().expect("observed artifact");
+        assert_eq!(
+            oa.tree, prior_tree,
+            "observed tree must be the restored prior tree"
+        );
+        assert_eq!(oa.release, prior_release);
+        let desired_tree = r2.attempt.as_ref().unwrap().desired[&PlacementSlotId::new("p1")]
+            .assignment
+            .artifact
+            .tree
+            .clone();
+        assert_ne!(
+            oa.tree, desired_tree,
+            "observed must NOT reflect the desired (failed) v2 tree"
+        );
+        assert_eq!(os.last_deployment, Some(id2.clone()));
+
+        // The failed attempt is terminal FailedRolledBack, produced no
+        // snapshot, and the f0 snapshot/ref are untouched.
+        assert_eq!(
+            h.store.latest_status(id2.as_str()).unwrap(),
+            Some(DeploymentStatus::FailedRolledBack)
+        );
+        let snapshots = h.store.read_snapshots("t1").unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].deployment_id, id1);
+        assert_eq!(
+            h.store.read_last_successful("t1").as_deref(),
+            Some(id1.as_str())
+        );
+    }
+
+    #[test]
+    fn activation_failure_compensation_failure_is_degraded_not_rolled_back() {
+        // Same scenario, but the marker is NEVER consumed (`once = false`):
+        // the desired activation fails AND the compensation's prior-activation
+        // restart fails too. requirement.md step 13 pins the contract: "If all
+        // compensation succeeds, mark the attempt failed_rolled_back;
+        // otherwise mark it degraded and retain the actual mixed per-server
+        // state." A failed compensation must therefore end `Degraded`, never a
+        // falsely clean `FailedRolledBack`.
+        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
+        let h = SysdHarness::new();
+        let marker = h._dir.path().join("fail-restart");
+        let _env = install_fake_systemctl(h._dir.path(), &marker, false);
+
+        let id1 = DeploymentId::new("deploy-act-compfail-baseline".to_string());
+        let r1 = h.push_head(&id1).unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+        let prior_gen = r1.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")]
+            .generation
+            .clone()
+            .expect("prior generation");
+        let prior_tree = r1.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")]
+            .artifact
+            .tree
+            .clone();
+
+        let project_root = h.config.project_root(&h.cfg_path);
+        std::fs::write(
+            project_root
+                .join("releases")
+                .join("v1")
+                .join("artifacts")
+                .join("build/output/app/server"),
+            "v2\n",
+        )
+        .unwrap();
+        std::fs::write(&marker, "fail").unwrap();
+        let id2 = DeploymentId::new("deploy-act-compfail".to_string());
+        let r2 = h.push_head(&id2).unwrap();
+        // Restore the environment and release the env lock BEFORE any
+        // assertion: a failing assertion must never poison the shared
+        // `ENV_LOCK` for the fingerprint/systemd env suites.
+        drop(_env);
+        drop(_lock);
+        assert_eq!(
+            r2.status,
+            Some(DeploymentStatus::Degraded),
+            "a failed compensation must end Degraded (docs: 'otherwise mark it degraded'), got {:?}",
+            r2.status
+        );
+        assert!(
+            marker.exists(),
+            "the marker persists: every restart (desired AND compensation) failed"
+        );
+
+        // results.json records the failure WITHOUT compensation: the slot
+        // stayed on the DESIRED generation (the compensation swap-back could
+        // not re-activate the prior service).
+        let results = h.store.read_results(id2.as_str()).unwrap();
+        let res = &results.slots[&PlacementSlotId::new("p1")];
+        assert_eq!(res.outcome, ServerOutcomeKind::Failed);
+        assert!(
+            !res.compensated,
+            "the failed compensation must not be recorded as compensated"
+        );
+
+        // The attempt is terminal Degraded and produced no snapshot; f0 is
+        // untouched.
+        assert_eq!(
+            h.store.latest_status(id2.as_str()).unwrap(),
+            Some(DeploymentStatus::Degraded)
+        );
+        let snapshots = h.store.read_snapshots("t1").unwrap();
+        assert_eq!(snapshots.len(), 1, "only the baseline snapshot exists");
+        assert_eq!(snapshots[0].deployment_id, id1);
+        assert_eq!(
+            h.store.read_last_successful("t1").as_deref(),
+            Some(id1.as_str())
+        );
+        // The mixed per-server state is retained, not hidden: the observed
+        // refresh reads the ACTUAL `current`, which the compensation swap-back
+        // moved to the prior generation even though the prior service could
+        // not be re-activated.
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let status = RemoteHelper::new(&remote).status().unwrap();
+        assert_eq!(
+            status.current_generation.as_deref(),
+            Some(prior_gen.as_str()),
+            "the compensation swap-back is visible on the remote current"
+        );
+        let observed = h.store.read_observed("t1").unwrap();
+        let os = &observed.slots[&PlacementSlotId::new("p1")];
+        assert_eq!(os.generation, Some(prior_gen.clone()));
+        assert_eq!(
+            os.artifact.as_ref().expect("observed artifact").tree,
+            prior_tree
         );
     }
 }

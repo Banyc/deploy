@@ -26,6 +26,16 @@ use std::path::Path;
 pub(crate) struct ServerProc {
     pub(crate) kind: ServerOutcomeKind,
     pub(crate) generation: GenerationId,
+    /// True when this slot's `current` was advanced (the per-slot commit point
+    /// was moved to the new generation) at some point during the attempt —
+    /// either it still points there, or compensation moved it back. This is
+    /// the failure-policy/status signal for "a server this deployment
+    /// advanced", distinct from `did_compensate`: a pre-swap failure never
+    /// advanced the slot (nothing to roll back, `FailedRolledBack` is
+    /// vacuously accurate), while a post-swap failure whose compensation
+    /// failed IS still changed from prior state and the attempt must be
+    /// `Degraded`, never a falsely clean `FailedRolledBack`.
+    pub(crate) did_advance: bool,
     pub(crate) did_compensate: bool,
     pub(crate) error: Option<String>,
 }
@@ -53,6 +63,7 @@ pub(crate) fn process_server(
             return Ok(ServerProc {
                 kind: ServerOutcomeKind::Failed,
                 generation: new_gen.clone(),
+                did_advance: false,
                 did_compensate: false,
                 error: Some(format!("lock acquire failed: {e}")),
             });
@@ -66,6 +77,7 @@ pub(crate) fn process_server(
             return Ok(ServerProc {
                 kind: ServerOutcomeKind::Failed,
                 generation: new_gen.clone(),
+                did_advance: false,
                 did_compensate: false,
                 error: Some(format!("status failed: {e}")),
             });
@@ -77,6 +89,7 @@ pub(crate) fn process_server(
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Skipped,
             generation: exp.clone(),
+            did_advance: false,
             did_compensate: false,
             error: Some(format!(
                 "compare-and-swap precondition failed: current {:?} expected {exp}",
@@ -90,6 +103,7 @@ pub(crate) fn process_server(
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Failed,
             generation: new_gen.clone(),
+            did_advance: false,
             did_compensate: false,
             error: Some(format!("publish failed: {e}")),
         });
@@ -103,6 +117,7 @@ pub(crate) fn process_server(
             return Ok(ServerProc {
                 kind: ServerOutcomeKind::Failed,
                 generation: new_gen.clone(),
+                did_advance: false,
                 did_compensate: false,
                 error: Some(format!("tempdir: {e}")),
             });
@@ -113,6 +128,7 @@ pub(crate) fn process_server(
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Failed,
             generation: new_gen.clone(),
+            did_advance: false,
             did_compensate: false,
             error: Some(format!("download for verify failed: {e}")),
         });
@@ -123,6 +139,7 @@ pub(crate) fn process_server(
             return Ok(ServerProc {
                 kind: ServerOutcomeKind::Failed,
                 generation: new_gen.clone(),
+                did_advance: false,
                 did_compensate: false,
                 error: Some(format!("canonicalize remote tree failed: {e}")),
             });
@@ -132,6 +149,7 @@ pub(crate) fn process_server(
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Failed,
             generation: new_gen.clone(),
+            did_advance: false,
             did_compensate: false,
             error: Some(format!(
                 "integrity: remote tree digest {} does not match requested {}",
@@ -145,6 +163,7 @@ pub(crate) fn process_server(
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Failed,
             generation: new_gen.clone(),
+            did_advance: false,
             did_compensate: false,
             error: Some(format!("artifact validation: {e}")),
         });
@@ -159,6 +178,7 @@ pub(crate) fn process_server(
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Failed,
             generation: new_gen.clone(),
+            did_advance: false,
             did_compensate: false,
             error: Some(format!("publish release failed: {e}")),
         });
@@ -175,6 +195,7 @@ pub(crate) fn process_server(
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Failed,
             generation: new_gen.clone(),
+            did_advance: false,
             did_compensate: false,
             error: Some(format!("create generation failed: {e}")),
         });
@@ -183,6 +204,7 @@ pub(crate) fn process_server(
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Failed,
             generation: new_gen.clone(),
+            did_advance: false,
             did_compensate: false,
             error: Some(format!("transaction record failed: {e}")),
         });
@@ -200,6 +222,7 @@ pub(crate) fn process_server(
             return Ok(ServerProc {
                 kind: ServerOutcomeKind::Failed,
                 generation: new_gen.clone(),
+                did_advance: false,
                 did_compensate: false,
                 error: Some(format!("swap failed: {e}")),
             });
@@ -241,6 +264,12 @@ pub(crate) fn process_server(
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Failed,
             generation,
+            // The desired swap already moved `current` to the new generation:
+            // this slot WAS advanced by the attempt, even if compensation
+            // (partially) moved it back. A failed compensation must not be
+            // mistaken for a never-advanced slot (the status logic treats
+            // empty `advanced` as "nothing to roll back").
+            did_advance: true,
             did_compensate: did_comp,
             error: Some(format!("activation failed: {e}")),
         });
@@ -269,6 +298,7 @@ pub(crate) fn process_server(
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Failed,
             generation,
+            did_advance: true,
             did_compensate: did_comp,
             error: Some(format!("verification failed: {e}")),
         });
@@ -289,6 +319,7 @@ pub(crate) fn process_server(
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Activated,
             generation: new_gen.clone(),
+            did_advance: true,
             did_compensate: false,
             error: Some(
                 "committed transaction record write failed; server active but bookkeeping incomplete"
@@ -299,6 +330,7 @@ pub(crate) fn process_server(
     Ok(ServerProc {
         kind: ServerOutcomeKind::Activated,
         generation: new_gen.clone(),
+        did_advance: true,
         did_compensate: false,
         error: None,
     })

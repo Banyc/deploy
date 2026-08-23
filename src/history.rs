@@ -378,6 +378,63 @@ mod tests {
         );
     }
 
+    /// The `:current` suffix forms parse with `current_variant` set: a
+    /// `release/<id>:current` token keeps each server's CONFIGURED variant
+    /// (as opposed to the release's own stored slot snapshot), and
+    /// `<target>@fN:current` / `@fN:current` carry the flag through the fleet
+    /// form. The same tokens WITHOUT the suffix parse with
+    /// `current_variant: false`; `HEAD:current` still resolves to `Head` (the
+    /// flag is meaningless for the materialize-HEAD form and is dropped).
+    #[test]
+    fn parse_ref_current_suffix_forms() {
+        // `release/<id>:current` — the variant is the server's CURRENT
+        // configured variant, not the release's stored slot snapshot.
+        assert_eq!(
+            parse_push_ref("release/rel-sha256-deadbeef:current").unwrap(),
+            PushRef::Release {
+                release: ReleaseId::parse("rel-sha256-deadbeef"),
+                current_variant: true
+            }
+        );
+        // Same token without the suffix keeps the flag false.
+        assert_eq!(
+            parse_push_ref("release/rel-sha256-deadbeef").unwrap(),
+            PushRef::Release {
+                release: ReleaseId::parse("rel-sha256-deadbeef"),
+                current_variant: false
+            }
+        );
+        // Hex-shorthand release form also accepts the suffix.
+        assert_eq!(
+            parse_push_ref("rel-sha256-deadbeef:current").unwrap(),
+            PushRef::Release {
+                release: ReleaseId::parse("rel-sha256-deadbeef"),
+                current_variant: true
+            }
+        );
+        // `<target>@fN:current` — fleet form with the flag set.
+        assert_eq!(
+            parse_push_ref("production@f3:current").unwrap(),
+            PushRef::Fleet {
+                target: TargetName::new("production".to_string()),
+                index: 3,
+                current_variant: true
+            }
+        );
+        // The bare `@fN:current` form (target filled in by the caller from
+        // the separate target argument) also carries the flag.
+        assert_eq!(
+            parse_push_ref("@f0:current").unwrap(),
+            PushRef::Fleet {
+                target: TargetName::new("".to_string()),
+                index: 0,
+                current_variant: true
+            }
+        );
+        // `HEAD:current` is still the Head form; the flag is dropped.
+        assert_eq!(parse_push_ref("HEAD:current").unwrap(), PushRef::Head);
+    }
+
     #[test]
     fn ref_name_index() {
         assert_eq!(
