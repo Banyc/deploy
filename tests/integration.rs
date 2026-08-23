@@ -1863,3 +1863,126 @@ fn corrupt_historical_policies_fail_preflight_without_remote_mutation() -> Resul
     );
     Ok(())
 }
+
+// ---- Dry-run must leave NO trace: byte-identical tempdir fingerprint ------
+
+/// A single-pod project (via `setup_single`) with store, project, and remotes
+/// all under ONE tempdir root. The whole tempdir is fingerprinted before and
+/// after a dry-run push: a dry run must mutate nothing — no remote layout, no
+/// store objects, and no leftover disposable staging.
+#[test]
+fn dry_run_leaves_no_trace_fingerprint() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let proj = root.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+
+    let config = setup_single(&proj, "true", true, 1);
+    let store = LocalStore::with_base(root.join("store"))?;
+    let rb = root.join("remotes");
+
+    let factory = move |s: &deploy::config::ServerDef,
+                        _pod: &deploy::config::PodDef|
+              -> Result<Box<dyn Remote>> {
+        Ok(Box::new(LocalTransport::new(rb.join(&s.id))?))
+    };
+
+    let before = remote_fingerprint(root);
+    let r = push(
+        &proj.join("deploy.toml"),
+        &store,
+        &factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: true,
+            ref_token: None,
+        },
+    )?;
+    assert!(r.dry_run && r.attempt.is_none());
+    assert_eq!(
+        before,
+        remote_fingerprint(root),
+        "a successful dry run must not change a single byte on disk"
+    );
+
+    // Remove the artifact source so the NEXT dry run fails during planning.
+    // Deleting `releases/v1/artifacts/build/output/app/server` alone would only
+    // change the tree contents (the mapping source is the parent directory),
+    // so the whole mapped source subtree is removed: materialization must fail
+    // closed BEFORE any mutation, and the RAII staging guard must still have
+    // removed every disposable byte.
+    let deleted_file = proj.join("releases/v1/artifacts/build/output/app/server");
+    assert!(deleted_file.exists(), "fixture artifact must exist");
+    std::fs::remove_dir_all(proj.join("releases/v1/artifacts/build/output"))?;
+
+    let mid = remote_fingerprint(root);
+    let r2 = push(
+        &proj.join("deploy.toml"),
+        &store,
+        &factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: true,
+            ref_token: None,
+        },
+    );
+    assert!(
+        r2.is_err(),
+        "dry run with vanished artifact source must fail, got {:?}",
+        r2.map(|rep| rep.dry_run)
+    );
+    assert_eq!(
+        mid,
+        remote_fingerprint(root),
+        "a FAILED dry run must also not change a single byte on disk"
+    );
+
+    // No disposable staging leftovers from either run.
+    let staging_entries: Vec<_> = std::fs::read_dir(store.staging_dir())
+        .map(|d| d.flatten().collect::<Vec<_>>())
+        .unwrap_or_default();
+    assert!(
+        staging_entries.is_empty(),
+        "<store>/staging must contain no entries after a dry run"
+    );
+    Ok(())
+}
+
+/// A factory that fails for every server aborts the dry run during remote-handle
+/// construction; that must not mutate anything either.
+#[test]
+fn dry_run_factory_failure_mutates_nothing() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let proj = root.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+
+    let config = setup_single(&proj, "true", true, 1);
+    let store = LocalStore::with_base(root.join("store"))?;
+
+    let factory = |_s: &deploy::config::ServerDef,
+                   _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> { Err(deploy::error::Error::remote("factory forced failure")) };
+
+    let before = remote_fingerprint(root);
+    let r = push(
+        &proj.join("deploy.toml"),
+        &store,
+        &factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: true,
+            ref_token: None,
+        },
+    );
+    assert!(r.is_err(), "push with a failing factory must return Err");
+    assert_eq!(
+        before,
+        remote_fingerprint(root),
+        "a factory failure during a dry run must not mutate anything"
+    );
+    Ok(())
+}

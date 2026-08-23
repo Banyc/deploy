@@ -42,8 +42,9 @@ pub struct SshTransport {
     /// host key the first time we contact it.
     host_key_fingerprint: Option<String>,
     /// Managed known-hosts file holding the pinned key (used when only a
-    /// fingerprint was configured).
-    pinned_known_hosts: Option<PathBuf>,
+    /// fingerprint was configured). Set only by [`SshTransport::provision`],
+    /// never at construction, so building the transport has no side effects.
+    pinned_known_hosts: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl SshTransport {
@@ -69,20 +70,19 @@ impl SshTransport {
         if deploy_dir.is_relative() {
             return Err(Error::transport("ssh deploy_dir must be an absolute path"));
         }
-        let mut t = SshTransport {
+        let t = SshTransport {
             target: format!("{user}@{address}"),
             address: address.to_string(),
             port,
             root: deploy_dir.to_path_buf(),
             known_hosts: known_hosts.map(|p| p.to_path_buf()),
             host_key_fingerprint: host_key_fingerprint.map(|s| s.to_string()),
-            pinned_known_hosts: None,
+            pinned_known_hosts: std::sync::Mutex::new(None),
         };
-        // If a fingerprint was supplied without an explicit known-hosts file,
-        // verify the host key and pin it in a managed file before any command.
-        if t.known_hosts.is_none() && t.host_key_fingerprint.is_some() {
-            t.pin_known_hosts()?;
-        }
+        // NOTE: construction is side-effect-free. When a fingerprint was
+        // supplied without an explicit known-hosts file, the host key is
+        // verified and pinned by `provision` (before the first mutation), not
+        // here — a dry run must never touch the network or disk.
         Ok(t)
     }
 
@@ -98,7 +98,9 @@ impl SshTransport {
             "-p".into(),
             self.port.to_string(),
         ];
-        match (&self.known_hosts, &self.pinned_known_hosts) {
+        // Read the pinned path through the lock; it is set only by `provision`.
+        let pinned = self.pinned_known_hosts.lock().ok().and_then(|g| g.clone());
+        match (&self.known_hosts, &pinned) {
             (Some(kh), _) => {
                 args.push("-o".into());
                 args.push(format!("UserKnownHostsFile={}", kh.display()));
@@ -137,8 +139,9 @@ impl SshTransport {
 
     /// Verify the remote host key against the configured fingerprint and pin it
     /// in a managed known-hosts file. Fails closed if the key cannot be fetched
-    /// or does not match.
-    fn pin_known_hosts(&mut self) -> Result<()> {
+    /// or does not match. Takes `&self`: the pinned path is stored through the
+    /// interior-mutability lock.
+    fn pin_known_hosts(&self) -> Result<()> {
         let expected = self
             .host_key_fingerprint
             .clone()
@@ -172,7 +175,9 @@ impl SshTransport {
             && let Ok(text) = std::fs::read_to_string(&path)
             && Self::fingerprints_match(&text, &expected)
         {
-            self.pinned_known_hosts = Some(path);
+            if let Ok(mut g) = self.pinned_known_hosts.lock() {
+                *g = Some(path);
+            }
             return Ok(());
         }
         if path.exists() {
@@ -230,7 +235,9 @@ impl SshTransport {
         drop(f);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .map_err(|e| Error::transport(format!("chmod known_hosts {}: {e}", path.display())))?;
-        self.pinned_known_hosts = Some(path);
+        if let Ok(mut g) = self.pinned_known_hosts.lock() {
+            *g = Some(path);
+        }
         Ok(())
     }
 
@@ -438,6 +445,38 @@ impl SshTransport {
 impl Remote for SshTransport {
     fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn provision(&self) -> Result<()> {
+        // Create the deployment-directory layout on the remote host (same list
+        // as LocalTransport::provision) with a single `mkdir -p`; every path is
+        // single-quoted by `argv_cmd`/`shell_quote` so it reaches `mkdir`
+        // verbatim. This runs only after the push engine's non-dry-run gate.
+        const LAYOUT: [&str; 9] = [
+            "control",
+            "helpers",
+            "objects/sha256",
+            "releases",
+            "generations",
+            "incoming",
+            "state",
+            "adapters",
+            "transactions",
+        ];
+        let mut argv: Vec<String> = vec!["mkdir".into(), "-p".into()];
+        argv.extend(
+            LAYOUT
+                .iter()
+                .map(|d| self.root.join(d).to_string_lossy().into_owned()),
+        );
+        self.run_remote_ok(&Self::argv_cmd(&argv))?;
+
+        // If a fingerprint was supplied without an explicit known-hosts file,
+        // verify the host key and pin it in a managed file before any mutation.
+        if self.known_hosts.is_none() && self.host_key_fingerprint.is_some() {
+            self.pin_known_hosts()?;
+        }
+        Ok(())
     }
 
     fn read(&self, rel: &Path) -> Result<Vec<u8>> {

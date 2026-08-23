@@ -73,6 +73,14 @@ pub trait Remote {
     fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome>;
     /// Available bytes on the filesystem backing the remote root.
     fn available_bytes(&self) -> Result<u64>;
+
+    /// Create the deployment-directory layout before the first mutation.
+    /// Construction is side-effect-free; provisioning happens only after the
+    /// push engine's non-dry-run gate.
+    fn provision(&self) -> Result<()> {
+        let _ = self;
+        Ok(())
+    }
 }
 
 fn join(root: &Path, rel: &Path) -> PathBuf {
@@ -100,10 +108,24 @@ pub struct LocalTransport {
 }
 
 impl LocalTransport {
+    /// Build a transport rooted at `base`. Construction is side-effect-free:
+    /// no directories are created and nothing is touched on disk. Call
+    /// [`Remote::provision`] to create the deployment layout before the first
+    /// mutation (the push engine does this behind its non-dry-run gate).
     pub fn new(base: PathBuf) -> Result<Self> {
-        if !base.exists() {
-            std::fs::create_dir_all(&base)
-                .map_err(|e| Error::transport(format!("mkdir {}: {e}", base.display())))?;
+        Ok(LocalTransport { base })
+    }
+}
+
+impl Remote for LocalTransport {
+    fn root(&self) -> &Path {
+        &self.base
+    }
+
+    fn provision(&self) -> Result<()> {
+        if !self.base.exists() {
+            std::fs::create_dir_all(&self.base)
+                .map_err(|e| Error::transport(format!("mkdir {}: {e}", self.base.display())))?;
         }
         // Provision the expected top-level layout.
         for d in [
@@ -117,19 +139,13 @@ impl LocalTransport {
             "adapters",
             "transactions",
         ] {
-            let p = base.join(d);
+            let p = self.base.join(d);
             if !p.exists() {
                 std::fs::create_dir_all(&p)
                     .map_err(|e| Error::transport(format!("mkdir {}: {e}", p.display())))?;
             }
         }
-        Ok(LocalTransport { base })
-    }
-}
-
-impl Remote for LocalTransport {
-    fn root(&self) -> &Path {
-        &self.base
+        Ok(())
     }
 
     fn read(&self, rel: &Path) -> Result<Vec<u8>> {
@@ -164,10 +180,17 @@ impl Remote for LocalTransport {
 
     fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
         let dir = join(&self.base, rel);
+        // An unprovisioned remote root has no directories yet; report an empty
+        // listing rather than erroring so read-only inspection stays valid.
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(Error::transport(format!("read_dir {}: {e}", dir.display())));
+            }
+        };
         let mut out = Vec::new();
-        for e in std::fs::read_dir(&dir)
-            .map_err(|e| Error::transport(format!("read_dir {}: {e}", dir.display())))?
-        {
+        for e in rd {
             let e = e.map_err(|e| Error::transport(format!("entry: {e}")))?;
             // `symlink_metadata` (not `metadata`) so a symlink is reported as a
             // symlink with its own mode rather than being followed to its target.

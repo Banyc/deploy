@@ -148,6 +148,19 @@ fn push_inner(
     let release_root = project_root.join("releases").join(config.release.as_str());
     let mut variant_trees: BTreeMap<String, TreeDigest> = BTreeMap::new();
     if matches!(pref, PushRef::Head) {
+        // Dry-run staging is disposable: the RAII guard removes the whole
+        // `dry-<deployment>` tree on drop, whether the loop below returns Ok,
+        // fails with `?`, or unwinds. A non-dry-run push stages into the
+        // persistent per-variant staging dirs and stores objects, so no guard.
+        let _staging_guard = if opts.dry_run {
+            Some(StagingCleanup(Some(
+                store
+                    .staging_dir()
+                    .join(format!("dry-{}", deployment_id.as_str())),
+            )))
+        } else {
+            None
+        };
         for v in config.variant_names() {
             let staging = if opts.dry_run {
                 store
@@ -315,6 +328,9 @@ fn push_inner(
         let helper = RemoteHelper::new(r.as_ref());
         let status = helper.status()?;
         if !opts.dry_run {
+            // First mutation-adjacent act: create the remote layout. A dry run
+            // never reaches this, so an unprovisioned remote stays untouched.
+            remotes.get(&sid).unwrap().provision()?;
             // Production path: handshake, clear abandoned incoming, check lock,
             // recover missing local objects.
             helper.handshake()?;
@@ -430,12 +446,8 @@ fn push_inner(
                 ));
             }
         }
-        // Clean up disposable staging (no object was stored).
-        let _ = std::fs::remove_dir_all(
-            store
-                .staging_dir()
-                .join(format!("dry-{}", deployment_id.as_str())),
-        );
+        // Disposable staging was already removed by `_staging_guard` (drop at
+        // the end of the Head-materialization block); nothing else to clean.
         return Ok(PushReport {
             status: None,
             attempt: None,
@@ -1444,6 +1456,17 @@ fn tree_size_on_host(root: &Path) -> u64 {
         .sum()
 }
 
+/// Removes the disposable dry-run staging tree on drop (error, panic, or
+/// normal exit), so an interrupted dry run never leaves state behind.
+struct StagingCleanup(Option<std::path::PathBuf>);
+impl Drop for StagingCleanup {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+}
+
 /// An advisory (flock) lock held by an open file descriptor. While the guard
 /// is alive the kernel prevents any other process from acquiring the same lock,
 /// and the lock is released automatically if the owning process dies. This
@@ -1747,6 +1770,38 @@ pods = ["p1"]
         fn helper(&self) -> RemoteHelper<'_> {
             RemoteHelper::new(&self.remote)
         }
+    }
+
+    #[test]
+    fn staging_cleanup_drop_removes_tree_take_prevents_removal() {
+        let base = tempfile::tempdir().unwrap();
+
+        // Drop removes the whole staging tree.
+        let p = base.path().join("dry-a");
+        std::fs::create_dir_all(p.join("nested")).unwrap();
+        std::fs::write(p.join("nested/f"), b"x").unwrap();
+        {
+            let _g = StagingCleanup(Some(p.clone()));
+            assert!(p.exists(), "tree survives while the guard is held");
+        }
+        assert!(!p.exists(), "drop must remove the staging tree");
+
+        // Dropping a None guard is a no-op (non-dry-run path).
+        drop(StagingCleanup(None));
+
+        // take() hands ownership out: dropping the emptied guard keeps the
+        // tree, dropping the taken value removes it.
+        let q = base.path().join("dry-b");
+        std::fs::create_dir_all(&q).unwrap();
+        let mut g = StagingCleanup(Some(q.clone()));
+        let taken = g.0.take();
+        assert!(taken.is_some(), "take must yield the guarded path");
+        drop(g);
+        assert!(q.exists(), "emptied guard's drop must not remove anything");
+        // Responsibility was handed out with take(): whoever re-wraps the path
+        // into a guard gets cleanup on their own drop.
+        drop(StagingCleanup(taken));
+        assert!(!q.exists(), "the re-wrapped taken value cleans up on drop");
     }
 
     #[test]
