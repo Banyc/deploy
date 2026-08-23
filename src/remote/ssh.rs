@@ -655,24 +655,42 @@ impl Remote for SshTransport {
     }
 
     fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
         let remote_path = self.root.join(rel);
         let remote_path_str = remote_path.to_string_lossy().into_owned();
         let payload = String::from_utf8_lossy(data).into_owned();
-        // `set -C` enables the noclobber option so the `>` redirection fails if
-        // the file already exists, giving an atomic create-if-absent (O_EXCL) on
-        // the remote. Both the payload and the path are single-quoted so they
-        // cannot be reinterpreted. The parent directory is created first (the
-        // remote layout is not provisioned by SSH the way LocalTransport does
-        // it), so a fresh remote root still allows the first lock acquisition.
         let parent = Path::new(&remote_path_str)
             .parent()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| ".".to_string());
+        // Durability protocol (mirrors LocalTransport::try_write_new):
+        //
+        // 1. Write the payload into a UNIQUE, dot-prefixed temporary file in
+        //    the destination directory, so a concurrent reader never sees a
+        //    partial record and listing-based observers skip the temp name.
+        // 2. Install atomically WITHOUT replacement via `ln` — it fails if the
+        //    destination exists, so no loser can clobber a winner.
+        // 3. Remove the temporary name and best-effort `sync` so the
+        //    installation survives a crash.
+        //
+        // The parent directory is created first (the remote layout is not
+        // provisioned by SSH the way LocalTransport does it), so a fresh remote
+        // root still allows the first lock acquisition.
+        let tmp = format!(
+            "{}.{}.tmp.{}.{}",
+            parent.trim_end_matches('/'),
+            remote_path_str.rsplit('/').next().unwrap_or("record"),
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        );
         let cmd = format!(
-            "mkdir -p {} && set -C; printf '%s' {} > {}",
-            shell_quote(&parent),
-            shell_quote(&payload),
-            shell_quote(&remote_path_str),
+            "mkdir -p {p} && printf '%s' {payload} > {tmp} && ln {tmp} {d}; rc=$?; rm -f {tmp}; test \"$rc\" -eq 0 && sync 2>/dev/null || true; exit $rc",
+            p = shell_quote(&parent),
+            payload = shell_quote(&payload),
+            tmp = shell_quote(&tmp),
+            d = shell_quote(&remote_path_str),
         );
         let out = self.run_remote(&cmd)?;
         if out.status.success() {

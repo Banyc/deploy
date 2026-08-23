@@ -45,7 +45,10 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
     );
     assert_eq!(config.targets["production"].pods.len(), 2);
     let variant = config.variant("standard")?;
-    assert_eq!(&variant.artifact.mappings[0].from, "artifacts/build/output/");
+    assert_eq!(
+        &variant.artifact.mappings[0].from,
+        "artifacts/build/output/"
+    );
     assert_eq!(variant.capacity.reserve_bytes, 1_073_741_824);
 
     // A dry-run materializes the release's artifacts and builds the full plan:
@@ -54,7 +57,9 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
     let store = LocalStore::with_base(tmp.path().join("store"))?;
     let remotes_base = tmp.path().join("remotes");
     std::fs::create_dir_all(&remotes_base).unwrap();
-    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef,
+                        _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(remotes_base.join(&s.id))?))
     };
     let r = push(

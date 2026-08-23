@@ -44,7 +44,8 @@ pub struct PushReport {
     pub dry_run: bool,
 }
 
-type RemoteFactory = dyn Fn(&crate::config::ServerDef, &crate::config::PodDef) -> Result<Box<dyn Remote>>;
+type RemoteFactory =
+    dyn Fn(&crate::config::ServerDef, &crate::config::PodDef) -> Result<Box<dyn Remote>>;
 
 /// Run a push against `target_name`.
 ///
@@ -203,73 +204,75 @@ fn push_inner(
 
     // Historical and rollback pushes carry the bound release's own per-variant
     // behavior contracts; they never fall back to the caller's current config.
-    let (local_release_id, desired_behaviors): (ReleaseId, BTreeMap<String, BehaviorContract>) =
-        if matches!(pref, PushRef::Head) {
-            let bindings: BTreeMap<VariantName, TreeDigest> = variant_trees
-                .iter()
-                .map(|(k, v)| (VariantName::new(k.clone()), v.clone()))
-                .collect();
-            let rec = crate::release::build_release(
-                &mapping_sha,
-                &behavior_sha,
-                &policies_sha,
-                &bindings,
-                project_root,
-            );
-            let rid = ReleaseId::new(rec.release_id.clone());
-            if !opts.dry_run {
-                store.write_release(&rec)?;
-                let release_json = serde_json::to_string(&rec)
-                    .map_err(|e| Error::store(format!("serialize release: {e}")))?;
-                store.write_release_aux(&rid, &mapping_toml, &behavior_json, &policies_json)?;
-                // Persist release JSON string for remote publication.
-                REMOTE_RELEASE_JSON.with(|c| {
-                    c.borrow_mut()
-                        .insert(rid.clone(), (release_json, behavior_json.to_string()))
-                });
+    let (local_release_id, desired_behaviors): (ReleaseId, BTreeMap<String, BehaviorContract>) = if matches!(
+        pref,
+        PushRef::Head
+    ) {
+        let bindings: BTreeMap<VariantName, TreeDigest> = variant_trees
+            .iter()
+            .map(|(k, v)| (VariantName::new(k.clone()), v.clone()))
+            .collect();
+        let rec = crate::release::build_release(
+            &mapping_sha,
+            &behavior_sha,
+            &policies_sha,
+            &bindings,
+            project_root,
+        );
+        let rid = ReleaseId::new(rec.release_id.clone());
+        if !opts.dry_run {
+            store.write_release(&rec)?;
+            let release_json = serde_json::to_string(&rec)
+                .map_err(|e| Error::store(format!("serialize release: {e}")))?;
+            store.write_release_aux(&rid, &mapping_toml, &behavior_json, &policies_json)?;
+            // Persist release JSON string for remote publication.
+            REMOTE_RELEASE_JSON.with(|c| {
+                c.borrow_mut()
+                    .insert(rid.clone(), (release_json, behavior_json.to_string()))
+            });
+        }
+        (rid, variant_behaviors)
+    } else {
+        // Historical ref: resolve the bound release.
+        let rid = match pref {
+            PushRef::Fleet {
+                target: ft, index, ..
+            } => {
+                let entry = history::resolve_fleet_ref(store, ft, *index)?;
+                entry
+                    .servers
+                    .values()
+                    .next()
+                    .map(|a| a.release.clone())
+                    .unwrap_or_else(|| ReleaseId::new(String::new()))
             }
-            (rid, variant_behaviors)
-        } else {
-            // Historical ref: resolve the bound release.
-            let rid = match pref {
-                PushRef::Fleet {
-                    target: ft, index, ..
-                } => {
-                    let entry = history::resolve_fleet_ref(store, ft, *index)?;
-                    entry
-                        .servers
-                        .values()
-                        .next()
-                        .map(|a| a.release.clone())
-                        .unwrap_or_else(|| ReleaseId::new(String::new()))
-                }
-                PushRef::Release { release, .. } => release.clone(),
-                PushRef::Head => unreachable!(),
-            };
-            // Restore the historical per-variant behavior contracts from the
-            // release record, NOT the caller's current configuration. If that
-            // behavior is unavailable we fail closed (preflight) rather than
-            // silently deploying the caller's current configuration instead.
-            let hist_behaviors = store.read_release_behaviors(&rid).map_err(|e| {
+            PushRef::Release { release, .. } => release.clone(),
+            PushRef::Head => unreachable!(),
+        };
+        // Restore the historical per-variant behavior contracts from the
+        // release record, NOT the caller's current configuration. If that
+        // behavior is unavailable we fail closed (preflight) rather than
+        // silently deploying the caller's current configuration instead.
+        let hist_behaviors = store.read_release_behaviors(&rid).map_err(|e| {
                 Error::preflight(format!(
                     "historical behavior for release {rid} unavailable (immutable behavior required): {e}"
                 ))
             })?;
-            if !opts.dry_run {
-                let rec = store.read_release(&rid).map_err(|e| {
-                    Error::preflight(format!("historical release {rid} not found: {e}"))
-                })?;
-                let release_json = serde_json::to_string(&rec)
-                    .map_err(|e| Error::store(format!("serialize release: {e}")))?;
-                let hist_behaviors_json = serde_json::to_string(&hist_behaviors)
-                    .map_err(|e| Error::store(format!("serialize behavior: {e}")))?;
-                REMOTE_RELEASE_JSON.with(|c| {
-                    c.borrow_mut()
-                        .insert(rid.clone(), (release_json, hist_behaviors_json))
-                });
-            }
-            (rid, hist_behaviors)
-        };
+        if !opts.dry_run {
+            let rec = store.read_release(&rid).map_err(|e| {
+                Error::preflight(format!("historical release {rid} not found: {e}"))
+            })?;
+            let release_json = serde_json::to_string(&rec)
+                .map_err(|e| Error::store(format!("serialize release: {e}")))?;
+            let hist_behaviors_json = serde_json::to_string(&hist_behaviors)
+                .map_err(|e| Error::store(format!("serialize behavior: {e}")))?;
+            REMOTE_RELEASE_JSON.with(|c| {
+                c.borrow_mut()
+                    .insert(rid.clone(), (release_json, hist_behaviors_json))
+            });
+        }
+        (rid, hist_behaviors)
+    };
 
     // The behavior digest this attempt is bound to: the frozen, name-keyed set of
     // every declared variant's activation + verification contract. Historical
@@ -565,8 +568,7 @@ fn push_inner(
                 }
                 continue;
             };
-            let variant_behavior_sha =
-                crate::release::behavior_contract_digest(variant_behavior);
+            let variant_behavior_sha = crate::release::behavior_contract_digest(variant_behavior);
             let outcome = process_server(
                 store,
                 remotes[sid].as_ref(),
@@ -1350,18 +1352,15 @@ fn capacity_preflight(
     deployment_id: &DeploymentId,
     config: &Config,
     rotation: &crate::config::RotationConfig,
-    frozen: Option<(
-        &ReleaseId,
-        &BTreeMap<String, crate::config::VariantPolicy>,
-    )>,
+    frozen: Option<(&ReleaseId, &BTreeMap<String, crate::config::VariantPolicy>)>,
 ) -> Result<()> {
     for a in assignments {
         // Resolve (and thus validate) the assigned policy snapshot for every
         // assignment, even when the tree is already installed remotely: a
         // corrupt or missing snapshot must fail this attempt in preflight
         // rather than surfacing only when space happens to run short.
-        let capacity = resolve_variant_policy(store, &a.release, a.variant.as_str(), frozen)?
-            .capacity;
+        let capacity =
+            resolve_variant_policy(store, &a.release, a.variant.as_str(), frozen)?.capacity;
         let reserve_bytes = capacity.reserve_bytes;
         let reserve_percent = capacity.reserve_percent as f64 / 100.0;
         let helper = helpers.get(&a.server_id).expect("helper present");
@@ -1411,10 +1410,7 @@ fn resolve_variant_policy(
     store: &LocalStore,
     release: &ReleaseId,
     variant: &str,
-    frozen: Option<(
-        &ReleaseId,
-        &BTreeMap<String, crate::config::VariantPolicy>,
-    )>,
+    frozen: Option<(&ReleaseId, &BTreeMap<String, crate::config::VariantPolicy>)>,
 ) -> Result<crate::config::VariantPolicy> {
     if let Some((frozen_release, frozen_policies)) = frozen
         && frozen_release == release

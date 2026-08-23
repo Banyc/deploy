@@ -99,7 +99,9 @@ impl<'a> RemoteHelper<'a> {
                 .components()
                 .map(|c| c.as_os_str().to_str().unwrap_or(""))
                 .collect();
-            if let Some(pos) = comps.iter().position(|&c| c == layout::GENERATIONS_COMPONENT)
+            if let Some(pos) = comps
+                .iter()
+                .position(|&c| c == layout::GENERATIONS_COMPONENT)
                 && let Some(gid) = comps.get(pos + 1)
             {
                 status.current_generation = Some(gid.to_string());
@@ -141,9 +143,7 @@ impl<'a> RemoteHelper<'a> {
     }
 
     pub fn read_assignment(&self, gen_id: &str) -> Result<GenerationAssignment> {
-        let p = layout::generation(gen_id)
-            
-            .join("assignment.json");
+        let p = layout::generation(gen_id).join("assignment.json");
         let data = self.remote.read(&p)?;
         serde_json::from_slice(&data).map_err(|e| Error::remote(format!("parse assignment: {e}")))
     }
@@ -153,15 +153,15 @@ impl<'a> RemoteHelper<'a> {
     /// assigned variant is selected explicitly rather than falling back to the
     /// caller's current configuration.
     pub fn read_behavior(&self, release_id: &ReleaseId, variant: &str) -> Result<BehaviorContract> {
-        let p = layout::remote_release(release_id.as_str())
-            .join("behavior.json");
+        let p = layout::remote_release(release_id.as_str()).join("behavior.json");
         let data = self.remote.read(&p)?;
         let behaviors = crate::release::behavior_contracts_from_json(&data)
             .map_err(|e| Error::remote(format!("parse behavior for {release_id}: {e}")))?;
-        behaviors
-            .get(variant)
-            .cloned()
-            .ok_or_else(|| Error::remote(format!("release {release_id} has no behavior for variant '{variant}'")))
+        behaviors.get(variant).cloned().ok_or_else(|| {
+            Error::remote(format!(
+                "release {release_id} has no behavior for variant '{variant}'"
+            ))
+        })
     }
 
     /// Acquire the server mutation lock. `force` overrides a held lock (used
@@ -214,8 +214,7 @@ impl<'a> RemoteHelper<'a> {
     }
 
     pub fn tree_exists(&self, digest: &str) -> bool {
-        self.remote
-            .exists(&layout::tree_root(digest))
+        self.remote.exists(&layout::tree_root(digest))
     }
 
     /// Copy a host-local tree into the remote object store, verifying the
@@ -353,8 +352,7 @@ impl<'a> RemoteHelper<'a> {
         inv.sort();
         let json = serde_json::to_vec_pretty(&inv)
             .map_err(|e| Error::remote(format!("serialize inventory: {e}")))?;
-        self.remote
-            .write(&layout::inventory(), &json, 0o644)?;
+        self.remote.write(&layout::inventory(), &json, 0o644)?;
         Ok(())
     }
 
@@ -624,5 +622,165 @@ mod tests {
             std::fs::symlink_metadata(remote.root().join("generations/gen-1/root")).is_ok(),
             "generation root symlink must exist"
         );
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+    use crate::remote::transport::PROTOCOL_VERSION;
+    use crate::remote::transport::{LocalTransport, Remote};
+    use std::path::PathBuf;
+
+    fn setup() -> (tempfile::TempDir, LocalTransport, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let root = remote.root().to_path_buf();
+        (dir, remote, root)
+    }
+
+    /// A crash during a protocol-marker install leaves only an orphaned temp
+    /// file: the final marker is absent, and a later handshake installs the
+    /// complete record without being confused by the stale temporary.
+    #[test]
+    fn interrupted_protocol_marker_write_is_recovered() {
+        let (_dir, remote, root) = setup();
+
+        // Simulate a writer that died after creating its unique temp and
+        // writing only a prefix of the payload.
+        std::fs::create_dir_all(root.join("control")).unwrap();
+        std::fs::write(
+            root.join("control/.protocol.json.tmp.99999.7"),
+            b"{ \"protocol_ver",
+        )
+        .unwrap();
+        assert!(!root.join("control/protocol.json").exists());
+
+        let helper = RemoteHelper::new(&remote);
+        let agreed = helper.handshake().expect("handshake must recover");
+        assert_eq!(agreed, PROTOCOL_VERSION);
+
+        // The installed marker is complete and correct.
+        let recorded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("control/protocol.json")).unwrap())
+                .expect("installed protocol marker must be valid JSON");
+        assert_eq!(
+            recorded["protocol_version"],
+            serde_json::json!(PROTOCOL_VERSION)
+        );
+    }
+
+    /// Same recovery rule for fleet-commit markers: an interrupted write never
+    /// surfaces as a partial marker, and a later commit succeeds cleanly.
+    #[test]
+    fn interrupted_commit_marker_write_is_recovered() {
+        let (_dir, remote, root) = setup();
+
+        std::fs::create_dir_all(root.join("state/commits")).unwrap();
+        std::fs::write(
+            root.join("state/commits/.deploy-0.json.tmp.99999.7"),
+            b"{ \"deployment_id\": \"deploy-0\", \"commi",
+        )
+        .unwrap();
+
+        let helper = RemoteHelper::new(&remote);
+        helper
+            .write_commit_marker("deploy-0", "gen-0", &["server-01".to_string()])
+            .expect("commit marker install must succeed past stale temp");
+
+        let marker: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join("state/commits/deploy-0.json")).unwrap(),
+        )
+        .expect("installed commit marker must be valid JSON");
+        assert_eq!(marker["committed"], serde_json::json!(true));
+        assert_eq!(marker["generation"], serde_json::json!("gen-0"));
+    }
+
+    /// Concurrent readers listing and parsing commit markers while they are
+    /// being installed must only ever observe complete records.
+    #[test]
+    fn commit_markers_are_never_partially_visible_to_concurrent_readers() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("remote");
+        let commits_dir = root.join("state/commits");
+        let done = Arc::new(AtomicBool::new(false));
+
+        // Set even if the writer panics (Drop runs during unwind), so the
+        // readers always terminate instead of hanging the test binary.
+        struct DoneGuard(Arc<AtomicBool>);
+        impl Drop for DoneGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        std::thread::scope(|s| {
+            let base = root.clone();
+            let done_w = done.clone();
+            let writer_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let writer_error_writer = writer_error.clone();
+            s.spawn(move || {
+                let _done = DoneGuard(done_w);
+                let Ok(remote) = LocalTransport::new(base) else {
+                    *writer_error_writer.lock().unwrap() =
+                        Some("transport setup failed".to_string());
+                    return;
+                };
+                let h = RemoteHelper::new(&remote);
+                for i in 0..80 {
+                    if let Err(e) = h.write_commit_marker(
+                        &format!("deploy-{i}"),
+                        &format!("gen-{i}"),
+                        &["server-01".to_string()],
+                    ) {
+                        *writer_error_writer.lock().unwrap() = Some(e.to_string());
+                        return;
+                    }
+                }
+            });
+            for _ in 0..2 {
+                let done = done.clone();
+                let commits_dir = commits_dir.clone();
+                s.spawn(move || {
+                    loop {
+                        if done.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if let Ok(entries) = std::fs::read_dir(&commits_dir) {
+                            for e in entries.flatten() {
+                                // Temporaries are dot-prefixed so listing-based
+                                // observers can skip them.
+                                if e.file_name().to_string_lossy().starts_with('.') {
+                                    continue;
+                                }
+                                let data = std::fs::read(e.path()).unwrap_or_default();
+                                if data.is_empty() {
+                                    panic!("concurrent reader observed an empty marker");
+                                }
+                                let v: serde_json::Value = serde_json::from_slice(&data)
+                                    .expect("marker must always be complete valid JSON");
+                                assert_eq!(v["committed"], serde_json::json!(true));
+                            }
+                        }
+                    }
+                });
+            }
+
+            // The writer must have completed every install successfully.
+            assert_eq!(
+                writer_error.lock().unwrap().as_deref(),
+                None,
+                "writer failed to install all commit markers"
+            );
+        });
+
+        for i in 0..80 {
+            let p = commits_dir.join(format!("deploy-{i}.json"));
+            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
+            assert_eq!(v["committed"], serde_json::json!(true));
+        }
     }
 }

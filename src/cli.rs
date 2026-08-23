@@ -56,9 +56,7 @@ pub fn run() -> Result<()> {
 
     let factory = move |s: &crate::config::ServerDef,
                         pod: &crate::config::PodDef|
-              -> Result<Box<dyn Remote>> {
-        create_remote(s, &pod.deploy_dir)
-    };
+          -> Result<Box<dyn Remote>> { create_remote(s, &pod.deploy_dir) };
 
     match cli.command {
         Command::Push {

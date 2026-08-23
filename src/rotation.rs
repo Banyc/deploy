@@ -167,7 +167,7 @@ pub fn retained_summary(retained: &HashSet<String>) -> Vec<TreeDigest> {
 mod tests {
     use super::*;
     use crate::config::Config;
-use crate::layout;
+    use crate::layout;
     use crate::remote::helper::{GenerationAssignment, RemoteHelper};
     use crate::remote::transport::LocalTransport;
     use crate::store::local::LocalStore;
@@ -322,7 +322,13 @@ pods = ["p1"]
 
         // With the pin, BOTH variants' trees are protected.
         let retained = compute_retained(&helper, &pinned, &store, rotation).unwrap();
-        assert!(retained.contains("tree-a"), "variant a protected by the pin");
-        assert!(retained.contains("tree-b"), "variant b protected by the pin");
+        assert!(
+            retained.contains("tree-a"),
+            "variant a protected by the pin"
+        );
+        assert!(
+            retained.contains("tree-b"),
+            "variant b protected by the pin"
+        );
     }
 }

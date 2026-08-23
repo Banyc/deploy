@@ -231,27 +231,67 @@ impl Remote for LocalTransport {
     }
 
     fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
         let p = join(&self.base, rel);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| Error::transport(format!("mkdir {}: {e}", parent.display())))?;
         }
-        // `create_new` maps to O_CREAT|O_EXCL: the create succeeds only if the
-        // file did not already exist, so two callers cannot both win the race.
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&p)
+        // Durability protocol for immutable records:
+        //
+        // 1. Write into a UNIQUE temporary file in the destination directory,
+        //    then fsync it. A concurrent reader observing the filesystem at
+        //    this point sees no destination file at all — never a partial one.
+        // 2. Install atomically WITHOUT replacement: link(2) publishes the
+        //    fully written inode under the final name and fails with EEXIST if
+        //    another writer won, so no reader can ever observe a torn record
+        //    and no loser can clobber a winner.
+        // 3. Unlink the temporary name and fsync the parent directory so the
+        //    installation survives a crash.
+        let tmp = p.with_file_name(format!(
+            ".{}.tmp.{}.{}",
+            p.file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default(),
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
         {
-            Ok(mut f) => {
-                use std::io::Write;
-                f.write_all(data)
-                    .map_err(|e| Error::transport(format!("write {}: {e}", p.display())))?;
-                Ok(true)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-            Err(e) => Err(Error::transport(format!("create {}: {e}", p.display()))),
+            use std::io::Write;
+            let mut f = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(Error::transport(format!("create {}: {e}", tmp.display())));
+                }
+            };
+            f.write_all(data)
+                .map_err(|e| Error::transport(format!("write {}: {e}", tmp.display())))?;
+            f.sync_all()
+                .map_err(|e| Error::transport(format!("fsync {}: {e}", tmp.display())))?;
         }
+        let installed = match std::fs::hard_link(&tmp, &p) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(Error::transport(format!("install {}: {e}", p.display())));
+            }
+        };
+        let _ = std::fs::remove_file(&tmp);
+        if installed
+            && let Some(parent) = p.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
+        Ok(installed)
     }
 
     fn remove_dir_all(&self, rel: &Path) -> Result<()> {
@@ -346,6 +386,88 @@ impl Remote for LocalTransport {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// Concurrent readers must only ever observe the destination file fully
+    /// written: installs happen by hard-linking a synced, complete temporary
+    /// inode, so a partial record is unrepresentable.
+    #[test]
+    fn try_write_new_concurrent_readers_never_observe_partial_content() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let t = LocalTransport::new(dir.path().join("r")).unwrap();
+        let markers = dir.path().join("r/markers");
+        const PAYLOAD: &str =
+            r#"{"committed":true,"generation":"gen-1","servers":["server-01","server-02"]}"#;
+
+        // Set even if the writer panics (Drop runs during unwind), so the
+        // readers always terminate instead of hanging the test binary.
+        struct DoneGuard(Arc<AtomicBool>);
+        impl Drop for DoneGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        std::thread::scope(|s| {
+            let done = Arc::new(AtomicBool::new(false));
+            let writer_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+            {
+                let done = done.clone();
+                let writer_error = writer_error.clone();
+                s.spawn(move || {
+                    let _done = DoneGuard(done);
+                    for i in 0..100 {
+                        let rel = Path::new("markers").join(format!("m{i}.json"));
+                        if let Err(e) = t.try_write_new(&rel, PAYLOAD.as_bytes()) {
+                            *writer_error.lock().unwrap() = Some(e.to_string());
+                            return;
+                        }
+                    }
+                });
+            }
+            for _ in 0..2 {
+                let done = done.clone();
+                let markers = markers.clone();
+                s.spawn(move || {
+                    while !done.load(Ordering::SeqCst) {
+                        let Ok(entries) = std::fs::read_dir(&markers) else {
+                            continue;
+                        };
+                        for e in entries.flatten() {
+                            // Temporary files are dot-prefixed precisely so that
+                            // listing-based observers can skip them; a real
+                            // reader of a marker path never touches them.
+                            if e.file_name().to_string_lossy().starts_with('.') {
+                                continue;
+                            }
+                            let data = std::fs::read(e.path()).unwrap_or_default();
+                            assert_eq!(
+                                String::from_utf8_lossy(&data).as_ref(),
+                                PAYLOAD,
+                                "partial marker observed by concurrent reader"
+                            );
+                        }
+                    }
+                });
+            }
+
+            // The writer must have completed every install successfully.
+            assert_eq!(
+                writer_error.lock().unwrap().as_deref(),
+                None,
+                "writer failed to install all markers"
+            );
+        });
+
+        // Every marker installed exactly once with full content.
+        for i in 0..100 {
+            let data = std::fs::read(markers.join(format!("m{i}.json"))).unwrap();
+            assert_eq!(String::from_utf8_lossy(&data).as_ref(), PAYLOAD);
+        }
+    }
 
     #[test]
     fn symlink_rename_exists() {

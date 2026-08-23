@@ -119,7 +119,10 @@ fn setup(proj: &Path) -> (Config, std::path::PathBuf) {
     let artifacts = proj.join("releases").join("v1").join("artifacts");
     write_file(&artifacts.join("build/output/app/server"), "server-v1\n");
     write_file(&artifacts.join("deployment/common/README"), "common\n");
-    write_file(&artifacts.join("deployment/variants/standard/extra"), "std\n");
+    write_file(
+        &artifacts.join("deployment/variants/standard/extra"),
+        "std\n",
+    );
     write_file(
         &artifacts.join("deployment/variants/high-capacity/extra"),
         "hc\n",
@@ -140,7 +143,9 @@ fn end_to_end_push_rollback() -> Result<()> {
     let (config, config_path) = setup(&proj);
     let store = LocalStore::with_base(store_base.clone())?;
 
-    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef,
+                        _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
         let p = remotes_base.join(&s.id);
         Ok(Box::new(LocalTransport::new(p)?))
     };
@@ -306,7 +311,9 @@ pods = ["p1"]
     let config0 = Config::load(&config_path)?;
     let store = LocalStore::with_base(store_base)?;
     let rf = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef,
+                        _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
     };
 
@@ -362,7 +369,10 @@ pods = ["p1"]
     let new_tree = r1.attempt.expect("attempt recorded").servers[&ServerId::new("server-01")]
         .tree
         .clone();
-    assert_ne!(old_tree, new_tree, "renamed variant materializes a new tree");
+    assert_ne!(
+        old_tree, new_tree,
+        "renamed variant materializes a new tree"
+    );
 
     // Roll back to the f0 fleet snapshot: restores variant `old` even though the
     // current configuration neither declares it nor ships its variant file.
@@ -384,7 +394,11 @@ pods = ["p1"]
     );
     let observed = store.read_observed("production")?;
     let restored = &observed.servers[&ServerId::new("server-01")];
-    assert_eq!(restored.tree.as_ref(), Some(&old_tree), "tree restored from f0");
+    assert_eq!(
+        restored.tree.as_ref(),
+        Some(&old_tree),
+        "tree restored from f0"
+    );
     assert_eq!(
         restored.variant.as_ref().map(|v| v.as_str()),
         Some("old"),
@@ -408,7 +422,9 @@ fn dry_run_reports_plan() -> Result<()> {
     std::fs::create_dir_all(&remotes_base).unwrap();
 
     let (config, config_path) = setup(&proj);
-    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef,
+                        _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
         let p = remotes_base.join(&s.id);
         Ok(Box::new(LocalTransport::new(p)?))
     };
@@ -770,12 +786,7 @@ pods = ["p1"]
 
 /// Build the single-variant project (deploy.toml + `standard.toml` variant
 /// file + source inputs) and load its config.
-fn setup_single(
-    proj: &Path,
-    verify_argv: &str,
-    stop_on_failure: bool,
-    batch_size: u32,
-) -> Config {
+fn setup_single(proj: &Path, verify_argv: &str, stop_on_failure: bool, batch_size: u32) -> Config {
     let p = write_string(
         &proj.join("deploy.toml"),
         &single_target_toml(stop_on_failure, batch_size),
@@ -870,12 +881,9 @@ reserve_percent = 0
         .unwrap()
         .address = format!("local://{}", endpoints.join("server-01").display());
 
-    let factory =
-        move |s: &deploy::config::ServerDef,
-              pod: &deploy::config::PodDef|
-              -> Result<Box<dyn Remote>> {
-            create_remote(s, &pod.deploy_dir)
-        };
+    let factory = move |s: &deploy::config::ServerDef,
+                        pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> { create_remote(s, &pod.deploy_dir) };
 
     let r = push(
         &proj.join("deploy.toml"),
@@ -920,9 +928,10 @@ fn dry_run_does_not_mutate() -> Result<()> {
     let mutations = Arc::new(AtomicUsize::new(0));
     let m = mutations.clone();
     let rb = remote_base.clone();
-    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
-        SpyRemote::build(rb.join(&s.id), m.clone())
-    };
+    let factory =
+        move |s: &deploy::config::ServerDef,
+              _pod: &deploy::config::PodDef|
+              -> Result<Box<dyn Remote>> { SpyRemote::build(rb.join(&s.id), m.clone()) };
 
     let r = push(
         &proj.join("deploy.toml"),
@@ -979,18 +988,24 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
 
     // Behavior A: verification succeeds.
     let config_a = setup_single(&proj, "true", true, 1);
-    let a_var = config_a.variant("standard").expect("standard variant present");
+    let a_var = config_a
+        .variant("standard")
+        .expect("standard variant present");
     let a_digest = release::behavior_digest(&a_var.activation, &a_var.verification);
     let b_digest = {
         // Behavior B: verification command differs (so its digest differs).
         let config_b = setup_single(&proj, "false", true, 1);
-        let b_var = config_b.variant("standard").expect("standard variant present");
+        let b_var = config_b
+            .variant("standard")
+            .expect("standard variant present");
         release::behavior_digest(&b_var.activation, &b_var.verification)
     };
     assert_ne!(a_digest, b_digest, "behaviors must differ");
 
     let rb = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef,
+                        _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rb.join(&s.id))?))
     };
 
@@ -1098,7 +1113,9 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
     let config_a = setup_single(&proj, "true", true, 1);
 
     let rb = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef,
+                        _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rb.join(&s.id))?))
     };
 
@@ -1183,7 +1200,10 @@ fn remote_fingerprint(root: &Path) -> Vec<(String, String)> {
                 .replace('\\', "/");
             let ft = std::fs::symlink_metadata(&p).unwrap().file_type();
             if ft.is_symlink() {
-                let target = std::fs::read_link(&p).unwrap().to_string_lossy().into_owned();
+                let target = std::fs::read_link(&p)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
                 out.push((rel, format!("symlink:{target}")));
             } else if ft.is_dir() {
                 out.push((rel, "dir".to_string()));
@@ -1212,7 +1232,9 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
     let config_a = setup_single(&proj, "true", true, 1);
 
     let rb = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef,
+                        _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rb.join(&s.id))?))
     };
 
@@ -1246,7 +1268,10 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
         .join("releases")
         .join(&hist_release)
         .join("behavior.json");
-    assert!(behavior_path.exists(), "historical behavior.json must exist");
+    assert!(
+        behavior_path.exists(),
+        "historical behavior.json must exist"
+    );
     std::fs::write(&behavior_path, "{}\n").unwrap();
 
     // Fingerprint every server remote before the rollback attempt.
@@ -1387,7 +1412,9 @@ reserve_percent = 0
 
     let config = Config::load(&proj.join("deploy.toml"))?;
     let rf = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef,
+                        _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
     };
 
@@ -1461,7 +1488,9 @@ fn post_lock_failure_releases_lock_and_records() -> Result<()> {
     let attempted = Arc::new(AtomicUsize::new(0));
     let at = attempted.clone();
     let remotes_for_factory = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef,
+                        _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
         FaultRemote::build(
             remotes_for_factory.join(&s.id),
             true,
@@ -1525,7 +1554,9 @@ fn committed_txn_write_failure_pends_commit() -> Result<()> {
     let attempted = Arc::new(AtomicUsize::new(0));
     let at = attempted.clone();
     let remotes_for_factory = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef,
+                        _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
         FaultRemote::build_committed_fault(remotes_for_factory.join(&s.id), at.clone())
     };
 
@@ -1583,7 +1614,9 @@ fn commit_marker_write_failure_pends_commit() -> Result<()> {
     let attempted = Arc::new(AtomicUsize::new(0));
     let at = attempted.clone();
     let remotes_for_factory = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef,
+                        _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
         FaultRemote::build_commit_marker_fault(remotes_for_factory.join(&s.id), at.clone())
     };
 
@@ -1641,10 +1674,7 @@ fn capacity_only_change_produces_new_release_identity() -> Result<()> {
     std::fs::create_dir_all(&remotes_base).unwrap();
 
     let (config, config_path) = {
-        let p = write_string(
-            &proj.join("deploy.toml"),
-            &single_target_toml(true, 1),
-        );
+        let p = write_string(&proj.join("deploy.toml"), &single_target_toml(true, 1));
         write_variant_file(&proj, "standard", &single_variant_body("true"));
         let artifacts = proj.join("releases").join("v1").join("artifacts");
         write_file(&artifacts.join("build/output/app/server"), "v1\n");
@@ -1653,7 +1683,9 @@ fn capacity_only_change_produces_new_release_identity() -> Result<()> {
     };
     let store = LocalStore::with_base(store_base.clone())?;
     let rf = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef,
+                        _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
     };
 
@@ -1670,15 +1702,16 @@ fn capacity_only_change_produces_new_release_identity() -> Result<()> {
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
-    let first = r0.attempt.expect("attempt recorded").servers
-        [&ServerId::new("server-01")]
-        .clone();
+    let first = r0.attempt.expect("attempt recorded").servers[&ServerId::new("server-01")].clone();
     assert_eq!(first.variant.as_str(), "standard");
 
     // Capacity-only change: identical bytes except `reserve_bytes`.
     let variant_path = proj.join("releases").join("v1").join("standard.toml");
     let body = std::fs::read_to_string(&variant_path)?;
-    let changed = body.replace("[capacity]\nreserve_bytes = 0", "[capacity]\nreserve_bytes = 4096");
+    let changed = body.replace(
+        "[capacity]\nreserve_bytes = 0",
+        "[capacity]\nreserve_bytes = 4096",
+    );
     assert_ne!(body, changed, "capacity line must exist in fixture");
     std::fs::write(&variant_path, changed).unwrap();
     let config2 = Config::load(&config_path)?;
@@ -1695,9 +1728,7 @@ fn capacity_only_change_produces_new_release_identity() -> Result<()> {
         },
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-    let second = r1.attempt.expect("attempt recorded").servers
-        [&ServerId::new("server-01")]
-        .clone();
+    let second = r1.attempt.expect("attempt recorded").servers[&ServerId::new("server-01")].clone();
 
     // New release identity, same tree bytes.
     assert_ne!(
@@ -1734,10 +1765,7 @@ fn corrupt_historical_policies_fail_preflight_without_remote_mutation() -> Resul
     std::fs::create_dir_all(&remotes_base).unwrap();
 
     let (config, config_path) = {
-        let p = write_string(
-            &proj.join("deploy.toml"),
-            &single_target_toml(true, 1),
-        );
+        let p = write_string(&proj.join("deploy.toml"), &single_target_toml(true, 1));
         write_variant_file(&proj, "standard", &single_variant_body("true"));
         let artifacts = proj.join("releases").join("v1").join("artifacts");
         write_file(&artifacts.join("build/output/app/server"), "v1\n");
@@ -1746,7 +1774,9 @@ fn corrupt_historical_policies_fail_preflight_without_remote_mutation() -> Resul
     };
     let store = LocalStore::with_base(store_base.clone())?;
     let rf = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef,
+                        _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
     };
 
@@ -1762,8 +1792,7 @@ fn corrupt_historical_policies_fail_preflight_without_remote_mutation() -> Resul
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
-    let release = r0.attempt.expect("attempt recorded").servers
-        [&ServerId::new("server-01")]
+    let release = r0.attempt.expect("attempt recorded").servers[&ServerId::new("server-01")]
         .release
         .clone();
 
@@ -1791,8 +1820,7 @@ fn corrupt_historical_policies_fail_preflight_without_remote_mutation() -> Resul
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
     assert_ne!(
-        r1.attempt.expect("attempt recorded").servers[&ServerId::new("server-01")]
-            .release,
+        r1.attempt.expect("attempt recorded").servers[&ServerId::new("server-01")].release,
         release,
         "changed inputs must produce a new release"
     );

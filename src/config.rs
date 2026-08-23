@@ -404,7 +404,9 @@ impl Config {
             )));
         }
         if self.variants.is_empty() {
-            return Err(Error::config("at least one release variant must be declared"));
+            return Err(Error::config(
+                "at least one release variant must be declared",
+            ));
         }
         if self.targets.is_empty() {
             return Err(Error::config("at least one target must be declared"));
@@ -485,7 +487,9 @@ impl Config {
             {
                 return Err(Error::config(format!(
                     "pods '{existing}' and '{}' bind the same location (server '{}', deploy_dir '{}'); each server+deploy_dir pair must belong to exactly one pod",
-                    p.id, p.server, p.deploy_dir.display()
+                    p.id,
+                    p.server,
+                    p.deploy_dir.display()
                 )));
             }
             bound_locations.insert((p.server.as_str(), p.deploy_dir.as_path()), &p.id);
@@ -552,8 +556,9 @@ impl Config {
             if let Some(mode) = &m.mode
                 && mode != "preserve"
             {
-                parse_octal_mode(mode)
-                    .map_err(|e| Error::config(format!("variant '{name}' mapping[{i}] mode: {e}")))?;
+                parse_octal_mode(mode).map_err(|e| {
+                    Error::config(format!("variant '{name}' mapping[{i}] mode: {e}"))
+                })?;
             }
             if m.from.trim().is_empty() || m.to.trim().is_empty() {
                 return Err(Error::config(format!(
@@ -586,25 +591,21 @@ impl Config {
             .ok_or_else(|| Error::not_found(format!("target '{target_name}'")))?;
         let mut out = Vec::with_capacity(target.pods.len());
         for pid in &target.pods {
-            let pod = self
-                .pods
+            let pod = self.pods.iter().find(|p| &p.id == pid).ok_or_else(|| {
+                Error::config(format!(
+                    "target '{target_name}' references unknown pod '{pid}'"
+                ))
+            })?;
+            let server = self
+                .servers
                 .iter()
-                .find(|p| &p.id == pid)
+                .find(|s| s.id == pod.server)
                 .ok_or_else(|| {
                     Error::config(format!(
-                        "target '{target_name}' references unknown pod '{pid}'"
+                        "pod '{}' references unknown server '{}'",
+                        pod.id, pod.server
                     ))
                 })?;
-            let server =
-                self.servers
-                    .iter()
-                    .find(|s| s.id == pod.server)
-                    .ok_or_else(|| {
-                        Error::config(format!(
-                            "pod '{}' references unknown server '{}'",
-                            pod.id, pod.server
-                        ))
-                    })?;
             out.push((pod, server));
         }
         Ok(out)
@@ -615,10 +616,9 @@ impl Config {
     /// inside `<project>/releases/<release>/` is a variant named by its file
     /// stem. Other entries (such as the `artifacts/` directory) are ignored.
     fn load_variants(&mut self, config_path: &Path) -> Result<()> {
-        let project_root = self
-            .project_root(config_path)
-            .canonicalize()
-            .map_err(|e| Error::config(format!("canonicalize project root for deploy.toml: {e}")))?;
+        let project_root = self.project_root(config_path).canonicalize().map_err(|e| {
+            Error::config(format!("canonicalize project root for deploy.toml: {e}"))
+        })?;
         let release_root = project_root.join("releases").join(self.release.as_str());
         let canonical_release = release_root.canonicalize().map_err(|_| {
             Error::config(format!(
@@ -884,7 +884,13 @@ pods = ["p1"]
         std::fs::write(&p, deploy_toml).unwrap();
 
         let cfg = Config::load(&p).expect("config loads with sibling variant files");
-        assert_eq!(cfg.targets["t1"].rotation.per_server.keep_distinct_artifacts, 5);
+        assert_eq!(
+            cfg.targets["t1"]
+                .rotation
+                .per_server
+                .keep_distinct_artifacts,
+            5
+        );
         assert_eq!(cfg.targets["t1"].rotation.fleet.protect_deployments, 2);
         let names = cfg.variant_names();
         assert_eq!(names.len(), 2);
@@ -896,7 +902,9 @@ pods = ["p1"]
         assert_eq!(std.activation.adapter, "none");
         assert_eq!(std.capacity.reserve_percent, 0);
 
-        let hc = cfg.variant("high-capacity").expect("high-capacity variant present");
+        let hc = cfg
+            .variant("high-capacity")
+            .expect("high-capacity variant present");
         assert_eq!(hc.verification.argv, vec!["false".to_string()]);
         assert_eq!(hc.activation.adapter, "systemd");
         assert!(!hc.activation.units.is_empty());
@@ -990,10 +998,7 @@ pods = ["p1"]
             vec!["high-capacity".to_string(), "standard".to_string()],
             "every *.toml file stem is a variant; other entries are ignored"
         );
-        assert_eq!(
-            cfg.release_root(&p),
-            project.join("releases").join("v1")
-        );
+        assert_eq!(cfg.release_root(&p), project.join("releases").join("v1"));
     }
 
     #[test]
@@ -1116,7 +1121,8 @@ pods = ["p1"]
         .unwrap();
         let err = Config::load(&p).expect_err("pod with unknown server must fail");
         assert!(
-            err.to_string().contains("references unknown server 'ghost'"),
+            err.to_string()
+                .contains("references unknown server 'ghost'"),
             "got: {err}"
         );
 
@@ -1128,7 +1134,8 @@ pods = ["p1"]
         .unwrap();
         let err = Config::load(&p).expect_err("pod with unknown variant must fail");
         assert!(
-            err.to_string().contains("references unknown variant 'ghost'"),
+            err.to_string()
+                .contains("references unknown variant 'ghost'"),
             "got: {err}"
         );
     }
@@ -1143,11 +1150,7 @@ pods = ["p1"]
 
         // Second pod, same server, SAME deploy_dir: rejected.
         let dup = "\n[[pods]]\nid = \"p2\"\nserver = \"s1\"\nvariant = \"standard\"\ndeploy_dir = \"/srv/forced\"\n\n[targets.t1]";
-        std::fs::write(
-            &p,
-            deploy_toml("v1").replace("\n[targets.t1]", dup),
-        )
-        .unwrap();
+        std::fs::write(&p, deploy_toml("v1").replace("\n[targets.t1]", dup)).unwrap();
         let err = Config::load(&p).expect_err("shared server+deploy_dir must fail");
         let msg = err.to_string();
         assert!(
@@ -1157,11 +1160,7 @@ pods = ["p1"]
 
         // Second pod, same server, DIFFERENT deploy_dir: accepted.
         let ok = "\n[[pods]]\nid = \"p2\"\nserver = \"s1\"\nvariant = \"standard\"\ndeploy_dir = \"/srv/other\"\n\n[targets.t1]";
-        std::fs::write(
-            &p,
-            deploy_toml("v1").replace("\n[targets.t1]", ok),
-        )
-        .unwrap();
+        std::fs::write(&p, deploy_toml("v1").replace("\n[targets.t1]", ok)).unwrap();
         let cfg = Config::load(&p).expect("distinct deploy_dir on the same server is valid");
         assert_eq!(cfg.pods.len(), 2);
     }
@@ -1174,7 +1173,8 @@ pods = ["p1"]
         write_standard_release(&project, "v1");
         let mut toml = deploy_toml("v1");
         // Insert a second [[servers]] entry with the same ID before [targets.t1].
-        let dup = "[[servers]]\nid = \"s1\"\naddress = \"a2\"\nuser = \"u\"\nvariant = \"standard\"\n\n";
+        let dup =
+            "[[servers]]\nid = \"s1\"\naddress = \"a2\"\nuser = \"u\"\nvariant = \"standard\"\n\n";
         toml = toml.replacen("[targets.t1]", &format!("{dup}[targets.t1]"), 1);
         let p = project.join("deploy.toml");
         std::fs::write(&p, toml).unwrap();

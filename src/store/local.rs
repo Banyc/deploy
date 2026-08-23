@@ -71,6 +71,9 @@ fn set_private(path: &Path) -> Result<()> {
 /// Callers serialize writes per store with the application-store lock; the
 /// temporary name additionally carries the process id to stay collision-free.
 fn write_atomic_cas(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     if path.exists() {
         let existing = std::fs::read(path)
             .map_err(|e| Error::store(format!("read {}: {e}", path.display())))?;
@@ -82,22 +85,56 @@ fn write_atomic_cas(path: &Path, bytes: &[u8]) -> Result<()> {
             path.display()
         )));
     }
-    let mut tmp_name = path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
-    tmp_name.push(format!(".tmp.{}", std::process::id()));
-    let tmp = path.with_file_name(tmp_name);
-    let _ = std::fs::remove_file(&tmp);
+    // Durability protocol for immutable records: write + fsync a UNIQUE temp
+    // file, install atomically WITHOUT replacement (link(2) fails on EEXIST,
+    // so a racing loser can never clobber a winner and no reader ever sees a
+    // torn record), unlink the temp name, then fsync the parent directory.
+    let tmp = path.with_file_name(format!(
+        ".{}.tmp.{}.{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default(),
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
     {
-        let mut f = std::fs::File::create(&tmp)
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
             .map_err(|e| Error::store(format!("create {}: {e}", tmp.display())))?;
         f.write_all(bytes)
             .map_err(|e| Error::store(format!("write {}: {e}", tmp.display())))?;
+        f.sync_all()
+            .map_err(|e| Error::store(format!("fsync {}: {e}", tmp.display())))?;
     }
-    set_private(&tmp)?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| Error::store(format!("rename {}: {e}", path.display())))?;
+    let installed = match std::fs::hard_link(&tmp, path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::store(format!("install {}: {e}", path.display())));
+        }
+    };
+    let _ = std::fs::remove_file(&tmp);
+    if !installed {
+        // Lost the race: the winner's content must match ours or refuse.
+        let existing = std::fs::read(path)
+            .map_err(|e| Error::store(format!("read {}: {e}", path.display())))?;
+        if existing != bytes {
+            return Err(Error::store(format!(
+                "refusing to replace existing {} with different content",
+                path.display()
+            )));
+        }
+        return Ok(());
+    }
+    set_private(path)?;
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
@@ -219,7 +256,8 @@ impl LocalStore {
         }
         write_atomic_cas(
             &self.object_tree_json(digest),
-            &serde_json::to_vec(&meta).map_err(|e| Error::store(format!("serialize tree.json: {e}")))?,
+            &serde_json::to_vec(&meta)
+                .map_err(|e| Error::store(format!("serialize tree.json: {e}")))?,
         )?;
         Ok(())
     }
@@ -574,7 +612,9 @@ mod tests {
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
         let plan = serde_json::json!({ "target": "t1" });
-        store.write_plan("deploy-1", &plan).expect("first plan write");
+        store
+            .write_plan("deploy-1", &plan)
+            .expect("first plan write");
         store
             .write_plan("deploy-1", &plan)
             .expect("identical rewrite is idempotent");
@@ -588,7 +628,9 @@ mod tests {
             target: TargetName::from("t1".to_string()),
             servers: Default::default(),
         };
-        store.write_results("deploy-1", &results).expect("first results");
+        store
+            .write_results("deploy-1", &results)
+            .expect("first results");
         let conflicting = DeploymentResults {
             deployment_id: DeploymentId::from("deploy-1".to_string()),
             target: TargetName::from("t2".to_string()),

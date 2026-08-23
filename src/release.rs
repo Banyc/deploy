@@ -53,9 +53,7 @@ pub fn variant_mappings_digest(mappings: &BTreeMap<String, Vec<Mapping>>) -> Str
 /// Canonical digest over name-sorted per-variant behavior contracts. Two
 /// releases share this digest only when every declared variant's activation and
 /// verification behavior is identical.
-pub fn variant_behaviors_digest(
-    contracts: &BTreeMap<String, BehaviorContract>,
-) -> String {
+pub fn variant_behaviors_digest(contracts: &BTreeMap<String, BehaviorContract>) -> String {
     let value = serde_json::to_vec(contracts).expect("variant behaviors serialize");
     sha256_bytes(&value)
 }
@@ -71,9 +69,7 @@ pub fn behavior_contracts_from_json(
 /// binds the policy snapshot into the release identity, so a capacity-only
 /// configuration change yields a new release instead of silently rewriting the
 /// retained snapshot of an existing one.
-pub fn variant_policies_digest(
-    policies: &BTreeMap<String, VariantPolicy>,
-) -> String {
+pub fn variant_policies_digest(policies: &BTreeMap<String, VariantPolicy>) -> String {
     let value = serde_json::to_vec(policies).expect("variant policies serialize");
     sha256_bytes(&value)
 }
