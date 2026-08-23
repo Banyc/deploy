@@ -173,6 +173,15 @@ reserve_percent = ... }`, defaulting to 0/0). The capacity policy is shared by
 every deployment slot on that server and is resolved from the caller's CURRENT
 configuration at preflight time; servers have no per-release history, so it is
 not part of any release snapshot.
+The exactly-one host-identity rule is ENFORCED, not merely documented: for
+every SSH-shaped `address`, a config with neither source (which would fall back
+to trust-on-first-use) and a config with both sources (an ambiguous choice) are
+both rejected at validation with a message naming the server, and the SSH
+transport defensively rejects both states at construction even when validation
+was bypassed. `local://` endpoints perform no host verification and need no
+identity source. The `deploy init` CLI mirrors the rule: the two identity flags
+conflict at parse time, and an SSH `--address` without exactly one of them is
+rejected by the init handler.
 Trust-on-first-use without a configured identity source is disabled.
 
 Each variant is described by its own file inside the release directory (e.g.
@@ -590,7 +599,7 @@ Artifact-controlled unit files are supported by default only with `scope: user`,
 For a system service, an administrator installs a root-owned wrapper unit whose security-sensitive directives, service user, and stable command entry point are not writable by the deployment account. In `scope: system`, `push` only verifies that wrapper's identity and uses a narrowly scoped permission to restart that specific unit. It never links an artifact-controlled unit into `/etc/systemd/system`. Treating a deployment account as authorized to replace system unit contents would make that account effectively root and is outside the safe default design.
 
 ## Transport and remote helper
-The initial transport is SSH with strict host-key verification (per-server `known_hosts` or pinned `host_key_fingerprint`). An explicit `local://<absolute-path>` server address instead routes the transport to that exact filesystem endpoint; it exists for tests and for local targets. Server IDs, target names, variant names, release IDs, and paths are validated data and are never concatenated into remote shell commands. Bulk tree transfer uses SFTP or an equivalent framed channel.
+The initial transport is SSH with strict host-key verification (per-server `known_hosts` or pinned `host_key_fingerprint` — exactly one source per SSH server, enforced at config validation and re-checked defensively at transport construction). An explicit `local://<absolute-path>` server address instead routes the transport to that exact filesystem endpoint; it exists for tests and for local targets. Server IDs, target names, variant names, release IDs, and paths are validated data and are never concatenated into remote shell commands. Bulk tree transfer uses SFTP or an equivalent framed channel.
 
 A small versioned remote helper owns status inspection, locking, object publication, generation switching, transaction recovery, adapter invocation, and rotation. Client and helper perform a protocol-version handshake before mutation (the negotiated version is recorded under `control/`; schema version 1 speaks protocol 1). Every mutating request carries an operation ID and is idempotent, and each operation's durable per-server transaction record (`transactions/<operation-id>.json`, advanced `prepared` → `committed`/`compensated` by the helper) lets a disconnected client reconnect and learn whether the operation prepared, committed, compensated, or never began. Packaging these operations as a single versioned helper binary uploaded beneath each slot's `deploy_dir` is the planned evolution; it does not change this contract.
 

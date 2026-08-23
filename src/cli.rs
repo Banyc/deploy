@@ -63,8 +63,9 @@ releases/ tree):\n\
 LOCAL-FIRST DEFAULT: the server address is `local://<project>/.deploy-remote`,\n\
 a local-filesystem endpoint, so `deploy push production` runs end-to-end with\n\
 zero SSH or server infrastructure. For a real server, pass --address, --user,\n\
-and either --known-hosts or --host-key-fingerprint (SSH trust-on-first-use is\n\
-refused; both must be absolute paths / a SHA256:... value).\n\
+and EXACTLY ONE of --known-hosts or --host-key-fingerprint (SSH\n\
+trust-on-first-use is refused, and the two flags are mutually exclusive: a\n\
+`known_hosts` must be an absolute path and a fingerprint a SHA256:... value).\n\
 \n\
 Where the project is created: <path> if given, else the directory of --config,\n\
 else the current directory. The application name defaults to that directory's\n\
@@ -104,10 +105,14 @@ Then, from inside the project:\n\
         #[arg(long)]
         port: Option<u16>,
         /// Absolute path to a known_hosts file (strict host-key checking).
-        #[arg(long, value_name = "FILE")]
+        /// Mutually exclusive with `--host-key-fingerprint`: exactly one
+        /// host-identity source must be configured for an SSH address.
+        #[arg(long, value_name = "FILE", conflicts_with = "host_key_fingerprint")]
         known_hosts: Option<PathBuf>,
-        /// Pre-verified host key fingerprint, e.g. SHA256:... .
-        #[arg(long, value_name = "SHA256:...")]
+        /// Pre-verified host key fingerprint, e.g. SHA256:... . Mutually
+        /// exclusive with `--known-hosts`: exactly one host-identity source
+        /// must be configured for an SSH address.
+        #[arg(long, value_name = "SHA256:...", conflicts_with = "known_hosts")]
         host_key_fingerprint: Option<String>,
     },
     /// Deploy the current local inputs (or a reference) to a named target.
@@ -450,6 +455,51 @@ mod tests {
     fn init_defaults_to_current_directory() {
         let cli = Cli::try_parse_from(["deploy", "init"]).unwrap();
         assert!(matches!(cli.command, Command::Init { .. }));
+    }
+
+    // Host identity is exactly one source: `--known-hosts` and
+    // `--host-key-fingerprint` conflict at parse time.
+    #[test]
+    fn init_rejects_both_identity_flags() {
+        let err = Cli::try_parse_from([
+            "deploy",
+            "init",
+            "--address",
+            "app.example.com",
+            "--known-hosts",
+            "/etc/ssh/known_hosts",
+            "--host-key-fingerprint",
+            "SHA256:abc",
+        ])
+        .err()
+        .expect("both identity flags must conflict at parse time");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot be used with") || msg.contains("conflicts"),
+            "clap must report the conflict, got: {msg}"
+        );
+        assert!(
+            msg.contains("--known-hosts") && msg.contains("--host-key-fingerprint"),
+            "error must name both flags, got: {msg}"
+        );
+    }
+
+    // The conflict also fires without --address (local:// default) — the
+    // identity flags are only meaningful for SSH, so both together is always
+    // a parse error.
+    #[test]
+    fn init_rejects_both_identity_flags_without_address() {
+        assert!(
+            Cli::try_parse_from([
+                "deploy",
+                "init",
+                "--known-hosts",
+                "/etc/ssh/known_hosts",
+                "--host-key-fingerprint",
+                "SHA256:abc",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

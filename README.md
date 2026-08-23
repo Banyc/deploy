@@ -69,8 +69,11 @@ deploy init my-app \
 ```
 
 or edit `deploy.toml` afterwards (it is annotated with exactly what to change).
-SSH always uses strict host-key checking — trust-on-first-use is refused, and
-`known_hosts` must be an absolute path.
+SSH always uses strict host-key checking — trust-on-first-use is refused. Every
+SSH server must configure EXACTLY ONE host-identity source: a dedicated
+`known_hosts` file (an absolute path) or a pre-verified `host_key_fingerprint`
+(`SHA256:...`); configuring both is ambiguous and rejected, and `local://`
+addresses need neither.
 
 ## Commands
 
@@ -135,8 +138,9 @@ address = "local:///abs/path"   # or a hostname for SSH
 user = "deploy"
 capacity = { reserve_bytes = 0, reserve_percent = 0 }  # per-server headroom, zero by default
 # port = 22
+# SSH addresses need EXACTLY ONE host-identity source (trust-on-first-use is disabled):
 # known_hosts = "/etc/ssh/known_hosts"   # absolute path
-# host_key_fingerprint = "SHA256:..."
+# host_key_fingerprint = "SHA256:..."    # pre-verified fingerprint; both together are rejected
 
 [[slots]]                     # one server + one variant under an id
 id = "app-1"
@@ -192,8 +196,11 @@ resolved from this file at preflight time — it is never part of a release.
 
 Validation is strict: `deploy_dir` and `known_hosts` must be absolute paths,
 server/slot IDs must be unique, targets must reference declared slots, and each
-slot's variant must exist. A config that fails validation is rejected at load
-time, before anything is touched.
+slot's variant must exist. Every SSH-shaped server address must configure
+EXACTLY ONE of `known_hosts` or `host_key_fingerprint` (neither means
+trust-on-first-use, which is refused; both are ambiguous) — `local://`
+addresses are exempt. A config that fails validation is rejected at load time,
+before anything is touched.
 
 ## Maintenance
 

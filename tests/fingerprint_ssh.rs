@@ -269,6 +269,10 @@ id = "server-01"
 address = "{address}"
 user = "deploy"
 port = 2222
+# Placeholder identity: the tests construct `SshTransport` directly with the
+# real fingerprint of the fake host key, so this only needs to satisfy config
+# validation (an SSH address requires exactly one identity source).
+host_key_fingerprint = "SHA256:placeholder"
 
 [[slots]]
 id = "p1"

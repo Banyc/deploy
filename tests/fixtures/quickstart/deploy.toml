@@ -10,16 +10,24 @@ release = "v1"
 # targets reference slots by ID. Capacity is a per-server policy (shared by
 # every deployment slot on the server), resolved from the caller's current
 # configuration — never part of the release identity.
+#
+# An SSH address requires EXACTLY ONE host-identity source (trust-on-first-use
+# is disabled): a dedicated `known_hosts` file, or a pre-verified
+# `host_key_fingerprint`. The placeholder below must be replaced with the
+# server's real SHA256 fingerprint (or swapped for `known_hosts =
+# "/etc/ssh/known_hosts"`) before pushing over SSH.
 [[servers]]
 id = "server-01"            # durable ID; never rename it
 address = "server-01.example.com"
 user = "deploy"
+host_key_fingerprint = "SHA256:quickstart-placeholder"
 capacity = { reserve_bytes = 1073741824, reserve_percent = 0 }  # keep at least 1 GiB free
 
 [[servers]]
 id = "server-02"
 address = "server-02.example.com"
 user = "deploy"
+host_key_fingerprint = "SHA256:quickstart-placeholder"
 capacity = { reserve_bytes = 1073741824, reserve_percent = 0 }  # keep at least 1 GiB free
 
 [[slots]]

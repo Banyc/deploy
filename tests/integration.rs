@@ -59,16 +59,19 @@ protect_deployments = 2
 id = "server-01"
 address = "server-01.example.com"
 user = "deploy"
+host_key_fingerprint = "SHA256:test"
 
 [[servers]]
 id = "server-02"
 address = "server-02.example.com"
 user = "deploy"
+host_key_fingerprint = "SHA256:test"
 
 [[servers]]
 id = "server-03"
 address = "server-03.example.com"
 user = "deploy"
+host_key_fingerprint = "SHA256:test"
 
 [[slots]]
 id = "p1"
@@ -297,6 +300,7 @@ release = "v1"
 id = "server-01"
 address = "server-01.example.com"
 user = "deploy"
+host_key_fingerprint = "SHA256:test"
 
 [[slots]]
 id = "p1"
@@ -962,6 +966,7 @@ protect_deployments = 2
 id = "server-01"
 address = "server-01.example.com"
 user = "deploy"
+host_key_fingerprint = "SHA256:test"
 
 [[slots]]
 id = "p1"
@@ -1543,16 +1548,19 @@ protect_deployments = 2
 id = "server-01"
 address = "a"
 user = "u"
+host_key_fingerprint = "SHA256:test"
 
 [[servers]]
 id = "server-02"
 address = "b"
 user = "u"
+host_key_fingerprint = "SHA256:test"
 
 [[servers]]
 id = "server-03"
 address = "c"
 user = "u"
+host_key_fingerprint = "SHA256:test"
 
 [[slots]]
 id = "p1"
@@ -2489,6 +2497,7 @@ protect_deployments = 1
 id = "server-01"
 address = "server-01.example.com"
 user = "deploy"
+host_key_fingerprint = "SHA256:test"
 
 [[slots]]
 id = "p1"

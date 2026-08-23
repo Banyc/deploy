@@ -57,9 +57,11 @@ impl SshTransport {
     /// Build a transport for `user@address` (connecting on `port`), whose
     /// application root is the absolute `deploy_dir` path on that host.
     ///
-    /// Host identity must be configured: pass a `known_hosts` file and/or a
-    /// `host_key_fingerprint`. If neither is provided the transport refuses to
-    /// connect (no trust-on-first-use).
+    /// Host identity must be configured with EXACTLY ONE source: pass a
+    /// `known_hosts` file OR a `host_key_fingerprint`. If neither is provided
+    /// the transport refuses to connect (no trust-on-first-use); if both are
+    /// provided the choice is ambiguous (the ssh arguments would silently
+    /// prefer `known_hosts`), so the construction is rejected.
     pub fn new(
         user: &str,
         address: &str,
@@ -75,6 +77,24 @@ impl SshTransport {
         }
         if deploy_dir.is_relative() {
             return Err(Error::transport("ssh deploy_dir must be an absolute path"));
+        }
+        // Defensive rejection of ambiguous or unusable identity states, even
+        // when the config validation was bypassed (e.g. a direct caller):
+        // exactly one of known_hosts / host_key_fingerprint may be set.
+        match (known_hosts, host_key_fingerprint) {
+            (Some(_), Some(_)) => {
+                return Err(Error::transport(
+                    "ssh host identity is ambiguous: exactly one of known_hosts or \
+                     host_key_fingerprint must be configured (both are set)",
+                ));
+            }
+            (None, None) => {
+                return Err(Error::transport(
+                    "ssh host identity is not configured: exactly one of `known_hosts` or \
+                     `host_key_fingerprint` must be provided (trust-on-first-use is disabled)",
+                ));
+            }
+            _ => {}
         }
         let t = SshTransport {
             target: format!("{user}@{address}"),
@@ -795,6 +815,48 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    // Host identity must be EXACTLY ONE source: both set is ambiguous, neither
+    // set is trust-on-first-use (disabled). Construction fails closed on both.
+    #[test]
+    fn new_rejects_both_identity_sources() {
+        let err = SshTransport::new(
+            "deploy",
+            "db.example.com",
+            2222,
+            Path::new("/srv/app"),
+            Some(Path::new("/etc/ssh/known_hosts")),
+            Some("SHA256:abc"),
+        )
+        .err()
+        .expect("both identity sources must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exactly one of known_hosts or host_key_fingerprint")
+                && msg.contains("both are set"),
+            "error must explain the ambiguity, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn new_rejects_missing_identity() {
+        let err = SshTransport::new(
+            "deploy",
+            "db.example.com",
+            2222,
+            Path::new("/srv/app"),
+            None,
+            None,
+        )
+        .err()
+        .expect("missing identity must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exactly one of `known_hosts` or `host_key_fingerprint`")
+                && msg.contains("trust-on-first-use is disabled"),
+            "error must refuse trust-on-first-use, got: {msg}"
+        );
     }
 
     // Finding 1: the configured port is propagated to ssh, and ssh-keyscan

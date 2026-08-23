@@ -72,6 +72,16 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
     // Capacity is a per-server policy, not a variant one.
     assert_eq!(config.servers[0].capacity.reserve_bytes, 1_073_741_824);
     assert_eq!(config.servers[1].capacity.reserve_bytes, 1_073_741_824);
+    // SSH-shaped addresses carry exactly one host-identity source (the
+    // placeholder fingerprint in the fixture), so the documented example stays
+    // valid under the exactly-one rule.
+    for s in &config.servers {
+        assert!(
+            s.host_key_fingerprint.is_some() && s.known_hosts.is_none(),
+            "server '{}' must have exactly one identity source",
+            s.id
+        );
+    }
 
     // A dry-run materializes the release's artifacts and builds the full plan:
     // the documented example stays a working configuration, not merely

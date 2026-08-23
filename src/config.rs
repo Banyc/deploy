@@ -307,13 +307,16 @@ pub struct ServerDef {
     #[serde(default = "default_ssh_port")]
     pub port: u16,
     /// Dedicated `known_hosts` file used with `StrictHostKeyChecking=yes` for
-    /// this server. Either this or `host_key_fingerprint` must be configured;
-    /// trust-on-first-use is disabled.
+    /// this server. Exactly one of this and `host_key_fingerprint` must be
+    /// configured for an SSH address (both together are ambiguous, neither
+    /// means trust-on-first-use, which is disabled); `local://` addresses are
+    /// exempt.
     #[serde(default)]
     pub known_hosts: Option<PathBuf>,
     /// Pre-verified host-key fingerprint (e.g. `SHA256:...`). When set without a
     /// `known_hosts` file, the host key is fetched and pinned on first contact
-    /// only if its fingerprint matches this value.
+    /// only if its fingerprint matches this value. Exactly one of this and
+    /// `known_hosts` must be configured for an SSH address.
     #[serde(default)]
     pub host_key_fingerprint: Option<String>,
     /// Per-server capacity headroom policy (defaults to 0/0 when omitted),
@@ -456,10 +459,7 @@ impl Config {
                     s.id
                 )));
             }
-            // When an identity source is provided it must be well-formed. The
-            // actual enforcement (refusing trust-on-first-use) happens in the
-            // SSH transport, so a missing source is not rejected here — local
-            // and `local://` transports never perform host verification.
+            // When an identity source is provided it must be well-formed.
             if let Some(kh) = &s.known_hosts
                 && !kh.is_absolute()
             {
@@ -473,6 +473,27 @@ impl Config {
             {
                 return Err(Error::config(format!(
                     "server '{}' host_key_fingerprint must be a SHA256:... value",
+                    s.id
+                )));
+            }
+            // An SSH address requires EXACTLY ONE host-identity source. With
+            // neither, the transport would have to fall back to
+            // trust-on-first-use (refused); with both, the choice is ambiguous
+            // (the transport would silently prefer `known_hosts` and ignore the
+            // fingerprint). `local://` endpoints never perform host
+            // verification, so they are exempt.
+            let is_local = s.address.starts_with("local://");
+            let has_known_hosts = s.known_hosts.is_some();
+            let has_fingerprint = s.host_key_fingerprint.is_some();
+            if !is_local && !has_known_hosts && !has_fingerprint {
+                return Err(Error::config(format!(
+                    "server '{}': exactly one of known_hosts or host_key_fingerprint must be configured for an SSH address (trust-on-first-use is disabled)",
+                    s.id
+                )));
+            }
+            if !is_local && has_known_hosts && has_fingerprint {
+                return Err(Error::config(format!(
+                    "server '{}': known_hosts and host_key_fingerprint are mutually exclusive; configure exactly one",
                     s.id
                 )));
             }
@@ -796,6 +817,7 @@ protect_deployments = 1
 id = "s1"
 address = "a"
 user = "u"
+host_key_fingerprint = "SHA256:test"
 
 [[slots]]
 id = "p1"
@@ -881,6 +903,7 @@ protect_deployments = 2
 id = "s1"
 address = "a"
 user = "u"
+host_key_fingerprint = "SHA256:test"
 capacity = { reserve_bytes = 1073741824, reserve_percent = 5 }
 
 [[slots]]
@@ -966,6 +989,7 @@ protect_deployments = 1
 id = "s1"
 address = "a"
 user = "u"
+host_key_fingerprint = "SHA256:test"
 
 [[slots]]
 id = "p1"
@@ -1233,6 +1257,75 @@ slots = ["p1"]
         let cfg = Config::load(&p).expect("inline server capacity parses");
         assert_eq!(cfg.servers[0].capacity.reserve_bytes, 4096);
         assert_eq!(cfg.servers[0].capacity.reserve_percent, 10);
+    }
+
+    /// SSH addresses require EXACTLY ONE host-identity source; `local://`
+    /// addresses are exempt. Neither (would-be trust-on-first-use) and both
+    /// (ambiguous) are rejected at load time, naming the server.
+    #[test]
+    fn ssh_identity_requires_exactly_one_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        let p = project.join("deploy.toml");
+
+        // SSH address + neither identity source: rejected (no trust-on-first-use).
+        std::fs::write(
+            &p,
+            deploy_toml("v1").replace("host_key_fingerprint = \"SHA256:test\"\n", ""),
+        )
+        .unwrap();
+        let err = Config::load(&p).expect_err("SSH address without identity must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("server 's1'")
+                && msg.contains("exactly one of known_hosts or host_key_fingerprint")
+                && msg.contains("trust-on-first-use is disabled"),
+            "error must name the server and the missing identity, got: {msg}"
+        );
+
+        // SSH address + BOTH sources: rejected as ambiguous.
+        let both = deploy_toml("v1").replace(
+            "host_key_fingerprint = \"SHA256:test\"",
+            "host_key_fingerprint = \"SHA256:test\"\nknown_hosts = \"/etc/ssh/known_hosts\"",
+        );
+        std::fs::write(&p, both).unwrap();
+        let err = Config::load(&p).expect_err("SSH address with both identities must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("server 's1'")
+                && msg.contains("mutually exclusive")
+                && msg.contains("configure exactly one"),
+            "error must name the server and the ambiguity, got: {msg}"
+        );
+
+        // local:// address + neither source: fine (no host verification).
+        let local = deploy_toml("v1")
+            .replace("address = \"a\"", "address = \"local:///srv/forced\"")
+            .replace("host_key_fingerprint = \"SHA256:test\"\n", "");
+        std::fs::write(&p, local).unwrap();
+        let cfg = Config::load(&p).expect("local:// address needs no identity");
+        assert!(cfg.servers[0].address.starts_with("local://"));
+
+        // SSH address + exactly one source: valid.
+        std::fs::write(&p, deploy_toml("v1")).unwrap();
+        let cfg = Config::load(&p).expect("SSH address with exactly one identity is valid");
+        assert_eq!(
+            cfg.servers[0].host_key_fingerprint.as_deref(),
+            Some("SHA256:test")
+        );
+        let kh_only = deploy_toml("v1").replace(
+            "host_key_fingerprint = \"SHA256:test\"",
+            "known_hosts = \"/etc/ssh/known_hosts\"",
+        );
+        std::fs::write(&p, kh_only).unwrap();
+        let cfg = Config::load(&p).expect("known_hosts-only SSH address is valid");
+        assert_eq!(
+            cfg.servers[0].known_hosts.as_deref(),
+            Some(Path::new("/etc/ssh/known_hosts"))
+        );
+        assert!(cfg.servers[0].host_key_fingerprint.is_none());
     }
 
     /// Every user-written config surface is strict: an unknown key fails at

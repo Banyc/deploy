@@ -61,7 +61,10 @@ pub struct InitReport {
 /// Scaffold a fresh deploy project into `target`.
 ///
 /// Fails closed: refuses to write if `deploy.toml` or a `releases/` tree
-/// already exists at `target`, and never writes outside it.
+/// already exists at `target`, never writes outside it, and rejects an SSH
+/// `--address` that does not configure EXACTLY ONE host-identity source
+/// (`known_hosts` or `host_key_fingerprint`) — SSH trust-on-first-use is
+/// disabled, and both sources together are ambiguous.
 pub fn init_project(target: &Path, opts: &InitOptions) -> Result<InitReport> {
     let target = ensure_target_dir(target)?;
     let name = sanitize_name(&match &opts.name {
@@ -71,6 +74,32 @@ pub fn init_project(target: &Path, opts: &InitOptions) -> Result<InitReport> {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "deploy".to_string()),
     });
+
+    // An SSH address (anything that is not an explicit `local://` endpoint)
+    // needs exactly one host-identity source. `clap` already rejects both
+    // flags together; this catches the SSH-address-without-identity case
+    // before anything is written.
+    let has_known_hosts = opts.known_hosts.is_some();
+    let has_fingerprint = opts.host_key_fingerprint.is_some();
+    if let Some(a) = &opts.address
+        && !a.starts_with("local://")
+    {
+        match (has_known_hosts, has_fingerprint) {
+            (false, false) => {
+                return Err(Error::config(format!(
+                    "SSH address '{a}': exactly one of --known-hosts or \
+                     --host-key-fingerprint must be provided (trust-on-first-use is disabled)"
+                )));
+            }
+            (true, true) => {
+                return Err(Error::config(format!(
+                    "--known-hosts and --host-key-fingerprint are mutually exclusive; \
+                     configure exactly one for SSH address '{a}'"
+                )));
+            }
+            _ => {}
+        }
+    }
 
     // Fail closed: never clobber. Both checks run before the first write.
     let deploy_toml_path = target.join("deploy.toml");
@@ -505,6 +534,51 @@ mod tests {
         // Second init in the same place must fail closed.
         let err = init_project(&proj, &opts()).unwrap_err();
         assert!(err.to_string().contains("clobber"), "got: {err}");
+    }
+
+    // An SSH address (not `local://`) needs EXACTLY ONE host-identity source:
+    // the handler rejects neither-set before anything is written, and the
+    // both-set case is already a clap parse error (conflicting flags).
+    #[test]
+    fn init_ssh_address_requires_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // SSH address + neither identity: handler error, nothing scaffolded.
+        let proj = tmp.path().join("no-identity");
+        let no_id_opts = InitOptions {
+            address: Some("app.example.com".to_string()),
+            ..Default::default()
+        };
+        let err = init_project(&proj, &no_id_opts).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exactly one of --known-hosts or --host-key-fingerprint")
+                && msg.contains("app.example.com"),
+            "got: {msg}"
+        );
+        assert!(
+            !proj.join("deploy.toml").exists(),
+            "nothing may be scaffolded on an invalid SSH address"
+        );
+
+        // SSH address with a fingerprint: valid.
+        let proj = tmp.path().join("fp-only");
+        let fp_opts = InitOptions {
+            address: Some("app.example.com".to_string()),
+            host_key_fingerprint: Some("SHA256:abc".to_string()),
+            ..Default::default()
+        };
+        let report = init_project(&proj, &fp_opts).unwrap();
+        let config = crate::config::Config::load(&report.target.join("deploy.toml")).unwrap();
+        assert_eq!(
+            config.servers[0].host_key_fingerprint.as_deref(),
+            Some("SHA256:abc")
+        );
+        assert!(config.servers[0].known_hosts.is_none());
+
+        // local:// address with no identity stays the zero-SSH default.
+        let proj = tmp.path().join("local");
+        init_project(&proj, &opts()).unwrap();
     }
 
     #[test]

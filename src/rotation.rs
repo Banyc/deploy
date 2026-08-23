@@ -211,6 +211,7 @@ protect_deployments = 1
 id = "s1"
 address = "a"
 user = "u"
+host_key_fingerprint = "SHA256:test"
 
 [[slots]]
 id = "p1"
