@@ -12,6 +12,7 @@ use crate::adapter::verify::run_verification;
 use crate::config::{Config, Mapping};
 use crate::error::{Error, Result};
 use crate::history::{self, PushRef};
+use crate::layout;
 use crate::model::{
     BehaviorContract, DeploymentId, GenerationId, OperationId, ReleaseId, ServerId, TargetName,
     TreeDigest, VariantName,
@@ -46,6 +47,14 @@ pub struct PushReport {
 type RemoteFactory = dyn Fn(&crate::config::ServerDef, &crate::config::PodDef) -> Result<Box<dyn Remote>>;
 
 /// Run a push against `target_name`.
+///
+/// Dry-run gating: `opts.dry_run` short-circuits every mutating stage of
+/// [`push_inner`] — no local or remote locks, no handshake or recovery, no
+/// object persistence (disposable staging only), no plan/status/results
+/// records, and it returns before capacity preflight — so a dry run never
+/// checks disk headroom. Any new mutating stage added to `push_inner` MUST sit
+/// behind the same gate; the dry-run branch is the single place that defines
+/// what "touch nothing" means.
 pub fn push(
     config_path: &Path,
     store: &LocalStore,
@@ -965,7 +974,7 @@ fn process_server(
             });
         }
     };
-    let object_rel = Path::new("objects/sha256").join(tree.as_str()).join("root");
+    let object_rel = layout::tree_root(tree.as_str());
     if let Err(e) = download_tree_to_host(remote, &object_rel, verify_tmp.path()) {
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Failed,
@@ -1065,8 +1074,8 @@ fn process_server(
     };
     let generation_root = remote
         .root()
-        .join("generations")
-        .join(new_gen.as_str())
+        .join(layout::generation(new_gen.as_str()))
+        .join("root")
         .join("root");
 
     // Activation adapter. On failure, compensate (current was advanced).
@@ -1213,8 +1222,8 @@ fn compensate_server(
             }
             let root = remote
                 .root()
-                .join("generations")
-                .join(prior.as_str())
+                .join(layout::generation(prior.as_str()))
+                .join("root")
                 .join("root");
             // Re-run prior activation contract + verification. A failure means the
             // service was not actually restored to prior behavior, so propagate
@@ -1240,9 +1249,7 @@ fn recover_if_missing(remote: &dyn Remote, store: &LocalStore, digest: &TreeDige
     if store.object_exists(digest) {
         return Ok(());
     }
-    let root_rel = Path::new("objects/sha256")
-        .join(digest.as_str())
-        .join("root");
+    let root_rel = layout::tree_root(digest.as_str());
     if !remote.exists(&root_rel) {
         return Ok(());
     }
@@ -1518,7 +1525,7 @@ thread_local! {
 mod tests {
     use super::*;
     use crate::remote::transport::LocalTransport;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     const NONE_VARIANT: &str = r#"
 [[artifact.mappings]]
@@ -1759,7 +1766,7 @@ pods = ["p1"]
         let proc = h.run(None);
         assert_eq!(proc.kind, ServerOutcomeKind::Activated);
         assert!(!proc.did_compensate);
-        assert!(h.remote.exists(Path::new("current")));
+        assert!(h.remote.exists(layout::current()));
     }
 
     #[test]
@@ -1828,7 +1835,7 @@ pods = ["p1"]
         let proc = h.run(None);
         assert_eq!(proc.kind, ServerOutcomeKind::Failed);
         assert!(proc.error.unwrap().contains("missing"));
-        assert!(!h.remote.exists(Path::new("current")));
+        assert!(!h.remote.exists(layout::current()));
     }
 
     #[test]

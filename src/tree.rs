@@ -4,10 +4,19 @@
 //! canonical form records normalized relative paths, entry types, modes, and
 //! content digests. It deliberately excludes ownership, timestamps, ACLs, and
 //! extended attributes (stripped in schema version 1).
+//!
+//! This canonical format is a cross-module contract: the mapper materializes
+//! into it (`mapper.rs`), the store verifies objects against it
+//! (`store/local.rs::store_object`), recovery and pre-activation checks
+//! re-hash with it (`push/engine.rs`), and the SSH transport must preserve
+//! exactly these bytes on upload — modes as raw octal in `list`, symlinks
+//! pinned to a fixed recorded mode. Any module that serializes or transfers
+//! tree bytes diverging from this format silently breaks digest equality for
+//! every other verifier.
 
 use crate::digest::sha256_bytes;
 use crate::error::{Error, Result};
-use crate::model::{TreeDigest, TreeEntry, TreeMetadata};
+use crate::model::{TreeEntry, TreeMetadata};
 use std::collections::BTreeSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -160,12 +169,6 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
 pub fn compute_tree_digest(meta: &TreeMetadata) -> String {
     let bytes = serde_json::to_vec(meta).expect("tree metadata serializes");
     sha256_bytes(&bytes)
-}
-
-/// Re-canonicalize an existing object root to verify its recorded digest.
-pub fn verify_tree_root(root: &Path, expected: &TreeDigest) -> Result<bool> {
-    let meta = canonicalize_tree(root)?;
-    Ok(meta.tree_sha256 == expected.as_str())
 }
 
 /// Build the artifact-relative path strings for a tree's entries (used by the

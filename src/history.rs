@@ -29,20 +29,6 @@ pub enum PushRef {
     },
 }
 
-impl PushRef {
-    pub fn is_current_variant(&self) -> bool {
-        match self {
-            PushRef::Head => true,
-            PushRef::Fleet {
-                current_variant, ..
-            } => *current_variant,
-            PushRef::Release {
-                current_variant, ..
-            } => *current_variant,
-        }
-    }
-}
-
 /// Parse a push source reference token (the part after the target name).
 pub fn parse_push_ref(token: &str) -> Result<PushRef> {
     let t = token.trim();

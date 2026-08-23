@@ -6,6 +6,7 @@
 //! keyed by an operation ID and is idempotent.
 
 use crate::error::{Error, Result};
+use crate::layout;
 use crate::model::{BehaviorContract, ReleaseId};
 use crate::remote::transport::Remote;
 use serde::{Deserialize, Serialize};
@@ -50,14 +51,40 @@ impl<'a> RemoteHelper<'a> {
     }
 
     /// Protocol handshake. Records the protocol version marker.
+    /// Negotiate the remote-state protocol version.
+    ///
+    /// First contact records this client's `PROTOCOL_VERSION` under
+    /// `control/protocol.json` via exclusive create; every later contact reads
+    /// it back and refuses on any mismatch, so an old client can never drive a
+    /// state directory written by a newer one (and vice versa). Returns the
+    /// agreed version.
     pub fn handshake(&self) -> Result<u32> {
         let marker =
             serde_json::json!({ "protocol_version": crate::remote::transport::PROTOCOL_VERSION });
         let bytes = serde_json::to_vec_pretty(&marker)
             .map_err(|e| Error::remote(format!("serialize marker: {e}")))?;
-        self.remote
-            .write(Path::new("control/protocol.json"), &bytes, 0o644)?;
-        Ok(crate::remote::transport::PROTOCOL_VERSION)
+        let marker_path = layout::protocol_marker();
+        if self.remote.try_write_new(&marker_path, &bytes)? {
+            return Ok(crate::remote::transport::PROTOCOL_VERSION);
+        }
+        #[derive(serde::Deserialize)]
+        struct ProtocolMarker {
+            protocol_version: u32,
+        }
+        let existing = self.remote.read(&marker_path)?;
+        let recorded: ProtocolMarker = serde_json::from_slice(&existing).map_err(|e| {
+            Error::remote(format!(
+                "corrupt control/protocol.json: {e}; refusing to negotiate"
+            ))
+        })?;
+        if recorded.protocol_version != crate::remote::transport::PROTOCOL_VERSION {
+            return Err(Error::remote(format!(
+                "protocol mismatch: remote state was written with protocol {}, but this client speaks {}",
+                recorded.protocol_version,
+                crate::remote::transport::PROTOCOL_VERSION
+            )));
+        }
+        Ok(recorded.protocol_version)
     }
 
     /// Inspect the actual remote generation, object inventory, lock, and
@@ -66,13 +93,13 @@ impl<'a> RemoteHelper<'a> {
         let mut status = RemoteStatus::default();
 
         // Current generation via the top-level `current` symlink.
-        if self.remote.exists(Path::new("current")) {
-            let target = self.remote.read_link(Path::new("current"))?;
+        if self.remote.exists(layout::current()) {
+            let target = self.remote.read_link(layout::current())?;
             let comps: Vec<&str> = target
                 .components()
                 .map(|c| c.as_os_str().to_str().unwrap_or(""))
                 .collect();
-            if let Some(pos) = comps.iter().position(|&c| c == "generations")
+            if let Some(pos) = comps.iter().position(|&c| c == layout::GENERATIONS_COMPONENT)
                 && let Some(gid) = comps.get(pos + 1)
             {
                 status.current_generation = Some(gid.to_string());
@@ -85,7 +112,7 @@ impl<'a> RemoteHelper<'a> {
         }
 
         // Object inventory.
-        let obj_root = Path::new("objects/sha256");
+        let obj_root = layout::objects();
         if self.remote.exists(obj_root) {
             for e in self.remote.list(obj_root)? {
                 if e.is_dir {
@@ -95,13 +122,13 @@ impl<'a> RemoteHelper<'a> {
         }
 
         // Lock holder.
-        if self.remote.exists(Path::new("state/operation.lock")) {
-            let data = self.remote.read(Path::new("state/operation.lock"))?;
+        if self.remote.exists(&layout::operation_lock()) {
+            let data = self.remote.read(&layout::operation_lock())?;
             status.lock = Some(String::from_utf8_lossy(&data).trim().to_string());
         }
 
         // Pending incoming.
-        let inc = Path::new("incoming");
+        let inc = layout::incoming();
         if self.remote.exists(inc) {
             for e in self.remote.list(inc)? {
                 if e.is_dir {
@@ -114,8 +141,8 @@ impl<'a> RemoteHelper<'a> {
     }
 
     pub fn read_assignment(&self, gen_id: &str) -> Result<GenerationAssignment> {
-        let p = Path::new("generations")
-            .join(gen_id)
+        let p = layout::generation(gen_id)
+            
             .join("assignment.json");
         let data = self.remote.read(&p)?;
         serde_json::from_slice(&data).map_err(|e| Error::remote(format!("parse assignment: {e}")))
@@ -126,8 +153,7 @@ impl<'a> RemoteHelper<'a> {
     /// assigned variant is selected explicitly rather than falling back to the
     /// caller's current configuration.
     pub fn read_behavior(&self, release_id: &ReleaseId, variant: &str) -> Result<BehaviorContract> {
-        let p = Path::new("releases")
-            .join(release_id.as_str())
+        let p = layout::remote_release(release_id.as_str())
             .join("behavior.json");
         let data = self.remote.read(&p)?;
         let behaviors = crate::release::behavior_contracts_from_json(&data)
@@ -141,7 +167,7 @@ impl<'a> RemoteHelper<'a> {
     /// Acquire the server mutation lock. `force` overrides a held lock (used
     /// only during recovery). Returns true if the lock is now owned by `op_id`.
     pub fn acquire_lock(&self, op_id: &str, force: bool) -> Result<bool> {
-        let p = Path::new("state/operation.lock");
+        let p = &layout::operation_lock();
         // Atomic create-if-absent: only one caller wins the race for a free lock.
         match self.remote.try_write_new(p, op_id.as_bytes())? {
             true => Ok(true),
@@ -165,7 +191,7 @@ impl<'a> RemoteHelper<'a> {
     }
 
     pub fn release_lock(&self, op_id: &str) -> Result<()> {
-        let p = Path::new("state/operation.lock");
+        let p = &layout::operation_lock();
         if self.remote.exists(p) {
             let held = self.remote.read(p)?;
             if String::from_utf8_lossy(&held).trim() == op_id {
@@ -189,7 +215,7 @@ impl<'a> RemoteHelper<'a> {
 
     pub fn tree_exists(&self, digest: &str) -> bool {
         self.remote
-            .exists(&Path::new("objects/sha256").join(digest).join("root"))
+            .exists(&layout::tree_root(digest))
     }
 
     /// Copy a host-local tree into the remote object store, verifying the
@@ -199,7 +225,7 @@ impl<'a> RemoteHelper<'a> {
             // Best-effort verification already trusted on first publish.
             return Ok(());
         }
-        let dest = Path::new("objects/sha256").join(digest).join("root");
+        let dest = layout::tree_root(digest);
         copy_host_tree_to_remote(host_src, &dest, self.remote)?;
         // Verify the canonical digest of the published object.
         // (The object was canonicalized by the local store before publication.)
@@ -212,7 +238,7 @@ impl<'a> RemoteHelper<'a> {
         release_json: &str,
         behavior_json: &str,
     ) -> Result<()> {
-        let dir = Path::new("releases").join(release_id);
+        let dir = layout::remote_release(release_id);
         self.publish_release_file(&dir.join("release.json"), release_json.as_bytes())?;
         self.publish_release_file(&dir.join("behavior.json"), behavior_json.as_bytes())
     }
@@ -245,7 +271,7 @@ impl<'a> RemoteHelper<'a> {
     /// fresh UUIDv7 values minted under the operation lock, so this can only
     /// fire on corruption or retry-after-crash with divergent state.
     pub fn create_generation(&self, op_id: &str, assignment: &GenerationAssignment) -> Result<()> {
-        let gen_dir = Path::new("generations").join(&assignment.generation_id);
+        let gen_dir = layout::generation(&assignment.generation_id);
         self.remote.create_dir_all(&gen_dir)?;
         let json = serde_json::to_vec_pretty(assignment)
             .map_err(|e| Error::remote(format!("serialize assignment: {e}")))?;
@@ -265,9 +291,7 @@ impl<'a> RemoteHelper<'a> {
         // it after a crash is safe.
         let root_link_path = gen_dir.join("root");
         if !self.remote.exists(&root_link_path) {
-            let root_link = Path::new("../../objects/sha256")
-                .join(&assignment.tree)
-                .join("root");
+            let root_link = layout::generation_root_link(&assignment.tree);
             self.remote.symlink(&root_link, &root_link_path)?;
         }
         let _ = op_id;
@@ -277,16 +301,23 @@ impl<'a> RemoteHelper<'a> {
     /// Atomically move `current` to the given generation. `expected` is the
     /// compare-and-swap precondition (the planned pre-push generation). When
     /// `expected` is `None` there is no precondition (first deployment).
+    ///
+    /// Lock discipline: the CAS precondition alone is necessary but NOT
+    /// sufficient — every caller MUST hold this server's mutation lock
+    /// ([`Self::acquire_lock_guard`]) for the whole read-decide-swap window.
+    /// The same rule governs [`Self::remove_current_if`]. A swap performed
+    /// without the flock can race a concurrent activation between its status
+    /// read and the rename.
     pub fn swap_current(&self, expected: Option<&str>, gen_id: &str, op_id: &str) -> Result<()> {
-        if self.remote.exists(Path::new("current")) {
-            let target = self.remote.read_link(Path::new("current"))?;
+        if self.remote.exists(layout::current()) {
+            let target = self.remote.read_link(layout::current())?;
             let comps: Vec<String> = target
                 .components()
                 .map(|c| c.as_os_str().to_string_lossy().into_owned())
                 .collect();
             let actual = comps
                 .iter()
-                .position(|c| c == "generations")
+                .position(|c| c == layout::GENERATIONS_COMPONENT)
                 .and_then(|i| comps.get(i + 1).cloned());
             if let Some(exp) = expected
                 && actual.as_deref() != Some(exp)
@@ -297,38 +328,21 @@ impl<'a> RemoteHelper<'a> {
                 )));
             }
         }
-        let new_target = Path::new("generations").join(gen_id).join("root");
+        let new_target = layout::generation(gen_id).join("root");
         let tmp_name = format!(".current.tmp.{op_id}");
         let tmp = Path::new(&tmp_name);
         // Remove any stale temp link.
         self.remote.remove_file(tmp)?;
         self.remote.symlink(new_target.as_path(), tmp)?;
-        self.remote.rename(tmp, Path::new("current"))?;
+        self.remote.rename(tmp, layout::current())?;
         self.remote.remove_file(tmp).ok();
-        Ok(())
-    }
-
-    /// Append a history line to `state/history.jsonl`.
-    pub fn record_history(&self, line: &str) -> Result<()> {
-        let p = Path::new("state/history.jsonl");
-        let existing = if self.remote.exists(p) {
-            self.remote.read(p)?
-        } else {
-            Vec::new()
-        };
-        let mut combined = existing;
-        combined.extend_from_slice(line.as_bytes());
-        if !line.ends_with('\n') {
-            combined.push(b'\n');
-        }
-        self.remote.write(p, &combined, 0o644)?;
         Ok(())
     }
 
     /// Recompute and write `state/inventory.json`.
     pub fn write_inventory(&self) -> Result<()> {
         let mut inv = Vec::new();
-        let obj_root = Path::new("objects/sha256");
+        let obj_root = layout::objects();
         if self.remote.exists(obj_root) {
             for e in self.remote.list(obj_root)? {
                 if e.is_dir {
@@ -340,13 +354,13 @@ impl<'a> RemoteHelper<'a> {
         let json = serde_json::to_vec_pretty(&inv)
             .map_err(|e| Error::remote(format!("serialize inventory: {e}")))?;
         self.remote
-            .write(Path::new("state/inventory.json"), &json, 0o644)?;
+            .write(&layout::inventory(), &json, 0o644)?;
         Ok(())
     }
 
     /// Persist a transaction record.
     pub fn transaction_record(&self, op_id: &str, state: &str) -> Result<()> {
-        let p = Path::new("transactions").join(format!("{op_id}.json"));
+        let p = layout::transaction_record(op_id);
         let payload = serde_json::json!({
             "operation_id": op_id,
             "state": state,
@@ -365,7 +379,7 @@ impl<'a> RemoteHelper<'a> {
         retained: &HashSet<String>,
         active_incoming: &HashSet<String>,
     ) -> Result<()> {
-        let obj_root = Path::new("objects/sha256");
+        let obj_root = layout::objects();
         if self.remote.exists(obj_root) {
             for e in self.remote.list(obj_root)? {
                 if e.is_dir && !retained.contains(&e.name) {
@@ -373,7 +387,7 @@ impl<'a> RemoteHelper<'a> {
                 }
             }
         }
-        let inc = Path::new("incoming");
+        let inc = layout::incoming();
         if self.remote.exists(inc) {
             for e in self.remote.list(inc)? {
                 if e.is_dir && !active_incoming.contains(&e.name) {
@@ -388,9 +402,7 @@ impl<'a> RemoteHelper<'a> {
     /// Stage a tree into a deployment-specific incoming directory (invisible to
     /// activation and rotation until published).
     pub fn stage_incoming(&self, deployment_id: &str, digest: &str, host_src: &Path) -> Result<()> {
-        let dest = Path::new("incoming")
-            .join(deployment_id)
-            .join(format!("{digest}.partial"));
+        let dest = layout::staged_tree(deployment_id, digest);
         copy_host_tree_to_remote(host_src, &dest, self.remote)
     }
 
@@ -400,10 +412,8 @@ impl<'a> RemoteHelper<'a> {
         if self.tree_exists(digest) {
             return Ok(());
         }
-        let from = Path::new("incoming")
-            .join(deployment_id)
-            .join(format!("{digest}.partial"));
-        let to = Path::new("objects/sha256").join(digest).join("root");
+        let from = layout::staged_tree(deployment_id, digest);
+        let to = layout::tree_root(digest);
         self.remote.create_dir_all(to.parent().unwrap())?;
         self.remote.rename(&from, &to)?;
         Ok(())
@@ -413,27 +423,23 @@ impl<'a> RemoteHelper<'a> {
     /// compensation). `expected` makes the removal a compare-and-swap: the link
     /// is removed only if it currently points at `expected`, so a concurrent
     /// activation cannot be clobbered.
-    pub fn remove_current(&self) -> Result<()> {
-        self.remote.remove_file(Path::new("current"))
-    }
-
     /// Remove `current` only if it currently points at `expected`. Returns true
     /// if it was removed, false if `current` pointed elsewhere (or did not exist).
     pub fn remove_current_if(&self, expected: &str) -> Result<bool> {
-        if !self.remote.exists(Path::new("current")) {
+        if !self.remote.exists(layout::current()) {
             return Ok(false);
         }
-        let target = self.remote.read_link(Path::new("current"))?;
+        let target = self.remote.read_link(layout::current())?;
         let comps: Vec<String> = target
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect();
         let actual = comps
             .iter()
-            .position(|c| c == "generations")
+            .position(|c| c == layout::GENERATIONS_COMPONENT)
             .and_then(|i| comps.get(i + 1).cloned());
         if actual.as_deref() == Some(expected) {
-            self.remote.remove_file(Path::new("current"))?;
+            self.remote.remove_file(layout::current())?;
             Ok(true)
         } else {
             Ok(false)
@@ -444,13 +450,18 @@ impl<'a> RemoteHelper<'a> {
     /// records the generation this server committed and the full set of server
     /// IDs that participate in the fleet commit, so a partial marker can never
     /// masquerade as a complete commit.
+    ///
+    /// Markers are immutable and write-once: the file is created exclusively,
+    /// and an existing marker must match byte-for-byte (deterministic payload
+    /// for the same deployment) or the rewrite fails integrity. A concurrent or
+    /// retried commit therefore can never alter a recorded fact.
     pub fn write_commit_marker(
         &self,
         deployment_id: &str,
         generation: &str,
         server_ids: &[String],
     ) -> Result<()> {
-        let p = Path::new("state/commits").join(format!("{deployment_id}.json"));
+        let p = layout::commit_marker(deployment_id);
         let payload = serde_json::json!({
             "deployment_id": deployment_id,
             "committed": true,
@@ -459,18 +470,16 @@ impl<'a> RemoteHelper<'a> {
         });
         let bytes = serde_json::to_vec_pretty(&payload)
             .map_err(|e| Error::remote(format!("serialize commit: {e}")))?;
-        self.remote.write(&p, &bytes, 0o644)
-    }
-
-    pub fn commit_marker_exists(&self, deployment_id: &str) -> bool {
-        self.remote
-            .exists(&Path::new("state/commits").join(format!("{deployment_id}.json")))
-    }
-
-    /// Persist durable pins.
-    pub fn set_pins(&self, pins_json: &str) -> Result<()> {
-        self.remote
-            .write(Path::new("state/pins.json"), pins_json.as_bytes(), 0o644)
+        if self.remote.try_write_new(&p, &bytes)? {
+            return Ok(());
+        }
+        let existing = self.remote.read(&p)?;
+        if existing != bytes {
+            return Err(Error::integrity(format!(
+                "commit marker for {deployment_id} already exists with different content"
+            )));
+        }
+        Ok(())
     }
 
     /// Publish a tree object from a host-local path (used when no prior
@@ -482,7 +491,7 @@ impl<'a> RemoteHelper<'a> {
     /// Remove a specific incoming directory (used after completion).
     pub fn remove_incoming(&self, deployment_id: &str) -> Result<()> {
         self.remote
-            .remove_dir_all(&Path::new("incoming").join(deployment_id))?;
+            .remove_dir_all(&layout::incoming_dir(deployment_id))?;
         Ok(())
     }
 }

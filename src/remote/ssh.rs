@@ -20,7 +20,6 @@
 //! syntax.
 
 use crate::error::{Error, Result};
-use crate::remote::transport::PROTOCOL_VERSION;
 use crate::remote::transport::{Remote, RemoteEntry, RemoteMeta};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -687,40 +686,6 @@ impl Remote for SshTransport {
                 String::from_utf8_lossy(&out.stderr)
             )))
         }
-    }
-}
-
-/// Confirm the transport can negotiate with the host. Host identity must be
-/// configured (see [`SshTransport::new`]); this refuses trust-on-first-use.
-pub fn handshake_probe(
-    target: &str,
-    known_hosts: Option<&Path>,
-    host_key_fingerprint: Option<&str>,
-    port: u16,
-) -> Result<u32> {
-    let (user, address) = match target.split_once('@') {
-        Some((u, a)) if !u.is_empty() && !a.is_empty() => (u.to_string(), a.to_string()),
-        _ => {
-            return Err(Error::transport(format!(
-                "ssh handshake probe: target '{target}' must be 'user@address'"
-            )));
-        }
-    };
-    let probe = SshTransport::new(
-        &user,
-        &address,
-        port,
-        Path::new("/"),
-        known_hosts,
-        host_key_fingerprint,
-    )?;
-    let out = probe.run_remote("true")?;
-    if out.status.success() {
-        Ok(PROTOCOL_VERSION)
-    } else {
-        Err(Error::transport(format!(
-            "ssh handshake probe to {target} failed"
-        )))
     }
 }
 

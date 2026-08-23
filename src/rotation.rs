@@ -15,12 +15,12 @@
 
 use crate::config::{Pin, RotationConfig};
 use crate::error::Result;
+use crate::layout;
 use crate::model::{ReleaseId, TreeDigest};
 use crate::remote::helper::RemoteHelper;
 use crate::store::local::LocalStore;
 use chrono::{DateTime, Utc};
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
 
 struct GenRecord {
     created_at: DateTime<Utc>,
@@ -51,7 +51,7 @@ pub fn compute_retained(
 
     // Enumerate generation records.
     let mut gens: Vec<GenRecord> = Vec::new();
-    let gen_root = Path::new("generations");
+    let gen_root = layout::generations();
     if helper.remote().exists(gen_root) {
         for e in helper.remote().list(gen_root)? {
             if !e.is_dir {
@@ -167,10 +167,10 @@ pub fn retained_summary(retained: &HashSet<String>) -> Vec<TreeDigest> {
 mod tests {
     use super::*;
     use crate::config::Config;
+use crate::layout;
     use crate::remote::helper::{GenerationAssignment, RemoteHelper};
     use crate::remote::transport::LocalTransport;
     use crate::store::local::LocalStore;
-    use std::path::Path;
 
     fn cfg() -> Config {
         let dir = tempfile::tempdir().unwrap();
@@ -237,11 +237,11 @@ pods = ["p1"]
         let helper = RemoteHelper::new(&remote);
         helper
             .remote()
-            .create_dir_all(Path::new("objects/sha256/t1/root"))
+            .create_dir_all(&layout::tree_root("t1"))
             .unwrap();
         helper
             .remote()
-            .create_dir_all(Path::new("objects/sha256/t2/root"))
+            .create_dir_all(&layout::tree_root("t2"))
             .unwrap();
         helper
             .create_generation(

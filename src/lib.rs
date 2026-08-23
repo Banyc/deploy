@@ -8,6 +8,7 @@ pub mod config;
 pub mod digest;
 pub mod error;
 pub mod history;
+pub mod layout;
 pub mod mapper;
 pub mod model;
 pub mod push;

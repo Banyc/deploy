@@ -643,6 +643,13 @@ impl Remote for FaultRemote {
                 "FaultRemote: write forced to fail",
             ));
         }
+        // Targeted fault injection mirrors `write`: markers are installed via
+        // exclusive create, so the failure must be observable there too.
+        if self.fail_commit_marker && rel.to_string_lossy().starts_with("state/commits/") {
+            return Err(deploy::error::Error::remote(
+                "FaultRemote: commit marker create forced to fail",
+            ));
+        }
         self.inner.try_write_new(rel, data)
     }
     fn create_dir(&self, rel: &Path) -> deploy::error::Result<()> {
