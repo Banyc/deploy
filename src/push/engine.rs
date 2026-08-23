@@ -936,7 +936,12 @@ fn push_inner(
             helper.rotate(&retained, &active_incoming)?;
             helper.release_lock(op_id.as_str())?;
         }
-        // Clean up this deployment's incoming directory.
+        // Clean up this deployment's incoming directory. Best-effort by
+        // design: the push already succeeded, so a leftover here cannot change
+        // the reported outcome, and the next push's reconciliation removes
+        // abandoned incoming dirs explicitly. Same for the (already released)
+        // lock file: releasing the advisory lock again is a no-op, and a
+        // stale lock file is re-acquired harmlessly next time.
         helpers[sid].remove_incoming(deployment_id.as_str()).ok();
         helpers[sid].release_lock(op_id.as_str()).ok();
     }
@@ -1534,11 +1539,26 @@ fn recover_if_missing(remote: &dyn Remote, store: &LocalStore, digest: &TreeDige
     let tmp = store
         .staging_dir()
         .join(format!("recover-{}", digest.as_str()));
+    // A stale `recover-<digest>` dir can survive an interrupted earlier
+    // recovery, and downloaded trees carry remote file modes (read-only
+    // dirs/files), so removal can fail with EACCES. Removal is EXPLICIT and
+    // FALLIBLE: restore owner-write inside the stale tree, then remove it. A
+    // stale temp that cannot be removed aborts the recovery loudly instead of
+    // letting `download_tree_to_host` write INTO the stale dir and
+    // `store.store_object` persist a mixed (stale leftovers + fresh content)
+    // tree under the digest. A missing temp is a no-op.
     if tmp.exists() {
-        std::fs::remove_dir_all(&tmp).ok();
+        remove_tree_restoring_write(&tmp, "remove stale recovery temp")?;
     }
     download_tree_to_host(remote, &root_rel, &tmp)?;
     store.store_object(digest, &tmp)?;
+    // Explicit FALLIBLE cleanup of the disposable download temp before
+    // returning, so a successful recovery never leaves `recover-<digest>`
+    // behind (a leftover that a later recovery would treat as stale and that
+    // could accumulate read-only content). `store_object` copies, so the temp
+    // is no longer needed; a cleanup failure surfaces as an error naming the
+    // path, mirroring the dry-run staging cleanup.
+    remove_tree_restoring_write(&tmp, "remove recovery temp")?;
     Ok(())
 }
 
@@ -1550,6 +1570,11 @@ fn download_tree_to_host(remote: &dyn Remote, rel: &Path, host_dest: &Path) -> R
         let dest = host_dest.join(&entry.name);
         if entry.is_symlink {
             // Reconstruct the exact symlink target; remove any stale entry first.
+            // Best-effort prep: in the only caller (`recover_if_missing`) the
+            // destination tree is freshly downloaded, so `dest` does not exist
+            // and remove_file returns NotFound. If a stale entry did linger, the
+            // subsequent symlink fails loudly with EEXIST rather than silently
+            // producing a wrong tree.
             let target = remote.read_link(&child_rel)?;
             let _ = std::fs::remove_file(&dest);
             std::os::unix::fs::symlink(&target, &dest)
@@ -1656,6 +1681,11 @@ fn capacity_preflight(
         if need + reserve > avail {
             // Run protected rotation using the target's rotation policy, then
             // recheck capacity directly rather than failing the restore.
+            // Best-effort by design: rotation is only an optimization to free
+            // capacity, and the hard capacity check below decides the outcome.
+            // A rotation failure is not recoverable at this point (the push
+            // would have to abort mid-preflight), and the recheck fails the
+            // push loudly if space is genuinely short.
             if helper.acquire_lock(op_id.as_str(), false).is_ok() {
                 let retained = compute_retained(helper, &config.pins, store, rotation)?;
                 let active = HashSet::from([deployment_id.as_str().to_string()]);
@@ -1753,25 +1783,34 @@ fn restore_owner_write_recursive(root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Remove a dry-run staging tree, propagating failures. Restores owner-write
+/// Remove a directory tree, restoring owner-write permission on read-only
+/// entries inside it first, then removing the whole tree. A missing tree is a
+/// no-op. `remove_dir_all` needs write permission on every directory it enters
+/// AND on the tree's parent; restoring u+w inside the tree fixes read-only
+/// entries preserved from artifact source modes, but never the parent (that is
+/// outside the tree's responsibility). Failures map to [`Error::transport`]
+/// with `what` and the path in the message, so every caller (dry-run staging
+/// cleanup, recovery temp removal) fails visibly instead of silently leaking
+/// the tree.
+fn remove_tree_restoring_write(root: &Path, what: &str) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    restore_owner_write_recursive(root)
+        .map_err(|e| Error::transport(format!("{what} {}: {e}", root.display())))?;
+    std::fs::remove_dir_all(root)
+        .map_err(|e| Error::transport(format!("{what} {}: {e}", root.display())))?;
+    Ok(())
+}
+
+/// Remove a dry-run's staging tree, propagating failures. Restores owner-write
 /// permission on read-only entries inside the tree first (the tree cannot fix
 /// permissions on its own parent), then removes the whole tree. A missing tree
 /// is a no-op. Failures map to [`Error::transport`] with the path in the
 /// message, so a dry run whose staging could not be cleaned fails visibly
 /// instead of silently leaving `staging/dry-<id>` behind forever.
 fn cleanup_dry_run_staging(root: &Path) -> Result<()> {
-    if !root.exists() {
-        return Ok(());
-    }
-    restore_owner_write_recursive(root).map_err(|e| {
-        Error::transport(format!(
-            "restore owner-write on dry-run staging {}: {e}",
-            root.display()
-        ))
-    })?;
-    std::fs::remove_dir_all(root)
-        .map_err(|e| Error::transport(format!("remove dry-run staging {}: {e}", root.display())))?;
-    Ok(())
+    remove_tree_restoring_write(root, "remove dry-run staging")
 }
 
 /// Removes the disposable dry-run staging tree on drop (error, panic, or
@@ -1848,6 +1887,10 @@ impl FileLock {
 impl std::ops::Drop for FileLock {
     fn drop(&mut self) {
         // Release the advisory lock, then remove the (now-unlocked) file.
+        // Best-effort by design, like the other Drop fallbacks: this runs on
+        // every return path (including panic/unwind), so a failure must not
+        // surface, and a stale lock file is re-acquired harmlessly next time
+        // (the flock itself is released by the kernel when the fd drops).
         unsafe {
             libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
@@ -2367,6 +2410,182 @@ pods = ["p1"]
             let _g = StagingCleanup(Some(p.clone()));
         }
         assert!(!p.exists(), "fallback Drop must clean a read-only tree");
+    }
+
+    #[test]
+    fn recovery_removes_stale_readonly_temp_no_mixed_tree() {
+        // A stale `recover-<digest>` temp (left by an interrupted earlier
+        // recovery) with READ-ONLY content must be removed FALLIBLY during
+        // recovery — restore owner-write, then remove_dir_all — so the
+        // re-downloaded tree is never mixed with stale leftovers before being
+        // stored under the digest. Regression: the old code swallowed
+        // remove_dir_all's EACCES, downloaded INTO the stale dir, and
+        // persisted a mixed tree (or failed verification).
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        std::fs::write(release_dir.join("standard.toml"), NONE_VARIANT).unwrap();
+        std::fs::write(project.join("deploy.toml"), NONE_TOML).unwrap();
+        let artifacts_dir = release_dir.join("artifacts");
+        for (p, c) in [
+            ("build/output/app/server", "v1"),
+            ("deployment/common/README", "common"),
+        ] {
+            let fp = artifacts_dir.join(p);
+            std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
+            std::fs::write(&fp, c).unwrap();
+        }
+
+        let config_path = project.join("deploy.toml");
+        let config = Config::load(&config_path).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let remotes_base = dir.path().join("remotes");
+        std::fs::create_dir_all(&remotes_base).unwrap();
+        let remote_path = remotes_base.join("s1");
+        let factory_path = remote_path.clone();
+        let factory = move |_s: &crate::config::ServerDef,
+                            _pod: &crate::config::PodDef|
+              -> Result<Box<dyn Remote>> {
+            Ok(Box::new(LocalTransport::new(factory_path.clone()).unwrap()))
+        };
+
+        // First push: deploys and publishes the tree into the remote object
+        // store, which is what recovery later re-downloads from.
+        let r0 = push(
+            &config_path,
+            &store,
+            &factory,
+            "t1",
+            &config,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            r0.status,
+            Some(DeploymentStatus::Successful),
+            "first push must deploy"
+        );
+        let tree = r0.attempt.expect("attempt recorded").servers[&ServerId::new("s1")]
+            .tree
+            .clone();
+
+        // Drop the local object: recovery must re-fetch from the remote.
+        std::fs::remove_dir_all(store.object_root(&tree)).unwrap();
+        assert!(!store.object_exists(&tree), "local object removed");
+        let remote_handle = LocalTransport::new(remote_path).unwrap();
+        assert!(
+            remote_handle.exists(&crate::layout::tree_root(tree.as_str())),
+            "remote still retains the tree"
+        );
+
+        // Plant a stale recovery temp with READ-ONLY content, simulating a
+        // crashed earlier recovery whose temp could not be removed.
+        let tmp = store
+            .staging_dir()
+            .join(format!("recover-{}", tree.as_str()));
+        std::fs::create_dir_all(tmp.join("stale-sub")).unwrap();
+        std::fs::write(tmp.join("stale-sub/stale-file"), b"STALE").unwrap();
+        std::fs::set_permissions(
+            tmp.join("stale-sub"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            tmp.join("stale-sub/stale-file"),
+            std::fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
+
+        // Second push: a ROLLBACK to f0 cannot re-materialize the tree from
+        // local artifacts (materialization only runs for HEAD pushes), so its
+        // reconciliation must `recover_if_missing` the missing digest from the
+        // remote. The stale read-only temp must be removed fallibly and must
+        // NOT be mixed into the re-downloaded object.
+        let r1 = push(
+            &config_path,
+            &store,
+            &factory,
+            "t1",
+            &config,
+            &PushOptions {
+                dry_run: false,
+                ref_token: Some("t1@f0".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            r1.status,
+            Some(DeploymentStatus::Successful),
+            "rollback push must deploy from the recovered object: {}",
+            r1.message
+        );
+
+        // The stored object must contain ONLY the tree downloaded from the
+        // remote: no stale leftovers mixed in.
+        let obj = store.object_root(&tree);
+        assert!(obj.exists(), "recovered object present");
+        let meta = crate::tree::canonicalize_tree(&obj).unwrap();
+        assert_eq!(
+            meta.tree_sha256,
+            tree.as_str(),
+            "recovered object must be exactly the remote tree (no mixing)"
+        );
+        let stale: Vec<String> = std::fs::read_dir(&obj)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("stale"))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "stale temp content must not be mixed into the object: {stale:?}"
+        );
+
+        // The stale temp dir itself must be gone.
+        assert!(!tmp.exists(), "stale recovery temp must be removed");
+    }
+
+    #[test]
+    fn remove_tree_restoring_write_reports_removal_failure() {
+        // Injection: removing the temp root requires write permission on its
+        // PARENT directory, and the helper only restores permissions INSIDE
+        // its own tree (it must not touch anything outside). So a read-only
+        // parent makes remove_dir_all fail with EACCES even after the
+        // owner-write restore, and that failure must surface as an Err naming
+        // the path — never a silent swallow that lets a mixed tree be stored.
+        // Mirrors `dry_run_cleanup_failure_is_reported`.
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("recover-x");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/f"), b"x").unwrap();
+        // Read-only entries INSIDE the tree are fixed by the helper; only the
+        // parent-side injection breaks removal.
+        std::fs::set_permissions(root.join("nested"), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = remove_tree_restoring_write(&root, "remove stale recovery temp").unwrap_err();
+        assert!(
+            matches!(err, Error::Transport(_)),
+            "removal failure must be a transport error, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("remove stale recovery temp") && msg.contains("recover-x"),
+            "error must name the tree path, got: {msg}"
+        );
+        assert!(
+            root.exists(),
+            "failed removal must not silently remove the tree"
+        );
+
+        // Restore the parent so the tempdir can clean up after the test.
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
