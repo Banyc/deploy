@@ -397,6 +397,56 @@ fn simple_hash(s: &str) -> String {
 }
 
 impl SshTransport {
+    /// Build the remote shell command implementing the durability protocol
+    /// for an immutable record at `root.join(rel)`. Extracted so tests can
+    /// assert on the exact command shape without spawning ssh.
+    fn write_new_cmd(root: &Path, rel: &Path, payload: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let remote_path = root.join(rel);
+        let remote_path_str = remote_path.to_string_lossy().into_owned();
+        let parent = Path::new(&remote_path_str)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        // Durability protocol (mirrors LocalTransport::try_write_new):
+        //
+        // 1. Write the payload into a UNIQUE, dot-prefixed temporary file in
+        //    the destination directory, so a concurrent reader never sees a
+        //    partial record and listing-based observers skip the temp name.
+        // 2. Install atomically WITHOUT replacement via `ln` -- it fails if
+        //    the destination exists, so no loser can clobber a winner.
+        // 3. Remove the temporary name and best-effort `sync` so the
+        //    installation survives a crash.
+        //
+        // The parent directory is created first (the remote layout is not
+        // provisioned by SSH the way LocalTransport does it), so a fresh remote
+        // root still allows the first lock acquisition.
+        let basename = Path::new(&remote_path_str)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "record".to_string());
+        // The temp lives INSIDE the destination's parent directory and is
+        // dot-prefixed, exactly like LocalTransport::try_write_new. A sibling
+        // name (`{parent}.{basename}.tmp...`) would escape the managed remote
+        // root whenever the destination's parent IS the deployment root.
+        let tmp = format!(
+            "{}/.{}.tmp.{}.{}",
+            parent.trim_end_matches('/'),
+            basename,
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        );
+        format!(
+            "mkdir -p {p} && printf '%s' {payload} > {tmp} && ln {tmp} {d}; rc=$?; rm -f {tmp}; test \"$rc\" -eq 0 && sync 2>/dev/null || true; exit $rc",
+            p = shell_quote(&parent),
+            payload = shell_quote(payload),
+            tmp = shell_quote(&tmp),
+            d = shell_quote(&remote_path_str),
+        )
+    }
+
     /// Build the remote `list` script for `rel`. The glob intentionally covers
     /// hidden entries but excludes the `.` and `..` self/parent directories,
     /// and each entry's real mode is fetched with `stat -c '%f'` (raw mode in
@@ -684,43 +734,8 @@ impl Remote for SshTransport {
     }
 
     fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-        let remote_path = self.root.join(rel);
-        let remote_path_str = remote_path.to_string_lossy().into_owned();
         let payload = String::from_utf8_lossy(data).into_owned();
-        let parent = Path::new(&remote_path_str)
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| ".".to_string());
-        // Durability protocol (mirrors LocalTransport::try_write_new):
-        //
-        // 1. Write the payload into a UNIQUE, dot-prefixed temporary file in
-        //    the destination directory, so a concurrent reader never sees a
-        //    partial record and listing-based observers skip the temp name.
-        // 2. Install atomically WITHOUT replacement via `ln` — it fails if the
-        //    destination exists, so no loser can clobber a winner.
-        // 3. Remove the temporary name and best-effort `sync` so the
-        //    installation survives a crash.
-        //
-        // The parent directory is created first (the remote layout is not
-        // provisioned by SSH the way LocalTransport does it), so a fresh remote
-        // root still allows the first lock acquisition.
-        let tmp = format!(
-            "{}.{}.tmp.{}.{}",
-            parent.trim_end_matches('/'),
-            remote_path_str.rsplit('/').next().unwrap_or("record"),
-            std::process::id(),
-            TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
-        );
-        let cmd = format!(
-            "mkdir -p {p} && printf '%s' {payload} > {tmp} && ln {tmp} {d}; rc=$?; rm -f {tmp}; test \"$rc\" -eq 0 && sync 2>/dev/null || true; exit $rc",
-            p = shell_quote(&parent),
-            payload = shell_quote(&payload),
-            tmp = shell_quote(&tmp),
-            d = shell_quote(&remote_path_str),
-        );
+        let cmd = Self::write_new_cmd(&self.root, rel, &payload);
         let out = self.run_remote(&cmd)?;
         if out.status.success() {
             Ok(true)
@@ -814,30 +829,56 @@ mod tests {
     }
 
     // Finding 4: try_write_new creates the parent directory before the
-    // noclobber redirect, so a fresh remote root can host the first lock.
+    // noclobber install, so a fresh remote root can host the first lock.
     #[test]
     fn try_write_new_creates_parent_dir() {
         let t = transport();
-        // Build the command string via the public surface by inspecting the
-        // produced remote command through a small proxy: re-create the same
-        // logic path used by try_write_new.
-        let rel = crate::layout::operation_lock();
-        let remote_path = t.root.join(rel);
-        let remote_path_str = remote_path.to_string_lossy().into_owned();
-        let parent = Path::new(&remote_path_str)
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| ".".to_string());
-        let cmd = format!(
-            "mkdir -p {} && set -C; printf '%s' {} > {}",
-            shell_quote(&parent),
-            shell_quote("op-proc"),
-            shell_quote(&remote_path_str),
+        let cmd =
+            SshTransport::write_new_cmd(t.root(), &crate::layout::operation_lock(), "op-proc");
+        assert!(
+            cmd.starts_with("mkdir -p '/srv/app/state'"),
+            "parent directory is created first, got: {cmd}"
+        );
+    }
+
+    // The unique temp file for the durability protocol must live INSIDE the
+    // destination's parent directory and be dot-prefixed (mirroring
+    // LocalTransport), never a sibling of the parent: a sibling name would
+    // escape the managed remote root whenever the destination's parent IS the
+    // deployment root.
+    #[test]
+    fn try_write_new_temp_is_dot_prefixed_inside_destination_parent() {
+        let t = transport();
+        let cmd =
+            SshTransport::write_new_cmd(t.root(), &crate::layout::operation_lock(), "op-proc");
+        assert!(
+            cmd.contains("/srv/app/state/.operation.lock.tmp."),
+            "temp must be inside the destination parent and dot-prefixed, got: {cmd}"
         );
         assert!(
-            cmd.starts_with("mkdir -p"),
-            "parent directory is created before the redirect"
+            !cmd.contains("/srv/app.state.operation.lock"),
+            "temp must not be a dot-sibling of the destination parent, got: {cmd}"
         );
-        assert!(cmd.contains("state"), "the target path is the lock file");
+        assert!(
+            !cmd.contains("/srv/app/.state.operation.lock"),
+            "temp must not leak above the destination parent, got: {cmd}"
+        );
+    }
+
+    // Regression: when the destination sits directly in the deployment root,
+    // the old sibling naming (`{root}.{basename}.tmp...`) placed the temp OUTSIDE
+    // the managed root entirely.
+    #[test]
+    fn try_write_new_temp_stays_inside_root_for_root_level_dest() {
+        let t = transport();
+        let cmd = SshTransport::write_new_cmd(t.root(), Path::new("files"), "payload-data");
+        assert!(
+            cmd.contains("/srv/app/.files.tmp."),
+            "temp for a root-level destination must stay inside the root, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("/srv.files.tmp."),
+            "temp must not escape the managed root, got: {cmd}"
+        );
     }
 }
