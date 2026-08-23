@@ -241,7 +241,27 @@ impl<'a> RemoteHelper<'a> {
         behavior_json: &str,
     ) -> Result<()> {
         let dir = layout::remote_release(release_id);
-        self.publish_release_file(&dir.join("release.json"), release_json.as_bytes())?;
+        // The release record is identified by its canonical digest
+        // (`release_sha256`), not by semantic equality of the full document:
+        // metadata fields such as `created_at` (and `provenance.git_revision`)
+        // legitimately differ between runs of the same canonical release, so
+        // byte/semantic comparison of the whole record would falsely reject
+        // idempotent re-publication. Two records with the same
+        // `release_sha256` are the same release.
+        let rel = dir.join("release.json");
+        if !self.remote.exists(&rel) {
+            self.publish_release_file(&rel, release_json.as_bytes())?;
+        } else {
+            let existing = self.remote.read(&rel)?;
+            if Self::release_identity_of(&existing)
+                != Self::release_identity_of(release_json.as_bytes())
+            {
+                return Err(Error::integrity(format!(
+                    "refusing to replace existing {} with a different release",
+                    rel.display()
+                )));
+            }
+        }
         self.publish_release_file(&dir.join("behavior.json"), behavior_json.as_bytes())
     }
 
@@ -262,6 +282,15 @@ impl<'a> RemoteHelper<'a> {
             "refusing to replace existing {} with different content",
             rel.display()
         )))
+    }
+
+    /// Extract the canonical release identity (`release_sha256`) from a
+    /// serialized release record, or `None` when the payload is not a valid
+    /// release record carrying that field.
+    fn release_identity_of(record: &[u8]) -> Option<String> {
+        serde_json::from_slice::<serde_json::Value>(record)
+            .ok()
+            .and_then(|v| v.get("release_sha256")?.as_str().map(|s| s.to_string()))
     }
 
     /// Create a generation record and its `root` symlink. Does not move
