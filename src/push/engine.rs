@@ -887,11 +887,25 @@ fn push_inner(
             slots: results.clone(),
         },
     )?;
-    // The final transition is the attempt's status. Its append is the last
-    // status persistence of the push; the reconcile eligibility gate reads
-    // the latest transition, so a crash before this append leaves the attempt
-    // at its previous (pending) status and a later push re-eligibilizes it.
-    store.append_transition(deployment_id.as_str(), &commit_status, commit_reason)?;
+
+    // Finalize the attempt's terminal status REPLAY-SAFELY. A SUCCESSFUL
+    // attempt goes through the SAME shared finalizer as pending-commit
+    // recovery ([`history::finalize_successful_attempt`]): first the
+    // recoverable `PendingCommit` marker is persisted (so a crash
+    // mid-finalization leaves the attempt re-eligible — its latest
+    // transition is `PendingCommit`, never a prematurely-written
+    // `Successful`), then the idempotent snapshot append and
+    // `refs/last-successful`, and the terminal `Successful` transition is
+    // written LAST. A non-successful final status (`Degraded` /
+    // `PendingCommit` demoted by the fleet-commit step) is a plain
+    // transition append; it produces no snapshot entry.
+    let mut message = format!("push status: {commit_status:?}");
+    if commit_status == DeploymentStatus::Successful {
+        let idx = history::finalize_successful_attempt(store, &attempt, "push completed")?;
+        message = format!("push successful; fleet ref {}@f{idx}", target_name);
+    } else {
+        store.append_transition(deployment_id.as_str(), &commit_status, commit_reason)?;
+    }
 
     // Refresh observed state. Observed maps are keyed by placement slot (the
     // deployment-location identity); the per-server record (`servers/<id>.json`)
@@ -920,14 +934,6 @@ fn push_inner(
         })?;
     }
     store.write_observed(target_name, &observed)?;
-
-    // 16. Advance the snapshot log only for successful fleet deployments.
-    let mut message = format!("push status: {commit_status:?}");
-    if commit_status == DeploymentStatus::Successful {
-        let idx =
-            history::append_snapshot(store, &TargetName::new(target_name.to_string()), &attempt)?;
-        message = format!("push successful; fleet ref {}@f{idx}", target_name);
-    }
 
     // 17. Per-slot rotation under each slot's mutation lock. Rotation uses
     // the slot's ACTUAL final assignment (read after any compensation), not
@@ -986,14 +992,17 @@ fn push_inner(
 /// 3. If everything matches, write the missing markers under each server's
 ///    mutation lock (idempotent: already-written markers are a byte-for-byte
 ///    no-op) using the attempt's ORIGINAL deployment ID, then finalize
-///    REPLAY-SAFELY: first the idempotent durable steps (ensure the snapshot
-///    entry exists and repair `refs/last-successful` via
-///    [`history::ensure_snapshot`]), and the final `Successful` transition
-///    LAST. The latest transition is the eligibility gate for recovery: as
-///    long as it still says `PendingCommit`, any crash or error mid-
-///    finalization leaves the attempt eligible and the next push replays
-///    exactly the remaining steps; once it says `Successful`, every earlier
-///    step is already durable, so nothing is lost.
+///    REPLAY-SAFELY through the SAME shared finalizer as the main success
+///    path ([`history::finalize_successful_attempt`]): the recoverable
+///    `PendingCommit` marker step is a no-op here (the latest transition is
+///    already `PendingCommit`), then the idempotent snapshot entry +
+///    `refs/last-successful` repair ([`history::ensure_snapshot`]), and the
+///    final `Successful` transition LAST. The latest transition is the
+///    eligibility gate for recovery: as long as it still says
+///    `PendingCommit`, any crash or error mid-finalization leaves the attempt
+///    eligible and the next push replays exactly the remaining steps; once it
+///    says `Successful`, every earlier step is already durable, so nothing is
+///    lost.
 /// 4. A confirmed membership/generation mismatch finalizes the attempt as
 ///    `Degraded` (no snapshot entry). An existing marker whose content differs
 ///    from the deterministic payload is an integrity conflict — a concurrent
@@ -1170,23 +1179,20 @@ fn reconcile_pending_commits(
             continue;
         }
 
-        // 4. Finalize REPLAY-SAFELY: the idempotent durable steps run FIRST
-        // and the final `Successful` transition is appended LAST. The latest
-        // transition is the eligibility gate for recovery, so a crash or
-        // error at ANY of these steps leaves the attempt `PendingCommit` and
-        // the next push replays exactly the remaining steps; once the
-        // transition says `Successful`, every earlier step is already
-        // durable. The snapshot insert is idempotent by deployment ID
-        // ([`history::ensure_snapshot`] never appends a second entry for the
-        // same deployment) and also repairs a stale `refs/last-successful`.
-        // The append-only attempts.jsonl record is untouched (still the
-        // original deployment ID, no status field).
-        history::ensure_snapshot(store, &attempt.target, &attempt)?;
-        store.append_transition(
-            attempt.deployment_id.as_str(),
-            &DeploymentStatus::Successful,
-            Some("recovery finalization"),
-        )?;
+        // 4. Finalize REPLAY-SAFELY through the SAME shared finalizer as the
+        //    main success path ([`history::finalize_successful_attempt`]):
+        //    the recoverable `PendingCommit` marker step is a no-op here (the
+        //    attempt's latest transition is already `PendingCommit` — the
+        //    eligibility gate for recovery), then the idempotent snapshot
+        //    insert + `refs/last-successful` repair
+        //    ([`history::ensure_snapshot`] never appends a second entry for
+        //    the same deployment), and the terminal `Successful` transition
+        //    LAST. A crash or error at ANY of these steps leaves the attempt
+        //    `PendingCommit` and the next push replays exactly the remaining
+        //    steps; once the transition says `Successful`, every earlier step
+        //    is already durable. The append-only attempts.jsonl record is
+        //    untouched (still the original deployment ID, no status field).
+        history::finalize_successful_attempt(store, &attempt, "recovery finalized")?;
     }
     Ok(())
 }
@@ -3026,6 +3032,216 @@ slots = ["p1"]
             h.store.read_attempts("t1").unwrap().len(),
             1,
             "no new attempt may be recorded by the replays"
+        );
+    }
+
+    // ---- Main-path replay-safe finalization ------------------------------
+    //
+    // The NORMAL success path finalizes through the SAME replay-safe
+    // finalizer as recovery (`history::finalize_successful_attempt`):
+    // recoverable `PendingCommit` marker -> idempotent snapshot +
+    // `refs/last-successful` -> terminal `Successful` transition LAST. These
+    // tests fault a normal push's finalization once at each persistence step
+    // and prove the recoverable window (the attempt's latest transition is
+    // `PendingCommit`, never a prematurely-written `Successful`) plus
+    // exactly-once replay on a clean follow-up push.
+    //
+    // `push()` mints the deployment id internally, so the faulted push drives
+    // `push_inner` DIRECTLY with a fixed id (the test module is inside
+    // `engine.rs`, so it can): the one-shot `arm_*` faults stay keyed by
+    // deployment id exactly like the recovery tests — deterministic under
+    // parallel `cargo test`.
+
+    /// A normal single-server push with a caller-supplied deployment id over
+    /// healthy `LocalTransport` remotes (no injected remote faults). Drives
+    /// the FULL normal success path (`push_inner`) so a test can arm store
+    /// faults keyed by the fixed deployment id BEFORE the push runs.
+    fn push_main_with_id(h: &RecoveryHarness, deployment_id: &DeploymentId) -> Result<PushReport> {
+        let project_root = h.config.project_root(&h.cfg_path);
+        let target = h
+            .config
+            .targets
+            .get("t1")
+            .expect("harness configures target t1");
+        let op_id = OperationId::new(format!("op-{}", deployment_id.as_str()));
+        let rf = h.remotes_base.clone();
+        let factory = move |s: &crate::config::ServerDef,
+                            _slot: &crate::config::SlotDef|
+              -> Result<Box<dyn Remote>> {
+            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        };
+        push_inner(
+            &project_root,
+            &h.store,
+            &factory,
+            "t1",
+            &PushRef::Head,
+            deployment_id,
+            &op_id,
+            &h.config,
+            target,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+    }
+
+    /// The single attempt recorded for target `t1`.
+    fn single_attempt(h: &RecoveryHarness) -> DeploymentAttempt {
+        let mut attempts = h.store.read_attempts("t1").unwrap();
+        assert_eq!(attempts.len(), 1, "exactly one attempt recorded");
+        attempts.remove(0)
+    }
+
+    #[test]
+    fn main_path_replays_after_snapshot_append_failure() {
+        let h = RecoveryHarness::new();
+        let id = DeploymentId::new("deploy-main-snapshot-fault".to_string());
+
+        // Push 1: a NORMAL push whose finalization is faulted at its first
+        // persistence step — the snapshot append fails once. The finalizer
+        // already persisted the recoverable `PendingCommit` marker, so the
+        // attempt is left in the crash window: latest transition
+        // `PendingCommit` (never `Successful`), no snapshot entry, no
+        // `refs/last-successful`.
+        crate::store::local::test_faults::arm_append_snapshot(id.as_str());
+        let err = push_main_with_id(&h, &id)
+            .err()
+            .expect("push must abort when the snapshot append fails");
+        assert!(
+            err.to_string().contains("append_snapshot"),
+            "error must name the injected fault, got: {err}"
+        );
+        assert!(
+            h.store.read_snapshots("t1").unwrap().is_empty(),
+            "no snapshot after the failed snapshot append"
+        );
+        assert!(h.store.read_last_successful("t1").is_none());
+        assert_eq!(
+            latest_status(&h, id.as_str()),
+            DeploymentStatus::PendingCommit,
+            "crash window must leave the attempt PendingCommit, not Successful"
+        );
+
+        // Push 2: a clean push reconciles the pending attempt (servers are
+        // already at the desired generation) and completes finalization
+        // exactly once: one snapshot entry, `refs/last-successful` pointing
+        // at it, latest transition `Successful`, marker present.
+        let r2 = push_clean(&h).unwrap();
+        assert_eq!(r2.status, None, "the replaying push is an up-to-date no-op");
+        assert_eq!(r2.message, "Everything up to date");
+        assert_eq!(
+            h.store.read_attempts("t1").unwrap().len(),
+            1,
+            "the replay must not record a new attempt"
+        );
+        assert_finalized(&h, &single_attempt(&h));
+    }
+
+    #[test]
+    fn main_path_replays_after_last_successful_failure() {
+        let h = RecoveryHarness::new();
+        let id = DeploymentId::new("deploy-main-last-successful-fault".to_string());
+
+        // First: the snapshot append succeeds but `refs/last-successful`
+        // (the second persistence step) fails once -> Err; the snapshot
+        // entry exists but the ref is stale and the attempt stays
+        // `PendingCommit`.
+        crate::store::local::test_faults::arm_write_last_successful(id.as_str());
+        let err = push_main_with_id(&h, &id)
+            .err()
+            .expect("push must abort when the last-successful write fails");
+        assert!(
+            err.to_string().contains("write_last_successful"),
+            "error must name the injected fault, got: {err}"
+        );
+        let snapshots = h.store.read_snapshots("t1").unwrap();
+        assert_eq!(snapshots.len(), 1, "snapshot was appended before the crash");
+        assert_eq!(snapshots[0].deployment_id, id);
+        assert!(h.store.read_last_successful("t1").is_none());
+        assert_eq!(
+            latest_status(&h, id.as_str()),
+            DeploymentStatus::PendingCommit,
+            "crash window must leave the attempt PendingCommit, not Successful"
+        );
+
+        // Push 2: the idempotent ensure must NOT append a second entry; it
+        // repairs `refs/last-successful` and finishes. Exactly one entry
+        // remains.
+        let r2 = push_clean(&h).unwrap();
+        assert_eq!(r2.status, None, "the replaying push is an up-to-date no-op");
+        assert_finalized(&h, &single_attempt(&h));
+    }
+
+    #[test]
+    fn main_path_replays_after_transition_append_failure() {
+        let h = RecoveryHarness::new();
+        let id = DeploymentId::from("deploy-main-transition-fault".to_string());
+
+        // First: the snapshot and `refs/last-successful` are durable but the
+        // final `Successful` transition append fails -> Err. The fault is
+        // armed for the TERMINAL transition only
+        // (`arm_append_transition_successful`), so the recoverable
+        // `PendingCommit` marker append passes through; the attempt stays
+        // `PendingCommit` and remains eligible.
+        crate::store::local::test_faults::arm_append_transition_successful(id.as_str());
+        let err = push_main_with_id(&h, &id)
+            .err()
+            .expect("push must abort when the final transition append fails");
+        assert!(
+            err.to_string().contains("append_transition"),
+            "error must name the injected fault, got: {err}"
+        );
+        let snapshots = h.store.read_snapshots("t1").unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            h.store.read_last_successful("t1").as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(
+            latest_status(&h, id.as_str()),
+            DeploymentStatus::PendingCommit,
+            "crash window must leave the attempt PendingCommit, not Successful"
+        );
+
+        // Push 2: the replay completes the final transition append; the
+        // ensure is a no-op and no duplicate entry is created.
+        let r2 = push_clean(&h).unwrap();
+        assert_eq!(r2.status, None, "the replaying push is an up-to-date no-op");
+        assert_finalized(&h, &single_attempt(&h));
+    }
+
+    #[test]
+    fn main_path_finalize_is_replay_safe_and_idempotent() {
+        let h = RecoveryHarness::new();
+        let id = DeploymentId::from("deploy-main-plain".to_string());
+
+        // First: a normal push completes finalization fully (no faults):
+        // the attempt is `Successful`, one snapshot entry, the ref set.
+        let r1 = push_main_with_id(&h, &id).unwrap();
+        assert_eq!(
+            r1.status,
+            Some(DeploymentStatus::Successful),
+            "clean push must finalize Successful"
+        );
+        assert!(
+            r1.message.contains("fleet ref t1@f0"),
+            "message must carry the fleet ref, got: {}",
+            r1.message
+        );
+        assert_finalized(&h, &single_attempt(&h));
+
+        // Push 2: a further push sees everything up to date; reconciliation
+        // skips the finalized attempt and no duplicate snapshot appears.
+        let r2 = push_clean(&h).unwrap();
+        assert_eq!(r2.status, None);
+        assert_eq!(r2.message, "Everything up to date");
+        assert_finalized(&h, &single_attempt(&h));
+        assert_eq!(
+            h.store.read_attempts("t1").unwrap().len(),
+            1,
+            "no new attempt may be recorded by the no-op push"
         );
     }
 }

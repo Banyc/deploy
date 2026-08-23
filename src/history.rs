@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::model::{
     GenerationRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, TargetName,
 };
-use crate::records::{DeploymentAttempt, DeploymentSnapshot};
+use crate::records::{DeploymentAttempt, DeploymentSnapshot, DeploymentStatus};
 use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
 
@@ -123,14 +123,72 @@ pub fn ensure_snapshot(
 /// Idempotent by deployment ID: delegates to
 /// [`ensure_snapshot`], so re-running finalization for the same
 /// attempt never duplicates the snapshot and always repairs
-/// `refs/last-successful`. Kept as the historical name so existing call sites
-/// (and the main success path) read naturally.
+/// `refs/last-successful`. Kept as the historical name; the main success
+/// path now finalizes through the shared
+/// [`finalize_successful_attempt`], which calls this.
 pub fn append_snapshot(
     store: &LocalStore,
     target: &TargetName,
     attempt: &DeploymentAttempt,
 ) -> Result<u64> {
     ensure_snapshot(store, target, attempt)
+}
+
+/// Finalize a successful fleet attempt replay-safely: the single shared
+/// terminal path used by BOTH the normal push success path and pending-commit
+/// recovery ([`crate::push::engine::reconcile_pending_commits`]).
+///
+/// Persistence order:
+/// 1. RECOVERABLE MARKER: ensure the attempt's LATEST transition is
+///    `PendingCommit`, appending a `PendingCommit` transition (reason
+///    "finalization started") only when the latest is not already
+///    `PendingCommit`. The latest transition is reconciliation's eligibility
+///    gate, so a crash at any later point leaves the attempt re-eligible and
+///    the next push replays exactly the remaining steps. On the main path the
+///    attempt's latest is `InProgress` here (this appends `PendingCommit`);
+///    in recovery it is already `PendingCommit` (a no-op).
+/// 2. SNAPSHOT + REF: [`ensure_snapshot`] — idempotent by deployment ID (a
+///    replay never appends a second entry) and (re)writes
+///    `refs/last-successful`, repairing a stale ref left by a crash between
+///    the snapshot append and the ref update.
+/// 3. STATUS LAST: append the terminal `Successful` transition with `reason`
+///    only after every durable step, so the attempt is never recorded
+///    `Successful` while its fleet snapshot is missing.
+///
+/// Replay idempotency: step 1 is skipped when the latest transition is
+/// already `PendingCommit`; step 2 is a no-op (or ref repair) when the
+/// snapshot entry already exists; step 3 appends exactly once — a crash
+/// before it leaves the attempt eligible, and a crash after it means every
+/// earlier step is already durable (and the eligibility gate skips the
+/// attempt forever once the latest transition says `Successful`).
+///
+/// Returns the attempt's snapshot index.
+pub fn finalize_successful_attempt(
+    store: &LocalStore,
+    attempt: &DeploymentAttempt,
+    reason: &str,
+) -> Result<u64> {
+    let id = attempt.deployment_id.as_str();
+    // Already fully finalized (the eligibility gate normally prevents this):
+    // every earlier step is durable by construction; only repair a stale
+    // `refs/last-successful` and stop without appending anything.
+    if store.latest_status(id)? == Some(DeploymentStatus::Successful) {
+        return ensure_snapshot(store, &attempt.target, attempt);
+    }
+    // 1. Recoverable marker: the attempt must be re-eligible if we crash
+    //    before the snapshot lands.
+    if store.latest_status(id)? != Some(DeploymentStatus::PendingCommit) {
+        store.append_transition(
+            id,
+            &DeploymentStatus::PendingCommit,
+            Some("finalization started"),
+        )?;
+    }
+    // 2. Snapshot entry + `refs/last-successful` (idempotent).
+    let idx = ensure_snapshot(store, &attempt.target, attempt)?;
+    // 3. Terminal status LAST.
+    store.append_transition(id, &DeploymentStatus::Successful, Some(reason))?;
+    Ok(idx)
 }
 
 /// Build a snapshot entry from a successful attempt. A successful fleet snapshot

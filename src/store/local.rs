@@ -545,6 +545,14 @@ impl LocalStore {
                 "test fault: append_transition forced to fail once",
             ));
         }
+        #[cfg(test)]
+        if status == &DeploymentStatus::Successful
+            && test_faults::consume(&test_faults::FAIL_APPEND_TRANSITION_SUCCESSFUL, id)
+        {
+            return Err(Error::store(
+                "test fault: append_transition(Successful) forced to fail once",
+            ));
+        }
         let dir = self.deployment_dir(id);
         ensure_private_dir(&dir)?;
         let p = dir.join("transitions.jsonl");
@@ -632,6 +640,17 @@ pub(crate) mod test_faults {
         arm(&FAIL_APPEND_TRANSITION, deployment_id);
     }
 
+    /// Arm the next `append_transition` call recording a `Successful` status
+    /// for `deployment_id` to fail once. The replay-safe finalizer
+    /// ([`crate::history::finalize_successful_attempt`]) writes the
+    /// recoverable `PendingCommit` marker FIRST and the terminal `Successful`
+    /// transition LAST, so faulting the terminal transition (rather than the
+    /// earlier marker) requires qualifying on the recorded status: the
+    /// `PendingCommit` marker append passes through untouched.
+    pub(crate) fn arm_append_transition_successful(deployment_id: &str) {
+        arm(&FAIL_APPEND_TRANSITION_SUCCESSFUL, deployment_id);
+    }
+
     /// Consume the one-shot fault for `deployment_id` if armed. Returns `true`
     /// when the fault fired (and is now disarmed).
     pub(crate) fn consume(fault: &Mutex<Option<String>>, deployment_id: &str) -> bool {
@@ -647,6 +666,7 @@ pub(crate) mod test_faults {
     pub(crate) static FAIL_APPEND_SNAPSHOT: Mutex<Option<String>> = Mutex::new(None);
     pub(crate) static FAIL_WRITE_LAST_SUCCESSFUL: Mutex<Option<String>> = Mutex::new(None);
     pub(crate) static FAIL_APPEND_TRANSITION: Mutex<Option<String>> = Mutex::new(None);
+    pub(crate) static FAIL_APPEND_TRANSITION_SUCCESSFUL: Mutex<Option<String>> = Mutex::new(None);
 }
 
 /// Sanitize a name for use as a directory/file component.
