@@ -458,6 +458,8 @@ impl Config {
         // Pods bind one declared server to one declared variant, under a unique
         // ID.
         let mut pod_by_id = std::collections::BTreeMap::new();
+        let mut bound_locations: std::collections::BTreeMap<(&str, &Path), &str> =
+            std::collections::BTreeMap::new();
         for p in &self.pods {
             if pod_by_id.insert(p.id.clone(), p).is_some() {
                 return Err(Error::config(format!(
@@ -483,6 +485,18 @@ impl Config {
                     p.id
                 )));
             }
+            // A (server, deploy_dir) pair names one on-server deployment
+            // location: its objects, releases, generations, and `current`. Two
+            // pods bound there would race over the same state.
+            if let Some(existing) =
+                bound_locations.get(&(p.server.as_str(), p.deploy_dir.as_path()))
+            {
+                return Err(Error::config(format!(
+                    "pods '{existing}' and '{}' bind the same location (server '{}', deploy_dir '{}'); each server+deploy_dir pair must belong to exactly one pod",
+                    p.id, p.server, p.deploy_dir.display()
+                )));
+            }
+            bound_locations.insert((p.server.as_str(), p.deploy_dir.as_path()), &p.id);
         }
 
         for (tname, target) in &self.targets {
@@ -1125,6 +1139,39 @@ pods = ["p1"]
             err.to_string().contains("references unknown variant 'ghost'"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn pods_on_the_same_server_never_share_a_deploy_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        let p = project.join("deploy.toml");
+
+        // Second pod, same server, SAME deploy_dir: rejected.
+        let dup = "\n[[pods]]\nid = \"p2\"\nserver = \"s1\"\nvariant = \"standard\"\ndeploy_dir = \"/srv/forced\"\n\n[targets.t1]";
+        std::fs::write(
+            &p,
+            deploy_toml("v1").replace("\n[targets.t1]", dup),
+        )
+        .unwrap();
+        let err = Config::load(&p).expect_err("shared server+deploy_dir must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("same location") && msg.contains("p1") && msg.contains("p2"),
+            "error must name the colliding pods, got: {msg}"
+        );
+
+        // Second pod, same server, DIFFERENT deploy_dir: accepted.
+        let ok = "\n[[pods]]\nid = \"p2\"\nserver = \"s1\"\nvariant = \"standard\"\ndeploy_dir = \"/srv/other\"\n\n[targets.t1]";
+        std::fs::write(
+            &p,
+            deploy_toml("v1").replace("\n[targets.t1]", ok),
+        )
+        .unwrap();
+        let cfg = Config::load(&p).expect("distinct deploy_dir on the same server is valid");
+        assert_eq!(cfg.pods.len(), 2);
     }
 
     #[test]
