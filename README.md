@@ -8,9 +8,14 @@ deploy push production
 
 Configure a named target once, then push your local files to every server in
 that target with one command. Each server gets an immutable release stored
-under each pod's `deploy_dir`, activation is atomic per server (an atomically swapped
-`current` symlink), verification runs after activation, and old artifacts are
-rotated automatically.
+under each pod's `deploy_dir`, activation is atomic per server (an atomically
+swapped `current` symlink), verification runs after activation, and old
+artifacts are rotated automatically.
+
+> The command line is the authoritative documentation. `deploy --help`,
+> `deploy help <command>`, and `deploy <command> --help` teach the project
+> structure, every flag, and copy-paste-runnable examples. This file is the
+> quick orientation; `requirement.md` has the full design.
 
 ## Install
 
@@ -20,249 +25,191 @@ Requires [Rust](https://rustup.rs). Build and install from this repository:
 cargo install --path .
 ```
 
-## Quick start
+## Quick start: `deploy init`
 
-Your project needs a `deploy.toml` plus a release directory containing the
-variant files and the artifact sources they map:
+Scaffold a fresh, immediately-pushable project:
+
+```sh
+deploy init my-app
+cd my-app
+```
+
+`deploy init` is **local-first**: the server address defaults to
+`local://<project>/.deploy-remote`, a local filesystem endpoint, so
+`deploy push production` works end-to-end with nothing but this binary — no
+SSH, no server, no provisioning. It never clobbers: re-running against a
+project that already has `deploy.toml` (or a `releases/` tree) fails.
+
+What it generates (also visible in `deploy init --help`):
 
 ```text
-my-project/
-  deploy.toml
-  releases/
-    v1/
-      standard.toml        # the "standard" variant: mappings + policies
-      artifacts/
-        build/output/app/server
-```
-
-`deploy.toml` names the active release, declares every server once at the top
-level, binds each server to a variant with a pod, and groups pods into targets
-by ID:
-
-```toml
-schema_version = 1
-application = "example"
-
-# The active release. The project structure is forced: the release directory
-# is `releases/<name>/`, and every `*.toml` file inside it is a variant
-# (e.g. `standard`); artifact sources live beneath its `artifacts/` tree.
-release = "v1"
-
-# Servers are declared once; a pod binds one server to one variant, and
-# targets reference pods by ID.
-[[servers]]
-id = "server-01"            # durable ID; never rename it
-address = "server-01.example.com"
-user = "deploy"
-
-[[servers]]
-id = "server-02"
-address = "server-02.example.com"
-user = "deploy"
-
-[[pods]]
-id = "app-1"
-server = "server-01"
-variant = "standard"
-deploy_dir = "/srv/deploy/example"
-
-[[pods]]
-id = "app-2"
-server = "server-02"
-variant = "standard"
-deploy_dir = "/srv/deploy/example"
-
-[targets.production]
-rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-pods = ["app-1", "app-2"]
-
-# Retention belongs to the target: how aggressively its servers rotate.
-[targets.production.rotation.per_server]
-keep_distinct_artifacts = 5   # keep the newest 5 distinct artifacts per server
-keep_days = 14                # ...and everything activated in the last 14 days
-protect_previous = true       # never delete the artifact `current` can roll back to
-
-[targets.production.rotation.fleet]
-protect_deployments = 2       # keep each server's artifacts of the newest 2 successful deployments
-```
-
-Each variant is a `*.toml` file directly inside the release directory, named by
-its file stem. It owns its artifact mappings and deployment policies
-(activation, verification, capacity); retention (`rotation`) belongs to each
-target. `from` paths resolve inside the release
-directory, so artifact sources live under `releases/v1/artifacts/`:
-
-```toml
-# The `standard` variant: its artifact mappings plus deployment policies.
-# `from` paths resolve inside the release directory (`releases/<name>/` — the
-# project structure is forced), so artifact sources live under
-# `releases/v1/artifacts/`. Rotation is not a variant setting: it belongs to
-# the target.
-description = "Standard deployment"
-
-[[artifact.mappings]]
-from = "artifacts/build/output/"
-to = "app/"
-recursive = true
-
-[activation]
-adapter = "none"          # or: systemd (scope = "user")
-
-[verification]
-adapter = "command"
-argv = ["/srv/deploy/example/current/app/server", "health-check"]
-timeout_seconds = 15
-attempts = 3
-interval_seconds = 2
-
-[capacity]
-reserve_bytes = 1073741824   # keep at least 1 GiB free on servers
-reserve_percent = 0
+my-app/
+  deploy.toml                          # schema v1: one server, one pod, target `production`
+  releases/v1/standard.toml            # the `standard` variant (mappings + policies)
+  releases/v1/artifacts/build/output/app/hello   # placeholder artifact source
+  .deploy-remote/                      # local deployment endpoint (git-ignored)
 ```
 
 Then deploy:
 
 ```sh
-deploy push production
+deploy push production --dry-run   # preview the plan; touches nothing
+deploy push production             # deploy (status: Successful, ref production@f0)
+deploy status production           # what is actually running on each server
+deploy log production              # deployment history
 ```
 
-To cut a new release, copy the release directory (e.g. `releases/v2`), set
-`release = "v2"` in `deploy.toml`, and edit its variant files.
+To deploy to a real server instead of the local endpoint, either pass flags at
+scaffold time:
+
+```sh
+deploy init my-app \
+  --address app.example.com --user deploy \
+  --host-key-fingerprint SHA256:...          # or --known-hosts /etc/ssh/known_hosts
+```
+
+or edit `deploy.toml` afterwards (it is annotated with exactly what to change).
+SSH always uses strict host-key checking — trust-on-first-use is refused, and
+`known_hosts` must be an absolute path.
 
 ## Commands
 
-### `deploy push <target> [reference]`
+| Command | What it does |
+| --- | --- |
+| `deploy init [PATH]` | Scaffold a fresh project (see above). |
+| `deploy push <target> [ref]` | Deploy local files (or restore a ref) to every server in the target, in rollout batches. |
+| `deploy log <target>` | Deployment history — successful *and* failed attempts. |
+| `deploy status <target>` | What is actually running on each server right now (generation, release, variant, tree). |
 
-Deploy to a target. Without a reference it deploys the currently mapped local
-files (`HEAD`). Pushing identical content prints `Everything up to date`.
+Global flag: `--config <path>` selects a different `deploy.toml` than
+`./deploy.toml` (usable anywhere on the command line).
 
-Useful flags and references:
+### Push and rollback references
 
 ```sh
-deploy push production --dry-run                 # show what would change, touch nothing
-deploy push production production@f1             # roll back to the 2nd-to-last successful deployment
+deploy push production --dry-run                 # preview; touches nothing
+deploy push production                           # HEAD: the local files
+deploy push production production@f1             # roll back to the 2nd successful deployment
 deploy push production release/rel-41da2f63      # deploy a specific retained release
+deploy push production release/rel-41da2f63:current   # same, but keep each server's configured variant
 ```
 
-Rollout is batched per `rollout.batch_size`. If activation or verification
-fails on a server, earlier batches are rolled back by default
-(`failure_policy: rollback_changed`); failed attempts never advance
-`refs/last-successful`. The final status is reported explicitly — including
-partial states like `degraded` — with the actual generation on every server.
+- `<target>@fN` refers to the Nth *successful* fleet snapshot; failed and
+  degraded attempts never advance the rollback ref and cannot be rolled back
+  to (`deploy log` still shows them).
+- Pushing identical content prints `Everything up to date`.
+- Rollout is batched per `rollout.batch_size`; on a failed server, earlier
+  batches roll back by default (`failure_policy: rollback_changed`). The final
+  status is reported explicitly, including partial states like `degraded`.
 
-### `deploy log <target>`
-
-Show the target's deployment history (successful *and* failed attempts).
-
-### `deploy status <target>`
-
-Show what is actually running on each server right now: generation, release,
-variant, and tree digest.
-
-Global flag: `--config <path>` to use a different config file than
-`./deploy.toml`.
-
-## How mappings work
-
-Each variant file maps local files into the artifact tree:
-
-```toml
-# inside releases/v1/standard.toml
-[[artifact.mappings]]
-from = "artifacts/build/output/"          # relative to the release directory
-to = "app/"
-recursive = true
-conflict = "replace"                        # "error" | "replace" | "keep"
-mode = "0755"                               # optional explicit mode
-```
-
-- Mappings apply in declaration order; collisions fail unless you set
-  `conflict`.
-- `{{ variant }}` is the only template variable, so all servers assigned the
-  same variant always receive identical content.
-- `from` paths resolve inside the release directory (`artifacts/` is the
-  convention); absolute paths and `..` escapes are rejected.
-
-## Variants
-
-Every `*.toml` file directly inside the release directory is a variant named by
-its file stem — declaring a variant is adding a file. Assign one per server. A
-typical use is a different build flavor for beefier machines:
+## Project structure (forced)
 
 ```text
-releases/
-  v1/
-    standard.toml
-    high-capacity.toml
+deploy.toml                    # names the active release, servers, pods, targets
+releases/<name>/              # the release directory named by `release:`
+releases/<name>/<variant>.toml  # every *.toml file here is a variant (file stem = name)
+releases/<name>/artifacts/    # artifact sources referenced by variant mappings
 ```
 
+- A **release** is a directory under `releases/`. `deploy.toml` names the
+  active one with `release: <name>`.
+- A **variant** is a `*.toml` file directly inside the release directory,
+  named by its file stem. It owns its artifact mappings and deployment
+  policies (activation, verification, capacity).
+- A **pod** binds one server to one variant under an ID and names the
+  absolute `deploy_dir` on the server. A **target** groups pods (in rollout
+  order) and carries the rollout and rotation policy.
+- Retention (`rotation`) belongs to the target, not the variant.
+
+## Config reference (condensed)
+
 ```toml
-# deploy.toml — a pod binds one server to one variant
-[[servers]]
-id = "server-01"
-address = "..."
+schema_version = 1
+application = "my-app"
+release = "v1"               # active release dir under releases/
 
-[[servers]]
-id = "server-03"
-address = "..."
+[[servers]]                  # declared once; pods reference by id
+id = "server-01"             # durable ID; never rename it
+address = "local:///abs/path"   # or a hostname for SSH
+user = "deploy"
+# port = 22
+# known_hosts = "/etc/ssh/known_hosts"   # absolute path
+# host_key_fingerprint = "SHA256:..."
 
-[[pods]]
+[[pods]]                     # one server + one variant under an id
 id = "app-1"
 server = "server-01"
 variant = "standard"
+deploy_dir = "/srv/deploy/my-app"   # absolute path on the server
 
-[[pods]]
-id = "hc-1"
-server = "server-03"
-variant = "high-capacity"
+[targets.production]         # targets group pods and set policy
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+pods = ["app-1"]
 
-# the target groups pods by ID and sets the rollout policy
-[targets.production]
-rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "rollback_changed" }
-pods = ["app-1", "hc-1"]
+[targets.production.rotation.per_server]   # retention is per target
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
 ```
 
-A pod can be a member of several targets. Two pods may share one server in
-different targets, but within a single target each server appears at most once
-(one running generation per server).
-
-Each variant file has the same shape as `standard.toml` in the Quick start —
-its own mappings, activation, verification, and capacity. Retention
-(`rotation`) belongs to the target: each target declares how aggressively its
-own servers rotate, so a canary target can retain more than production.
-
-## systemd support
-
-Set `adapter: systemd` with `scope: user` in the variant file to have pushes
-register, enable, and restart unit files that you map into the artifact (e.g.
-`integration/systemd/example.service`):
+A variant file (`releases/<release>/<name>.toml`) is a mapping plus policy:
 
 ```toml
-# inside releases/v1/standard.toml
-[activation]
-adapter = "systemd"
-scope = "user"
-reconcile_managed_units = true
+description = "Standard deployment"
 
-[[activation.units]]
-name = "example.service"
-artifact_path = "integration/systemd/example.service"
-enable = true
-restart = true
+[[artifact.mappings]]
+from = "artifacts/build/output/"   # relative to the release directory
+to = "app/"
+recursive = true
+# conflict = "error" | "replace" | "keep"     (default "error")
+# mode = "0755"                              (or "preserve")
+
+[activation]
+adapter = "none"                # or: "systemd" (scope = "user")
+
+[verification]
+adapter = "command"
+argv = ["true"]                 # replace with a real health-check
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+
+[capacity]                      # capacity headroom, zero by default
+reserve_bytes = 0
+reserve_percent = 0
 ```
 
-On rollback the previous generation's units are restored and verified.
+Validation is strict: `deploy_dir` and `known_hosts` must be absolute paths,
+server/pod IDs must be unique, targets must reference declared pods, and each
+pod's variant must exist. A config that fails validation is rejected at load
+time, before anything is touched.
 
-## Requirements on servers
+## Maintenance
 
-- SSH access as the configured `user` (strict host-key checking is used).
+- **Add a variant**: add `releases/<release>/<new-name>.toml` and bind a pod
+  to it (`variant = "<new-name>"`).
+- **Add a server**: add a `[[servers]]` entry, a `[[pods]]` entry binding it to
+  a variant and absolute `deploy_dir`, and add the pod ID to the target(s).
+- **Cut a release**: copy the release directory (e.g. `releases/v1` →
+  `releases/v2`), edit the variant files (new mappings, verification, etc.),
+  and set `release = "v2"` in `deploy.toml`. Old releases stay deployable via
+  their `release/<id>` refs.
+- **Roll back**: `deploy push production production@fN` restores a historical
+  successful fleet snapshot; `deploy push production release/<id>` deploys a
+  retained release. Historical deployments restore their original behavior —
+  they never re-run today's verification or activation settings.
+- **Change rollout policy**: edit `[targets.<name>]` in `deploy.toml`; push.
+
+## Requirements on servers (SSH)
+
+- SSH access as the configured `user` with strict host-key checking.
 - The deployment account must be able to create each pod's `deploy_dir`
-  (e.g. `/srv/deploy/example`) — provision it once if not.
+  (e.g. `/srv/deploy/my-app`) — provision it once if not.
 
 ## Where things live locally
 
-State is kept under `~/.local/share/simple-deploy/<application>/`: immutable
-tree objects, release records, per-target history, and refs used for
-rollback. Treat anything you map into the artifact as confidential — it is
-retained in multiple versions locally and remotely. Prefer external secret
-references over mapping secret files into the artifact.
+State is kept under `~/.local/share/simple-deploy/<application>/` (or
+`$XDG_DATA_HOME`): immutable tree objects, release records, per-target history,
+and the refs used for rollback. Treat anything you map into the artifact as
+confidential — it is retained in multiple versions locally and remotely.
+Prefer external secret references over mapping secret files into the artifact.
