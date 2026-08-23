@@ -8,7 +8,7 @@ deploy push production
 
 Configure a named target once, then push your local files to every server in
 that target with one command. Each server gets an immutable release stored
-under `remote_root`, activation is atomic per server (an atomically swapped
+under each pod's `deploy_dir`, activation is atomic per server (an atomically swapped
 `current` symlink), verification runs after activation, and old artifacts are
 rotated automatically.
 
@@ -42,7 +42,6 @@ by ID:
 ```toml
 schema_version = 1
 application = "example"
-remote_root = "/srv/deploy/example"
 
 # The active release. The project structure is forced: the release directory
 # is `releases/<name>/`, and every `*.toml` file inside it is a variant
@@ -65,11 +64,13 @@ user = "deploy"
 id = "app-1"
 server = "server-01"
 variant = "standard"
+deploy_dir = "/srv/deploy/example"
 
 [[pods]]
 id = "app-2"
 server = "server-02"
 variant = "standard"
+deploy_dir = "/srv/deploy/example"
 
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
@@ -255,7 +256,7 @@ On rollback the previous generation's units are restored and verified.
 ## Requirements on servers
 
 - SSH access as the configured `user` (strict host-key checking is used).
-- The deployment account must be able to create `remote_root`
+- The deployment account must be able to create each pod's `deploy_dir`
   (e.g. `/srv/deploy/example`) — provision it once if not.
 
 ## Where things live locally

@@ -203,7 +203,6 @@ reserve_percent = 0
         let deploy_toml = r#"
 schema_version = 1
 application = "rot"
-remote_root = "/srv"
 release = "v1"
 
 [targets.t1.rotation.per_server]
@@ -223,6 +222,7 @@ user = "u"
 id = "p1"
 server = "s1"
 variant = "standard"
+deploy_dir = "/srv"
 
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }

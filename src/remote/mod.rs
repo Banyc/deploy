@@ -4,19 +4,19 @@ pub mod helper;
 pub mod ssh;
 pub mod transport;
 
-use crate::config::{Config, ServerDef};
+use crate::config::ServerDef;
 use crate::error::{Error, Result};
 use crate::remote::transport::{LocalTransport, Remote};
 
 /// Build the remote handle for one server from the configuration.
 ///
 /// Production pushes use the SSH transport keyed by `ServerDef.address`,
-/// `ServerDef.user`, and `Config.remote_root` with strict host-key
+/// `ServerDef.user`, and the pod's absolute `deploy_dir`, with strict host-key
 /// verification. The local transport is reserved for tests and for servers whose
 /// `address` is an explicit `local://` path, which routes the transport to that
 /// exact filesystem location (an explicit local endpoint) rather than the
 /// application store's `remotes/` directory.
-pub fn create_remote(server: &ServerDef, config: &Config) -> Result<Box<dyn Remote>> {
+pub fn create_remote(server: &ServerDef, deploy_dir: &std::path::Path) -> Result<Box<dyn Remote>> {
     if let Some(local_path) = server.address.strip_prefix("local://") {
         let p = std::path::PathBuf::from(local_path);
         if p.is_relative() {
@@ -31,7 +31,7 @@ pub fn create_remote(server: &ServerDef, config: &Config) -> Result<Box<dyn Remo
         &server.user,
         &server.address,
         server.port,
-        &config.remote_root,
+        deploy_dir,
         server.known_hosts.as_deref(),
         server.host_key_fingerprint.as_deref(),
     )?))

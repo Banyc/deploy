@@ -40,7 +40,7 @@ pub fn config_home() -> PathBuf {
 }
 
 /// Where user-scope unit links live: `<config_home>/systemd/user/<unit>`.
-pub fn user_unit_link(_remote_root: &Path, unit: &str) -> PathBuf {
+pub fn user_unit_link(_deploy_dir: &Path, unit: &str) -> PathBuf {
     user_unit_link_for(&config_home(), unit)
 }
 
@@ -115,7 +115,7 @@ fn validate_unit_name(name: &str) -> Result<()> {
 /// [`resolve_remote_config_home`]); unit links are placed under it so the path
 /// is correct on the remote host rather than reflecting the controller's env.
 pub fn activation_commands(
-    _remote_root: &Path,
+    _deploy_dir: &Path,
     generation_root: &Path,
     config_home: &Path,
     cfg: &ActivationConfig,
@@ -210,7 +210,7 @@ pub fn validate_artifact_paths(
 /// managed unit links.
 pub fn run_activation(
     remote: &dyn Remote,
-    remote_root: &Path,
+    deploy_dir: &Path,
     generation_root: &Path,
     cfg: &ActivationConfig,
 ) -> Result<()> {
@@ -226,7 +226,7 @@ pub fn run_activation(
     }
     // Resolve the unit directory base on the *remote* host, not the controller.
     let config_home = resolve_remote_config_home(remote)?;
-    let cmds = activation_commands(remote_root, generation_root, &config_home, cfg);
+    let cmds = activation_commands(deploy_dir, generation_root, &config_home, cfg);
     for argv in &cmds {
         let outcome = remote.exec(argv, Duration::from_secs(30))?;
         if !outcome.success() {

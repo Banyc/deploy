@@ -101,7 +101,6 @@ Example `deploy.toml`:
 ```toml
 schema_version = 1
 application = "example"
-remote_root = "/srv/deploy/example"
 release = "v1"              # the release directory is forced to releases/v1/
 
 [[pins]]
@@ -139,11 +138,13 @@ user = "deploy"
 id = "app-1"
 server = "server-01"
 variant = "standard"
+deploy_dir = "/srv/deploy/example"
 
 [[pods]]
 id = "app-2"
 server = "server-02"
 variant = "standard"
+deploy_dir = "/srv/deploy/example"
 
 [[pods]]
 id = "hc-1"
@@ -535,9 +536,9 @@ For a system service, an administrator installs a root-owned wrapper unit whose 
 ## Transport and remote helper
 The initial transport is SSH with strict host-key verification (per-server `known_hosts` or pinned `host_key_fingerprint`). An explicit `local://<absolute-path>` server address instead routes the transport to that exact filesystem endpoint; it exists for tests and for local targets. Server IDs, target names, variant names, release IDs, and paths are validated data and are never concatenated into remote shell commands. Bulk tree transfer uses SFTP or an equivalent framed channel.
 
-A small versioned remote helper owns status inspection, locking, object publication, generation switching, transaction recovery, adapter invocation, and rotation. Client and helper perform a protocol-version handshake before mutation (the negotiated version is recorded under `control/`; schema version 1 speaks protocol 1). Every mutating request carries an operation ID and is idempotent, so a disconnected client can reconnect and learn whether the operation prepared, committed, compensated, or never began. Packaging these operations as a single versioned helper binary uploaded beneath `remote_root` is the planned evolution; it does not change this contract.
+A small versioned remote helper owns status inspection, locking, object publication, generation switching, transaction recovery, adapter invocation, and rotation. Client and helper perform a protocol-version handshake before mutation (the negotiated version is recorded under `control/`; schema version 1 speaks protocol 1). Every mutating request carries an operation ID and is idempotent, so a disconnected client can reconnect and learn whether the operation prepared, committed, compensated, or never began. Packaging these operations as a single versioned helper binary uploaded beneath each pod's `deploy_dir` is the planned evolution; it does not change this contract.
 
-If the deployment account cannot create `remote_root`, an administrator must provision that directory once. Privileged systemd control must likewise be provisioned through the fixed, root-owned wrapper and narrowly scoped restart permission described above; `push` does not grant itself privileges.
+If the deployment account cannot create a pod's `deploy_dir`, an administrator must provision that directory once. Privileged systemd control must likewise be provisioned through the fixed, root-owned wrapper and narrowly scoped restart permission described above; `push` does not grant itself privileges.
 
 The remote application root and state are writable only by the deployment account. Artifact permissions may make selected files readable by the runtime service account, but state, incoming content, and manifests are not generally readable. Because the core cannot recognize secrets, users must understand that any sensitive bytes mapped into a tree will be retained in multiple local and remote versions. External credential references are preferred when versioned secret retention is undesirable.
 

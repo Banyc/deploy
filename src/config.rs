@@ -316,14 +316,17 @@ pub struct ServerDef {
 }
 
 /// Binds one server to one variant under an ID. The connection details live on
-/// the top-level `[[servers]]` entry; the workload choice lives here. Targets
-/// reference pods by ID.
+/// the top-level `[[servers]]` entry; the workload choice and its on-server
+/// location live here. Targets reference pods by ID.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PodDef {
     pub id: String,
     /// The ID of the top-level server this pod deploys onto.
     pub server: String,
     pub variant: String,
+    /// Absolute directory on the server where this pod's deployment state
+    /// (objects, releases, generations, `current`) lives.
+    pub deploy_dir: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -342,7 +345,6 @@ pub struct TargetDef {
 pub struct Config {
     pub schema_version: u32,
     pub application: String,
-    pub remote_root: PathBuf,
     /// The active release: the name of a directory directly beneath
     /// `releases/` in the project root (`release: v1` -> `releases/v1/`).
     pub release: ReleaseName,
@@ -473,6 +475,12 @@ impl Config {
                 return Err(Error::config(format!(
                     "pod '{}' references unknown variant '{}'",
                     p.id, p.variant
+                )));
+            }
+            if p.deploy_dir.is_relative() {
+                return Err(Error::config(format!(
+                    "pod '{}' deploy_dir must be an absolute path on the server",
+                    p.id
                 )));
             }
         }
@@ -748,7 +756,6 @@ reserve_percent = 0
         let deploy_toml = r#"
 schema_version = 1
 application = "esc"
-remote_root = "/srv/esc"
 release = "v1"
 
 [targets.t1.rotation.per_server]
@@ -768,6 +775,7 @@ user = "u"
 id = "p1"
 server = "s1"
 variant = "standard"
+deploy_dir = "/srv/esc"
 
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
@@ -841,7 +849,6 @@ reserve_percent = 5
         let deploy_toml = r#"
 schema_version = 1
 application = "example"
-remote_root = "/srv/example"
 release = "v1"
 
 [targets.t1.rotation.per_server]
@@ -861,6 +868,7 @@ user = "u"
 id = "p1"
 server = "s1"
 variant = "standard"
+deploy_dir = "/srv/example"
 
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
@@ -916,7 +924,6 @@ reserve_percent = 0
             r#"
 schema_version = 1
 application = "forced"
-remote_root = "/srv/forced"
 release = "{release_value}"
 
 [targets.t1.rotation.per_server]
@@ -936,6 +943,7 @@ user = "u"
 id = "p1"
 server = "s1"
 variant = "standard"
+deploy_dir = "/srv/forced"
 
 [targets.t1]
 rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
@@ -993,7 +1001,6 @@ pods = ["p1"]
         let legacy_toml = r#"
 schema_version = 1
 application = "legacy"
-remote_root = "/srv/legacy"
 release = { path = "releases/v1", variants = { standard = "standard.toml" } }
 
 [[servers]]
@@ -1005,6 +1012,7 @@ user = "u"
 id = "p1"
 server = "s1"
 variant = "standard"
+deploy_dir = "/srv/legacy"
 
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }

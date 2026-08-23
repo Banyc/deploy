@@ -43,7 +43,7 @@ pub struct PushReport {
     pub dry_run: bool,
 }
 
-type RemoteFactory = dyn Fn(&crate::config::ServerDef) -> Result<Box<dyn Remote>>;
+type RemoteFactory = dyn Fn(&crate::config::ServerDef, &crate::config::PodDef) -> Result<Box<dyn Remote>>;
 
 /// Run a push against `target_name`.
 pub fn push(
@@ -292,9 +292,9 @@ fn push_inner(
     let mut remotes: HashMap<ServerId, Box<dyn Remote>> = HashMap::new();
     let mut helpers: HashMap<ServerId, RemoteHelper> = HashMap::new();
     let mut statuses: HashMap<ServerId, crate::remote::helper::RemoteStatus> = HashMap::new();
-    for (_, s) in &members {
+    for (pod, s) in &members {
         let sid = ServerId::new(s.id.clone());
-        let remote = factory(s)?;
+        let remote = factory(s, pod)?;
         remotes.insert(sid.clone(), remote);
     }
     for (_, s) in &members {
@@ -965,8 +965,8 @@ fn process_server(
             });
         }
     };
-    let remote_root_rel = Path::new("objects/sha256").join(tree.as_str()).join("root");
-    if let Err(e) = download_tree_to_host(remote, &remote_root_rel, verify_tmp.path()) {
+    let object_rel = Path::new("objects/sha256").join(tree.as_str()).join("root");
+    if let Err(e) = download_tree_to_host(remote, &object_rel, verify_tmp.path()) {
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Failed,
             generation: new_gen.clone(),
@@ -998,7 +998,7 @@ fn process_server(
     }
 
     // 3. Validate all declared artifact paths and types before changing current.
-    if let Err(e) = validate_artifact_paths(remote, &remote_root_rel, &behavior.activation) {
+    if let Err(e) = validate_artifact_paths(remote, &object_rel, &behavior.activation) {
         return Ok(ServerProc {
             kind: ServerOutcomeKind::Failed,
             generation: new_gen.clone(),
@@ -1549,7 +1549,6 @@ reserve_percent = 0
     const NONE_TOML: &str = r#"
 schema_version = 1
 application = "eng"
-remote_root = "/srv/eng"
 release = "v1"
 
 [targets.t1.rotation.per_server]
@@ -1569,6 +1568,7 @@ user = "u"
 id = "p1"
 server = "s1"
 variant = "standard"
+deploy_dir = "/srv/eng"
 
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
@@ -1616,7 +1616,6 @@ reserve_percent = 0
     const SYSTEMD_TOML: &str = r#"
 schema_version = 1
 application = "eng"
-remote_root = "/srv/eng"
 release = "v1"
 
 [targets.t1.rotation.per_server]
@@ -1636,6 +1635,7 @@ user = "u"
 id = "p1"
 server = "s1"
 variant = "standard"
+deploy_dir = "/srv/eng"
 
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }

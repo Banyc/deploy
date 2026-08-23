@@ -1,6 +1,5 @@
 schema_version = 1
 application = "example"
-remote_root = "/srv/deploy/example"
 
 # The active release. The project structure is forced: the release directory
 # is `releases/<name>/`, and every `*.toml` file inside it is a variant
@@ -23,11 +22,13 @@ user = "deploy"
 id = "app-1"
 server = "server-01"
 variant = "standard"
+deploy_dir = "/srv/deploy/example"
 
 [[pods]]
 id = "app-2"
 server = "server-02"
 variant = "standard"
+deploy_dir = "/srv/deploy/example"
 
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }

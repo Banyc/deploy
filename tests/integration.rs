@@ -49,7 +49,6 @@ reserve_percent = 0
 const CONFIG: &str = r#"
 schema_version = 1
 application = "example"
-remote_root = "/srv/deploy/example"
 release = "v1"
 
 [targets.production.rotation.per_server]
@@ -79,16 +78,19 @@ user = "deploy"
 id = "p1"
 server = "server-01"
 variant = "standard"
+deploy_dir = "/srv/deploy/example"
 
 [[pods]]
 id = "p2"
 server = "server-02"
 variant = "standard"
+deploy_dir = "/srv/deploy/example"
 
 [[pods]]
 id = "p3"
 server = "server-03"
 variant = "high-capacity"
+deploy_dir = "/srv/deploy/example"
 
 [targets.production]
 rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "rollback_changed" }
@@ -138,7 +140,7 @@ fn end_to_end_push_rollback() -> Result<()> {
     let (config, config_path) = setup(&proj);
     let store = LocalStore::with_base(store_base.clone())?;
 
-    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
         let p = remotes_base.join(&s.id);
         Ok(Box::new(LocalTransport::new(p)?))
     };
@@ -273,7 +275,6 @@ fn fleet_rollback_after_variant_rename_succeeds() -> Result<()> {
             r#"
 schema_version = 1
 application = "example"
-remote_root = "/srv/deploy/example"
 release = "v1"
 
 [[servers]]
@@ -285,6 +286,7 @@ user = "deploy"
 id = "p1"
 server = "server-01"
 variant = "{variant}"
+deploy_dir = "/srv/deploy/example"
 
 [targets.production]
 rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
@@ -304,7 +306,7 @@ pods = ["p1"]
     let config0 = Config::load(&config_path)?;
     let store = LocalStore::with_base(store_base)?;
     let rf = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
     };
 
@@ -406,7 +408,7 @@ fn dry_run_reports_plan() -> Result<()> {
     std::fs::create_dir_all(&remotes_base).unwrap();
 
     let (config, config_path) = setup(&proj);
-    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
         let p = remotes_base.join(&s.id);
         Ok(Box::new(LocalTransport::new(p)?))
     };
@@ -731,7 +733,6 @@ fn single_target_toml(stop_on_failure: bool, batch_size: u32) -> String {
         r#"
 schema_version = 1
 application = "example"
-remote_root = "/srv/deploy/example"
 release = "v1"
 
 [targets.production.rotation.per_server]
@@ -751,6 +752,7 @@ user = "deploy"
 id = "p1"
 server = "server-01"
 variant = "standard"
+deploy_dir = "/srv/deploy/example"
 
 [targets.production]
 rollout = {{ batch_size = {batch_size}, stop_on_failure = {stop_on_failure}, failure_policy = "rollback_changed" }}
@@ -797,7 +799,6 @@ fn cli_reaches_configured_endpoint() -> Result<()> {
     let config_toml = r#"
 schema_version = 1
 application = "example"
-remote_root = "/srv/deploy/example"
 release = "v1"
 
 [targets.production.rotation.per_server]
@@ -817,6 +818,7 @@ user = "deploy"
 id = "p1"
 server = "server-01"
 variant = "standard"
+deploy_dir = "/srv/deploy/example"
 
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
@@ -861,10 +863,12 @@ reserve_percent = 0
         .unwrap()
         .address = format!("local://{}", endpoints.join("server-01").display());
 
-    let factory_config = config.clone();
-    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
-        create_remote(s, &factory_config)
-    };
+    let factory =
+        move |s: &deploy::config::ServerDef,
+              pod: &deploy::config::PodDef|
+              -> Result<Box<dyn Remote>> {
+            create_remote(s, &pod.deploy_dir)
+        };
 
     let r = push(
         &proj.join("deploy.toml"),
@@ -909,7 +913,7 @@ fn dry_run_does_not_mutate() -> Result<()> {
     let mutations = Arc::new(AtomicUsize::new(0));
     let m = mutations.clone();
     let rb = remote_base.clone();
-    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
         SpyRemote::build(rb.join(&s.id), m.clone())
     };
 
@@ -979,7 +983,7 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
     assert_ne!(a_digest, b_digest, "behaviors must differ");
 
     let rb = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rb.join(&s.id))?))
     };
 
@@ -1087,7 +1091,7 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
     let config_a = setup_single(&proj, "true", true, 1);
 
     let rb = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rb.join(&s.id))?))
     };
 
@@ -1201,7 +1205,7 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
     let config_a = setup_single(&proj, "true", true, 1);
 
     let rb = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rb.join(&s.id))?))
     };
 
@@ -1302,7 +1306,6 @@ fn stop_on_failure_records_all_servers() -> Result<()> {
     let deploy_toml = r#"
 schema_version = 1
 application = "example"
-remote_root = "/srv/deploy/example"
 release = "v1"
 
 [targets.production.rotation.per_server]
@@ -1332,16 +1335,19 @@ user = "u"
 id = "p1"
 server = "server-01"
 variant = "standard"
+deploy_dir = "/srv/deploy/example"
 
 [[pods]]
 id = "p2"
 server = "server-02"
 variant = "standard"
+deploy_dir = "/srv/deploy/example"
 
 [[pods]]
 id = "p3"
 server = "server-03"
 variant = "standard"
+deploy_dir = "/srv/deploy/example"
 
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
@@ -1374,7 +1380,7 @@ reserve_percent = 0
 
     let config = Config::load(&proj.join("deploy.toml"))?;
     let rf = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
     };
 
@@ -1448,7 +1454,7 @@ fn post_lock_failure_releases_lock_and_records() -> Result<()> {
     let attempted = Arc::new(AtomicUsize::new(0));
     let at = attempted.clone();
     let remotes_for_factory = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
         FaultRemote::build(
             remotes_for_factory.join(&s.id),
             true,
@@ -1512,7 +1518,7 @@ fn committed_txn_write_failure_pends_commit() -> Result<()> {
     let attempted = Arc::new(AtomicUsize::new(0));
     let at = attempted.clone();
     let remotes_for_factory = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
         FaultRemote::build_committed_fault(remotes_for_factory.join(&s.id), at.clone())
     };
 
@@ -1570,7 +1576,7 @@ fn commit_marker_write_failure_pends_commit() -> Result<()> {
     let attempted = Arc::new(AtomicUsize::new(0));
     let at = attempted.clone();
     let remotes_for_factory = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
         FaultRemote::build_commit_marker_fault(remotes_for_factory.join(&s.id), at.clone())
     };
 
@@ -1640,7 +1646,7 @@ fn capacity_only_change_produces_new_release_identity() -> Result<()> {
     };
     let store = LocalStore::with_base(store_base.clone())?;
     let rf = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
     };
 
@@ -1733,7 +1739,7 @@ fn corrupt_historical_policies_fail_preflight_without_remote_mutation() -> Resul
     };
     let store = LocalStore::with_base(store_base.clone())?;
     let rf = remotes_base.clone();
-    let factory = move |s: &deploy::config::ServerDef| -> Result<Box<dyn Remote>> {
+    let factory = move |s: &deploy::config::ServerDef, _pod: &deploy::config::PodDef| -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
     };
 

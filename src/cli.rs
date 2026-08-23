@@ -54,9 +54,10 @@ pub fn run() -> Result<()> {
     let remotes_base = store.base().join("remotes");
     std::fs::create_dir_all(&remotes_base).ok();
 
-    let config_for_factory = config.clone();
-    let factory = move |s: &crate::config::ServerDef| -> Result<Box<dyn Remote>> {
-        create_remote(s, &config_for_factory)
+    let factory = move |s: &crate::config::ServerDef,
+                        pod: &crate::config::PodDef|
+              -> Result<Box<dyn Remote>> {
+        create_remote(s, &pod.deploy_dir)
     };
 
     match cli.command {

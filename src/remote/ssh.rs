@@ -49,7 +49,7 @@ pub struct SshTransport {
 
 impl SshTransport {
     /// Build a transport for `user@address` (connecting on `port`), whose
-    /// application root is the absolute `remote_root` path on that host.
+    /// application root is the absolute `deploy_dir` path on that host.
     ///
     /// Host identity must be configured: pass a `known_hosts` file and/or a
     /// `host_key_fingerprint`. If neither is provided the transport refuses to
@@ -58,7 +58,7 @@ impl SshTransport {
         user: &str,
         address: &str,
         port: u16,
-        remote_root: &Path,
+        deploy_dir: &Path,
         known_hosts: Option<&Path>,
         host_key_fingerprint: Option<&str>,
     ) -> Result<Self> {
@@ -67,14 +67,14 @@ impl SshTransport {
                 "ssh transport requires a non-empty user and address",
             ));
         }
-        if remote_root.is_relative() {
-            return Err(Error::transport("ssh remote_root must be an absolute path"));
+        if deploy_dir.is_relative() {
+            return Err(Error::transport("ssh deploy_dir must be an absolute path"));
         }
         let mut t = SshTransport {
             target: format!("{user}@{address}"),
             address: address.to_string(),
             port,
-            root: remote_root.to_path_buf(),
+            root: deploy_dir.to_path_buf(),
             known_hosts: known_hosts.map(|p| p.to_path_buf()),
             host_key_fingerprint: host_key_fingerprint.map(|s| s.to_string()),
             pinned_known_hosts: None,
