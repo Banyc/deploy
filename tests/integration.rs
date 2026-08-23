@@ -522,6 +522,12 @@ impl Remote for SpyRemote {
             "SpyRemote: create_dir_all is forbidden",
         ))
     }
+    fn set_mode(&self, _rel: &Path, _mode: u32) -> deploy::error::Result<()> {
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+        Err(deploy::error::Error::remote(
+            "SpyRemote: set_mode is forbidden",
+        ))
+    }
     fn list(&self, rel: &Path) -> deploy::error::Result<Vec<RemoteEntry>> {
         self.inner.list(rel)
     }
@@ -683,6 +689,9 @@ impl Remote for FaultRemote {
     fn create_dir_all(&self, rel: &Path) -> deploy::error::Result<()> {
         self.inner.create_dir_all(rel)
     }
+    fn set_mode(&self, rel: &Path, mode: u32) -> deploy::error::Result<()> {
+        self.inner.set_mode(rel, mode)
+    }
     fn list(&self, rel: &Path) -> deploy::error::Result<Vec<RemoteEntry>> {
         self.inner.list(rel)
     }
@@ -783,6 +792,9 @@ impl Remote for FailOnceMarkerRemote {
     }
     fn create_dir_all(&self, rel: &Path) -> Result<()> {
         self.inner.create_dir_all(rel)
+    }
+    fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+        self.inner.set_mode(rel, mode)
     }
     fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
         self.inner.list(rel)
@@ -885,6 +897,9 @@ impl Remote for ConflictingMarkerRemote {
     }
     fn create_dir_all(&self, rel: &Path) -> Result<()> {
         self.inner.create_dir_all(rel)
+    }
+    fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+        self.inner.set_mode(rel, mode)
     }
     fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
         self.inner.list(rel)

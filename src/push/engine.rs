@@ -2717,6 +2717,9 @@ slots = ["p1"]
         fn create_dir_all(&self, rel: &std::path::Path) -> Result<()> {
             self.inner.create_dir_all(rel)
         }
+        fn set_mode(&self, rel: &std::path::Path, mode: u32) -> Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
         fn list(
             &self,
             rel: &std::path::Path,

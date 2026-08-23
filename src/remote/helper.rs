@@ -532,6 +532,10 @@ pub fn copy_host_tree_to_remote(host: &Path, rel_dest: &Path, remote: &dyn Remot
             .map_err(|e| Error::remote(format!("stat {}: {e}", path.display())))?;
         if meta.is_dir() {
             remote.create_dir(&dest)?;
+            // Preserve the canonical mode explicitly: a bare `mkdir` inherits
+            // the remote umask (e.g. 0775 on umask-0002 hosts), which would
+            // change the tree digest and fail the post-upload integrity check.
+            remote.set_mode(&dest, meta.mode() & 0o777)?;
         } else if meta.file_type().is_symlink() {
             let target = std::fs::read_link(path)
                 .map_err(|e| Error::remote(format!("readlink {}: {e}", path.display())))?;

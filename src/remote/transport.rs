@@ -67,6 +67,12 @@ pub trait Remote {
     fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool>;
     fn create_dir(&self, rel: &Path) -> Result<()>;
     fn create_dir_all(&self, rel: &Path) -> Result<()>;
+    /// Apply a permission mode to an existing remote entry (file or directory).
+    /// Uploads must preserve the canonical tree's modes exactly, or the
+    /// post-upload integrity re-hash diverges on hosts with a permissive umask
+    /// (a bare `mkdir`/`cat` inherits the remote umask, so modes must be
+    /// applied explicitly).
+    fn set_mode(&self, rel: &Path, mode: u32) -> Result<()>;
     fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>>;
     fn rename(&self, from: &Path, to: &Path) -> Result<()>;
     fn symlink(&self, target: &Path, link: &Path) -> Result<()>;
@@ -184,6 +190,14 @@ impl Remote for LocalTransport {
     fn create_dir_all(&self, rel: &Path) -> Result<()> {
         std::fs::create_dir_all(join(&self.base, rel))
             .map_err(|e| Error::transport(format!("mkdir {}: {e}", rel.display())))
+    }
+
+    fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+        std::fs::set_permissions(
+            join(&self.base, rel),
+            std::fs::Permissions::from_mode(mode & 0o7777),
+        )
+        .map_err(|e| Error::transport(format!("chmod {}: {e}", rel.display())))
     }
 
     fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {

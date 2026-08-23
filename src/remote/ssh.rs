@@ -582,6 +582,15 @@ impl Remote for SshTransport {
         self.run_remote_ok(&Self::argv_cmd(&["mkdir".into(), "-p".into(), p]))
     }
 
+    fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+        let p = self.root.join(rel).to_string_lossy().into_owned();
+        self.run_remote_ok(&Self::argv_cmd(&[
+            "chmod".into(),
+            format!("{:o}", mode & 0o7777),
+            p,
+        ]))
+    }
+
     fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
         let out = self.run_remote(&self.list_script(rel))?;
         if !out.status.success() {
