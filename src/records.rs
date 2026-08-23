@@ -79,6 +79,12 @@ impl DeploymentStatus {
 pub enum ServerOutcomeKind {
     Activated,
     Failed,
+    /// Reserved: never emitted today. In-process compensation (a post-swap
+    /// activation/verification failure restored by the per-server pipeline,
+    /// step 11) is recorded as [`ServerOutcomeKind::Failed`] with
+    /// `ServerResult.compensated = true` — "record both the failure and the
+    /// compensation result" — and failure-policy compensation (step 13)
+    /// upgrades the slot to [`ServerOutcomeKind::Restored`].
     Compensated,
     Skipped,
     Restored,

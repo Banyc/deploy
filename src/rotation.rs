@@ -46,8 +46,23 @@ pub fn compute_retained(
     let mut retained: HashSet<String> = HashSet::new();
     let status = helper.status()?;
 
-    // Current generation's tree.
-    if let Some(t) = &status.current_tree {
+    // Current generation's tree — the live artifact is ALWAYS in the retained
+    // set. When the live generation's assignment cannot be read (a missing or
+    // corrupt `assignment.json`), the current tree is UNKNOWN: sweeping
+    // anything we cannot prove unreferenced would leave `current` pointing at
+    // a deleted tree (a dangling commit pointer). Fail closed — retain every
+    // object present so rotation deletes nothing it cannot account for.
+    let live_tree_unknown = status.current_generation.is_some() && status.current_tree.is_none();
+    if live_tree_unknown {
+        let obj_root = layout::objects();
+        if helper.remote().exists(obj_root) {
+            for e in helper.remote().list(obj_root)? {
+                if e.is_dir {
+                    retained.insert(e.name);
+                }
+            }
+        }
+    } else if let Some(t) = &status.current_tree {
         retained.insert(t.clone());
     }
 
@@ -530,6 +545,55 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert!(
             retained.contains("t1"),
             "protected previous tree is never swept"
+        );
+    }
+
+    /// Rotation must NEVER sweep the tree behind a live `current` whose
+    /// assignment cannot be read (a missing or corrupt `assignment.json`): the
+    /// retained set always includes "the artifact referenced by the current
+    /// generation" (requirement.md), and an unreadable assignment makes that
+    /// artifact UNKNOWN. Failing open (sweeping) would leave `current`
+    /// dangling. The engine hits this when a push fails pre-swap against a
+    /// corrupt live generation and then runs rotation.
+    #[test]
+    fn rotation_never_sweeps_when_live_assignment_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        make_gen(&helper, "d1", "g1", "t1", "2020-01-01T00:00:00Z", None);
+        helper.swap_current(None, "g1", "op").unwrap();
+        // Corrupt the live generation's assignment record.
+        std::fs::write(
+            dir.path()
+                .join("remote")
+                .join(crate::layout::generation("g1"))
+                .join("assignment.json"),
+            b"{ corrupt !",
+        )
+        .unwrap();
+        assert!(
+            helper.read_assignment("g1").is_err(),
+            "the live assignment must be unreadable after corruption"
+        );
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let c = cfg();
+        // Every window zeroed + no pins: WITHOUT the fail-closed rule the
+        // sweep would delete the live tree.
+        let mut rotation = c.targets["t1"].rotation.clone();
+        rotation.per_server.keep_distinct_artifacts = 0;
+        rotation.per_server.keep_days = 0;
+        rotation.per_server.protect_previous = false;
+        rotation.fleet.protect_deployments = 0;
+
+        let retained = compute_retained(&helper, &c.pins, &store, &rotation).unwrap();
+        assert!(
+            retained.contains("t1"),
+            "the live (unreadable) generation's tree must be retained fail-closed"
+        );
+        helper.rotate(&retained, &HashSet::new()).unwrap();
+        assert!(
+            helper.remote().exists(&crate::layout::tree_root("t1")),
+            "rotation must not sweep the tree behind a live current with an unreadable assignment"
         );
     }
 }

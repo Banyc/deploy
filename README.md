@@ -104,15 +104,29 @@ Global flag: `--config <path>` selects a different `deploy.toml` than
 
 ```sh
 deploy push production --dry-run                 # preview; touches nothing
-deploy push production                           # HEAD: the local files
-deploy push production production@f1             # roll back to the 2nd successful deployment
+# HEAD: the local files
+deploy push production
+# roll back to the 2nd successful deployment (restores the exact historical
+# per-slot artifacts — variant and tree together)
+deploy push production production@f1
+deploy push production production@f1:current    # same release, but keep each server's configured variant
 deploy push production release/rel-41da2f63      # deploy a specific retained release
-deploy push production release/rel-41da2f63:current   # same, but keep each server's configured variant
+# same release, but assign each current server its CONFIGURED variant
+# (the tree still comes from the release's own per-variant bindings)
+deploy push production release/rel-41da2f63:current
 ```
 
 - `<target>@fN` refers to the Nth *successful* fleet snapshot; failed and
   degraded attempts never advance the rollback ref and cannot be rolled back
   to (`deploy log` still shows them).
+- The `:current` suffix — on `release/<id>:current` or `<target>@fN:current` —
+  keeps each slot's CURRENT configured variant (the variant file that declares
+  the slot in today's config) while the tree still comes from the referenced
+  release's own per-variant bindings. The bare form (`release/<id>`,
+  `<target>@fN`) instead restores the release/snapshot's OWN stored
+  slot→variant mapping. A `:current` push fails closed if the referenced
+  release does not ship the current variant (e.g. the variant was renamed
+  after the release was materialized).
 - Pushing identical content prints `Everything up to date`.
 - Rollout is batched per `rollout.batch_size`; on a failed server, earlier
   batches roll back by default (`failure_policy: rollback_changed`). The final

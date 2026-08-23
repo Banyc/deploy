@@ -448,7 +448,12 @@ fn push_inner(
             slot_id.clone(),
             expected.as_ref().map(|g| {
                 // Record the slot's *actual* current assignment (read from the
-                // remote generation), not the desired one.
+                // remote generation), not the desired one. When the live
+                // generation's assignment cannot be read (a missing or corrupt
+                // `assignment.json`), never substitute the planned (desired)
+                // artifact: preserve the observed generation and mark the
+                // assignment unknown — the same contract the post-push
+                // `actual_servers` refresh uses (see below).
                 helpers[slot_id]
                     .read_assignment(g.as_str())
                     .map(|asn| AttemptServer {
@@ -456,7 +461,7 @@ fn push_inner(
                         generation: Some(g.clone()),
                     })
                     .unwrap_or_else(|_| AttemptServer {
-                        artifact: a.artifact.clone(),
+                        artifact: ArtifactRef::default(),
                         generation: Some(g.clone()),
                     })
             }),
@@ -656,6 +661,17 @@ fn push_inner(
     // historical or rollback push applies the server's current headroom
     // exactly as a HEAD push does. Only the variant behavior contract resolves
     // from the immutable snapshot (see `desired_behaviors` above).
+    //
+    // A PREFLIGHT failure here happens AFTER the attempt intent and its
+    // initial `InProgress` transition were persisted (requirement.md step 14
+    // orders the intent before capacity, step 8). The attempt must therefore
+    // end terminal `FailedPreflight` — "an attempt that fails before any
+    // `current` change is `failed_preflight`" — never stranded `InProgress`
+    // (which would be misreported later as a recoverable/pending attempt or
+    // falsely degraded as "generation diverged" by a later reconcile).
+    // Failures BEFORE the intent is persisted (plan resolution, historical
+    // behavior snapshot, handshake) surface as the push error with no attempt
+    // record at all.
     capacity_preflight(
         store,
         &assignments,
@@ -664,7 +680,17 @@ fn push_inner(
         deployment_id,
         config,
         &target.rotation,
-    )?;
+    )
+    .map_err(|e| {
+        if matches!(e, Error::Preflight(_)) {
+            let _ = store.append_transition(
+                deployment_id.as_str(),
+                &DeploymentStatus::FailedPreflight,
+                Some("preflight failed"),
+            );
+        }
+        e
+    })?;
     // Stage every needed tree into operation-unique incoming paths.
     for a in &assignments {
         let _remote = remotes[&a.placement_slot].as_ref();
@@ -4091,6 +4117,781 @@ interval_seconds = 0
         assert_eq!(
             os.artifact.as_ref().expect("observed artifact").tree,
             prior_tree
+        );
+    }
+
+    // ---- First-deploy activation failure, preflight outcomes, observed
+    // unknown-assignment fallback ------------------------------------------
+
+    /// A transport wrapper that reports a FIXED number of available bytes,
+    /// letting a test control the headroom the capacity preflight sees
+    /// deterministically (mirrors `push::capacity::tests`).
+    struct FakeCapacityRemote {
+        inner: LocalTransport,
+        avail: u64,
+    }
+
+    impl FakeCapacityRemote {
+        fn build(base: PathBuf, avail: u64) -> Result<Box<dyn Remote>> {
+            Ok(Box::new(FakeCapacityRemote {
+                inner: LocalTransport::new(base)?,
+                avail,
+            }))
+        }
+    }
+
+    impl Remote for FakeCapacityRemote {
+        fn root(&self) -> &std::path::Path {
+            self.inner.root()
+        }
+        fn provision_layout(&self) -> Result<()> {
+            self.inner.provision_layout()
+        }
+        fn read(&self, rel: &std::path::Path) -> Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<bool> {
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &std::path::Path, mode: u32) -> Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(
+            &self,
+            rel: &std::path::Path,
+        ) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &std::path::Path) -> Result<std::path::PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &std::path::Path) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &std::path::Path) -> Result<crate::remote::transport::RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn exec(
+            &self,
+            argv: &[String],
+            timeout: std::time::Duration,
+        ) -> Result<crate::remote::transport::ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+        fn available_bytes(&self) -> Result<u64> {
+            Ok(self.avail)
+        }
+    }
+
+    /// FIRST-DEPLOY activation failure: there is no prior generation to
+    /// restore, so compensation removes `current` — compare-and-swap style,
+    /// only while it still points at the generation this attempt advanced
+    /// (`remove_current_if`) — and the attempt is `FailedRolledBack`
+    /// (requirement.md step 11: "On a first deployment with no prior
+    /// generation, compensation removes `current` and reverses only adapter
+    /// resources created by that attempt"; step 13: "If all compensation
+    /// succeeds, mark the attempt `failed_rolled_back`"). The remote is left
+    /// WITHOUT a stale `current` pointing at the dead generation.
+    #[test]
+    fn first_deploy_activation_failure_compensates_and_removes_current() {
+        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
+        let h = SysdHarness::new();
+        let marker = h._dir.path().join("fail-restart");
+        // One-shot marker: the desired activation's restart fails and consumes
+        // it; the (absent) prior activation contract has nothing to re-run.
+        let _env = install_fake_systemctl(h._dir.path(), &marker, true);
+        std::fs::write(&marker, "fail").unwrap();
+
+        let id = DeploymentId::new("deploy-first-act-fail".to_string());
+        let r = h.push_head(&id).unwrap();
+        // Restore the environment and release the env lock BEFORE any
+        // assertion: a failing assertion must never poison the shared
+        // `ENV_LOCK` for the fingerprint/systemd env suites.
+        drop(_env);
+        drop(_lock);
+
+        assert_eq!(
+            r.status,
+            Some(DeploymentStatus::FailedRolledBack),
+            "a compensated first-deploy activation failure must end FailedRolledBack, got {:?}",
+            r.status
+        );
+        assert!(
+            !marker.exists(),
+            "the one-shot marker was consumed by the failed restart"
+        );
+
+        // The remote has NO stale `current`: the compare-and-swap removal
+        // removed the link (it still pointed at the generation this attempt
+        // advanced).
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        assert!(
+            !remote.exists(crate::layout::current()),
+            "first-deploy compensation must remove `current`"
+        );
+        let status = RemoteHelper::new(&remote).status().unwrap();
+        assert!(
+            status.current_generation.is_none(),
+            "no current generation may remain after first-deploy compensation"
+        );
+
+        // results.json records the failure WITH compensation (the failure AND
+        // the compensation result are both recorded, step 11) at the advanced
+        // (then removed) generation.
+        let results = h.store.read_results(id.as_str()).unwrap();
+        let res = &results.slots[&PlacementSlotId::new("p1")];
+        assert_eq!(res.outcome, ServerOutcomeKind::Failed);
+        assert!(
+            res.compensated,
+            "first-deploy compensation must be recorded as compensated"
+        );
+
+        // The attempt is terminal FailedRolledBack and produced no snapshot /
+        // no ref — a failed FIRST deployment has nothing to roll the ref back
+        // from.
+        assert_eq!(
+            h.store.latest_status(id.as_str()).unwrap(),
+            Some(DeploymentStatus::FailedRolledBack)
+        );
+        assert!(
+            h.store.read_snapshots("t1").unwrap().is_empty(),
+            "a failed first deployment must produce no snapshot"
+        );
+        assert!(h.store.read_last_successful("t1").is_none());
+        assert_eq!(h.store.read_attempts("t1").unwrap().len(), 1);
+    }
+
+    /// A CAPACITY preflight failure (after the intent is durable, before any
+    /// server mutation) must end the attempt `FailedPreflight` —
+    /// requirement.md: "An attempt that fails before any `current` change is
+    /// `failed_preflight`" — never a stranded `InProgress` that a later push
+    /// would misreport as a recoverable attempt or falsely degrade. No
+    /// generation, `current`, or object is created remotely; no snapshot or
+    /// ref is produced.
+    #[test]
+    fn capacity_preflight_failure_records_failed_preflight_status() {
+        let h = RecoveryHarness::new();
+        let id = DeploymentId::new("deploy-capacity-preflight".to_string());
+        // Deterministic capacity: the remote reports 100 bytes available and
+        // the server policy reserves 1 MiB, so the first deployment cannot
+        // fit its tree.
+        let mut config = Config::load(&h.cfg_path).unwrap();
+        config.servers[0].capacity = crate::config::CapacityConfig {
+            reserve_bytes: 1024 * 1024,
+            reserve_percent: 0,
+        };
+        let project_root = config.project_root(&h.cfg_path);
+        let target = config.targets.get("t1").expect("harness target");
+        let op_id = OperationId::new(format!("op-{}", id.as_str()));
+        let rf = h.remotes_base.clone();
+        let factory = move |s: &crate::config::ServerDef,
+                            _slot: &crate::config::SlotDef|
+              -> Result<Box<dyn Remote>> {
+            FakeCapacityRemote::build(rf.join(&s.id), 100)
+        };
+        let err = push_inner(
+            &project_root,
+            &h.store,
+            &factory,
+            "t1",
+            &PushRef::Head,
+            &id,
+            &op_id,
+            &config,
+            target,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .err()
+        .expect("capacity preflight must fail the push");
+        assert!(
+            err.to_string().contains("insufficient capacity"),
+            "expected a capacity preflight error, got: {err}"
+        );
+
+        // The intent is durable and the attempt's LATEST status is the
+        // terminal `FailedPreflight` — never stranded `InProgress`.
+        let attempts = h.store.read_attempts("t1").unwrap();
+        assert_eq!(
+            attempts.len(),
+            1,
+            "intent must be persisted before preflight"
+        );
+        assert_eq!(
+            latest_status(&h, id.as_str()),
+            DeploymentStatus::FailedPreflight,
+            "a preflight failure after intent must end FailedPreflight"
+        );
+        let transitions = h.store.read_transitions(id.as_str()).unwrap();
+        let statuses: Vec<DeploymentStatus> =
+            transitions.iter().map(|t| t.status.clone()).collect();
+        assert_eq!(
+            statuses,
+            vec![
+                DeploymentStatus::InProgress,
+                DeploymentStatus::FailedPreflight,
+            ],
+            "the attempt must evolve InProgress -> FailedPreflight"
+        );
+
+        // No reflog/snapshot, and NO remote deployment mutation: no `current`,
+        // no generation record, no tree object.
+        assert!(h.store.read_snapshots("t1").unwrap().is_empty());
+        assert!(h.store.read_last_successful("t1").is_none());
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        assert!(!remote.exists(crate::layout::current()), "no current");
+        assert!(
+            remote
+                .list(crate::layout::generations())
+                .unwrap()
+                .is_empty(),
+            "no generation record may be durable"
+        );
+        assert!(
+            remote.list(crate::layout::objects()).unwrap().is_empty(),
+            "no tree object may be published"
+        );
+    }
+
+    /// A HISTORICAL push whose release's behavior snapshot is missing (or
+    /// corrupt) must fail in PREFLIGHT before any attempt, reflog, snapshot,
+    /// or remote connection — never silently substitute the caller's current
+    /// configuration (requirement.md: "a missing or corrupt historical
+    /// behavior snapshot aborts the attempt during preflight").
+    #[test]
+    fn historical_release_missing_behavior_snapshot_fails_preflight_untouched() {
+        let h = RecoveryHarness::new();
+        // A release record whose behavior snapshot was never written:
+        // `write_release` persists `release.json` only; the aux
+        // `behavior.json` is absent.
+        let release = crate::model::ReleaseId::new("rel-sha256-no-behavior".to_string());
+        h.store
+            .write_release(&crate::model::ReleaseRecord {
+                release_schema_version: 1,
+                release_id: release.as_str().to_string(),
+                release_sha256: "rel-sha256-no-behavior".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                provenance: crate::model::Provenance {
+                    git_revision: None,
+                    mapping_sha256: "m".to_string(),
+                    behavior_sha256: "b".to_string(),
+                },
+                variants: BTreeMap::from([("standard".to_string(), "tree-x".to_string())]),
+                slots: BTreeMap::new(),
+            })
+            .unwrap();
+
+        let project_root = h.config.project_root(&h.cfg_path);
+        let target = h.config.targets.get("t1").expect("harness target");
+        let op_id = OperationId::new("op-historical-behavior".to_string());
+        let id = DeploymentId::new("deploy-hist-behavior".to_string());
+        let rf = h.remotes_base.clone();
+        let factory = move |s: &crate::config::ServerDef,
+                            _slot: &crate::config::SlotDef|
+              -> Result<Box<dyn Remote>> {
+            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        };
+        let err = push_inner(
+            &project_root,
+            &h.store,
+            &factory,
+            "t1",
+            &PushRef::Release {
+                release: release.clone(),
+                current_variant: false,
+            },
+            &id,
+            &op_id,
+            &h.config,
+            target,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .err()
+        .expect("a release without its behavior snapshot must fail preflight");
+        assert!(
+            err.to_string().contains("historical behavior")
+                && err.to_string().contains("unavailable"),
+            "expected a historical-behavior preflight error, got: {err}"
+        );
+
+        // Nothing recorded and nothing touched: no attempt, no snapshot/ref,
+        // and the remote directory was never even created (the failure fires
+        // before any remote connection).
+        assert!(h.store.read_attempts("t1").unwrap().is_empty());
+        assert!(h.store.read_snapshots("t1").unwrap().is_empty());
+        assert!(h.store.read_last_successful("t1").is_none());
+        assert!(
+            !h.remotes_base.join("s1").exists(),
+            "no remote layout may be created before the preflight failure"
+        );
+
+        // The same preflight refusal fires for a CORRUPT (unparseable)
+        // behavior snapshot: write garbage over behavior.json.
+        let behavior_path = h.store.release_dir(&release).join("behavior.json");
+        std::fs::create_dir_all(behavior_path.parent().unwrap()).unwrap();
+        std::fs::write(&behavior_path, b"{ not json !").unwrap();
+        let op_id2 = OperationId::new("op-historical-behavior-2".to_string());
+        let err2 = push_inner(
+            &project_root,
+            &h.store,
+            &factory,
+            "t1",
+            &PushRef::Release {
+                release: release.clone(),
+                current_variant: false,
+            },
+            &id,
+            &op_id2,
+            &h.config,
+            target,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .err()
+        .expect("a corrupt behavior snapshot must also fail preflight");
+        assert!(
+            err2.to_string().contains("historical behavior")
+                && err2.to_string().contains("unavailable"),
+            "expected a historical-behavior preflight error, got: {err2}"
+        );
+        assert!(h.store.read_attempts("t1").unwrap().is_empty());
+        assert!(h.store.read_snapshots("t1").unwrap().is_empty());
+    }
+
+    /// OBSERVED-REFRESH UNKNOWN-ASSIGNMENT FALLBACK: when a live generation's
+    /// `assignment.json` cannot be read (missing/corrupt), the refresh must
+    /// preserve the OBSERVED generation and mark the assignment UNKNOWN
+    /// (`ArtifactRef::default()`) — never substitute the desired/planned
+    /// artifact. BOTH the pre-push intent (`pre_push`) and the post-push
+    /// observed refresh use this contract; results.json records the slot's
+    /// pre-swap failure, `current` stays on the observed (corrupt) generation,
+    /// and no stale snapshot/ref is produced.
+    #[test]
+    fn observed_refresh_preserves_generation_with_unknown_assignment() {
+        let h = RecoveryHarness::new();
+        let id1 = DeploymentId::new("deploy-obs-fallback-baseline".to_string());
+        let r1 = push_main_with_id(&h, &id1).unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+        let gen1 = r1.attempt.as_ref().expect("attempt").slots[&PlacementSlotId::new("p1")]
+            .generation
+            .clone()
+            .expect("baseline generation");
+        eprintln!("DEBUG gen1={gen1}");
+
+        // Corrupt the live generation's assignment record on the remote.
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let asn_path = crate::layout::generations()
+            .join(gen1.as_str())
+            .join("assignment.json");
+        remote.write(&asn_path, b"{ corrupt json !", 0o600).unwrap();
+        assert!(
+            RemoteHelper::new(&remote)
+                .read_assignment(gen1.as_str())
+                .is_err(),
+            "the assignment must be unreadable after corruption"
+        );
+
+        // Push 2: the artifact content changes (not a no-op) and the
+        // generation-record write for the NEW generation fails once
+        // (pre-swap). `current` therefore stays at gen1 — whose assignment is
+        // unreadable.
+        std::fs::write(
+            h.config
+                .project_root(&h.cfg_path)
+                .join("releases")
+                .join("v1")
+                .join("artifacts")
+                .join("build/output/app/server"),
+            "v2\n",
+        )
+        .unwrap();
+        let id2 = DeploymentId::new("deploy-obs-fallback".to_string());
+        let armed = Arc::new(AtomicBool::new(true));
+        let armed_for_factory = armed.clone();
+        let rf = h.remotes_base.clone();
+        let fault_factory = move |s: &crate::config::ServerDef,
+                                  _slot: &crate::config::SlotDef|
+              -> Result<Box<dyn Remote>> {
+            FailOnceGenerationRemote::build(rf.join(&s.id), armed_for_factory.clone())
+        };
+        let project_root = h.config.project_root(&h.cfg_path);
+        let target = h.config.targets.get("t1").expect("harness target");
+        let op_id = OperationId::new(format!("op-{}", id2.as_str()));
+        let r2 = push_inner(
+            &project_root,
+            &h.store,
+            &fault_factory,
+            "t1",
+            &PushRef::Head,
+            &id2,
+            &op_id,
+            &h.config,
+            target,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            r2.status,
+            Some(DeploymentStatus::FailedRolledBack),
+            "a pre-swap mid-mutation failure must be reported as a failure, got {:?}",
+            r2.status
+        );
+
+        // The remote `current` still points at gen1 (never advanced, never
+        // clobbered) — the observed generation we are about to record.
+        let status = RemoteHelper::new(&remote).status().unwrap();
+        assert_eq!(status.current_generation.as_deref(), Some(gen1.as_str()));
+
+        // THE OBSERVED FALLBACK: observed.json preserves the observed
+        // generation and marks the assignment UNKNOWN (the default artifact),
+        // never the desired v2 artifact.
+        let observed = h.store.read_observed("t1").unwrap();
+        let os = &observed.slots[&PlacementSlotId::new("p1")];
+        assert_eq!(
+            os.generation,
+            Some(gen1.clone()),
+            "observed generation must be preserved"
+        );
+        let oa = os.artifact.as_ref().expect("observed artifact present");
+        assert_eq!(
+            oa,
+            &ArtifactRef::default(),
+            "an unreadable assignment must be marked unknown (default artifact), got: {oa:?}"
+        );
+        let desired_art = &r2.attempt.as_ref().expect("attempt").desired
+            [&PlacementSlotId::new("p1")]
+            .assignment
+            .artifact;
+        assert_ne!(
+            oa.tree, desired_art.tree,
+            "observed must NOT substitute the desired v2 artifact"
+        );
+        assert_eq!(os.last_deployment, Some(id2.clone()));
+
+        // The PERSISTED INTENT's pre_push map uses the SAME contract:
+        // generation preserved, assignment unknown.
+        let attempts = h.store.read_attempts("t1").unwrap();
+        assert_eq!(attempts.len(), 2);
+        let intent2 = &attempts[1];
+        assert_eq!(intent2.deployment_id, id2);
+        let pp = intent2.pre_push[&PlacementSlotId::new("p1")]
+            .as_ref()
+            .expect("pre_push present");
+        assert_eq!(pp.generation, Some(gen1.clone()));
+        assert_eq!(
+            pp.artifact,
+            ArtifactRef::default(),
+            "pre_push must mark the unreadable assignment unknown, not fabricate the desired one"
+        );
+
+        // results.json records the pre-swap failure; the failed attempt
+        // produced no snapshot/ref and the baseline ref is untouched.
+        let results = h.store.read_results(id2.as_str()).unwrap();
+        assert_eq!(
+            results.slots[&PlacementSlotId::new("p1")].outcome,
+            ServerOutcomeKind::Failed
+        );
+        assert_eq!(
+            latest_status(&h, id2.as_str()),
+            DeploymentStatus::FailedRolledBack
+        );
+        let snapshots = h.store.read_snapshots("t1").unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].deployment_id, id1);
+        assert_eq!(
+            h.store.read_last_successful("t1").as_deref(),
+            Some(id1.as_str())
+        );
+    }
+
+    /// The `leave_changed` failure policy (requirement.md step 13: "An
+    /// optional `leave_changed` policy may retain successful advances
+    /// deliberately; any attempt with failures under that policy is
+    /// `degraded`") must NOT compensate earlier successful batches: the
+    /// advanced slots keep their `current`, the attempt ends `Degraded` (never
+    /// a falsely clean `FailedRolledBack`), and the failing slot is still
+    /// compensated IN-PROCESS (step 11, per-server) with its own `current`
+    /// removed on first deploy.
+    #[test]
+    fn leave_changed_policy_retains_advances_and_reports_degraded() {
+        const LEAVE_TOML: &str = r#"
+schema_version = 1
+application = "leave"
+release = "v1"
+
+[targets.t1.rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[targets.t1.rotation.fleet]
+protect_deployments = 2
+
+[[servers]]
+id = "s1"
+address = "a"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s2"
+address = "b"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s3"
+address = "c"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s4"
+address = "d"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[targets.t1]
+rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "leave_changed" }
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        // Variant `good` (sorts first) declares p1/p2 with PASSING
+        // verification; variant `z-failing` declares p3/p4 with FAILING
+        // verification.
+        let good = r#"
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+deploy_dir = "/srv/p1"
+
+[[slots]]
+id = "p2"
+server = "s2"
+target = "t1"
+deploy_dir = "/srv/p2"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+        let z_failing = r#"
+[[slots]]
+id = "p3"
+server = "s3"
+target = "t1"
+deploy_dir = "/srv/p3"
+
+[[slots]]
+id = "p4"
+server = "s4"
+target = "t1"
+deploy_dir = "/srv/p4"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["false"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+        std::fs::write(release_dir.join("good.toml"), good).unwrap();
+        std::fs::write(release_dir.join("z-failing.toml"), z_failing).unwrap();
+        let artifacts = release_dir.join("artifacts");
+        std::fs::create_dir_all(artifacts.join("build/output/app")).unwrap();
+        std::fs::write(artifacts.join("build/output/app/server"), "v1\n").unwrap();
+
+        let cfg_path = project.join("deploy.toml");
+        std::fs::write(&cfg_path, LEAVE_TOML).unwrap();
+        let config = Config::load(&cfg_path).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let remotes_base = dir.path().join("remotes");
+        std::fs::create_dir_all(&remotes_base).unwrap();
+
+        let id = DeploymentId::new("deploy-leave-changed".to_string());
+        let project_root = config.project_root(&cfg_path);
+        let target = config.targets.get("t1").expect("target t1");
+        let op_id = OperationId::new(format!("op-{}", id.as_str()));
+        let rf = remotes_base.clone();
+        let factory = move |s: &crate::config::ServerDef,
+                            _slot: &crate::config::SlotDef|
+              -> Result<Box<dyn Remote>> {
+            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        };
+        let r = push_inner(
+            &project_root,
+            &store,
+            &factory,
+            "t1",
+            &PushRef::Head,
+            &id,
+            &op_id,
+            &config,
+            target,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            r.status,
+            Some(DeploymentStatus::Degraded),
+            "under leave_changed a failing batch must end Degraded, got {:?}",
+            r.status
+        );
+
+        // The earlier successful batch is retained deliberately: p1/p2 keep
+        // their live `current` (no fleet compensation pass runs).
+        for (sid, sname) in [("p1", "s1"), ("p2", "s2")] {
+            let remote = LocalTransport::new(remotes_base.join(sname)).unwrap();
+            assert!(
+                remote.exists(crate::layout::current()),
+                "slot {sid} must stay advanced under leave_changed"
+            );
+        }
+        // The FAILING slot is still compensated in-process (step 11) and its
+        // first-deploy `current` was removed; the never-started slot is
+        // untouched.
+        let remote3 = LocalTransport::new(remotes_base.join("s3")).unwrap();
+        assert!(
+            !remote3.exists(crate::layout::current()),
+            "the failing slot's current is removed by in-process compensation"
+        );
+        let remote4 = LocalTransport::new(remotes_base.join("s4")).unwrap();
+        assert!(
+            !remote4.exists(crate::layout::current()),
+            "the never-started slot has no current"
+        );
+
+        // Per-slot outcomes: advanced, failed(+compensated), skipped.
+        let results = store.read_results(id.as_str()).unwrap();
+        assert_eq!(
+            results.slots[&PlacementSlotId::new("p1")].outcome,
+            ServerOutcomeKind::Activated
+        );
+        assert_eq!(
+            results.slots[&PlacementSlotId::new("p2")].outcome,
+            ServerOutcomeKind::Activated
+        );
+        assert_eq!(
+            results.slots[&PlacementSlotId::new("p3")].outcome,
+            ServerOutcomeKind::Failed
+        );
+        assert!(
+            results.slots[&PlacementSlotId::new("p3")].compensated,
+            "the failing slot's in-process compensation is recorded"
+        );
+        assert_eq!(
+            results.slots[&PlacementSlotId::new("p4")].outcome,
+            ServerOutcomeKind::Skipped
+        );
+
+        // No snapshot/ref for a degraded attempt.
+        assert!(
+            store.read_snapshots("t1").unwrap().is_empty(),
+            "a degraded attempt must produce no snapshot"
+        );
+        assert!(store.read_last_successful("t1").is_none());
+        assert_eq!(
+            store.latest_status(id.as_str()).unwrap(),
+            Some(DeploymentStatus::Degraded)
+        );
+    }
+
+    /// The bare `@fN` ref form (no target prefix) is filled in by the engine
+    /// from the push's own target argument (`history.rs`: "An empty target
+    /// (e.g. ref token `@f0`) is filled in by the caller from the separate
+    /// target argument"). A dry run against `@f0` must plan the SAME
+    /// historical fleet snapshot as the explicit `t1@f0` form.
+    #[test]
+    fn bare_at_f_ref_fills_target_from_push_argument() {
+        let h = RecoveryHarness::new();
+        let id1 = DeploymentId::new("deploy-bare-atf".to_string());
+        let r1 = push_main_with_id(&h, &id1).unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+        let f0_tree = r1.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")]
+            .artifact
+            .tree
+            .clone();
+
+        let rf = h.remotes_base.clone();
+        let factory = move |s: &crate::config::ServerDef,
+                            _slot: &crate::config::SlotDef|
+              -> Result<Box<dyn Remote>> {
+            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        };
+        let r = push(
+            &h.cfg_path,
+            &h.store,
+            &factory,
+            "t1",
+            &h.config,
+            &PushOptions {
+                dry_run: true,
+                ref_token: Some("@f0".to_string()),
+            },
+        )
+        .unwrap();
+        assert!(r.dry_run, "the bare `@f0` dry run plans without mutating");
+        assert!(
+            r.message.contains(f0_tree.as_str()),
+            "the bare `@f0` form must plan the same f0 snapshot as `t1@f0`, got: {}",
+            r.message
         );
     }
 }

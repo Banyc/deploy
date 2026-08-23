@@ -490,7 +490,7 @@ verification.
 16. Only an attempt whose fleet-commit markers are complete becomes `successful`. Both the normal success path and recovery finalize through ONE replay-safe finalizer that writes the recoverable `pending_commit` marker, then the snapshot entry and `refs/last-successful`, and appends the terminal `Successful` transition LAST (snapshot and ref first, status last, so the attempt is never recorded `successful` while its fleet snapshot is missing); the snapshot log (`<target>@fN`) and `refs/last-successful` advance only for such fully finalized attempts. The snapshot is built from the attempt's OUTCOMES — the per-slot actuals the engine observed on the main path, or `deployments/<id>/results.json` (falling back to the verified desired state when the outcomes were never persisted, e.g. a faulted `write_results`) during recovery — never from the intent record (`attempts.jsonl`), which carries no outcomes.
 17. Apply rotation under each server's mutation lock using the protection set defined below.
 
-The tool never claims fleet-wide atomicity. It reports `successful`, `pending_commit`, `failed_preflight`, `failed_rolled_back`, or `degraded`, including the actual generation on every server. An attempt that fails before any `current` change is `failed_preflight`. A later push always reconciles first and can finish an incomplete fleet commit (see step 15) or repair an incomplete target.
+The tool never claims fleet-wide atomicity. It reports `successful`, `pending_commit`, `failed_preflight`, `failed_rolled_back`, or `degraded`, including the actual generation on every server. An attempt that fails before any `current` change is `failed_preflight`: a preflight failure AFTER the attempt intent was persisted (capacity, staging) appends the terminal `FailedPreflight` transition to that attempt (never a stranded `in_progress`); a failure BEFORE the intent could be computed (plan resolution, historical behavior snapshot, handshake) surfaces as the push error with no attempt record at all. A later push always reconciles first and can finish an incomplete fleet commit (see step 15) or repair an incomplete target.
 
 The local target lock prevents competing pushes from the same local store. Expected-generation and compensation compare-and-swap checks prevent a second controller from being silently overwritten. Concurrent controllers can still cause a visible failed or degraded fleet attempt, but cannot create a lost update on an individual server.
 
@@ -566,6 +566,8 @@ Pushing an older successful reference restores its complete assignment, includin
 deploy push production production@f1
 ```
 
+The `:current` suffix on a fleet ref (`production@f1:current`) keeps the snapshot's release but reassigns each slot its CURRENT configured variant, sourcing the tree from that release's own per-variant bindings; the same physical-binding and membership checks apply, and the push fails closed if the release no longer ships the current variant.
+
 Exact fleet rollback requires the current target to contain the same stable placement-slot set as the saved deployment AND each slot's complete physical binding to match the binding the snapshot recorded (`bindings[slot]` = the `{server, deploy_dir}` pair from the slot's variant-file `[[slots]]` entry): a slot rebound to a different server — or moved to a different `deploy_dir` on the SAME server — would otherwise receive the historical generations on the wrong host or at the wrong on-server location. A legacy snapshot entry that never recorded the binding (pre-feature lines, or the intermediate server-only `servers` shape) is unverifiable and is refused the same way. Addresses may change and are taken from the current target definition after host-identity verification. If membership has changed or any slot's physical binding changed, exact rollback fails during preflight without modifying a server.
 
 Schema version 1 permits a target-history ref only as a source for that same target; cross-target deployment uses a release ref instead.
@@ -573,10 +575,11 @@ Schema version 1 permits a target-history ref only as a source for that same tar
 The operator may instead push an old release to the new target membership:
 
 ```sh
+deploy push production release/rel-41da2f63a950
 deploy push production release/rel-41da2f63a950:current
 ```
 
-That form assigns each slot the named release's tree for the variant the release's OWN stored slot snapshot assigns to it: a historical release resolves slot→variant bindings against the slots it was materialized from, never the caller's current variant files (only a legacy record without a stored slot snapshot falls back to the current declaring file). The abbreviated release ID must be unambiguous; scripts and persistent configuration use the full ID. The push fails if the release lacks any assigned variant.
+The BARE form assigns each slot the named release's tree for the variant the release's OWN stored slot snapshot assigns to it: a historical release resolves slot→variant bindings against the slots it was materialized from, never the caller's current variant files (only a legacy record without a stored slot snapshot falls back to the current declaring file). The `:current` suffix instead keeps each slot's CURRENT configured variant — the variant binding comes from the caller's current variant files (the declaring file, `config.slot_variant`), while the TREE still comes from the named release's own per-variant bindings: "assign each current server its configured variant from that release". The push fails closed (rollback error, no server touched) when the release lacks the assigned variant's tree — e.g. the variant was renamed after the release was materialized. The abbreviated release ID must be unambiguous; scripts and persistent configuration use the full ID.
 
 Rollback never rebuilds a tree. It uses the retained immutable object with the recorded digest. All required objects are checked locally and staged remotely before the first server changes. If an object is missing locally, reconciliation first attempts to recover it from a target server that retains the verified digest. If no verified copy can be recovered, preflight fails and leaves every `current` pointer unchanged.
 
@@ -654,7 +657,7 @@ The remote application root and state are writable only by the deployment accoun
 - Recover or compensate every unfinished transaction before another mutation.
 - Hold the server mutation lock across publication, activation, state commit, and rotation; staging alone may occur outside it in unique incoming paths.
 - Never delete a tree, release, or generation in the computed retained set.
-- Never infer fleet success from the local plan; reconcile actual generations and fleet-commit markers, and record successful, pending, failed, compensated, and degraded results.
+- Never infer fleet success from the local plan; reconcile actual generations and fleet-commit markers, and record every attempt (statuses: `successful`, `pending_commit`, `failed_preflight`, `failed_rolled_back`, `degraded`) with per-slot outcomes (`activated`, `failed`, `skipped`, `restored`; a failed slot's `compensated` flag records whether its compensation succeeded — step 11 records BOTH the failure and the compensation result).
 - Never describe fleet rollout as atomic; expose partial state explicitly.
 - Ensure a release variant always resolves to one canonical tree digest, independent of target or server.
 - Snapshot mappings, variant bindings, behavior contract, target placement-slot IDs, pre-push generations, desired generations, timestamps, and actual results.
