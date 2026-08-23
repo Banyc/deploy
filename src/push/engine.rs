@@ -9,7 +9,7 @@
 
 use crate::adapter::systemd::{run_activation, validate_artifact_paths};
 use crate::adapter::verify::run_verification;
-use crate::config::{Config, Mapping};
+use crate::config::{Config, Mapping, SlotDef};
 use crate::error::{Error, Result};
 use crate::history::{self, PushRef};
 use crate::layout;
@@ -232,16 +232,20 @@ fn push_inner(
         }
     }
 
-    // 4. Freeze per-variant mappings + behavior and generate or reuse the
-    // release record. The release identity covers the name-sorted mappings and
-    // behavior contracts of every declared variant plus each variant's tree.
-    // Capacity is NOT part of the release: it is a per-server policy resolved
-    // from the caller's current `deploy.toml` at preflight time (servers have
-    // no per-release history), so a server-capacity change never produces a
-    // new release. Rotation is fleet-wide configuration read from
-    // `deploy.toml` at push time, so it is not snapshotted per variant either.
+    // 4. Freeze per-variant mappings + behavior + slots and generate or reuse
+    // the release record. The release identity covers the name-sorted mappings,
+    // behavior contracts, and slot declarations of every declared variant plus
+    // each variant's tree. Slots ARE part of the identity: they are declared
+    // inside the variant files, so rebinding a slot to another server, moving
+    // its `deploy_dir`, or retargeting it produces a new release. Capacity is
+    // NOT part of the release: it is a per-server policy resolved from the
+    // caller's current `deploy.toml` at preflight time (servers have no
+    // per-release history), so a server-capacity change never produces a new
+    // release. Rotation is fleet-wide configuration read from `deploy.toml` at
+    // push time, so it is not snapshotted per variant either.
     let mut variant_mappings: BTreeMap<String, Vec<Mapping>> = BTreeMap::new();
     let mut variant_behaviors: BTreeMap<String, BehaviorContract> = BTreeMap::new();
+    let mut variant_slots: BTreeMap<String, Vec<SlotDef>> = BTreeMap::new();
     for v in config.variant_names() {
         let vcfg = config.variant(&v)?;
         variant_mappings.insert(v.clone(), vcfg.artifact.mappings.clone());
@@ -252,6 +256,7 @@ fn push_inner(
                 verification: vcfg.verification.clone(),
             },
         );
+        variant_slots.insert(v.clone(), vcfg.slots.clone());
     }
     let mapping_sha = crate::release::variant_mappings_digest(&variant_mappings);
     let behavior_sha = crate::release::variant_behaviors_digest(&variant_behaviors);
@@ -269,8 +274,13 @@ fn push_inner(
             .iter()
             .map(|(k, v)| (VariantName::new(k.clone()), v.clone()))
             .collect();
-        let rec =
-            crate::release::build_release(&mapping_sha, &behavior_sha, &bindings, project_root);
+        let rec = crate::release::build_release(
+            &mapping_sha,
+            &behavior_sha,
+            &bindings,
+            &variant_slots,
+            project_root,
+        );
         let rid = ReleaseId::new(rec.release_id.clone());
         if !opts.dry_run {
             store.write_release(&rec)?;

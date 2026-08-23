@@ -121,10 +121,36 @@ pub fn plan_assignments(
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
                 let slot_id = PlacementSlotId::new(slot.id.clone());
-                // The variant comes from the slot's declaring variant file.
-                let variant_name = config.slot_variant(&slot.id)?;
-                let variant = VariantName::new(variant_name.to_string());
-                let tree = rec.variants.get(variant_name).cloned().ok_or_else(|| {
+                // The variant comes from the release's OWN stored slot
+                // snapshot: a historical release resolves each slot's
+                // slot→variant binding against the slots it was materialized
+                // from, never the caller's current variant files. A record
+                // written before the canonical slot snapshot existed (empty
+                // `rec.slots`) falls back to the current configuration's
+                // declaring file. Note this slot declaration snapshot is
+                // distinct from a fleet snapshot's slot→SERVER bindings (the
+                // exact-rollback physical-host check): those remain a
+                // per-target deployment concern.
+                let variant_name = if rec.slots.is_empty() {
+                    // Legacy record: fall back to the current declaring file.
+                    config.slot_variant(&slot.id)?.to_string()
+                } else {
+                    rec.slots
+                        .iter()
+                        .find_map(|(v, cs)| {
+                            cs.slots
+                                .iter()
+                                .any(|s| s.id == slot_id.as_str())
+                                .then(|| v.clone())
+                        })
+                        .ok_or_else(|| {
+                            Error::rollback(format!(
+                                "release {release} declares no slot '{slot_id}'"
+                            ))
+                        })?
+                };
+                let variant = VariantName::new(variant_name.clone());
+                let tree = rec.variants.get(&variant_name).cloned().ok_or_else(|| {
                     Error::rollback(format!("release {release} lacks variant '{variant_name}'"))
                 })?;
                 out.push(PlannedAssignment {

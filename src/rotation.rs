@@ -307,6 +307,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 ("a".to_string(), "tree-a".to_string()),
                 ("b".to_string(), "tree-b".to_string()),
             ]),
+            slots: std::collections::BTreeMap::new(),
         };
         store.write_release(&rec).unwrap();
 

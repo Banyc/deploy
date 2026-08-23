@@ -193,20 +193,53 @@ pub struct CanonicalBehavior {
     pub verification: serde_json::Value,
 }
 
+/// One canonical slot declaration: the four identity-bearing fields of a
+/// [`crate::config::SlotDef`], with `deploy_dir` reduced to a lexically
+/// normalized absolute path string. Server-level policy (user, address, port,
+/// capacity) is deliberately absent: it is a per-server policy resolved from
+/// the caller's current configuration, never part of a release identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalSlot {
+    pub id: String,
+    pub server: String,
+    pub deploy_dir: String,
+    pub target: String,
+}
+
+/// The canonicalized slot declaration set of one variant: its slots sorted by
+/// slot id. A variant's slot declarations ARE release identity — rebinding a
+/// slot to another server, moving its `deploy_dir`, or retargeting it changes
+/// the release — so this snapshot is frozen into the release record and
+/// digest. It carries exactly the four [`CanonicalSlot`] fields and no derived
+/// state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalSlots {
+    pub slots: Vec<CanonicalSlot>,
+}
+
 /// The canonical release identity payload. It deliberately excludes the
 /// resulting release ID, creation time, display name, and provenance to avoid
 /// a circular hash.
 ///
 /// The payload covers the name-sorted per-variant mapping digest, the
-/// name-sorted per-variant behavior (activation + verification) digest, and
-/// the `variant -> tree digest` bindings. Capacity is NOT part of the release
-/// identity: it is a per-server policy resolved from the caller's current
-/// configuration, so a server-capacity change does NOT produce a new release.
+/// name-sorted per-variant behavior (activation + verification) digest, the
+/// name-sorted per-variant slot declaration digest, and the
+/// `variant -> tree digest` bindings. Slots ARE part of the release identity:
+/// they are declared inside the variant files, so rebinding a slot to another
+/// server, moving its `deploy_dir`, or retargeting it produces a new release.
+/// Capacity is NOT part of the release identity: it is a per-server policy
+/// resolved from the caller's current configuration, so a server-capacity
+/// change does NOT produce a new release.
+///
+/// Schema version 2: the identity payload now includes the per-variant slot
+/// declaration digest (added alongside the mappings/behavior digests).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalReleasePayload {
     pub schema_version: u32,
     pub mapping_sha256: String,
     pub behavior_sha256: String,
+    /// Canonical digest of the name-sorted per-variant slot declarations.
+    pub slots_digest: String,
     /// Sorted `variant -> tree digest` bindings.
     pub variants: std::collections::BTreeMap<String, String>,
 }
@@ -230,6 +263,16 @@ pub struct ReleaseRecord {
     pub provenance: Provenance,
     /// `variant -> tree digest`.
     pub variants: std::collections::BTreeMap<String, String>,
+    /// The release's OWN canonical per-variant slot declaration snapshot
+    /// (name-sorted, each variant's slots sorted by slot id). A historical or
+    /// rollback push resolves slot→variant bindings from this snapshot rather
+    /// than the caller's current variant files, so a historical release keeps
+    /// the slot declarations it was materialized from. Written since the
+    /// slots-into-identity refactor; `#[serde(default)]` keeps records written
+    /// by older code loadable (the empty map falls back to the caller's
+    /// current configuration for slot→variant resolution).
+    #[serde(default)]
+    pub slots: std::collections::BTreeMap<String, CanonicalSlots>,
 }
 
 /// Per-variant tree resolution result produced during materialization.

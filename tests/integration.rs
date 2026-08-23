@@ -106,6 +106,18 @@ target = "production"
 deploy_dir = "/srv/deploy/example"
 "#;
 
+/// A slot declaration that MOVES to the `canary` variant file (p1 on
+/// server-01, target `production`) — used to prove that a historical release
+/// resolves slot→variant bindings from its stored snapshot, not the caller's
+/// current variant files.
+const SLOT_MOVED_BODY: &str = r#"
+[[slots]]
+id = "p1"
+server = "server-01"
+target = "production"
+deploy_dir = "/srv/deploy/example"
+"#;
+
 fn write_file(path: &Path, content: &str) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).unwrap();
@@ -2723,6 +2735,311 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
         third.artifact.release, first.artifact.release,
         "a content change must produce a new release identity"
     );
+
+    Ok(())
+}
+
+/// Single-variant body declaring exactly one slot `p1` on the given server,
+/// with the same mappings/behavior used across the slot-identity tests.
+fn slot_only_variant_body(server: &str) -> String {
+    format!(
+        r#"
+[[slots]]
+id = "p1"
+server = "{server}"
+target = "production"
+deploy_dir = "/srv/deploy/example"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[[artifact.mappings]]
+from = "artifacts/deployment/common/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#
+    )
+}
+
+/// A slot-only change (rebinding a slot to a different server) creates a NEW
+/// `ReleaseId` while the tree/artifact bytes stay identical: the per-variant
+/// slot declarations are part of the canonical release identity (unlike
+/// per-server capacity, which is NOT). The stored release records persist
+/// their own canonical slot snapshots, and a later `push production
+/// release/<old>` resolves the OLD slot declaration from that snapshot.
+#[test]
+fn slot_only_change_creates_new_release_id() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store_base = tmp.path().join("store");
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    // Two servers; the slot starts on server-01 and is later rebound to
+    // server-02.
+    let deploy_toml = r#"
+schema_version = 1
+application = "example"
+release = "v1"
+
+[targets.production.rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[targets.production.rotation.fleet]
+protect_deployments = 2
+
+[[servers]]
+id = "server-01"
+address = "server-01.example.com"
+user = "deploy"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "server-02"
+address = "server-02.example.com"
+user = "deploy"
+host_key_fingerprint = "SHA256:test"
+
+[targets.production]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#;
+    write_file(&proj.join("deploy.toml"), deploy_toml);
+    write_variant_file(&proj, "standard", &slot_only_variant_body("server-01"));
+    let artifacts = proj.join("releases").join("v1").join("artifacts");
+    write_file(&artifacts.join("build/output/app/server"), "v1\n");
+    write_file(&artifacts.join("deployment/common/README"), "common\n");
+    let config_path = proj.join("deploy.toml");
+    let config = Config::load(&config_path)?;
+
+    let store = LocalStore::with_base(store_base.clone())?;
+    let rf = remotes_base.clone();
+    let factory = move |s: &deploy::config::ServerDef,
+                        _slot: &deploy::config::SlotDef|
+          -> Result<Box<dyn Remote>> {
+        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+    };
+
+    // f0: p1 on server-01.
+    let r0 = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r0.status, Some(DeploymentStatus::Successful));
+    let first = r0.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")].clone();
+    let old_release = first.artifact.release.clone();
+    let tree = first.artifact.tree.clone();
+
+    // Slot-only change: rebind p1 to server-02. No content, mapping, behavior,
+    // or capacity change anywhere else.
+    write_variant_file(&proj, "standard", &slot_only_variant_body("server-02"));
+    let config2 = Config::load(&config_path)?;
+    let r1 = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config2,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+    let second = r1.attempt.expect("attempt").slots[&PlacementSlotId::new("p1")].clone();
+    assert_ne!(
+        second.artifact.release, old_release,
+        "a slot-only change must produce a new release identity"
+    );
+    assert_eq!(
+        second.artifact.tree, tree,
+        "the tree bytes are unchanged by a slot-only change"
+    );
+    assert_eq!(
+        std::fs::read_dir(store_base.join("releases"))?.count(),
+        2,
+        "two releases recorded"
+    );
+
+    // Each release persists ITS OWN canonical slot snapshot.
+    let rec_old = store.read_release(&old_release)?;
+    let rec_new = store.read_release(&second.artifact.release)?;
+    assert_eq!(rec_old.slots["standard"].slots[0].server, "server-01");
+    assert_eq!(rec_new.slots["standard"].slots[0].server, "server-02");
+
+    // Historical push of the OLD release resolves the OLD slot declaration
+    // from the stored snapshot (server-01 stays in the record) — not the
+    // caller's current variant file — and the historical push never rewrites
+    // the stored snapshot.
+    let rh = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config2,
+        &PushOptions {
+            dry_run: false,
+            ref_token: Some(format!("release/{}", old_release.as_str())),
+        },
+    )?;
+    assert_eq!(rh.status, Some(DeploymentStatus::Successful));
+    let hist = rh.attempt.expect("attempt").slots[&PlacementSlotId::new("p1")].clone();
+    assert_eq!(hist.artifact.release, old_release);
+    assert_eq!(hist.artifact.variant.as_str(), "standard");
+    let rec_after = store.read_release(&old_release)?;
+    assert_eq!(
+        rec_after.slots["standard"].slots[0].server, "server-01",
+        "the historical push must not rewrite the stored slot snapshot"
+    );
+
+    Ok(())
+}
+
+/// A historical release resolves each slot's variant binding from its OWN
+/// stored slot snapshot, never the caller's current variant files. Here the
+/// slot `p1` is declared by variant `standard` in the old release, but the
+/// current config moved the declaration into a new `canary` variant file.
+/// `push production release/<old>` must still assign p1 to `standard` (with
+/// the old tree) — the pre-refactor code resolved the variant from the current
+/// config and failed with `release ... lacks variant 'canary'`.
+#[test]
+fn historical_release_resolves_slots_from_stored_snapshot() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store_base = tmp.path().join("store");
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    let deploy_toml = r#"
+schema_version = 1
+application = "example"
+release = "v1"
+
+[targets.production.rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[targets.production.rotation.fleet]
+protect_deployments = 2
+
+[[servers]]
+id = "server-01"
+address = "server-01.example.com"
+user = "deploy"
+host_key_fingerprint = "SHA256:test"
+
+[targets.production]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#;
+    let config_path = write_string(&proj.join("deploy.toml"), deploy_toml);
+    // f0: the slot is declared inside the `standard` variant file.
+    write_variant_file(&proj, "standard", &slot_only_variant_body("server-01"));
+    let artifacts = proj.join("releases").join("v1").join("artifacts");
+    write_file(&artifacts.join("build/output/app/server"), "v1\n");
+    write_file(&artifacts.join("deployment/common/README"), "common\n");
+    let config0 = Config::load(&config_path)?;
+
+    let store = LocalStore::with_base(store_base.clone())?;
+    let rf = remotes_base.clone();
+    let factory = move |s: &deploy::config::ServerDef,
+                        _slot: &deploy::config::SlotDef|
+          -> Result<Box<dyn Remote>> {
+        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+    };
+
+    let r0 = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config0,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r0.status, Some(DeploymentStatus::Successful));
+    let first = r0.attempt.expect("attempt").slots[&PlacementSlotId::new("p1")].clone();
+    let old_release = first.artifact.release.clone();
+    let old_tree = first.artifact.tree.clone();
+
+    // v2: the slot declaration MOVES to a new `canary` variant file; `standard`
+    // still exists (with the same mappings) but no longer declares any slot.
+    // The current config therefore says p1 is a `canary` slot.
+    write_variant_file(&proj, "standard", VARIANT_BODY);
+    write_variant_file(&proj, "canary", &format!("{VARIANT_BODY}{SLOT_MOVED_BODY}"));
+    write_file(
+        &artifacts.join("deployment/variants/standard/extra"),
+        "std\n",
+    );
+    write_file(
+        &artifacts.join("deployment/variants/canary/extra"),
+        "canary\n",
+    );
+    let config1 = Config::load(&config_path)?;
+    assert_eq!(config1.slot_variant("p1").unwrap(), "canary");
+    let r1 = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config1,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+    let current = r1.attempt.expect("attempt").slots[&PlacementSlotId::new("p1")].clone();
+    assert_eq!(current.artifact.variant.as_str(), "canary");
+    assert_ne!(current.artifact.release, old_release);
+
+    // Historical push of the OLD release: the plan must resolve p1's variant
+    // from the OLD release's stored slot snapshot (`standard`) and its old
+    // tree — NOT from the current config (`canary`).
+    let rh = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config1,
+        &PushOptions {
+            dry_run: false,
+            ref_token: Some(format!("release/{}", old_release.as_str())),
+        },
+    )?;
+    assert_eq!(rh.status, Some(DeploymentStatus::Successful));
+    let hist = rh.attempt.expect("attempt").slots[&PlacementSlotId::new("p1")].clone();
+    assert_eq!(hist.artifact.release, old_release);
+    assert_eq!(
+        hist.artifact.variant.as_str(),
+        "standard",
+        "historical resolution must use the stored slot snapshot, not the current variant file"
+    );
+    assert_eq!(hist.artifact.tree, old_tree);
 
     Ok(())
 }

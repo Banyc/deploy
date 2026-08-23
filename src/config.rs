@@ -15,8 +15,9 @@
 //!
 //! The same local inputs always produce one target-independent release identity
 //! (see `model::ReleaseDigest`): the name-sorted per-variant mappings, the
-//! name-sorted per-variant behavior contracts, and every declared variant's
-//! tree binding.
+//! name-sorted per-variant behavior contracts, the name-sorted per-variant
+//! slot declarations (each variant's `[[slots]]` canonicalized and sorted by
+//! slot id), and every declared variant's tree binding.
 
 use crate::error::{Error, Result};
 use crate::model::{PlacementSlotId, SCHEMA_VERSION, ServerId};
