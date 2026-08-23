@@ -1863,6 +1863,55 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
     let attempts = store.read_attempts("production")?;
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].deployment_id, attempt1.deployment_id);
+
+    // Push 3 with the same healthy remote: the attempt was already finalized
+    // on push 2, so reconciliation must SKIP it (eligibility is the MUTABLE
+    // status, now Successful, not the append-only attempts.jsonl record which
+    // still says PendingCommit). No re-reconciliation, no duplicate reflog
+    // entry, no ref churn, no marker rewrite.
+    let marker_before = std::fs::read(&marker)?;
+    let last_successful_before = store.read_last_successful("production").unwrap();
+    let r3 = push(
+        &proj.join("deploy.toml"),
+        &store,
+        &clean_factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r3.status, None);
+    assert_eq!(r3.message, "Everything up to date");
+    let reflog = store.read_reflog("production")?;
+    assert_eq!(
+        reflog.len(),
+        1,
+        "reconciled attempt must remain eligible for the reflog only once"
+    );
+    assert_eq!(reflog[0].deployment_id, attempt1.deployment_id);
+    assert_eq!(
+        store.read_last_successful("production").as_deref(),
+        Some(last_successful_before.as_str()),
+        "last-successful must be unchanged by a redundant push"
+    );
+    assert_eq!(
+        std::fs::read(&marker)?,
+        marker_before,
+        "marker must be untouched by a redundant push"
+    );
+    let status = std::fs::read_to_string(
+        store
+            .deployment_dir(attempt1.deployment_id.as_str())
+            .join("status"),
+    )?;
+    assert_eq!(
+        status, "Successful",
+        "mutable status must remain Successful after the redundant push"
+    );
+    let attempts = store.read_attempts("production")?;
+    assert_eq!(attempts.len(), 1, "no new attempt on a redundant push");
     Ok(())
 }
 

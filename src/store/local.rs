@@ -542,6 +542,19 @@ impl LocalStore {
         std::fs::write(&p, status).map_err(|e| Error::store(format!("write status: {e}")))?;
         set_private(&p)
     }
+
+    /// Read the mutable status file for a deployment. `None` when no status
+    /// file exists yet (e.g. an attempt was just recorded but not finalized);
+    /// the recorded Debug string otherwise ("Successful", "Degraded", ...).
+    pub fn read_status(&self, id: &str) -> Result<Option<String>> {
+        let p = self.deployment_dir(id).join("status");
+        if !p.exists() {
+            return Ok(None);
+        }
+        std::fs::read_to_string(&p)
+            .map(Some)
+            .map_err(|e| Error::store(format!("read status: {e}")))
+    }
 }
 
 /// Sanitize a name for use as a directory/file component.

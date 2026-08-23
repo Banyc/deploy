@@ -79,6 +79,12 @@ pub fn ref_name(target: &TargetName, index: u64) -> String {
 }
 
 /// Append a successful fleet snapshot to the reflog and return its index.
+///
+/// Idempotent by deployment ID: deployment IDs are unique per attempt, so a
+/// deployment must appear in the reflog exactly once. If an entry for
+/// `attempt.deployment_id` already exists, this returns that entry's index
+/// WITHOUT appending a duplicate and WITHOUT rewriting `refs/last-successful`
+/// (the entry already advanced the ref when it was first appended).
 pub fn append_successful_reflog(
     store: &LocalStore,
     target: &TargetName,
@@ -86,6 +92,12 @@ pub fn append_successful_reflog(
 ) -> Result<u64> {
     let target = target.as_str();
     let entries = store.read_reflog(target)?;
+    if let Some(existing) = entries
+        .iter()
+        .find(|e| e.deployment_id == attempt.deployment_id)
+    {
+        return Ok(existing.index);
+    }
     let next = entries.len() as u64;
     let entry = build_reflog_entry(next, attempt);
     store.append_reflog(target, &entry)?;
@@ -147,7 +159,9 @@ pub fn reflog_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ReleaseId;
+    use crate::model::{DeploymentId, ReleaseId, ServerId};
+    use crate::records::DeploymentStatus;
+    use std::collections::BTreeMap;
 
     #[test]
     fn parse_ref_forms() {
@@ -182,6 +196,47 @@ mod tests {
         assert_eq!(
             ref_name(&TargetName::new("production".to_string()), 3),
             "production@f3"
+        );
+    }
+
+    #[test]
+    fn append_successful_reflog_is_idempotent_by_deployment_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        let target = TargetName::new("production".to_string());
+        let attempt = AttemptRecord {
+            deployment_schema_version: 1,
+            deployment_id: DeploymentId::new("deploy-idempotent".to_string()),
+            status: DeploymentStatus::Successful,
+            target: target.clone(),
+            server_ids: vec![ServerId::new("server-01".to_string())],
+            behavior_sha256: "sha256-aa".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            desired: BTreeMap::new(),
+            pre_push: BTreeMap::new(),
+            servers: BTreeMap::new(),
+        };
+
+        // First call appends the entry and advances the ref.
+        let first = append_successful_reflog(&store, &target, &attempt).unwrap();
+        assert_eq!(first, 0);
+        let reflog = store.read_reflog(target.as_str()).unwrap();
+        assert_eq!(reflog.len(), 1);
+        assert_eq!(reflog[0].deployment_id, attempt.deployment_id);
+        assert_eq!(
+            store.read_last_successful(target.as_str()).as_deref(),
+            Some("deploy-idempotent")
+        );
+
+        // Second call with the same deployment ID is a no-op: same index, no
+        // duplicate entry, and `refs/last-successful` is untouched.
+        let second = append_successful_reflog(&store, &target, &attempt).unwrap();
+        assert_eq!(second, first, "repeated append must return the same index");
+        let reflog = store.read_reflog(target.as_str()).unwrap();
+        assert_eq!(reflog.len(), 1, "no duplicate reflog entry");
+        assert_eq!(
+            store.read_last_successful(target.as_str()).as_deref(),
+            Some("deploy-idempotent")
         );
     }
 }

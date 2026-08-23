@@ -939,8 +939,16 @@ fn push_inner(
 /// file still says `PendingCommit`, the reflog never advanced, and a naive
 /// "Everything up to date" push would otherwise skip the missing markers.
 ///
-/// For each pending attempt, oldest first (attempts.jsonl order, so reflog
-/// indices stay monotonic):
+/// Eligibility is determined by the MUTABLE status file
+/// (`deployments/<id>/status`), not the append-only `attempts.jsonl` record:
+/// an attempt is reconciled only while its mutable status is `PendingCommit`
+/// (or the status file is momentarily absent for a just-recorded attempt).
+/// Once a push finalizes the mutable status to `Successful` or `Degraded`, the
+/// attempt is skipped on every later push — a finalized attempt is never
+/// re-reconciled and never re-entered into the reflog.
+///
+/// For each eligible pending attempt, oldest first (attempts.jsonl order, so
+/// reflog indices stay monotonic):
 /// 1. Membership: every participating server must still exist in the target.
 /// 2. Generations: each participating server's CURRENT generation (fresh
 ///    `helper.status()`) must equal the generation the attempt recorded for it
@@ -967,11 +975,25 @@ fn reconcile_pending_commits(
     op_id: &OperationId,
     helpers: &HashMap<ServerId, RemoteHelper>,
 ) -> Result<()> {
-    let pending: Vec<AttemptRecord> = store
-        .read_attempts(target_name)?
-        .into_iter()
-        .filter(|a| a.status == DeploymentStatus::PendingCommit)
-        .collect();
+    // Eligible attempts: the append-only attempts.jsonl record must say
+    // `PendingCommit` (a legitimately new pending attempt whose status file is
+    // momentarily absent is still eligible), but the MUTABLE status file is
+    // authoritative once it exists — a finalized attempt (`Successful` /
+    // `Degraded`) is skipped regardless of what attempts.jsonl says, so an
+    // already-reconciled attempt is never re-reconciled on a later push.
+    let mut pending: Vec<AttemptRecord> = Vec::new();
+    for attempt in store.read_attempts(target_name)? {
+        if attempt.status != DeploymentStatus::PendingCommit {
+            continue;
+        }
+        match store.read_status(attempt.deployment_id.as_str())? {
+            // Status file not written yet: legitimately new pending attempt.
+            None => pending.push(attempt),
+            Some(s) if s == "PendingCommit" => pending.push(attempt),
+            // Finalized on an earlier push (Successful/Degraded): skip.
+            Some(_) => {}
+        }
+    }
     if pending.is_empty() {
         return Ok(());
     }
