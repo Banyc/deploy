@@ -13,7 +13,7 @@
 //! Rotation is a mark-and-sweep operation: a tree object is deleted only when no
 //! retained binding or applicable pin references it.
 
-use crate::config::{Pin, PinVariants, RotationConfig};
+use crate::config::{Pin, RotationConfig};
 use crate::error::Result;
 use crate::model::{ReleaseId, TreeDigest};
 use crate::remote::helper::RemoteHelper;
@@ -137,21 +137,18 @@ pub fn compute_retained(
         }
     }
 
-    // Durable pins.
+    // Durable pins. A pin protects the whole release: every variant's tree
+    // recorded in the release record is retained, so the pinned release stays
+    // fully rollback-able no matter how old it is or how far outside the
+    // count/age windows it falls.
     for pin in pins {
         let rid = ReleaseId::parse(&pin.release);
         let rec = match store.read_release(&rid) {
             Ok(r) => r,
             Err(_) => continue,
         };
-        let variants: Vec<String> = match &pin.variants {
-            PinVariants::All => rec.variants.keys().cloned().collect(),
-            PinVariants::Some(list) => list.clone(),
-        };
-        for v in variants {
-            if let Some(tree) = rec.variants.get(&v) {
-                retained.insert(tree.clone());
-            }
+        for tree in rec.variants.values() {
+            retained.insert(tree.clone());
         }
     }
 
@@ -283,5 +280,49 @@ pods = ["p1"]
             compute_retained(&helper, &c.pins, &store, &c.targets["t1"].rotation).unwrap();
         assert!(retained.contains("t2"), "current tree retained");
         assert!(retained.contains("t1"), "previous tree retained");
+    }
+
+    /// A pin protects the whole release: every variant's tree recorded in the
+    /// pinned release is retained even when nothing else would keep it.
+    #[test]
+    fn pin_protects_every_variant_of_a_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+
+        // A release with two variants, persisted in the local store.
+        let rec = crate::model::ReleaseRecord {
+            release_schema_version: 1,
+            release_id: "rel-sha256-pin-test".into(),
+            release_sha256: "pin-test".into(),
+            created_at: "2020-01-01T00:00:00Z".into(),
+            provenance: crate::model::Provenance {
+                git_revision: None,
+                mapping_sha256: String::new(),
+                behavior_sha256: String::new(),
+            },
+            variants: std::collections::BTreeMap::from([
+                ("a".to_string(), "tree-a".to_string()),
+                ("b".to_string(), "tree-b".to_string()),
+            ]),
+        };
+        store.write_release(&rec).unwrap();
+
+        let c = cfg();
+        let rotation = &c.targets["t1"].rotation;
+        let pinned = [Pin {
+            release: "rel-sha256-pin-test".into(),
+            reason: "known-good".into(),
+        }];
+
+        // Without the pin the server has no history, so nothing is retained.
+        let bare = compute_retained(&helper, &[], &store, rotation).unwrap();
+        assert!(bare.is_empty(), "no history and no pins retains nothing");
+
+        // With the pin, BOTH variants' trees are protected.
+        let retained = compute_retained(&helper, &pinned, &store, rotation).unwrap();
+        assert!(retained.contains("tree-a"), "variant a protected by the pin");
+        assert!(retained.contains("tree-b"), "variant b protected by the pin");
     }
 }

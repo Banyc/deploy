@@ -49,14 +49,6 @@ pub enum ConflictPolicy {
     Keep,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PinVariants {
-    #[default]
-    All,
-    Some(Vec<String>),
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Mapping {
     /// Source path relative to the release directory (`releases/<release>/`),
@@ -214,11 +206,11 @@ impl From<&VariantConfig> for VariantPolicy {
     }
 }
 
+/// Durable protection for one whole release: every variant's artifact in the
+/// pinned release is retained forever; rotation never sweeps it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Pin {
     pub release: String,
-    #[serde(default)]
-    pub variants: PinVariants,
     pub reason: String,
 }
 

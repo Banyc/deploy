@@ -105,7 +105,6 @@ release = "v1"              # the release directory is forced to releases/v1/
 
 [[pins]]
 release = "rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1"
-variants = "all"
 reason = "known-good recovery release"
 
 # Retention policy — a target-level setting, not a per-variant or global one.
@@ -490,7 +489,7 @@ For each server, the retained content set is exactly this union:
 - the artifact referenced by the current generation
 - the prior distinct successful artifact when protect_previous is true
 - artifacts referenced by incomplete transactions
-- artifacts or releases selected by durable pins
+- releases selected by durable pins
 - the newest keep_distinct_artifacts distinct successful artifact bindings
 - artifacts successfully activated less than keep_days ago
 - that server's artifacts in the newest protect_deployments fleet commits
