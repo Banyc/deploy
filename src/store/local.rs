@@ -866,4 +866,86 @@ mod tests {
         );
         assert_eq!(store.read_transitions(id).unwrap().len(), 3);
     }
+
+    /// The attempts stream is append-only: appending a SECOND record with the
+    /// SAME deployment id (the engine never does — ids are minted fresh)
+    /// appends rather than replacing, so the log always preserves every
+    /// recorded intent. Deployment IDs are unique by construction, so the
+    /// duplicate case exercises corruption-tolerant append semantics, not a
+    /// rewrite.
+    #[test]
+    fn attempts_stream_is_append_only_for_duplicate_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let target = "t1";
+        let attempt = DeploymentAttempt {
+            deployment_schema_version: 2,
+            deployment_id: DeploymentId::new("deploy-dup".to_string()),
+            target: TargetName::new(target.to_string()),
+            slot_ids: vec![],
+            behavior_sha256: "sha256-aa".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            desired: BTreeMap::new(),
+            pre_push: BTreeMap::new(),
+            slots: BTreeMap::new(),
+        };
+        store.append_attempt(target, &attempt).unwrap();
+        let second = DeploymentAttempt {
+            attempted_at: "2026-01-02T00:00:00Z".to_string(),
+            ..attempt.clone()
+        };
+        store.append_attempt(target, &second).unwrap();
+
+        let attempts = store.read_attempts(target).unwrap();
+        assert_eq!(
+            attempts.len(),
+            2,
+            "append-only: a duplicate id appends a second record, never replaces"
+        );
+        assert_eq!(attempts[0].deployment_id, attempts[1].deployment_id);
+        assert_eq!(attempts[0].attempted_at, "2026-01-01T00:00:00Z");
+        assert_eq!(attempts[1].attempted_at, "2026-01-02T00:00:00Z");
+    }
+
+    /// `arm_append_transition_successful` is status-qualified and one-shot:
+    /// non-`Successful` appends (the recoverable `PendingCommit` marker, an
+    /// `InProgress` overlay) pass through untouched, the FIRST `Successful`
+    /// append fails, and a later `Successful` append passes.
+    #[test]
+    fn transition_successful_fault_is_status_qualified_and_one_shot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let id = "deploy-txn-success-fault";
+
+        test_faults::arm_append_transition_successful(id);
+        // The recoverable finalize marker passes through (status-qualified).
+        store
+            .append_transition(
+                id,
+                &DeploymentStatus::PendingCommit,
+                Some("finalization started"),
+            )
+            .expect("PendingCommit append passes through untouched");
+        // The FIRST Successful append fires the fault.
+        let err = store
+            .append_transition(id, &DeploymentStatus::Successful, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("append_transition"));
+        // A later Successful append passes (one-shot, disarmed).
+        store
+            .append_transition(id, &DeploymentStatus::Successful, None)
+            .expect("disarmed");
+
+        // Re-arm: an InProgress overlay must not consume the arm.
+        test_faults::arm_append_transition_successful(id);
+        store
+            .append_transition(id, &DeploymentStatus::InProgress, None)
+            .expect("InProgress append does not consume the arm");
+        store
+            .append_transition(id, &DeploymentStatus::Successful, None)
+            .expect_err("first Successful append fires again");
+        store
+            .append_transition(id, &DeploymentStatus::Successful, None)
+            .expect("disarmed again");
+    }
 }

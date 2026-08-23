@@ -2480,4 +2480,492 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         assert_eq!(h.store.read_attempts("t1").unwrap().len(), 2);
     }
+
+    // ---- Transition sequence, outcomes separation, no-op trace, mid-mutation
+    // durability, and multi-attempt reconcile ordering -----------------------
+
+    /// A remote that fails the FIRST generation-record write exactly once
+    /// (`try_write_new` under `generations/`), then behaves normally. Fires
+    /// inside `create_generation`, i.e. AFTER the intent is durable and BEFORE
+    /// the server's `current` advances: the exact mid-mutation window.
+    struct FailOnceGenerationRemote {
+        inner: LocalTransport,
+        armed: Arc<AtomicBool>,
+    }
+
+    impl FailOnceGenerationRemote {
+        fn build(base: PathBuf, armed: Arc<AtomicBool>) -> Result<Box<dyn Remote>> {
+            Ok(Box::new(FailOnceGenerationRemote {
+                inner: LocalTransport::new(base)?,
+                armed,
+            }))
+        }
+        fn fail_generation(&self, rel: &std::path::Path) -> bool {
+            self.armed.load(Ordering::SeqCst)
+                && rel.to_string_lossy().starts_with("generations/")
+                && rel.to_string_lossy().ends_with("assignment.json")
+        }
+    }
+
+    impl Remote for FailOnceGenerationRemote {
+        fn root(&self) -> &std::path::Path {
+            self.inner.root()
+        }
+        fn read(&self, rel: &std::path::Path) -> Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<bool> {
+            if self.fail_generation(rel) {
+                self.armed.store(false, Ordering::SeqCst);
+                return Err(Error::remote(
+                    "FailOnceGenerationRemote: generation write forced to fail (once)",
+                ));
+            }
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &std::path::Path, mode: u32) -> Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(
+            &self,
+            rel: &std::path::Path,
+        ) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &std::path::Path) -> Result<std::path::PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &std::path::Path) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &std::path::Path) -> Result<crate::remote::transport::RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn exec(
+            &self,
+            argv: &[String],
+            timeout: std::time::Duration,
+        ) -> Result<crate::remote::transport::ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+        fn available_bytes(&self) -> Result<u64> {
+            self.inner.available_bytes()
+        }
+    }
+
+    /// Recursively snapshot every file under `dir` as (relative path, bytes),
+    /// sorted, for byte-for-byte store-comparison assertions.
+    fn snapshot_files(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let e = e.unwrap();
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    let rel = p.strip_prefix(dir).unwrap().to_string_lossy().into_owned();
+                    out.push((rel, std::fs::read(&p).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// A clean successful push records the EXACT latest-status evolution
+    /// `InProgress -> PendingCommit (finalize marker) -> Successful` (the
+    /// recoverable window is `PendingCommit`), writes `results.json` after the
+    /// mutation loop, and builds the snapshot from those OUTCOMES — the
+    /// persisted intent record itself carries an empty `slots` map.
+    #[test]
+    fn clean_push_transition_sequence_and_outcomes() {
+        let h = RecoveryHarness::new();
+        let id = DeploymentId::new("deploy-sequence".to_string());
+        let r = push_main_with_id(&h, &id).unwrap();
+        assert_eq!(r.status, Some(DeploymentStatus::Successful));
+
+        let transitions = h.store.read_transitions(id.as_str()).unwrap();
+        let statuses: Vec<DeploymentStatus> =
+            transitions.iter().map(|t| t.status.clone()).collect();
+        assert_eq!(
+            statuses,
+            vec![
+                DeploymentStatus::InProgress,
+                DeploymentStatus::PendingCommit,
+                DeploymentStatus::Successful,
+            ],
+            "a successful push must evolve InProgress -> PendingCommit -> Successful"
+        );
+        // The finalize marker carries the recoverable-window reason.
+        assert_eq!(
+            transitions[1].reason.as_deref(),
+            Some("finalization started")
+        );
+
+        // Outcomes separation: results.json exists with the per-slot outcome
+        // and the persisted intent carries NO outcomes.
+        let results = h.store.read_results(id.as_str()).unwrap();
+        assert_eq!(
+            results.slots[&PlacementSlotId::new("p1")].outcome,
+            ServerOutcomeKind::Activated
+        );
+        let attempt = single_attempt(&h);
+        assert!(
+            attempt.slots.is_empty(),
+            "the persisted intent record must carry no outcomes"
+        );
+
+        // The snapshot is built from the OUTCOMES: its per-slot generation
+        // equals results.json's outcome generation, and its artifact equals the
+        // report's actual (observed) assignment.
+        let snapshots = h.store.read_snapshots("t1").unwrap();
+        assert_eq!(snapshots.len(), 1);
+        let snap = &snapshots[0];
+        assert_eq!(
+            snap.slots[&PlacementSlotId::new("p1")].generation,
+            results.slots[&PlacementSlotId::new("p1")]
+                .generation
+                .clone()
+                .unwrap()
+        );
+        let actual = &r.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")];
+        assert_eq!(
+            snap.slots[&PlacementSlotId::new("p1")].assignment.artifact,
+            actual.artifact
+        );
+    }
+
+    /// A remote failure MID-mutation (after the intent is durable, before the
+    /// server's generation record — and therefore `current` — exists) leaves
+    /// the intent record durable with an EMPTY outcomes map, records a failure
+    /// outcome in results.json, and never advances the remote; a follow-up
+    /// clean push recovers.
+    #[test]
+    fn mid_mutation_fault_leaves_intent_durable_without_advancing_remote() {
+        let h = RecoveryHarness::new();
+        let id = DeploymentId::new("deploy-mid-mutation".to_string());
+        let armed = Arc::new(AtomicBool::new(true));
+        let armed_for_factory = armed.clone();
+        let rf = h.remotes_base.clone();
+        let fault_factory = move |s: &crate::config::ServerDef,
+                                  _slot: &crate::config::SlotDef|
+              -> Result<Box<dyn Remote>> {
+            FailOnceGenerationRemote::build(rf.join(&s.id), armed_for_factory.clone())
+        };
+        let project_root = h.config.project_root(&h.cfg_path);
+        let target = h.config.targets.get("t1").expect("harness target");
+        let op_id = OperationId::new(format!("op-{}", id.as_str()));
+        let r = push_inner(
+            &project_root,
+            &h.store,
+            &fault_factory,
+            "t1",
+            &PushRef::Head,
+            &id,
+            &op_id,
+            &h.config,
+            target,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            r.status == Some(DeploymentStatus::FailedRolledBack)
+                || r.status == Some(DeploymentStatus::Degraded),
+            "mid-mutation failure must be reported as a failure, got {:?}",
+            r.status
+        );
+
+        // The intent record is durable with EMPTY outcomes (results live in
+        // results.json, which records the per-slot failure).
+        let attempts = h.store.read_attempts("t1").unwrap();
+        assert_eq!(attempts.len(), 1, "intent must be recorded before mutation");
+        assert!(attempts[0].slots.is_empty(), "intent carries no outcomes");
+        assert_eq!(
+            latest_status(&h, id.as_str()),
+            DeploymentStatus::FailedRolledBack
+        );
+        let results = h.store.read_results(id.as_str()).unwrap();
+        assert_eq!(
+            results.slots[&PlacementSlotId::new("p1")].outcome,
+            ServerOutcomeKind::Failed
+        );
+
+        // The remote never advanced: no `current`, no durable generation
+        // record (the mid-mutation fault fired before the assignment write, so
+        // the generation dir may exist but is empty).
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        assert!(!remote.exists(crate::layout::current()), "no current");
+        for e in remote.list(crate::layout::generations()).unwrap() {
+            assert!(
+                !remote.exists(
+                    &crate::layout::generations()
+                        .join(&e.name)
+                        .join("assignment.json")
+                ),
+                "no generation record may be durable ({} was never written)",
+                e.name
+            );
+        }
+
+        // A follow-up clean push succeeds and advances the remote.
+        let r2 = push_clean(&h).unwrap();
+        assert_eq!(
+            r2.status,
+            Some(DeploymentStatus::Successful),
+            "the interrupted state must be recoverable: {}",
+            r2.message
+        );
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        assert!(remote.exists(crate::layout::current()), "remote advanced");
+        assert_eq!(h.store.read_attempts("t1").unwrap().len(), 2);
+    }
+
+    /// Everything-up-to-date no-op: a second push with nothing changed records
+    /// no new attempt, no new snapshot, no transition stream, and leaves the
+    /// whole per-target store state byte-for-byte identical (attempts,
+    /// transitions, observed, refs).
+    #[test]
+    fn no_op_push_leaves_store_untouched() {
+        let h = RecoveryHarness::new();
+        let id = DeploymentId::new("deploy-noop-baseline".to_string());
+        let r1 = push_main_with_id(&h, &id).unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+
+        let target_dir = h.store.target_dir("t1");
+        let before = snapshot_files(&target_dir);
+
+        let r2 = push_clean(&h).unwrap();
+        assert_eq!(r2.status, None, "no-op push creates no attempt");
+        assert_eq!(r2.message, "Everything up to date");
+        assert_eq!(
+            h.store.read_attempts("t1").unwrap().len(),
+            1,
+            "no new attempt may be recorded by the no-op"
+        );
+        assert_eq!(
+            h.store.read_snapshots("t1").unwrap().len(),
+            1,
+            "no new snapshot may be appended by the no-op"
+        );
+
+        let after = snapshot_files(&target_dir);
+        assert_eq!(
+            before, after,
+            "the no-op push must not touch any store file (attempts, transitions, observed, refs)"
+        );
+        // Observed still reflects the successful push.
+        let observed = h.store.read_observed("t1").unwrap();
+        assert_eq!(
+            observed.slots[&PlacementSlotId::new("p1")].generation,
+            r1.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")].generation
+        );
+    }
+
+    /// A just-recorded attempt with NO transition stream at all (latest status
+    /// `None`) is eligible for reconciliation: the next push finalizes it
+    /// Successful with its own snapshot entry instead of skipping it.
+    #[test]
+    fn reconcile_attempt_without_transitions_is_eligible() {
+        let h = RecoveryHarness::new();
+        let id_b = DeploymentId::new("deploy-no-status-baseline".to_string());
+        let r1 = push_main_with_id(&h, &id_b).unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+        let baseline = r1.attempt.as_ref().expect("attempt recorded");
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        assert!(remote.exists(crate::layout::current()), "remote advanced");
+
+        // Craft an intent with NO transition appended: eligibility treats the
+        // absent status file as eligible (a just-recorded attempt).
+        let id_a = DeploymentId::new("deploy-no-status".to_string());
+        let desired_ref = baseline.desired[&PlacementSlotId::new("p1")].clone();
+        let intent = DeploymentAttempt {
+            deployment_schema_version: 2,
+            deployment_id: id_a.clone(),
+            target: TargetName::new("t1".to_string()),
+            slot_ids: vec![PlacementSlotId::new("p1".to_string())],
+            behavior_sha256: baseline.behavior_sha256.clone(),
+            attempted_at: crate::remote::helper::now_rfc3339(),
+            desired: BTreeMap::from([(PlacementSlotId::new("p1".to_string()), desired_ref)]),
+            pre_push: BTreeMap::new(),
+            slots: BTreeMap::new(),
+        };
+        h.store.append_attempt("t1", &intent).unwrap();
+        assert_eq!(
+            h.store.latest_status(id_a.as_str()).unwrap(),
+            None,
+            "no transition stream for the crafted attempt"
+        );
+
+        // The next push reconciles the transition-less attempt (the remote is
+        // already at its desired generation) and finalizes it Successful.
+        let r2 = push_clean(&h).unwrap();
+        assert_eq!(r2.status, None, "reconciling push is an up-to-date no-op");
+        assert_eq!(r2.message, "Everything up to date");
+        assert_eq!(
+            latest_status(&h, id_a.as_str()),
+            DeploymentStatus::Successful
+        );
+        let snapshots = h.store.read_snapshots("t1").unwrap();
+        assert_eq!(snapshots.len(), 2, "baseline + reconciled attempt");
+        assert_eq!(snapshots[1].deployment_id, id_a);
+        assert_eq!(snapshots[1].index, 1);
+        assert_eq!(
+            h.store.read_last_successful("t1").as_deref(),
+            Some(id_a.as_str())
+        );
+        let marker = h
+            .remotes_base
+            .join("s1")
+            .join(crate::layout::commit_marker(id_a.as_str()));
+        assert!(marker.exists(), "marker written for the original id");
+    }
+
+    /// Multiple pending attempts are reconciled OLDEST FIRST (attempts.jsonl
+    /// order) so snapshot/reflog indices stay monotonic: two crafted
+    /// `InProgress` intents appended A-then-B finalize in that order with
+    /// indices 1 and 2 after the baseline.
+    #[test]
+    fn reconcile_multiple_pending_oldest_first_with_monotonic_indices() {
+        let h = RecoveryHarness::new();
+        let id_b = DeploymentId::new("deploy-multi-baseline".to_string());
+        let r1 = push_main_with_id(&h, &id_b).unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+        let baseline = r1.attempt.as_ref().expect("attempt recorded");
+        let desired_ref = baseline.desired[&PlacementSlotId::new("p1")].clone();
+
+        let mk = |id: &str| DeploymentAttempt {
+            deployment_schema_version: 2,
+            deployment_id: DeploymentId::new(id.to_string()),
+            target: TargetName::new("t1".to_string()),
+            slot_ids: vec![PlacementSlotId::new("p1".to_string())],
+            behavior_sha256: baseline.behavior_sha256.clone(),
+            attempted_at: crate::remote::helper::now_rfc3339(),
+            desired: BTreeMap::from([(
+                PlacementSlotId::new("p1".to_string()),
+                desired_ref.clone(),
+            )]),
+            pre_push: BTreeMap::new(),
+            slots: BTreeMap::new(),
+        };
+        let a = mk("deploy-multi-a");
+        let b = mk("deploy-multi-b");
+        h.store.append_attempt("t1", &a).unwrap();
+        h.store
+            .append_transition(
+                a.deployment_id.as_str(),
+                &DeploymentStatus::InProgress,
+                Some("attempt started"),
+            )
+            .unwrap();
+        h.store.append_attempt("t1", &b).unwrap();
+        h.store
+            .append_transition(
+                b.deployment_id.as_str(),
+                &DeploymentStatus::InProgress,
+                Some("attempt started"),
+            )
+            .unwrap();
+
+        // One push reconciles BOTH, oldest first.
+        let r2 = push_clean(&h).unwrap();
+        assert_eq!(r2.message, "Everything up to date");
+        let snapshots = h.store.read_snapshots("t1").unwrap();
+        assert_eq!(snapshots.len(), 3);
+        assert_eq!(snapshots[1].deployment_id, a.deployment_id);
+        assert_eq!(snapshots[2].deployment_id, b.deployment_id);
+        assert_eq!(snapshots[1].index, 1, "reflog indices stay monotonic");
+        assert_eq!(snapshots[2].index, 2);
+        assert_eq!(
+            latest_status(&h, a.deployment_id.as_str()),
+            DeploymentStatus::Successful
+        );
+        assert_eq!(
+            latest_status(&h, b.deployment_id.as_str()),
+            DeploymentStatus::Successful
+        );
+        assert_eq!(
+            h.store.read_last_successful("t1").as_deref(),
+            Some(b.deployment_id.as_str())
+        );
+        assert_eq!(h.store.read_attempts("t1").unwrap().len(), 3);
+        for id in [a.deployment_id.as_str(), b.deployment_id.as_str()] {
+            let marker = h
+                .remotes_base
+                .join("s1")
+                .join(crate::layout::commit_marker(id));
+            assert!(marker.exists(), "marker present for {id}");
+        }
+    }
+
+    /// Replay-safe retry chain: faulting the SAME finalize step on the main
+    /// push AND on the first replay still converges on a later clean push with
+    /// exactly one snapshot entry and one attempt record (idempotent retries).
+    #[test]
+    fn second_faulted_replay_still_converges_exactly_once() {
+        let h = RecoveryHarness::new();
+        let id = DeploymentId::new("deploy-retry-chain".to_string());
+
+        // Push 1: the terminal Successful transition fails once -> PendingCommit.
+        crate::testutil::test_faults::arm_append_transition_successful(id.as_str());
+        let err = push_main_with_id(&h, &id)
+            .err()
+            .expect("first faulted push must abort");
+        assert!(err.to_string().contains("append_transition"));
+        assert_eq!(
+            latest_status(&h, id.as_str()),
+            DeploymentStatus::PendingCommit
+        );
+        assert_eq!(h.store.read_snapshots("t1").unwrap().len(), 1);
+
+        // Push 2: the REPLAY faults the SAME step again -> still PendingCommit,
+        // still exactly one snapshot (idempotent ensure, no duplicate).
+        crate::testutil::test_faults::arm_append_transition_successful(id.as_str());
+        let err2 = push_clean(&h)
+            .err()
+            .expect("second faulted replay must abort");
+        assert!(err2.to_string().contains("append_transition"));
+        assert_eq!(
+            latest_status(&h, id.as_str()),
+            DeploymentStatus::PendingCommit
+        );
+        assert_eq!(
+            h.store.read_snapshots("t1").unwrap().len(),
+            1,
+            "a second faulted replay must not duplicate the snapshot"
+        );
+
+        // Push 3: a clean replay converges to exactly-once success.
+        let r3 = push_clean(&h).unwrap();
+        assert_eq!(r3.status, None);
+        assert_eq!(r3.message, "Everything up to date");
+        assert_finalized(&h, &single_attempt(&h));
+        assert_eq!(h.store.read_attempts("t1").unwrap().len(), 1);
+        assert_eq!(h.store.read_snapshots("t1").unwrap().len(), 1);
+    }
 }

@@ -1046,4 +1046,124 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         }
         outcome.unwrap();
     }
+
+    /// Compensation is a compare-and-swap: it restores the prior generation
+    /// only while `current` still names the generation the failed push
+    /// advanced. If a concurrent controller has since moved `current`
+    /// elsewhere, compensation REFUSES (returns `false`) and leaves the
+    /// foreign `current` untouched.
+    #[test]
+    fn compensation_refuses_when_current_moved() {
+        let h = Harness::new(
+            NONE_TOML,
+            NONE_VARIANT,
+            &[
+                ("build/output/app/server", "v1"),
+                ("deployment/common/README", "common"),
+            ],
+        );
+        // First deploy: the PRIOR generation g1 is live.
+        let first = h.run(None);
+        assert_eq!(first.kind, ServerOutcomeKind::Activated);
+        let helper = h.helper();
+
+        // The failed push advanced to g2 (its generation record exists, and
+        // `current` moved to g2)...
+        let g2 = GenerationId::generate();
+        helper
+            .create_generation(
+                "op2",
+                &crate::remote::helper::GenerationAssignment {
+                    deployment_id: "d2".to_string().into(),
+                    generation_id: g2.clone(),
+                    artifact: ArtifactRef {
+                        release: ReleaseId::new("rel-sha256-r1"),
+                        variant: crate::model::VariantName::new("standard"),
+                        tree: h.tree.clone(),
+                    },
+                    behavior_sha256: "b".into(),
+                    prior_generation: Some(first.generation.clone()),
+                    created_at: crate::remote::helper::now_rfc3339(),
+                },
+            )
+            .unwrap();
+        helper
+            .swap_current(Some(first.generation.as_str()), g2.as_str(), "op2")
+            .unwrap();
+        // ...but a concurrent controller moved `current` to g3 BEFORE this
+        // op's compensation ran: the CAS precondition (current == g2) fails.
+        let g3 = GenerationId::generate();
+        helper
+            .create_generation(
+                "op3",
+                &crate::remote::helper::GenerationAssignment {
+                    deployment_id: "d3".to_string().into(),
+                    generation_id: g3.clone(),
+                    artifact: ArtifactRef {
+                        release: ReleaseId::new("rel-sha256-r1"),
+                        variant: crate::model::VariantName::new("standard"),
+                        tree: h.tree.clone(),
+                    },
+                    behavior_sha256: "b".into(),
+                    prior_generation: Some(g2.clone()),
+                    created_at: crate::remote::helper::now_rfc3339(),
+                },
+            )
+            .unwrap();
+        helper
+            .swap_current(Some(g2.as_str()), g3.as_str(), "op3")
+            .unwrap();
+
+        // The prior generation's behavior must be readable for compensation to
+        // attempt restoration (it still refuses on the CAS before using it).
+        let behaviors = std::collections::BTreeMap::from([("standard".to_string(), h.behave())]);
+        helper
+            .publish_release(
+                "rel-sha256-r1",
+                "{}",
+                &serde_json::to_string(&behaviors).unwrap(),
+            )
+            .unwrap();
+
+        let members = h.config.target_slots("t1").unwrap();
+        let (slot, server) = members[0];
+        let vars = crate::template::TemplateVars::slot(
+            &slot.deploy_dir,
+            "standard",
+            &h.config.application,
+            "rel-sha256-desired",
+            "t1",
+            &server.id,
+        )
+        .with_server(&server.user, &server.address, server.port)
+        .with_slot_id(&slot.id)
+        .with_deployment(
+            Some(&DeploymentId::generate()),
+            Some(&GenerationId::generate()),
+            Some(&h.tree),
+        );
+        let ok = compensate_server(
+            &h.store,
+            &h.remote,
+            &helper,
+            &OperationId::generate(),
+            &DeploymentId::generate(),
+            Some(&first.generation),
+            &g2,
+            &h.config,
+            &vars,
+        )
+        .unwrap();
+        assert!(
+            !ok,
+            "compensation must refuse when current no longer names the advanced generation"
+        );
+        // The foreign current (g3) survives untouched.
+        let current = h.helper().status().unwrap().current_generation.unwrap();
+        assert_eq!(
+            current.as_str(),
+            g3.as_str(),
+            "the concurrent controller's current must survive a refused compensation"
+        );
+    }
 }

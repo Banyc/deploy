@@ -1606,4 +1606,182 @@ slots = ["p1"]
         .unwrap();
         Config::load(&fixture).expect("known-good config still loads");
     }
+
+    /// One server runs exactly one generation, so two member slots of the same
+    /// target can never share a server: a target with multiple slots on the
+    /// same server is rejected (the per-target `current` pointer names a
+    /// single generation).
+    #[test]
+    fn target_may_not_have_multiple_slots_on_one_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        // A second slot in the SAME target on the SAME server.
+        let dup = format!(
+            "{MINIMAL_VARIANT}\n{STANDARD_SLOTS}\n[[slots]]\nid = \"p2\"\nserver = \"s1\"\ntarget = \"t1\"\ndeploy_dir = \"/srv/forced-2\"\n"
+        );
+        std::fs::write(project.join("releases/v1/standard.toml"), dup).unwrap();
+        let p = project.join("deploy.toml");
+        std::fs::write(&p, deploy_toml("v1")).unwrap();
+        let err = Config::load(&p).expect_err("two slots of one target on one server must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("target 't1' has multiple slots on server 's1'"),
+            "error must name the target and the shared server, got: {msg}"
+        );
+
+        // The same two slots split across TWO servers is valid.
+        let ok = format!(
+            "{MINIMAL_VARIANT}\n{STANDARD_SLOTS}\n[[slots]]\nid = \"p2\"\nserver = \"s2\"\ntarget = \"t1\"\ndeploy_dir = \"/srv/forced-2\"\n"
+        );
+        std::fs::write(project.join("releases/v1/standard.toml"), ok).unwrap();
+        let two_servers = deploy_toml("v1").replacen(
+            "[targets.t1]",
+            "[[servers]]\nid = \"s2\"\naddress = \"b\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n[targets.t1]",
+            1,
+        );
+        std::fs::write(&p, two_servers).unwrap();
+        let cfg = Config::load(&p).expect("two slots on distinct servers are valid");
+        assert_eq!(cfg.target_slot_ids("t1").unwrap(), vec!["p1", "p2"]);
+    }
+
+    /// Capacity is a per-SERVER policy: a `[capacity]` table inside a variant
+    /// file is an unknown field on the variant surface and must be rejected by
+    /// `deny_unknown_fields` (it is NOT per-variant configuration).
+    #[test]
+    fn variant_file_capacity_block_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        let bad = format!("{MINIMAL_VARIANT}\n{STANDARD_SLOTS}\n[capacity]\nreserve_bytes = 1\n");
+        std::fs::write(project.join("releases/v1/standard.toml"), bad).unwrap();
+        let p = project.join("deploy.toml");
+        std::fs::write(&p, deploy_toml("v1")).unwrap();
+        let err = Config::load(&p).expect_err("[capacity] inside a variant must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("capacity") && msg.contains("unknown field"),
+            "error must name the unknown capacity table, got: {msg}"
+        );
+    }
+
+    /// The SSH port defaults to 22 and is NOT a host-identity source: a server
+    /// with only a `port` (no known_hosts / no fingerprint) is still rejected
+    /// under the exactly-one rule.
+    #[test]
+    fn server_port_defaults_to_22_and_is_not_an_identity_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        let p = project.join("deploy.toml");
+
+        // Omitted port defaults to 22.
+        std::fs::write(&p, deploy_toml("v1")).unwrap();
+        let cfg = Config::load(&p).expect("config loads");
+        assert_eq!(cfg.servers[0].port, 22, "default SSH port is 22");
+
+        // `port` alone does not satisfy the exactly-one identity rule.
+        let port_only = deploy_toml("v1")
+            .replace("host_key_fingerprint = \"SHA256:test\"\n", "")
+            .replace("user = \"u\"", "user = \"u\"\nport = 2200");
+        std::fs::write(&p, port_only).unwrap();
+        let err = Config::load(&p).expect_err("port-only server must still be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exactly one of known_hosts or host_key_fingerprint"),
+            "port must not count as an identity source, got: {msg}"
+        );
+
+        // An explicit port WITH exactly one identity loads and is carried.
+        let with_port = deploy_toml("v1").replace("user = \"u\"", "user = \"u\"\nport = 2200");
+        std::fs::write(&p, with_port).unwrap();
+        let cfg = Config::load(&p).expect("explicit port with one identity is valid");
+        assert_eq!(cfg.servers[0].port, 2200);
+    }
+
+    /// `deny_unknown_fields` extends to the remaining user-written surfaces:
+    /// the variant's `[verification]` table, the top-level `[targets.t1.rollout]`
+    /// table, a variant's `[[artifact.mappings]]` entries, and the rotation
+    /// policy tables.
+    #[test]
+    fn unknown_fields_rejected_in_verification_rollout_mapping_and_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        let p = project.join("deploy.toml");
+        let base = deploy_toml("v1");
+
+        // Unknown field inside a variant's [verification] table.
+        let bad_ver = MINIMAL_VARIANT.replace(
+            "adapter = \"command\"",
+            "adapter = \"command\"\nretries = 3",
+        );
+        std::fs::write(project.join("releases/v1/standard.toml"), bad_ver).unwrap();
+        std::fs::write(&p, base.clone()).unwrap();
+        let err = Config::load(&p).expect_err("unknown verification field must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("retries") && msg.contains("unknown field"),
+            "error must name the unknown verification field, got: {msg}"
+        );
+
+        // Unknown field inside a top-level [targets.t1.rollout] table.
+        let bad_rollout = base.replace(
+            "rollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }",
+            "rollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\", max_parallel = 4 }",
+        );
+        std::fs::write(project.join("releases/v1/standard.toml"), MINIMAL_VARIANT).unwrap();
+        std::fs::write(&p, bad_rollout).unwrap();
+        let err = Config::load(&p).expect_err("unknown rollout field must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_parallel") && msg.contains("unknown field"),
+            "error must name the unknown rollout field, got: {msg}"
+        );
+
+        // Unknown field inside a variant's [[artifact.mappings]] entry.
+        let mapping_variant = r#"
+[[artifact.mappings]]
+from = "a"
+to = "b"
+conflic = "replace"
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+        std::fs::write(project.join("releases/v1/standard.toml"), mapping_variant).unwrap();
+        std::fs::write(&p, base).unwrap();
+        let err = Config::load(&p).expect_err("unknown mapping field must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("conflic") && msg.contains("unknown field"),
+            "error must name the unknown mapping field, got: {msg}"
+        );
+
+        // Unknown field inside the [targets.t1.rotation] tables.
+        let bad_rotation = deploy_toml("v1").replacen(
+            "[targets.t1.rotation.per_server]",
+            "[targets.t1.rotation]\nprotect_nothing = 1\n\n[targets.t1.rotation.per_server]",
+            1,
+        );
+        std::fs::write(project.join("releases/v1/standard.toml"), MINIMAL_VARIANT).unwrap();
+        std::fs::write(&p, bad_rotation).unwrap();
+        let err = Config::load(&p).expect_err("unknown rotation field must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("protect_nothing") && msg.contains("unknown field"),
+            "error must name the unknown rotation field, got: {msg}"
+        );
+    }
 }

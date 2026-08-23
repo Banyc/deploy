@@ -3548,3 +3548,171 @@ fn dry_run_factory_failure_mutates_nothing() -> Result<()> {
     );
     Ok(())
 }
+
+// ---- Server POLICY (user/address/port) is not release identity ---------------
+
+/// Only canonical identity inputs — mappings, behavior, per-variant tree
+/// bindings, and canonical slot declarations — produce a ReleaseId. Changing a
+/// server's POLICY (its user or address; capacity is covered by the dedicated
+/// test) must yield the SAME release: the follow-up push is an up-to-date
+/// no-op and no second release record is created.
+#[test]
+fn server_policy_change_does_not_change_release_identity() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store_base = tmp.path().join("store");
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    let config = setup_single(&proj, "true", true, 1);
+    let store = LocalStore::with_base(store_base.clone())?;
+    let rf = remotes_base.clone();
+    let factory = move |s: &deploy::config::ServerDef,
+                        _slot: &deploy::config::SlotDef|
+          -> Result<Box<dyn Remote>> {
+        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+    };
+
+    // f0: deploy with the original server policy.
+    let r0 = push(
+        &proj.join("deploy.toml"),
+        &store,
+        &factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r0.status, Some(DeploymentStatus::Successful));
+    let first = r0.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")].clone();
+
+    // Policy-only change: identical inputs except the server's user + address.
+    let body = std::fs::read_to_string(&proj.join("deploy.toml"))?;
+    let changed = body
+        .replace("user = \"deploy\"", "user = \"deployer\"")
+        .replace(
+            "address = \"server-01.example.com\"",
+            "address = \"server-01.internal.example.com\"",
+        );
+    assert_ne!(body, changed, "policy line must be replaceable");
+    std::fs::write(&proj.join("deploy.toml"), changed).unwrap();
+    let config2 = Config::load(&proj.join("deploy.toml"))?;
+    assert_eq!(config2.servers[0].user, "deployer");
+
+    let r1 = push(
+        &proj.join("deploy.toml"),
+        &store,
+        &factory,
+        "production",
+        &config2,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert!(
+        r1.status.is_none() && r1.attempt.is_none(),
+        "server-policy change must be an up-to-date no-op, got: {}",
+        r1.message
+    );
+    assert_eq!(r1.message, "Everything up to date");
+    assert_eq!(
+        std::fs::read_dir(store_base.join("releases"))?.count(),
+        1,
+        "no new release may be created by a server-policy change"
+    );
+    let after = store.read_release(&first.artifact.release)?;
+    assert_eq!(
+        after.release_sha256,
+        first.artifact.release.digest().as_str(),
+        "stored release identity unchanged by server policy"
+    );
+    Ok(())
+}
+
+// ---- Tree dedup: identical bytes share one tree object ----------------------
+
+/// Trees are content-addressed: two variants whose artifact bytes materialize
+/// to identical content share ONE tree digest and ONE tree object in the local
+/// store and on the remote — never a per-variant copy.
+#[test]
+fn identical_variant_bytes_share_one_tree_object() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store_base = tmp.path().join("store");
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    // `standard` declares the p1 slot; `mirror` declares none but materializes
+    // the SAME mappings from the SAME artifact bytes.
+    setup_single(&proj, "true", true, 1);
+    let mirror = r#"
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[[artifact.mappings]]
+from = "artifacts/deployment/common/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+    write_variant_file(&proj, "mirror", mirror);
+
+    let config = Config::load(&proj.join("deploy.toml"))?;
+    assert_eq!(config.variant_names().len(), 2);
+    let store = LocalStore::with_base(store_base.clone())?;
+    let rf = remotes_base.clone();
+    let factory = move |s: &deploy::config::ServerDef,
+                        _slot: &deploy::config::SlotDef|
+          -> Result<Box<dyn Remote>> {
+        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+    };
+
+    let r = push(
+        &proj.join("deploy.toml"),
+        &store,
+        &factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r.status, Some(DeploymentStatus::Successful));
+    let slot = &r.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")];
+
+    // Both variants bind to the SAME tree digest in the release record.
+    let rec = store.read_release(&slot.artifact.release)?;
+    assert_eq!(
+        rec.variants["standard"], rec.variants["mirror"],
+        "identical bytes must yield the identical tree digest for both variants"
+    );
+    assert_eq!(rec.variants["standard"], slot.artifact.tree.as_str());
+
+    // Exactly ONE tree object in the local store and on the remote.
+    let local_objs: Vec<_> = std::fs::read_dir(store_base.join("objects/sha256"))?
+        .flatten()
+        .collect();
+    assert_eq!(local_objs.len(), 1, "one local tree object");
+    let remote_objs: Vec<_> = std::fs::read_dir(remotes_base.join("server-01/objects/sha256"))?
+        .flatten()
+        .collect();
+    assert_eq!(remote_objs.len(), 1, "one remote tree object");
+    Ok(())
+}

@@ -483,6 +483,61 @@ mod tests {
         assert!(render_argv(&["{{ bogus }}".to_string()], &v).is_err());
     }
 
+    /// Template output is LITERAL text: a `deploy_dir` (or any variable)
+    /// containing spaces, `$`, backticks, or braces is passed through verbatim
+    /// in argv elements — never shell-escaped, quoted, or split — because the
+    /// adapter receives argv element-wise with no shell in between.
+    #[test]
+    fn special_chars_in_deploy_dir_render_literal() {
+        let v = TemplateVars::slot(
+            Path::new("/srv/Deploy Dir$/app"),
+            "standard",
+            "app",
+            "rel-sha256-111",
+            "prod",
+            "s1",
+        )
+        .with_server("deploy", "10.0.0.5", 22)
+        .with_slot_id("app-1")
+        .with_deployment(
+            Some(&DeploymentId::new("d1")),
+            Some(&GenerationId::new("g1")),
+            Some(&TreeDigest::new("t1")),
+        );
+        let argv = render_argv(
+            &[
+                "{{ deploy_dir }}/bin/probe".to_string(),
+                "--root={{ deploy_dir }}".to_string(),
+                "{{ variant }}".to_string(),
+            ],
+            &v,
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "/srv/Deploy Dir$/app/bin/probe".to_string(),
+                "--root=/srv/Deploy Dir$/app".to_string(),
+                "standard".to_string(),
+            ],
+            "spaces and $ must pass through as literal text (no escaping, no quoting)"
+        );
+        // A deploy_dir containing a backtick or brace is equally literal in
+        // plain template text.
+        let v2 = TemplateVars::slot(
+            Path::new("/srv/`tick`/{braced}"),
+            "standard",
+            "app",
+            "rel-sha256-111",
+            "prod",
+            "s1",
+        );
+        assert_eq!(
+            render_template("{{ deploy_dir }}/current", &v2).unwrap(),
+            "/srv/`tick`/{braced}/current"
+        );
+    }
+
     #[test]
     fn with_artifact_replaces_artifact_vars_together() {
         let v = TemplateVars::slot(

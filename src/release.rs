@@ -349,4 +349,117 @@ mod tests {
         assert_eq!(rec_a.variants, rec_b.variants, "trees unchanged");
         assert_ne!(rec_a.release_sha256, rec_b.release_sha256);
     }
+
+    /// The release digest is sensitive to EVERY canonical identity input —
+    /// mapping set, behavior contract set, per-variant tree bindings, and
+    /// canonical slot declarations — and to nothing else: an identical payload
+    /// always produces the identical digest. Server-level policy (user,
+    /// address, port, capacity) is not even an input to the digest function.
+    #[test]
+    fn release_digest_sensitivity_matrix() {
+        let base_slots: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+            "standard".to_string(),
+            vec![sdef("p1", "server-01", "/srv/deploy/example", "production")],
+        )]);
+        let base_variants: BTreeMap<VariantName, TreeDigest> =
+            BTreeMap::from([(VariantName::new("standard"), TreeDigest::new("tree-1"))]);
+        let bindings: BTreeMap<String, String> = base_variants
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
+            .collect();
+        let base = release_digest(
+            "mapping-sha",
+            "behavior-sha",
+            &variant_slots_digest(&base_slots),
+            &bindings,
+        );
+
+        // Identical payload -> identical digest.
+        assert_eq!(
+            release_digest(
+                "mapping-sha",
+                "behavior-sha",
+                &variant_slots_digest(&base_slots),
+                &bindings
+            )
+            .as_str(),
+            base.as_str()
+        );
+
+        // Mapping change -> new digest.
+        let m = release_digest(
+            "mapping-sha-2",
+            "behavior-sha",
+            &variant_slots_digest(&base_slots),
+            &bindings,
+        );
+        assert_ne!(base.as_str(), m.as_str(), "mapping change must re-digest");
+
+        // Behavior contract change -> new digest.
+        let b = release_digest(
+            "mapping-sha",
+            "behavior-sha-2",
+            &variant_slots_digest(&base_slots),
+            &bindings,
+        );
+        assert_ne!(base.as_str(), b.as_str(), "behavior change must re-digest");
+
+        // Tree-binding change -> new digest.
+        let t_variants: BTreeMap<VariantName, TreeDigest> =
+            BTreeMap::from([(VariantName::new("standard"), TreeDigest::new("tree-2"))]);
+        let t_bindings: BTreeMap<String, String> = t_variants
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
+            .collect();
+        let tb = release_digest(
+            "mapping-sha",
+            "behavior-sha",
+            &variant_slots_digest(&base_slots),
+            &t_bindings,
+        );
+        assert_ne!(
+            base.as_str(),
+            tb.as_str(),
+            "tree-binding change must re-digest"
+        );
+
+        // Canonical-slot change -> new digest (already asserted per-field by
+        // `variant_slots_digest_is_sensitive_to_each_field`, folded into the
+        // full digest here).
+        let s2: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+            "standard".to_string(),
+            vec![sdef("p1", "server-02", "/srv/deploy/example", "production")],
+        )]);
+        let sb = release_digest(
+            "mapping-sha",
+            "behavior-sha",
+            &variant_slots_digest(&s2),
+            &bindings,
+        );
+        assert_ne!(
+            base.as_str(),
+            sb.as_str(),
+            "canonical-slot change must re-digest"
+        );
+
+        // The built release record follows the digest: identical inputs build
+        // the identical ReleaseId, any single changed input builds a new one.
+        let rec = build_release(
+            "mapping-sha",
+            "behavior-sha",
+            &base_variants,
+            &base_slots,
+            Path::new("."),
+        );
+        assert_eq!(rec.release_sha256, base.as_str());
+        assert_eq!(rec.release_id, format!("rel-sha256-{}", base.as_str()));
+        let rec_m = build_release(
+            "mapping-sha-2",
+            "behavior-sha",
+            &base_variants,
+            &base_slots,
+            Path::new("."),
+        );
+        assert_ne!(rec.release_id, rec_m.release_id);
+    }
 }

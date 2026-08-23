@@ -333,4 +333,203 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "variant b protected by the pin"
         );
     }
+
+    /// Create one generation record (tree + assignment) without touching
+    /// `current`.
+    fn make_gen(
+        helper: &RemoteHelper,
+        deployment_id: &str,
+        generation_id: &str,
+        tree: &str,
+        created: &str,
+        prior_generation: Option<&str>,
+    ) {
+        // The tree object must resolve for `status()`/`exists` to follow the
+        // `current` symlink chain (mirrors the existing rotation tests).
+        helper
+            .remote()
+            .create_dir_all(&layout::tree_root(tree))
+            .unwrap();
+        helper
+            .create_generation(
+                "op",
+                &crate::remote::helper::GenerationAssignment {
+                    deployment_id: deployment_id.to_string().into(),
+                    generation_id: generation_id.to_string().into(),
+                    artifact: crate::model::ArtifactRef {
+                        release: crate::model::ReleaseId::new("r".to_string()),
+                        variant: "standard".to_string().into(),
+                        tree: tree.to_string().into(),
+                    },
+                    behavior_sha256: "b".into(),
+                    prior_generation: prior_generation.map(|g| g.to_string().into()),
+                    created_at: created.into(),
+                },
+            )
+            .unwrap();
+    }
+
+    /// The `keep_distinct_artifacts` window retains the newest N DISTINCT
+    /// successful artifact bindings in addition to `current` and the protected
+    /// previous: with `keep_distinct_artifacts = 2`, the third-oldest distinct
+    /// tree is swept.
+    #[test]
+    fn keep_distinct_artifacts_retains_newest_distinct_bindings() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        make_gen(&helper, "d1", "g1", "t1", "2020-01-01T00:00:00Z", None);
+        make_gen(
+            &helper,
+            "d2",
+            "g2",
+            "t2",
+            "2020-01-02T00:00:00Z",
+            Some("g1"),
+        );
+        make_gen(
+            &helper,
+            "d3",
+            "g3",
+            "t3",
+            "2020-01-03T00:00:00Z",
+            Some("g2"),
+        );
+        helper.swap_current(None, "g3", "op").unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let c = cfg();
+        let mut rotation = c.targets["t1"].rotation.clone();
+        rotation.per_server.keep_distinct_artifacts = 2;
+        rotation.per_server.keep_days = 0;
+        rotation.fleet.protect_deployments = 0;
+        // No prior chain, so protect_previous has nothing to add.
+        rotation.per_server.protect_previous = false;
+
+        let retained = compute_retained(&helper, &c.pins, &store, &rotation).unwrap();
+        assert!(retained.contains("t3"), "current tree retained");
+        assert!(retained.contains("t2"), "newest distinct binding retained");
+        assert!(
+            !retained.contains("t1"),
+            "the third-oldest distinct binding must be swept"
+        );
+    }
+
+    /// The `keep_days` window retains every artifact activated within the
+    /// window in addition to the distinct-artifact window.
+    #[test]
+    fn keep_days_retains_recent_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        let now = chrono::Utc::now();
+        let old = (now - chrono::Duration::days(60)).to_rfc3339();
+        let recent = (now - chrono::Duration::days(5)).to_rfc3339();
+        make_gen(&helper, "d1", "g1", "t-old", &old, None);
+        make_gen(&helper, "d2", "g2", "t-recent", &recent, Some("g1"));
+        helper.swap_current(None, "g2", "op").unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let c = cfg();
+        let mut rotation = c.targets["t1"].rotation.clone();
+        rotation.per_server.keep_distinct_artifacts = 1;
+        rotation.per_server.keep_days = 30;
+        rotation.per_server.protect_previous = false;
+        rotation.fleet.protect_deployments = 0;
+
+        let retained = compute_retained(&helper, &c.pins, &store, &rotation).unwrap();
+        assert!(retained.contains("t-recent"));
+        assert!(
+            !retained.contains("t-old"),
+            "artifact older than keep_days must be swept"
+        );
+
+        // Widen the window past the old artifact: it is retained again.
+        rotation.per_server.keep_days = 90;
+        let retained = compute_retained(&helper, &c.pins, &store, &rotation).unwrap();
+        assert!(
+            retained.contains("t-old"),
+            "artifact inside keep_days must be retained"
+        );
+        assert!(retained.contains("t-recent"));
+    }
+
+    /// The fleet `protect_deployments` window retains the artifacts of the
+    /// newest N distinct deployment IDs, even when the distinct-artifact
+    /// window alone would sweep them.
+    #[test]
+    fn fleet_protect_deployments_retains_newest_deployments() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        make_gen(&helper, "d1", "g1", "t1", "2020-01-01T00:00:00Z", None);
+        make_gen(
+            &helper,
+            "d2",
+            "g2",
+            "t2",
+            "2020-01-02T00:00:00Z",
+            Some("g1"),
+        );
+        make_gen(
+            &helper,
+            "d3",
+            "g3",
+            "t3",
+            "2020-01-03T00:00:00Z",
+            Some("g2"),
+        );
+        helper.swap_current(None, "g3", "op").unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let c = cfg();
+        let mut rotation = c.targets["t1"].rotation.clone();
+        rotation.per_server.keep_distinct_artifacts = 1;
+        rotation.per_server.keep_days = 0;
+        rotation.per_server.protect_previous = false;
+        rotation.fleet.protect_deployments = 2;
+
+        let retained = compute_retained(&helper, &c.pins, &store, &rotation).unwrap();
+        assert!(retained.contains("t3"), "current deployment retained");
+        assert!(
+            retained.contains("t2"),
+            "second-newest deployment protected by the fleet window"
+        );
+        assert!(
+            !retained.contains("t1"),
+            "oldest deployment outside the fleet window must be swept"
+        );
+    }
+
+    /// Rotation never deletes what rollback needs: with EVERY retention
+    /// window zeroed (keep_distinct = 0, keep_days = 0, fleet = 0) and no
+    /// pins, the current artifact and the protected previous artifact survive.
+    #[test]
+    fn current_and_protected_previous_survive_zero_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        make_gen(&helper, "d1", "g1", "t1", "2020-01-01T00:00:00Z", None);
+        make_gen(
+            &helper,
+            "d2",
+            "g2",
+            "t2",
+            "2020-01-02T00:00:00Z",
+            Some("g1"),
+        );
+        // current -> g2, whose assignment records g1 as prior.
+        helper.swap_current(None, "g2", "op").unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let c = cfg();
+        let mut rotation = c.targets["t1"].rotation.clone();
+        rotation.per_server.keep_distinct_artifacts = 0;
+        rotation.per_server.keep_days = 0;
+        rotation.per_server.protect_previous = true;
+        rotation.fleet.protect_deployments = 0;
+
+        let retained = compute_retained(&helper, &c.pins, &store, &rotation).unwrap();
+        assert!(retained.contains("t2"), "current tree is never swept");
+        assert!(
+            retained.contains("t1"),
+            "protected previous tree is never swept"
+        );
+    }
 }
