@@ -463,6 +463,14 @@ fn push_inner(
         });
     }
 
+    // Reconcile `PendingCommit` attempts left by earlier pushes BEFORE the
+    // early no-op check: an up-to-date push must complete the missing
+    // fleet-commit markers (and advance the reflog) rather than returning
+    // "Everything up to date" with the metadata still absent. Runs under the
+    // local target lock already held by this push; never reactivates or
+    // restarts services (markers/status/reflog only).
+    reconcile_pending_commits(store, config, target_name, op_id, &helpers)?;
+
     // Early "Everything up to date" check for HEAD pushes. Run BEFORE persisting
     // any plan/status record so an up-to-date no-op leaves no dangling
     // `in_progress` deployment behind.
@@ -727,7 +735,9 @@ fn push_inner(
                 Err(_) => {
                     // Recoverable metadata failure: do not abort the whole push
                     // (which would leave the attempt unrecorded); mark the fleet
-                    // commit incomplete and keep going.
+                    // commit incomplete and keep going. A later push reconciles
+                    // this `PendingCommit` attempt (see
+                    // `reconcile_pending_commits`) before its own no-op check.
                     commit_status = DeploymentStatus::PendingCommit;
                     continue;
                 }
@@ -743,7 +753,10 @@ fn push_inner(
                 .write_commit_marker(deployment_id.as_str(), new_gen[sid].as_str(), &server_ids)
                 .is_err()
             {
-                // Recoverable metadata failure writing the marker.
+                // Recoverable metadata failure writing the marker: the attempt
+                // is recorded `PendingCommit` and a later push's
+                // `reconcile_pending_commits` completes the marker set before
+                // its no-op check.
                 commit_status = DeploymentStatus::PendingCommit;
                 continue;
             }
@@ -906,6 +919,169 @@ fn push_inner(
         message,
         dry_run: false,
     })
+}
+
+/// Reconcile `PendingCommit` attempts recorded by earlier pushes (step 15 of
+/// `requirement.md`). A `PendingCommit` attempt means the fleet-commit markers
+/// were not all written before the earlier push gave up; the mutable status
+/// file still says `PendingCommit`, the reflog never advanced, and a naive
+/// "Everything up to date" push would otherwise skip the missing markers.
+///
+/// For each pending attempt, oldest first (attempts.jsonl order, so reflog
+/// indices stay monotonic):
+/// 1. Membership: every participating server must still exist in the target.
+/// 2. Generations: each participating server's CURRENT generation (fresh
+///    `helper.status()`) must equal the generation the attempt recorded for it
+///    (`desired[server].generation`, falling back to `servers[server].generation`).
+/// 3. If everything matches, write the missing markers under each server's
+///    mutation lock (idempotent: already-written markers are a byte-for-byte
+///    no-op) using the attempt's ORIGINAL deployment ID, then finalize the
+///    mutable status to `Successful` and advance the reflog via
+///    [`history::append_successful_reflog`].
+/// 4. A confirmed membership/generation mismatch finalizes the attempt as
+///    `Degraded` (no reflog entry). A transient remote failure (lock held,
+///    status read error, marker write error) leaves the attempt `PendingCommit`
+///    for a later retry: it is never falsely marked `Successful` (markers are
+///    missing) and never falsely accused of divergence (fail-closed, not
+///    degrade, on errors we cannot attribute to state change).
+///
+/// Recovery only touches markers, the mutable status file, the reflog, and
+/// `refs/last-successful`: no activation, no verification adapters, no
+/// `current` changes, no restart of healthy services.
+fn reconcile_pending_commits(
+    store: &LocalStore,
+    config: &Config,
+    target_name: &str,
+    op_id: &OperationId,
+    helpers: &HashMap<ServerId, RemoteHelper>,
+) -> Result<()> {
+    let pending: Vec<AttemptRecord> = store
+        .read_attempts(target_name)?
+        .into_iter()
+        .filter(|a| a.status == DeploymentStatus::PendingCommit)
+        .collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    // Current target membership: a pending attempt whose participants were
+    // removed from the target can no longer be completed as a fleet commit.
+    let members: HashSet<String> = config
+        .target_pods(target_name)?
+        .iter()
+        .map(|(_, s)| s.id.clone())
+        .collect();
+
+    for attempt in pending {
+        // 1. Membership check.
+        let membership_ok = attempt
+            .server_ids
+            .iter()
+            .all(|sid| members.contains(sid.as_str()));
+        if !membership_ok {
+            store.write_status(attempt.deployment_id.as_str(), "Degraded")?;
+            continue;
+        }
+
+        // 2. Generation verification against fresh remote status reads.
+        // `recorded` collects the generation the attempt minted for each
+        // server (the same value step 15 compared against when writing the
+        // markers), so recovery writes markers identical to what the original
+        // commit would have written.
+        let mut recorded: BTreeMap<ServerId, GenerationId> = BTreeMap::new();
+        let mut all_match = true;
+        let mut unverifiable = false;
+        for sid in &attempt.server_ids {
+            let Some(recorded_gen) = attempt
+                .desired
+                .get(sid)
+                .and_then(|d| d.generation.clone())
+                .or_else(|| attempt.servers.get(sid).and_then(|s| s.generation.clone()))
+            else {
+                // No recorded generation for a participant: the attempt is not
+                // a coherent fleet commit; finalize as degraded.
+                all_match = false;
+                break;
+            };
+            let Some(helper) = helpers.get(sid) else {
+                all_match = false;
+                break;
+            };
+            match helper.status() {
+                Ok(st) if st.current_generation.as_deref() == Some(recorded_gen.as_str()) => {
+                    recorded.insert(sid.clone(), recorded_gen);
+                }
+                Ok(_) => {
+                    // Confirmed divergence: the server no longer points at the
+                    // generation this attempt minted.
+                    all_match = false;
+                    break;
+                }
+                Err(_) => {
+                    // Transient status read failure: cannot verify, so leave
+                    // the attempt pending for a later retry (fail-closed).
+                    unverifiable = true;
+                    break;
+                }
+            }
+        }
+        if unverifiable {
+            continue;
+        }
+        if !all_match {
+            store.write_status(attempt.deployment_id.as_str(), "Degraded")?;
+            continue;
+        }
+
+        // 3. Write the missing markers under each server's mutation lock
+        // (mirroring step 15's lock discipline: the guard is held for the
+        // whole write and released on drop). The marker payload carries the
+        // full participating server set; already-present markers are an
+        // idempotent byte-for-byte no-op.
+        let server_ids: Vec<String> = attempt
+            .server_ids
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect();
+        let mut markers_written = true;
+        for sid in &attempt.server_ids {
+            let helper = &helpers[sid];
+            let _guard = match helper.acquire_lock_guard(op_id.as_str()) {
+                Ok(g) => g,
+                Err(_) => {
+                    // Lock transiently held elsewhere: keep the attempt pending
+                    // so a later push retries rather than degrading a healthy
+                    // attempt on a transient blip.
+                    markers_written = false;
+                    break;
+                }
+            };
+            if helper
+                .write_commit_marker(
+                    attempt.deployment_id.as_str(),
+                    recorded[sid].as_str(),
+                    &server_ids,
+                )
+                .is_err()
+            {
+                // Marker not durable yet: leave the attempt pending.
+                markers_written = false;
+                break;
+            }
+            // `_guard` drops here, releasing the lock.
+        }
+        if !markers_written {
+            continue;
+        }
+
+        // 4. Finalize: mutable status -> Successful, then advance the reflog
+        // and `refs/last-successful` exactly like the main success path. The
+        // append-only attempts.jsonl record is untouched (still the original
+        // deployment ID and status); the mutable status file is the live marker.
+        store.write_status(attempt.deployment_id.as_str(), "Successful")?;
+        history::append_successful_reflog(store, &attempt.target, &attempt)?;
+    }
+    Ok(())
 }
 
 struct ServerProc {
@@ -1166,6 +1342,8 @@ fn process_server(
     // service is active but the attempt cannot be durably marked committed. We
     // still report the server as Activated, but carry the error so the attempt
     // status is demoted to `PendingCommit` rather than erroneously `Successful`.
+    // A later push's `reconcile_pending_commits` completes the marker set
+    // without touching the healthy server when its generation still matches.
     if helper
         .transaction_record(op_id.as_str(), "committed")
         .is_err()

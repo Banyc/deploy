@@ -462,7 +462,7 @@ use deploy::remote::create_remote;
 use deploy::remote::helper::{GenerationAssignment, RemoteHelper};
 use deploy::remote::transport::{ExecOutcome, RemoteEntry, RemoteMeta};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// A read-only spy remote: all mutation/exec operations are forbidden. Any call
@@ -714,6 +714,95 @@ impl Remote for FaultRemote {
         self.inner.exec(argv, timeout)
     }
     fn available_bytes(&self) -> deploy::error::Result<u64> {
+        self.inner.available_bytes()
+    }
+}
+
+/// A remote that fails fleet-commit marker writes exactly once: the first
+/// write/create under `state/commits/` errors (leaving the marker absent), then
+/// the wrapper behaves normally. Lets a test record a `PendingCommit` attempt
+/// on the first push and observe the next push's reconciliation completing the
+/// markers with the ORIGINAL deployment ID. Lock acquisition writes
+/// `state/operation.lock` — a different path — so locking is unaffected.
+struct FailOnceMarkerRemote {
+    inner: LocalTransport,
+    armed: Arc<AtomicBool>,
+}
+
+impl FailOnceMarkerRemote {
+    fn build(base: std::path::PathBuf, armed: Arc<AtomicBool>) -> Result<Box<dyn Remote>> {
+        Ok(Box::new(FailOnceMarkerRemote {
+            inner: LocalTransport::new(base)?,
+            armed,
+        }))
+    }
+    fn fail_marker(&self, rel: &Path) -> bool {
+        self.armed.load(Ordering::SeqCst) && rel.to_string_lossy().starts_with("state/commits/")
+    }
+}
+
+impl Remote for FailOnceMarkerRemote {
+    fn root(&self) -> &Path {
+        self.inner.root()
+    }
+    fn provision_layout(&self) -> Result<()> {
+        self.inner.provision_layout()
+    }
+    fn read(&self, rel: &Path) -> Result<Vec<u8>> {
+        self.inner.read(rel)
+    }
+    fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
+        if self.fail_marker(rel) {
+            self.armed.store(false, Ordering::SeqCst);
+            return Err(deploy::error::Error::remote(
+                "FailOnceMarkerRemote: commit marker write forced to fail (once)",
+            ));
+        }
+        self.inner.write(rel, data, mode)
+    }
+    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+        if self.fail_marker(rel) {
+            self.armed.store(false, Ordering::SeqCst);
+            return Err(deploy::error::Error::remote(
+                "FailOnceMarkerRemote: commit marker create forced to fail (once)",
+            ));
+        }
+        self.inner.try_write_new(rel, data)
+    }
+    fn create_dir(&self, rel: &Path) -> Result<()> {
+        self.inner.create_dir(rel)
+    }
+    fn create_dir_all(&self, rel: &Path) -> Result<()> {
+        self.inner.create_dir_all(rel)
+    }
+    fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
+        self.inner.list(rel)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+        self.inner.symlink(target, link)
+    }
+    fn read_link(&self, rel: &Path) -> Result<std::path::PathBuf> {
+        self.inner.read_link(rel)
+    }
+    fn remove_file(&self, rel: &Path) -> Result<()> {
+        self.inner.remove_file(rel)
+    }
+    fn remove_dir_all(&self, rel: &Path) -> Result<()> {
+        self.inner.remove_dir_all(rel)
+    }
+    fn exists(&self, rel: &Path) -> bool {
+        self.inner.exists(rel)
+    }
+    fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
+        self.inner.metadata(rel)
+    }
+    fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
+        self.inner.exec(argv, timeout)
+    }
+    fn available_bytes(&self) -> Result<u64> {
         self.inner.available_bytes()
     }
 }
@@ -1646,6 +1735,242 @@ fn commit_marker_write_failure_pends_commit() -> Result<()> {
     assert!(
         !remotes_base.join("server-01/state/operation.lock").exists(),
         "mutation lock must be released"
+    );
+    Ok(())
+}
+
+// ---- Pending-commit reconciliation: a push that left the fleet-commit
+// markers incomplete records a `PendingCommit` attempt, and the NEXT push must
+// reconcile it BEFORE its no-op path: verify membership + recorded
+// generations, create the missing markers with the original deployment ID, and
+// finalize the mutable status/reflog. A diverged attempt must be `Degraded`.
+
+#[test]
+fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store = LocalStore::with_base(tmp.path().join("store"))?;
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    let config = setup_single(&proj, "true", true, 1);
+
+    // Push 1: the fleet-commit marker write fails once -> PendingCommit.
+    let armed = Arc::new(AtomicBool::new(true));
+    let armed_for_factory = armed.clone();
+    let rf = remotes_base.clone();
+    let fault_factory = move |s: &deploy::config::ServerDef,
+                              _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
+        FailOnceMarkerRemote::build(rf.join(&s.id), armed_for_factory.clone())
+    };
+    let r1 = push(
+        &proj.join("deploy.toml"),
+        &store,
+        &fault_factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(
+        r1.status,
+        Some(DeploymentStatus::PendingCommit),
+        "failed marker write must yield PendingCommit"
+    );
+    let attempt1 = r1.attempt.expect("attempt recorded");
+
+    let marker = remotes_base
+        .join("server-01/state/commits")
+        .join(format!("{}.json", attempt1.deployment_id.as_str()));
+    assert!(
+        !marker.exists(),
+        "marker must be absent after the failed commit-marker push"
+    );
+    assert!(
+        store.read_reflog("production")?.is_empty(),
+        "no reflog entry for a pending attempt"
+    );
+    assert!(
+        store.read_last_successful("production").is_none(),
+        "last-successful must not point at a pending attempt"
+    );
+
+    // Push 2 with a healthy remote: reconciliation must run BEFORE the no-op
+    // path, create the missing marker with attempt 1's ORIGINAL deployment ID,
+    // and finalize -- even though this push itself is an up-to-date no-op.
+    let rf2 = remotes_base.clone();
+    let clean_factory = move |s: &deploy::config::ServerDef,
+                              _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
+        Ok(Box::new(LocalTransport::new(rf2.join(&s.id))?))
+    };
+    let r2 = push(
+        &proj.join("deploy.toml"),
+        &store,
+        &clean_factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(
+        r2.status, None,
+        "reconciliation must not fabricate a new attempt for an up-to-date push"
+    );
+    assert_eq!(r2.message, "Everything up to date");
+
+    // The missing marker now exists, bound to attempt 1's deployment ID and
+    // carrying the generation the attempt recorded for the server.
+    let marker_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+    assert_eq!(
+        marker_json["deployment_id"].as_str().unwrap(),
+        attempt1.deployment_id.as_str(),
+        "marker must carry the ORIGINAL pending attempt's deployment id"
+    );
+    assert_eq!(marker_json["committed"].as_bool(), Some(true));
+    let recorded_gen = attempt1.desired[&ServerId::new("server-01")]
+        .generation
+        .as_ref()
+        .expect("attempt records the minted generation");
+    assert_eq!(
+        marker_json["generation"].as_str().unwrap(),
+        recorded_gen.as_str(),
+        "marker generation must be the attempt's recorded generation"
+    );
+
+    // Finalized: mutable status Successful, reflog + last-successful advanced
+    // to attempt 1; the append-only attempts record keeps the original ID.
+    let status = std::fs::read_to_string(
+        store
+            .deployment_dir(attempt1.deployment_id.as_str())
+            .join("status"),
+    )?;
+    assert_eq!(status, "Successful", "mutable status must be finalized");
+    let reflog = store.read_reflog("production")?;
+    assert_eq!(reflog.len(), 1, "exactly one successful fleet snapshot");
+    assert_eq!(reflog[0].deployment_id, attempt1.deployment_id);
+    assert_eq!(
+        store.read_last_successful("production").as_deref(),
+        Some(attempt1.deployment_id.as_str())
+    );
+    let attempts = store.read_attempts("production")?;
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].deployment_id, attempt1.deployment_id);
+    Ok(())
+}
+
+#[test]
+fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store = LocalStore::with_base(tmp.path().join("store"))?;
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    let config = setup_single(&proj, "true", true, 1);
+
+    // Push 1: marker write fails once -> PendingCommit with no markers.
+    let armed = Arc::new(AtomicBool::new(true));
+    let armed_for_factory = armed.clone();
+    let rf = remotes_base.clone();
+    let fault_factory = move |s: &deploy::config::ServerDef,
+                              _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
+        FailOnceMarkerRemote::build(rf.join(&s.id), armed_for_factory.clone())
+    };
+    let r1 = push(
+        &proj.join("deploy.toml"),
+        &store,
+        &fault_factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r1.status, Some(DeploymentStatus::PendingCommit));
+    let attempt1 = r1.attempt.expect("attempt recorded");
+    let marker = remotes_base
+        .join("server-01/state/commits")
+        .join(format!("{}.json", attempt1.deployment_id.as_str()));
+    assert!(!marker.exists());
+
+    // Simulate another controller advancing the server: re-point `current` at a
+    // generation the pending attempt did not mint, and change the pushed
+    // content so this push is a real deployment (a fresh release) rather than
+    // an up-to-date no-op.
+    let cur = remotes_base.join("server-01/current");
+    std::fs::remove_file(&cur)?;
+    std::os::unix::fs::symlink("generations/manual-diverge/root", &cur)?;
+    write_file(
+        &proj
+            .join("releases")
+            .join("v1")
+            .join("artifacts")
+            .join("build/output/app/server"),
+        "v2\n",
+    );
+
+    // Push 2 with a healthy remote: the recorded generation no longer matches
+    // (current points at the foreign generation), so recovery must finalize
+    // attempt 1 as Degraded (no markers, no reflog entry) and the push itself
+    // proceeds as a normal deployment of v2.
+    let rf2 = remotes_base.clone();
+    let clean_factory = move |s: &deploy::config::ServerDef,
+                              _pod: &deploy::config::PodDef|
+          -> Result<Box<dyn Remote>> {
+        Ok(Box::new(LocalTransport::new(rf2.join(&s.id))?))
+    };
+    let r2 = push(
+        &proj.join("deploy.toml"),
+        &store,
+        &clean_factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    let attempt2 = r2.attempt.expect("new attempt recorded");
+    assert_eq!(
+        r2.status,
+        Some(DeploymentStatus::Successful),
+        "the push itself proceeds after degrading the diverged pending attempt"
+    );
+
+    let status = std::fs::read_to_string(
+        store
+            .deployment_dir(attempt1.deployment_id.as_str())
+            .join("status"),
+    )?;
+    assert_eq!(
+        status, "Degraded",
+        "a diverged pending attempt must finalize as Degraded"
+    );
+    assert!(
+        !marker.exists(),
+        "no markers may be written for a degraded attempt"
+    );
+    let reflog = store.read_reflog("production")?;
+    assert_eq!(reflog.len(), 1, "only the new push is in the reflog");
+    assert_ne!(
+        reflog[0].deployment_id, attempt1.deployment_id,
+        "the diverged attempt must never enter the reflog"
+    );
+    assert_eq!(reflog[0].deployment_id, attempt2.deployment_id);
+    assert_eq!(
+        store.read_last_successful("production").as_deref(),
+        Some(attempt2.deployment_id.as_str())
     );
     Ok(())
 }
