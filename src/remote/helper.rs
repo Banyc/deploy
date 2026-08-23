@@ -712,6 +712,38 @@ mod durability_tests {
         );
     }
 
+    /// The handshake REFUSES a state directory written by a DIFFERENT
+    /// protocol version: a marker carrying a version other than the client's
+    /// must make `handshake()` fail on read-back (an old client can never
+    /// drive a state directory written by a newer one, and vice versa). This
+    /// is the documented cross-version corruption invariant; the recovery test
+    /// above covers only the interrupted-write half of the marker lifecycle.
+    #[test]
+    fn protocol_version_mismatch_refuses_handshake() {
+        let (_dir, remote, root) = setup();
+        let marker = layout::protocol_marker();
+        std::fs::create_dir_all(root.join(marker.parent().unwrap())).unwrap();
+        std::fs::write(
+            root.join(&marker),
+            format!("{{\"protocol_version\": {}}}", PROTOCOL_VERSION + 1),
+        )
+        .unwrap();
+
+        let err = RemoteHelper::new(&remote)
+            .handshake()
+            .expect_err("a mismatched protocol marker must refuse the handshake");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("protocol mismatch"),
+            "error must report the protocol mismatch, got: {msg}"
+        );
+        assert!(
+            msg.contains(PROTOCOL_VERSION.to_string().as_str())
+                && msg.contains((PROTOCOL_VERSION + 1).to_string().as_str()),
+            "error must name both recorded and client protocol versions, got: {msg}"
+        );
+    }
+
     /// Same recovery rule for fleet-commit markers: an interrupted write never
     /// surfaces as a partial marker, and a later commit succeeds cleanly.
     #[test]

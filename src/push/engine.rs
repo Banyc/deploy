@@ -2238,6 +2238,139 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
     }
 
+    /// The marker-integrity-conflict recovery contract (requirement.md step
+    /// 15): a `PendingCommit` attempt whose marker ALREADY exists with
+    /// DIFFERENT content — a concurrent controller recorded a different fact,
+    /// or the remote state diverged — must finalize `Degraded` with reason
+    /// "marker integrity conflict", never `Successful`. The conflicting
+    /// marker must be left byte-for-byte untouched (a retry would only hit the
+    /// same permanent condition, so the attempt must not strand `PendingCommit`
+    /// forever either), and no snapshot entry may appear for the attempt.
+    #[test]
+    fn conflicting_commit_marker_finalizes_degraded_and_never_successful() {
+        let h = RecoveryHarness::new();
+        // Baseline: a clean successful push (dep1) owns f0.
+        let id1 = DeploymentId::new("deploy-conflict-baseline".to_string());
+        let r1 = push_main_with_id(&h, &id1).unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+
+        // Push 2 must MUTATE (otherwise it is an up-to-date no-op and the
+        // marker fault never fires): change the artifact content first. The
+        // fleet-commit marker write fails once -> PendingCommit; the marker is
+        // absent, no snapshot exists, and the SERVERS already advanced to the
+        // attempt's generation.
+        let project_root = h.config.project_root(&h.cfg_path);
+        std::fs::write(
+            project_root
+                .join("releases")
+                .join("v1")
+                .join("artifacts")
+                .join("build/output/app/server"),
+            "v2\n",
+        )
+        .unwrap();
+        // Faulted push (inline, since `push_pending_attempt` asserts an empty
+        // snapshot log, which a baseline push precludes): the commit-marker
+        // write fails once -> PendingCommit; the marker is absent, no NEW
+        // snapshot exists, and the servers already advanced to the attempt's
+        // generation.
+        let armed = Arc::new(AtomicBool::new(true));
+        let armed_for_factory = armed.clone();
+        let rf = h.remotes_base.clone();
+        let fault_factory = move |s: &crate::config::ServerDef,
+                                  _slot: &crate::config::SlotDef|
+              -> Result<Box<dyn Remote>> {
+            FailOnceMarkerRemote::build(rf.join(&s.id), armed_for_factory.clone())
+        };
+        let r2 = push(
+            &h.cfg_path,
+            &h.store,
+            &fault_factory,
+            "t1",
+            &h.config,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(r2.status, Some(DeploymentStatus::PendingCommit));
+        let attempt = r2.attempt.expect("attempt recorded");
+        let dep2 = attempt.deployment_id.clone();
+        let gen_v2 = attempt.desired[&PlacementSlotId::new("p1")]
+            .generation
+            .clone();
+        assert_eq!(
+            h.store.read_snapshots("t1").unwrap().len(),
+            1,
+            "the PendingCommit push adds no snapshot entry"
+        );
+        let marker_path = h
+            .remotes_base
+            .join("s1")
+            .join(crate::layout::commit_marker(dep2.as_str()));
+        assert!(
+            !marker_path.exists(),
+            "marker absent after the faulted push"
+        );
+
+        // A concurrent controller (or divergent remote state) planted a marker
+        // for dep2 with DIFFERENT content: a different generation.
+        let conflicting = serde_json::json!({
+            "deployment_id": dep2.as_str(),
+            "committed": true,
+            "generation": "gen-from-another-controller",
+            "slots": ["p1"],
+        });
+        let conflicting_bytes = serde_json::to_vec_pretty(&conflicting).unwrap();
+        std::fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+        std::fs::write(&marker_path, &conflicting_bytes).unwrap();
+
+        // Push 3: recovery sees the conflicting marker, finalizes dep2 as
+        // Degraded (transition only, no snapshot entry), leaves the marker
+        // untouched, and then proceeds with the HEAD push (a no-op here).
+        let r3 = push_clean(&h).unwrap();
+        assert_eq!(r3.status, None, "the main HEAD push is an up-to-date no-op");
+        assert_eq!(r3.message, "Everything up to date");
+        assert_eq!(
+            latest_status(&h, dep2.as_str()),
+            DeploymentStatus::Degraded,
+            "a conflicting marker must NEVER finalize the attempt Successful"
+        );
+        let transitions = h.store.read_transitions(dep2.as_str()).unwrap();
+        let last = transitions.last().expect("transition stream non-empty");
+        assert_eq!(
+            last.reason.as_deref(),
+            Some("marker integrity conflict"),
+            "the degradation must be explained"
+        );
+        assert_eq!(
+            std::fs::read(&marker_path).unwrap(),
+            conflicting_bytes,
+            "the conflicting marker must be left byte-for-byte untouched"
+        );
+        // No snapshot entry for dep2; the ref still points at the baseline.
+        let snapshots = h.store.read_snapshots("t1").unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].deployment_id, id1);
+        assert_eq!(
+            h.store.read_last_successful("t1").as_deref(),
+            Some(id1.as_str())
+        );
+        // The live deployment is undisturbed: the servers stay at the gen the
+        // PendingCommit attempt actually advanced them to.
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        assert_eq!(
+            RemoteHelper::new(&remote)
+                .status()
+                .unwrap()
+                .current_generation
+                .as_deref(),
+            Some(gen_v2.as_str()),
+            "the conflict must not disturb the live deployment"
+        );
+    }
+
     // ---- Intent persisted BEFORE remote mutation; InProgress recovery -----
     //
     // The attempt INTENT is now persisted BEFORE any server mutation (a crash
@@ -3679,6 +3812,220 @@ interval_seconds = 0
         );
         assert_eq!(h.store.read_attempts("t1").unwrap().len(), 1);
         assert_eq!(h.store.read_snapshots("t1").unwrap().len(), 1);
+    }
+
+    // ---- End-to-end `t1@f0:current` (non-dry-run) ------------------------
+    //
+    // Round-3 covered the PLAN-level semantics of `:current`; here the FULL
+    // push path (locks, publication, generation minting, `current` swap,
+    // observed refresh, fleet snapshot) must apply the CURRENT config variant
+    // with the f0 release's own tree, while a bare `t1@f0` in the SAME
+    // scenario restores the stored snapshot variant — the contrast proves the
+    // flag. Variant-renamed scenario: the f0 release ships BOTH variants
+    // (`other` declares p1 at materialization, `standard` is an auxiliary
+    // variant with a different tree); after the rename the current config
+    // declares p1 inside `standard`.
+
+    #[test]
+    fn end_to_end_fleet_ref_current_variant_push() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        let artifacts_dir = release_dir.join("artifacts");
+        for (p, c) in [
+            ("build/output/app/server", "v1\n"),
+            ("deployment/common/README", "common\n"),
+        ] {
+            let fp = artifacts_dir.join(p);
+            std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
+            std::fs::write(&fp, c).unwrap();
+        }
+        // The auxiliary `standard` variant ships an EXTRA mapping so its tree
+        // digest differs from `other`'s (the digest is the contrast asserted
+        // below). It exists at materialization time but declares NO slots.
+        std::fs::create_dir_all(artifacts_dir.join("standard-extra")).unwrap();
+        std::fs::write(artifacts_dir.join("standard-extra").join("flag"), "std\n").unwrap();
+        std::fs::write(release_dir.join("other.toml"), NONE_VARIANT).unwrap();
+        std::fs::write(
+            release_dir.join("standard.toml"),
+            r#"
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[[artifact.mappings]]
+from = "artifacts/standard-extra/"
+to = "std/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#,
+        )
+        .unwrap();
+        std::fs::write(project.join("deploy.toml"), NONE_TOML).unwrap();
+
+        let cfg_path = project.join("deploy.toml");
+        let config = Config::load(&cfg_path).unwrap();
+        assert_eq!(config.slot_variant("p1").unwrap(), "other");
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let remotes_base = dir.path().join("remotes");
+        std::fs::create_dir_all(&remotes_base).unwrap();
+        let rf = remotes_base.clone();
+        let factory = move |s: &crate::config::ServerDef,
+                            _slot: &crate::config::SlotDef|
+              -> Result<Box<dyn Remote>> {
+            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        };
+
+        // Phase A: HEAD push materializes BOTH variants into release R0; the
+        // deployed assignment uses the then-current declaring file (`other`),
+        // and the release ships `standard` with a DIFFERENT tree.
+        let r0 = push(
+            &cfg_path,
+            &store,
+            &factory,
+            "t1",
+            &config,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(r0.status, Some(DeploymentStatus::Successful));
+        let f0 = r0.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")].clone();
+        assert_eq!(f0.artifact.variant.as_str(), "other");
+        let release = f0.artifact.release.clone();
+        let tree_other = f0.artifact.tree.clone();
+        let rec = store.read_release(&release).unwrap();
+        let tree_standard = TreeDigest::new(rec.variants["standard"].clone());
+        assert_ne!(
+            tree_standard, tree_other,
+            "the current-variant tree must differ from the snapshot variant's tree"
+        );
+        let f0_snap = &store.read_snapshots("t1").unwrap()[0];
+        assert_eq!(
+            f0_snap.slots[&PlacementSlotId::new("p1")]
+                .assignment
+                .artifact
+                .variant
+                .as_str(),
+            "other"
+        );
+
+        // Phase B: variant rename. `other.toml` disappears; the p1-declaring
+        // content moves into `standard.toml` (same server/deploy_dir, so the
+        // exact-rollback physical-binding check still passes).
+        std::fs::remove_file(release_dir.join("other.toml")).unwrap();
+        let renamed = format!(
+            "[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntarget = \"t1\"\ndeploy_dir = \"/srv/eng\"\n\n{}",
+            std::fs::read_to_string(release_dir.join("standard.toml")).unwrap()
+        );
+        std::fs::write(release_dir.join("standard.toml"), renamed).unwrap();
+        let config2 = Config::load(&cfg_path).unwrap();
+        assert_eq!(config2.slot_variant("p1").unwrap(), "standard");
+
+        // Phase C: `t1@f0:current` — the CURRENT config variant (`standard`)
+        // with the f0 release's own tree for it. Generation, remote `current`
+        // symlink, observed.json, and the fleet snapshot all reflect the
+        // current-variant mapping.
+        let rc = push(
+            &cfg_path,
+            &store,
+            &factory,
+            "t1",
+            &config2,
+            &PushOptions {
+                dry_run: false,
+                ref_token: Some("t1@f0:current".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(rc.status, Some(DeploymentStatus::Successful));
+        let slot_c = &rc.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")];
+        assert_eq!(slot_c.artifact.release, release);
+        assert_eq!(slot_c.artifact.variant.as_str(), "standard");
+        assert_eq!(slot_c.artifact.tree, tree_standard);
+        let gen_c = slot_c.generation.clone().expect("generation minted");
+        let observed_c = &store.read_observed("t1").unwrap().slots[&PlacementSlotId::new("p1")];
+        assert_eq!(observed_c.generation.as_ref(), Some(&gen_c));
+        let obs_c = observed_c.artifact.as_ref().expect("observed assignment");
+        assert_eq!(obs_c.release, release);
+        assert_eq!(obs_c.variant.as_str(), "standard");
+        assert_eq!(obs_c.tree, tree_standard);
+        let remote = LocalTransport::new(remotes_base.join("s1")).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        let current_c = helper
+            .status()
+            .unwrap()
+            .current_generation
+            .expect("remote current");
+        assert_eq!(current_c, gen_c.as_str());
+        let asn_c = helper.read_assignment(&current_c).unwrap();
+        assert_eq!(asn_c.artifact.release, release);
+        assert_eq!(asn_c.artifact.variant.as_str(), "standard");
+        assert_eq!(asn_c.artifact.tree, tree_standard);
+        let snap_c = &store.read_snapshots("t1").unwrap()[1];
+        let snap_art_c = &snap_c.slots[&PlacementSlotId::new("p1")]
+            .assignment
+            .artifact;
+        assert_eq!(snap_art_c.variant.as_str(), "standard");
+        assert_eq!(snap_art_c.tree, tree_standard);
+
+        // Phase D: bare `t1@f0` in the SAME scenario restores the stored
+        // snapshot artifact (variant `other` + tree_other together) — the
+        // contrast that proves `:current` is doing the variant substitution
+        // rather than restoring the historical assignment.
+        let rd = push(
+            &cfg_path,
+            &store,
+            &factory,
+            "t1",
+            &config2,
+            &PushOptions {
+                dry_run: false,
+                ref_token: Some("t1@f0".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(rd.status, Some(DeploymentStatus::Successful));
+        let slot_d = &rd.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")];
+        assert_eq!(slot_d.artifact.release, release);
+        assert_eq!(slot_d.artifact.variant.as_str(), "other");
+        assert_eq!(slot_d.artifact.tree, tree_other);
+        let gen_d = slot_d.generation.clone().expect("generation minted");
+        assert_ne!(gen_d, gen_c, "the bare rollback mints a fresh generation");
+        let observed_d = &store.read_observed("t1").unwrap().slots[&PlacementSlotId::new("p1")];
+        assert_eq!(observed_d.generation.as_ref(), Some(&gen_d));
+        let obs_d = observed_d.artifact.as_ref().expect("observed assignment");
+        assert_eq!(obs_d.variant.as_str(), "other");
+        assert_eq!(obs_d.tree, tree_other);
+        let current_d = helper
+            .status()
+            .unwrap()
+            .current_generation
+            .expect("remote current");
+        assert_eq!(current_d, gen_d.as_str());
+        let asn_d = helper.read_assignment(&current_d).unwrap();
+        assert_eq!(asn_d.artifact.variant.as_str(), "other");
+        assert_eq!(asn_d.artifact.tree, tree_other);
+        let snap_d = &store.read_snapshots("t1").unwrap()[2];
+        let snap_art_d = &snap_d.slots[&PlacementSlotId::new("p1")]
+            .assignment
+            .artifact;
+        assert_eq!(snap_art_d.variant.as_str(), "other");
+        assert_eq!(snap_art_d.tree, tree_other);
     }
 
     // ---- Engine-level activation-failure compensation ---------------------

@@ -642,6 +642,11 @@ impl LocalStore {
     }
 }
 /// Sanitize a name for use as a directory/file component.
+///
+/// The character filter is not enough on its own: `.` and `..` pass through
+/// unchanged (dots are legal in ids), and a component named `..` would make
+/// `targets/..` (or `deployments/..`) resolve to the STORE ROOT — a target or
+/// deployment named `..` must never escape the intended layout.
 pub fn sanitize(name: &str) -> String {
     let mut out = String::new();
     for c in name.chars() {
@@ -651,8 +656,8 @@ pub fn sanitize(name: &str) -> String {
             out.push('_');
         }
     }
-    if out.is_empty() {
-        out.push('_');
+    if out.is_empty() || out == "." || out == ".." {
+        out = "_".to_string();
     }
     out
 }
@@ -661,6 +666,53 @@ pub fn sanitize(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::model::{DeploymentId, TargetName};
+
+    /// `sanitize` must neutralize path-traversal components. `.` and `..` are
+    /// the one case the character filter lets through untouched (dots are
+    /// legal in ids), and an unsuffixed component named `..` would make
+    /// `targets/..` resolve to the STORE ROOT — the `..`/`.` names are
+    /// reachable via the CLI (`deploy status ..`) or a quoted TOML target key
+    /// (`[targets.".."]`), so escaping the layout must be impossible.
+    #[test]
+    fn sanitize_neutralizes_path_traversal_components() {
+        assert_eq!(sanitize(".."), "_");
+        assert_eq!(sanitize("."), "_");
+        assert_eq!(sanitize(""), "_");
+        // Separators and any other non-id characters become underscores.
+        assert_eq!(sanitize("../evil"), ".._evil");
+        assert_eq!(sanitize("a/b"), "a_b");
+        assert_eq!(sanitize("a\\b"), "a_b");
+        // Ordinary ids pass through unchanged.
+        assert_eq!(sanitize("normal-name_1.x"), "normal-name_1.x");
+
+        // End-to-end: a target named `..` must stay inside the target tree,
+        // never resolve to the store root.
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        assert_eq!(
+            store.target_dir(".."),
+            dir.path().join("store").join("targets").join("_"),
+            "a '..' target must be confined to its own target dir, not the store root"
+        );
+        store
+            .write_observed(
+                "..",
+                &ObservedTarget {
+                    target: TargetName::new("..".to_string()),
+                    ..ObservedTarget::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            !dir.path().join("store").join("observed.json").exists(),
+            "observed state for a '..' target must never land at the store root"
+        );
+        assert_eq!(
+            store.read_observed("..").unwrap().target.as_str(),
+            "..",
+            "the sanitized path must not corrupt the recorded target identity"
+        );
+    }
 
     #[test]
     fn release_aux_snapshots_are_immutable_and_atomic() {

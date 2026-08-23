@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::init::{InitOptions, init_project};
 use crate::push::engine::{PushOptions, PushReport, push};
-use crate::records::{DeploymentAttempt, DeploymentStatus};
+use crate::records::{DeploymentAttempt, DeploymentStatus, ObservedTarget};
 use crate::remote::create_remote;
 use crate::remote::transport::Remote;
 use crate::store::local::LocalStore;
@@ -291,21 +291,38 @@ where
         }
         Command::Status { target } => {
             let observed = store.read_observed(&target)?;
-            for (slot_id, srv) in &observed.slots {
-                let artifact = srv.artifact.as_ref();
-                println!(
-                    "{}  generation={:?} release={:?} variant={:?} tree={:?}",
-                    slot_id,
-                    srv.generation,
-                    artifact.map(|a| &a.release),
-                    artifact.map(|a| &a.variant),
-                    artifact.map(|a| &a.tree),
-                );
+            for line in render_status(&observed) {
+                println!("{line}");
             }
         }
         Command::Init { .. } => unreachable!("handled above"),
     }
     Ok(())
+}
+
+/// Render `deploy status <target>` output: one line per observed slot with
+/// the generation, release, variant, and tree AS OBSERVED ON THE SERVER right
+/// now (never from local history). A slot with no known assignment renders
+/// `None` on every column; a known generation with an unreadable assignment
+/// renders the generation while the artifact columns stay `None`. The CLI
+/// prints exactly these lines; the unit test asserts on them directly because
+/// lib unit tests cannot capture the harness-owned stdout sink.
+fn render_status(observed: &ObservedTarget) -> Vec<String> {
+    observed
+        .slots
+        .iter()
+        .map(|(slot_id, srv)| {
+            let artifact = srv.artifact.as_ref();
+            format!(
+                "{}  generation={:?} release={:?} variant={:?} tree={:?}",
+                slot_id,
+                srv.generation,
+                artifact.map(|a| &a.release),
+                artifact.map(|a| &a.variant),
+                artifact.map(|a| &a.tree),
+            )
+        })
+        .collect()
 }
 
 /// Effective status of an attempt for `deploy log`: the append-only
@@ -354,7 +371,10 @@ fn print_report(report: &PushReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DeploymentId, PlacementSlotId, TargetName};
+    use crate::model::{
+        DeploymentId, GenerationId, PlacementSlotId, ReleaseId, TargetName, TreeDigest, VariantName,
+    };
+    use crate::records::{ObservedServer, ObservedTarget};
     use std::collections::BTreeMap;
 
     fn pending_attempt(id: &str) -> DeploymentAttempt {
@@ -425,6 +445,173 @@ mod tests {
             (DeploymentStatus::Degraded, None)
         );
     }
+
+    /// `deploy status <target>` renders each slot's OBSERVED state as it is
+    /// right now on the server: generation, release, variant, and tree. A slot
+    /// with an unknown assignment renders `None` on every column (the observed
+    /// artifact is optional), and a slot with a known generation but no known
+    /// artifact renders the generation while the artifact columns stay `None`.
+    /// The CLI prints exactly what [`render_status`] returns, so the test
+    /// drives the real `run_with` path (parse, config load, store resolution,
+    /// print loop) and asserts the rendered lines through the helper — lib
+    /// unit tests cannot capture the harness-owned stdout sink.
+    #[test]
+    fn status_renders_observed_assignments() {
+        // The store lives under `XDG_DATA_HOME` and `run_with` reads the real
+        // process env, so the env-lock invariant applies.
+        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        // A minimal but VALID project: `Config::load` requires the release
+        // directory to exist with at least one variant file.
+        std::fs::write(
+            release_dir.join("standard.toml"),
+            r#"[[slots]]
+id = "p1"
+server = "s1"
+target = "production"
+deploy_dir = "/srv/status"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("deploy.toml"),
+            r#"schema_version = 1
+application = "status-cli"
+release = "v1"
+
+[targets.production.rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[targets.production.rotation.fleet]
+protect_deployments = 1
+
+[[servers]]
+id = "s1"
+address = "a"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[targets.production]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#,
+        )
+        .unwrap();
+        let cfg_path = project.join("deploy.toml");
+
+        // Point the store at a hermetic `XDG_DATA_HOME` and seed observed.json
+        // with three slots: p1 has a full assignment, p2 has NO known
+        // assignment (never observed / rotated away), and p3 has a known
+        // generation but no known artifact (the assignment could not be read).
+        let data_home = dir.path().join("data");
+        unsafe { std::env::set_var("XDG_DATA_HOME", &data_home) };
+        let store = LocalStore::with_base(data_home.join("simple-deploy")).unwrap();
+        store
+            .write_observed(
+                "production",
+                &ObservedTarget {
+                    target: TargetName::new("production".to_string()),
+                    slots: BTreeMap::from([
+                        (
+                            PlacementSlotId::new("p1".to_string()),
+                            ObservedServer {
+                                generation: Some(GenerationId::new("gen-41da".to_string())),
+                                artifact: Some(crate::model::ArtifactRef {
+                                    release: ReleaseId::new("rel-sha256-status".to_string()),
+                                    variant: VariantName::new("standard".to_string()),
+                                    tree: TreeDigest::new("tree-2c4f".to_string()),
+                                }),
+                                last_deployment: Some(DeploymentId::new(
+                                    "deploy-status-1".to_string(),
+                                )),
+                            },
+                        ),
+                        (
+                            PlacementSlotId::new("p2".to_string()),
+                            ObservedServer {
+                                generation: None,
+                                artifact: None,
+                                last_deployment: None,
+                            },
+                        ),
+                        (
+                            PlacementSlotId::new("p3".to_string()),
+                            ObservedServer {
+                                generation: Some(GenerationId::new("gen-9f00".to_string())),
+                                artifact: None,
+                                last_deployment: None,
+                            },
+                        ),
+                    ]),
+                },
+            )
+            .unwrap();
+
+        // Drive the real CLI path end-to-end: argument parsing, config load,
+        // store resolution, and the print loop must all succeed against the
+        // seeded store.
+        run_with([
+            "deploy",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "status",
+            "production",
+        ])
+        .expect("deploy status must succeed");
+
+        // Restore the environment and release the env lock BEFORE any
+        // assertion: a failing assertion must never poison the shared
+        // `ENV_LOCK`.
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        drop(_lock);
+
+        // The rendered lines are exactly what the CLI printed, one per slot
+        // (BTreeMap order: p1, p2, p3).
+        let lines = render_status(&store.read_observed("production").unwrap());
+        assert_eq!(lines.len(), 3, "one line per observed slot: {lines:?}");
+        let p1 = &lines[0];
+        assert!(p1.contains("p1  generation="), "p1 line: {p1}");
+        assert!(p1.contains("gen-41da"), "generation id rendered: {p1}");
+        assert!(
+            p1.contains("rel-sha256-status"),
+            "release id rendered: {p1}"
+        );
+        assert!(p1.contains("standard"), "variant rendered: {p1}");
+        assert!(p1.contains("tree-2c4f"), "tree digest rendered: {p1}");
+        // p2: an entirely unknown assignment renders as None on every column.
+        assert_eq!(
+            lines[1],
+            "p2  generation=None release=None variant=None tree=None"
+        );
+        // p3: a known generation with an unknown artifact renders the
+        // generation but None on the artifact columns.
+        assert!(lines[2].contains("gen-9f00"), "p3 line: {}", lines[2]);
+        assert!(
+            lines[2].contains("release=None variant=None tree=None"),
+            "generation-only slot must keep the artifact columns None: {}",
+            lines[2]
+        );
+    }
+
     use clap::{CommandFactory, Parser};
     use std::path::Path;
 
