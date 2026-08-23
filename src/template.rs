@@ -5,21 +5,46 @@
 //!
 //! The renderer understands exactly this fixed set of variables:
 //!
-//! | variable      | meaning                                                       | render sites |
-//! |---------------|---------------------------------------------------------------|--------------|
-//! | `deploy_dir`  | absolute on-server deployment directory of the slot           | activation, verification |
-//! | `variant`     | the release variant being materialized / activated            | mapping, activation, verification |
-//! | `application` | `application` from `deploy.toml`                              | activation, verification |
-//! | `release`     | the active release name (`release:` in `deploy.toml`)         | activation, verification |
-//! | `target`      | the target being pushed                                       | activation, verification |
-//! | `server`      | the server ID of the slot                                     | activation, verification |
+//! | variable        | meaning                                                              |
+//! |-----------------|----------------------------------------------------------------------|
+//! | `deploy_dir`    | absolute on-server deployment directory of the slot                  |
+//! | `variant`       | the release variant being materialized / activated                   |
+//! | `application`   | `application` from `deploy.toml`                                     |
+//! | `release`       | the active release name (`release:` in `deploy.toml`)                |
+//! | `target`        | the target being pushed                                              |
+//! | `server`        | the server ID of the slot (`[[servers]].id`)                         |
+//! | `user`          | the server's deployment account (`[[servers]].user`)                 |
+//! | `address`       | the server's address (`[[servers]].address`)                         |
+//! | `port`          | the server's SSH port (`[[servers]].port`)                           |
+//! | `slot`          | the placement-slot ID of the slot (`[[slots]].id`)                   |
+//! | `deployment_id` | the deployment ID being activated (per-server activation/verification only) |
+//! | `generation`    | the generation being activated (per-server activation/verification only)    |
+//! | `tree`          | the tree digest being activated (per-server activation/verification only)   |
+//!
+//! # Availability matrix
 //!
 //! Sites that cannot fill a variable leave it unset, and referencing it at
-//! that site fails loudly (see below). Materialization is the constrained
-//! case: trees are content-addressed and shared across slots, so mapping
-//! paths may only use `variant` — never per-slot values such as `deploy_dir`
-//! (two slots with different `deploy_dir`s must still produce the same tree
-//! digest).
+//! that site fails loudly (see below).
+//!
+//! | context                                             | available variables                                        |
+//! |-----------------------------------------------------|------------------------------------------------------------|
+//! | `TemplateVars::mapping` (materialization)           | `variant`, `application`, `release`                        |
+//! | `TemplateVars::slot` (base activation/verification) | `deploy_dir`, `variant`, `application`, `release`, `target`, `server` |
+//! | slot + [`TemplateVars::with_server`]                | ... + `user`, `address`, `port`                            |
+//! | slot + [`TemplateVars::with_slot_id`]               | ... + `slot`                                               |
+//! | slot + [`TemplateVars::with_deployment`]            | ... + `deployment_id`, `generation`, `tree`                |
+//!
+//! Materialization is the constrained case: trees are content-addressed and
+//! shared across slots, so mapping paths may only use per-variant values
+//! (`variant`, `application`, `release`) — never per-slot or per-server
+//! values such as `deploy_dir`, `user`, or `address` (two slots with
+//! different `deploy_dir`s must still produce the same tree digest).
+//!
+//! The three deployment-scoped variables (`deployment_id`, `generation`,
+//! `tree`) are only filled by the engine's per-server activation/verification
+//! path (and compensation); sites that do not know them (e.g. the
+//! reconciliation loop) leave them unset, so a unit/argv referencing them
+//! there fails loudly rather than rendering a stale value.
 //!
 //! # Security posture
 //!
@@ -45,22 +70,30 @@ use crate::error::{Error, Result};
 use std::path::Path;
 
 /// The full elected variable set, in documentation order.
-pub const ELECTED_VARIABLES: [&str; 6] = [
+pub const ELECTED_VARIABLES: [&str; 13] = [
     "deploy_dir",
     "variant",
     "application",
     "release",
     "target",
     "server",
+    "user",
+    "address",
+    "port",
+    "slot",
+    "deployment_id",
+    "generation",
+    "tree",
 ];
 
 /// The context for one [`render`] call.
 ///
 /// Every field is `Option` because a render site can only fill the variables
-/// it actually knows: materialization (`TemplateVars::mapping`) knows only the
-/// variant, while activation/verification (`TemplateVars::slot`) knows the
-/// full slot context. A template that references a `None` field fails loudly
-/// instead of silently rendering an empty string.
+/// it actually knows: materialization ([`TemplateVars::mapping`]) knows only
+/// `variant`/`application`/`release`, while activation/verification
+/// ([`TemplateVars::slot`] plus the `with_*` builders) knows the full slot
+/// context. A template that references a `None` field fails loudly instead of
+/// silently rendering an empty string.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TemplateVars {
     deploy_dir: Option<String>,
@@ -69,25 +102,46 @@ pub struct TemplateVars {
     release: Option<String>,
     target: Option<String>,
     server: Option<String>,
+    user: Option<String>,
+    address: Option<String>,
+    port: Option<String>,
+    slot: Option<String>,
+    deployment_id: Option<String>,
+    generation: Option<String>,
+    tree: Option<String>,
 }
 
 impl TemplateVars {
-    /// Context for mapping materialization: only per-variant values are
-    /// available. Trees are content-addressed and shared across slots, so
-    /// slot-level variables (`deploy_dir`, `server`, `target`) must never be
-    /// rendered into a tree; a mapping that references them fails loudly.
-    pub fn mapping(variant: &str) -> TemplateVars {
+    /// Context for mapping materialization: per-variant values only
+    /// (`variant`, `application`, `release`). Trees are content-addressed and
+    /// shared across slots, so slot/server/deployment variables
+    /// (`deploy_dir`, `server`, `target`, `user`, `address`, `port`, `slot`,
+    /// `deployment_id`, `generation`, `tree`) must never be rendered into a
+    /// tree; a mapping that references them fails loudly.
+    pub fn mapping(application: &str, release: &str, variant: &str) -> TemplateVars {
         TemplateVars {
             deploy_dir: None,
             variant: Some(variant.to_string()),
-            application: None,
-            release: None,
+            application: Some(application.to_string()),
+            release: Some(release.to_string()),
             target: None,
             server: None,
+            user: None,
+            address: None,
+            port: None,
+            slot: None,
+            deployment_id: None,
+            generation: None,
+            tree: None,
         }
     }
 
-    /// Full slot context available at activation/verification time.
+    /// Base slot context available at activation/verification time: the
+    /// per-slot deployment location plus the configuration-level values. The
+    /// server-level (`user`/`address`/`port`), slot ID, and
+    /// deployment-scoped variables start unset — fill them with
+    /// [`TemplateVars::with_server`], [`TemplateVars::with_slot_id`], and
+    /// [`TemplateVars::with_deployment`] at sites that have them.
     pub fn slot(
         deploy_dir: &Path,
         variant: &str,
@@ -103,12 +157,55 @@ impl TemplateVars {
             release: Some(release.to_string()),
             target: Some(target.to_string()),
             server: Some(server.to_string()),
+            user: None,
+            address: None,
+            port: None,
+            slot: None,
+            deployment_id: None,
+            generation: None,
+            tree: None,
         }
+    }
+
+    /// Add the server's connection metadata: the deployment account
+    /// (`user`, from `[[servers]].user`), the address, and the SSH `port`.
+    /// Together with `server` (the ID) these describe the physical host the
+    /// slot deploys onto.
+    pub fn with_server(mut self, user: &str, address: &str, port: u16) -> TemplateVars {
+        self.user = Some(user.to_string());
+        self.address = Some(address.to_string());
+        self.port = Some(port.to_string());
+        self
+    }
+
+    /// Add the placement-slot ID (`[[slots]].id`), distinct from `server`
+    /// (the physical server the slot deploys onto).
+    pub fn with_slot_id(mut self, slot: &str) -> TemplateVars {
+        self.slot = Some(slot.to_string());
+        self
+    }
+
+    /// Add the per-deployment identity, available only in the per-server
+    /// activation/verification path: the deployment ID being pushed, the
+    /// generation being activated, and the activated tree digest. Pass
+    /// `None` at sites that do not know them (e.g. the reconciliation loop);
+    /// a template referencing an unfilled deployment variable fails loudly.
+    pub fn with_deployment(
+        mut self,
+        deployment_id: Option<&crate::model::DeploymentId>,
+        generation: Option<&crate::model::GenerationId>,
+        tree: Option<&crate::model::TreeDigest>,
+    ) -> TemplateVars {
+        self.deployment_id = deployment_id.map(|d| d.as_str().to_string());
+        self.generation = generation.map(|g| g.as_str().to_string());
+        self.tree = tree.map(|t| t.as_str().to_string());
+        self
     }
 
     /// Same context with a different `variant`. Compensation re-runs the
     /// PRIOR generation's contract, whose variant can differ from the desired
-    /// one; everything else (deploy_dir, application, ...) is unchanged.
+    /// one; everything else (deploy_dir, application, server metadata,
+    /// deployment identity, ...) is unchanged.
     pub fn with_variant(&self, variant: &str) -> TemplateVars {
         let mut out = self.clone();
         out.variant = Some(variant.to_string());
@@ -125,6 +222,13 @@ impl TemplateVars {
             "release" => self.release.as_deref(),
             "target" => self.target.as_deref(),
             "server" => self.server.as_deref(),
+            "user" => self.user.as_deref(),
+            "address" => self.address.as_deref(),
+            "port" => self.port.as_deref(),
+            "slot" => self.slot.as_deref(),
+            "deployment_id" => self.deployment_id.as_deref(),
+            "generation" => self.generation.as_deref(),
+            "tree" => self.tree.as_deref(),
             _ => return None,
         };
         Some(value)
@@ -187,6 +291,7 @@ pub fn render_argv(argv: &[String], vars: &TemplateVars) -> Result<Vec<String>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{DeploymentId, GenerationId, TreeDigest};
 
     fn slot_vars() -> TemplateVars {
         TemplateVars::slot(
@@ -196,6 +301,13 @@ mod tests {
             "v1",
             "production",
             "server-01",
+        )
+        .with_server("deploy", "10.0.0.5", 22)
+        .with_slot_id("app-1")
+        .with_deployment(
+            Some(&DeploymentId::new("deploy-1")),
+            Some(&GenerationId::new("gen-1")),
+            Some(&TreeDigest::new("abc123")),
         )
     }
 
@@ -209,7 +321,7 @@ mod tests {
         assert_eq!(
             render_template(
                 "deployment/variants/{{ variant }}/",
-                &TemplateVars::mapping("standard"),
+                &TemplateVars::mapping("example", "v1", "standard"),
             )
             .unwrap(),
             "deployment/variants/standard/"
@@ -221,13 +333,13 @@ mod tests {
         );
         // Every elected variable renders from the slot context.
         let all = render_template(
-            "{{ deploy_dir }}|{{ variant }}|{{ application }}|{{ release }}|{{ target }}|{{ server }}",
+            "{{ deploy_dir }}|{{ variant }}|{{ application }}|{{ release }}|{{ target }}|{{ server }}|{{ user }}|{{ address }}|{{ port }}|{{ slot }}|{{ deployment_id }}|{{ generation }}|{{ tree }}",
             &v,
         )
         .unwrap();
         assert_eq!(
             all,
-            "/srv/deploy/example|standard|example|v1|production|server-01"
+            "/srv/deploy/example|standard|example|v1|production|server-01|deploy|10.0.0.5|22|app-1|deploy-1|gen-1|abc123"
         );
     }
 
@@ -247,13 +359,48 @@ mod tests {
 
     #[test]
     fn unavailable_variable_fails_at_its_render_site() {
-        // A mapping context knows only `variant`: referencing deploy_dir there
-        // must fail loudly rather than render an empty path component.
-        let m = TemplateVars::mapping("standard");
+        // A mapping context knows only variant/application/release:
+        // referencing deploy_dir there must fail loudly rather than render an
+        // empty path component.
+        let m = TemplateVars::mapping("example", "v1", "standard");
         let err = render_template("artifacts/{{ deploy_dir }}", &m).unwrap_err();
         assert!(
             err.to_string()
                 .contains("variable 'deploy_dir' is not available in this context")
+        );
+    }
+
+    #[test]
+    fn mapping_context_rejects_server_and_deployment_variables() {
+        // Trees are content-addressed and shared across slots: slot-level,
+        // server-level, and deployment-scoped variables must never render
+        // into a tree. Every one of them fails loudly in the mapping context.
+        let m = TemplateVars::mapping("example", "v1", "standard");
+        for name in [
+            "deploy_dir",
+            "target",
+            "server",
+            "user",
+            "address",
+            "port",
+            "slot",
+            "deployment_id",
+            "generation",
+            "tree",
+        ] {
+            let t = format!("artifacts/{{{{ {name} }}}}");
+            let err = render_template(&t, &m).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!(
+                    "variable '{name}' is not available in this context"
+                )),
+                "mapping context must reject '{name}' (got: {err})"
+            );
+        }
+        // The mapping context DOES provide variant/application/release.
+        assert_eq!(
+            render_template("{{ variant }}/{{ application }}/{{ release }}", &m).unwrap(),
+            "standard/example/v1"
         );
     }
 
@@ -310,11 +457,22 @@ mod tests {
 
     #[test]
     fn with_variant_replaces_only_the_variant() {
-        let v = TemplateVars::slot(Path::new("/srv/a"), "standard", "app", "v2", "prod", "s1");
+        let v = TemplateVars::slot(Path::new("/srv/a"), "standard", "app", "v2", "prod", "s1")
+            .with_server("deploy", "10.0.0.5", 22)
+            .with_slot_id("app-1")
+            .with_deployment(
+                Some(&DeploymentId::new("d1")),
+                Some(&GenerationId::new("g1")),
+                Some(&TreeDigest::new("t1")),
+            );
         let prior = v.with_variant("old");
         assert_eq!(
-            render_template("{{ variant }}|{{ deploy_dir }}|{{ release }}", &prior).unwrap(),
-            "old|/srv/a|v2"
+            render_template(
+                "{{ variant }}|{{ deploy_dir }}|{{ release }}|{{ user }}|{{ slot }}|{{ generation }}",
+                &prior
+            )
+            .unwrap(),
+            "old|/srv/a|v2|deploy|app-1|g1"
         );
     }
 }

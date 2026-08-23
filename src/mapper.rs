@@ -137,10 +137,16 @@ fn ensure_within_dest(dest_root: &Path, dst: &Path) -> Result<()> {
 
 /// Apply all mappings for `variant` to assemble a complete staging tree at
 /// `dest`. `dest` is created/cleared before mapping.
+///
+/// `vars` is the mapping context ([`TemplateVars::mapping`]): only
+/// per-variant values (`variant`, `application`, `release`) are available,
+/// because the assembled tree is content-addressed and shared across slots —
+/// a mapping `from` that references a server/slot variable fails loudly
+/// instead of producing a slot-dependent tree.
 pub fn materialize_variant(
     root: &Path,
     mappings: &[Mapping],
-    variant: &str,
+    vars: &crate::template::TemplateVars,
     dest: &Path,
 ) -> Result<()> {
     if dest.exists() {
@@ -152,10 +158,7 @@ pub fn materialize_variant(
     set_mode(dest, Some(0o755))?;
 
     for (idx, m) in mappings.iter().enumerate() {
-        let from = crate::template::render_template(
-            &m.from,
-            &crate::template::TemplateVars::mapping(variant),
-        )?;
+        let from = crate::template::render_template(&m.from, vars)?;
         let src = root.join(&from);
         let mode_override = resolved_mode(&m.mode)?;
         if !src.exists() {
@@ -260,7 +263,13 @@ mod tests {
             optional: false,
         }];
         let dest = dir.path().join("dest");
-        materialize_variant(&root, &mappings, "standard", &dest).unwrap();
+        materialize_variant(
+            &root,
+            &mappings,
+            &crate::template::TemplateVars::mapping("app", "v1", "standard"),
+            &dest,
+        )
+        .unwrap();
 
         let check = |rel: &str, want: u32| {
             let m = std::fs::metadata(dest.join(rel)).unwrap().mode() & 0o7777;
@@ -310,9 +319,54 @@ mod tests {
             },
         ];
         let dest = dir.path().join("dest");
-        materialize_variant(&root, &mappings, "standard", &dest).unwrap();
+        materialize_variant(
+            &root,
+            &mappings,
+            &crate::template::TemplateVars::mapping("app", "v1", "standard"),
+            &dest,
+        )
+        .unwrap();
         assert!(dest.join("app/README").exists());
         assert!(dest.join("app/extra").exists());
         assert!(dest.join("app/server").exists());
+    }
+
+    #[test]
+    fn mapping_referencing_server_variable_fails_loudly() {
+        // Trees are content-addressed and shared across slots: a mapping
+        // `from` referencing a per-server variable (e.g. `{{ user }}`) must
+        // fail loudly — never render an empty path component, never produce a
+        // slot-dependent tree.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        std::fs::create_dir_all(root.join("deployment")).unwrap();
+        std::fs::write(root.join("deployment/x"), b"x").unwrap();
+        let mappings = vec![Mapping {
+            from: "deployment/{{ user }}/".into(),
+            to: "app/".into(),
+            recursive: true,
+            conflict: ConflictPolicy::Replace,
+            mode: None,
+            optional: false,
+        }];
+        let dest = dir.path().join("dest");
+        let err = materialize_variant(
+            &root,
+            &mappings,
+            &crate::template::TemplateVars::mapping("app", "v1", "standard"),
+            &dest,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("variable 'user' is not available in this context"),
+            "mapping must reject a server-scoped variable: {err}"
+        );
+        // The staging dir exists (created before mapping) but nothing was
+        // materialized into it — no slot-dependent tree content.
+        assert!(
+            !dest.join("app").exists(),
+            "nothing materialized on a template error"
+        );
     }
 }

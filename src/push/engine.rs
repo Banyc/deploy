@@ -51,12 +51,20 @@ type RemoteFactory =
 /// configuration. `variant` is the variant whose contract is being rendered —
 /// the desired variant during activation, or the PRIOR variant when
 /// compensating (compensation overrides it via `TemplateVars::with_variant`).
+///
+/// `deployment_id`/`generation`/`tree` are the per-deployment identity,
+/// available only in the per-server activation/verification path; sites that
+/// do not know them (e.g. the reconciliation loop) pass `None`, and a
+/// template referencing such a variable there fails loudly.
 fn slot_vars(
     members: &[(&crate::config::SlotDef, &crate::config::ServerDef)],
     config: &Config,
     target_name: &str,
     slot_id: &PlacementSlotId,
     variant: &str,
+    deployment_id: Option<&DeploymentId>,
+    generation: Option<&GenerationId>,
+    tree: Option<&TreeDigest>,
 ) -> Result<crate::template::TemplateVars> {
     let (slot, server) = members
         .iter()
@@ -74,7 +82,10 @@ fn slot_vars(
         config.release.as_str(),
         target_name,
         &server.id,
-    ))
+    )
+    .with_server(&server.user, &server.address, server.port)
+    .with_slot_id(&slot.id)
+    .with_deployment(deployment_id, generation, tree))
 }
 
 /// Run a push against `target_name`.
@@ -206,7 +217,11 @@ fn push_inner(
             crate::mapper::materialize_variant(
                 &release_root,
                 &config.variant(&v)?.artifact.mappings,
-                &v,
+                &crate::template::TemplateVars::mapping(
+                    &config.application,
+                    config.release.as_str(),
+                    &v,
+                ),
                 &staging,
             )?;
             let meta = tree::canonicalize_tree(&staging)?;
@@ -547,6 +562,9 @@ fn push_inner(
                     target_name,
                     &a.placement_slot,
                     a.artifact.variant.as_str(),
+                    Some(deployment_id),
+                    Some(&new_gen[&a.placement_slot]),
+                    Some(&a.artifact.tree),
                 )?;
                 if run_verification(remote, &variant_behavior.verification, &vars).is_err() {
                     verified = false;
@@ -696,6 +714,9 @@ fn push_inner(
                 target_name,
                 sid,
                 a.artifact.variant.as_str(),
+                Some(deployment_id),
+                Some(&new_gen[sid]),
+                Some(&a.artifact.tree),
             )?;
             let outcome = process_server(
                 store,
@@ -778,6 +799,9 @@ fn push_inner(
                 target_name,
                 sid,
                 plan_servers[sid].artifact.variant.as_str(),
+                Some(deployment_id),
+                Some(&new_gen[sid]),
+                Some(&plan_servers[sid].artifact.tree),
             )?;
             let ok = compensate_server(
                 store,
@@ -2200,7 +2224,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             crate::mapper::materialize_variant(
                 &release_root,
                 &vcfg.artifact.mappings,
-                "standard",
+                &crate::template::TemplateVars::mapping(
+                    &config.application,
+                    config.release.as_str(),
+                    "standard",
+                ),
                 &staging,
             )
             .unwrap();
@@ -2254,7 +2282,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 self.config.release.as_str(),
                 "t1",
                 &server.id,
-            );
+            )
+            .with_server(&server.user, &server.address, server.port)
+            .with_slot_id(&slot.id)
+            .with_deployment(Some(&deployment_id), Some(&new_gen), Some(&self.tree));
             process_server(
                 &self.store,
                 &self.remote,
@@ -2883,7 +2914,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         crate::mapper::materialize_variant(
             &release_root,
             &vcfg.artifact.mappings,
-            "standard",
+            &crate::template::TemplateVars::mapping(
+                &config.application,
+                config.release.as_str(),
+                "standard",
+            ),
             &staging,
         )
         .unwrap();

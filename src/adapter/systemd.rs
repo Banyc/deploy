@@ -329,6 +329,7 @@ pub fn run_activation(
 pub(crate) mod tests {
     use super::*;
     use crate::config::{ActivationConfig, ActivationScope, UnitDef};
+    use crate::model::{DeploymentId, GenerationId, TreeDigest};
     use crate::remote::transport::LocalTransport;
 
     /// Serializes every test that mutates the process-wide `PATH` or
@@ -356,6 +357,9 @@ pub(crate) mod tests {
         }
     }
 
+    /// Full slot context including the per-server metadata (user, address,
+    /// port), the slot ID, and the per-deployment identity, exactly as the
+    /// engine's `slot_vars` fills it for the activation/verification path.
     fn slot_vars() -> TemplateVars {
         TemplateVars::slot(
             Path::new("/srv/deploy/example"),
@@ -364,6 +368,13 @@ pub(crate) mod tests {
             "v1",
             "production",
             "server-01",
+        )
+        .with_server("deploy", "10.0.0.5", 22)
+        .with_slot_id("app-1")
+        .with_deployment(
+            Some(&DeploymentId::new("deploy-1")),
+            Some(&GenerationId::new("gen-1")),
+            Some(&TreeDigest::new("abc123")),
         )
     }
 
@@ -457,12 +468,14 @@ pub(crate) mod tests {
         );
     }
 
-    /// A unit file containing `{{ deploy_dir }}` (and other elected
-    /// variables) renders with the slot's context when staged, and the staged
-    /// REGULAR FILE is what the install commands copy into the user systemd
-    /// dir.
+    /// A unit file containing `{{ deploy_dir }}`, `{{ user }}`, `{{ address }}`,
+    /// `{{ port }}`, and `{{ deployment_id }}` (plus other elected variables)
+    /// renders with the slot's context when staged, and the staged REGULAR
+    /// FILE is what the install commands copy into the user systemd dir. The
+    /// per-server `user`/`address`/`port` values come from the matching
+    /// `[[servers]]` entry; `deployment_id` from the push being activated.
     #[test]
-    fn rendered_unit_uses_slot_deploy_dir() {
+    fn rendered_unit_uses_slot_deploy_dir_and_server_metadata() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("remote");
         let remote = LocalTransport::new(base.clone()).unwrap();
@@ -472,7 +485,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(base.join(unit_rel.parent().unwrap())).unwrap();
         std::fs::write(
             base.join(&unit_rel),
-            "[Service]\nExecStart={{ deploy_dir }}/current/app/server\nArg={{ variant }} {{ application }} {{ target }}/{{ server }}\n",
+            "[Service]\n# deployed by {{ user }} on {{ address }}:{{ port }} (deployment {{ deployment_id }})\nExecStart={{ deploy_dir }}/current/app/server\nArg={{ variant }} {{ application }} {{ target }}/{{ server }}\n",
         )
         .unwrap();
         // `generations/<gid>/root` -> the tree content root (symlink), as the
@@ -496,7 +509,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             String::from_utf8(staged).unwrap(),
-            "[Service]\nExecStart=/srv/deploy/example/current/app/server\nArg=standard example production/server-01\n"
+            "[Service]\n# deployed by deploy on 10.0.0.5:22 (deployment deploy-1)\nExecStart=/srv/deploy/example/current/app/server\nArg=standard example production/server-01\n"
         );
         // The install commands install the staged file into the user dir.
         let cmds = activation_commands(&base, Path::new("/home/deploy/.config"), &c);
@@ -631,13 +644,14 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("remote");
         let remote = LocalTransport::new(base.clone()).unwrap();
-        // Unit artifact with a slot-dependent ExecStart, under the tree.
+        // Unit artifact with a slot-dependent ExecStart and the per-server
+        // deployment account, under the tree.
         let tree_rel = crate::layout::tree_root("abc123");
         let unit_rel = tree_rel.join("integration/systemd/example.service");
         std::fs::create_dir_all(base.join(unit_rel.parent().unwrap())).unwrap();
         std::fs::write(
             base.join(&unit_rel),
-            "[Service]\nExecStart={{ deploy_dir }}/current/app/server\n",
+            "[Unit]\nDescription=Example service (managed by deploy, run as {{ user }})\n\n[Service]\nExecStart={{ deploy_dir }}/current/app/server\n",
         )
         .unwrap();
         let gen_dir = base.join(crate::layout::generation("g1"));
@@ -715,7 +729,7 @@ pub(crate) mod tests {
         assert!(meta.is_file(), "installed unit must be a regular file");
         assert_eq!(
             std::fs::read_to_string(&installed).unwrap(),
-            "[Service]\nExecStart=/srv/deploy/example/current/app/server\n"
+            "[Unit]\nDescription=Example service (managed by deploy, run as deploy)\n\n[Service]\nExecStart=/srv/deploy/example/current/app/server\n"
         );
         // Adapter state recorded on the remote root.
         assert!(base.join("adapters/systemd.json").is_file());

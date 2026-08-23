@@ -2,7 +2,8 @@
 # REAL systemd unit instead of a commented-out block. The unit file is an
 # artifact (`artifacts/systemd/example.service`) whose CONTENT is rendered per
 # slot at activation time (`{{ deploy_dir }}` resolves to the slot's
-# deploy_dir — the tree itself stays slot-independent); the rendered copy is
+# deploy_dir, `{{ user }}` to the per-server deployment account — the tree
+# itself stays slot-independent); the rendered copy is
 # installed into the user service manager (`~/.config/systemd/user/`),
 # enabled, and restarted after `current` is swapped.
 #

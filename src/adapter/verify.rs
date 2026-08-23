@@ -149,6 +149,8 @@ mod tests {
             "production",
             "server-01",
         )
+        .with_server("deploy", "10.0.0.5", 22)
+        .with_slot_id("app-1")
     }
 
     #[test]
@@ -159,6 +161,10 @@ mod tests {
             "{{ variant }}",
             "--tag",
             "{{ target }}",
+            "--user",
+            "{{ user }}",
+            "--slot",
+            "{{ slot }}",
         ]);
         run_verification(&remote, &c, &slot_vars()).unwrap();
         let executed = remote.executed.borrow();
@@ -170,6 +176,10 @@ mod tests {
                 "standard",
                 "--tag",
                 "production",
+                "--user",
+                "deploy",
+                "--slot",
+                "app-1",
             ]
         );
     }
