@@ -2415,6 +2415,120 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert!(proc.error.unwrap().to_lowercase().contains("type"));
     }
 
+    /// Regression: the engine must hand the activation adapter
+    /// `<remote>/generations/<gid>/root` (the `root` symlink to the tree
+    /// content root) as the generation root — never a nested `root/root`. A
+    /// full push with the systemd adapter exercises the real path
+    /// construction at both `run_activation` call sites; staging reads the
+    /// unit from `generations/<gid>/root/<artifact>`, so a `root/root`
+    /// double-join would ENOENT and the push would never reach Activated.
+    /// Fake `systemctl` in PATH and a temp `XDG_CONFIG_HOME` keep the
+    /// activation hermetic (same pattern as the adapter end-to-end test; the
+    /// shared `ENV_LOCK` serializes env-mutating tests).
+    #[test]
+    fn systemd_push_activation_uses_generation_root_not_nested() {
+        let _lock = crate::adapter::systemd::tests::ENV_LOCK.lock().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Fake systemctl (daemon-reload/enable/restart all succeed) and a temp
+        // config home so the installed unit lands somewhere hermetic.
+        let bindir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let fake = bindir.join("systemctl");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config_home = tmp.path().join("xdg");
+        let old_path = std::env::var_os("PATH");
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bindir.display(),
+                    old_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ),
+            );
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        }
+
+        let outcome = (|| {
+            let h = Harness::new(
+                SYSTEMD_TOML,
+                SYSTEMD_VARIANT,
+                &[
+                    ("build/output/app/server", "v1"),
+                    ("deployment/common/README", "common"),
+                    (
+                        "units/example.service",
+                        "[Service]\nExecStart={{ deploy_dir }}/current/app/server\n",
+                    ),
+                ],
+            );
+            let proc = h.run(None);
+            // The activation read the unit from `generations/<gid>/root`
+            // (through the `root` symlink into the tree content root). A
+            // `root/root` double-join would fail that read and never reach
+            // Activated.
+            assert_eq!(
+                proc.kind,
+                ServerOutcomeKind::Activated,
+                "activation failed (root/root double-join?): {:?}",
+                proc.error
+            );
+            assert!(!proc.did_compensate);
+            let gen_root = h
+                .remote
+                .root()
+                .join(crate::layout::generation(proc.generation.as_str()))
+                .join("root");
+            assert!(
+                gen_root.ends_with(
+                    Path::new("generations")
+                        .join(proc.generation.as_str())
+                        .join("root")
+                ),
+                "activation generation root must be <root>/generations/<gid>/root, got {}",
+                gen_root.display()
+            );
+            assert!(
+                !gen_root.to_string_lossy().contains("root/root"),
+                "activation generation root must not be a nested root/root"
+            );
+            // The double-joined path resolves to nothing on the published
+            // layout: the tree content root has no nested `root` directory.
+            assert!(
+                !h.remote
+                    .root()
+                    .join(crate::layout::generation(proc.generation.as_str()))
+                    .join("root/root")
+                    .exists(),
+                "published tree must have no nested root dir (root/root double-join would ENOENT)"
+            );
+            // The installed unit's content proves staging read the artifact
+            // through `generations/<gid>/root` and rendered it with the slot
+            // context (deploy_dir /srv/eng from the variant).
+            let installed = config_home.join("systemd/user/example.service");
+            assert_eq!(
+                std::fs::read_to_string(&installed).unwrap(),
+                "[Service]\nExecStart=/srv/eng/current/app/server\n"
+            );
+            Ok::<(), String>(())
+        })();
+        match old_path {
+            Some(p) => unsafe { std::env::set_var("PATH", p) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        match old_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        outcome.unwrap();
+    }
+
     #[test]
     fn dry_run_removes_readonly_staging_tree() {
         // A dry-run staging tree containing read-only directories/files (modes

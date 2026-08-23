@@ -326,10 +326,18 @@ pub fn run_activation(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::{ActivationConfig, ActivationScope, UnitDef};
     use crate::remote::transport::LocalTransport;
+
+    /// Serializes every test that mutates the process-wide `PATH` or
+    /// `XDG_CONFIG_HOME` (the fake-`systemctl` end-to-end test here and the
+    /// engine-level systemd push regression in `push/engine.rs`): all lib
+    /// tests share one process, and `run_activation` resolves the unit
+    /// directory base from the process environment, so two env-mutating tests
+    /// must never overlap.
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn cfg(scope: ActivationScope, units: Vec<&str>) -> ActivationConfig {
         ActivationConfig {
@@ -501,6 +509,89 @@ mod tests {
         assert_eq!(cp[2], "/home/deploy/.config/systemd/user/example.service");
     }
 
+    /// Regression: the activation generation root must be
+    /// `<remote_root>/generations/<gid>/root` — the `root` symlink to the tree
+    /// content root — never `<remote_root>/generations/<gid>/root/root`.
+    /// `push/engine.rs` builds this path at both `run_activation` call sites;
+    /// staging derives the unit read source from it, so a `root/root`
+    /// double-join would try to read through a nonexistent nested `root`
+    /// directory inside the tree content root and fail loudly. This test pins
+    /// the shape and proves staging reads the unit from the canonical root.
+    #[test]
+    fn activation_generation_root_is_single_root_not_nested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("remote");
+        let remote = LocalTransport::new(base.clone()).unwrap();
+        // Unit artifact under the tree content root.
+        let tree_rel = crate::layout::tree_root("abc123");
+        let unit_rel = tree_rel.join("integration/systemd/example.service");
+        std::fs::create_dir_all(base.join(unit_rel.parent().unwrap())).unwrap();
+        std::fs::write(
+            base.join(&unit_rel),
+            "[Service]\nExecStart={{ deploy_dir }}/current/app/server\n",
+        )
+        .unwrap();
+        // `generations/<gid>/root` -> the tree content root (symlink), exactly
+        // as `RemoteHelper::create_generation` installs it.
+        let gen_dir = base.join(crate::layout::generation("g1"));
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        std::os::unix::fs::symlink(
+            crate::layout::generation_root_link("abc123"),
+            gen_dir.join("root"),
+        )
+        .unwrap();
+
+        // Build the generation root exactly as the engine does at both
+        // `run_activation` call sites: `<root>/generations/<gid>/root`.
+        let generation_root = remote
+            .root()
+            .join(crate::layout::generation("g1"))
+            .join("root");
+        assert!(
+            generation_root.ends_with(Path::new("generations/g1/root")),
+            "activation generation root must be <root>/generations/<gid>/root, got {}",
+            generation_root.display()
+        );
+        assert!(
+            !generation_root.to_string_lossy().contains("root/root"),
+            "activation generation root must never be a nested root/root, got {}",
+            generation_root.display()
+        );
+
+        // Staging reads the unit from `generations/<gid>/root/<artifact>`:
+        // assert the exact relative read source `stage_rendered_units` derives
+        // from the generation root.
+        let gen_rel = generation_root.strip_prefix(remote.root()).unwrap();
+        let read_src = gen_rel.join("integration/systemd/example.service");
+        assert_eq!(
+            read_src,
+            Path::new("generations/g1/root/integration/systemd/example.service")
+        );
+        assert!(
+            !read_src.to_string_lossy().contains("root/root"),
+            "unit read source must not be a nested root/root path"
+        );
+        // The double-joined variant resolves to nothing on this layout (the
+        // tree content root has no nested `root` directory), so a `root/root`
+        // generation root would fail activation with a read error.
+        assert!(
+            !base.join("generations/g1/root/root").exists(),
+            "tree content root must have no nested root dir (a root/root double-join would ENOENT)"
+        );
+
+        // End-to-end: staging must read the content through the canonical
+        // `generations/<gid>/root` symlink (only that path reaches the unit).
+        let c = cfg(ActivationScope::User, vec!["example.service"]);
+        stage_rendered_units(&remote, &generation_root, &c, &slot_vars()).unwrap();
+        let staged = remote
+            .read(Path::new("adapters/systemd/example.service"))
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(staged).unwrap(),
+            "[Service]\nExecStart=/srv/deploy/example/current/app/server\n"
+        );
+    }
+
     /// An unknown or malformed variable in a unit file fails activation
     /// loudly: nothing is staged and nothing is installed.
     #[test]
@@ -535,7 +626,6 @@ mod tests {
     #[test]
     fn run_activation_installs_rendered_unit_end_to_end() {
         use std::os::unix::fs::PermissionsExt;
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _lock = ENV_LOCK.lock().unwrap();
 
         let tmp = tempfile::tempdir().unwrap();
@@ -583,9 +673,29 @@ mod tests {
             std::env::set_var("XDG_CONFIG_HOME", &config_home);
         }
 
+        // Regression pin: the activation generation root must be
+        // `<remote>/generations/<gid>/root` (the symlink to the tree content
+        // root), never a nested `root/root`. A double-join would make staging
+        // read through a nonexistent `root` directory inside the tree content
+        // root and fail below.
+        let generation_root = base.join(crate::layout::generation("g1")).join("root");
+        assert!(
+            generation_root.ends_with(Path::new("generations/g1/root")),
+            "activation root must be <root>/generations/<gid>/root, got {}",
+            generation_root.display()
+        );
+        assert!(
+            !generation_root.to_string_lossy().contains("root/root"),
+            "activation root must not be a nested root/root, got {}",
+            generation_root.display()
+        );
+        assert!(
+            !base.join("generations/g1/root/root").exists(),
+            "tree content root has no nested root dir: a root/root double-join would ENOENT"
+        );
+
         let result = (|| {
             let c = cfg(ActivationScope::User, vec!["example.service"]);
-            let generation_root = base.join(crate::layout::generation("g1")).join("root");
             run_activation(&remote, &generation_root, &c, &slot_vars())
         })();
         match old_path {
