@@ -5,7 +5,7 @@ use deploy::config::Config;
 use deploy::error::Result;
 use deploy::model::{PlacementSlotId, ServerId, TreeDigest};
 use deploy::push::engine::{PushOptions, push};
-use deploy::records::DeploymentStatus;
+use deploy::records::{DeploymentStatus, PhysicalBinding};
 use deploy::remote::transport::{LocalTransport, Remote};
 use deploy::store::local::LocalStore;
 use std::path::Path;
@@ -297,12 +297,13 @@ fn end_to_end_push_rollback() -> Result<()> {
     Ok(())
 }
 
-/// A successful push's fleet snapshot records the PHYSICAL server each slot
-/// was bound to (`servers[slot]`), not just the deployment-location slot id.
-/// Without this, exact rollback (which maps generations to slots by slot ID)
-/// would silently deploy onto a rebound host.
+/// A successful push's fleet snapshot records the COMPLETE physical binding
+/// each slot was bound to (`bindings[slot]` = `{server, deploy_dir}`), not
+/// just the deployment-location slot id. Without this, exact rollback (which
+/// maps generations to slots by slot ID) would silently deploy onto a
+/// rebound host or a moved on-host location.
 #[test]
-fn snapshot_records_each_slots_physical_server() -> Result<()> {
+fn snapshot_records_each_slots_physical_binding() -> Result<()> {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
@@ -332,20 +333,26 @@ fn snapshot_records_each_slots_physical_server() -> Result<()> {
 
     let snapshots = store.read_snapshots("production")?;
     assert_eq!(snapshots.len(), 1);
-    // p1 -> server-01, p2 -> server-02, p3 -> server-03 per the shared CONFIG.
+    // p1 -> (server-01, /srv/deploy/example), p2 -> (server-02,
+    // /srv/deploy/example), p3 -> (server-03, /srv/deploy/example) per the
+    // shared CONFIG's slot declarations.
+    let binding = |server: &str| PhysicalBinding {
+        server: ServerId::new(server),
+        deploy_dir: "/srv/deploy/example".to_string(),
+    };
     assert_eq!(
-        snapshots[0].servers.get(&PlacementSlotId::new("p1")),
-        Some(&ServerId::new("server-01"))
+        snapshots[0].bindings.get(&PlacementSlotId::new("p1")),
+        Some(&binding("server-01"))
     );
     assert_eq!(
-        snapshots[0].servers.get(&PlacementSlotId::new("p2")),
-        Some(&ServerId::new("server-02"))
+        snapshots[0].bindings.get(&PlacementSlotId::new("p2")),
+        Some(&binding("server-02"))
     );
     assert_eq!(
-        snapshots[0].servers.get(&PlacementSlotId::new("p3")),
-        Some(&ServerId::new("server-03"))
+        snapshots[0].bindings.get(&PlacementSlotId::new("p3")),
+        Some(&binding("server-03"))
     );
-    assert_eq!(snapshots[0].servers.len(), 3);
+    assert_eq!(snapshots[0].bindings.len(), 3);
 
     Ok(())
 }
@@ -434,9 +441,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let snapshots = store.read_snapshots("production")?;
     assert_eq!(snapshots.len(), 1);
     assert_eq!(
-        snapshots[0].servers.get(&PlacementSlotId::new("p1")),
-        Some(&ServerId::new("server-01")),
-        "f0 records the physical server the slot was deployed onto"
+        snapshots[0].bindings.get(&PlacementSlotId::new("p1")),
+        Some(&PhysicalBinding {
+            server: ServerId::new("server-01"),
+            deploy_dir: "/srv/deploy/rebind".to_string(),
+        }),
+        "f0 records the complete physical binding the slot was deployed onto"
     );
     let s01 = remotes_base.join("server-01");
     assert!(
@@ -473,12 +483,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     .expect("rebound slot must refuse exact rollback");
     let msg = err.to_string();
     assert!(
-        msg.contains("slot 'p1' was bound to server 'server-01' in production@f0"),
-        "error must name the slot and the recorded server, got: {msg}"
+        msg.contains(
+            "slot 'p1' was bound to server 'server-01' at '/srv/deploy/rebind' in production@f0"
+        ),
+        "error must name the slot, the recorded server and its deploy_dir, got: {msg}"
     );
     assert!(
-        msg.contains("now bound to 'server-02'"),
-        "error must name the current binding, got: {msg}"
+        msg.contains("now bound to 'server-02' at '/srv/deploy/rebind'"),
+        "error must name the current binding (server and deploy_dir), got: {msg}"
     );
     assert!(
         msg.contains("wrong host"),
@@ -518,6 +530,202 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     assert!(
         s02.join("current").exists(),
         "server-02 now hosts the slot after a HEAD push"
+    );
+
+    Ok(())
+}
+
+/// A slot whose deploy_dir MOVES to a different location on the SAME server
+/// must refuse an exact fleet rollback: the snapshot's generations are keyed
+/// by slot ID, so deploying them at the new location would silently roll back
+/// onto the wrong place on the same host (same server, different on-server
+/// state). The failed push must not touch either location's remote root at
+/// all.
+#[test]
+fn rollback_refuses_moved_deploy_dir() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store_base = tmp.path().join("store");
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    // One physical server; the slot starts bound to it at deploy_dir A.
+    let config_toml = r#"
+schema_version = 1
+application = "movedir"
+release = "v1"
+
+[targets.production.rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[targets.production.rotation.fleet]
+protect_deployments = 2
+
+[[servers]]
+id = "server-01"
+address = "local:///srv/s01"
+user = "deploy"
+
+[targets.production]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#;
+    let config_path = proj.join("deploy.toml");
+    write_file(&config_path, config_toml);
+    write_variant_file(
+        &proj,
+        "standard",
+        &format!(
+            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntarget = \"production\"\ndeploy_dir = \"/srv/move/movedir-a\"\n"
+        ),
+    );
+    let artifacts = proj.join("releases").join("v1").join("artifacts");
+    write_file(&artifacts.join("build/output/app/server"), "server-v1\n");
+    write_file(&artifacts.join("deployment/common/README"), "common\n");
+    write_file(
+        &artifacts.join("deployment/variants/standard/extra"),
+        "std\n",
+    );
+
+    let store = LocalStore::with_base(store_base.clone())?;
+    let factory_base = remotes_base.clone();
+    let factory = move |s: &deploy::config::ServerDef,
+                        _slot: &deploy::config::SlotDef|
+          -> Result<Box<dyn Remote>> {
+        Ok(Box::new(LocalTransport::new(factory_base.join(&s.id))?))
+    };
+
+    // Deploy f0 with the slot at deploy_dir A on server-01.
+    let config = Config::load(&config_path)?;
+    let r0 = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r0.status, Some(DeploymentStatus::Successful));
+    let snapshots = store.read_snapshots("production")?;
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(
+        snapshots[0].bindings.get(&PlacementSlotId::new("p1")),
+        Some(&PhysicalBinding {
+            server: ServerId::new("server-01"),
+            deploy_dir: "/srv/move/movedir-a".to_string(),
+        }),
+        "f0 records the slot's {{server, deploy_dir}} binding"
+    );
+    assert!(
+        remotes_base.join("server-01/current").exists(),
+        "server-01 hosts the deployed slot after f0"
+    );
+
+    // MOVE the slot's deploy_dir to B on the SAME server: same slot id, same
+    // physical server, different on-server location. The config stays valid
+    // (exactly one slot, one server per target).
+    let moved_variant = format!(
+        "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntarget = \"production\"\ndeploy_dir = \"/srv/move/movedir-b\"\n"
+    );
+    write_variant_file(&proj, "standard", &moved_variant);
+    let config2 = Config::load(&config_path)?;
+
+    // Exact rollback to f0 must FAIL with the binding mismatch naming the
+    // directory change, and must not touch the remote state at either
+    // location (in this harness the transport root is `remotes/server-01`
+    // regardless of deploy_dir, so "the wrong location" shows up as any
+    // change on that root: a new generation, a moved `current`, new
+    // objects).
+    let root = remotes_base.join("server-01");
+    let gen_count = |root: &std::path::Path| -> usize {
+        std::fs::read_dir(root.join("generations"))
+            .map(|it| it.count())
+            .unwrap_or(0)
+    };
+    let current_target = |root: &std::path::Path| std::fs::read_link(root.join("current")).ok();
+    let gens_before = gen_count(&root);
+    let current_before = current_target(&root);
+    assert!(gens_before >= 1, "f0 minted at least one generation");
+
+    let err = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config2,
+        &PushOptions {
+            dry_run: false,
+            ref_token: Some("production@f0".to_string()),
+        },
+    )
+    .err()
+    .expect("moved deploy_dir must refuse exact rollback");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(
+            "slot 'p1' was bound to server 'server-01' at '/srv/move/movedir-a' in production@f0"
+        ),
+        "error must name the slot, the recorded server AND its deploy_dir, got: {msg}"
+    );
+    assert!(
+        msg.contains("now bound to 'server-01' at '/srv/move/movedir-b'"),
+        "error must name the current binding including the moved deploy_dir, got: {msg}"
+    );
+    assert!(
+        msg.contains("wrong host"),
+        "error must say the rollback would hit the wrong place, got: {msg}"
+    );
+    assert_eq!(
+        gen_count(&root),
+        gens_before,
+        "refused rollback must not mint a generation on the new location"
+    );
+    assert_eq!(
+        current_target(&root),
+        current_before,
+        "refused rollback must not move `current` away from the f0 location"
+    );
+    assert!(
+        root.join("current").exists(),
+        "the f0 location keeps its deployment untouched"
+    );
+
+    // A fresh HEAD push on the MOVED binding is a REAL deployment: the
+    // slot declaration is part of the canonical release identity, so the
+    // deploy_dir change creates a NEW ReleaseId even though the tree bytes
+    // are unchanged — the push materializes the new release and advances the
+    // generation. Only EXACT rollback (which restores the recorded f0
+    // binding) refuses.
+    let r1 = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config2,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(
+        r1.status,
+        Some(DeploymentStatus::Successful),
+        "the HEAD push after a slot-only change materializes a new release"
+    );
+    assert_eq!(
+        gen_count(&root),
+        gens_before + 1,
+        "the HEAD push mints exactly one new generation"
+    );
+    assert_ne!(
+        current_target(&root),
+        current_before,
+        "the HEAD push advances `current` to the new generation"
     );
 
     Ok(())

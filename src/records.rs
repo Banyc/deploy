@@ -36,9 +36,10 @@
 //!   rollback, exposed as `<target>@fN`. Only successful deployments produce
 //!   a snapshot (`refs/snapshots.jsonl` + `refs/last-successful`). It records
 //!   each slot's advanced [`GenerationRef`] keyed by the DEPLOYMENT-LOCATION
-//!   identity AND the physical [`crate::model::ServerId`] each slot was bound
-//!   to (`servers`), so exact rollback can verify a slot still lives on the
-//!   same host.
+//!   identity AND the complete physical binding ([`PhysicalBinding`]
+//!   `{server, deploy_dir}`) each slot was bound to (`bindings`), so exact
+//!   rollback can verify a slot still lives at the exact same on-host
+//!   location it was deployed onto.
 
 use crate::model::{
     ArtifactRef, BehaviorContract, DeploymentId, GenerationId, GenerationRef, PlacementSlotId,
@@ -152,21 +153,43 @@ pub struct DeploymentTransition {
 }
 
 /// A terminal successful fleet state used for rollback, exposed as
+/// The complete PHYSICAL binding of one placement slot at snapshot time: the
+/// actual server ([`ServerId`]) AND the absolute `deploy_dir` on that server
+/// where the slot's deployment state (objects, releases, generations,
+/// `current`) lives. Together `{server, deploy_dir}` name the exact on-host
+/// deployment location a fleet snapshot's generations were advanced on.
+/// Exact rollback must verify BOTH halves: a slot that keeps its server but
+/// moves its `deploy_dir` would otherwise receive the historical generations
+/// at the new location, silently deploying to the wrong place on the same
+/// host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhysicalBinding {
+    /// The physical server the slot was bound to at snapshot time.
+    pub server: ServerId,
+    /// The absolute on-server directory the slot's deployment state lives
+    /// in, exactly as declared in the slot's `deploy_dir` at snapshot time.
+    pub deploy_dir: String,
+}
+
+/// A terminal successful fleet state used for rollback, exposed as
 /// `<target>@fN`. Only successful deployments produce a snapshot
 /// (`refs/snapshots.jsonl` + `refs/last-successful`). Each slot's entry is
 /// the complete [`GenerationRef`] it advanced to (a successful snapshot always
 /// has a generation per slot).
 ///
-/// `servers` records the PHYSICAL server each slot was bound to when the
-/// snapshot was taken (the deployment-location identity lives in the `slots`
-/// key; the actual-server identity lives here). Exact rollback maps a
-/// snapshot's generation to a slot BY SLOT ID, so without this map a slot
-/// rebound to a different server in `deploy.toml` would silently roll back
-/// onto the wrong host. A MISSING entry means the binding is unverifiable
-/// (legacy pre-feature snapshots never recorded it): rollback refuses rather
-/// than guessing the host. Kept as a separate `#[serde(default)]` field so
-/// the `slots` map and its [`GenerationRef`]s stay intact and pre-feature
-/// snapshot log lines still deserialize.
+/// `bindings` records the COMPLETE PHYSICAL BINDING (`{server, deploy_dir}`)
+/// each slot had when the snapshot was taken (the deployment-location
+/// identity lives in the `slots` key; the actual on-host location lives
+/// here). Exact rollback maps a snapshot's generation to a slot BY SLOT ID,
+/// so without this map a slot rebound to a different server — or moved to a
+/// different `deploy_dir` on the same server — in `deploy.toml` would
+/// silently roll back onto the wrong host/location. A MISSING entry means
+/// the binding is unverifiable (legacy pre-feature snapshots never recorded
+/// it): rollback refuses rather than guessing the host. Kept as a separate
+/// `#[serde(default)]` field so the `slots` map and its [`GenerationRef`]s
+/// stay intact and pre-feature snapshot log lines still deserialize (the
+/// old `servers` key and older lines without any binding are ignored,
+/// yielding an empty map).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentSnapshot {
     pub index: u64,
@@ -174,12 +197,13 @@ pub struct DeploymentSnapshot {
     pub target: TargetName,
     pub behavior_sha256: String,
     pub slots: BTreeMap<PlacementSlotId, GenerationRef>,
-    /// The physical server each slot was bound to at snapshot time, keyed by
-    /// [`PlacementSlotId`]. `#[serde(default)]` keeps append-only legacy
-    /// entries (pre-server-binding) readable; a missing entry is
-    /// "unverifiable" and makes exact rollback refuse the slot.
+    /// The complete physical binding (`{server, deploy_dir}`) each slot was
+    /// bound to at snapshot time, keyed by [`PlacementSlotId`].
+    /// `#[serde(default)]` keeps append-only legacy entries (pre-binding)
+    /// readable; a missing entry is "unverifiable" and makes exact rollback
+    /// refuse the slot.
     #[serde(default)]
-    pub servers: BTreeMap<PlacementSlotId, ServerId>,
+    pub bindings: BTreeMap<PlacementSlotId, PhysicalBinding>,
 }
 
 /// Observed remote state for one placement slot.

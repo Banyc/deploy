@@ -533,7 +533,7 @@ is the LATEST transition. For example:
 {"deployment_id": "deploy-20260821T102000Z", "status": "successful", "recorded_at": "2026-08-21T10:25:00Z"}
 ```
 
-The target snapshot log contains only fully successful fleet snapshots and exposes them as `production@f0`, `production@f1`, and so on. Failed and degraded attempts remain visible through `deploy log production` and `attempts.jsonl`, but are not valid rollback sources. Each snapshot entry records every slot's advanced generation AND the physical server it was bound to (`servers`, keyed by slot ID): exact rollback maps generations to slots by slot ID, so the recorded server binding is what proves a slot still lives on the same host it was deployed onto.
+The target snapshot log contains only fully successful fleet snapshots and exposes them as `production@f0`, `production@f1`, and so on. Failed and degraded attempts remain visible through `deploy log production` and `attempts.jsonl`, but are not valid rollback sources. Each snapshot entry records every slot's advanced generation AND the complete physical binding it had (`bindings`, keyed by slot ID — the slot's `{server, deploy_dir}` pair at deployment time): exact rollback maps generations to slots by slot ID, so the recorded binding is what proves a slot still lives at the exact on-host location it was deployed onto.
 
 A fleet commit is authoritative only when the same deployment ID and placement-slot set are committed on every member. This lets a fresh or repaired local store reconstruct successful fleet history from the servers instead of trusting a stale local ref.
 
@@ -543,7 +543,7 @@ Pushing an older successful reference restores its complete assignment, includin
 deploy push production production@f1
 ```
 
-Exact fleet rollback requires the current target to contain the same stable placement-slot set as the saved deployment AND each slot's physical server binding (the slot's `server` field in its variant file's `[[slots]]` entry) to match the binding the snapshot recorded (`servers[slot]`): a slot rebound to a different server would otherwise receive the historical generations on the wrong host. A legacy snapshot entry that never recorded the binding is unverifiable and is refused the same way. Addresses may change and are taken from the current target definition after host-identity verification. If membership has changed or any slot was rebound, exact rollback fails during preflight without modifying a server.
+Exact fleet rollback requires the current target to contain the same stable placement-slot set as the saved deployment AND each slot's complete physical binding to match the binding the snapshot recorded (`bindings[slot]` = the `{server, deploy_dir}` pair from the slot's variant-file `[[slots]]` entry): a slot rebound to a different server — or moved to a different `deploy_dir` on the SAME server — would otherwise receive the historical generations on the wrong host or at the wrong on-server location. A legacy snapshot entry that never recorded the binding (pre-feature lines, or the intermediate server-only `servers` shape) is unverifiable and is refused the same way. Addresses may change and are taken from the current target definition after host-identity verification. If membership has changed or any slot's physical binding changed, exact rollback fails during preflight without modifying a server.
 
 Schema version 1 permits a target-history ref only as a source for that same target; cross-target deployment uses a release ref instead.
 

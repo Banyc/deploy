@@ -7,9 +7,11 @@
 
 use crate::error::{Error, Result};
 use crate::model::{
-    GenerationRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, ServerId, TargetName,
+    GenerationRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, TargetName,
 };
-use crate::records::{AttemptServer, DeploymentAttempt, DeploymentSnapshot, DeploymentStatus};
+use crate::records::{
+    AttemptServer, DeploymentAttempt, DeploymentSnapshot, DeploymentStatus, PhysicalBinding,
+};
 use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
 
@@ -107,7 +109,7 @@ pub fn ensure_snapshot(
     target: &TargetName,
     attempt: &DeploymentAttempt,
     outcomes: &BTreeMap<PlacementSlotId, AttemptServer>,
-    servers: &BTreeMap<PlacementSlotId, ServerId>,
+    bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
 ) -> Result<u64> {
     let target = target.as_str();
     let entries = store.read_snapshots(target)?;
@@ -119,7 +121,7 @@ pub fn ensure_snapshot(
         return Ok(existing.index);
     }
     let next = entries.len() as u64;
-    let entry = build_snapshot(next, attempt, outcomes, servers);
+    let entry = build_snapshot(next, attempt, outcomes, bindings);
     store.append_snapshot(target, &entry)?;
     store.write_last_successful(target, attempt.deployment_id.as_str())?;
     Ok(next)
@@ -141,9 +143,9 @@ pub fn append_snapshot(
     target: &TargetName,
     attempt: &DeploymentAttempt,
     outcomes: &BTreeMap<PlacementSlotId, AttemptServer>,
-    servers: &BTreeMap<PlacementSlotId, ServerId>,
+    bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
 ) -> Result<u64> {
-    ensure_snapshot(store, target, attempt, outcomes, servers)
+    ensure_snapshot(store, target, attempt, outcomes, bindings)
 }
 
 /// Finalize a successful fleet attempt replay-safely: the single shared
@@ -186,14 +188,14 @@ pub fn finalize_successful_attempt(
     attempt: &DeploymentAttempt,
     outcomes: &BTreeMap<PlacementSlotId, AttemptServer>,
     reason: &str,
-    servers: &BTreeMap<PlacementSlotId, ServerId>,
+    bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
 ) -> Result<u64> {
     let id = attempt.deployment_id.as_str();
     // Already fully finalized (the eligibility gate normally prevents this):
     // every earlier step is durable by construction; only repair a stale
     // `refs/last-successful` and stop without appending anything.
     if store.latest_status(id)? == Some(DeploymentStatus::Successful) {
-        return ensure_snapshot(store, &attempt.target, attempt, outcomes, servers);
+        return ensure_snapshot(store, &attempt.target, attempt, outcomes, bindings);
     }
     // 1. Recoverable marker: the attempt must be re-eligible if we crash
     //    before the snapshot lands.
@@ -205,7 +207,7 @@ pub fn finalize_successful_attempt(
         )?;
     }
     // 2. Snapshot entry + `refs/last-successful` (idempotent).
-    let idx = ensure_snapshot(store, &attempt.target, attempt, outcomes, servers)?;
+    let idx = ensure_snapshot(store, &attempt.target, attempt, outcomes, bindings)?;
     // 3. Terminal status LAST.
     store.append_transition(id, &DeploymentStatus::Successful, Some(reason))?;
     Ok(idx)
@@ -261,17 +263,17 @@ pub fn resolve_attempt_outcomes(
 /// recorded generation are not part of a coherent successful snapshot and
 /// are dropped.
 ///
-/// `servers` records the physical [`ServerId`] each slot was bound to at
-/// the time the deployment ran (the engine passes the target's current
-/// slot→server binding from `deploy.toml`). It is stored as a separate map
-/// so the `slots` map and its [`GenerationRef`]s stay intact; a legacy
-/// entry with no `servers` map deserializes to an empty one (unverifiable,
-/// so rollback refuses rather than guessing the host).
+/// `bindings` records the COMPLETE physical binding (`{server, deploy_dir}`)
+/// each slot had when the deployment ran (the engine passes the target's
+/// current slot→binding map from `deploy.toml`). It is stored as a separate
+/// map so the `slots` map and its [`GenerationRef`]s stay intact; a legacy
+/// entry with no bindings map deserializes to an empty one (unverifiable,
+/// so rollback refuses rather than guessing the host/location).
 pub fn build_snapshot(
     index: u64,
     attempt: &DeploymentAttempt,
     outcomes: &BTreeMap<PlacementSlotId, AttemptServer>,
-    servers: &BTreeMap<PlacementSlotId, ServerId>,
+    bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
 ) -> DeploymentSnapshot {
     DeploymentSnapshot {
         index,
@@ -295,7 +297,7 @@ pub fn build_snapshot(
                 })
             })
             .collect(),
-        servers: servers.clone(),
+        bindings: bindings.clone(),
     }
 }
 
@@ -343,7 +345,9 @@ pub fn snapshot_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ArtifactRef, DeploymentId, GenerationId, PlacementSlotId, ReleaseId};
+    use crate::model::{
+        ArtifactRef, DeploymentId, GenerationId, PlacementSlotId, ReleaseId, ServerId,
+    };
     use std::collections::BTreeMap;
 
     #[test]
@@ -387,8 +391,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         let target = TargetName::new("production".to_string());
-        let servers: BTreeMap<PlacementSlotId, ServerId> =
-            BTreeMap::from([(PlacementSlotId::new("p1"), ServerId::new("server-01"))]);
+        let bindings: BTreeMap<PlacementSlotId, PhysicalBinding> = BTreeMap::from([(
+            PlacementSlotId::new("p1"),
+            PhysicalBinding {
+                server: ServerId::new("server-01"),
+                deploy_dir: "/srv/deploy/p1".to_string(),
+            },
+        )]);
         let attempt = DeploymentAttempt {
             deployment_schema_version: 2,
             deployment_id: DeploymentId::new("deploy-idempotent".to_string()),
@@ -404,8 +413,8 @@ mod tests {
         // First call appends the snapshot and advances the ref. The snapshot
         // is built from the attempt's OUTCOMES map (the attempt record
         // itself carries only intent; its `slots` map is empty), and records
-        // the slot→server binding from `servers`.
-        let first = append_snapshot(&store, &target, &attempt, &attempt.slots, &servers).unwrap();
+        // the slot→{server, deploy_dir} binding from `bindings`.
+        let first = append_snapshot(&store, &target, &attempt, &attempt.slots, &bindings).unwrap();
         assert_eq!(first, 0);
         let snapshots = store.read_snapshots(target.as_str()).unwrap();
         assert_eq!(snapshots.len(), 1);
@@ -417,7 +426,7 @@ mod tests {
 
         // Second call with the same deployment ID is a no-op: same index, no
         // duplicate entry, and `refs/last-successful` is untouched.
-        let second = append_snapshot(&store, &target, &attempt, &attempt.slots, &servers).unwrap();
+        let second = append_snapshot(&store, &target, &attempt, &attempt.slots, &bindings).unwrap();
         assert_eq!(second, first, "repeated append must return the same index");
         let snapshots = store.read_snapshots(target.as_str()).unwrap();
         assert_eq!(snapshots.len(), 1, "no duplicate snapshot entry");
@@ -428,11 +437,11 @@ mod tests {
     }
 
     #[test]
-    fn build_snapshot_records_each_slots_physical_server() {
+    fn build_snapshot_records_each_slots_physical_binding() {
         let slot = PlacementSlotId::new("p1".to_string());
         let attempt = DeploymentAttempt {
             deployment_schema_version: 2,
-            deployment_id: DeploymentId::new("deploy-server-map".to_string()),
+            deployment_id: DeploymentId::new("deploy-binding-map".to_string()),
             target: TargetName::new("production".to_string()),
             slot_ids: vec![slot.clone()],
             behavior_sha256: "sha256-aa".to_string(),
@@ -447,29 +456,51 @@ mod tests {
                 },
             )]),
         };
-        let servers: BTreeMap<PlacementSlotId, ServerId> =
-            BTreeMap::from([(slot.clone(), ServerId::new("server-01"))]);
+        let bindings: BTreeMap<PlacementSlotId, PhysicalBinding> = BTreeMap::from([(
+            slot.clone(),
+            PhysicalBinding {
+                server: ServerId::new("server-01"),
+                deploy_dir: "/srv/deploy/p1".to_string(),
+            },
+        )]);
 
-        let snapshot = build_snapshot(3, &attempt, &attempt.slots, &servers);
+        let snapshot = build_snapshot(3, &attempt, &attempt.slots, &bindings);
         assert_eq!(
-            snapshot.servers.get(&slot),
-            Some(&ServerId::new("server-01")),
-            "the snapshot must record the physical server the slot was bound to"
+            snapshot.bindings.get(&slot),
+            Some(&PhysicalBinding {
+                server: ServerId::new("server-01"),
+                deploy_dir: "/srv/deploy/p1".to_string(),
+            }),
+            "the snapshot must record the slot's complete physical binding (server AND deploy_dir)"
         );
         assert_eq!(snapshot.slots.len(), 1, "generation refs preserved intact");
-        assert_eq!(snapshot.servers.len(), 1);
+        assert_eq!(snapshot.bindings.len(), 1);
     }
 
-    /// A legacy pre-feature snapshot line (no `servers` key) must still
-    /// deserialize; its `servers` map defaults to empty, which rollback treats
-    /// as unverifiable rather than guessing.
+    /// A legacy pre-feature snapshot line (no `bindings` key — either the
+    /// oldest pre-binding shape or the intermediate shape that only recorded
+    /// a `servers` map) must still deserialize; its `bindings` map defaults
+    /// to empty, which rollback treats as unverifiable rather than guessing
+    /// the host/location.
     #[test]
-    fn legacy_snapshot_without_servers_deserializes_with_empty_map() {
-        let line = r#"{"index":0,"deployment_id":"deploy-old","target":"production","behavior_sha256":"sha256-aa","slots":{}}"#;
-        let snapshot: DeploymentSnapshot = serde_json::from_str(line).unwrap();
+    fn legacy_snapshot_without_bindings_deserializes_with_empty_map() {
+        // Oldest shape: no binding recorded at all.
+        let bare = r#"{"index":0,"deployment_id":"deploy-old","target":"production","behavior_sha256":"sha256-aa","slots":{}}"#;
+        let snapshot: DeploymentSnapshot = serde_json::from_str(bare).unwrap();
         assert!(
-            snapshot.servers.is_empty(),
-            "legacy line yields an empty map"
+            snapshot.bindings.is_empty(),
+            "legacy line without bindings yields an empty map"
+        );
+
+        // Intermediate server-only shape: the `servers` key is an unknown
+        // field now (the physical binding is richer than a bare ServerId),
+        // so it is ignored and `bindings` still defaults to empty →
+        // fail-closed refusal.
+        let with_servers = r#"{"index":1,"deployment_id":"deploy-old-servers","target":"production","behavior_sha256":"sha256-aa","slots":{},"servers":{"p1":"server-01"}}"#;
+        let snapshot: DeploymentSnapshot = serde_json::from_str(with_servers).unwrap();
+        assert!(
+            snapshot.bindings.is_empty(),
+            "old `servers`-keyed line yields an empty bindings map"
         );
     }
 }

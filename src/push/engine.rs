@@ -1019,20 +1019,22 @@ fn push_inner(
     // is a plain transition append; it produces no snapshot entry.
     let mut message = format!("push status: {commit_status:?}");
     if commit_status == DeploymentStatus::Successful {
-        // The snapshot records each slot's physical server binding so an exact
-        // rollback can verify a slot still lives on the host it was deployed
-        // onto (a rebound slot must refuse rather than deploy to the wrong
-        // host). The binding comes from the CURRENT configuration: it is the
-        // live placement this attempt actually used. The snapshot itself is
-        // built from the actual per-slot OUTCOMES (`actual_servers`), never
-        // from the intent record.
-        let slot_servers = config.target_slot_servers(target_name)?;
+        // The snapshot records each slot's COMPLETE physical binding
+        // (`{server, deploy_dir}`) so an exact rollback can verify a slot
+        // still lives at the exact on-host location it was deployed onto (a
+        // rebound slot OR a slot whose deploy_dir moved must refuse rather
+        // than deploy to the wrong host/location). The binding comes from
+        // the CURRENT configuration: it is the live placement this attempt
+        // actually used. The snapshot itself is built from the actual
+        // per-slot OUTCOMES (`actual_servers`), never from the intent
+        // record.
+        let slot_bindings = config.target_slot_bindings(target_name)?;
         let idx = history::finalize_successful_attempt(
             store,
             &attempt_intent,
             &actual_servers,
             "push completed",
-            &slot_servers,
+            &slot_bindings,
         )?;
         message = format!("push successful; fleet ref {}@f{idx}", target_name);
     } else {
@@ -1202,9 +1204,10 @@ fn reconcile_pending_commits(
         .iter()
         .map(|(slot, _)| slot.id.clone())
         .collect();
-    // The slot→server binding map recorded into snapshots finalized by
-    // recovery (identical to the map the original commit would have recorded).
-    let slot_servers = config.target_slot_servers(target_name)?;
+    // The slot→physical-binding map recorded into snapshots finalized by
+    // recovery (identical to the map the original commit would have
+    // recorded: the current config's `{server, deploy_dir}` per slot).
+    let slot_bindings = config.target_slot_bindings(target_name)?;
 
     'pending: for attempt in pending {
         // 1. Membership check.
@@ -1349,15 +1352,17 @@ fn reconcile_pending_commits(
         //    `deployments/<id>/results.json` when present, else the verified
         //    desired state ([`history::resolve_attempt_outcomes`]) — and
         //    records each slot's physical server binding from the current
-        //    config (`slot_servers`), so rollback can verify a slot still
-        //    lives on the host it was deployed onto.
+        //    records each slot's complete physical binding (`{server,
+        //    deploy_dir}`) from the current config (`slot_bindings`), so
+        //    rollback can verify a slot still lives at the exact on-host
+        //    location it was deployed onto.
         let outcomes = history::resolve_attempt_outcomes(store, &attempt)?;
         history::finalize_successful_attempt(
             store,
             &attempt,
             &outcomes,
             "recovery finalized",
-            &slot_servers,
+            &slot_bindings,
         )?;
     }
     Ok(())

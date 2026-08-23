@@ -21,6 +21,7 @@
 
 use crate::error::{Error, Result};
 use crate::model::{PlacementSlotId, SCHEMA_VERSION, ServerId};
+use crate::records::PhysicalBinding;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -723,21 +724,28 @@ impl Config {
             .collect())
     }
 
-    /// The slot→server binding map for a target, keyed by placement slot ID:
-    /// the physical [`ServerId`] each slot is currently bound to in the
-    /// configuration. Used to record (and later verify) the physical host a
-    /// fleet snapshot's slots were deployed on.
-    pub fn target_slot_servers(
+    /// The slot→physical-binding map for a target, keyed by placement slot
+    /// ID: the complete `{server, deploy_dir}` binding ([`PhysicalBinding`])
+    /// each slot currently has in the configuration — the physical server
+    /// AND the absolute on-server directory its deployment state lives in.
+    /// Used to record (and later verify) the exact physical location a fleet
+    /// snapshot's slots were deployed onto: exact rollback must see BOTH
+    /// halves unchanged, because a slot that keeps its server but moves its
+    /// `deploy_dir` would otherwise roll back onto the new location.
+    pub fn target_slot_bindings(
         &self,
         target_name: &str,
-    ) -> Result<BTreeMap<PlacementSlotId, ServerId>> {
+    ) -> Result<BTreeMap<PlacementSlotId, PhysicalBinding>> {
         Ok(self
             .target_slots(target_name)?
             .into_iter()
             .map(|(slot, server)| {
                 (
                     PlacementSlotId::new(slot.id.clone()),
-                    ServerId::new(server.id.clone()),
+                    PhysicalBinding {
+                        server: ServerId::new(server.id.clone()),
+                        deploy_dir: slot.deploy_dir.to_string_lossy().into_owned(),
+                    },
                 )
             })
             .collect())
