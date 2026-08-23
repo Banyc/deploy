@@ -147,20 +147,23 @@ fn push_inner(
     //    to the object store.
     let release_root = project_root.join("releases").join(config.release.as_str());
     let mut variant_trees: BTreeMap<String, TreeDigest> = BTreeMap::new();
+    // Dry-run staging is disposable. The guard's Drop removes the whole
+    // `dry-<deployment>` tree (on error, `?`, or unwind); the guard must
+    // outlive the Head-materialization block because the dry-run branch below
+    // performs an explicit FALLIBLE cleanup (reporting errors instead of
+    // silently swallowing them) and empties the guard first, keeping the Drop
+    // as a fallback only. A non-dry-run push stages into the persistent
+    // per-variant staging dirs and stores objects, so no guard.
+    let mut staging_guard = if opts.dry_run && matches!(pref, PushRef::Head) {
+        Some(StagingCleanup(Some(
+            store
+                .staging_dir()
+                .join(format!("dry-{}", deployment_id.as_str())),
+        )))
+    } else {
+        None
+    };
     if matches!(pref, PushRef::Head) {
-        // Dry-run staging is disposable: the RAII guard removes the whole
-        // `dry-<deployment>` tree on drop, whether the loop below returns Ok,
-        // fails with `?`, or unwinds. A non-dry-run push stages into the
-        // persistent per-variant staging dirs and stores objects, so no guard.
-        let _staging_guard = if opts.dry_run {
-            Some(StagingCleanup(Some(
-                store
-                    .staging_dir()
-                    .join(format!("dry-{}", deployment_id.as_str())),
-            )))
-        } else {
-            None
-        };
         for v in config.variant_names() {
             let staging = if opts.dry_run {
                 store
@@ -453,8 +456,17 @@ fn push_inner(
                 ));
             }
         }
-        // Disposable staging was already removed by `_staging_guard` (drop at
-        // the end of the Head-materialization block); nothing else to clean.
+        // Explicit, FALLIBLE cleanup BEFORE returning: remove the disposable
+        // staging tree, restoring owner-write permission on read-only entries
+        // first so the removal can succeed (materialized trees can contain
+        // read-only dirs/files, which make `remove_dir_all` fail with EACCES).
+        // A cleanup failure returns an Err so a dry run fails visibly instead
+        // of silently leaking `staging/dry-<id>` forever. Taking the path out
+        // of the guard empties it, so its Drop becomes a no-op here (the guard
+        // remains only as a fallback for panic/unwind paths).
+        if let Some(root) = staging_guard.as_mut().and_then(|g| g.0.take()) {
+            cleanup_dry_run_staging(&root)?;
+        }
         return Ok(PushReport {
             status: None,
             attempt: None,
@@ -1641,13 +1653,72 @@ fn tree_size_on_host(root: &Path) -> u64 {
         .sum()
 }
 
+/// Restore owner-write permission (u+w, mode bit 0o200) on every directory and
+/// file under `root` that lacks it, leaving all other mode bits untouched.
+/// Materialized dry-run staging trees can contain read-only entries — artifact
+/// source modes are preserved by [`crate::mapper::materialize_variant`] — and
+/// POSIX `remove_dir_all` needs write permission on every directory it enters,
+/// so a read-only subdirectory makes the whole removal fail with EACCES.
+/// Symlinks are never followed or modified.
+fn restore_owner_write_recursive(root: &Path) -> std::io::Result<()> {
+    fn walk(dir: &Path) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                walk(&path)?;
+            } else if ft.is_symlink() {
+                continue;
+            }
+            let mode = entry.metadata()?.permissions().mode();
+            if mode & 0o200 == 0 {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode | 0o200))?;
+            }
+        }
+        Ok(())
+    }
+    walk(root)?;
+    let mode = std::fs::metadata(root)?.permissions().mode();
+    if mode & 0o200 == 0 {
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(mode | 0o200))?;
+    }
+    Ok(())
+}
+
+/// Remove a dry-run staging tree, propagating failures. Restores owner-write
+/// permission on read-only entries inside the tree first (the tree cannot fix
+/// permissions on its own parent), then removes the whole tree. A missing tree
+/// is a no-op. Failures map to [`Error::transport`] with the path in the
+/// message, so a dry run whose staging could not be cleaned fails visibly
+/// instead of silently leaving `staging/dry-<id>` behind forever.
+fn cleanup_dry_run_staging(root: &Path) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    restore_owner_write_recursive(root).map_err(|e| {
+        Error::transport(format!(
+            "restore owner-write on dry-run staging {}: {e}",
+            root.display()
+        ))
+    })?;
+    std::fs::remove_dir_all(root)
+        .map_err(|e| Error::transport(format!("remove dry-run staging {}: {e}", root.display())))?;
+    Ok(())
+}
+
 /// Removes the disposable dry-run staging tree on drop (error, panic, or
-/// normal exit), so an interrupted dry run never leaves state behind.
+/// normal exit), so an interrupted dry run never leaves state behind. This is
+/// only a FALLBACK: the normal dry-run path runs the explicit fallible
+/// [`cleanup_dry_run_staging`] and empties the guard first, so cleanup failures
+/// surface as a push error rather than being silently swallowed. The Drop
+/// performs the same permission-restore + remove best-effort (still silent),
+/// so even panic/unwind paths clean read-only trees when they can.
 struct StagingCleanup(Option<std::path::PathBuf>);
 impl Drop for StagingCleanup {
     fn drop(&mut self) {
         if let Some(p) = self.0.take() {
-            let _ = std::fs::remove_dir_all(p);
+            let _ = cleanup_dry_run_staging(&p);
         }
     }
 }
@@ -2089,6 +2160,144 @@ pods = ["p1"]
         let proc = h.run(None);
         assert_eq!(proc.kind, ServerOutcomeKind::Failed);
         assert!(proc.error.unwrap().to_lowercase().contains("type"));
+    }
+
+    #[test]
+    fn dry_run_removes_readonly_staging_tree() {
+        // A dry-run staging tree containing read-only directories/files (modes
+        // preserved from the artifact sources by materialize_variant) must be
+        // fully removed before the push returns. Regression: the old Drop-only
+        // cleanup swallowed remove_dir_all's EACCES and left `staging/dry-<id>`
+        // (and every file inside it) behind forever.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        std::fs::write(release_dir.join("standard.toml"), NONE_VARIANT).unwrap();
+        std::fs::write(project.join("deploy.toml"), NONE_TOML).unwrap();
+        let artifacts_dir = release_dir.join("artifacts");
+        for (p, c) in [
+            ("build/output/app/server", "v1"),
+            ("deployment/common/README", "common"),
+        ] {
+            let fp = artifacts_dir.join(p);
+            std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
+            std::fs::write(&fp, c).unwrap();
+        }
+        // Make one artifact source directory AND one file read-only; their
+        // modes are preserved into the staged tree, where they break
+        // remove_dir_all unless the cleanup restores owner-write first.
+        std::fs::set_permissions(
+            artifacts_dir.join("deployment/common"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            artifacts_dir.join("deployment/common/README"),
+            std::fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
+
+        let config_path = project.join("deploy.toml");
+        let config = Config::load(&config_path).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let remotes_base = dir.path().join("remotes");
+        std::fs::create_dir_all(&remotes_base).unwrap();
+        let factory = move |_s: &crate::config::ServerDef,
+                            _pod: &crate::config::PodDef|
+              -> Result<Box<dyn Remote>> {
+            Ok(Box::new(
+                LocalTransport::new(remotes_base.join("s1")).unwrap(),
+            ))
+        };
+
+        let r = push(
+            &config_path,
+            &store,
+            &factory,
+            "t1",
+            &config,
+            &PushOptions {
+                dry_run: true,
+                ref_token: None,
+            },
+        )
+        .unwrap();
+        assert!(r.dry_run);
+        assert!(r.message.contains("dry-run plan"));
+
+        // The read-only staged tree must actually be gone: no `dry-<id>` entry
+        // (and no leftover files) may remain under the staging dir.
+        let leftovers: Vec<String> = std::fs::read_dir(store.staging_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("dry-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "read-only dry-run staging tree left behind: {leftovers:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(store.staging_dir()).unwrap().count(),
+            0,
+            "no entries may remain under staging after a dry run"
+        );
+    }
+
+    #[test]
+    fn dry_run_cleanup_failure_is_reported() {
+        // Injection: removing the staging root requires write permission on its
+        // PARENT directory, and the cleanup only restores permissions INSIDE
+        // its own tree (it must not touch anything outside). So a read-only
+        // parent makes remove_dir_all fail with EACCES, and that failure must
+        // surface as an Err — not a silent success that leaves the tree behind.
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("dry-x");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/f"), b"x").unwrap();
+        // Parent becomes read-only AFTER the tree is built. This parent-side
+        // injection is not reachable through a real materialize-then-push: a
+        // push needs to CREATE the dry-<id> root inside staging, which requires
+        // write on the parent at materialize time. So the failure injection is
+        // unit-level, against the exact routine the dry-run branch calls;
+        // the engine-level read-only-restore path is covered by
+        // `dry_run_removes_readonly_staging_tree`.
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = cleanup_dry_run_staging(&root).unwrap_err();
+        assert!(
+            matches!(err, Error::Transport(_)),
+            "cleanup failure must be a transport error, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("remove dry-run staging") && msg.contains("dry-x"),
+            "error must name the staging root, got: {msg}"
+        );
+        // The tree was NOT silently swallowed: it is still present, and the
+        // dry-run branch propagates this Err instead of returning Ok.
+        assert!(
+            root.exists(),
+            "failed cleanup must not silently remove the tree"
+        );
+
+        // Restore the parent so the tempdir can clean up after the test.
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The fallback Drop still removes read-only trees best-effort when it
+        // CAN (read-only entries INSIDE the tree): u+w is restored and the
+        // whole tree is removed silently on drop.
+        let p = base.path().join("dry-ro");
+        std::fs::create_dir_all(p.join("sub")).unwrap();
+        std::fs::write(p.join("sub/f"), b"y").unwrap();
+        std::fs::set_permissions(p.join("sub"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::set_permissions(p.join("sub/f"), std::fs::Permissions::from_mode(0o444)).unwrap();
+        {
+            let _g = StagingCleanup(Some(p.clone()));
+        }
+        assert!(!p.exists(), "fallback Drop must clean a read-only tree");
     }
 
     #[test]
