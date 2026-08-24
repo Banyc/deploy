@@ -2482,10 +2482,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         // Push 2: the snapshot append (first persistence step of finalization)
         // fails once -> the push aborts with Err and nothing is durable yet.
-        crate::testutil::test_faults::arm_append_snapshot(attempt.deployment_id.as_str());
-        let err = push_clean(&h)
-            .err()
-            .expect("push must abort when the snapshot append fails");
+        let err = {
+            let _fault_guard = crate::testutil::FAULT_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::testutil::test_faults::arm_append_snapshot(attempt.deployment_id.as_str());
+            push_clean(&h)
+                .err()
+                .expect("push must abort when the snapshot append fails")
+        };
         assert!(
             err.to_string().contains("append_snapshot"),
             "error must name the injected fault, got: {err}"
@@ -2514,10 +2519,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // Push 2: the snapshot append succeeds but `refs/last-successful` (the
         // second persistence step) fails once -> Err; the snapshot exists
         // but the ref is stale and the attempt stays `PendingCommit`.
-        crate::testutil::test_faults::arm_write_last_successful(attempt.deployment_id.as_str());
-        let err = push_clean(&h)
-            .err()
-            .expect("push must abort when the last-successful write fails");
+        let err = {
+            let _fault_guard = crate::testutil::FAULT_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::testutil::test_faults::arm_write_last_successful(attempt.deployment_id.as_str());
+            push_clean(&h)
+                .err()
+                .expect("push must abort when the last-successful write fails")
+        };
         assert!(
             err.to_string().contains("write_last_successful"),
             "error must name the injected fault, got: {err}"
@@ -2546,10 +2556,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // Push 2: the snapshot and last-successful are durable but the
         // final `Successful` transition append fails -> Err; the attempt
         // stays `PendingCommit`, so it is still eligible for the next push.
-        crate::testutil::test_faults::arm_append_transition(attempt.deployment_id.as_str());
-        let err = push_clean(&h)
-            .err()
-            .expect("push must abort when the final transition append fails");
+        let err = {
+            let _fault_guard = crate::testutil::FAULT_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::testutil::test_faults::arm_append_transition(attempt.deployment_id.as_str());
+            push_clean(&h)
+                .err()
+                .expect("push must abort when the final transition append fails")
+        };
         assert!(
             err.to_string().contains("append_transition"),
             "error must name the injected fault, got: {err}"
@@ -2671,10 +2686,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // attempt is left in the crash window: latest transition
         // `PendingCommit` (never `Successful`), no snapshot entry, no
         // `refs/last-successful`.
-        crate::testutil::test_faults::arm_append_snapshot(id.as_str());
-        let err = push_main_with_id(&h, &id)
-            .err()
-            .expect("push must abort when the snapshot append fails");
+        let err = {
+            let _fault_guard = crate::testutil::FAULT_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::testutil::test_faults::arm_append_snapshot(id.as_str());
+            push_main_with_id(&h, &id)
+                .err()
+                .expect("push must abort when the snapshot append fails")
+        };
         assert!(
             err.to_string().contains("append_snapshot"),
             "error must name the injected fault, got: {err}"
@@ -2714,10 +2734,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // (the second persistence step) fails once -> Err; the snapshot
         // entry exists but the ref is stale and the attempt stays
         // `PendingCommit`.
-        crate::testutil::test_faults::arm_write_last_successful(id.as_str());
-        let err = push_main_with_id(&h, &id)
-            .err()
-            .expect("push must abort when the last-successful write fails");
+        let err = {
+            let _fault_guard = crate::testutil::FAULT_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::testutil::test_faults::arm_write_last_successful(id.as_str());
+            push_main_with_id(&h, &id)
+                .err()
+                .expect("push must abort when the last-successful write fails")
+        };
         assert!(
             err.to_string().contains("write_last_successful"),
             "error must name the injected fault, got: {err}"
@@ -2751,10 +2776,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // (`arm_append_transition_successful`), so the recoverable
         // `PendingCommit` marker append passes through; the attempt stays
         // `PendingCommit` and remains eligible.
-        crate::testutil::test_faults::arm_append_transition_successful(id.as_str());
-        let err = push_main_with_id(&h, &id)
-            .err()
-            .expect("push must abort when the final transition append fails");
+        let err = {
+            let _fault_guard = crate::testutil::FAULT_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::testutil::test_faults::arm_append_transition_successful(id.as_str());
+            push_main_with_id(&h, &id)
+                .err()
+                .expect("push must abort when the final transition append fails")
+        };
         assert!(
             err.to_string().contains("append_transition"),
             "error must name the injected fault, got: {err}"
@@ -2968,11 +2998,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     fn intent_persist_fault_leaves_remote_untouched() {
         let h = RecoveryHarness::new();
         let id = DeploymentId::new("deploy-intent-fault".to_string());
-        crate::testutil::test_faults::arm_append_attempt(id.as_str());
-
-        let err = push_main_with_id(&h, &id)
-            .err()
-            .expect("push must abort when the intent persist fails");
+        let err = {
+            let _fault_guard = crate::testutil::FAULT_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::testutil::test_faults::arm_append_attempt(id.as_str());
+            push_main_with_id(&h, &id)
+                .err()
+                .expect("push must abort when the intent persist fails")
+        };
         assert!(
             err.to_string().contains("append_attempt"),
             "error must name the injected fault, got: {err}"
@@ -3021,11 +3055,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     fn write_results_fault_leaves_intent_durable_and_recovers_from_verified_desired() {
         let h = RecoveryHarness::new();
         let id = DeploymentId::new("deploy-inprogress-no-results".to_string());
-        crate::testutil::test_faults::arm_write_results(id.as_str());
-
-        let err = push_main_with_id(&h, &id)
-            .err()
-            .expect("push must abort when write_results fails");
+        let err = {
+            let _fault_guard = crate::testutil::FAULT_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::testutil::test_faults::arm_write_results(id.as_str());
+            push_main_with_id(&h, &id)
+                .err()
+                .expect("push must abort when write_results fails")
+        };
         assert!(err.to_string().contains("write_results"));
 
         // The intent record is durable even though a later step failed; it
@@ -3093,13 +3131,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     fn inprogress_crash_window_reconciles_to_exactly_once_success() {
         let h = RecoveryHarness::new();
         let id = DeploymentId::new("deploy-inprogress-window".to_string());
-        crate::testutil::test_faults::arm_append_transition_pending(id.as_str());
-
-        // Push 1: mutation completes, outcomes are durable, but the first
-        // PendingCommit append (the finalize marker) fails once -> Err.
-        let err = push_main_with_id(&h, &id)
-            .err()
-            .expect("push must abort when the finalize marker append fails");
+        let err = {
+            let _fault_guard = crate::testutil::FAULT_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::testutil::test_faults::arm_append_transition_pending(id.as_str());
+            push_main_with_id(&h, &id)
+                .err()
+                .expect("push must abort when the finalize marker append fails")
+        };
         assert!(
             err.to_string().contains("append_transition"),
             "error must name the injected fault, got: {err}"
@@ -3856,10 +3896,15 @@ interval_seconds = 0
         let id = DeploymentId::new("deploy-retry-chain".to_string());
 
         // Push 1: the terminal Successful transition fails once -> PendingCommit.
-        crate::testutil::test_faults::arm_append_transition_successful(id.as_str());
-        let err = push_main_with_id(&h, &id)
-            .err()
-            .expect("first faulted push must abort");
+        let err = {
+            let _fault_guard = crate::testutil::FAULT_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::testutil::test_faults::arm_append_transition_successful(id.as_str());
+            push_main_with_id(&h, &id)
+                .err()
+                .expect("first faulted push must abort")
+        };
         assert!(err.to_string().contains("append_transition"));
         assert_eq!(
             latest_status(&h, id.as_str()),
@@ -3869,10 +3914,15 @@ interval_seconds = 0
 
         // Push 2: the REPLAY faults the SAME step again -> still PendingCommit,
         // still exactly one snapshot (idempotent ensure, no duplicate).
-        crate::testutil::test_faults::arm_append_transition_successful(id.as_str());
-        let err2 = push_clean(&h)
-            .err()
-            .expect("second faulted replay must abort");
+        let err2 = {
+            let _fault_guard = crate::testutil::FAULT_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::testutil::test_faults::arm_append_transition_successful(id.as_str());
+            push_clean(&h)
+                .err()
+                .expect("second faulted replay must abort")
+        };
         assert!(err2.to_string().contains("append_transition"));
         assert_eq!(
             latest_status(&h, id.as_str()),

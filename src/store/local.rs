@@ -1367,6 +1367,9 @@ mod tests {
     /// an earlier `InProgress` (or any other status) append passes through.
     #[test]
     fn new_fault_arms_are_one_shot_and_status_qualified() {
+        let _fault_guard = crate::testutil::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
@@ -1631,6 +1634,9 @@ mod tests {
     /// append fails, and a later `Successful` append passes.
     #[test]
     fn transition_successful_fault_is_status_qualified_and_one_shot() {
+        let _fault_guard = crate::testutil::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let id = "deploy-txn-success-fault";

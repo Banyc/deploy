@@ -24,12 +24,34 @@
 //! Note: each integration-test *binary* (`tests/*.rs`) is a separate process
 //! and cannot race the lib tests, so it only needs its own lock to serialize
 //! its own tests within that binary.
+//!
+//! # The fault-arm lock invariant
+//!
+//! ANY test that ARMS a one-shot [`test_faults`] fault (any `arm_*` call)
+//! must hold [`FAULT_LOCK`] for the entire window from the arm through the
+//! operation that consumes it (the push / store call that must fail). The arm
+//! OVERWRITES the process-global static slot, so two tests arming the same
+//! slot concurrently clobber each other's fault — the deployment-id keying
+//! only protects the CONSUME side, never the arm. The lifecycle fault-matrix
+//! suite, the engine fault tests, and the store fault tests all run
+//! concurrently in ONE process; a private per-module lock does not protect
+//! against the other modules, so every arm+consume window serializes on THIS
+//! single lock (exactly like [`ENV_LOCK`] serializes env mutation). The
+//! consume calls inside the store methods never take the lock themselves;
+//! the arm+consume window the test holds it for covers them.
 
 use std::sync::Mutex;
 
 /// THE lock guarding every env-mutating test in the lib test binary. See the
 /// module docs for the invariant.
 pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// THE lock guarding every test that arms a [`test_faults`] one-shot fault
+/// in the lib test binary. See the module docs for the invariant: hold it
+/// from the `arm_*` call through the consuming operation, so no concurrently
+/// running test can clobber the armed slot (or consume an arm meant for
+/// another deployment id).
+pub(crate) static FAULT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Test-only one-shot fault injection for crash-mid-finalization tests.
 ///
@@ -48,6 +70,10 @@ pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// `arm_write_observed`) are additionally keyed by TARGET, so a test can arm
 /// the primary target's `write_observed` (the push's own target) or an other
 /// member target's independently.
+///
+/// The keying protects the CONSUME side only: the `arm_*` functions
+/// OVERWRITE the slot, so every arming test must hold [`FAULT_LOCK`] from the
+/// arm through the consuming operation (see the module docs).
 #[cfg(test)]
 pub(crate) mod test_faults {
     use std::sync::Mutex;

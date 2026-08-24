@@ -83,14 +83,6 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// Serializes every test in this module that arms a SHARED one-shot store
-/// fault ([`crate::testutil::test_faults`]): `arm` OVERWRITES the static
-/// slot, so two tests arming the same slot concurrently clobber each other's
-/// fault (the deployment-id keying only protects the CONSUME side). Holding
-/// this lock for the arm+push keeps the fixture's push/fail/retry sequences
-/// deterministic under parallel `cargo test`.
-static FAULT_LOCK: Mutex<()> = Mutex::new(());
-
 // ---------------------------------------------------------------------------
 // Fixture project
 // ---------------------------------------------------------------------------
@@ -1136,7 +1128,9 @@ fn state_machine_lifecycle_intent_persist_leaves_remote_untouched() {
     let f = Fixture::new();
     let id = DeploymentId::new("si-intent-fault".to_string());
     let err = {
-        let _fault_guard = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _fault_guard = crate::testutil::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         f.arm_store_fault(FailureStep::IntentPersist, &id);
         f.push_with_id("t1", &id)
             .err()
@@ -1283,7 +1277,9 @@ fn observed_scope_crash_before_refresh_recovered_by_noop_retry() {
     f.apply(Action::Build(1));
     let id = DeploymentId::new("si-obs-crash-before-refresh");
     let err = {
-        let _fault_guard = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _fault_guard = crate::testutil::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         f.arm_store_fault(FailureStep::ResultsWrite, &id);
         f.push_with_id("t1", &id)
             .err()
@@ -1361,7 +1357,9 @@ fn observed_scope_preflight_failure_leaves_observed_equal() {
     f.apply(Action::Build(2));
     let id = DeploymentId::new("si-obs-preflight");
     let err = {
-        let _fault_guard = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _fault_guard = crate::testutil::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         f.arm_store_fault(FailureStep::IntentPersist, &id);
         f.push_with_id("t2", &id)
             .err()
@@ -1432,7 +1430,9 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     f.apply(Action::Build(3));
     let id_p = DeploymentId::new("si-obs-seq-preflight");
     let err = {
-        let _fault_guard = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _fault_guard = crate::testutil::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         f.arm_store_fault(FailureStep::IntentPersist, &id_p);
         f.push_with_id("t2", &id_p)
             .err()
@@ -1465,7 +1465,9 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
         .clone();
     let id_c = DeploymentId::new("si-obs-seq-crash");
     let err = {
-        let _fault_guard = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _fault_guard = crate::testutil::FAULT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         f.arm_store_fault(FailureStep::ResultsWrite, &id_c);
         f.push_with_id("t1", &id_c)
             .err()
@@ -1804,7 +1806,9 @@ fn lifecycle_store_fault_matrix_recovers_without_duplicate_history() {
         let f = Fixture::new();
         let id = DeploymentId::new(format!("si-lc-fault-{i}"));
         let err = {
-            let _fault_guard = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _fault_guard = crate::testutil::FAULT_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             f.arm_store_fault(step, &id);
             f.push_with_id("t1", &id)
                 .err()
@@ -3047,6 +3051,11 @@ proptest! {
 
     #[test]
     fn semantic_state_machine(actions in prop::collection::vec(action_strategy(), 1..20)) {
+        // Hold the shared fault lock for the WHOLE case: the case's pushes
+        // (and any arm it performs) must never interleave with another test's
+        // armed store fault — the 128 cases run concurrently with the
+        // fault-matrix and engine fault tests in the same process.
+        let _fault_guard = crate::testutil::FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut model = Model::new();
         let system = Fixture::new();
         for action in actions {
