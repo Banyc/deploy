@@ -7,7 +7,9 @@
 
 use crate::error::{Error, Result};
 use crate::layout;
-use crate::model::{ArtifactRef, BehaviorContract, DeploymentId, GenerationId, ReleaseId};
+use crate::model::{
+    ArtifactRef, BehaviorContract, DeploymentId, GenerationId, ReleaseId, ReleaseRecord,
+};
 use crate::remote::transport::Remote;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -240,6 +242,21 @@ impl<'a> RemoteHelper<'a> {
         release_json: &str,
         behavior_json: &str,
     ) -> Result<()> {
+        // Recompute-and-verify before publishing: never install a release
+        // whose stored identity does not match its content. The digest is
+        // recomputed from the record's own payload (slot snapshot, bindings,
+        // provenance digests), never trusted from the `release_sha256` field;
+        // a malformed or tampered record fails closed with an integrity error.
+        let rec: ReleaseRecord = serde_json::from_str(release_json).map_err(|e| {
+            Error::integrity(format!("malformed release record for {release_id}: {e}"))
+        })?;
+        crate::release::verify_release_identity(&rec)?;
+        if rec.release_id != release_id {
+            return Err(Error::integrity(format!(
+                "release record identity {} does not match the publish path {release_id}",
+                rec.release_id
+            )));
+        }
         let dir = layout::remote_release(release_id);
         // The release record is identified by its canonical digest
         // (`release_sha256`), not by semantic equality of the full document:
@@ -657,6 +674,83 @@ mod tests {
             prior_generation: None,
             created_at: "2020-01-01T00:00:00Z".to_string(),
         }
+    }
+
+    /// `publish_release` recomputes the canonical digest from the serialized
+    /// record's content and verifies it against the stored identity before
+    /// installing anything: a pristine record publishes (and re-publishes
+    /// idempotently), while a record whose slot declaration was edited with the
+    /// old `release_sha256`/`release_id` retained fails closed with an
+    /// integrity error — a release whose identity does not match its content is
+    /// never published.
+    #[test]
+    fn publish_release_recomputes_and_verifies_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        let variants: std::collections::BTreeMap<
+            crate::model::VariantName,
+            crate::model::TreeDigest,
+        > = std::collections::BTreeMap::from([(
+            crate::model::VariantName::new("standard"),
+            crate::model::TreeDigest::new("t1"),
+        )]);
+        let slots: std::collections::BTreeMap<String, Vec<crate::config::SlotDef>> =
+            std::collections::BTreeMap::from([(
+                "standard".to_string(),
+                vec![crate::config::SlotDef {
+                    id: "p1".to_string(),
+                    server: "s1".to_string(),
+                    deploy_dir: std::path::PathBuf::from("/srv/deploy/p1"),
+                    targets: vec!["t1".to_string()],
+                }],
+            )]);
+        let rec =
+            crate::release::build_release("m", "b", &variants, &slots, std::path::Path::new("."));
+        let release_json = serde_json::to_string(&rec).unwrap();
+        let behaviors = serde_json::json!({});
+        let behavior_json = behaviors.to_string();
+
+        // Positive case: the pristine record publishes, and re-publishing the
+        // identical release is an idempotent no-op.
+        helper
+            .publish_release(rec.release_id.as_str(), &release_json, &behavior_json)
+            .expect("pristine record publishes");
+        helper
+            .publish_release(rec.release_id.as_str(), &release_json, &behavior_json)
+            .expect("identical re-publication is idempotent");
+
+        // Tampered record: slot content changed, digest fields retained -> the
+        // publish must fail with an integrity error naming the mismatch.
+        let mut tampered = rec.clone();
+        tampered.slots.get_mut("standard").unwrap().slots[0].deploy_dir =
+            "/srv/elsewhere".to_string();
+        assert_eq!(
+            tampered.release_sha256, rec.release_sha256,
+            "digest retained"
+        );
+        let err = helper
+            .publish_release(
+                rec.release_id.as_str(),
+                &serde_json::to_string(&tampered).unwrap(),
+                &behavior_json,
+            )
+            .expect_err("tampered record must never be published");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("identity mismatch"),
+            "error must name the mismatch, got: {msg}"
+        );
+        assert!(
+            msg.contains(&rec.release_sha256),
+            "error must name the stored digest, got: {msg}"
+        );
+
+        // A malformed payload is refused outright.
+        let err = helper
+            .publish_release(rec.release_id.as_str(), "{}", &behavior_json)
+            .expect_err("a malformed release record must be refused");
+        assert!(err.to_string().contains("malformed release record"));
     }
 
     /// A generation record is immutable: installed with create-or-compare, so

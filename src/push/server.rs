@@ -590,6 +590,31 @@ host_key_fingerprint = "SHA256:test"
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 "#;
 
+    /// A minimal release record for the harness's synthetic `rel-sha256-r1`
+    /// release: legacy shape (no canonical slot snapshot), so the publish
+    /// path's recompute-and-verify accepts it (the digest cannot be recomputed
+    /// from a record that carries no slot declarations) while `behavior.json`
+    /// still carries the real per-variant contracts.
+    fn harness_release_json() -> String {
+        let rec = crate::model::ReleaseRecord {
+            release_schema_version: 1,
+            release_id: "rel-sha256-r1".to_string(),
+            release_sha256: "r1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            provenance: crate::model::Provenance {
+                git_revision: None,
+                mapping_sha256: "m".to_string(),
+                behavior_sha256: "b".to_string(),
+            },
+            variants: std::collections::BTreeMap::from([(
+                "standard".to_string(),
+                "tree".to_string(),
+            )]),
+            slots: std::collections::BTreeMap::new(),
+        };
+        serde_json::to_string(&rec).unwrap()
+    }
+
     struct Harness {
         _dir: tempfile::TempDir,
         config: Config,
@@ -1043,7 +1068,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             helper
                 .publish_release(
                     "rel-sha256-r1",
-                    "{}",
+                    &harness_release_json(),
                     &serde_json::to_string(&behaviors).unwrap(),
                 )
                 .unwrap();
@@ -1194,7 +1219,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         helper
             .publish_release(
                 "rel-sha256-r1",
-                "{}",
+                &harness_release_json(),
                 &serde_json::to_string(&behaviors).unwrap(),
             )
             .unwrap();

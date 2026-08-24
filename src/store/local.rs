@@ -312,7 +312,14 @@ impl LocalStore {
     }
 
     pub fn read_release(&self, id: &ReleaseId) -> Result<ReleaseRecord> {
-        read_json(&self.release_dir(id).join("release.json"))
+        let rec: ReleaseRecord = read_json(&self.release_dir(id).join("release.json"))?;
+        // Recompute-and-verify: the release's canonical digest is derived from
+        // its own content (slot snapshot, bindings, provenance digests), never
+        // trusted from the stored `release_sha256`/`release_id` fields. A
+        // tampered record whose content was edited while the digest fields were
+        // left unchanged fails closed with an integrity error.
+        crate::release::verify_release_identity(&rec)?;
+        Ok(rec)
     }
 
     pub fn write_release_aux(
@@ -770,6 +777,67 @@ mod tests {
         // ...and the stored snapshot is untouched (no torn write).
         let read = store.read_release_behaviors(&id).expect("snapshot exists");
         assert_eq!(read["standard"].activation.adapter, "none");
+    }
+
+    /// `read_release` recomputes the canonical digest from the record's own
+    /// content and verifies it against BOTH stored identity fields: a pristine
+    /// record reads fine, while a record whose slot declaration was edited with
+    /// the old `release_sha256`/`release_id` retained fails closed with an
+    /// integrity error naming the mismatch.
+    #[test]
+    fn read_release_recomputes_and_verifies_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let variants: BTreeMap<crate::model::VariantName, crate::model::TreeDigest> =
+            BTreeMap::from([(
+                crate::model::VariantName::new("standard"),
+                crate::model::TreeDigest::new("t1"),
+            )]);
+        let slots: BTreeMap<String, Vec<crate::config::SlotDef>> = BTreeMap::from([(
+            "standard".to_string(),
+            vec![crate::config::SlotDef {
+                id: "p1".to_string(),
+                server: "s1".to_string(),
+                deploy_dir: PathBuf::from("/srv/deploy/p1"),
+                targets: vec!["t1".to_string()],
+            }],
+        )]);
+        let rec = crate::release::build_release("m", "b", &variants, &slots, Path::new("."));
+        let id = ReleaseId::new(rec.release_id.clone());
+        store.write_release(&rec).unwrap();
+
+        // Positive case: the unmodified record reads fine.
+        let read = store.read_release(&id).unwrap();
+        assert_eq!(read.release_sha256, rec.release_sha256);
+        assert_eq!(read.release_id, rec.release_id);
+
+        // Tamper: change a slot's deploy_dir in the STORED record while
+        // retaining the old digest fields (the bug: content edited, digest
+        // trusted). `write_release` compares only the digest field, so the
+        // tampered record must be installed by writing the file directly.
+        let mut tampered = read.clone();
+        tampered.slots.get_mut("standard").unwrap().slots[0].deploy_dir =
+            "/srv/elsewhere".to_string();
+        assert_eq!(
+            tampered.release_sha256, rec.release_sha256,
+            "digest retained"
+        );
+        assert_eq!(tampered.release_id, rec.release_id, "release id retained");
+        let path = store.release_dir(&id).join("release.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+
+        let err = store
+            .read_release(&id)
+            .expect_err("tampered record must fail verification");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("identity mismatch"),
+            "error must name the mismatch, got: {msg}"
+        );
+        assert!(
+            msg.contains(&rec.release_sha256),
+            "error must name the stored digest, got: {msg}"
+        );
     }
 
     /// A recorded attempt's plan and results are immutable: deployment IDs are

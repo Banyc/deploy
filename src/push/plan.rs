@@ -324,6 +324,21 @@ interval_seconds = 0
         }
     }
 
+    /// Recompute a release record's stored identity from its own content so
+    /// `read_release`'s recompute-and-verify passes: the digest is derived
+    /// from the record's slot snapshot, bindings, and provenance digests
+    /// exactly as `build_release` derives it. Returns the record's release id
+    /// (the digest form, which is also the store directory key).
+    fn consistent(rec: &mut ReleaseRecord) -> ReleaseId {
+        let digest = crate::release::recompute_release_digest(rec)
+            .expect("consistent record must carry a slot snapshot");
+        rec.release_sha256 = digest.as_str().to_string();
+        rec.release_id = crate::model::ReleaseId::from_digest(&digest)
+            .as_str()
+            .to_string();
+        ReleaseId::new(rec.release_id.clone())
+    }
+
     /// A `PushRef::Release` resolution against a LEGACY release record (empty
     /// stored slot snapshot) must fall back to the CURRENT configuration's
     /// declaring file for each slot's variant binding
@@ -380,8 +395,7 @@ interval_seconds = 0
     fn release_snapshot_missing_slot_fails_rollback() {
         let (_dir, config) = project_with_config();
         let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
-        let release = ReleaseId::new("rel-sha256-no-p1".to_string());
-        let mut rec = legacy_record(release.as_str(), "tree-x");
+        let mut rec = legacy_record("unused", "tree-x");
         // A stored snapshot that declares a DIFFERENT slot (not the target's
         // member p1).
         rec.slots = BTreeMap::from([(
@@ -395,6 +409,7 @@ interval_seconds = 0
                 }],
             },
         )]);
+        let release = consistent(&mut rec);
         store.write_release(&rec).unwrap();
 
         let err = plan_assignments(
@@ -454,27 +469,25 @@ interval_seconds = 0
     fn release_snapshot_binding_wins_over_current_config() {
         let (_dir, config) = project_with_config();
         let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
-        let release = ReleaseId::new("rel-sha256-snapshot".to_string());
         // Current config declares p1 under `standard`; the stored snapshot
         // instead records p1 under `other` (as if the slot later moved).
-        let rec = ReleaseRecord {
-            slots: BTreeMap::from([(
-                "other".to_string(),
-                CanonicalSlots {
-                    slots: vec![CanonicalSlot {
-                        id: "p1".to_string(),
-                        server: "s1".to_string(),
-                        deploy_dir: "/srv/plan".to_string(),
-                        targets: vec!["t1".to_string()],
-                    }],
-                },
-            )]),
-            variants: BTreeMap::from([
-                ("standard".to_string(), "tree-standard".to_string()),
-                ("other".to_string(), "tree-other".to_string()),
-            ]),
-            ..legacy_record(release.as_str(), "tree-x")
-        };
+        let mut rec = legacy_record("unused", "tree-x");
+        rec.slots = BTreeMap::from([(
+            "other".to_string(),
+            CanonicalSlots {
+                slots: vec![CanonicalSlot {
+                    id: "p1".to_string(),
+                    server: "s1".to_string(),
+                    deploy_dir: "/srv/plan".to_string(),
+                    targets: vec!["t1".to_string()],
+                }],
+            },
+        )]);
+        rec.variants = BTreeMap::from([
+            ("standard".to_string(), "tree-standard".to_string()),
+            ("other".to_string(), "tree-other".to_string()),
+        ]);
+        let release = consistent(&mut rec);
         store.write_release(&rec).unwrap();
 
         let (assignments, _, _) = plan_assignments(
@@ -513,27 +526,25 @@ interval_seconds = 0
     fn release_ref_current_suffix_uses_current_config_variant() {
         let (_dir, config) = project_with_config();
         let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
-        let release = ReleaseId::new("rel-sha256-curvar".to_string());
         // Stored slot snapshot: p1 was bound to `other` at materialization.
         // Current config: p1 is declared by `standard` (slot_variant = standard).
-        let rec = ReleaseRecord {
-            slots: BTreeMap::from([(
-                "other".to_string(),
-                CanonicalSlots {
-                    slots: vec![CanonicalSlot {
-                        id: "p1".to_string(),
-                        server: "s1".to_string(),
-                        deploy_dir: "/srv/plan".to_string(),
-                        targets: vec!["t1".to_string()],
-                    }],
-                },
-            )]),
-            variants: BTreeMap::from([
-                ("standard".to_string(), "tree-standard".to_string()),
-                ("other".to_string(), "tree-other".to_string()),
-            ]),
-            ..legacy_record(release.as_str(), "tree-x")
-        };
+        let mut rec = legacy_record("unused", "tree-x");
+        rec.slots = BTreeMap::from([(
+            "other".to_string(),
+            CanonicalSlots {
+                slots: vec![CanonicalSlot {
+                    id: "p1".to_string(),
+                    server: "s1".to_string(),
+                    deploy_dir: "/srv/plan".to_string(),
+                    targets: vec!["t1".to_string()],
+                }],
+            },
+        )]);
+        rec.variants = BTreeMap::from([
+            ("standard".to_string(), "tree-standard".to_string()),
+            ("other".to_string(), "tree-other".to_string()),
+        ]);
+        let release = consistent(&mut rec);
         store.write_release(&rec).unwrap();
         assert_eq!(config.slot_variant("p1").unwrap(), "standard");
 
@@ -593,24 +604,22 @@ interval_seconds = 0
     fn release_ref_current_suffix_missing_current_variant_fails_closed() {
         let (_dir, config) = project_with_config();
         let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
-        let release = ReleaseId::new("rel-sha256-curvar-missing".to_string());
         // The release ships ONLY `other`; the current config declares p1 in
         // `standard` (which the release never shipped).
-        let rec = ReleaseRecord {
-            slots: BTreeMap::from([(
-                "other".to_string(),
-                CanonicalSlots {
-                    slots: vec![CanonicalSlot {
-                        id: "p1".to_string(),
-                        server: "s1".to_string(),
-                        deploy_dir: "/srv/plan".to_string(),
-                        targets: vec!["t1".to_string()],
-                    }],
-                },
-            )]),
-            variants: BTreeMap::from([("other".to_string(), "tree-other".to_string())]),
-            ..legacy_record(release.as_str(), "tree-x")
-        };
+        let mut rec = legacy_record("unused", "tree-x");
+        rec.slots = BTreeMap::from([(
+            "other".to_string(),
+            CanonicalSlots {
+                slots: vec![CanonicalSlot {
+                    id: "p1".to_string(),
+                    server: "s1".to_string(),
+                    deploy_dir: "/srv/plan".to_string(),
+                    targets: vec!["t1".to_string()],
+                }],
+            },
+        )]);
+        rec.variants = BTreeMap::from([("other".to_string(), "tree-other".to_string())]);
+        let release = consistent(&mut rec);
         store.write_release(&rec).unwrap();
 
         let err = plan_assignments(
@@ -670,27 +679,24 @@ interval_seconds = 0
 
         // The snapshot's release ships BOTH the historical variant `old` and
         // the current variant `new`; its slot snapshot records p1 under `old`.
-        let release = ReleaseId::new("rel-sha256-fleet-curvar".to_string());
-        store
-            .write_release(&ReleaseRecord {
-                variants: BTreeMap::from([
-                    ("old".to_string(), "tree-old".to_string()),
-                    ("new".to_string(), "tree-new".to_string()),
-                ]),
-                slots: BTreeMap::from([(
-                    "old".to_string(),
-                    CanonicalSlots {
-                        slots: vec![CanonicalSlot {
-                            id: "p1".to_string(),
-                            server: "s1".to_string(),
-                            deploy_dir: "/srv/plan".to_string(),
-                            targets: vec!["t1".to_string()],
-                        }],
-                    },
-                )]),
-                ..legacy_record(release.as_str(), "tree-x")
-            })
-            .unwrap();
+        let mut rec = legacy_record("unused", "tree-x");
+        rec.variants = BTreeMap::from([
+            ("old".to_string(), "tree-old".to_string()),
+            ("new".to_string(), "tree-new".to_string()),
+        ]);
+        rec.slots = BTreeMap::from([(
+            "old".to_string(),
+            CanonicalSlots {
+                slots: vec![CanonicalSlot {
+                    id: "p1".to_string(),
+                    server: "s1".to_string(),
+                    deploy_dir: "/srv/plan".to_string(),
+                    targets: vec!["t1".to_string()],
+                }],
+            },
+        )]);
+        let release = consistent(&mut rec);
+        store.write_release(&rec).unwrap();
         let snapshot = DeploymentSnapshot {
             index: 0,
             deployment_id: DeploymentId::new("deploy-fleet-curvar".to_string()),

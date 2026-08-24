@@ -11,6 +11,7 @@
 
 use crate::config::{ActivationConfig, Mapping, SlotDef, VerificationConfig};
 use crate::digest::sha256_bytes;
+use crate::error::{Error, Result};
 use crate::model::{
     BehaviorContract, CanonicalReleasePayload, CanonicalSlot, CanonicalSlots, Provenance,
     ReleaseDigest, ReleaseId, ReleaseRecord, TreeDigest, VariantName,
@@ -206,6 +207,73 @@ pub fn build_release(
         variants: bindings,
         slots,
     }
+}
+
+/// Recompute the canonical release digest from a stored record's OWN content:
+/// the per-variant canonical slot snapshot, the `variant -> tree digest`
+/// bindings, and the provenance digests — exactly the inputs `build_release`
+/// folds into the identity. Returns `None` for legacy records that carry no
+/// canonical slot snapshot (written before the slots-into-identity refactor):
+/// their slot declarations were not persisted, so the digest cannot be
+/// recomputed from the record alone and the existing fallback semantics apply.
+pub fn recompute_release_digest(rec: &ReleaseRecord) -> Option<ReleaseDigest> {
+    if rec.slots.is_empty() {
+        return None;
+    }
+    // Rebuild the per-variant slot declarations from the record's canonical
+    // snapshot (the four identity fields map 1:1 onto `SlotDef`) and re-run
+    // the same component digest `build_release` uses, so any change to the
+    // canonical slot digest inputs merges mechanically.
+    let slots: BTreeMap<String, Vec<SlotDef>> = rec
+        .slots
+        .iter()
+        .map(|(v, cs)| {
+            (
+                v.clone(),
+                cs.slots
+                    .iter()
+                    .map(|s| SlotDef {
+                        id: s.id.clone(),
+                        server: s.server.clone(),
+                        deploy_dir: PathBuf::from(&s.deploy_dir),
+                        targets: s.targets.clone(),
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    let slots_digest = variant_slots_digest(&slots);
+    Some(release_digest(
+        &rec.provenance.mapping_sha256,
+        &rec.provenance.behavior_sha256,
+        &slots_digest,
+        &rec.variants,
+    ))
+}
+
+/// Verify that a release record's stored identity — BOTH `release_sha256` and
+/// the `release_id` (`rel-sha256-<digest>`) — matches the canonical digest
+/// recomputed from the record's own content. The digest is never trusted from
+/// the stored fields: a tampered record whose content was edited while the
+/// digest fields were left unchanged fails closed with an integrity error
+/// naming the release and the expected vs recomputed digest. Legacy records
+/// without a canonical slot snapshot cannot be re-verified from their own
+/// content and are accepted (the existing fallback semantics apply).
+pub fn verify_release_identity(rec: &ReleaseRecord) -> Result<()> {
+    let Some(recomputed) = recompute_release_digest(rec) else {
+        return Ok(());
+    };
+    let expected_id = ReleaseId::from_digest(&recomputed);
+    if rec.release_sha256 != recomputed.as_str() || rec.release_id != expected_id.as_str() {
+        return Err(Error::integrity(format!(
+            "release {} identity mismatch: stored release_sha256 {} / release_id {} do not match the digest {} recomputed from the record content",
+            rec.release_id,
+            rec.release_sha256,
+            rec.release_id,
+            recomputed.as_str()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -540,5 +608,59 @@ mod tests {
             Path::new("."),
         );
         assert_ne!(rec.release_id, rec_m.release_id);
+    }
+
+    /// `verify_release_identity` recomputes the canonical digest from the
+    /// record's OWN content and checks it against BOTH stored identity fields:
+    /// a pristine record verifies, a record whose slot declaration or variant
+    /// binding was edited while the digest fields were retained fails closed
+    /// with an integrity error naming the mismatch, and a legacy record
+    /// without a slot snapshot (digest not recomputable from the record alone)
+    /// is accepted.
+    #[test]
+    fn verify_release_identity_recomputes_from_content() {
+        let variants: BTreeMap<VariantName, TreeDigest> =
+            BTreeMap::from([(VariantName::new("standard"), TreeDigest::new("t1"))]);
+        let slots: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+            "standard".to_string(),
+            vec![sdef("p1", "server-01", "/srv/deploy/example", "production")],
+        )]);
+        let rec = build_release("m", "b", &variants, &slots, Path::new("."));
+
+        // Pristine: the recomputed digest matches both stored fields.
+        verify_release_identity(&rec).expect("pristine record verifies");
+
+        // Tampered slot declaration (deploy_dir moved) with the digest fields
+        // retained -> Err naming the stored vs recomputed digest.
+        let mut tampered = rec.clone();
+        tampered.slots.get_mut("standard").unwrap().slots[0].deploy_dir =
+            "/srv/elsewhere".to_string();
+        let err = verify_release_identity(&tampered)
+            .expect_err("tampered slot content must fail verification");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("identity mismatch"),
+            "error must name the mismatch, got: {msg}"
+        );
+        assert!(
+            msg.contains(&rec.release_sha256),
+            "error must name the stored digest, got: {msg}"
+        );
+
+        // Tampered variant binding with the digest fields retained -> Err.
+        let mut tampered2 = rec.clone();
+        tampered2
+            .variants
+            .insert("standard".to_string(), "tree-2".to_string());
+        let err2 = verify_release_identity(&tampered2)
+            .expect_err("tampered variant binding must fail verification");
+        assert!(err2.to_string().contains("identity mismatch"));
+
+        // Legacy record (no slot snapshot): accepted — the digest cannot be
+        // recomputed from the record alone.
+        let mut legacy = rec.clone();
+        legacy.slots.clear();
+        verify_release_identity(&legacy)
+            .expect("legacy record without a slot snapshot is accepted");
     }
 }
