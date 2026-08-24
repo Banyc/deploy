@@ -46,6 +46,11 @@
 //! observable state after every action while re-evaluating all five
 //! invariant groups. Random vectors with shrinking find interleaving bugs the
 //! fixed sequences miss, and minimize any failing vector to its core.
+//! The oracle classifies EVERY push outcome into two INDEPENDENT dimensions —
+//! the return boundary (`Ok` report vs `Err`) and the deployment disposition
+//! (what the attempt recorded) — so an `Err` that occurred before the intent
+//! was persisted is never conflated with an `Ok` report carrying a terminal
+//! failure status (the old single-class `ErrPreCommit` folded both together).
 //!
 //! The five mutations the harness applies one at a time (and reverts) each
 //! kill at least one test in this module or the suite it feeds:
@@ -77,6 +82,7 @@ use crate::remote::transport::{
 };
 use crate::rotation::compute_retained;
 use crate::store::local::LocalStore;
+use crate::testutil::step17_hook;
 use proptest::prelude::*;
 use proptest::test_runner::{FileFailurePersistence, RngSeed};
 use std::collections::{BTreeMap, HashSet};
@@ -392,39 +398,79 @@ pub(crate) enum Outcome {
     Tampered,
 }
 
+/// The RETURN BOUNDARY — the FIRST of the two independent outcome dimensions:
+/// whether the push API returned `Ok(report)` or `Err(_)`. An `Err` means the
+/// push call itself failed; an `Ok` means a report was returned (what the
+/// report records is the SECOND dimension, the [`Disposition`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReturnBoundary {
+    /// The push API returned `Ok(report)`.
+    Ok,
+    /// The push API returned `Err(_)`.
+    Err,
+}
+
+/// The DEPLOYMENT DISPOSITION — the SECOND of the two independent outcome
+/// dimensions: what, if anything, the push recorded. On an `Ok` return it
+/// maps from the report status (`Successful` / `PendingCommit` / the terminal
+/// failure statuses / `None` for the no-op report); on an `Err` return it is
+/// resolved from the system's store — whether the intent was persisted BEFORE
+/// the failure and, if so, the attempt's latest status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Disposition {
+    /// Nothing was recorded: the no-op report (`status: None`), a non-push
+    /// action's plain [`Outcome::Ok`], or an `Err` that occurred BEFORE the
+    /// intent was persisted (plan rejection, early lock contention, the
+    /// `append_attempt` itself) — no attempt/plan exists.
+    NoAttempt,
+    /// The deployment durably committed: report status `Successful` (attempt,
+    /// snapshot, `refs/last-successful`, and the terminal transition all
+    /// durable). Post-commit maintenance warnings (rotation, observed
+    /// refresh, debt I/O) ride on the SAME report and never change the class.
+    Successful,
+    /// Recorded but NOT durably committed: report status `PendingCommit`
+    /// (the fleet-commit marker write failed — a deferred/recoverable
+    /// completion a later push reconciles), or a crash-window `Err` that left
+    /// the recorded attempt recoverable-pending (`PendingCommit` /
+    /// `InProgress`).
+    Pending,
+    /// The attempt ended terminal `FailedPreflight`: a pre-mutation failure
+    /// AFTER the intent was persisted (capacity/staging) — the push returns
+    /// `Err` with the attempt recorded `FailedPreflight`.
+    FailedPreflight,
+    /// The attempt ended terminal `FailedRolledBack` (activation failure
+    /// fully compensated).
+    FailedRolledBack,
+    /// The attempt ended terminal `Degraded` (failed compensation / a
+    /// non-rollback failure policy).
+    Degraded,
+}
+
 /// The expected outcome CLASS of one applied action — the RESULT the model
 /// oracle predicts and the property test compares against the actual
-/// [`Outcome`] the system produced. The classes are derived from the engine's
-/// real report statuses (`Successful` / `PendingCommit` / `FailedPreflight` /
-/// `Degraded` / `FailedRolledBack` / the no-op report) and the `Err`
-/// boundary, so a push whose RESULT disagrees with the model (a `PendingCommit`
-/// where the model expected a durable `Successful`, an `Err` after a durable
-/// commit, or a no-op where the model expected a deployment) fails the oracle
-/// even though every observable record matched.
+/// [`Outcome`] the system produced. A push is classified into TWO INDEPENDENT
+/// dimensions — the [`ReturnBoundary`] (`Ok` report vs `Err`) and the
+/// [`Disposition`] — asserted separately after EVERY action, so `Ok` +
+/// [`Disposition::FailedPreflight`] is a DIFFERENT class from `Err` +
+/// [`Disposition::NoAttempt`]: an IntentPersist regression that wrongly
+/// returned `Ok(FailedPreflight)` would satisfy the OLD single-class
+/// `ErrPreCommit` oracle but fails the boundary comparison here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OutcomeClass {
-    /// A push that durably committed: report status `Successful`, attempt
-    /// recorded, snapshot + `refs/last-successful` + the terminal `Successful`
-    /// transition all durable. Post-commit maintenance warnings (rotation,
-    /// observed refresh, debt I/O) ride on the SAME report and never change
-    /// the class.
-    OkCommitted,
-    /// "Everything up to date": `status: None`, no records created.
-    OkNoop,
-    /// The push returned `Ok` but the deployment is NOT durably committed: a
-    /// `PendingCommit` status (the fleet-commit marker write failed) — a
-    /// deferred/recoverable completion a later push reconciles.
-    OkPending,
-    /// A failure BEFORE the durable commit: an `Err` return (a pre-commit
-    /// fault, a plan rejection, a crash-window finalize fault) or a terminal
-    /// non-committed status (`FailedPreflight` / `Degraded` /
-    /// `FailedRolledBack`) that ends the attempt with nothing durably
-    /// committed. Per the hard post-commit rule, an `Err` is legal ONLY here.
-    ErrPreCommit,
-    /// A non-push action (Build / Rotate / InjectFailure) reported [`Outcome::Ok`].
-    OkAction,
+    /// A push result — or a non-push action's plain [`Outcome::Ok`] (Build /
+    /// Rotate / InjectFailure record nothing) — classified into the
+    /// (boundary, disposition) pair. `Ok` + `NoAttempt` is the no-op report
+    /// (and any non-push action); `Ok` + `Successful` is the durably
+    /// committed deployment; `Ok` + `Pending` is the recoverable
+    /// fleet-commit failure; `Err` + `NoAttempt` is a pre-intent failure;
+    /// `Err` + `Pending` is a crash-window failure whose intent WAS recorded.
+    Push {
+        boundary: ReturnBoundary,
+        disposition: Disposition,
+    },
     /// A deliberate [`Action::Tamper`] — the Integrity group is broken by
-    /// construction and the fixture reports [`Outcome::Tampered`].
+    /// construction and the fixture reports [`Outcome::Tampered`]; no
+    /// boundary/disposition pair is meaningful.
     Tampered,
 }
 
@@ -494,40 +540,157 @@ pub(crate) enum FailureClass {
     /// or the no-op check — even an up-to-date push errors, and nothing is
     /// recorded or mutated.
     LockContention,
+    /// The slot's mutation lock is CONTENDED ONLY AT STEP 17 (the
+    /// post-commit per-slot rotation), via the test-only step-17 phase hook
+    /// ([`crate::testutil::step17_hook`]): the engine parks immediately
+    /// before its per-slot `acquire_lock_guard`, the fixture holds the
+    /// competing guard, then releases the engine — so the rotation
+    /// deterministically defers (debt marker + warning naming the slot), the
+    /// push still reports `Successful` (it already committed — the outcome
+    /// class is `Ok` + `Successful`, NEVER `Err`), and a later clean no-op
+    /// services the marker once the lock is free. The pre-commit lock checks
+    /// (preflight, reconcile, fleet-commit) run while the lock is FREE: the
+    /// fixture only grabs the guard the moment the engine parks at a
+    /// step-17-equivalent lock acquisition — the push's own step-17 rotation
+    /// AND, when prior debt exists, the deferred-maintenance retry that runs
+    /// before it (the fixture services every park, so both contend).
+    Step17Contended,
+    /// [`FailureClass::Step17Contended`] combined with a rotation-debt
+    /// marker READ fault (target-keyed registry arm) in the same push: the
+    /// retry's debt read fails FIRST (explicit "rotation debt maintenance
+    /// deferred: failed to read" warning), then step 17's contended deferral
+    /// still persists its own marker (its read passes — the one-shot arm was
+    /// spent). Warning-only; non-fallible.
+    Step17ContentionDebtRead,
+    /// [`FailureClass::Step17Contended`] combined with a rotation-debt
+    /// marker WRITE fault (target-keyed registry arm) in the same push: the
+    /// contended deferral's `set_rotation_deferred` (or, with a prior
+    /// marker, the retry's final debt write) cannot persist the marker —
+    /// explicit "rotation debt maintenance deferred: failed to write"
+    /// warning, NO marker (no automatic retryability claim). Warning-only;
+    /// non-fallible.
+    Step17ContentionDebtWrite,
 }
 
-/// Classify an ACTUAL [`Outcome`] into the [`OutcomeClass`] the model must
-/// have predicted. `Push(Ok(report))` is classified by the report's status
-/// (`Successful` -> committed, `PendingCommit` -> pending, any other terminal
-/// status -> pre-commit failure, `None` status -> the no-op report);
-/// `Push(Err(_))` is always [`OutcomeClass::ErrPreCommit`] — the hard
-/// post-commit rule says an `Err` after a durable commit can never happen,
-/// which the oracle asserts explicitly at the call site.
-fn classify_outcome(outcome: &Outcome) -> OutcomeClass {
+/// The step-17 contention else-branch's explicit per-slot warning: the
+/// marker-persisted "retryable" claim the model asserts for the contention
+/// combinations (a later push services the marker once the lock is free).
+const STEP17_CONTENTION_WARNING: &str =
+    "rotation deferred for slot 'p1': slot lock held by another operation";
+/// The explicit debt-I/O failure notice — the marker was NOT persisted /
+/// maintenance deferred WITHOUT a marker, so no automatic retryability is
+/// claimed. `set_rotation_deferred` (and the retry's I/O) emit exactly this
+/// shape on a read/write failure.
+const DEBT_READ_WARNING: &str = "rotation debt maintenance deferred: failed to read rotation debt";
+const DEBT_WRITE_WARNING: &str =
+    "rotation debt maintenance deferred: failed to write rotation debt";
+
+/// Classify an ACTUAL [`Outcome`] into the two-dimension [`OutcomeClass`] the
+/// model must have predicted. `Push(Ok(report))` is classified by the report's
+/// status (`Successful` -> `Ok` + `Successful`, `PendingCommit` -> `Ok` +
+/// `Pending`, the terminal statuses -> `Ok` + their EXACT disposition, `None`
+/// status -> the no-op, `Ok` + `NoAttempt`); `Push(Err(_))` is `Err` + the
+/// disposition resolved by `err_disposition` — the caller (the fixture) asks
+/// the system's OWN store whether THIS push's intent was persisted before it
+/// failed (a pre-intent `Err` recorded nothing -> `NoAttempt`; the
+/// crash-window `Err`s recorded a recoverable-pending attempt -> `Pending`; a
+/// post-intent preflight failure recorded the terminal `FailedPreflight`).
+fn classify_outcome(
+    outcome: &Outcome,
+    err_disposition: impl FnOnce() -> Disposition,
+) -> OutcomeClass {
     match outcome {
-        Outcome::Ok => OutcomeClass::OkAction,
+        Outcome::Ok => OutcomeClass::Push {
+            boundary: ReturnBoundary::Ok,
+            disposition: Disposition::NoAttempt,
+        },
         Outcome::Tampered => OutcomeClass::Tampered,
         Outcome::Push(result) => match &**result {
-            Ok(report) => match report.status {
-                None => {
-                    assert_eq!(
-                        report.message, "Everything up to date",
-                        "the only statusless report the fixture produces is the no-op"
-                    );
-                    OutcomeClass::OkNoop
+            Ok(report) => {
+                let boundary = ReturnBoundary::Ok;
+                let disposition = match report.status {
+                    None => {
+                        assert_eq!(
+                            report.message, "Everything up to date",
+                            "the only statusless report the fixture produces is the no-op"
+                        );
+                        Disposition::NoAttempt
+                    }
+                    Some(DeploymentStatus::Successful) => Disposition::Successful,
+                    Some(DeploymentStatus::PendingCommit) => Disposition::Pending,
+                    Some(DeploymentStatus::FailedPreflight) => Disposition::FailedPreflight,
+                    Some(DeploymentStatus::Degraded) => Disposition::Degraded,
+                    Some(DeploymentStatus::FailedRolledBack) => Disposition::FailedRolledBack,
+                    Some(DeploymentStatus::InProgress) => {
+                        panic!("a final push report must never carry InProgress")
+                    }
+                };
+                OutcomeClass::Push {
+                    boundary,
+                    disposition,
                 }
-                Some(DeploymentStatus::Successful) => OutcomeClass::OkCommitted,
-                Some(DeploymentStatus::PendingCommit) => OutcomeClass::OkPending,
-                Some(DeploymentStatus::FailedPreflight)
-                | Some(DeploymentStatus::Degraded)
-                | Some(DeploymentStatus::FailedRolledBack) => OutcomeClass::ErrPreCommit,
-                Some(DeploymentStatus::InProgress) => {
-                    panic!("a final push report must never carry InProgress")
-                }
+            }
+            Err(_) => OutcomeClass::Push {
+                boundary: ReturnBoundary::Err,
+                disposition: err_disposition(),
             },
-            Err(_) => OutcomeClass::ErrPreCommit,
         },
     }
+}
+
+/// REGRESSION GUARD for the two-dimension split: the oracle must distinguish
+/// the CORRECT IntentPersist outcome — `Err` + `NoAttempt` (the intent
+/// persist fails BEFORE any record) — from the WRONG pair an IntentPersist
+/// regression would return: `Ok` + `FailedPreflight` (a preflight failure
+/// reported in an `Ok` report). The OLD single-class oracle folded both into
+/// `ErrPreCommit` and passed the regression; the boundary dimension
+/// distinguishes them.
+#[test]
+fn classifier_distinguishes_err_noattempt_from_ok_failed_preflight() {
+    use crate::error::Error;
+    let no_attempt = || Disposition::NoAttempt;
+
+    // The correct outcome for the IntentPersist fault: the push returns Err
+    // with nothing recorded (verified against the engine: `append_attempt`
+    // fails before any remote mutation, `read_attempts` stays empty).
+    let correct = classify_outcome(
+        &Outcome::Push(Box::new(Err(Error::store(
+            "test fault: append_attempt forced to fail once",
+        )))),
+        no_attempt,
+    );
+    assert_eq!(
+        correct,
+        OutcomeClass::Push {
+            boundary: ReturnBoundary::Err,
+            disposition: Disposition::NoAttempt,
+        }
+    );
+
+    // The regression: the same fault wrongly reported as an Ok report with
+    // the terminal `FailedPreflight` status. Different boundary AND different
+    // disposition — the oracle must NOT conflate the two.
+    let regression = classify_outcome(
+        &Outcome::Push(Box::new(Ok(PushReport {
+            status: Some(DeploymentStatus::FailedPreflight),
+            attempt: None,
+            message: "staging failed".to_string(),
+            warning: None,
+            dry_run: false,
+        }))),
+        no_attempt,
+    );
+    assert_eq!(
+        regression,
+        OutcomeClass::Push {
+            boundary: ReturnBoundary::Ok,
+            disposition: Disposition::FailedPreflight,
+        }
+    );
+    assert_ne!(
+        correct, regression,
+        "Err+NoAttempt (IntentPersist) must never equal Ok+FailedPreflight (the regression)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +718,14 @@ pub(crate) struct Fixture {
     /// the unique tempdir name) so concurrent proptest cases keep unique
     /// deployment ids (each case owns its per-fixture fault registry).
     prop_tag: String,
+    /// The (target, deployment id) of the LAST property push/rollback step,
+    /// so the oracle can resolve the DISPOSITION of an `Err` outcome by
+    /// asking the store whether THAT push's intent was persisted (a pre-intent
+    /// `Err` recorded nothing -> `NoAttempt`; the post-intent crash-window
+    /// `Err`s recorded a recoverable attempt -> `Pending`). Set by
+    /// [`Fixture::push_prop`]; a `Mutex` keeps `Fixture` `Sync` (some
+    /// hand-written tests move the fixture into scoped threads).
+    last_prop: Mutex<Option<(String, String)>>,
 }
 
 impl Fixture {
@@ -602,6 +773,7 @@ impl Fixture {
             fault: Arc::new(Mutex::new(RemoteFault::default())),
             prop_ids: AtomicU64::new(0),
             prop_tag,
+            last_prop: Mutex::new(None),
         };
         fixture.write_artifacts(1);
         fixture
@@ -738,7 +910,15 @@ impl Fixture {
             FailureClass::DebtWrite | FailureClass::DebtRemove => {
                 reg.arm_write_rotation_debt(pushed)
             }
-            FailureClass::None | FailureClass::LockContention => {}
+            // `None`, `LockContention` and `Step17Contended` need no registry
+            // arm: contention is driven by the fixture itself (the whole-push
+            // guard for `LockContention`, the step-17 phase hook for
+            // `Step17Contended`). The step-17 DEBT COMBINATIONS ride the same
+            // hook for the contention and the target-keyed registry arms for
+            // the debt half of the combination.
+            FailureClass::None | FailureClass::LockContention | FailureClass::Step17Contended => {}
+            FailureClass::Step17ContentionDebtRead => reg.arm_read_rotation_debt(pushed),
+            FailureClass::Step17ContentionDebtWrite => reg.arm_write_rotation_debt(pushed),
         }
     }
 
@@ -775,7 +955,7 @@ impl Fixture {
         let _ = helper.release_lock(op);
     }
 
-    /// Apply one PROPERTY step: arm the step's failure class, run the action
+    /// Simulate STEP-17 lock contention (the post-commit rotation the action
     /// with a fixed deployment id, then disarm every one-shot fault (the
     /// classes are step-scoped). Invariant checks are NOT run here — the
     /// oracle runs them only when the model reports the step left the state
@@ -799,7 +979,28 @@ impl Fixture {
     /// the raw outcome; the caller gates the invariant checks.
     fn push_prop(&self, t: &str, ref_token: Option<&str>, class: FailureClass) -> Outcome {
         let id = self.next_prop_id();
+        // Remember WHICH deployment this step pushed, so the oracle can ask
+        // the store whether the intent was persisted when the push returns
+        // `Err` (pre-intent Errs recorded nothing; the crash-window Errs
+        // recorded a recoverable attempt under this id).
+        *self.last_prop.lock().unwrap() = Some((t.to_string(), id.as_str().to_string()));
         self.arm_prop_fault(class, t, &id);
+        // Step-17 lock contention is driven by the test-only phase hook for
+        // ALL three step-17 classes (the fixture holds the competing guard
+        // while the engine is parked at its step-17-equivalent lock
+        // acquisition; the debt halves of the combinations ride the
+        // target-keyed registry arms armed above), so the push runs in a
+        // scoped thread.
+        if matches!(
+            class,
+            FailureClass::Step17Contended
+                | FailureClass::Step17ContentionDebtRead
+                | FailureClass::Step17ContentionDebtWrite
+        ) {
+            let res = self.push_prop_step17_contended(t, ref_token, &id);
+            self.disarm_prop_faults();
+            return Outcome::Push(Box::new(res));
+        }
         let contend = if class == FailureClass::LockContention {
             Some(self.hold_contention_lock())
         } else {
@@ -825,6 +1026,110 @@ impl Fixture {
         }
         self.disarm_prop_faults();
         Outcome::Push(Box::new(res))
+    }
+
+    /// Resolve the DEPLOYMENT DISPOSITION of an `Err` outcome from the
+    /// system's OWN store: the last property push's deployment id is looked up
+    /// in the pushed target's attempt log. An attempt recorded for that id
+    /// means the intent WAS persisted before the failure — the attempt's
+    /// latest transition gives the disposition (the recoverable crash-window
+    /// faults -> `Pending`, a post-intent preflight failure ->
+    /// `FailedPreflight`); NO attempt for the id means the failure preceded
+    /// the intent persist (early lock contention, plan rejection, the
+    /// `append_attempt` itself) -> `NoAttempt`.
+    fn err_disposition(&self) -> Disposition {
+        let last = self.last_prop.lock().unwrap();
+        let Some((t, id)) = last.as_ref() else {
+            return Disposition::NoAttempt;
+        };
+        let attempts = self.store.read_attempts(t).unwrap_or_default();
+        if !attempts.iter().any(|a| a.deployment_id.as_str() == id) {
+            return Disposition::NoAttempt;
+        }
+        match self.store.latest_status(id).ok().flatten() {
+            Some(DeploymentStatus::PendingCommit) | Some(DeploymentStatus::InProgress) => {
+                Disposition::Pending
+            }
+            Some(DeploymentStatus::FailedPreflight) => Disposition::FailedPreflight,
+            Some(DeploymentStatus::Degraded) => Disposition::Degraded,
+            Some(DeploymentStatus::FailedRolledBack) => Disposition::FailedRolledBack,
+            Some(DeploymentStatus::Successful) => Disposition::Successful,
+            None => Disposition::NoAttempt,
+        }
+    }
+
+    /// Run a push/rollback step under the step-17 phase hook (the
+    /// [`FailureClass::Step17Contended`] branch of [`Fixture::push_prop`]):
+    /// arm the hook for the step's deployment id, run the push in a scoped
+    /// thread, and the instant the engine parks at a step-17-equivalent lock
+    /// acquisition, acquire the slot's mutation lock via a SECOND helper and
+    /// hold it until the push returns — the engine's own rotation then
+    /// deterministically CONTENDS (deferred: debt marker + warning naming the
+    /// slot), never silent and never via a race on the lock file. A push that
+    /// finishes WITHOUT firing the hook is an up-to-date no-op carrying no
+    /// debt (its maintenance retry never reaches a step-17 lock acquisition):
+    /// the armed hook is dropped with no contention and the step is a plain
+    /// clean no-op.
+    fn push_prop_step17_contended(
+        &self,
+        t: &str,
+        ref_token: Option<&str>,
+        id: &DeploymentId,
+    ) -> Result<PushReport> {
+        let hook = step17_hook::Step17Hook::arm(self.store.step17_hook(), id.as_str());
+        std::thread::scope(|s| {
+            let push = s.spawn(|| match ref_token {
+                Some(rt) => crate::push::engine::push_ref_with_id(
+                    &self.cfg_path,
+                    &self.store,
+                    &self.remote_factory(),
+                    t,
+                    &self.config,
+                    &PushOptions {
+                        dry_run: false,
+                        ref_token: Some(rt.to_string()),
+                    },
+                    id,
+                ),
+                None => self.push_with_id(t, id),
+            });
+            // The competing guard, held until AFTER the push returns — the
+            // engine must find the lock held when it wakes from EVERY park.
+            // The remote / helper are declared here so the guard's borrow
+            // outlives the loop (an uncontended step just drops an unused
+            // helper).
+            let remote = self.remote();
+            let helper = RemoteHelper::new(remote.as_ref());
+            let mut guard: Option<crate::remote::helper::LockGuard<'_>> = None;
+            // Service EVERY park, not just the first: with prior debt the
+            // engine parks at the deferred-maintenance RETRY first and AGAIN
+            // at its own step-17 rotation — each is a step-17-equivalent lock
+            // acquisition, so each must find the guard held. The first park
+            // acquires the competing guard (deterministically — the engine
+            // cannot race it while parked); every park is then released. The
+            // loop exits when the push finishes WITHOUT ever reaching a
+            // step-17 lock acquisition (the no-op-without-debt case, where
+            // the hook can never fire). `recv_timeout` SLEEPS (it does not
+            // spin), so the wait costs nothing while the engine runs.
+            while !push.is_finished() {
+                if hook
+                    .wait_at_step17_bounded(std::time::Duration::from_millis(5))
+                    .is_ok()
+                {
+                    if guard.is_none() {
+                        let holder = format!("si-step17-{}", OperationId::generate().as_str());
+                        guard = Some(helper.acquire_lock_guard(&holder).expect(
+                            "the slot mutation lock must be free while the engine is parked \
+                             at the step-17 hook",
+                        ));
+                    }
+                    hook.release();
+                }
+            }
+            let res = push.join().expect("push thread panicked");
+            drop(hook);
+            res
+        })
     }
 
     /// Apply a non-push action WITHOUT the invariant checks (the property
@@ -1517,159 +1822,112 @@ fn state_machine_lifecycle_cleanup_failure_after_commit() {
 /// the lock held stays deferred and keeps warning; the FIRST no-op with the
 /// lock FREE services the rotation (marker cleared) and reports no warning.
 ///
-/// Determinism: the contention is created by a SECOND RemoteHelper's lock
-/// guard held directly (no sleeps, no wall clock). The push runs in a scoped
-/// thread; the guard is acquired the moment the engine's own step-15 guard
-/// drops (synchronized on the durable fleet-commit marker + the lock file's
-/// release), long before step 17 — the engine still has its whole
-/// finalize + observed-refresh window to run, so the acquire wins the race by
-/// a wide margin. If the engine's own rotation ever wins instead (oracle
-/// branch (a): the slot was rotated, no debt), the scenario is re-run on a
-/// fresh fixture — the assertion below only accepts the debt+warning branch.
+/// Determinism: NO thread ever races on the lock file. The test arms the
+/// test-only step-17 phase hook ([`crate::testutil::step17_hook`]) for the
+/// push's deployment id; the engine signals "at step-17 lock acquisition"
+/// and PARKS immediately before its per-slot `acquire_lock_guard`, the
+/// fixture then acquires the slot lock via a second `RemoteHelper` while the
+/// engine is parked, and releases the hook — the engine's own acquisition
+/// afterwards fails deterministically. No spin, no retry, no oracle branch:
+/// the deferred outcome is guaranteed. The no-op step is deterministic the
+/// same way: the no-op's deferred-maintenance retry shares the step-17
+/// RAII-guarded rotation block, so it parks at the SAME barrier.
 #[test]
 fn state_machine_lifecycle_rotation_lock_contention_defers_not_silent() {
     let id = DeploymentId::new("si-lockcont-push".to_string());
     let holder = "op-lockcont-holder";
-    for attempt in 0..16 {
-        let f = Fixture::new();
-        let remote = f.remote();
-        let helper = RemoteHelper::new(remote.as_ref());
+    let f = Fixture::new();
+    let remote = f.remote();
+    let helper = RemoteHelper::new(remote.as_ref());
 
-        // ---- Step 1: PUSH with the mutation lock held from step 17 on.
-        // The push runs in a scoped thread; the main thread waits for the
-        // fleet-commit marker (the engine passed preflight, the batch, and
-        // step 15), then acquires the lock via the second helper the moment
-        // the engine's own guard drops. Step 17's `acquire_lock_guard` then
-        // contends and the maintenance is deferred (debt + warning), never
-        // silent, never an `Err`.
-        let report1 = std::thread::scope(|s| {
+    // ---- Step 1: PUSH with the slot mutation lock contended from step 17
+    // on. Arm the phase hook, run the push in a scoped thread, and the
+    // instant the engine parks at its step-17 lock acquisition, hold the
+    // competing guard via the second helper, then release the engine — its
+    // own `acquire_lock_guard` now deterministically contends, so the
+    // maintenance is deferred (debt + warning), never silent, never an `Err`.
+    let report1 = {
+        let hook = step17_hook::Step17Hook::arm(f.store.step17_hook(), id.as_str());
+        std::thread::scope(|s| {
             let push = s.spawn(|| f.push_with_id("t1", &id));
-            let _guard = {
-                let marker = layout::commit_marker(id.as_str());
-                let mut spins = 0u64;
-                while !remote.exists(&marker) {
-                    std::thread::yield_now();
-                    spins += 1;
-                    assert!(
-                        spins < 20_000_000,
-                        "attempt {attempt}: the push never wrote its fleet-commit marker (step 15)"
-                    );
-                }
-                // The marker is written UNDER the engine's own guard; wait for
-                // that guard to drop (lock file gone), then hold it ourselves.
-                loop {
-                    if !remote.exists(&layout::operation_lock())
-                        && let Ok(g) = helper.acquire_lock_guard(holder)
-                    {
-                        break g;
-                    }
-                    std::thread::yield_now();
-                    spins += 1;
-                    assert!(
-                        spins < 20_000_000,
-                        "attempt {attempt}: the push never released the mutation lock after step 15"
-                    );
-                }
-            };
+            hook.wait_at_step17();
+            let _guard = helper.acquire_lock_guard(holder).expect(
+                "the slot lock must be free while the engine is parked at the step-17 hook",
+            );
+            hook.release();
             push.join().expect("push thread panicked")
-        });
-        // Oracle after the successful push: (b) the slot carries debt AND the
-        // report warns naming it — never silent, never Err. (If the engine's
-        // own rotation won the lock, oracle branch (a) holds instead: the slot
-        // was rotated with no debt; retry the scenario on a fresh fixture.)
-        let Ok(report1) = report1 else {
-            panic!(
-                "attempt {attempt}: a committed deployment must never fail (post-commit maintenance)"
-            )
-        };
-        let warning1 = report1.warning.as_deref().unwrap_or("");
-        let contended = report1.status == Some(DeploymentStatus::Successful)
-            && warning1.contains("rotation deferred for slot 'p1'")
-            && warning1.contains("slot lock held by another operation")
-            && !f.store.read_rotation_debt("t1").unwrap().is_empty();
-        if !contended {
-            continue;
-        }
-
-        // ---- Step 2: NO-OP with the lock HELD — the deferred maintenance
-        // stays deferred (marker kept) and keeps warning. The lock must be
-        // held AFTER this push's preflight (which reads the lock fresh) but
-        // BEFORE the no-op's deferred-maintenance retry: the write-once
-        // protocol marker is removed first so the push's handshake re-creates
-        // it as a fresh mid-push signal that the status read is done.
-        remote
-            .remove_file(&layout::protocol_marker())
-            .expect("remove protocol marker for a fresh handshake signal");
-        let report2 = std::thread::scope(|s| {
-            let push = s.spawn(|| f.push_with_id("t1", &id));
-            let _guard = {
-                let marker = layout::protocol_marker();
-                let mut spins = 0u64;
-                while !remote.exists(&marker) {
-                    std::thread::yield_now();
-                    spins += 1;
-                    assert!(
-                        spins < 20_000_000,
-                        "attempt {attempt}: the no-op push never handshaked"
-                    );
-                }
-                // The no-op path holds the lock nowhere before its deferred-
-                // maintenance retry, so the acquire lands immediately and is
-                // certain to precede the retry (the no-op check still runs its
-                // verification subprocess in between).
-                loop {
-                    if let Ok(g) = helper.acquire_lock_guard(holder) {
-                        break g;
-                    }
-                    std::thread::yield_now();
-                    spins += 1;
-                    assert!(
-                        spins < 20_000_000,
-                        "attempt {attempt}: the mutation lock stayed acquired"
-                    );
-                }
-            };
-            push.join().expect("push thread panicked")
-        });
-        let Ok(report2) = report2 else {
-            panic!(
-                "attempt {attempt}: the no-op must never fail because its maintenance retry contended"
-            )
-        };
-        let warning2 = report2.warning.as_deref().unwrap_or("");
-        let still_deferred = report2.message == "Everything up to date"
-            && report2.status.is_none()
-            && warning2.contains("rotation still deferred for slot 'p1'")
-            && warning2.contains("slot lock held by another operation")
-            && !f.store.read_rotation_debt("t1").unwrap().is_empty();
-        if !still_deferred {
-            continue;
-        }
-        // Step 2's guard drops here (lock released).
-
-        // ---- Step 3: the FIRST no-op with the lock FREE services the
-        // deferred rotation: the marker is cleared, no warning remains.
-        let report3 = f.push("t1").expect("the retrying push succeeds");
-        assert_eq!(report3.message, "Everything up to date");
-        assert_eq!(
-            report3.status, None,
-            "the retrying push is an up-to-date no-op"
-        );
-        assert!(
-            report3.warning.is_none(),
-            "the maintenance succeeded on the unlocked no-op, so no warning remains"
-        );
-        assert!(
-            f.store.read_rotation_debt("t1").unwrap().is_empty(),
-            "the debt marker must be cleared once the rotation succeeds"
-        );
-        f.check_invariants();
-        return;
-    }
-    panic!(
-        "the held-lock step-17 contention was never observed in 16 attempts; \
-         the engine's own rotation kept winning the lock race"
+        })
+    };
+    let report1 =
+        report1.expect("a committed deployment must never fail (post-commit maintenance)");
+    assert_eq!(
+        report1.status,
+        Some(DeploymentStatus::Successful),
+        "the contended push still commits successfully"
     );
+    let warning1 = report1.warning.as_deref().unwrap_or("");
+    assert!(
+        warning1.contains("rotation deferred for slot 'p1'")
+            && warning1.contains("slot lock held by another operation"),
+        "the contended push must warn naming the slot (never silent), got: {warning1}"
+    );
+    assert!(
+        !f.store.read_rotation_debt("t1").unwrap().is_empty(),
+        "the contended push must record the debt marker"
+    );
+    // Step 1's guard drops here (lock released).
+
+    // ---- Step 2: NO-OP with the lock HELD — the deferred maintenance
+    // stays deferred (marker kept) and keeps warning. The no-op path's only
+    // step-17-equivalent lock acquisition is the deferred-maintenance retry,
+    // so the same hook fires there: the fixture holds the guard while the
+    // engine is parked, releases the hook, and the retry's acquire fails —
+    // "rotation still deferred", marker kept, warning kept.
+    let report2 = {
+        let hook = step17_hook::Step17Hook::arm(f.store.step17_hook(), id.as_str());
+        std::thread::scope(|s| {
+            let push = s.spawn(|| f.push_with_id("t1", &id));
+            hook.wait_at_step17();
+            let _guard = helper.acquire_lock_guard(holder).expect(
+                "the slot lock must be free while the engine is parked at the no-op retry hook",
+            );
+            hook.release();
+            push.join().expect("push thread panicked")
+        })
+    };
+    let report2 =
+        report2.expect("the no-op must never fail because its maintenance retry contended");
+    assert_eq!(report2.message, "Everything up to date");
+    assert_eq!(report2.status, None, "the contended no-op is a no-op");
+    let warning2 = report2.warning.as_deref().unwrap_or("");
+    assert!(
+        warning2.contains("rotation still deferred for slot 'p1'")
+            && warning2.contains("slot lock held by another operation"),
+        "the held-lock no-op must keep warning that the rotation is deferred, got: {warning2}"
+    );
+    assert!(
+        !f.store.read_rotation_debt("t1").unwrap().is_empty(),
+        "the held-lock no-op must keep the debt marker"
+    );
+    // Step 2's guard drops here (lock released).
+
+    // ---- Step 3: the FIRST no-op with the lock FREE services the
+    // deferred rotation: the marker is cleared, no warning remains.
+    let report3 = f.push("t1").expect("the retrying push succeeds");
+    assert_eq!(report3.message, "Everything up to date");
+    assert_eq!(
+        report3.status, None,
+        "the retrying push is an up-to-date no-op"
+    );
+    assert!(
+        report3.warning.is_none(),
+        "the maintenance succeeded on the unlocked no-op, so no warning remains"
+    );
+    assert!(
+        f.store.read_rotation_debt("t1").unwrap().is_empty(),
+        "the debt marker must be cleared once the rotation succeeds"
+    );
+    f.check_invariants();
 }
 
 /// Lifecycle: a failure at the FIRST I/O boundary (the intent persist) must
@@ -3305,6 +3563,17 @@ struct Model {
     /// evaluate (see [`Model::lingering_crash`]). The five invariant groups
     /// and the model-vs-system comparisons are suspended while it is open.
     crash_window: bool,
+    /// The warning the CURRENT step's push report must contain: one
+    /// substring per entry, EVERY one asserted against the actual report's
+    /// `warning`. Set ONLY by the step-17 contention classes (see
+    /// [`FailureClass::Step17Contended`] and its debt combinations) so the
+    /// oracle asserts the retryable-vs-not distinction — "rotation deferred
+    /// for slot" (the marker-persisted claim) plus, on a debt read/write
+    /// fault, the explicit "rotation debt maintenance deferred: failed to
+    /// ..." notice that says the marker was NOT persisted (no automatic
+    /// retryability). `None` for every other class (their warnings are not
+    /// cross-checked).
+    expected_warning: Option<&'static [&'static str]>,
     /// True when the previous action was a deliberate tamper (the system's
     /// own invariant checks are skipped for that step too).
     last_was_tamper: bool,
@@ -3327,36 +3596,59 @@ impl Model {
             current_gen: 0,
             debt: BTreeMap::from([("t1", false), ("t2", false)]),
             crash_window: false,
+            expected_warning: None,
             last_was_tamper: false,
             index: 0,
         }
     }
 
     /// Advance the oracle by ONE property step — the action AND its failure
-    /// class together — and return the [`OutcomeClass`] the CORRECT engine
-    /// must produce. The state transitions mirror the engine's real behavior
-    /// per fault (a pre-commit arm -> [`OutcomeClass::ErrPreCommit`], a
-    /// post-commit arm -> the committed class with the model's tracked debt/
-    /// warning state). Kept ADAPTIVE: unknown action variants and failure
-    /// classes added by sibling features fall into catch-alls that suspend
-    /// the cross-comparisons instead of breaking the build.
+    /// class together — and return the two-dimension [`OutcomeClass`] the
+    /// CORRECT engine must produce: the [`ReturnBoundary`] (Ok vs Err) AND the
+    /// [`Disposition`]. The state transitions mirror the engine's real
+    /// behavior per fault (a PRE-INTENT arm -> `Err` + `NoAttempt` — the
+    /// intent was never persisted; a crash-window arm -> `Err` + `Pending` —
+    /// the intent WAS persisted but the attempt is recoverable; a post-commit
+    /// arm -> `Ok` + the committed class with the model's tracked debt/warning
+    /// state). Kept ADAPTIVE: unknown action variants and failure classes
+    /// added by sibling features fall into catch-alls that suspend the
+    /// cross-comparisons instead of breaking the build.
     fn apply(&mut self, action: &Action, fault: FailureClass) -> OutcomeClass {
         self.index += 1;
         self.last_was_tamper = false;
+        self.expected_warning = None;
         self.armed_fault = Some(fault);
         let (class, window) = match action {
             Action::Build(v) => {
                 self.head_version = *v;
-                (OutcomeClass::OkAction, self.crash_window)
+                (
+                    OutcomeClass::Push {
+                        boundary: ReturnBoundary::Ok,
+                        disposition: Disposition::NoAttempt,
+                    },
+                    self.crash_window,
+                )
             }
             Action::Push(t) | Action::Retry(t) => self.deploy(t, None),
             Action::Rollback(t, i) => self.rollback(t, *i),
-            Action::Rotate => (OutcomeClass::OkAction, self.crash_window),
+            Action::Rotate => (
+                OutcomeClass::Push {
+                    boundary: ReturnBoundary::Ok,
+                    disposition: Disposition::NoAttempt,
+                },
+                self.crash_window,
+            ),
             Action::InjectFailure(_) => {
                 // The property injects faults per step (never via this action);
                 // a stray sticky arm cannot be cross-checked.
                 self.unknown = true;
-                (OutcomeClass::OkAction, self.crash_window)
+                (
+                    OutcomeClass::Push {
+                        boundary: ReturnBoundary::Ok,
+                        disposition: Disposition::NoAttempt,
+                    },
+                    self.crash_window,
+                )
             }
             Action::Tamper(_) => {
                 if self.current.is_some() {
@@ -3429,7 +3721,8 @@ impl Model {
 
     /// A fleet-rollback to snapshot `i`. Out-of-range refs are rejected by
     /// the engine's plan BEFORE reconcile or any mutation: the push returns
-    /// `Err` (nothing recorded) and the crash-window state stands.
+    /// `Err` (nothing recorded — `NoAttempt`) and the crash-window state
+    /// stands.
     fn rollback(&mut self, t: &'static str, i: u64) -> (OutcomeClass, bool) {
         let Some(v) = self
             .snapshots
@@ -3437,7 +3730,13 @@ impl Model {
             .and_then(|snaps| snaps.get(i as usize))
             .copied()
         else {
-            return (OutcomeClass::ErrPreCommit, self.crash_window);
+            return (
+                OutcomeClass::Push {
+                    boundary: ReturnBoundary::Err,
+                    disposition: Disposition::NoAttempt,
+                },
+                self.crash_window,
+            );
         };
         self.deploy(t, Some(v))
     }
@@ -3450,11 +3749,22 @@ impl Model {
         // The engine's EARLY per-slot preflight checks the mutation lock
         // BEFORE reconciliation, the early no-op check, or the intent persist:
         // a contended push aborts with `Err` and records NOTHING — no attempt,
-        // no reconcile, no recovery, no observed refresh. The crash-window
-        // state and the step's fault stand exactly as before (a pending
-        // attempt is left for a later push to reconcile).
+        // no reconcile, no recovery, no observed refresh — so the expected
+        // class is `Err` + `NoAttempt` (CONFIRMED against the engine: the
+        // per-slot preflight lock check at `push_inner` runs before
+        // `reconcile_pending_commits`, `write_plan`, and `append_attempt`;
+        // the step-15 fleet-commit contention, by contrast, happens AFTER the
+        // intent and yields `Ok` + `Pending`). The crash-window state and the
+        // step's fault stand exactly as before (a pending attempt is left for
+        // a later push to reconcile).
         if matches!(self.armed_fault, Some(FailureClass::LockContention)) {
-            return (OutcomeClass::ErrPreCommit, self.crash_window);
+            return (
+                OutcomeClass::Push {
+                    boundary: ReturnBoundary::Err,
+                    disposition: Disposition::NoAttempt,
+                },
+                self.crash_window,
+            );
         }
         self.reconcile(t);
         let version = match rollback_version {
@@ -3480,15 +3790,29 @@ impl Model {
                 self.observed.insert("t1", Some(c));
                 self.observed.insert("t2", Some(c));
             }
-            return (OutcomeClass::OkNoop, false);
+            return (
+                OutcomeClass::Push {
+                    boundary: ReturnBoundary::Ok,
+                    disposition: Disposition::NoAttempt,
+                },
+                false,
+            );
         };
         let fault = self.armed_fault.take();
         let had_debt = self.debt.get(t).copied().unwrap_or(false);
         // A PRE-MUTATION abort (the intent persist): the push returns `Err`
-        // with NOTHING recorded or mutated and no refresh — the observed
+        // with NOTHING recorded or mutated and no refresh — `Err` + `NoAttempt`
+        // (verified against the engine: `append_attempt` fails before any
+        // remote mutation and `read_attempts` stays empty). The observed
         // projections and any open crash window stand exactly as before.
         if matches!(fault, Some(FailureClass::IntentPersist)) {
-            return (OutcomeClass::ErrPreCommit, self.crash_window);
+            return (
+                OutcomeClass::Push {
+                    boundary: ReturnBoundary::Err,
+                    disposition: Disposition::NoAttempt,
+                },
+                self.crash_window,
+            );
         }
         // A REAL deployment: the remote advances, the attempt is recorded,
         // and the observed refresh runs — EXCEPT for the crash-window faults,
@@ -3532,6 +3856,22 @@ impl Model {
                 self.snapshots.entry(t).or_default().push(v);
                 self.debt.insert(t, !had_debt);
             }
+            Some(FailureClass::Step17Contended) => {
+                // The step-17 mutation lock is CONTENDED (deterministic via
+                // the phase hook: the fixture holds the guard while the
+                // engine is parked at every step-17-equivalent lock
+                // acquisition). The deployment already committed, so the
+                // outcome class is unchanged; the rotation is DEFERRED — the
+                // marker is ALWAYS set (both the deferred-maintenance retry,
+                // when prior debt exists, and the push's own step-17
+                // rotation run while the guard is held), with the explicit
+                // "rotation deferred for slot 'p1'" warning naming the slot,
+                // never silent. A later clean unlocked no-op services the
+                // marker.
+                self.snapshots.entry(t).or_default().push(v);
+                self.debt.insert(t, true);
+                self.expected_warning = Some(&[STEP17_CONTENTION_WARNING]);
+            }
             Some(FailureClass::ObservedWriteServer) => {
                 // The per-server projection write fails (warning-only); the
                 // observed maps themselves still refresh.
@@ -3562,8 +3902,10 @@ impl Model {
             | Some(FailureClass::TransitionPending) => {
                 // Crash-window faults: the remote advanced and the attempt is
                 // recorded (InProgress / PendingCommit), but the snapshot was
-                // NOT written and the observed refresh never ran. The Err is
-                // pre-commit: the attempt stays recoverable-pending.
+                // NOT written and the observed refresh never ran. The push
+                // returns `Err` but the intent WAS persisted — the expected
+                // class is `Err` + `Pending` (the attempt stays
+                // recoverable-pending).
                 self.pending.insert(t, (v, self.current_gen, false));
             }
             Some(FailureClass::LastSuccessfulWrite) | Some(FailureClass::TransitionSuccessful) => {
@@ -3575,6 +3917,46 @@ impl Model {
             }
             Some(FailureClass::IntentPersist) | Some(FailureClass::LockContention) => {
                 unreachable!("handled before the real-deployment mutation")
+            }
+            Some(FailureClass::Step17ContentionDebtRead)
+            | Some(FailureClass::Step17ContentionDebtWrite) => {
+                // STEP-17 LOCK CONTENTION (post-commit, via the phase hook)
+                // combined with a rotation-debt I/O fault: the fleet commit
+                // succeeded and the slot's rotation lock is contended, so the
+                // step-17 loop defers the rotation as a debt marker. The
+                // deferral I/O is NON-FALLIBLE — a debt read/write failure
+                // warns but never changes the committed outcome.
+                self.snapshots.entry(t).or_default().push(v);
+                match fault {
+                    Some(FailureClass::Step17ContentionDebtRead) => {
+                        // The debt READ arm fires at the retry's FIRST debt
+                        // read (the retry runs before step 17): the retry
+                        // treats the debt as empty and warns "rotation debt
+                        // maintenance deferred: failed to read". The
+                        // contended deferral's OWN read then passes (the
+                        // one-shot arm is spent) and its write persists the
+                        // marker.
+                        self.debt.insert(t, true);
+                        self.expected_warning =
+                            Some(&[STEP17_CONTENTION_WARNING, DEBT_READ_WARNING]);
+                    }
+                    Some(FailureClass::Step17ContentionDebtWrite) => {
+                        // The debt WRITE arm fires at the FIRST debt write:
+                        // with no prior marker the retry writes nothing, so
+                        // the contended deferral's persist is the first write
+                        // — it FAILS, no marker is persisted, and the model
+                        // must NOT claim automatic retryability (the warning
+                        // carries the "rotation debt maintenance deferred:
+                        // failed to write" notice instead). With a prior
+                        // marker the retry's clearing write consumes the arm
+                        // and the deferral's re-persist succeeds, so the
+                        // marker stays.
+                        self.debt.insert(t, had_debt);
+                        self.expected_warning =
+                            Some(&[STEP17_CONTENTION_WARNING, DEBT_WRITE_WARNING]);
+                    }
+                    _ => unreachable!("step-17 classes handled above"),
+                }
             }
         }
         // The post-finalize observed refresh: every member target is rebuilt
@@ -3590,12 +3972,32 @@ impl Model {
             }
         }
         let window = crash || primary_stale || other_stale;
+        // The TWO-DIMENSION class: the boundary is `Ok` unless the step crashed
+        // inside the commit path (an `Err` whose intent WAS persisted —
+        // disposition `Pending`); the disposition is `Pending` for the
+        // fleet-commit marker failure and for the crash-window `Err`s, and
+        // `Successful` for a durable commit. Terminal failure dispositions
+        // (`FailedPreflight` / `Degraded` / `FailedRolledBack`) are not
+        // reachable from the property's injected fault classes (no server
+        // activation failure is generated), but the classifier maps their
+        // report statuses to the EXACT disposition — `Ok` + `FailedPreflight`
+        // is a DIFFERENT class from `Err` + `NoAttempt` (see
+        // `classifier_distinguishes_err_noattempt_from_ok_failed_preflight`).
         let class = if matches!(fault, Some(FailureClass::CommitMarker)) {
-            OutcomeClass::OkPending
+            OutcomeClass::Push {
+                boundary: ReturnBoundary::Ok,
+                disposition: Disposition::Pending,
+            }
         } else if crash {
-            OutcomeClass::ErrPreCommit
+            OutcomeClass::Push {
+                boundary: ReturnBoundary::Err,
+                disposition: Disposition::Pending,
+            }
         } else {
-            OutcomeClass::OkCommitted
+            OutcomeClass::Push {
+                boundary: ReturnBoundary::Ok,
+                disposition: Disposition::Successful,
+            }
         };
         (class, window)
     }
@@ -3607,6 +4009,16 @@ impl Model {
     /// succeeds and clears the debt. Under contention the retry's lock
     /// acquisition fails first: the marker stays (both trunks agree).
     fn noop_maintenance(&mut self, t: &'static str) {
+        // The DebtRead combination's warning is expected EVEN with no marker:
+        // the no-op's retry reads the debt FIRST regardless, so the one-shot
+        // read arm always fires ("failed to read" notice) — set the
+        // expectation before the no-debt early return.
+        if matches!(
+            self.armed_fault,
+            Some(FailureClass::Step17ContentionDebtRead)
+        ) {
+            self.expected_warning = Some(&[DEBT_READ_WARNING]);
+        }
         if !self.debt.get(t).copied().unwrap_or(false) {
             return;
         }
@@ -3617,6 +4029,15 @@ impl Model {
             }
             Some(FailureClass::LockContention) => {
                 // the retry cannot acquire the lock: the marker stays
+            }
+            Some(FailureClass::Step17Contended) => {
+                // The no-op's deferred-maintenance retry is a
+                // step-17-equivalent lock acquisition, so the phase hook
+                // fires there: the fixture holds the lock, the retry cannot
+                // acquire, and the marker stays. (Without a marker the hook
+                // never fires and the no-op is plain — `noop_maintenance`
+                // already returned early.)
+                self.armed_fault = None;
             }
             Some(FailureClass::CommitMarker) => {
                 self.debt.insert(t, false);
@@ -3630,6 +4051,32 @@ impl Model {
                 // Either way the marker STAYS and the maintenance warns — the
                 // no-op report is unchanged.
                 self.armed_fault = None;
+            }
+            Some(FailureClass::Step17ContentionDebtRead)
+            | Some(FailureClass::Step17ContentionDebtWrite) => {
+                // The no-op path runs no step-17 rotation, but the hook
+                // still fires at the retry's step-17-equivalent lock
+                // acquisition; each combination behaves exactly like its debt
+                // arm — the debt fault fires inside the retry: a read
+                // failure treats the marker as absent (nothing serviced,
+                // marker stays), a write failure keeps the marker — and the
+                // "rotation debt maintenance deferred: failed to ..." notice
+                // is explicit (the marker was NOT persisted / cleared, so no
+                // retryability is claimed). (The plain [`FailureClass::Step17Contended`]
+                // arm above keeps the marker via the hook contention.)
+                match self.armed_fault {
+                    Some(FailureClass::Step17ContentionDebtRead)
+                    | Some(FailureClass::Step17ContentionDebtWrite) => {
+                        if matches!(
+                            self.armed_fault,
+                            Some(FailureClass::Step17ContentionDebtWrite)
+                        ) {
+                            self.expected_warning = Some(&[DEBT_WRITE_WARNING]);
+                        }
+                        self.armed_fault = None;
+                    }
+                    _ => unreachable!("step-17 debt-combination arm"),
+                }
             }
             Some(_) => {
                 // Any other armed class does not touch the no-op's debt
@@ -3712,11 +4159,17 @@ fn action_strategy() -> impl Strategy<Value = Action> {
 }
 
 /// The failure-class strategy for the property test: injected PER STEP, so
-/// the model must predict the outcome under every arm — a pre-commit arm
-/// yields [`OutcomeClass::ErrPreCommit`], a post-commit arm yields the
-/// committed class with the model's tracked debt/warning, and lock contention
-/// demotes the whole attempt. Weights: the clean path dominates so the
-/// vectors stay realistic; every fault class is reachable.
+/// the model must predict the outcome under every arm — a PRE-INTENT arm
+/// (IntentPersist, early lock contention, a rejected plan) yields `Err` +
+/// `NoAttempt`; a crash-window arm (results/finalizer I/O) yields `Err` +
+/// `Pending`; a post-commit arm yields the committed class with the model's
+/// tracked debt/warning state; and the fleet-commit marker failure yields
+/// `Ok` + `Pending`. Lock contention demotes the whole attempt
+/// (`LockContention`, pre-intent: `Err` + `NoAttempt`) or only the step-17
+/// rotation (`Step17Contended`, deferred via the phase hook: debt + warning,
+/// the committed outcome — `Ok` + `Successful` — unchanged). Weights: the
+/// clean path dominates so the vectors stay realistic; every fault class is
+/// reachable.
 fn failure_class_strategy() -> impl Strategy<Value = FailureClass> {
     prop_oneof![
         12 => Just(FailureClass::None),
@@ -3740,6 +4193,18 @@ fn failure_class_strategy() -> impl Strategy<Value = FailureClass> {
         1 => Just(FailureClass::DebtRemove),
         // lock contention (the fixture holds the slot lock for the action)
         1 => Just(FailureClass::LockContention),
+        // step-17 lock contention (deterministic via the test-only phase
+        // hook: the fixture holds the guard while the engine is parked at its
+        // step-17 lock acquisition), alone and combined with a rotation-debt
+        // read/write fault in the same push. The outcome oracle predicts the
+        // committed push stays `Ok` + `Successful` (never `Err`); successful
+        // persistence (contention alone) leaves a debt marker + warning, while
+        // a coincident debt read/write failure produces the explicit "rotation
+        // debt maintenance deferred" notice (no automatic retryability claim).
+        // The combined weights are bounded so the vector count does not grow.
+        1 => Just(FailureClass::Step17Contended),
+        1 => Just(FailureClass::Step17ContentionDebtRead),
+        1 => Just(FailureClass::Step17ContentionDebtWrite),
     ]
 }
 
@@ -3963,13 +4428,15 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
     }
 }
 
-// Property-based state machine — outcome-class oracle + bounded random action
-// vectors (1..20 steps). Every step is an (ACTION, FAILURE CLASS) pair — the
-// actions and the injected failure classes are generated TOGETHER, so the
-// model must predict the outcome under every arm. A fresh [`Model`] oracle
-// and [`Fixture`] are driven in lockstep; after EVERY step the oracle asserts
-// both the observable state (existing [`assert_semantic_invariants`]) and the
-// RESULT class ([`OutcomeClass`]).
+// Property-based state machine — TWO-DIMENSION outcome oracle + bounded
+// random action vectors (1..20 steps). Every step is an (ACTION, FAILURE
+// CLASS) pair — the actions and the injected failure classes are generated
+// TOGETHER, so the model must predict the outcome under every arm. A fresh
+// [`Model`] oracle and [`Fixture`] are driven in lockstep; after EVERY step
+// the oracle asserts both the observable state (existing
+// [`assert_semantic_invariants`]) and the TWO-DIMENSION result class
+// ([`OutcomeClass`]: the [`ReturnBoundary`] AND the [`Disposition`], asserted
+// independently).
 //
 // TWO configs: the main test runs ORDINARY RANDOMIZED seeds with failure
 // persistence (a failing vector is written to
@@ -4001,18 +4468,23 @@ fn run_semantic_state_case(steps: Vec<(Action, FailureClass)>) {
         }
         // THE ORACLE: the model predicts the outcome class under the step's
         // failure class, then the system runs the same step and its actual
-        // outcome is classified identically. Both must agree.
+        // outcome is classified identically. Both must agree on BOTH
+        // dimensions.
         let expected = model.apply(&action, fault);
         let outcome = system.apply_prop(&action, fault);
         // The HARD POST-COMMIT RULE, asserted explicitly: once the deployment
-        // durably committed (the model expects [`OutcomeClass::OkCommitted`]),
-        // the push must NEVER return `Err` — the observed refresh, rotation,
-        // and debt I/O are warning-only after the durable commit. This binds
-        // the post-commit lifecycle + maintenance properties into the result
+        // durably committed (the model expects `Ok` + `Successful`), the push
+        // must NEVER return `Err` — the observed refresh, rotation, and debt
+        // I/O are warning-only after the durable commit. This binds the
+        // post-commit lifecycle + maintenance properties into the result
         // comparison.
         if let Outcome::Push(result) = &outcome
             && let Err(e) = &**result
-            && expected == OutcomeClass::OkCommitted
+            && expected
+                == (OutcomeClass::Push {
+                    boundary: ReturnBoundary::Ok,
+                    disposition: Disposition::Successful,
+                })
         {
             panic!(
                 "after action {}: a push the model expected to durably commit returned Err — \
@@ -4020,12 +4492,83 @@ fn run_semantic_state_case(steps: Vec<(Action, FailureClass)>) {
                 model.index
             );
         }
-        let actual = classify_outcome(&outcome);
-        assert_eq!(
-            expected, actual,
-            "after action {}: the expected outcome class must equal the actual one",
-            model.index
-        );
+        let actual = classify_outcome(&outcome, || system.err_disposition());
+        match (expected, actual) {
+            (OutcomeClass::Tampered, OutcomeClass::Tampered) => {}
+            (
+                OutcomeClass::Push {
+                    boundary: eb,
+                    disposition: ed,
+                },
+                OutcomeClass::Push {
+                    boundary: ab,
+                    disposition: ad,
+                },
+            ) => {
+                assert_eq!(
+                    eb, ab,
+                    "after action {}: the RETURN BOUNDARY (Ok report vs Err) must match the oracle",
+                    model.index
+                );
+                assert_eq!(
+                    ed, ad,
+                    "after action {}: the DEPLOYMENT DISPOSITION must match the oracle",
+                    model.index
+                );
+            }
+            (e, a) => panic!(
+                "after action {}: expected outcome class {e:?}, the system produced {a:?}",
+                model.index
+            ),
+        }
+        // THE REPORT'S WARNING CHANNEL (asserts the ACTUAL report text per
+        // step-17 contention combination): the marker-persisted "rotation
+        // deferred for slot 'p1'" claim — the retryable deferral a later push
+        // services once the lock is free — plus, on the debt combinations,
+        // the explicit "rotation debt maintenance deferred: failed to ..."
+        // notice (the marker was NOT persisted / maintenance deferred without
+        // a marker, so no automatic retryability is claimed). Every expected
+        // substring must appear in the actual report's warning. Under the
+        // two-dimension oracle the contended push is ALWAYS `Ok` +
+        // `Successful` (never `Err`) — the boundary/disposition asserts above
+        // already bind that — so a missing warning is the ONLY way a silent
+        // skip could slip through.
+        if let Some(wants) = model.expected_warning {
+            let actual_warning = match &outcome {
+                Outcome::Push(result) => match &**result {
+                    Ok(report) => report.warning.as_deref().unwrap_or(""),
+                    Err(_) => "",
+                },
+                _ => "",
+            };
+            for w in wants {
+                assert!(
+                    actual_warning.contains(w),
+                    "after action {}: the report must warn with {w:?}, got: {actual_warning:?}",
+                    model.index
+                );
+            }
+        }
+        // THE CONVERGENCE ORACLE: the first CLEAN unlocked no-op services
+        // the deferred rotation — the marker is cleared (cross-checked by
+        // `assert_semantic_invariants`) and no warning remains on the report.
+        if fault == FailureClass::None
+            && expected
+                == (OutcomeClass::Push {
+                    boundary: ReturnBoundary::Ok,
+                    disposition: Disposition::NoAttempt,
+                })
+            && let Outcome::Push(result) = &outcome
+            && let Ok(report) = &**result
+        {
+            assert!(
+                report.warning.is_none(),
+                "after action {}: a clean no-op must report no warning once the deferred \
+                 rotation converged; got: {:?}",
+                model.index,
+                report.warning,
+            );
+        }
         // The observable-state oracle (the existing cross-check plus the five
         // invariant groups); internally suspended while the crash window is
         // open or the step was a tamper / an unknown class.

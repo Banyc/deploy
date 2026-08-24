@@ -315,6 +315,153 @@ pub(crate) mod test_faults {
     }
 }
 
+/// Test-only step-17 phase hook: a per-fixture one-shot barrier that makes
+/// step-17 lock contention DETERMINISTIC.
+///
+/// The engine calls [`Step17Hook::barrier`] immediately BEFORE a
+/// step-17-equivalent lock acquisition — its per-slot rotation block in step
+/// 17, and the deferred-maintenance retry that shares the same RAII-guarded
+/// block. When a test armed the hook for THIS deployment id, the engine (a)
+/// signals "at step-17 lock acquisition" on the armed channel, then (b)
+/// BLOCKS until the test releases it: while the engine is parked, the test
+/// acquires the slot's mutation lock via a SECOND helper, then releases the
+/// engine — whose own acquisition afterwards deterministically contends (no
+/// thread ever races on the lock file). Unarmed stores and non-matching
+/// deployment ids pass through untouched, and the whole module is
+/// `#[cfg(test)]` (the engine call sites are `#[cfg(test)]` too), so this is
+/// a NO-OP in production builds.
+///
+/// Like the fault registry, the hook is PER-FIXTURE — owned by each
+/// [`crate::store::local::LocalStore`], never a process-global slot: a hook
+/// armed by one test can never fire in another fixture's push, so the
+/// parallel `cargo test` threads stay structurally isolated. The
+/// deployment-id half of the arm keys the barrier to exactly one push
+/// (property cases and the contention test all use unique ids), so a hook
+/// cannot even fire for a DIFFERENT push of the same fixture.
+#[cfg(test)]
+pub(crate) mod step17_hook {
+    use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use crate::model::DeploymentId;
+
+    /// The armed half stored in the per-fixture slot: the ENGINE-facing ends.
+    struct Armed {
+        deployment_id: String,
+        /// engine -> test: fired once, the instant the engine is parked.
+        at_step17: Sender<()>,
+        /// test -> engine: the engine parks here until the test releases it.
+        release: Receiver<()>,
+    }
+
+    /// Per-fixture one-shot step-17 phase hook slot. Created empty by
+    /// [`crate::store::local::LocalStore::with_base`]; a test arms it via
+    /// [`Step17Hook::arm`] immediately before the push under test. The
+    /// engine-side [`Step17Hook::barrier`] is a no-op while the slot is
+    /// empty or the deployment id does not match.
+    #[derive(Default)]
+    pub(crate) struct Step17Hook {
+        inner: Mutex<Option<Armed>>,
+    }
+
+    impl Step17Hook {
+        /// Arm the hook for `deployment_id` (replacing any prior arm — a
+        /// fired handle already left the slot empty) and return the
+        /// TEST-facing handle. The engine of a push carrying THIS deployment
+        /// id will now signal + park at its step-17 lock acquisition; the
+        /// test receives the signal, holds the competing lock guard, then
+        /// releases the engine via [`HookHandle::release`].
+        pub(crate) fn arm(hook: &Arc<Self>, deployment_id: &str) -> HookHandle {
+            let (at_tx, at_rx) = channel();
+            let (rel_tx, rel_rx) = channel();
+            *hook.inner.lock().unwrap() = Some(Armed {
+                deployment_id: deployment_id.to_string(),
+                at_step17: at_tx,
+                release: rel_rx,
+            });
+            HookHandle {
+                hook: Arc::clone(hook),
+                at_step17: at_rx,
+                release: rel_tx,
+            }
+        }
+
+        /// ENGINE-side, called immediately BEFORE a step-17-equivalent lock
+        /// acquisition: signal "at step 17" and park until the test releases
+        /// the engine — or return immediately when unarmed / the deployment
+        /// id does not match. NEVER called from production code (the call
+        /// sites in `src/push/engine.rs` are `#[cfg(test)]`). The slot mutex
+        /// stays held while parked so a concurrently-dropped handle cannot
+        /// disarm mid-park; the handle releases the engine (non-blocking)
+        /// BEFORE its drop can take the lock.
+        pub(crate) fn barrier(&self, deployment_id: &DeploymentId) {
+            let guard = self.inner.lock().unwrap();
+            let Some(armed) = guard.as_ref() else {
+                return;
+            };
+            if armed.deployment_id != deployment_id.as_str() {
+                return;
+            }
+            let _ = armed.at_step17.send(());
+            let _ = armed.release.recv();
+        }
+    }
+
+    /// The TEST-facing handle: owns the receive end of the "at step 17"
+    /// signal and the send end of the release. Dropping the handle disarms
+    /// the slot AND releases a parked engine first, so a panicked test can
+    /// never strand the engine thread.
+    pub(crate) struct HookHandle {
+        hook: Arc<Step17Hook>,
+        at_step17: Receiver<()>,
+        release: Sender<()>,
+    }
+
+    impl HookHandle {
+        /// Block until the engine signals it is parked at the step-17 lock
+        /// acquisition. The push MUST reach a step-17-equivalent barrier for
+        /// this deployment id (a real push, or a no-op retrying debt);
+        /// otherwise this blocks forever — the property test uses
+        /// [`HookHandle::wait_at_step17_bounded`] for the can-never-fire
+        /// case.
+        pub(crate) fn wait_at_step17(&self) {
+            self.at_step17
+                .recv()
+                .expect("the step-17 hook fired before the handle dropped");
+        }
+
+        /// Like [`HookHandle::wait_at_step17`], but bounded: returns
+        /// `Err(Timeout)` when the engine did not fire within `timeout` —
+        /// the caller then checks whether the push already completed (the
+        /// hook will never fire, e.g. an up-to-date no-op with no debt).
+        pub(crate) fn wait_at_step17_bounded(
+            &self,
+            timeout: Duration,
+        ) -> Result<(), RecvTimeoutError> {
+            self.at_step17.recv_timeout(timeout)
+        }
+
+        /// Release the parked engine: its step-17 lock acquisition now runs
+        /// while the fixture holds the competing guard, so it contends
+        /// deterministically. Safe to call more than once (a stale token is
+        /// dropped with the handle).
+        pub(crate) fn release(&self) {
+            let _ = self.release.send(());
+        }
+    }
+
+    impl Drop for HookHandle {
+        fn drop(&mut self) {
+            // Release any parked engine first (non-blocking — the buffered
+            // channel never blocks a send) so the disarm below can take the
+            // slot mutex without waiting on a parked engine.
+            let _ = self.release.send(());
+            *self.hook.inner.lock().unwrap() = None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod registry_property_tests {
     // Property tests for the per-fixture fault registry: two DISTINCT fault

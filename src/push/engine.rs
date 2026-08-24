@@ -1405,6 +1405,15 @@ fn push_inner(
             .find(|s| s.id.as_str() == sid.as_str())
             .map(|s| s.targets.clone())
             .unwrap_or_default();
+        // TEST-ONLY step-17 phase hook: when a test armed the barrier for
+        // THIS deployment id, signal "at step-17 lock acquisition" and park
+        // until the test releases the engine (the fixture holds the competing
+        // guard meanwhile) — per-slot lock contention becomes DETERMINISTIC,
+        // with no thread racing the lock file. A no-op in production builds
+        // (both this call and the store method are `#[cfg(test)]`) and in
+        // unarmed tests.
+        #[cfg(test)]
+        store.step17_hook_barrier(deployment_id);
         if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
             match rotate_slot_locked(helper, store, config, &slot_targets, deployment_id) {
                 Ok(()) => {
@@ -1447,16 +1456,20 @@ fn push_inner(
                 sid.as_str()
             ));
             // Best-effort debt record; NEVER propagates an error out of
-            // post-commit maintenance. Merge seam: when the debt I/O lands
-            // non-fallible (warning-collecting), this line extends
-            // `maintenance` with the returned warnings — the `Result` here
-            // is discarded either way.
-            let _ = set_rotation_deferred(
+            // post-commit maintenance: every debt read/write failure becomes
+            // a warning in the returned vec (merged into the report's
+            // `maintenance` channel), never an `Err` — the committed outcome
+            // is unchanged. On persistence failure there is no marker, but
+            // the explicit "rotation debt maintenance deferred" warning
+            // names the slot, so the report distinguishes a retryable
+            // deferral (marker persisted) from one that must be re-deferred
+            // by a later push.
+            maintenance.extend(set_rotation_deferred(
                 store,
                 target_name,
                 sid,
                 "slot lock held by another operation",
-            );
+            ));
         }
         // Clean up this deployment's incoming directory. Best-effort by
         // design: the push already succeeded, so a leftover here cannot change
@@ -1715,6 +1728,14 @@ fn retry_deferred_rotations(
             ));
             continue;
         };
+        // TEST-ONLY phase hook: the deferred-maintenance retry shares the
+        // same RAII-guarded rotation block as step 17, so it signals + parks
+        // at the SAME barrier — a test that armed the step-17 hook for this
+        // deployment id gets deterministic contention at the retry too (the
+        // no-op path reaches a step-17-equivalent lock acquisition only
+        // here). A no-op in production builds and unarmed tests.
+        #[cfg(test)]
+        store.step17_hook_barrier(deployment_id);
         if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
             // The slot's FULL member target list (union retention), resolved
             // from the current config.

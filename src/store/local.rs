@@ -45,6 +45,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
+use crate::testutil::step17_hook::Step17Hook;
+#[cfg(test)]
 use crate::testutil::test_faults::{FaultKind, FaultRegistry};
 #[cfg(test)]
 use std::sync::Arc;
@@ -214,6 +216,15 @@ pub struct LocalStore {
     /// of threading. See `src/testutil.rs` for the design.
     #[cfg(test)]
     fault_registry: Arc<FaultRegistry>,
+    /// Per-fixture one-shot step-17 phase hook (test-only). Created EMPTY by
+    /// [`LocalStore::with_base`]; a test arms it via [`LocalStore::step17_hook`]
+    /// right before the push under test. Like the fault registry it lives on
+    /// THIS store (never a process-global slot), so a hook armed by one
+    /// fixture can never fire in another's push. The engine consults it via
+    /// [`LocalStore::step17_hook_barrier`] immediately before each
+    /// step-17-equivalent lock acquisition. See `src/testutil.rs`.
+    #[cfg(test)]
+    step17_hook: Arc<Step17Hook>,
 }
 
 impl LocalStore {
@@ -237,6 +248,8 @@ impl LocalStore {
             base,
             #[cfg(test)]
             fault_registry: Arc::new(FaultRegistry::default()),
+            #[cfg(test)]
+            step17_hook: Arc::new(Step17Hook::default()),
         })
     }
 
@@ -247,6 +260,27 @@ impl LocalStore {
     #[cfg(test)]
     pub(crate) fn fault_registry(&self) -> &Arc<FaultRegistry> {
         &self.fault_registry
+    }
+
+    /// The fixture's per-fixture step-17 phase hook slot. A test arms it via
+    /// [`Step17Hook::arm`] right before the push under test, so the engine
+    /// parks at its step-17 lock acquisition until the test holds the
+    /// competing guard and releases the engine — deterministic lock
+    /// contention, per fixture (never a process-global slot).
+    #[cfg(test)]
+    pub(crate) fn step17_hook(&self) -> &Arc<Step17Hook> {
+        &self.step17_hook
+    }
+
+    /// ENGINE-side step-17 phase barrier, called immediately BEFORE a
+    /// step-17-equivalent lock acquisition (the per-slot rotation block and
+    /// the deferred-maintenance retry that shares it). A no-op in unarmed
+    /// stores and non-matching deployment ids; the call sites in
+    /// `src/push/engine.rs` are `#[cfg(test)]`, so production builds never
+    /// reach this method.
+    #[cfg(test)]
+    pub(crate) fn step17_hook_barrier(&self, deployment_id: &DeploymentId) {
+        self.step17_hook.barrier(deployment_id);
     }
 
     pub fn base(&self) -> &Path {
