@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::model::{DeploymentId, OperationId, PlacementSlotId};
 use crate::remote::helper::RemoteHelper;
+use crate::remote::transport::FsBytes;
 use crate::rotation::compute_retained;
 use crate::store::local::LocalStore;
 use std::collections::{HashMap, HashSet};
@@ -51,22 +52,22 @@ pub(crate) fn capacity_preflight(
             .expect("slot's server present in config");
         let capacity = &server.capacity;
         let reserve_bytes = capacity.reserve_bytes;
-        let reserve_percent = capacity.reserve_percent as f64 / 100.0;
+        let reserve_percent = capacity.reserve_percent as u64;
         let helper = helpers.get(&a.placement_slot).expect("helper present");
         if helper.tree_exists(a.artifact.tree.as_str()) {
             continue;
         }
         let need = tree_size_on_host(&store.object_root(&a.artifact.tree));
-        let avail = helper.remote().available_bytes().unwrap_or(0);
-        let total = helper
-            .remote()
-            .root()
-            .metadata()
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let _ = total;
-        let reserve = reserve_bytes.max((avail as f64 * reserve_percent) as u64);
-        if need + reserve > avail {
+        let fs = helper.remote().filesystem_bytes().unwrap_or(FsBytes {
+            total: 0,
+            available: 0,
+        });
+        // `reserve_percent` is a percentage of the filesystem's TOTAL size
+        // (requirement.md: "reserve_percent of the destination filesystem"),
+        // not of the currently available space: a small available amount on a
+        // large filesystem must still reserve `total * percent / 100`.
+        let reserve = reserve_bytes.max(percent_of_total(fs.total, reserve_percent));
+        if need + reserve > fs.available {
             // Run protected rotation using the target's rotation policy, then
             // recheck capacity directly rather than failing the restore.
             // Best-effort by design: rotation is only an optimization to free
@@ -80,16 +81,26 @@ pub(crate) fn capacity_preflight(
                 helper.rotate(&retained, &active).ok();
                 helper.release_lock(op_id.as_str()).ok();
             }
-            let avail2 = helper.remote().available_bytes().unwrap_or(0);
-            if need + reserve > avail2 {
+            let fs2 = helper.remote().filesystem_bytes().unwrap_or(FsBytes {
+                total: 0,
+                available: 0,
+            });
+            let reserve2 = reserve_bytes.max(percent_of_total(fs2.total, reserve_percent));
+            if need + reserve2 > fs2.available {
                 return Err(Error::preflight(format!(
                     "insufficient capacity on slot {}: need {} + reserve {} > avail {}",
-                    a.placement_slot, need, reserve, avail2
+                    a.placement_slot, need, reserve2, fs2.available
                 )));
             }
         }
     }
     Ok(())
+}
+
+/// `total * percent / 100` in u128 so a large filesystem size times a
+/// percentage cannot overflow u64.
+fn percent_of_total(total: u64, percent: u64) -> u64 {
+    ((total as u128 * percent as u128) / 100) as u64
 }
 
 fn tree_size_on_host(root: &Path) -> u64 {
@@ -108,22 +119,26 @@ mod tests {
     };
     use crate::push::plan::PlannedAssignment;
     use crate::remote::helper::RemoteHelper;
-    use crate::remote::transport::{ExecOutcome, LocalTransport, Remote, RemoteEntry, RemoteMeta};
+    use crate::remote::transport::{
+        ExecOutcome, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
+    };
     use crate::store::local::LocalStore;
     use std::path::{Path, PathBuf};
 
-    /// A transport wrapper that reports a FIXED number of available bytes,
-    /// letting a test control the headroom the capacity check sees
+    /// A transport wrapper that reports FIXED total and available filesystem
+    /// bytes, letting a test control the headroom the capacity check sees
     /// deterministically.
     struct FakeCapacityRemote {
         inner: LocalTransport,
+        total: u64,
         avail: u64,
     }
 
     impl FakeCapacityRemote {
-        fn build(base: PathBuf, avail: u64) -> Result<Box<dyn Remote>> {
+        fn build(base: PathBuf, total: u64, avail: u64) -> Result<Box<dyn Remote>> {
             Ok(Box::new(FakeCapacityRemote {
                 inner: LocalTransport::new(base)?,
+                total,
                 avail,
             }))
         }
@@ -178,8 +193,11 @@ mod tests {
         fn exec(&self, argv: &[String], timeout: std::time::Duration) -> Result<ExecOutcome> {
             self.inner.exec(argv, timeout)
         }
-        fn available_bytes(&self) -> Result<u64> {
-            Ok(self.avail)
+        fn filesystem_bytes(&self) -> Result<FsBytes> {
+            Ok(FsBytes {
+                total: self.total,
+                available: self.avail,
+            })
         }
     }
 
@@ -238,12 +256,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     }
 
     /// The capacity headroom is the LARGER of `reserve_bytes` and
-    /// `reserve_percent` of the available space (requirement.md: "reserves the
-    /// larger of capacity.reserve_bytes and capacity.reserve_percent"). With a
-    /// 6000-byte tree on a 10000-byte filesystem, 4500 bytes of headroom
-    /// fails while the equivalent 20% (2000 bytes) would pass; 45% (4500
-    /// bytes) fails while 1000 bytes would pass — pinning that BOTH halves of
-    /// the max() participate and neither is ignored.
+    /// `reserve_percent` of the filesystem's TOTAL size (requirement.md:
+    /// "reserves the larger of capacity.reserve_bytes and capacity.reserve_percent
+    /// of the destination filesystem"). The fake reports a 100000-byte
+    /// filesystem with only 10000 bytes available, so the percent half is
+    /// computed against the TOTAL: 10% reserves 10000 bytes, not 10% of the
+    /// 10000 available (1000). With a 6000-byte tree, 4500 bytes of headroom
+    /// fails while the equivalent 1% (1000 bytes) would pass; 10% (10000
+    /// bytes of total) fails while 1000 bytes would pass — pinning that BOTH
+    /// halves of the max() participate, that the percent half is a percentage
+    /// of the TOTAL filesystem size, and that neither is ignored.
     #[test]
     fn capacity_reserves_the_larger_of_bytes_and_percent() {
         let dir = tempfile::tempdir().unwrap();
@@ -254,9 +276,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         std::fs::create_dir_all(obj_root.join("app")).unwrap();
         std::fs::write(obj_root.join("app/file"), vec![b'x'; 6000]).unwrap();
 
-        // A remote reporting exactly 10000 bytes available; provisioned so the
-        // protected-rotation pass inside the failing branch can run.
-        let remote = FakeCapacityRemote::build(dir.path().join("remote"), 10000).unwrap();
+        // A remote reporting a 100000-byte filesystem with 10000 bytes
+        // available; provisioned so the protected-rotation pass inside the
+        // failing branch can run.
+        let remote = FakeCapacityRemote::build(dir.path().join("remote"), 100_000, 10_000).unwrap();
         remote.provision_layout().unwrap();
         let helper = RemoteHelper::new(remote.as_ref());
         let helpers = HashMap::from([(PlacementSlotId::new("p1".to_string()), helper)]);
@@ -274,10 +297,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let op_id = OperationId::generate();
         let deployment_id = DeploymentId::generate();
 
-        // Comfortable: 1000 bytes / 10% -> reserve 1000 -> 7000 <= 10000.
+        // Comfortable: 1000 bytes / 1% of total (1000) -> reserve 1000 ->
+        // 7000 <= 10000.
         config.servers[0].capacity = crate::config::CapacityConfig {
             reserve_bytes: 1000,
-            reserve_percent: 10,
+            reserve_percent: 1,
         };
         capacity_preflight(
             &store,
@@ -291,10 +315,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         .expect("small reserve fits");
 
         // reserve_bytes dominates: 4500 bytes -> 10500 > 10000 fails, while
-        // the 20% (2000 bytes) alone would fit.
+        // the 1% (1000 bytes) alone would fit.
         config.servers[0].capacity = crate::config::CapacityConfig {
             reserve_bytes: 4500,
-            reserve_percent: 20,
+            reserve_percent: 1,
         };
         let err = capacity_preflight(
             &store,
@@ -311,11 +335,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "expected a capacity preflight failure, got: {err}"
         );
 
-        // reserve_percent dominates: 45% (4500 bytes) -> fails, while the
-        // 1000 bytes alone would fit.
+        // reserve_percent dominates AND is a percentage of the TOTAL: 10% of
+        // the 100000-byte filesystem is 10000 bytes -> 16000 > 10000 fails,
+        // while the 1000 bytes alone would fit. The old avail-based math (10%
+        // of the 10000 available = 1000) would have PASSED this case, so this
+        // assertion pins the percent-of-total semantics.
         config.servers[0].capacity = crate::config::CapacityConfig {
             reserve_bytes: 1000,
-            reserve_percent: 45,
+            reserve_percent: 10,
         };
         let err = capacity_preflight(
             &store,
@@ -326,7 +353,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &config,
             &rotation,
         )
-        .expect_err("percent-half must be honored");
+        .expect_err("percent-half must be honored against the total");
         assert!(
             err.to_string().contains("insufficient capacity"),
             "expected a capacity preflight failure, got: {err}"

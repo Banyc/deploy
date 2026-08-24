@@ -26,7 +26,7 @@
 //! syntax.
 
 use crate::error::{Error, Result};
-use crate::remote::transport::{Remote, RemoteEntry, RemoteMeta};
+use crate::remote::transport::{FsBytes, Remote, RemoteEntry, RemoteMeta};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -776,7 +776,7 @@ impl Remote for SshTransport {
         })
     }
 
-    fn available_bytes(&self) -> Result<u64> {
+    fn filesystem_bytes(&self) -> Result<FsBytes> {
         let p = self.root.to_string_lossy().into_owned();
         let out = self.run_remote(&Self::argv_cmd(&["df".into(), "-kP".into(), p]))?;
         if !out.status.success() {
@@ -791,11 +791,20 @@ impl Remote for SshTransport {
             .nth(1)
             .ok_or_else(|| Error::transport("unexpected ssh df output".to_string()))?;
         let cols: Vec<&str> = line.split_whitespace().collect();
+        // blocks is the 2nd column and avail the 4th (1-indexed) on both
+        // macOS and Linux; both are in 1024-byte units.
+        let total_kb = cols
+            .get(1)
+            .and_then(|c| c.parse::<u64>().ok())
+            .ok_or_else(|| Error::transport("could not parse ssh df blocks".to_string()))?;
         let avail_kb = cols
             .get(3)
             .and_then(|c| c.parse::<u64>().ok())
             .ok_or_else(|| Error::transport("could not parse ssh df avail".to_string()))?;
-        Ok(avail_kb * 1024)
+        Ok(FsBytes {
+            total: total_kb * 1024,
+            available: avail_kb * 1024,
+        })
     }
 
     fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {

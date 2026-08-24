@@ -125,7 +125,7 @@ mod tests {
                 stderr: String::new(),
             })
         }
-        fn available_bytes(&self) -> Result<u64> {
+        fn filesystem_bytes(&self) -> Result<crate::remote::transport::FsBytes> {
             unreachable!("not used by run_verification")
         }
     }

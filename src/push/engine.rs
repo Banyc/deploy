@@ -1759,8 +1759,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         ) -> Result<crate::remote::transport::ExecOutcome> {
             self.inner.exec(argv, timeout)
         }
-        fn available_bytes(&self) -> Result<u64> {
-            self.inner.available_bytes()
+        fn filesystem_bytes(&self) -> Result<crate::remote::transport::FsBytes> {
+            self.inner.filesystem_bytes()
         }
     }
 
@@ -2753,8 +2753,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         ) -> Result<crate::remote::transport::ExecOutcome> {
             self.inner.exec(argv, timeout)
         }
-        fn available_bytes(&self) -> Result<u64> {
-            self.inner.available_bytes()
+        fn filesystem_bytes(&self) -> Result<crate::remote::transport::FsBytes> {
+            self.inner.filesystem_bytes()
         }
     }
 
@@ -4564,8 +4564,11 @@ interval_seconds = 0
         ) -> Result<crate::remote::transport::ExecOutcome> {
             self.inner.exec(argv, timeout)
         }
-        fn available_bytes(&self) -> Result<u64> {
-            Ok(self.avail)
+        fn filesystem_bytes(&self) -> Result<crate::remote::transport::FsBytes> {
+            Ok(crate::remote::transport::FsBytes {
+                total: self.avail,
+                available: self.avail,
+            })
         }
     }
 
@@ -4661,8 +4664,8 @@ interval_seconds = 0
         ) -> Result<crate::remote::transport::ExecOutcome> {
             self.inner.exec(argv, timeout)
         }
-        fn available_bytes(&self) -> Result<u64> {
-            self.inner.available_bytes()
+        fn filesystem_bytes(&self) -> Result<crate::remote::transport::FsBytes> {
+            self.inner.filesystem_bytes()
         }
     }
 

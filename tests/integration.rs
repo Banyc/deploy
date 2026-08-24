@@ -6,7 +6,7 @@ use deploy::error::Result;
 use deploy::model::{PlacementSlotId, ServerId, TreeDigest};
 use deploy::push::engine::{PushOptions, push};
 use deploy::records::{DeploymentStatus, PhysicalBinding};
-use deploy::remote::transport::{LocalTransport, Remote};
+use deploy::remote::transport::{FsBytes, LocalTransport, Remote};
 use deploy::store::local::LocalStore;
 use std::path::Path;
 
@@ -1035,8 +1035,8 @@ impl Remote for SpyRemote {
         self.mutations.fetch_add(1, Ordering::SeqCst);
         Err(deploy::error::Error::remote("SpyRemote: exec is forbidden"))
     }
-    fn available_bytes(&self) -> deploy::error::Result<u64> {
-        self.inner.available_bytes()
+    fn filesystem_bytes(&self) -> deploy::error::Result<FsBytes> {
+        self.inner.filesystem_bytes()
     }
 }
 
@@ -1198,8 +1198,8 @@ impl Remote for FaultRemote {
         }
         self.inner.exec(argv, timeout)
     }
-    fn available_bytes(&self) -> deploy::error::Result<u64> {
-        self.inner.available_bytes()
+    fn filesystem_bytes(&self) -> deploy::error::Result<FsBytes> {
+        self.inner.filesystem_bytes()
     }
 }
 
@@ -1290,8 +1290,8 @@ impl Remote for FailOnceMarkerRemote {
     fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
         self.inner.exec(argv, timeout)
     }
-    fn available_bytes(&self) -> Result<u64> {
-        self.inner.available_bytes()
+    fn filesystem_bytes(&self) -> Result<FsBytes> {
+        self.inner.filesystem_bytes()
     }
 }
 
@@ -1395,8 +1395,8 @@ impl Remote for ConflictingMarkerRemote {
     fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
         self.inner.exec(argv, timeout)
     }
-    fn available_bytes(&self) -> Result<u64> {
-        self.inner.available_bytes()
+    fn filesystem_bytes(&self) -> Result<FsBytes> {
+        self.inner.filesystem_bytes()
     }
 }
 

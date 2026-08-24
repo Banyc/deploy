@@ -53,6 +53,15 @@ impl ExecOutcome {
     }
 }
 
+/// Total and available bytes on the filesystem backing a remote root, as
+/// reported by `df`. `total` is the filesystem's full size; `available` is
+/// the free space a new upload can consume. Both are in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FsBytes {
+    pub total: u64,
+    pub available: u64,
+}
+
 /// Filesystem + execution surface for one server's remote root.
 pub trait Remote {
     fn root(&self) -> &Path;
@@ -83,8 +92,12 @@ pub trait Remote {
     fn metadata(&self, rel: &Path) -> Result<RemoteMeta>;
     /// Execute a command vector (no shell). Returns the outcome.
     fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome>;
-    /// Available bytes on the filesystem backing the remote root.
-    fn available_bytes(&self) -> Result<u64>;
+    /// Total and available bytes on the filesystem backing the remote root.
+    /// `total` is the filesystem's full size; `available` is the free space a
+    /// new upload can consume. Capacity preflight needs both: the percent
+    /// reserve is a percentage of the TOTAL size, while the fit check
+    /// compares against the AVAILABLE space.
+    fn filesystem_bytes(&self) -> Result<FsBytes>;
 
     /// Prepare the host identity (verify/pin the host key) before ANY remote
     /// request, including read-only status inspection in a dry run. A dry run
@@ -406,7 +419,7 @@ impl Remote for LocalTransport {
         })
     }
 
-    fn available_bytes(&self) -> Result<u64> {
+    fn filesystem_bytes(&self) -> Result<FsBytes> {
         let out = std::process::Command::new("df")
             .args(["-k", self.base.to_string_lossy().as_ref()])
             .output()
@@ -418,12 +431,20 @@ impl Remote for LocalTransport {
             .nth(1)
             .ok_or_else(|| Error::transport("unexpected df output".to_string()))?;
         let cols: Vec<&str> = line.split_whitespace().collect();
-        // avail is the 4th column (1-indexed) on both macOS and Linux.
+        // blocks is the 2nd column and avail the 4th (1-indexed) on both
+        // macOS and Linux; both are in 1024-byte units.
+        let total_kb = cols
+            .get(1)
+            .and_then(|c| c.parse::<u64>().ok())
+            .ok_or_else(|| Error::transport("could not parse df blocks".to_string()))?;
         let avail_kb = cols
             .get(3)
             .and_then(|c| c.parse::<u64>().ok())
             .ok_or_else(|| Error::transport("could not parse df avail".to_string()))?;
-        Ok(avail_kb * 1024)
+        Ok(FsBytes {
+            total: total_kb * 1024,
+            available: avail_kb * 1024,
+        })
     }
 }
 

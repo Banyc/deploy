@@ -163,7 +163,8 @@ pub struct CapacityConfig {
     /// Keep at least this many bytes free on the server after an upload.
     #[serde(default)]
     pub reserve_bytes: u64,
-    /// Keep at least this percentage of the free space available (0..=100).
+    /// Keep at least this percentage of the destination filesystem's TOTAL
+    /// size free after an upload (0..=100).
     #[serde(default)]
     pub reserve_percent: u8,
 }
