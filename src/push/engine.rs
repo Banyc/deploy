@@ -562,8 +562,15 @@ fn push_inner(
                     helpers[&a.placement_slot]
                         .read_assignment(g)
                         .map(|asn| {
-                            let ok = asn.artifact.tree == a.artifact.tree
-                                && asn.artifact.release == a.artifact.release;
+                            // COMPLETE ArtifactRef equality (release + variant
+                            // + tree). Two variants can share a release AND the
+                            // same tree bytes (identical artifact mappings) yet
+                            // carry DIFFERENT behavior contracts; matching only
+                            // tree+release would falsely report "Everything up to
+                            // date" when the slot's variant changes, leaving the
+                            // service claimed verified under the new contract
+                            // without ever running it.
+                            let ok = asn.artifact == a.artifact;
                             if ok {
                                 existing.insert(a.placement_slot.clone(), asn);
                             }
@@ -585,7 +592,7 @@ fn push_inner(
             // would be fabricated. The behavior contract to verify against stays
             // the DESIRED variant's contract: in a true no-op the existing
             // generation's variant equals the desired one (the comparison above
-            // already proved tree+release match).
+            // already proved complete ArtifactRef equality, variant included).
             let mut verified = true;
             for a in &assignments {
                 let remote = remotes[&a.placement_slot].as_ref();
@@ -5969,6 +5976,299 @@ interval_seconds = 0
             r.message.contains(f0_tree.as_str()),
             "the bare `@f0` form must plan the same f0 snapshot as `t1@f0`, got: {}",
             r.message
+        );
+    }
+
+    /// Regression: the early "Everything up to date" comparison must compare
+    /// the COMPLETE `ArtifactRef` (release + variant + tree), never just
+    /// tree+release. Two variants can materialize the SAME tree bytes
+    /// (identical artifact mappings and identical artifact source content ->
+    /// same tree digest) while carrying DIFFERENT behavior contracts.
+    /// Switching the slot's variant binding from `standard` to `other` (with
+    /// the same tree) must be a REAL push (new generation, new attempt,
+    /// verification under `other`'s contract) — a tree+release comparison
+    /// would falsely report "Everything up to date", leaving the service
+    /// claimed verified under the new contract without ever running it.
+    #[test]
+    fn variant_switch_same_tree_no_op_comparison() {
+        // Two variants with IDENTICAL artifact mappings (and identical source
+        // content) -> the SAME tree digest, but DIFFERENT verification
+        // contracts: `standard` runs `["true"]`, `other` runs
+        // `["true", "{{ variant }}"]` so the recording remote proves WHICH
+        // contract actually ran.
+        const STD_VARIANT: &str = r#"
+[[slots]]
+id = "p1"
+server = "s1"
+targets = ["t1"]
+deploy_dir = "/srv/eng"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[[artifact.mappings]]
+from = "artifacts/deployment/common/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+        const OTHER_VARIANT_NO_SLOTS: &str = r#"
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[[artifact.mappings]]
+from = "artifacts/deployment/common/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true", "{{ variant }}"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+        const OTHER_VARIANT_WITH_SLOTS: &str = r#"
+[[slots]]
+id = "p1"
+server = "s1"
+targets = ["t1"]
+deploy_dir = "/srv/eng"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[[artifact.mappings]]
+from = "artifacts/deployment/common/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true", "{{ variant }}"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+        const STD_VARIANT_NO_SLOTS: &str = r#"
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[[artifact.mappings]]
+from = "artifacts/deployment/common/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        std::fs::write(release_dir.join("standard.toml"), STD_VARIANT).unwrap();
+        std::fs::write(release_dir.join("other.toml"), OTHER_VARIANT_NO_SLOTS).unwrap();
+        std::fs::write(project.join("deploy.toml"), NONE_TOML).unwrap();
+        let artifacts_dir = release_dir.join("artifacts");
+        for (p, c) in [
+            ("build/output/app/server", "v1\n"),
+            ("deployment/common/README", "common\n"),
+        ] {
+            let fp = artifacts_dir.join(p);
+            std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
+            std::fs::write(&fp, c).unwrap();
+        }
+
+        let cfg_path = project.join("deploy.toml");
+        let config = Config::load(&cfg_path).unwrap();
+        assert_eq!(config.slot_variant("p1").unwrap(), "standard");
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let remotes_base = dir.path().join("remotes");
+        std::fs::create_dir_all(&remotes_base).unwrap();
+        let executed: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let rf = remotes_base.clone();
+        let recorded = executed.clone();
+        let factory = move |s: &crate::config::ServerDef,
+                            _slot: &crate::config::SlotDef|
+              -> Result<Box<dyn Remote>> {
+            Ok(Box::new(RecordingRemote::new(
+                rf.join(&s.id),
+                recorded.clone(),
+            )?))
+        };
+
+        // Push 1: slot p1 on variant `standard`. Successful; the verification
+        // contract that ran is standard's `["true"]`.
+        let r1 = push(
+            &cfg_path,
+            &store,
+            &factory,
+            "t1",
+            &config,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+        let first_attempt = r1.attempt.as_ref().expect("attempt recorded");
+        let first_slot = &first_attempt.slots[&PlacementSlotId::new("p1")];
+        assert_eq!(first_slot.artifact.variant.as_str(), "standard");
+        let first_tree = first_slot.artifact.tree.clone();
+        let first_gen = first_slot.generation.clone().expect("generation minted");
+        let argv1 = executed.lock().unwrap().clone();
+        assert_eq!(argv1.len(), 1, "push 1 runs verification once: {argv1:?}");
+        assert_eq!(
+            argv1[0],
+            vec!["true".to_string()],
+            "push 1 must run the standard contract: {argv1:?}"
+        );
+
+        // Switch the slot binding: `standard.toml` loses the slot
+        // declaration, `other.toml` gains it (identical server/deploy_dir,
+        // IDENTICAL artifact mappings + source content). The SAME slot id now
+        // resolves to variant `other` with the SAME tree bytes as `standard`.
+        std::fs::write(release_dir.join("standard.toml"), STD_VARIANT_NO_SLOTS).unwrap();
+        std::fs::write(release_dir.join("other.toml"), OTHER_VARIANT_WITH_SLOTS).unwrap();
+        let config2 = Config::load(&cfg_path).unwrap();
+        assert_eq!(config2.slot_variant("p1").unwrap(), "other");
+
+        // Push 2: the variant changed (standard -> other) even though the
+        // tree bytes are identical. The up-to-date comparison must compare
+        // the COMPLETE ArtifactRef (variant included): this must be a REAL
+        // push — a new generation minted, a new attempt recorded, a new
+        // snapshot — and verification must run under `other`'s contract
+        // (`["true", "{{ variant }}"]` rendering `other`). A tree+release
+        // comparison would falsely report "Everything up to date" and leave
+        // the service claimed verified under the new contract without ever
+        // running it.
+        executed.lock().unwrap().clear();
+        let r2 = push(
+            &cfg_path,
+            &store,
+            &factory,
+            "t1",
+            &config2,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .unwrap();
+        assert_ne!(
+            r2.message, "Everything up to date",
+            "a variant switch with an identical tree must not no-op"
+        );
+        assert_eq!(r2.status, Some(DeploymentStatus::Successful));
+        let second_attempt = r2.attempt.as_ref().expect("attempt recorded");
+        let second_slot = &second_attempt.slots[&PlacementSlotId::new("p1")];
+        assert_eq!(second_slot.artifact.variant.as_str(), "other");
+        assert_eq!(
+            second_slot.artifact.tree, first_tree,
+            "both variants materialize the SAME tree bytes; only the variant differs"
+        );
+        let second_gen = second_slot.generation.clone().expect("generation minted");
+        assert_ne!(
+            second_gen, first_gen,
+            "the switch must mint a NEW generation, never reuse the standard one"
+        );
+        assert_eq!(
+            second_attempt.desired[&PlacementSlotId::new("p1")]
+                .assignment
+                .artifact
+                .variant
+                .as_str(),
+            "other",
+            "the attempt's desired assignment must carry the other variant"
+        );
+
+        // Verification ran under `other`'s contract: the recording remote
+        // captured `["true", "{{ variant }}"]` with the variant rendered.
+        let argv2 = executed.lock().unwrap().clone();
+        assert_eq!(argv2.len(), 1, "push 2 runs verification once: {argv2:?}");
+        assert_eq!(
+            argv2[0],
+            vec!["true".to_string(), "other".to_string()],
+            "push 2 must run the OTHER variant's contract with {{ variant }} rendered: {argv2:?}"
+        );
+
+        // A REAL push means fresh durable records: a second attempt, a second
+        // snapshot, and the remote advanced to the new generation whose stored
+        // assignment carries variant `other`.
+        assert_eq!(store.read_attempts("t1").unwrap().len(), 2);
+        assert_eq!(store.read_snapshots("t1").unwrap().len(), 2);
+        let remote = LocalTransport::new(remotes_base.join("s1")).unwrap();
+        let status = RemoteHelper::new(&remote).status().unwrap();
+        let cur = status
+            .current_generation
+            .expect("push 2 must advance the remote");
+        assert_eq!(cur, second_gen.as_str());
+        let asn: crate::remote::helper::GenerationAssignment = serde_json::from_slice(
+            &remote
+                .read(
+                    &crate::layout::generations()
+                        .join(&cur)
+                        .join("assignment.json"),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(asn.artifact.variant.as_str(), "other");
+        assert_eq!(asn.artifact.tree, first_tree);
+
+        // The reverse stays true: a push with NO change at all still no-ops
+        // ("Everything up to date", no new attempt).
+        let r3 = push(
+            &cfg_path,
+            &store,
+            &factory,
+            "t1",
+            &config2,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(r3.status, None, "an unchanged push is a no-op");
+        assert_eq!(r3.message, "Everything up to date");
+        assert_eq!(
+            store.read_attempts("t1").unwrap().len(),
+            2,
+            "the no-op must not record a third attempt"
         );
     }
 }
