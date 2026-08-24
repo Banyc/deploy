@@ -707,15 +707,7 @@ fn push_inner(
     // record at all.
     let mut preflight_reason = "preflight failed";
     let preflight = (|| -> Result<()> {
-        capacity_preflight(
-            store,
-            &assignments,
-            &helpers,
-            op_id,
-            deployment_id,
-            config,
-            &target.rotation,
-        )?;
+        capacity_preflight(store, &assignments, &helpers, op_id, deployment_id, config)?;
         // Stage every needed tree into operation-unique incoming paths.
         preflight_reason = "staging failed";
         for a in &assignments {
@@ -809,6 +801,7 @@ fn push_inner(
                 &helpers[sid],
                 op_id,
                 deployment_id,
+                target_name,
                 &a.artifact,
                 &new_gen[sid],
                 plan_servers[sid].expected_generation.as_ref(),
@@ -981,6 +974,7 @@ fn push_inner(
                 deployment_id.as_str(),
                 new_gen[sid].as_str(),
                 &slot_ids,
+                Some(target_name),
             ) {
                 Err(Error::Integrity(_)) => {
                     // A conflicting marker already exists with different
@@ -1172,10 +1166,14 @@ fn push_inner(
 
     // 17. Per-slot rotation under each slot's mutation lock. Rotation uses
     // the slot's ACTUAL final assignment (read after any compensation), not
-    // the desired plan: a compensated slot restored its prior variant. The
-    // retention policy is the target's `rotation` configuration from
-    // `deploy.toml`, so it applies uniformly regardless of which variant each
-    // slot ended up running.
+    // the desired plan: a compensated slot restored its prior variant. A slot
+    // may belong to SEVERAL targets with DIFFERENT retention policies; the
+    // retained set is the UNION of every member target's policy applied to
+    // the generations that target created (`rotation::compute_retained`), so
+    // rotation under this push's target can never delete a generation or
+    // artifact another member target's policy retains. The policies resolve
+    // from the caller's current `deploy.toml` (retention is never part of a
+    // release snapshot).
     for sid in &servers_order {
         let helper = &helpers[sid];
         // The mutation lock is held via an RAII guard for the whole rotation
@@ -1185,7 +1183,16 @@ fn push_inner(
         // lock held by ..."). Rotation errors still propagate exactly as
         // before; only the lock discipline changes.
         if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
-            let retained = compute_retained(helper, &config.pins, store, &target.rotation)?;
+            // The slot's FULL member target list (not just this push's
+            // target): a shared slot's retention is the union of every
+            // member's policy.
+            let slot_targets: Vec<String> = config
+                .slot_defs()
+                .iter()
+                .find(|s| s.id.as_str() == sid.as_str())
+                .map(|s| s.targets.clone())
+                .unwrap_or_default();
+            let retained = compute_retained(helper, &config.pins, store, config, &slot_targets)?;
             let active_incoming = HashSet::from([deployment_id.as_str().to_string()]);
             helper.rotate(&retained, &active_incoming)?;
         }

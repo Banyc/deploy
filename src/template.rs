@@ -637,6 +637,7 @@ mod tests {
             behavior_sha256: "b".to_string(),
             prior_generation: None,
             created_at: "2020-01-01T00:00:00Z".to_string(),
+            target: Some(crate::model::TargetName::new("prod")),
         });
         // All five move TOGETHER from the one assignment: never a torn
         // combination (prior artifact with the failed deployment identity).

@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::model::{
-    ArtifactRef, BehaviorContract, DeploymentId, GenerationId, OperationId, ReleaseId,
+    ArtifactRef, BehaviorContract, DeploymentId, GenerationId, OperationId, ReleaseId, TargetName,
 };
 use crate::records::ServerOutcomeKind;
 use crate::remote::helper::RemoteHelper;
@@ -47,6 +47,7 @@ pub(crate) fn process_server(
     helper: &RemoteHelper,
     op_id: &OperationId,
     deployment_id: &DeploymentId,
+    target_name: &str,
     artifact: &ArtifactRef,
     new_gen: &GenerationId,
     expected_gen: Option<&GenerationId>,
@@ -190,6 +191,7 @@ pub(crate) fn process_server(
         behavior_sha256: behavior_sha256.to_string(),
         prior_generation: expected_gen.cloned(),
         created_at: crate::remote::helper::now_rfc3339(),
+        target: Some(TargetName::new(target_name.to_string())),
     };
     if let Err(e) = helper.create_generation(op_id.as_str(), &assignment) {
         return Ok(ServerProc {
@@ -731,6 +733,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &helper,
                 &op_id,
                 &deployment_id,
+                "t1",
                 &artifact,
                 &new_gen,
                 expected_gen.as_ref(),
@@ -1183,6 +1186,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     behavior_sha256: "b".into(),
                     prior_generation: Some(first.generation.clone()),
                     created_at: crate::remote::helper::now_rfc3339(),
+                    target: Some(crate::model::TargetName::new("t1")),
                 },
             )
             .unwrap();
@@ -1206,6 +1210,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     behavior_sha256: "b".into(),
                     prior_generation: Some(g2.clone()),
                     created_at: crate::remote::helper::now_rfc3339(),
+                    target: Some(crate::model::TargetName::new("t1")),
                 },
             )
             .unwrap();

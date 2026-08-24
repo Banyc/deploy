@@ -10,14 +10,24 @@
 //! * artifacts successfully activated less than `keep_days` ago
 //! * that server's artifacts in the newest `protect_deployments` fleet window
 //!
+//! A slot may belong to SEVERAL targets with DIFFERENT retention policies (the
+//! multi-target feature). Every generation record (and fleet-commit marker)
+//! carries the target that created it (`GenerationAssignment.target`); on
+//! rotation, each member target's policy is applied to the generations that
+//! target created, and the retained set is the UNION of every member's
+//! policy — a shared slot can never be rotated under one target's policy and
+//! delete a generation or artifact another member target's policy would
+//! retain. A legacy record with no originating target is evaluated under EVERY
+//! member policy and retained on any hit (conservative attribution).
+//!
 //! Rotation is a mark-and-sweep operation: a tree object is deleted only when no
 //! retained binding or applicable pin references it.
 
-use crate::config::{Pin, RotationConfig};
+use crate::config::{Config, Pin, RotationConfig};
 use crate::error::Result;
 use crate::layout;
 use crate::model::{ReleaseId, TreeDigest};
-use crate::remote::helper::RemoteHelper;
+use crate::remote::helper::{RemoteHelper, RemoteStatus};
 use crate::store::local::LocalStore;
 use chrono::{DateTime, Utc};
 use std::collections::{BTreeMap, HashSet};
@@ -28,20 +38,28 @@ struct GenRecord {
     variant: String,
     tree: String,
     deployment_id: String,
+    /// The target whose push created this generation. `None` marks a LEGACY
+    /// record written before originating-target attribution existed.
+    target: Option<String>,
 }
 
 /// Compute the set of retained tree digests for one server, using the
-/// fleet-wide rotation policy supplied by the caller and the durable pins
-/// declared in `deploy.toml`. The rotation policy is read from the caller's
-/// current configuration; capacity headroom, by contrast, is a per-server
-/// policy declared on the server entry (`ServerDef.capacity`) and likewise
-/// resolved from the caller's current configuration — it is never part of a
-/// release snapshot.
+/// fleet-wide rotation policies of EVERY target the slot belongs to and the
+/// durable pins declared in `deploy.toml`. `target_names` (the slot's FULL
+/// member list) resolves each member's `RotationConfig` from the caller's
+/// current configuration; each policy is applied to the generations that
+/// target created, and the returned set is the UNION across all members — a
+/// shared slot can never be rotated under one target's policy and delete a
+/// generation or artifact another member target's policy retains. Capacity
+/// headroom, by contrast, is a per-server policy declared on the server entry
+/// (`ServerDef.capacity`) and likewise resolved from the caller's current
+/// configuration — it is never part of a release snapshot.
 pub fn compute_retained(
     helper: &RemoteHelper,
     pins: &[Pin],
     store: &LocalStore,
-    rotation: &RotationConfig,
+    config: &Config,
+    target_names: &[String],
 ) -> Result<HashSet<String>> {
     let mut retained: HashSet<String> = HashSet::new();
     let status = helper.status()?;
@@ -66,7 +84,7 @@ pub fn compute_retained(
         retained.insert(t.clone());
     }
 
-    // Enumerate generation records.
+    // Enumerate generation records, keeping each record's originating target.
     let mut gens: Vec<GenRecord> = Vec::new();
     let gen_root = layout::generations();
     if helper.remote().exists(gen_root) {
@@ -87,9 +105,89 @@ pub fn compute_retained(
                 variant: a.artifact.variant.as_str().to_string(),
                 tree: a.artifact.tree.as_str().to_string(),
                 deployment_id: a.deployment_id.as_str().to_string(),
+                target: a.target.as_ref().map(|t| t.as_str().to_string()),
             });
         }
     }
+
+    // Per-target retention attribution + union. Resolve every member target's
+    // rotation policy from the caller's current `deploy.toml` (retention is
+    // never part of a release snapshot). Each policy is applied to the
+    // generations that target created; the union is the slot's retained set.
+    let member_policies: Vec<(&str, &RotationConfig)> = target_names
+        .iter()
+        .filter_map(|t| {
+            config
+                .targets
+                .get(t.as_str())
+                .map(|td| (t.as_str(), &td.rotation))
+        })
+        .collect();
+    if member_policies.is_empty() {
+        // Fail closed: a slot whose member policies cannot be resolved has no
+        // attributable retention, so sweeping anything could delete content a
+        // policy we cannot see would retain. Retain every object instead.
+        let obj_root = layout::objects();
+        if helper.remote().exists(obj_root) {
+            for e in helper.remote().list(obj_root)? {
+                if e.is_dir {
+                    retained.insert(e.name);
+                }
+            }
+        }
+        return Ok(retained);
+    }
+    for (target_name, rotation) in &member_policies {
+        let target_name = *target_name;
+        let owned = |g: &GenRecord| match &g.target {
+            // A generation created by this target is evaluated under its own
+            // policy...
+            Some(t) => t.as_str() == target_name,
+            // ...while a LEGACY record (no originating target) is evaluated
+            // under EVERY member policy and retained on any hit
+            // (conservative: it predates attribution, so no member can claim
+            // it — and no member may sweep it out from under another).
+            None => true,
+        };
+        retained.extend(retained_for_policy(
+            helper, &status, &gens, rotation, &owned,
+        )?);
+    }
+
+    // Durable pins. A pin protects the whole release: every variant's tree
+    // recorded in the release record is retained, so the pinned release stays
+    // fully rollback-able no matter how old it is or how far outside the
+    // count/age windows it falls.
+    for pin in pins {
+        let rid = ReleaseId::parse(&pin.release);
+        let rec = match store.read_release(&rid) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for tree in rec.variants.values() {
+            retained.insert(tree.clone());
+        }
+    }
+
+    Ok(retained)
+}
+
+/// Apply ONE member target's rotation policy to the generation records that
+/// target owns (`owns` filters the slot's records: the target's own records
+/// plus legacy records, which carry no originating target). The caller unions
+/// the per-policy results across every member of the slot. The current
+/// generation's prior is protected whenever THIS policy sets
+/// `protect_previous`, independent of which target pushed the current or prior
+/// generation: it is the immediate rollback target, and every member policy
+/// that asks for it keeps it.
+fn retained_for_policy(
+    helper: &RemoteHelper,
+    status: &RemoteStatus,
+    gens: &[GenRecord],
+    rotation: &RotationConfig,
+    owns: &dyn Fn(&GenRecord) -> bool,
+) -> Result<HashSet<String>> {
+    let mut retained: HashSet<String> = HashSet::new();
 
     // Prior distinct successful artifact when protect_previous is true.
     if rotation.per_server.protect_previous
@@ -101,9 +199,10 @@ pub fn compute_retained(
         retained.insert(pa.artifact.tree.as_str().to_string());
     }
 
-    // Distinct successful artifact bindings, keyed by (release, variant, tree).
+    // Distinct successful artifact bindings owned by this target, keyed by
+    // (release, variant, tree).
     let mut distinct: BTreeMap<(String, String, String), DateTime<Utc>> = BTreeMap::new();
-    for g in &gens {
+    for g in gens.iter().filter(|g| owns(g)) {
         let key = (g.release.clone(), g.variant.clone(), g.tree.clone());
         let slot = distinct.entry(key).or_insert(g.created_at);
         if g.created_at > *slot {
@@ -130,11 +229,12 @@ pub fn compute_retained(
         }
     }
 
-    // Fleet window: newest `protect_deployments` distinct deployment IDs.
+    // Fleet window: newest `protect_deployments` distinct deployment IDs
+    // among this target's owned records.
     let protect_deployments = rotation.fleet.protect_deployments as usize;
     if protect_deployments > 0 {
         let mut depl: BTreeMap<String, DateTime<Utc>> = BTreeMap::new();
-        for g in &gens {
+        for g in gens.iter().filter(|g| owns(g)) {
             let slot = depl.entry(g.deployment_id.clone()).or_insert(g.created_at);
             if g.created_at > *slot {
                 *slot = g.created_at;
@@ -147,24 +247,10 @@ pub fn compute_retained(
             .take(protect_deployments)
             .map(|(id, _)| id.clone())
             .collect();
-        for g in &gens {
+        for g in gens {
             if keep_ids.contains(&g.deployment_id) {
                 retained.insert(g.tree.clone());
             }
-        }
-    }
-    // Durable pins. A pin protects the whole release: every variant's tree
-    // recorded in the release record is retained, so the pinned release stays
-    // fully rollback-able no matter how old it is or how far outside the
-    // count/age windows it falls.
-    for pin in pins {
-        let rid = ReleaseId::parse(&pin.release);
-        let rec = match store.read_release(&rid) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        for tree in rec.variants.values() {
-            retained.insert(tree.clone());
         }
     }
 
@@ -242,6 +328,76 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         Config::load(&p).unwrap()
     }
 
+    /// A slot shared between `production` (CONSERVATIVE retention) and
+    /// `staging` (AGGRESSIVE retention): production keeps 5 distinct
+    /// artifacts, 14 days of age, the protected previous, and 2 fleet
+    /// deployments; staging keeps only the newest 1, no age, no previous
+    /// protection, and 1 fleet deployment.
+    fn cfg_shared() -> Config {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        let variant_toml = r#"
+[artifact]
+mappings = []
+
+[[slots]]
+id = "p1"
+server = "s1"
+targets = ["production", "staging"]
+deploy_dir = "/srv"
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+        std::fs::write(release_dir.join("standard.toml"), variant_toml).unwrap();
+        let deploy_toml = r#"
+schema_version = 1
+application = "rot"
+release = "v1"
+
+[targets.production.rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[targets.production.rotation.fleet]
+protect_deployments = 2
+
+[targets.staging.rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = false
+
+[targets.staging.rotation.fleet]
+protect_deployments = 1
+
+[[servers]]
+id = "s1"
+address = "a"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[targets.production]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+
+[targets.staging]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#;
+        let p = project.join("deploy.toml");
+        std::fs::write(&p, deploy_toml).unwrap();
+        Config::load(&p).unwrap()
+    }
+
     #[test]
     fn retains_current_and_previous() {
         let dir = tempfile::tempdir().unwrap();
@@ -269,6 +425,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     behavior_sha256: "b".into(),
                     prior_generation: None,
                     created_at: "2020-01-01T00:00:00Z".into(),
+                    target: None,
                 },
             )
             .unwrap();
@@ -286,14 +443,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     behavior_sha256: "b".into(),
                     prior_generation: Some("g1".to_string().into()),
                     created_at: "2020-01-02T00:00:00Z".into(),
+                    target: None,
                 },
             )
             .unwrap();
         helper.swap_current(None, "g2", "op").unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let c = cfg();
-        let retained =
-            compute_retained(&helper, &c.pins, &store, &c.targets["t1"].rotation).unwrap();
+        let retained = compute_retained(&helper, &c.pins, &store, &c, &["t1".to_string()]).unwrap();
         assert!(retained.contains("t2"), "current tree retained");
         assert!(retained.contains("t1"), "previous tree retained");
     }
@@ -327,18 +484,17 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         store.write_release(&rec).unwrap();
 
         let c = cfg();
-        let rotation = &c.targets["t1"].rotation;
         let pinned = [Pin {
             release: "rel-sha256-pin-test".into(),
             reason: "known-good".into(),
         }];
 
         // Without the pin the server has no history, so nothing is retained.
-        let bare = compute_retained(&helper, &[], &store, rotation).unwrap();
+        let bare = compute_retained(&helper, &[], &store, &c, &["t1".to_string()]).unwrap();
         assert!(bare.is_empty(), "no history and no pins retains nothing");
 
         // With the pin, BOTH variants' trees are protected.
-        let retained = compute_retained(&helper, &pinned, &store, rotation).unwrap();
+        let retained = compute_retained(&helper, &pinned, &store, &c, &["t1".to_string()]).unwrap();
         assert!(
             retained.contains("tree-a"),
             "variant a protected by the pin"
@@ -350,7 +506,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     }
 
     /// Create one generation record (tree + assignment) without touching
-    /// `current`.
+    /// `current`. `target` is the originating target recorded on the
+    /// assignment; `None` writes a legacy record without attribution.
     fn make_gen(
         helper: &RemoteHelper,
         deployment_id: &str,
@@ -358,6 +515,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         tree: &str,
         created: &str,
         prior_generation: Option<&str>,
+        target: Option<&str>,
     ) {
         // The tree object must resolve for `status()`/`exists` to follow the
         // `current` symlink chain (mirrors the existing rotation tests).
@@ -379,6 +537,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     behavior_sha256: "b".into(),
                     prior_generation: prior_generation.map(|g| g.to_string().into()),
                     created_at: created.into(),
+                    target: target.map(|t| crate::model::TargetName::new(t.to_string())),
                 },
             )
             .unwrap();
@@ -393,7 +552,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let dir = tempfile::tempdir().unwrap();
         let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
         let helper = RemoteHelper::new(&remote);
-        make_gen(&helper, "d1", "g1", "t1", "2020-01-01T00:00:00Z", None);
+        make_gen(
+            &helper,
+            "d1",
+            "g1",
+            "t1",
+            "2020-01-01T00:00:00Z",
+            None,
+            None,
+        );
         make_gen(
             &helper,
             "d2",
@@ -401,6 +568,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t2",
             "2020-01-02T00:00:00Z",
             Some("g1"),
+            None,
         );
         make_gen(
             &helper,
@@ -409,18 +577,38 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t3",
             "2020-01-03T00:00:00Z",
             Some("g2"),
+            None,
         );
         helper.swap_current(None, "g3", "op").unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let c = cfg();
-        let mut rotation = c.targets["t1"].rotation.clone();
-        rotation.per_server.keep_distinct_artifacts = 2;
-        rotation.per_server.keep_days = 0;
-        rotation.fleet.protect_deployments = 0;
+        let mut c = cfg();
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .per_server
+            .keep_distinct_artifacts = 2;
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .per_server
+            .keep_days = 0;
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .fleet
+            .protect_deployments = 0;
         // No prior chain, so protect_previous has nothing to add.
-        rotation.per_server.protect_previous = false;
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .per_server
+            .protect_previous = false;
 
-        let retained = compute_retained(&helper, &c.pins, &store, &rotation).unwrap();
+        let retained = compute_retained(&helper, &c.pins, &store, &c, &["t1".to_string()]).unwrap();
         assert!(retained.contains("t3"), "current tree retained");
         assert!(retained.contains("t2"), "newest distinct binding retained");
         assert!(
@@ -439,18 +627,37 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let now = chrono::Utc::now();
         let old = (now - chrono::Duration::days(60)).to_rfc3339();
         let recent = (now - chrono::Duration::days(5)).to_rfc3339();
-        make_gen(&helper, "d1", "g1", "t-old", &old, None);
-        make_gen(&helper, "d2", "g2", "t-recent", &recent, Some("g1"));
+        make_gen(&helper, "d1", "g1", "t-old", &old, None, None);
+        make_gen(&helper, "d2", "g2", "t-recent", &recent, Some("g1"), None);
         helper.swap_current(None, "g2", "op").unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let c = cfg();
-        let mut rotation = c.targets["t1"].rotation.clone();
-        rotation.per_server.keep_distinct_artifacts = 1;
-        rotation.per_server.keep_days = 30;
-        rotation.per_server.protect_previous = false;
-        rotation.fleet.protect_deployments = 0;
+        let mut c = cfg();
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .per_server
+            .keep_distinct_artifacts = 1;
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .per_server
+            .keep_days = 30;
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .per_server
+            .protect_previous = false;
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .fleet
+            .protect_deployments = 0;
 
-        let retained = compute_retained(&helper, &c.pins, &store, &rotation).unwrap();
+        let retained = compute_retained(&helper, &c.pins, &store, &c, &["t1".to_string()]).unwrap();
         assert!(retained.contains("t-recent"));
         assert!(
             !retained.contains("t-old"),
@@ -458,8 +665,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
 
         // Widen the window past the old artifact: it is retained again.
-        rotation.per_server.keep_days = 90;
-        let retained = compute_retained(&helper, &c.pins, &store, &rotation).unwrap();
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .per_server
+            .keep_days = 90;
+        let retained = compute_retained(&helper, &c.pins, &store, &c, &["t1".to_string()]).unwrap();
         assert!(
             retained.contains("t-old"),
             "artifact inside keep_days must be retained"
@@ -475,7 +687,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let dir = tempfile::tempdir().unwrap();
         let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
         let helper = RemoteHelper::new(&remote);
-        make_gen(&helper, "d1", "g1", "t1", "2020-01-01T00:00:00Z", None);
+        make_gen(
+            &helper,
+            "d1",
+            "g1",
+            "t1",
+            "2020-01-01T00:00:00Z",
+            None,
+            None,
+        );
         make_gen(
             &helper,
             "d2",
@@ -483,6 +703,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t2",
             "2020-01-02T00:00:00Z",
             Some("g1"),
+            None,
         );
         make_gen(
             &helper,
@@ -491,17 +712,37 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t3",
             "2020-01-03T00:00:00Z",
             Some("g2"),
+            None,
         );
         helper.swap_current(None, "g3", "op").unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let c = cfg();
-        let mut rotation = c.targets["t1"].rotation.clone();
-        rotation.per_server.keep_distinct_artifacts = 1;
-        rotation.per_server.keep_days = 0;
-        rotation.per_server.protect_previous = false;
-        rotation.fleet.protect_deployments = 2;
+        let mut c = cfg();
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .per_server
+            .keep_distinct_artifacts = 1;
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .per_server
+            .keep_days = 0;
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .per_server
+            .protect_previous = false;
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .fleet
+            .protect_deployments = 2;
 
-        let retained = compute_retained(&helper, &c.pins, &store, &rotation).unwrap();
+        let retained = compute_retained(&helper, &c.pins, &store, &c, &["t1".to_string()]).unwrap();
         assert!(retained.contains("t3"), "current deployment retained");
         assert!(
             retained.contains("t2"),
@@ -521,7 +762,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let dir = tempfile::tempdir().unwrap();
         let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
         let helper = RemoteHelper::new(&remote);
-        make_gen(&helper, "d1", "g1", "t1", "2020-01-01T00:00:00Z", None);
+        make_gen(
+            &helper,
+            "d1",
+            "g1",
+            "t1",
+            "2020-01-01T00:00:00Z",
+            None,
+            None,
+        );
         make_gen(
             &helper,
             "d2",
@@ -529,18 +778,38 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t2",
             "2020-01-02T00:00:00Z",
             Some("g1"),
+            None,
         );
         // current -> g2, whose assignment records g1 as prior.
         helper.swap_current(None, "g2", "op").unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let c = cfg();
-        let mut rotation = c.targets["t1"].rotation.clone();
-        rotation.per_server.keep_distinct_artifacts = 0;
-        rotation.per_server.keep_days = 0;
-        rotation.per_server.protect_previous = true;
-        rotation.fleet.protect_deployments = 0;
+        let mut c = cfg();
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .per_server
+            .keep_distinct_artifacts = 0;
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .per_server
+            .keep_days = 0;
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .per_server
+            .protect_previous = true;
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .fleet
+            .protect_deployments = 0;
 
-        let retained = compute_retained(&helper, &c.pins, &store, &rotation).unwrap();
+        let retained = compute_retained(&helper, &c.pins, &store, &c, &["t1".to_string()]).unwrap();
         assert!(retained.contains("t2"), "current tree is never swept");
         assert!(
             retained.contains("t1"),
@@ -560,7 +829,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let dir = tempfile::tempdir().unwrap();
         let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
         let helper = RemoteHelper::new(&remote);
-        make_gen(&helper, "d1", "g1", "t1", "2020-01-01T00:00:00Z", None);
+        make_gen(
+            &helper,
+            "d1",
+            "g1",
+            "t1",
+            "2020-01-01T00:00:00Z",
+            None,
+            None,
+        );
         helper.swap_current(None, "g1", "op").unwrap();
         // Corrupt the live generation's assignment record.
         std::fs::write(
@@ -576,16 +853,35 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "the live assignment must be unreadable after corruption"
         );
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let c = cfg();
+        let mut c = cfg();
         // Every window zeroed + no pins: WITHOUT the fail-closed rule the
         // sweep would delete the live tree.
-        let mut rotation = c.targets["t1"].rotation.clone();
-        rotation.per_server.keep_distinct_artifacts = 0;
-        rotation.per_server.keep_days = 0;
-        rotation.per_server.protect_previous = false;
-        rotation.fleet.protect_deployments = 0;
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .per_server
+            .keep_distinct_artifacts = 0;
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .per_server
+            .keep_days = 0;
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .per_server
+            .protect_previous = false;
+        c.targets
+            .get_mut("t1")
+            .unwrap()
+            .rotation
+            .fleet
+            .protect_deployments = 0;
 
-        let retained = compute_retained(&helper, &c.pins, &store, &rotation).unwrap();
+        let retained = compute_retained(&helper, &c.pins, &store, &c, &["t1".to_string()]).unwrap();
         assert!(
             retained.contains("t1"),
             "the live (unreadable) generation's tree must be retained fail-closed"
@@ -594,6 +890,311 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert!(
             helper.remote().exists(&crate::layout::tree_root("t1")),
             "rotation must not sweep the tree behind a live current with an unreadable assignment"
+        );
+    }
+
+    /// A slot shared across a CONSERVATIVE (`production`) and an AGGRESSIVE
+    /// (`staging`) target must never be rotated under ONE target's policy
+    /// alone: retention is attributed per originating target and the retained
+    /// set is the UNION of every member's policy. Rotation here runs as a
+    /// staging push would trigger it (a capacity-tight staging push / step 17
+    /// under `staging`); staging's policy applied to ALL records would retain
+    /// only the current tree and sweep everything else. The union keeps what
+    /// production's policy retains — its newest 5 distinct bindings AND the
+    /// previous generation of `current` (a STAGING push, whose own
+    /// `protect_previous=false` would sweep it) — and sweeps only objects NO
+    /// target retains. The generation and fleet-commit records are asserted to
+    /// carry their originating target.
+    #[test]
+    fn shared_slot_rotates_under_the_union_of_every_targets_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        // Interleaved deployments: production pushes g1,g3,g4,g6,g7,g9
+        // (distinct trees t1,t3,t4,t6,t7,t9); staging pushes g2,g5,g8,g10
+        // (t2,t5,t8,t10). `current` = g10 = a STAGING generation.
+        make_gen(
+            &helper,
+            "d1",
+            "g1",
+            "t1",
+            "2020-01-01T00:00:00Z",
+            None,
+            Some("production"),
+        );
+        make_gen(
+            &helper,
+            "d2",
+            "g2",
+            "t2",
+            "2020-01-02T00:00:00Z",
+            Some("g1"),
+            Some("staging"),
+        );
+        make_gen(
+            &helper,
+            "d3",
+            "g3",
+            "t3",
+            "2020-01-03T00:00:00Z",
+            Some("g2"),
+            Some("production"),
+        );
+        make_gen(
+            &helper,
+            "d4",
+            "g4",
+            "t4",
+            "2020-01-04T00:00:00Z",
+            Some("g3"),
+            Some("production"),
+        );
+        make_gen(
+            &helper,
+            "d5",
+            "g5",
+            "t5",
+            "2020-01-05T00:00:00Z",
+            Some("g4"),
+            Some("staging"),
+        );
+        make_gen(
+            &helper,
+            "d6",
+            "g6",
+            "t6",
+            "2020-01-06T00:00:00Z",
+            Some("g5"),
+            Some("production"),
+        );
+        make_gen(
+            &helper,
+            "d7",
+            "g7",
+            "t7",
+            "2020-01-07T00:00:00Z",
+            Some("g6"),
+            Some("production"),
+        );
+        make_gen(
+            &helper,
+            "d8",
+            "g8",
+            "t8",
+            "2020-01-08T00:00:00Z",
+            Some("g7"),
+            Some("staging"),
+        );
+        make_gen(
+            &helper,
+            "d9",
+            "g9",
+            "t9",
+            "2020-01-09T00:00:00Z",
+            Some("g8"),
+            Some("production"),
+        );
+        make_gen(
+            &helper,
+            "d10",
+            "g10",
+            "t10",
+            "2020-01-10T00:00:00Z",
+            Some("g9"),
+            Some("staging"),
+        );
+        helper.swap_current(None, "g10", "op").unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let c = cfg_shared();
+
+        // Rotation runs with the slot's FULL member list (as the engine's
+        // step 17 and the capacity preflight pass it): the union of both
+        // targets' policies.
+        let slot_targets = ["production".to_string(), "staging".to_string()];
+        let retained = compute_retained(&helper, &c.pins, &store, &c, &slot_targets).unwrap();
+        // `current`'s live tree is ALWAYS retained.
+        assert!(
+            retained.contains("t10"),
+            "current live tree always retained"
+        );
+        // Production's `protect_previous` retains the previous generation of
+        // `current` (g9 -> t9) even though `current` itself is a STAGING
+        // push, whose own `protect_previous=false` would sweep it.
+        assert!(
+            retained.contains("t9"),
+            "production's protect_previous must retain the previous generation's tree"
+        );
+        // Production's keep_distinct_artifacts=5 window retains its newest 5
+        // distinct bindings (t9,t7,t6,t4,t3); staging's keep_distinct=1 alone
+        // would keep only t10.
+        for t in ["t3", "t4", "t6", "t7"] {
+            assert!(
+                retained.contains(t),
+                "production's distinct window must retain {t}"
+            );
+        }
+        // Only objects NO target policy retains are swept: production's own
+        // oldest distinct (t1, outside its 5-window) and staging's older
+        // records (t2,t5,t8, outside staging's newest-1).
+        for t in ["t1", "t2", "t5", "t8"] {
+            assert!(
+                !retained.contains(t),
+                "an object no target policy retains must be swept: {t}"
+            );
+        }
+        helper.rotate(&retained, &HashSet::new()).unwrap();
+        for t in ["t3", "t4", "t6", "t7", "t9", "t10"] {
+            assert!(
+                helper.remote().exists(&crate::layout::tree_root(t)),
+                "tree {t} must remain after rotation"
+            );
+        }
+        for t in ["t1", "t2", "t5", "t8"] {
+            assert!(
+                !helper.remote().exists(&crate::layout::tree_root(t)),
+                "tree {t} must be swept"
+            );
+        }
+
+        // The generation and fleet-commit records carry their originating
+        // target: read assignment.json (a production generation and a staging
+        // generation) and a commit marker payload.
+        assert_eq!(
+            helper
+                .read_assignment("g1")
+                .unwrap()
+                .target
+                .as_ref()
+                .map(|t| t.as_str()),
+            Some("production"),
+            "production record must carry its originating target"
+        );
+        assert_eq!(
+            helper
+                .read_assignment("g10")
+                .unwrap()
+                .target
+                .as_ref()
+                .map(|t| t.as_str()),
+            Some("staging"),
+            "staging record must carry its originating target"
+        );
+        helper
+            .remote()
+            .create_dir_all(&crate::layout::commits_dir())
+            .unwrap();
+        helper
+            .write_commit_marker("d10", "g10", &["p1".to_string()], Some("staging"))
+            .unwrap();
+        let marker: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                dir.path()
+                    .join("remote")
+                    .join(crate::layout::commit_marker("d10")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            marker["target"],
+            serde_json::json!("staging"),
+            "commit marker payload must carry the originating target"
+        );
+    }
+
+    /// LEGACY generation records (no originating target) predate attribution:
+    /// no single member can claim them, so they must be retained if ANY member
+    /// target's policy retains them (evaluated under every policy, retained on
+    /// any hit). Here production (keep_distinct=2) retains the two newest
+    /// legacy bindings while staging (keep_distinct=1) retains only the
+    /// newest — the second-newest legacy tree survives only because
+    /// production's policy retains it.
+    #[test]
+    fn legacy_records_without_a_target_are_retained_if_any_policy_retains_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        // Legacy records: no originating target on any of them.
+        make_gen(
+            &helper,
+            "d1",
+            "g1",
+            "t1",
+            "2020-01-01T00:00:00Z",
+            None,
+            None,
+        );
+        make_gen(
+            &helper,
+            "d2",
+            "g2",
+            "t2",
+            "2020-01-02T00:00:00Z",
+            Some("g1"),
+            None,
+        );
+        make_gen(
+            &helper,
+            "d3",
+            "g3",
+            "t3",
+            "2020-01-03T00:00:00Z",
+            Some("g2"),
+            None,
+        );
+        helper.swap_current(None, "g3", "op").unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let mut c = cfg_shared();
+        // Isolate the distinct window: no keep_days, no protect_previous, no
+        // fleet window on either member.
+        c.targets
+            .get_mut("production")
+            .unwrap()
+            .rotation
+            .per_server
+            .keep_distinct_artifacts = 2;
+        c.targets
+            .get_mut("production")
+            .unwrap()
+            .rotation
+            .per_server
+            .keep_days = 0;
+        c.targets
+            .get_mut("production")
+            .unwrap()
+            .rotation
+            .per_server
+            .protect_previous = false;
+        c.targets
+            .get_mut("production")
+            .unwrap()
+            .rotation
+            .fleet
+            .protect_deployments = 0;
+        c.targets
+            .get_mut("staging")
+            .unwrap()
+            .rotation
+            .per_server
+            .keep_days = 0;
+        c.targets
+            .get_mut("staging")
+            .unwrap()
+            .rotation
+            .fleet
+            .protect_deployments = 0;
+
+        let slot_targets = ["production".to_string(), "staging".to_string()];
+        let retained = compute_retained(&helper, &c.pins, &store, &c, &slot_targets).unwrap();
+        assert!(retained.contains("t3"), "current live tree retained");
+        assert!(
+            retained.contains("t2"),
+            "legacy record retained on any policy hit: production's keep_distinct=2 keeps it \
+             even though staging's keep_distinct=1 would sweep it"
+        );
+        assert!(
+            !retained.contains("t1"),
+            "no policy retains the oldest legacy record, so it is swept"
         );
     }
 }

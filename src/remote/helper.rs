@@ -8,7 +8,7 @@
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::model::{
-    ArtifactRef, BehaviorContract, DeploymentId, GenerationId, ReleaseId, ReleaseRecord,
+    ArtifactRef, BehaviorContract, DeploymentId, GenerationId, ReleaseId, ReleaseRecord, TargetName,
 };
 use crate::remote::transport::Remote;
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,7 @@ use walkdir::WalkDir;
 /// artifact relationship is expressed via the canonical [`ArtifactRef`]; the
 /// ID fields are the (string-shaped on the wire) typed newtypes so the JSON
 /// stays `{deployment_id, generation_id, artifact: {release, variant, tree},
-/// behavior_sha256, prior_generation, created_at}`.
+/// behavior_sha256, prior_generation, created_at, target}`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GenerationAssignment {
     pub deployment_id: DeploymentId,
@@ -31,6 +31,12 @@ pub struct GenerationAssignment {
     #[serde(default)]
     pub prior_generation: Option<GenerationId>,
     pub created_at: String,
+    /// The target whose push created this generation record. Retention on a
+    /// slot shared between several targets is attributed per originating
+    /// target; `None` marks a LEGACY record written before this field existed
+    /// (retained conservatively under every member policy).
+    #[serde(default)]
+    pub target: Option<TargetName>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -497,27 +503,33 @@ impl<'a> RemoteHelper<'a> {
     }
 
     /// Write a fleet-commit marker for a deployment under this server. The marker
-    /// records the generation this slot committed and the full set of placement
-    /// slot IDs that participate in the fleet commit, so a partial marker can
-    /// never masquerade as a complete commit.
+    /// records the generation this slot committed, the full set of placement
+    /// slot IDs that participate in the fleet commit (so a partial marker can
+    /// never masquerade as a complete commit), and the originating target of
+    /// the push. `target` is optional for legacy markers written before
+    /// originating-target attribution existed; new commits always record it.
     ///
     /// Markers are immutable and write-once: the file is created exclusively,
-    /// and an existing marker must match byte-for-byte (deterministic payload
+    /// and an existing record must match byte-for-byte (deterministic payload
     /// for the same deployment) or the rewrite fails integrity. A concurrent or
-    /// retried commit therefore can never alter a recorded fact.
+    /// retried commit therefore never corrupts a recorded fact.
     pub fn write_commit_marker(
         &self,
         deployment_id: &str,
         generation: &str,
         slot_ids: &[String],
+        target: Option<&str>,
     ) -> Result<()> {
         let p = layout::commit_marker(deployment_id);
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "deployment_id": deployment_id,
             "committed": true,
             "generation": generation,
             "slots": slot_ids,
         });
+        if let Some(t) = target {
+            payload["target"] = serde_json::json!(t);
+        }
         let bytes = serde_json::to_vec_pretty(&payload)
             .map_err(|e| Error::remote(format!("serialize commit: {e}")))?;
         if self.remote.try_write_new(&p, &bytes)? {
@@ -673,6 +685,7 @@ mod tests {
             behavior_sha256: "b".to_string(),
             prior_generation: None,
             created_at: "2020-01-01T00:00:00Z".to_string(),
+            target: Some(TargetName::new("t1")),
         }
     }
 
@@ -1047,7 +1060,7 @@ mod durability_tests {
 
         let helper = RemoteHelper::new(&remote);
         helper
-            .write_commit_marker("deploy-0", "gen-0", &["p1".to_string()])
+            .write_commit_marker("deploy-0", "gen-0", &["p1".to_string()], Some("t1"))
             .expect("commit marker install must succeed past stale temp");
 
         let marker: serde_json::Value = serde_json::from_slice(
@@ -1097,6 +1110,7 @@ mod durability_tests {
                         &format!("deploy-{i}"),
                         &format!("gen-{i}"),
                         &["p1".to_string()],
+                        Some("t1"),
                     ) {
                         *writer_error_writer.lock().unwrap() = Some(e.to_string());
                         return;

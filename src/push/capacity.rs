@@ -23,7 +23,8 @@ use std::path::Path;
 /// pushes alike. Servers have no per-release history, so capacity is never
 /// part of the release snapshot: the release identity covers mappings,
 /// behavior, and trees only. Rotation (used for the protected pre-rotation) is
-/// target-level configuration from `deploy.toml`.
+/// target-level configuration from `deploy.toml`; a shared slot's retained set
+/// is the union of every member target's policy.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn capacity_preflight(
     store: &LocalStore,
@@ -32,7 +33,6 @@ pub(crate) fn capacity_preflight(
     op_id: &OperationId,
     deployment_id: &DeploymentId,
     config: &Config,
-    rotation: &crate::config::RotationConfig,
 ) -> Result<()> {
     for a in assignments {
         // Resolve the server's CURRENT capacity policy for this assignment.
@@ -74,10 +74,11 @@ pub(crate) fn capacity_preflight(
         // second arm `need > available - reserve` is only evaluated when
         // `reserve <= available`, so the subtraction cannot underflow.
         if reserve > fs.available || need > fs.available - reserve {
-            // Run protected rotation using the target's rotation policy, then
-            // recheck capacity directly rather than failing the restore.
-            // Best-effort by design: rotation is only an optimization to free
-            // capacity, and the hard capacity check below decides the outcome.
+            // Run protected rotation under the slot's FULL member-target
+            // policy union, then recheck capacity directly rather than failing
+            // the restore. Best-effort by design: rotation is only an
+            // optimization to free capacity, and the hard capacity check below
+            // decides the outcome.
             // A rotation failure is not recoverable at this point (the push
             // would have to abort mid-preflight), and the recheck fails the
             // push loudly if space is genuinely short.
@@ -89,7 +90,8 @@ pub(crate) fn capacity_preflight(
             // stranding every later operation on this slot with "mutation
             // lock held by ...".
             if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
-                let retained = compute_retained(helper, &config.pins, store, rotation)?;
+                let retained =
+                    compute_retained(helper, &config.pins, store, config, &slot.targets)?;
                 let active = HashSet::from([deployment_id.as_str().to_string()]);
                 helper.rotate(&retained, &active).ok();
             }
@@ -298,7 +300,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let helpers = HashMap::from([(PlacementSlotId::new("p1".to_string()), helper)]);
 
         let mut config = cfg();
-        let rotation = config.targets["t1"].rotation.clone();
         let assignment = PlannedAssignment {
             placement_slot: PlacementSlotId::new("p1".to_string()),
             artifact: ArtifactRef {
@@ -323,7 +324,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &op_id,
             &deployment_id,
             &config,
-            &rotation,
         )
         .expect("small reserve fits");
 
@@ -340,7 +340,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &op_id,
             &deployment_id,
             &config,
-            &rotation,
         )
         .expect_err("bytes-half must be honored");
         assert!(
@@ -364,7 +363,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &op_id,
             &deployment_id,
             &config,
-            &rotation,
         )
         .expect_err("percent-half must be honored against the total");
         assert!(
@@ -387,7 +385,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &op_id,
             &deployment_id,
             &config,
-            &rotation,
         )
         .expect("an already-present tree skips the headroom check");
     }
@@ -416,7 +413,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let helpers = HashMap::from([(PlacementSlotId::new("p1".to_string()), helper)]);
 
         let mut config = cfg();
-        let rotation = config.targets["t1"].rotation.clone();
         config.servers[0].capacity = crate::config::CapacityConfig {
             reserve_bytes,
             reserve_percent,
@@ -438,7 +434,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &op_id,
             &deployment_id,
             &config,
-            &rotation,
         )
     }
 

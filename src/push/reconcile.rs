@@ -221,6 +221,7 @@ pub(crate) fn reconcile_pending_commits(
                 attempt.deployment_id.as_str(),
                 recorded[sid].as_str(),
                 &slot_ids,
+                Some(attempt.target.as_str()),
             ) {
                 Err(Error::Integrity(_)) => {
                     // Conflicting marker already exists with different
