@@ -480,6 +480,19 @@ impl LocalStore {
     /// id to the reason the rotation was deferred. Empty when no maintenance
     /// is pending.
     pub fn read_rotation_debt(&self, target: &str) -> Result<BTreeMap<String, String>> {
+        // Post-commit debt-maintenance fault injection: the rotation-debt
+        // marker is read during post-commit maintenance (the deferred-rotation
+        // retry, the step-17 clear/defer), so a fault here is reported as a
+        // maintenance warning by the engine, never a push error. Keyed by
+        // target (the only identity the debt methods carry); the arming test
+        // holds FAULT_LOCK for the whole arm->consume window and pushes a
+        // target unique to the fixture so no other test can consume the arm.
+        #[cfg(test)]
+        if test_faults::consume(&test_faults::FAIL_READ_ROTATION_DEBT, target) {
+            return Err(Error::store(
+                "test fault: read_rotation_debt forced to fail once",
+            ));
+        }
         let p = self.rotation_debt_path(target);
         if p.exists() {
             read_json(&p)
@@ -491,6 +504,17 @@ impl LocalStore {
     /// Persist the target's deferred-rotation markers. An EMPTY map removes
     /// the marker file, so a fully-serviced target leaves no trace.
     pub fn write_rotation_debt(&self, target: &str, debt: &BTreeMap<String, String>) -> Result<()> {
+        // Post-commit debt-maintenance fault injection: the marker's persist
+        // AND its removal (the empty-map delete below) both go through this
+        // one write, so the "debt remove" fault uses the same arm. A fault
+        // here is reported as a maintenance warning by the engine, never a
+        // push error. See [`LocalStore::read_rotation_debt`] for the keying.
+        #[cfg(test)]
+        if test_faults::consume(&test_faults::FAIL_WRITE_ROTATION_DEBT, target) {
+            return Err(Error::store(
+                "test fault: write_rotation_debt forced to fail once",
+            ));
+        }
         let p = self.rotation_debt_path(target);
         if debt.is_empty() {
             if p.exists() {

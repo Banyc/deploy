@@ -113,13 +113,25 @@ attempts = 1
 interval_seconds = 0
 "#;
 
-/// The single physical slot: server `s1`, member of BOTH targets.
+/// The single physical slot: server `s1`, member of BOTH targets, plus a
+/// third single-member slot `pdx` (target `debtfx`) used ONLY by the
+/// rotation-debt fault-matrix test. `debtfx`'s name is unique to that test
+/// (no other test pushes it), so the TARGET-keyed debt fault arms
+/// (`arm_read_rotation_debt` / `arm_write_rotation_debt`) cannot be consumed
+/// by a concurrent test's push — the fixture's `t1`/`t2` pushes stay
+/// untouched.
 const SLOT_BODY: &str = r#"
 [[slots]]
 id = "p1"
 server = "s1"
 targets = ["t1", "t2"]
 deploy_dir = "/srv/si"
+
+[[slots]]
+id = "pdx"
+server = "s1"
+targets = ["debtfx"]
+deploy_dir = "/srv/si-debt"
 "#;
 
 /// Two CONTRASTING rotation policies over the shared slot: `t1` is AGGRESSIVE
@@ -160,6 +172,17 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
 [targets.t2]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+
+[targets.debtfx.rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = false
+
+[targets.debtfx.rotation.fleet]
+protect_deployments = 1
+
+[targets.debtfx]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 "#;
 
 // ---------------------------------------------------------------------------
@@ -194,6 +217,19 @@ pub(crate) enum FailureStep {
     /// Post-commit observed-refresh `write_observed` for the OTHER member
     /// target of the shared slot (store) — the shared-slot propagation.
     ObservedOtherWrite,
+    /// Post-commit rotation-debt READ (`LocalStore::read_rotation_debt`,
+    /// target-keyed) — the marker read during the deferred-rotation retry or
+    /// the step-17 clear/defer, after the durable commit point.
+    DebtRead,
+    /// Post-commit rotation-debt WRITE/REMOVE
+    /// (`LocalStore::write_rotation_debt`, target-keyed) — the marker's
+    /// persist, and the empty-map removal that clears a serviced marker.
+    DebtWrite,
+    /// The "debt remove" arm of the matrix: the cleared-marker removal is the
+    /// same `write_rotation_debt` call, so this maps onto [`DebtWrite`]'s arm
+    /// (kept as a distinct step so the {read, write, remove} matrix is
+    /// explicit).
+    DebtRemove,
 }
 
 /// Remote-side fault configuration, shared between the fixture and the remote
@@ -516,6 +552,15 @@ impl Fixture {
             FailureStep::ObservedWriteServer => faults::arm_write_server(id.as_str(), "t1"),
             FailureStep::ObservedPrimaryWrite => faults::arm_write_observed(id.as_str(), "t1"),
             FailureStep::ObservedOtherWrite => faults::arm_write_observed(id.as_str(), "t2"),
+            // The rotation-debt faults are keyed by the TARGET only (the debt
+            // methods carry no deployment id) and fire on `debtfx` — the
+            // fixture target no other test pushes — so no concurrent test's
+            // push can consume the arm (the arming test holds FAULT_LOCK for
+            // the whole arm->consume window).
+            FailureStep::DebtRead => faults::arm_read_rotation_debt("debtfx"),
+            FailureStep::DebtWrite | FailureStep::DebtRemove => {
+                faults::arm_write_rotation_debt("debtfx")
+            }
             other => panic!("{other:?} is a remote step, not a store step"),
         }
     }
@@ -1983,6 +2028,231 @@ fn lifecycle_observed_refresh_faults_never_fail_after_commit() {
         assert_eq!(r3.status, None);
         assert_eq!(f.store.read_snapshots("t1").unwrap().len(), 1);
         f.check_invariants();
+    }
+}
+
+/// Lifecycle: the rotation-debt maintenance I/O is POST-COMMIT maintenance —
+/// every debt read/write/remove failure must never turn a push into an `Err`
+/// once the deployment is durably committed. The matrix generates
+/// {real push, no-op} × {debt read, debt write, debt remove} × {empty,
+/// existing debt}. The "debt remove" arm is the same `write_rotation_debt`
+/// call as the write (the cleared marker's removal is the empty-map write), so
+/// it shares the write arm — the matrix keeps the third column explicit.
+///
+/// ORACLE per combination:
+/// (a) the push returns `Ok` with the committed status — `Successful` for the
+///     real push, the "Everything up to date" no-op report for the no-op;
+/// (b) HISTORY REMAINS EXACTLY ONCE: one attempt, one snapshot, the terminal
+///     `Successful` transition, `refs/last-successful` bound — no duplicates
+///     (the no-op creates no records at all);
+/// (c) MAINTENANCE EITHER CONVERGES OR REMAINS EXPLICITLY WARNED/DEFERRED:
+///     every case that leaves the marker in place must carry a warning naming
+///     the deferred debt maintenance (never silently lost, never silently
+///     deferred), and a real push whose step-17 rotation succeeded clears the
+///     pre-seeded marker even when the earlier retry's debt I/O faulted (the
+///     fault is one-shot, so the later clear write succeeds) — the warning
+///     from the faulted retry stays on the report.
+///
+/// The `debtfx` fixture target is pushed ONLY by this test, and every
+/// arm→push window holds [`crate::testutil::FAULT_LOCK`], so the target-keyed
+/// one-shot arms (`arm_read_rotation_debt` / `arm_write_rotation_debt`)
+/// cannot be consumed by a concurrent test's push.
+#[test]
+fn lifecycle_debt_fault_matrix_never_fails_after_commit() {
+    const SLOT: &str = "pdx";
+    // One shared guard for the WHOLE matrix: every arm->push window (and the
+    // inter-case clears) must never interleave with another fault-arming test
+    // in the same process.
+    let _fault_guard = crate::testutil::FAULT_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (i, step) in [
+        FailureStep::DebtRead,
+        FailureStep::DebtWrite,
+        FailureStep::DebtRemove,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (j, have_debt) in [false, true].into_iter().enumerate() {
+            let ctx = format!("{step:?} x have_debt={have_debt}");
+            // ---- REAL push: the first push to `debtfx` commits, then the
+            // maintenance block retries any pre-seeded debt and runs step 17
+            // (which succeeds and clears the marker). ----
+            {
+                let f = Fixture::new();
+                let id = DeploymentId::new(format!("si-debt-fault-{i}-{j}"));
+                if have_debt {
+                    f.store
+                        .write_rotation_debt(
+                            "debtfx",
+                            &BTreeMap::from([(SLOT.to_string(), "seeded".to_string())]),
+                        )
+                        .unwrap();
+                }
+                let r1 = {
+                    f.arm_store_fault(step, &id);
+                    f.push_with_id("debtfx", &id)
+                        .expect("{ctx}: a push past the durable commit point must never fail")
+                };
+                // (a) the committed status is unchanged by the fault.
+                assert_eq!(
+                    r1.status,
+                    Some(DeploymentStatus::Successful),
+                    "{ctx}: the deployment committed; the debt fault must not change its outcome"
+                );
+                assert!(
+                    r1.attempt.is_some(),
+                    "{ctx}: a real push records an attempt"
+                );
+                // (b) history remains EXACTLY ONCE.
+                assert_eq!(
+                    f.store.read_snapshots("debtfx").unwrap().len(),
+                    1,
+                    "{ctx}: exactly one snapshot entry"
+                );
+                assert_eq!(
+                    f.store.read_attempts("debtfx").unwrap().len(),
+                    1,
+                    "{ctx}: exactly one attempt record"
+                );
+                assert_eq!(
+                    f.store.latest_status(id.as_str()).unwrap(),
+                    Some(DeploymentStatus::Successful),
+                    "{ctx}: the terminal transition is Successful"
+                );
+                assert_eq!(
+                    f.store.read_transitions(id.as_str()).unwrap().len(),
+                    3,
+                    "{ctx}: exactly InProgress + PendingCommit + Successful — no duplicates"
+                );
+                assert_eq!(
+                    f.store.read_last_successful("debtfx").as_deref(),
+                    Some(id.as_str()),
+                    "{ctx}: refs/last-successful points at the committed attempt"
+                );
+                // (c) maintenance either converged or stayed explicitly
+                // warned/deferred: a retained marker must be warned about;
+                // a warning must name the debt maintenance; the real push's
+                // step-17 clear always converges the marker (the one-shot
+                // fault is spent by the retry's I/O).
+                let debt = f.store.read_rotation_debt("debtfx").unwrap();
+                let expect_warning = !matches!(
+                    (step, have_debt),
+                    (FailureStep::DebtWrite | FailureStep::DebtRemove, false)
+                );
+                if let Some(w) = &r1.warning {
+                    assert!(
+                        w.contains("debt"),
+                        "{ctx}: the warning names the debt maintenance, got: {w}"
+                    );
+                }
+                assert_eq!(
+                    r1.warning.is_some(),
+                    expect_warning,
+                    "{ctx}: warning presence matches the faulted I/O"
+                );
+                assert!(
+                    debt.is_empty(),
+                    "{ctx}: the real push's step-17 rotation succeeded, so the (pre-seeded) \
+                     marker must be cleared — the one-shot fault was spent by the retry"
+                );
+                // A retained marker must never be silent: no case here keeps
+                // one, but assert the guard shape anyway.
+                assert!(
+                    debt.is_empty() || r1.warning.is_some(),
+                    "{ctx}: a retained debt marker must be explicitly warned"
+                );
+                // The arm may not have fired (an empty-debt write case never
+                // writes); clear it so the next case's pre-seed write cannot
+                // consume a stale arm.
+                crate::testutil::test_faults::clear_rotation_debt_faults();
+            }
+            // ---- NO-OP: push once clean, seed the debt (existing cases),
+            // arm, then an up-to-date no-op push whose maintenance hook retries
+            // the debt before reporting "Everything up to date". ----
+            {
+                let f = Fixture::new();
+                let seed_id = DeploymentId::new(format!("si-debt-seed-{i}-{j}"));
+                let r0 = f
+                    .push_with_id("debtfx", &seed_id)
+                    .expect("seed push succeeds");
+                assert_eq!(r0.status, Some(DeploymentStatus::Successful));
+                if have_debt {
+                    f.store
+                        .write_rotation_debt(
+                            "debtfx",
+                            &BTreeMap::from([(SLOT.to_string(), "seeded".to_string())]),
+                        )
+                        .unwrap();
+                }
+                let r2 = {
+                    f.arm_store_fault(step, &seed_id);
+                    f.push("debtfx")
+                        .expect("{ctx}: a no-op past the durable commit point must never fail")
+                };
+                // (a) the no-op report is unchanged by the fault.
+                assert_eq!(r2.message, "Everything up to date");
+                assert_eq!(
+                    r2.status, None,
+                    "{ctx}: the retrying push is an up-to-date no-op"
+                );
+                // (b) history exactly ONCE — the no-op created no records.
+                assert_eq!(
+                    f.store.read_snapshots("debtfx").unwrap().len(),
+                    1,
+                    "{ctx}: the no-op adds no snapshot"
+                );
+                assert_eq!(
+                    f.store.read_attempts("debtfx").unwrap().len(),
+                    1,
+                    "{ctx}: the no-op adds no attempt"
+                );
+                assert_eq!(
+                    f.store.latest_status(seed_id.as_str()).unwrap(),
+                    Some(DeploymentStatus::Successful),
+                    "{ctx}: the seed deployment stays Successful"
+                );
+                assert_eq!(
+                    f.store.read_last_successful("debtfx").as_deref(),
+                    Some(seed_id.as_str()),
+                    "{ctx}: refs/last-successful unchanged by the no-op"
+                );
+                // (c) with a pre-seeded marker the no-op's retry serviced the
+                // debt and either cleared it (no fault) or left it retained
+                // WITH a warning naming the deferred maintenance; with no
+                // marker and a read fault the report warns about the failed
+                // read; with no marker and a write/remove fault nothing is
+                // written, the arm never fires, and nothing is warned.
+                let debt = f.store.read_rotation_debt("debtfx").unwrap();
+                let expect_warning = !matches!(
+                    (step, have_debt),
+                    (FailureStep::DebtWrite | FailureStep::DebtRemove, false)
+                );
+                assert_eq!(
+                    r2.warning.is_some(),
+                    expect_warning,
+                    "{ctx}: warning presence must match the faulted I/O"
+                );
+                if let Some(w) = &r2.warning {
+                    assert!(
+                        w.contains("debt"),
+                        "{ctx}: the warning names the debt maintenance, got: {w}"
+                    );
+                }
+                assert_eq!(
+                    !debt.is_empty(),
+                    have_debt,
+                    "{ctx}: a pre-seeded marker survives the faulted no-op retry (never silently \
+                     lost); an empty debt stays empty"
+                );
+                assert!(
+                    debt.is_empty() || r2.warning.is_some(),
+                    "{ctx}: a retained marker must be explicitly warned — never silently deferred"
+                );
+                crate::testutil::test_faults::clear_rotation_debt_faults();
+            }
+        }
     }
 }
 

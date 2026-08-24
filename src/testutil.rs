@@ -69,7 +69,11 @@ pub(crate) static FAULT_LOCK: Mutex<()> = Mutex::new(());
 /// post-commit observed-refresh faults (`arm_write_server`,
 /// `arm_write_observed`) are additionally keyed by TARGET, so a test can arm
 /// the primary target's `write_observed` (the push's own target) or an other
-/// member target's independently.
+/// member target's independently. The post-commit rotation-debt faults
+/// (`arm_read_rotation_debt`, `arm_write_rotation_debt`) are keyed by TARGET
+/// alone — the debt methods carry no deployment id — so an arming test must
+/// hold [`FAULT_LOCK`] for the arm->consume window AND push a target no other
+/// test pushes, keeping the target-keyed consume deterministic.
 ///
 /// The keying protects the CONSUME side only: the `arm_*` functions
 /// OVERWRITE the slot, so every arming test must hold [`FAULT_LOCK`] from the
@@ -165,6 +169,39 @@ pub(crate) mod test_faults {
         arm2(&FAIL_WRITE_OBSERVED, deployment_id, target);
     }
 
+    /// Arm the next `read_rotation_debt` call for `target` to fail once. The
+    /// rotation-debt marker is read during POST-COMMIT maintenance (the
+    /// deferred-rotation retry and the step-17 clear/defer), so a fault here
+    /// is warning-only in the engine, never a push error. The arm is keyed by
+    /// TARGET (the only identity the debt methods carry): the arming test must
+    /// hold [`crate::testutil::FAULT_LOCK`] for the whole arm->consume window
+    /// and push a target no other test pushes, so no concurrent push can
+    /// consume the arm.
+    pub(crate) fn arm_read_rotation_debt(target: &str) {
+        arm(&FAIL_READ_ROTATION_DEBT, target);
+    }
+
+    /// Arm the next `write_rotation_debt` call for `target` to fail once. The
+    /// marker's persist AND its removal (the empty-map delete that clears a
+    /// serviced marker) both go through `LocalStore::write_rotation_debt`, so
+    /// the "debt remove" fault is the same arm. Post-commit maintenance:
+    /// warning-only in the engine, never a push error. See
+    /// [`arm_read_rotation_debt`] for the target-keying / lock contract.
+    pub(crate) fn arm_write_rotation_debt(target: &str) {
+        arm(&FAIL_WRITE_ROTATION_DEBT, target);
+    }
+
+    /// Clear a one-shot TARGET-keyed arm without consuming it. A fault armed
+    /// for a case whose push never performs the operation (e.g. a debt-write
+    /// arm on an empty-debt case that never writes) would otherwise stay armed
+    /// and be consumed by the NEXT case's pre-seed write of the same target.
+    /// The matrix test holds [`crate::testutil::FAULT_LOCK`] for the whole
+    /// test and calls this between cases.
+    pub(crate) fn clear_rotation_debt_faults() {
+        *FAIL_READ_ROTATION_DEBT.lock().unwrap() = None;
+        *FAIL_WRITE_ROTATION_DEBT.lock().unwrap() = None;
+    }
+
     /// Consume the one-shot fault for `deployment_id` if armed. Returns `true`
     /// when the fault fired (and is now disarmed).
     pub(crate) fn consume(fault: &Mutex<Option<String>>, deployment_id: &str) -> bool {
@@ -210,4 +247,10 @@ pub(crate) mod test_faults {
     /// One-shot `(deployment_id, target)` fault for the post-commit
     /// observed-refresh `write_observed` call.
     pub(crate) static FAIL_WRITE_OBSERVED: Mutex<Option<(String, String)>> = Mutex::new(None);
+    /// One-shot TARGET-keyed fault for the post-commit rotation-debt `read`.
+    pub(crate) static FAIL_READ_ROTATION_DEBT: Mutex<Option<String>> = Mutex::new(None);
+    /// One-shot TARGET-keyed fault for the post-commit rotation-debt `write`
+    /// (a marker persist or the cleared-marker removal — both go through
+    /// `LocalStore::write_rotation_debt`).
+    pub(crate) static FAIL_WRITE_ROTATION_DEBT: Mutex<Option<String>> = Mutex::new(None);
 }

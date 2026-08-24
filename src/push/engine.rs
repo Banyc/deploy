@@ -673,8 +673,11 @@ fn push_inner(
                 // creates no records and skips step 17, so any rotation debt
                 // left by an earlier push would never be serviced here — retry
                 // it explicitly before reporting "Everything up to date".
-                // Best-effort: a failure keeps the marker and surfaces as a
-                // warning; the no-op report itself is unchanged.
+                // Best-effort: a failure stays as the marker and surfaces as a
+                // warning; the no-op report itself is unchanged. The retry is
+                // NON-FALLIBLE (post-commit maintenance): every debt read/write
+                // failure is collected into the returned warnings, never an
+                // `Err` — the no-op report stays "Everything up to date".
                 let deferred = retry_deferred_rotations(
                     store,
                     config,
@@ -683,7 +686,7 @@ fn push_inner(
                     &helpers,
                     op_id,
                     deployment_id,
-                )?;
+                );
                 // Refresh observed state on the NO-OP path (the same
                 // [`refresh_observed`] helper and projection as the real-push
                 // path). A crash-window push — one that aborted AFTER the
@@ -1330,7 +1333,10 @@ fn push_inner(
     maintenance.extend(observed_warnings);
     // Retry any debt left by earlier pushes FIRST (before this push's own
     // rotation), so a marker that succeeds here is cleared without re-rotating
-    // the same slot immediately after a fresh step-17 failure.
+    // the same slot immediately after a fresh step-17 failure. The retry is
+    // NON-FALLIBLE (post-commit maintenance): every debt read/write failure is
+    // a warning entry in the returned vec, never an `Err` — a debt-file fault
+    // must not change the outcome of a deployment that already committed.
     maintenance.extend(retry_deferred_rotations(
         store,
         config,
@@ -1339,7 +1345,7 @@ fn push_inner(
         &helpers,
         op_id,
         deployment_id,
-    )?);
+    ));
     for sid in &servers_order {
         let helper = &helpers[sid];
         // The slot's FULL member target list (union retention), resolved from
@@ -1361,13 +1367,23 @@ fn push_inner(
             ) {
                 Ok(()) => {
                     // Maintenance done for this slot: clear any marker left by
-                    // an earlier push whose rotation failed after commit.
-                    clear_rotation_deferred(store, target_name, sid)?;
+                    // an earlier push whose rotation failed after commit. The
+                    // clear is NON-FALLIBLE post-commit maintenance: a debt
+                    // read/write failure becomes a warning, never an `Err`.
+                    maintenance.extend(clear_rotation_deferred(store, target_name, sid));
                 }
                 Err(e) => {
                     // The deployment already committed; defer the maintenance
-                    // (marker + warning) instead of failing the push.
-                    set_rotation_deferred(store, target_name, sid, &e.to_string())?;
+                    // (marker + warning) instead of failing the push. The
+                    // deferral is NON-FALLIBLE: a debt read/write failure here
+                    // (e.g. the marker cannot be persisted) is a warning, never
+                    // an `Err` — the committed outcome is unchanged.
+                    maintenance.extend(set_rotation_deferred(
+                        store,
+                        target_name,
+                        sid,
+                        &e.to_string(),
+                    ));
                     maintenance.push(format!(
                         "rotation deferred for slot '{}': {e}",
                         sid.as_str()
@@ -1417,36 +1433,74 @@ fn rotate_slot_locked(
 
 /// Record a deferred-rotation debt marker for one slot (keyed by
 /// target+slot). Called only when the rotation failed after the deployment
-/// already committed.
+/// already committed — POST-COMMIT MAINTENANCE, so this function is
+/// NON-FALLIBLE: every debt I/O failure (a read or write of the marker file)
+/// becomes a WARNING returned here (merged into the report's `maintenance`
+/// channel by the caller), never an `Err`. On a read failure the write is
+/// skipped entirely — writing a map built from scratch would silently drop
+/// the OTHER slots' existing markers — and the returned warning names the
+/// deferral, so the maintenance is explicitly warned even though this slot's
+/// marker was not persisted.
 fn set_rotation_deferred(
     store: &LocalStore,
     target: &str,
     slot: &PlacementSlotId,
     reason: &str,
-) -> Result<()> {
-    let mut debt = store.read_rotation_debt(target)?;
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut debt = match store.read_rotation_debt(target) {
+        Ok(debt) => debt,
+        Err(e) => {
+            warnings.push(format!(
+                "rotation debt maintenance deferred: failed to read rotation debt for \
+                 '{target}': {e}"
+            ));
+            return warnings;
+        }
+    };
     debt.insert(slot.as_str().to_string(), reason.to_string());
-    store.write_rotation_debt(target, &debt)
+    if let Err(e) = store.write_rotation_debt(target, &debt) {
+        warnings.push(format!(
+            "rotation debt maintenance deferred: failed to write rotation debt for \
+             '{target}': {e}"
+        ));
+    }
+    warnings
 }
 
 /// Clear a slot's deferred-rotation debt marker once the rotation succeeded.
-fn clear_rotation_deferred(store: &LocalStore, target: &str, slot: &PlacementSlotId) -> Result<()> {
-    let mut debt = store.read_rotation_debt(target)?;
+/// POST-COMMIT MAINTENANCE, so this is NON-FALLIBLE: a debt read failure
+/// leaves the marker in place (a later push retries it) and a write/remove
+/// failure keeps the stale marker — both become WARNING entries returned to
+/// the caller (merged into the report's `maintenance` channel), never an
+/// `Err`.
+fn clear_rotation_deferred(
+    store: &LocalStore,
+    target: &str,
+    slot: &PlacementSlotId,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut debt = match store.read_rotation_debt(target) {
+        Ok(debt) => debt,
+        Err(e) => {
+            warnings.push(format!(
+                "rotation debt maintenance deferred: failed to read rotation debt for \
+                 '{target}': {e}"
+            ));
+            return warnings;
+        }
+    };
     if debt.remove(slot.as_str()).is_some() {
-        store.write_rotation_debt(target, &debt)?;
+        if let Err(e) = store.write_rotation_debt(target, &debt) {
+            warnings.push(format!(
+                "rotation debt maintenance deferred: failed to clear rotation debt for \
+                 '{target}': {e}"
+            ));
+        }
     }
-    Ok(())
+    warnings
 }
 
-/// Retry deferred post-commit rotation maintenance for `target`: every slot
-/// carrying a debt marker gets its rotation re-attempted under the slot's
-/// mutation lock (the same RAII-guarded block as step 17). Success clears the
-/// marker; failure keeps it and refreshes its reason. Runs on later pushes —
-/// before step 17 on the normal path and at the no-op return — because
-/// rotation is maintenance that must never change a deployment's reported
-/// outcome. Best-effort: this function NEVER fails the push. Returns the
-/// slots still deferred, for the push report's warning.
-///
 /// Refresh `observed.json` for `target_name` from a caller-supplied per-slot
 /// observed projection, and propagate every shared slot's entry to EACH of its
 /// member targets. Every store fault in this block is WARNING-ONLY: the
@@ -1546,6 +1600,18 @@ fn refresh_observed(
     }
 }
 
+/// Retry deferred post-commit rotation maintenance for `target`: every slot
+/// carrying a debt marker gets its rotation re-attempted under the slot's
+/// mutation lock (the same RAII-guarded block as step 17). Success clears the
+/// marker; failure keeps it and refreshes its reason. Runs on later pushes —
+/// before step 17 on the normal path and at the no-op return — because
+/// rotation is maintenance that must never change a deployment's reported
+/// outcome. NON-FALLIBLE by contract: this function never returns `Err` — a
+/// debt I/O failure (a read treated as empty debt, or a write/remove of the
+/// marker) becomes a WARNING entry in the returned vec, so a debt-file fault
+/// can never turn a push (real or no-op) into an error after the deployment
+/// durably committed. Returns the slots still deferred, for the push report's
+/// warning.
 fn retry_deferred_rotations(
     store: &LocalStore,
     config: &Config,
@@ -1554,10 +1620,21 @@ fn retry_deferred_rotations(
     helpers: &HashMap<PlacementSlotId, RemoteHelper>,
     op_id: &OperationId,
     deployment_id: &DeploymentId,
-) -> Result<Vec<String>> {
-    let mut debt = store.read_rotation_debt(target_name)?;
+) -> Vec<String> {
+    // A debt READ failure is treated as empty debt: nothing can be serviced
+    // this push, and the marker file (if any) is left untouched for a later
+    // push to retry — the warning keeps the deferral explicit.
+    let mut debt = match store.read_rotation_debt(target_name) {
+        Ok(debt) => debt,
+        Err(e) => {
+            return vec![format!(
+                "rotation debt maintenance deferred: failed to read rotation debt for \
+                 '{target_name}': {e}"
+            )];
+        }
+    };
     if debt.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     let mut still_deferred: Vec<String> = Vec::new();
     let mut serviced: Vec<String> = Vec::new();
@@ -1608,8 +1685,17 @@ fn retry_deferred_rotations(
     for s in &serviced {
         debt.remove(s);
     }
-    store.write_rotation_debt(target_name, &debt)?;
-    Ok(still_deferred)
+    // A debt WRITE/REMOVE failure (the marker could not be persisted or
+    // removed) is post-commit maintenance: warn and leave the marker file as
+    // it is — the rotation itself succeeded, but a later push retries and
+    // converges. Never an `Err`.
+    if let Err(e) = store.write_rotation_debt(target_name, &debt) {
+        still_deferred.push(format!(
+            "rotation debt maintenance deferred: failed to write rotation debt for \
+             '{target_name}': {e}"
+        ));
+    }
+    still_deferred
 }
 
 /// Build the report's `warning` from deferred-maintenance entries: `None`
