@@ -4123,10 +4123,30 @@ rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_
         &push_opt("production"),
     )?;
     assert_eq!(rp.status, Some(DeploymentStatus::Successful));
-    let prod_v1 = rp.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")]
-        .artifact
-        .tree
-        .clone();
+    let prod_slot = &rp.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")];
+    let prod_v1 = prod_slot.artifact.tree.clone();
+    let prod_gen = prod_slot
+        .generation
+        .clone()
+        .expect("production advanced a generation");
+
+    // A shared slot's observed state is refreshed in EVERY member target on a
+    // push: staging (never pushed) already carries the ACTUAL tree/generation
+    // the production push deployed, not merely a present-but-stale entry.
+    for tname in ["production", "staging"] {
+        let observed = store.read_observed(tname)?;
+        let os = &observed.slots[&PlacementSlotId::new("p1")];
+        assert_eq!(
+            os.artifact.as_ref().expect("observed artifact").tree,
+            prod_v1,
+            "{tname} observed must carry the actual tree deployed by the production push"
+        );
+        assert_eq!(
+            os.generation.as_ref().expect("observed generation"),
+            &prod_gen,
+            "{tname} observed must carry the actual generation deployed by the production push"
+        );
+    }
 
     // Change content, then push `staging` (content v2): the SAME slot deploys
     // independently for staging, with its own per-target attempt/snapshot.
@@ -4140,28 +4160,37 @@ rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_
         &push_opt("staging"),
     )?;
     assert_eq!(rs.status, Some(DeploymentStatus::Successful));
-    let staging_v2 = rs.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")]
-        .artifact
-        .tree
-        .clone();
+    let staging_slot = &rs.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")];
+    let staging_v2 = staging_slot.artifact.tree.clone();
+    let staging_gen = staging_slot
+        .generation
+        .clone()
+        .expect("staging advanced a generation");
     assert_ne!(prod_v1, staging_v2, "staging deployed the newer content");
 
     // Per-target records are separate: each target has its own attempt and
     // its own observed state.
     assert_eq!(store.read_attempts("production")?.len(), 1);
     assert_eq!(store.read_attempts("staging")?.len(), 1);
-    let prod_observed = store.read_observed("production")?;
-    let staging_observed = store.read_observed("staging")?;
-    assert!(
-        prod_observed.slots[&PlacementSlotId::new("p1")]
-            .artifact
-            .is_some()
-    );
-    assert!(
-        staging_observed.slots[&PlacementSlotId::new("p1")]
-            .artifact
-            .is_some()
-    );
+
+    // The shared slot's observed value CHANGES when the OTHER target pushes
+    // (stale -> fresh): production's observed is refreshed to staging's actual
+    // assignment even though production itself was not pushed, and staging's
+    // own record carries its fresh actual too.
+    for tname in ["production", "staging"] {
+        let obs = store.read_observed(tname)?;
+        let os = &obs.slots[&PlacementSlotId::new("p1")];
+        assert_eq!(
+            os.artifact.as_ref().expect("observed artifact").tree,
+            staging_v2,
+            "{tname} observed must be refreshed from the actual tree deployed by the staging push"
+        );
+        assert_eq!(
+            os.generation.as_ref().expect("observed generation"),
+            &staging_gen,
+            "{tname} observed must be refreshed from the actual generation deployed by the staging push"
+        );
+    }
 
     // `@f0` rollback on EACH target restores that target's own f0 tree.
     let rrb_prod = push(
@@ -4176,6 +4205,8 @@ rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_
         },
     )?;
     assert_eq!(rrb_prod.status, Some(DeploymentStatus::Successful));
+    let restored_prod_slot =
+        &rrb_prod.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")];
     let restored_prod = store.read_observed("production")?;
     assert_eq!(
         restored_prod.slots[&PlacementSlotId::new("p1")]
@@ -4185,6 +4216,23 @@ rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_
             .tree,
         prod_v1,
         "production rolled back to its own f0 tree"
+    );
+    assert_eq!(
+        restored_prod.slots[&PlacementSlotId::new("p1")].generation,
+        restored_prod_slot.generation,
+        "production's observed generation is the actual restored generation"
+    );
+    // The rollback refreshed the shared slot in staging too: staging's
+    // observed now carries production's restored f0 tree (fresh, not stale).
+    let restored_staging = store.read_observed("staging")?;
+    assert_eq!(
+        restored_staging.slots[&PlacementSlotId::new("p1")]
+            .artifact
+            .as_ref()
+            .unwrap()
+            .tree,
+        prod_v1,
+        "the production rollback refreshes the shared slot's observed state in staging"
     );
 
     let rrb_staging = push(

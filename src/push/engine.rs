@@ -1124,7 +1124,13 @@ fn push_inner(
 
     // Refresh observed state. Observed maps are keyed by placement slot (the
     // deployment-location identity); the per-server record (`servers/<id>.json`)
-    // keeps the actual [`crate::model::ServerId`] for transport identity.
+    // keeps the actual [`crate::model::ServerId`] for transport identity. A slot
+    // may be a member of SEVERAL targets (its on-server `deploy_dir` state is
+    // shared across them): a shared slot's observed entry is refreshed in EVERY
+    // member target whenever it changes, so `deploy status <other>` and any
+    // consumer of that target's observed.json see the CURRENT assignment
+    // (generation, artifact, last deployment), never a stale one left by an
+    // earlier push to another target.
     let mut observed = ObservedTarget {
         target: TargetName::new(target_name.to_string()),
         slots: Default::default(),
@@ -1145,8 +1151,22 @@ fn push_inner(
         store.write_server(&crate::records::ServerState {
             id: crate::model::ServerId::new(sdef.id.clone()),
             last_seen_target: Some(TargetName::new(target_name.to_string())),
-            last_observed: Some(observed_server),
+            last_observed: Some(observed_server.clone()),
         })?;
+        // Propagate the refreshed slot to EVERY other member target of the
+        // shared slot (single-target slots have no other members and are
+        // skipped harmlessly). The slot's server is the same physical server
+        // across all member targets, so no per-server record semantics change.
+        for other_target in &slot.targets {
+            if other_target == target_name {
+                continue;
+            }
+            let mut other_observed = store.read_observed(other_target)?;
+            other_observed
+                .slots
+                .insert(slot_id.clone(), observed_server.clone());
+            store.write_observed(other_target, &other_observed)?;
+        }
     }
     store.write_observed(target_name, &observed)?;
 
