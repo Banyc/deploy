@@ -75,11 +75,17 @@ pub(crate) fn capacity_preflight(
             // A rotation failure is not recoverable at this point (the push
             // would have to abort mid-preflight), and the recheck fails the
             // push loudly if space is genuinely short.
-            if helper.acquire_lock(op_id.as_str(), false).is_ok() {
+            //
+            // The mutation lock is held via an RAII guard for the whole
+            // rotation block, so EVERY exit path releases it on drop — a `?`
+            // error from `compute_retained` included. A manual
+            // acquire/release pair would leak the lock on that error path,
+            // stranding every later operation on this slot with "mutation
+            // lock held by ...".
+            if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
                 let retained = compute_retained(helper, &config.pins, store, rotation)?;
                 let active = HashSet::from([deployment_id.as_str().to_string()]);
                 helper.rotate(&retained, &active).ok();
-                helper.release_lock(op_id.as_str()).ok();
             }
             let fs2 = helper.remote().filesystem_bytes().unwrap_or(FsBytes {
                 total: 0,

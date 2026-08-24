@@ -1295,6 +1295,121 @@ impl Remote for FailOnceMarkerRemote {
     }
 }
 
+/// A remote that reports a FIXED number of available bytes and fails ONE
+/// specific remote call exactly once (the first matching call errors, then the
+/// wrapper behaves normally). Lets a test inject a transient failure into a
+/// rotation step — `compute_retained`'s remote reads (a `list` of the
+/// generations root) or `rotate`'s inventory write — and then verify the
+/// mutation lock was released on the error path (a manual acquire/release pair
+/// would leak it, stranding every later operation on the slot). Lock
+/// acquisition writes `state/operation.lock` — a different path — so locking
+/// is unaffected.
+struct FailOnceRotationRemote {
+    inner: LocalTransport,
+    armed: Arc<AtomicBool>,
+    fail_path: &'static str,
+    fail_list: bool,
+    fail_write: bool,
+    avail: u64,
+}
+
+impl FailOnceRotationRemote {
+    fn build(
+        base: std::path::PathBuf,
+        armed: Arc<AtomicBool>,
+        fail_path: &'static str,
+        fail_list: bool,
+        fail_write: bool,
+        avail: u64,
+    ) -> Result<Box<dyn Remote>> {
+        Ok(Box::new(FailOnceRotationRemote {
+            inner: LocalTransport::new(base)?,
+            armed,
+            fail_path,
+            fail_list,
+            fail_write,
+            avail,
+        }))
+    }
+    fn should_fail(&self, rel: &Path) -> bool {
+        self.armed.load(Ordering::SeqCst) && rel.to_string_lossy().starts_with(self.fail_path)
+    }
+}
+
+impl Remote for FailOnceRotationRemote {
+    fn root(&self) -> &Path {
+        self.inner.root()
+    }
+    fn provision_layout(&self) -> Result<()> {
+        self.inner.provision_layout()
+    }
+    fn read(&self, rel: &Path) -> Result<Vec<u8>> {
+        self.inner.read(rel)
+    }
+    fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
+        if self.fail_write && self.should_fail(rel) {
+            self.armed.store(false, Ordering::SeqCst);
+            return Err(deploy::error::Error::remote(format!(
+                "FailOnceRotationRemote: write of {} forced to fail (once)",
+                rel.display()
+            )));
+        }
+        self.inner.write(rel, data, mode)
+    }
+    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+        self.inner.try_write_new(rel, data)
+    }
+    fn remove_file(&self, rel: &Path) -> Result<()> {
+        self.inner.remove_file(rel)
+    }
+    fn create_dir(&self, rel: &Path) -> Result<()> {
+        self.inner.create_dir(rel)
+    }
+    fn create_dir_all(&self, rel: &Path) -> Result<()> {
+        self.inner.create_dir_all(rel)
+    }
+    fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+        self.inner.set_mode(rel, mode)
+    }
+    fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
+        if self.fail_list && self.should_fail(rel) {
+            self.armed.store(false, Ordering::SeqCst);
+            return Err(deploy::error::Error::remote(format!(
+                "FailOnceRotationRemote: list of {} forced to fail (once)",
+                rel.display()
+            )));
+        }
+        self.inner.list(rel)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+        self.inner.symlink(target, link)
+    }
+    fn read_link(&self, rel: &Path) -> Result<std::path::PathBuf> {
+        self.inner.read_link(rel)
+    }
+    fn remove_dir_all(&self, rel: &Path) -> Result<()> {
+        self.inner.remove_dir_all(rel)
+    }
+    fn exists(&self, rel: &Path) -> bool {
+        self.inner.exists(rel)
+    }
+    fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
+        self.inner.metadata(rel)
+    }
+    fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
+        self.inner.exec(argv, timeout)
+    }
+    fn filesystem_bytes(&self) -> Result<FsBytes> {
+        Ok(FsBytes {
+            total: self.avail,
+            available: self.avail,
+        })
+    }
+}
+
 /// A remote whose FIRST fleet-commit marker create installs CONFLICTING
 /// content (a concurrent controller's divergent fact, or remote corruption)
 /// instead of the payload the push computed, so `write_commit_marker`'s
@@ -2211,6 +2326,192 @@ fn post_lock_failure_releases_lock_and_records() -> Result<()> {
         !remotes_base.join("server-01/state/operation.lock").exists(),
         "mutation lock must be released after post-lock failure"
     );
+    Ok(())
+}
+
+// ---- Rotation lock discipline: the protected rotation in the capacity
+// preflight (step 8) and the per-slot rotation after a successful push (step
+// 17) hold the server mutation lock via an RAII guard, so an error inside
+// `compute_retained` or `rotate` releases the lock on drop. A manual
+// acquire/release pair would leak it on the `?` error path, stranding every
+// later operation on the slot with "mutation lock held by ...".
+
+/// A capacity preflight whose protected rotation fails inside
+/// `compute_retained` (a transient remote read error on the generations root)
+/// must NOT leak the server mutation lock: the rotation block holds the lock
+/// via an RAII guard, so the error path releases it on drop, and a later
+/// operation can acquire the lock again. The push itself still fails (the
+/// `compute_retained` error propagates out of the preflight).
+#[test]
+fn capacity_rotation_compute_retained_failure_releases_lock() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store = LocalStore::with_base(tmp.path().join("store"))?;
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    let (mut config, config_path) = setup(&proj);
+    // Force the capacity preflight to trigger protected rotation: the remote
+    // reports 100 bytes available and every server policy reserves 1 MiB, so
+    // need + reserve > avail on every slot.
+    for s in &mut config.servers {
+        s.capacity = deploy::config::CapacityConfig {
+            reserve_bytes: 1024 * 1024,
+            reserve_percent: 0,
+        };
+    }
+
+    // Inject a one-shot failure into `compute_retained`'s remote read of the
+    // generations root (`rotation::compute_retained` lists `generations/`;
+    // nothing else in the push touches that path before the preflight).
+    let armed = Arc::new(AtomicBool::new(true));
+    let armed_for_factory = armed.clone();
+    let rf = remotes_base.clone();
+    let fault_factory = move |s: &deploy::config::ServerDef,
+                              _slot: &deploy::config::SlotDef|
+          -> Result<Box<dyn Remote>> {
+        FailOnceRotationRemote::build(
+            rf.join(&s.id),
+            armed_for_factory.clone(),
+            "generations",
+            true,  // fail_list
+            false, // fail_write
+            100,   // avail
+        )
+    };
+
+    // The push fails: the injected `compute_retained` read error propagates
+    // out of the capacity preflight.
+    let err = push(
+        &config_path,
+        &store,
+        &fault_factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )
+    .err()
+    .expect("the injected compute_retained failure must fail the push");
+    assert!(
+        err.to_string().contains("generations"),
+        "expected the injected rotation read failure, got: {err}"
+    );
+
+    // The mutation lock was released on the error path: no server carries a
+    // lock file, and a fresh operation on every slot can acquire the lock.
+    // (The rotation runs on the FIRST assignment in plan order, so check all
+    // three servers rather than assuming a specific slot.)
+    for server in ["server-01", "server-02", "server-03"] {
+        let remote = LocalTransport::new(remotes_base.join(server))?;
+        assert!(
+            !remote.exists(&deploy::layout::operation_lock()),
+            "the lock file must be removed when the guard drops ({server})"
+        );
+        let helper = RemoteHelper::new(&remote);
+        assert!(
+            helper.acquire_lock("op-after", false).is_ok(),
+            "another operation must be able to acquire the lock after the failure ({server})"
+        );
+        helper.release_lock("op-after")?;
+    }
+    Ok(())
+}
+
+/// A successful push whose step-17 per-slot rotation fails inside `rotate` (a
+/// transient inventory-write error) must NOT leak the server mutation lock:
+/// the rotation block holds the lock via an RAII guard, so the error path
+/// releases it on drop. The push still reports the rotation error (step 17
+/// propagates it), and a later operation — including a fresh push — can
+/// acquire the lock again.
+#[test]
+fn step17_rotation_failure_releases_lock() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store = LocalStore::with_base(tmp.path().join("store"))?;
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    let (config, config_path) = setup(&proj);
+
+    // Inject a one-shot failure into `rotate`'s inventory write
+    // (`RemoteHelper::rotate` ends with `write_inventory`, which writes
+    // `state/inventory.json`; nothing else in the push writes that path, and
+    // the default 0/0 capacity never triggers the preflight rotation).
+    let armed = Arc::new(AtomicBool::new(true));
+    let armed_for_factory = armed.clone();
+    let rf = remotes_base.clone();
+    let fault_factory = move |s: &deploy::config::ServerDef,
+                              _slot: &deploy::config::SlotDef|
+          -> Result<Box<dyn Remote>> {
+        FailOnceRotationRemote::build(
+            rf.join(&s.id),
+            armed_for_factory.clone(),
+            "state/inventory.json",
+            false,    // fail_list
+            true,     // fail_write
+            u64::MAX, // avail: plenty of space, so preflight never rotates
+        )
+    };
+
+    // The push deploys everything but fails at step 17: the first slot's
+    // `rotate` hits the injected inventory-write failure and propagates it.
+    let err = push(
+        &config_path,
+        &store,
+        &fault_factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )
+    .err()
+    .expect("the injected rotate failure must fail the push");
+    assert!(
+        err.to_string().contains("inventory.json"),
+        "expected the injected rotation write failure, got: {err}"
+    );
+
+    // The mutation lock was released on the error path: no server carries a
+    // lock file, and a fresh operation on every slot can acquire the lock.
+    // (Step 17 rotates the FIRST assignment in plan order, so check all three
+    // servers rather than assuming a specific slot.)
+    for server in ["server-01", "server-02", "server-03"] {
+        let remote = LocalTransport::new(remotes_base.join(server))?;
+        assert!(
+            !remote.exists(&deploy::layout::operation_lock()),
+            "the lock file must be removed when the guard drops ({server})"
+        );
+        let helper = RemoteHelper::new(&remote);
+        assert!(
+            helper.acquire_lock("op-after", false).is_ok(),
+            "another operation must be able to acquire the lock after the failure ({server})"
+        );
+        // Release the probe lock so the end-to-end re-push below starts clean.
+        helper.release_lock("op-after")?;
+    }
+
+    // End-to-end: a second push (a fresh operation) reconciles and reports
+    // "Everything up to date" — it would have failed with "mutation lock held
+    // by ..." during reconciliation if the step-17 error had leaked the lock.
+    let r2 = push(
+        &config_path,
+        &store,
+        &fault_factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r2.message, "Everything up to date");
     Ok(())
 }
 

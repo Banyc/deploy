@@ -664,6 +664,42 @@ mod tests {
             "generation root symlink must exist"
         );
     }
+
+    /// The RAII lock guard releases the server mutation lock on drop, even
+    /// when the guarded block exits through an error path (no explicit
+    /// release): after the guard drops, a fresh operation can acquire the
+    /// lock again and the lock file is gone. This is the property the two
+    /// rotation paths rely on — a manual acquire/release pair would leak the
+    /// lock on a `?` error and strand every later operation on the slot.
+    #[test]
+    fn lock_guard_releases_on_drop_after_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let helper = RemoteHelper::new(&remote);
+
+        {
+            let _guard = helper.acquire_lock_guard("op-1").expect("lock acquired");
+            // While the guard is alive the lock is held: a second operation
+            // cannot acquire it.
+            assert!(
+                helper.acquire_lock("op-2", false).is_err(),
+                "a second operation must not acquire a held lock"
+            );
+            // Simulate an error path: the guard drops here (scope exit)
+            // without any explicit release.
+        }
+
+        // After the guard dropped, the lock file is gone and another
+        // operation can acquire the lock.
+        assert!(
+            !remote.exists(&layout::operation_lock()),
+            "the lock file must be removed on drop"
+        );
+        assert!(
+            helper.acquire_lock("op-2", false).is_ok(),
+            "the lock must be released when the guard drops"
+        );
+    }
 }
 
 #[cfg(test)]

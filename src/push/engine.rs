@@ -1131,11 +1131,16 @@ fn push_inner(
     // slot ended up running.
     for sid in &servers_order {
         let helper = &helpers[sid];
-        if helper.acquire_lock(op_id.as_str(), false).is_ok() {
+        // The mutation lock is held via an RAII guard for the whole rotation
+        // block, so a `?` error from `compute_retained` or `rotate` releases
+        // the lock on drop instead of leaking it (a manual acquire/release
+        // pair would strand every later operation on this slot with "mutation
+        // lock held by ..."). Rotation errors still propagate exactly as
+        // before; only the lock discipline changes.
+        if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
             let retained = compute_retained(helper, &config.pins, store, &target.rotation)?;
             let active_incoming = HashSet::from([deployment_id.as_str().to_string()]);
             helper.rotate(&retained, &active_incoming)?;
-            helper.release_lock(op_id.as_str())?;
         }
         // Clean up this deployment's incoming directory. Best-effort by
         // design: the push already succeeded, so a leftover here cannot change
