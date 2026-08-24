@@ -368,7 +368,10 @@ pub struct SlotDef {
     /// this is a membership list: each target's member slots are derived by
     /// scanning every variant's slots for its name. A slot with an empty list
     /// belongs to no target and is rejected at validation (mirroring the
-    /// rule that a target must have at least one member). TOML form:
+    /// rule that a target must have at least one member). A name must not
+    /// appear twice: a duplicate adds no membership yet would change the
+    /// release identity, so it is rejected at validation (the canonical form
+    /// additionally dedups defensively). TOML form:
     /// `targets = ["production", "staging"]`.
     #[serde(default)]
     pub targets: Vec<String>,
@@ -529,8 +532,10 @@ impl Config {
         // exist among the top-level `[[servers]]` entries, each declared target
         // in a slot's `targets` list must exist among the top-level
         // `[targets.<name>]` keys (and the list must be non-empty — a slot in
-        // no target is useless), and a (server, deploy_dir) pair names one
-        // on-server deployment location that exactly one slot may own.
+        // no target is useless — and must not repeat a name: a duplicate would
+        // change release identity without changing membership), and a
+        // (server, deploy_dir) pair names one on-server deployment location
+        // that exactly one slot may own.
         let mut slot_ids = std::collections::HashSet::new();
         let mut bound_locations: std::collections::BTreeMap<(&str, &Path), &str> =
             std::collections::BTreeMap::new();
@@ -554,7 +559,14 @@ impl Config {
                         p.id
                     )));
                 }
+                let mut seen_targets = std::collections::HashSet::new();
                 for t in &p.targets {
+                    if !seen_targets.insert(t) {
+                        return Err(Error::config(format!(
+                            "variant '{vname}': slot '{}' declares duplicate target '{}'",
+                            p.id, t
+                        )));
+                    }
                     if !self.targets.contains_key(t) {
                         return Err(Error::config(format!(
                             "variant '{vname}': slot '{}' references unknown target '{}'",
@@ -1392,6 +1404,28 @@ slots = ["p1"]
         assert!(
             msg.contains("duplicate slot id 'p1'") && msg.contains("variant 'standard'"),
             "error must name the duplicate id and the variant where the collision was found, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn duplicate_target_names_in_a_slot_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        // A slot declaring the same target twice: the duplicate adds no
+        // membership yet would change release identity, so it is rejected.
+        let dup = format!(
+            "{MINIMAL_VARIANT}\n[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntargets = [\"t1\", \"t1\"]\ndeploy_dir = \"/srv/forced\"\n"
+        );
+        std::fs::write(project.join("releases/v1/standard.toml"), dup).unwrap();
+        let p = project.join("deploy.toml");
+        std::fs::write(&p, deploy_toml("v1")).unwrap();
+        let err = Config::load(&p).expect_err("duplicate target name in a slot must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate target 't1'") && msg.contains("slot 'p1'"),
+            "error must name the duplicate target and the slot, got: {msg}"
         );
     }
 

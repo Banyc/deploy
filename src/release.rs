@@ -100,9 +100,12 @@ pub fn normalize_deploy_dir(path: &Path) -> String {
 /// Canonicalize a variant's declared `[[slots]]` into the sorted, normalized
 /// identity form: exactly the four identity-bearing fields of [`SlotDef`]
 /// (`id`, `server`, `deploy_dir` as a lexically-normalized absolute path
-/// string, `targets` SORTED), sorted by slot id. Server-level policy (user,
-/// address, port, capacity) is deliberately absent — it is not release
-/// identity.
+/// string, `targets` SORTED and DEDUPLICATED), sorted by slot id. The
+/// `targets` dedup is defensive: a duplicate name adds no membership, so a
+/// record that slipped past validation (or predates it) must still
+/// canonicalize to the same identity as the deduplicated list — duplicate
+/// noise never shifts the digest. Server-level policy (user, address, port,
+/// capacity) is deliberately absent — it is not release identity.
 pub fn canonicalize_slots(slots: &[SlotDef]) -> CanonicalSlots {
     let mut out: Vec<CanonicalSlot> = slots
         .iter()
@@ -113,6 +116,7 @@ pub fn canonicalize_slots(slots: &[SlotDef]) -> CanonicalSlots {
             targets: {
                 let mut t = s.targets.clone();
                 t.sort();
+                t.dedup();
                 t
             },
         })
@@ -123,13 +127,13 @@ pub fn canonicalize_slots(slots: &[SlotDef]) -> CanonicalSlots {
 
 /// Canonical digest over name-sorted per-variant slot declarations. Each
 /// variant's slots are canonicalized (the four identity fields, `deploy_dir`
-/// lexically normalized, `targets` sorted) and sorted by slot id; the
-/// variants are name-sorted by the `BTreeMap`. Two releases share this digest
-/// only when every declared variant declares the same slots — a rebind,
-/// `deploy_dir` move, or target-membership change alters it, while a
-/// reordering of slot declarations (or of variants, or of a slot's `targets`
-/// list) does not. Server-level policy (user/address/port/capacity) is not
-/// part of it.
+/// lexically normalized, `targets` sorted and deduplicated) and sorted by
+/// slot id; the variants are name-sorted by the `BTreeMap`. Two releases
+/// share this digest only when every declared variant declares the same
+/// slots — a rebind, `deploy_dir` move, or target-membership change alters
+/// it, while a reordering of slot declarations (or of variants, or of a
+/// slot's `targets` list, or duplicate names in it — deduplicated away) does
+/// not. Server-level policy (user/address/port/capacity) is not part of it.
 pub fn variant_slots_digest(slots: &BTreeMap<String, Vec<SlotDef>>) -> String {
     let canonical: BTreeMap<String, CanonicalSlots> = slots
         .iter()
@@ -417,6 +421,54 @@ mod tests {
             variant_slots_digest(&reordered),
             variant_slots_digest(&added),
             "targets list order must not affect the digest"
+        );
+    }
+
+    /// Duplicate names in a slot's `targets` list add no membership, so the
+    /// canonical form DEDUPS them: `["t1","t1"]` and `["t1"]` produce the
+    /// SAME digest (a record that slipped past validation, or predates it,
+    /// must not shift release identity), while a change that DOES alter
+    /// membership (adding a distinct target) still changes the digest.
+    #[test]
+    fn variant_slots_digest_dedups_duplicate_targets() {
+        let single: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+            "standard".to_string(),
+            vec![SlotDef {
+                id: "p1".to_string(),
+                server: "server-01".to_string(),
+                deploy_dir: PathBuf::from("/srv/deploy/example"),
+                targets: vec!["t1".to_string()],
+            }],
+        )]);
+        let duplicated: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+            "standard".to_string(),
+            vec![SlotDef {
+                id: "p1".to_string(),
+                server: "server-01".to_string(),
+                deploy_dir: PathBuf::from("/srv/deploy/example"),
+                targets: vec!["t1".to_string(), "t1".to_string()],
+            }],
+        )]);
+        assert_eq!(
+            variant_slots_digest(&single),
+            variant_slots_digest(&duplicated),
+            "a duplicated target name must not change the digest (membership is unchanged)"
+        );
+
+        // A change that DOES alter membership still changes the digest.
+        let added: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+            "standard".to_string(),
+            vec![SlotDef {
+                id: "p1".to_string(),
+                server: "server-01".to_string(),
+                deploy_dir: PathBuf::from("/srv/deploy/example"),
+                targets: vec!["t1".to_string(), "t2".to_string()],
+            }],
+        )]);
+        assert_ne!(
+            variant_slots_digest(&single),
+            variant_slots_digest(&added),
+            "a target-membership change must still alter the digest"
         );
     }
 
