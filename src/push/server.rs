@@ -398,12 +398,13 @@ pub(crate) fn compensate_server(
             // Re-run prior activation contract + verification. A failure means the
             // service was not actually restored to prior behavior, so propagate
             // it as a compensation failure (the attempt is marked Degraded).
-            // The prior contract is rendered with the PRIOR artifact: its own
-            // release (the immutable ReleaseId), variant, and tree move
-            // together via `with_artifact`, so a restored slot that switches
-            // variants never renders a torn combination (e.g. the prior
-            // variant with the desired release/tree).
-            let prior_vars = template_vars.with_artifact(&prior_assignment.artifact);
+            // The prior contract is rendered with the PRIOR assignment: its own
+            // release (the immutable ReleaseId), variant, tree, AND the prior
+            // deployment identity (`deployment_id`/`generation`) move together
+            // via `with_assignment`, so a restored slot never renders a torn
+            // combination (e.g. the prior variant with the desired release, or
+            // the prior artifact with the failed generation's deployment id).
+            let prior_vars = template_vars.with_assignment(&prior_assignment);
             run_activation(remote, &root, &prior_behavior.activation, &prior_vars)
                 .map_err(|e| Error::remote(format!("compensation activation failed: {e}")))?;
             run_verification(remote, &prior_behavior.verification, &prior_vars)
@@ -938,10 +939,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     }
 
     /// Compensation re-runs the PRIOR generation's activation contract with the
-    /// PRIOR artifact's identity: the unit it installs renders the PRIOR
-    /// immutable release id (`{{ release }}`), variant, and tree — never a torn
-    /// mix of the desired release with the prior variant. This pins the
-    /// `TemplateVars::with_artifact` path through the real systemd adapter.
+    /// PRIOR assignment's identity: the unit it installs renders the PRIOR
+    /// immutable release id (`{{ release }}`), variant, tree, AND the prior
+    /// deployment identity (`{{ deployment_id }}`/`{{ generation }}`) — never a
+    /// torn mix of the desired release with the prior variant, and never the
+    /// failed generation's deployment id. This pins the
+    /// `TemplateVars::with_assignment` path through the real systemd adapter.
     #[test]
     fn compensation_renders_prior_artifact_release_id() {
         let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
@@ -979,12 +982,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     ("deployment/common/README", "common"),
                     (
                         "units/example.service",
-                        "[Service]\nExecStart=/srv/eng/bin/server --release={{ release }} --variant={{ variant }} --tree={{ tree }}\n",
+                        "[Service]\nExecStart=/srv/eng/bin/server --release={{ release }} --variant={{ variant }} --tree={{ tree }} --deployment={{ deployment_id }} --generation={{ generation }}\n",
                     ),
                 ],
             );
-            // First deploy: establishes the PRIOR generation whose artifact
-            // carries the immutable release id `rel-sha256-r1`.
+            // First deploy: establishes the PRIOR generation whose assignment
+            // carries the immutable release id `rel-sha256-r1` and the PRIOR
+            // deployment identity (deployment_id + generation_id).
             let first = h.run(None);
             assert_eq!(
                 first.kind,
@@ -992,13 +996,22 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "first deploy must activate: {:?}",
                 first.error
             );
+            // The prior generation's assignment is the source of truth for the
+            // five values compensation must render: read it back from the
+            // remote record (generations/<gen>/assignment.json).
+            let prior_assignment = h
+                .helper()
+                .read_assignment(first.generation.as_str())
+                .unwrap();
 
             // A subsequent (desired) push fails activation and the engine
             // compensates back to the prior generation. Drive the same
             // compensation directly: the desired artifact's vars carry a
-            // DIFFERENT release/tree than the prior artifact.
+            // DIFFERENT release/tree AND a DIFFERENT (failed) deployment
+            // identity than the prior assignment.
             let op_id = OperationId::generate();
-            let deployment_id = DeploymentId::generate();
+            let failed_deployment_id = DeploymentId::generate();
+            let failed_generation = GenerationId::generate();
             let members = h.config.target_slots("t1").unwrap();
             let (slot, server) = members[0];
             let desired = ArtifactRef {
@@ -1017,8 +1030,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .with_server(&server.user, &server.address, server.port)
             .with_slot_id(&slot.id)
             .with_deployment(
-                Some(&deployment_id),
-                Some(&GenerationId::generate()),
+                Some(&failed_deployment_id),
+                Some(&failed_generation),
                 Some(&desired.tree),
             );
             let helper = h.helper();
@@ -1039,7 +1052,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &h.remote,
                 &helper,
                 &op_id,
-                &deployment_id,
+                &failed_deployment_id,
                 Some(&first.generation),
                 &first.generation, // current still points at the first generation
                 &h.config,
@@ -1048,13 +1061,18 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .map_err(|e| e.to_string())?;
             assert!(ok, "compensation must restore the prior generation");
 
-            // The installed unit was re-rendered with the PRIOR artifact: its
-            // own immutable release id, variant, and tree — never the desired
-            // release/tree the failed push would have rendered.
+            // The installed unit was re-rendered with the PRIOR assignment:
+            // its own immutable release id, variant, tree, AND the prior
+            // deployment identity (`deployment_id`/`generation`) — never the
+            // desired release/tree or the failed generation's identities the
+            // failed push would have rendered.
             let installed =
                 std::fs::read_to_string(config_home.join("systemd/user/example.service")).unwrap();
             assert!(
-                installed.contains("--release=rel-sha256-r1"),
+                installed.contains(&format!(
+                    "--release={}",
+                    prior_assignment.artifact.release.as_str()
+                )),
                 "compensated unit must render the PRIOR release id, got: {installed}"
             );
             assert!(
@@ -1062,9 +1080,33 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "compensated unit must not render the desired release, got: {installed}"
             );
             assert!(
-                installed.contains("--variant=standard")
-                    && installed.contains(&format!("--tree={}", h.tree.as_str())),
+                installed.contains(&format!(
+                    "--variant={}",
+                    prior_assignment.artifact.variant.as_str()
+                )) && installed.contains(&format!(
+                    "--tree={}",
+                    prior_assignment.artifact.tree.as_str()
+                )),
                 "compensated unit must render the prior variant/tree, got: {installed}"
+            );
+            assert!(
+                installed.contains(&format!(
+                    "--deployment={}",
+                    prior_assignment.deployment_id.as_str()
+                )),
+                "compensated unit must render the PRIOR deployment id, got: {installed}"
+            );
+            assert!(
+                installed.contains(&format!(
+                    "--generation={}",
+                    prior_assignment.generation_id.as_str()
+                )),
+                "compensated unit must render the PRIOR generation id, got: {installed}"
+            );
+            assert!(
+                !installed.contains(&format!("--deployment={}", failed_deployment_id.as_str()))
+                    && !installed.contains(&format!("--generation={}", failed_generation.as_str())),
+                "compensated unit must not render the failed generation's identities, got: {installed}"
             );
             Ok::<(), String>(())
         })();

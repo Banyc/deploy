@@ -34,6 +34,7 @@
 //! | slot + [`TemplateVars::with_slot_id`]               | ... + `slot`                                               |
 //! | slot + [`TemplateVars::with_deployment`]            | ... + `deployment_id`, `generation`, `tree`                |
 //! | slot + [`TemplateVars::with_artifact`]              | replaces `release`, `variant`, `tree` from one `ArtifactRef` |
+//! | slot + [`TemplateVars::with_assignment`]            | replaces `release`, `variant`, `tree`, `deployment_id`, `generation` from one `GenerationAssignment` |
 //!
 //! Materialization is the constrained case: trees are content-addressed and
 //! shared across slots, so mapping paths may only use per-variant values
@@ -228,6 +229,31 @@ impl TemplateVars {
         out.variant = Some(artifact.variant.as_str().to_string());
         out.release = Some(artifact.release.as_str().to_string());
         out.tree = Some(artifact.tree.as_str().to_string());
+        out
+    }
+
+    /// Same context with the FIVE deployment-scoped variables replaced from
+    /// ONE [`crate::remote::helper::GenerationAssignment`]: `variant`,
+    /// `release`, and `tree` from the assignment's artifact, plus
+    /// `deployment_id` and `generation` from the assignment's own identity
+    /// fields. The deployment identity must move WITH the artifact: a
+    /// compensation-rendered unit/argv describes the PRIOR generation, so it
+    /// must carry the prior deployment's `deployment_id`/`generation`, never
+    /// the failed (new) generation's. This supersedes
+    /// [`TemplateVars::with_artifact`] for compensation, which replaces only
+    /// the artifact triple and would leave the deployment identity pointing at
+    /// the failed generation. Everything else (deploy_dir, application, server
+    /// metadata, ...) is unchanged.
+    pub fn with_assignment(
+        &self,
+        assignment: &crate::remote::helper::GenerationAssignment,
+    ) -> TemplateVars {
+        let mut out = self.clone();
+        out.variant = Some(assignment.artifact.variant.as_str().to_string());
+        out.release = Some(assignment.artifact.release.as_str().to_string());
+        out.tree = Some(assignment.artifact.tree.as_str().to_string());
+        out.deployment_id = Some(assignment.deployment_id.as_str().to_string());
+        out.generation = Some(assignment.generation_id.as_str().to_string());
         out
     }
 
@@ -578,6 +604,70 @@ mod tests {
             "rel-sha256-111"
         );
         assert_eq!(render_template("{{ variant }}", &v).unwrap(), "standard");
+    }
+
+    #[test]
+    fn with_assignment_replaces_all_five_from_one_assignment() {
+        let v = TemplateVars::slot(
+            Path::new("/srv/a"),
+            "standard",
+            "app",
+            "rel-sha256-111",
+            "prod",
+            "s1",
+        )
+        .with_server("deploy", "10.0.0.5", 22)
+        .with_slot_id("app-1")
+        .with_deployment(
+            Some(&DeploymentId::new("d-failed")),
+            Some(&GenerationId::new("g-failed")),
+            Some(&TreeDigest::new("t-failed")),
+        );
+        // The prior assignment differs in every one of the five values: a
+        // historical release, a different variant/tree, and the PRIOR
+        // deployment identity (not the failed generation's).
+        let prior = v.with_assignment(&crate::remote::helper::GenerationAssignment {
+            deployment_id: DeploymentId::new("d-prior"),
+            generation_id: GenerationId::new("g-prior"),
+            artifact: ArtifactRef {
+                release: ReleaseId::new("rel-sha256-999"),
+                variant: VariantName::new("legacy"),
+                tree: TreeDigest::new("t9"),
+            },
+            behavior_sha256: "b".to_string(),
+            prior_generation: None,
+            created_at: "2020-01-01T00:00:00Z".to_string(),
+        });
+        // All five move TOGETHER from the one assignment: never a torn
+        // combination (prior artifact with the failed deployment identity).
+        assert_eq!(
+            render_template(
+                "{{ variant }}|{{ release }}|{{ tree }}|{{ deployment_id }}|{{ generation }}",
+                &prior
+            )
+            .unwrap(),
+            "legacy|rel-sha256-999|t9|d-prior|g-prior"
+        );
+        // The failed generation's identities are gone from the prior context.
+        assert!(
+            !render_template("{{ deployment_id }}", &prior)
+                .unwrap()
+                .contains("d-failed")
+        );
+        assert!(
+            !render_template("{{ generation }}", &prior)
+                .unwrap()
+                .contains("g-failed")
+        );
+        // The source context is unchanged (with_assignment clones).
+        assert_eq!(
+            render_template("{{ deployment_id }}", &v).unwrap(),
+            "d-failed"
+        );
+        assert_eq!(
+            render_template("{{ release }}", &v).unwrap(),
+            "rel-sha256-111"
+        );
     }
 
     #[test]

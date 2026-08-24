@@ -56,8 +56,11 @@ type RemoteFactory =
 /// immutable `ReleaseId`, `VariantName`, and `TreeDigest` — never the caller's
 /// current release name — so a historical/rollback push renders the release id
 /// it actually deploys, and a template never sees a torn (desired-variant,
-/// current-release) combination. Compensation overrides the triple again with
-/// the PRIOR artifact via [`crate::template::TemplateVars::with_artifact`].
+/// current-release) combination. Compensation overrides the five
+/// deployment-scoped values again with the PRIOR assignment via
+/// [`crate::template::TemplateVars::with_assignment`]: the prior artifact's
+/// release/variant/tree AND the prior deployment identity
+/// (`deployment_id`/`generation`) move together.
 ///
 /// `deployment_id`/`generation` are the per-deployment identity, available
 /// only in the per-server activation/verification path; sites that do not know
