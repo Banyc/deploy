@@ -479,8 +479,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             ref_token: Some("production@f0".to_string()),
         },
     )
-    .err()
-    .expect("rebound slot must refuse exact rollback");
+    .expect_err("rebound slot must refuse exact rollback");
     let msg = err.to_string();
     assert!(
         msg.contains(
@@ -663,8 +662,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             ref_token: Some("production@f0".to_string()),
         },
     )
-    .err()
-    .expect("moved deploy_dir must refuse exact rollback");
+    .expect_err("moved deploy_dir must refuse exact rollback");
     let msg = err.to_string();
     assert!(
         msg.contains(
@@ -748,8 +746,7 @@ fn fleet_rollback_after_variant_rename_succeeds() -> Result<()> {
     std::fs::create_dir_all(&remotes_base).unwrap();
 
     fn config_toml() -> String {
-        format!(
-            r#"
+        r#"
 schema_version = 1
 application = "example"
 release = "v1"
@@ -761,9 +758,9 @@ user = "deploy"
 host_key_fingerprint = "SHA256:test"
 
 [targets.production]
-rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 "#
-        )
+        .to_string()
     }
 
     // f0: deploy variant `old`. The slot is declared inside the variant file
@@ -2397,8 +2394,7 @@ fn capacity_rotation_compute_retained_failure_releases_lock() -> Result<()> {
             ref_token: None,
         },
     )
-    .err()
-    .expect("the injected compute_retained failure must fail the push");
+    .expect_err("the injected compute_retained failure must fail the push");
     assert!(
         err.to_string().contains("generations"),
         "expected the injected rotation read failure, got: {err}"
@@ -3847,8 +3843,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             ref_token: Some("production@f0".to_string()),
         },
     )
-    .err()
-    .expect("huge current reserve must fail the historical rollback");
+    .expect_err("huge current reserve must fail the historical rollback");
     assert!(
         err.to_string().contains("insufficient capacity"),
         "error must be a capacity preflight failure, got: {err}"
@@ -4061,7 +4056,7 @@ fn server_policy_change_does_not_change_release_identity() -> Result<()> {
     let first = r0.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")].clone();
 
     // Policy-only change: identical inputs except the server's user + address.
-    let body = std::fs::read_to_string(&proj.join("deploy.toml"))?;
+    let body = std::fs::read_to_string(proj.join("deploy.toml"))?;
     let changed = body
         .replace("user = \"deploy\"", "user = \"deployer\"")
         .replace(
@@ -4069,7 +4064,7 @@ fn server_policy_change_does_not_change_release_identity() -> Result<()> {
             "address = \"server-01.internal.example.com\"",
         );
     assert_ne!(body, changed, "policy line must be replaceable");
-    std::fs::write(&proj.join("deploy.toml"), changed).unwrap();
+    std::fs::write(proj.join("deploy.toml"), changed).unwrap();
     let config2 = Config::load(&proj.join("deploy.toml"))?;
     assert_eq!(config2.servers[0].user, "deployer");
 
@@ -4202,8 +4197,7 @@ fn slot_in_two_targets_deploys_per_target_and_rolls_back_each() -> Result<()> {
 
     // One slot p1 on server-01, declared in the `standard` variant, belonging
     // to BOTH `production` and `staging`.
-    let variant = format!(
-        r#"
+    let variant = r#"
 [[slots]]
 id = "p1"
 server = "server-01"
@@ -4225,10 +4219,9 @@ timeout_seconds = 5
 attempts = 1
 interval_seconds = 0
 "#
-    );
+    .to_string();
     write_variant_file(&proj, "standard", &variant);
-    let manifest = format!(
-        r#"
+    let manifest = r#"
 schema_version = 1
 application = "example"
 release = "v1"
@@ -4256,12 +4249,12 @@ user = "deploy"
 host_key_fingerprint = "SHA256:test"
 
 [targets.production]
-rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 
 [targets.staging]
-rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 "#
-    );
+    .to_string();
     write_file(&proj.join("deploy.toml"), &manifest);
     let artifacts = proj.join("releases").join("v1").join("artifacts");
     write_file(&artifacts.join("build/output/app/server"), "server-v1\n");

@@ -25,7 +25,6 @@ use std::path::Path;
 /// behavior, and trees only. Rotation (used for the protected pre-rotation) is
 /// target-level configuration from `deploy.toml`; a shared slot's retained set
 /// is the union of every member target's policy.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn capacity_preflight(
     store: &LocalStore,
     assignments: &[crate::push::plan::PlannedAssignment],
@@ -329,7 +328,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         };
         capacity_preflight(
             &store,
-            &[assignment.clone()],
+            std::slice::from_ref(&assignment),
             &helpers,
             &op_id,
             &deployment_id,
@@ -345,7 +344,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         };
         let err = capacity_preflight(
             &store,
-            &[assignment.clone()],
+            std::slice::from_ref(&assignment),
             &helpers,
             &op_id,
             &deployment_id,
@@ -368,7 +367,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         };
         let err = capacity_preflight(
             &store,
-            &[assignment.clone()],
+            std::slice::from_ref(&assignment),
             &helpers,
             &op_id,
             &deployment_id,
@@ -390,7 +389,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         };
         capacity_preflight(
             &store,
-            &[assignment.clone()],
+            std::slice::from_ref(&assignment),
             &helpers,
             &op_id,
             &deployment_id,

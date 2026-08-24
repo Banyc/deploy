@@ -974,7 +974,7 @@ mod tests {
         let cmd = SshTransport::rename_cmd(
             t.root(),
             Path::new(".current.tmp.op-x"),
-            &crate::layout::current(),
+            crate::layout::current(),
         );
         assert!(
             cmd.contains("mv -T"),

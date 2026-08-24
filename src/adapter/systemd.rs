@@ -707,10 +707,10 @@ pub(crate) mod tests {
             "tree content root has no nested root dir: a root/root double-join would ENOENT"
         );
 
-        let result = (|| {
+        let result = {
             let c = cfg(ActivationScope::User, vec!["example.service"]);
             run_activation(&remote, &generation_root, &c, &slot_vars())
-        })();
+        };
         match old_path {
             Some(p) => unsafe { std::env::set_var("PATH", p) },
             None => unsafe { std::env::remove_var("PATH") },

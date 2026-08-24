@@ -605,7 +605,7 @@ impl Config {
         // independently for each target the slot declares, so the same two
         // slots may share one server in DIFFERENT targets (each target's
         // per-server uniqueness is scoped to that target alone).
-        for (tname, _target) in &self.targets {
+        for tname in self.targets.keys() {
             let mut used_servers = std::collections::HashSet::new();
             let mut members = 0;
             for slot in self.slot_defs() {

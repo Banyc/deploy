@@ -8,7 +8,7 @@
 //! per-server rotation.
 
 use crate::adapter::verify::run_verification;
-use crate::config::{Config, Mapping, Pin, RotationConfig, SlotDef};
+use crate::config::{Config, Mapping, SlotDef};
 use crate::error::{Error, Result};
 use crate::history::{self, PushRef};
 use crate::layout;
@@ -40,6 +40,7 @@ pub struct PushOptions {
     pub ref_token: Option<String>,
 }
 
+#[derive(Debug)]
 pub struct PushReport {
     /// `None` means no attempt was created (dry-run or already up to date).
     pub status: Option<DeploymentStatus>,
@@ -264,6 +265,14 @@ pub(crate) fn push_ref_with_id(
     )
 }
 
+// The 10 parameters are the full push operation (data: project_root, store,
+// factory, target_name, pref, deployment_id, op_id; policy: config, target,
+// opts). The `config` + `opts` pair is already the settings half, and
+// `target`/`project_root` are derived views of it. Bundling all three policy
+// args into one settings struct is a dedicated refactor (deferred: it would
+// touch every internal `config`/`target`/`opts` reference in this ~1200-line
+// body with no behavioral gain), so the allow documents the deliberate
+// choice rather than a band-aid.
 #[allow(clippy::too_many_arguments)]
 fn push_inner(
     project_root: &Path,
@@ -726,7 +735,6 @@ fn push_inner(
                 let deferred = retry_deferred_rotations(
                     store,
                     config,
-                    target,
                     target_name,
                     &helpers,
                     op_id,
@@ -1091,14 +1099,6 @@ fn push_inner(
             let helper = &helpers[sid];
             // Hold the lock for the whole commit step so a failure cannot leak it
             // (a `?` on a manual lock would otherwise leave the lock held).
-            // The slot's FULL member target list (union retention), resolved
-            // from the current config.
-            let slot_targets: Vec<String> = config
-                .slot_defs()
-                .iter()
-                .find(|s| s.id.as_str() == sid.as_str())
-                .map(|s| s.targets.clone())
-                .unwrap_or_default();
             let _guard = match helper.acquire_lock_guard(op_id.as_str()) {
                 Ok(g) => g,
                 Err(_) => {
@@ -1390,7 +1390,6 @@ fn push_inner(
     maintenance.extend(retry_deferred_rotations(
         store,
         config,
-        target,
         target_name,
         &helpers,
         op_id,
@@ -1407,14 +1406,7 @@ fn push_inner(
             .map(|s| s.targets.clone())
             .unwrap_or_default();
         if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
-            match rotate_slot_locked(
-                helper,
-                &config.pins,
-                store,
-                config,
-                &slot_targets,
-                deployment_id,
-            ) {
+            match rotate_slot_locked(helper, store, config, &slot_targets, deployment_id) {
                 Ok(()) => {
                     // Maintenance done for this slot: clear any marker left by
                     // an earlier push whose rotation failed after commit. The
@@ -1491,16 +1483,16 @@ fn push_inner(
 /// retries, so both paths apply the same retention semantics and the same
 /// lock discipline. `deployment_id` marks this operation's incoming
 /// directory as active so rotation never sweeps a deployment currently being
-/// published.
+/// published. Pins are the config's own pins (policy lives in the
+/// caller-supplied `config` settings object, never a separate argument).
 fn rotate_slot_locked(
     helper: &RemoteHelper,
-    pins: &[Pin],
     store: &LocalStore,
     config: &Config,
     slot_targets: &[String],
     deployment_id: &DeploymentId,
 ) -> Result<()> {
-    let retained = compute_retained(helper, pins, store, config, slot_targets)?;
+    let retained = compute_retained(helper, &config.pins, store, config, slot_targets)?;
     let active_incoming = HashSet::from([deployment_id.as_str().to_string()]);
     helper.rotate(&retained, &active_incoming)?;
     Ok(())
@@ -1565,13 +1557,13 @@ fn clear_rotation_deferred(
             return warnings;
         }
     };
-    if debt.remove(slot.as_str()).is_some() {
-        if let Err(e) = store.write_rotation_debt(target, &debt) {
-            warnings.push(format!(
-                "rotation debt maintenance deferred: failed to clear rotation debt for \
-                 '{target}': {e}"
-            ));
-        }
+    if debt.remove(slot.as_str()).is_some()
+        && let Err(e) = store.write_rotation_debt(target, &debt)
+    {
+        warnings.push(format!(
+            "rotation debt maintenance deferred: failed to clear rotation debt for \
+             '{target}': {e}"
+        ));
     }
     warnings
 }
@@ -1675,7 +1667,7 @@ fn refresh_observed(
     }
 }
 
-/// Retry deferred post-commit rotation maintenance for `target`: every slot
+/// Retry deferred post-commit rotation maintenance for `target_name`: every slot
 /// carrying a debt marker gets its rotation re-attempted under the slot's
 /// mutation lock (the same RAII-guarded block as step 17). Success clears the
 /// marker; failure keeps it and refreshes its reason. Runs on later pushes —
@@ -1690,7 +1682,6 @@ fn refresh_observed(
 fn retry_deferred_rotations(
     store: &LocalStore,
     config: &Config,
-    target: &crate::config::TargetDef,
     target_name: &str,
     helpers: &HashMap<PlacementSlotId, RemoteHelper>,
     op_id: &OperationId,
@@ -1733,14 +1724,7 @@ fn retry_deferred_rotations(
                 .find(|s| s.id.as_str() == slot_str.as_str())
                 .map(|s| s.targets.clone())
                 .unwrap_or_default();
-            match rotate_slot_locked(
-                helper,
-                &config.pins,
-                store,
-                config,
-                &slot_targets,
-                deployment_id,
-            ) {
+            match rotate_slot_locked(helper, store, config, &slot_targets, deployment_id) {
                 Ok(()) => serviced.push(slot_str.clone()),
                 Err(e) => {
                     // Keep the marker with the fresh reason.
@@ -2648,9 +2632,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             h.store
                 .fault_registry()
                 .arm_append_snapshot(attempt.deployment_id.as_str());
-            push_clean(&h)
-                .err()
-                .expect("push must abort when the snapshot append fails")
+            push_clean(&h).expect_err("push must abort when the snapshot append fails")
         };
         assert!(
             err.to_string().contains("append_snapshot"),
@@ -2684,9 +2666,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             h.store
                 .fault_registry()
                 .arm_write_last_successful(attempt.deployment_id.as_str());
-            push_clean(&h)
-                .err()
-                .expect("push must abort when the last-successful write fails")
+            push_clean(&h).expect_err("push must abort when the last-successful write fails")
         };
         assert!(
             err.to_string().contains("write_last_successful"),
@@ -2720,9 +2700,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             h.store
                 .fault_registry()
                 .arm_append_transition(attempt.deployment_id.as_str());
-            push_clean(&h)
-                .err()
-                .expect("push must abort when the final transition append fails")
+            push_clean(&h).expect_err("push must abort when the final transition append fails")
         };
         assert!(
             err.to_string().contains("append_transition"),
@@ -2796,7 +2774,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// healthy `LocalTransport` remotes (no injected remote faults). Drives
     /// the FULL normal success path (`push_inner`) so a test can arm store
     /// faults keyed by the fixed deployment id BEFORE the push runs.
-
     fn push_main_with_id(h: &RecoveryHarness, deployment_id: &DeploymentId) -> Result<PushReport> {
         let project_root = h.config.project_root(&h.cfg_path);
         let target = h
@@ -2848,9 +2825,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // `refs/last-successful`.
         let err = {
             h.store.fault_registry().arm_append_snapshot(id.as_str());
-            push_main_with_id(&h, &id)
-                .err()
-                .expect("push must abort when the snapshot append fails")
+            push_main_with_id(&h, &id).expect_err("push must abort when the snapshot append fails")
         };
         assert!(
             err.to_string().contains("append_snapshot"),
@@ -2896,8 +2871,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 .fault_registry()
                 .arm_write_last_successful(id.as_str());
             push_main_with_id(&h, &id)
-                .err()
-                .expect("push must abort when the last-successful write fails")
+                .expect_err("push must abort when the last-successful write fails")
         };
         assert!(
             err.to_string().contains("write_last_successful"),
@@ -2937,8 +2911,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 .fault_registry()
                 .arm_append_transition_successful(id.as_str());
             push_main_with_id(&h, &id)
-                .err()
-                .expect("push must abort when the final transition append fails")
+                .expect_err("push must abort when the final transition append fails")
         };
         assert!(
             err.to_string().contains("append_transition"),
@@ -3155,9 +3128,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let id = DeploymentId::new("deploy-intent-fault".to_string());
         let err = {
             h.store.fault_registry().arm_append_attempt(id.as_str());
-            push_main_with_id(&h, &id)
-                .err()
-                .expect("push must abort when the intent persist fails")
+            push_main_with_id(&h, &id).expect_err("push must abort when the intent persist fails")
         };
         assert!(
             err.to_string().contains("append_attempt"),
@@ -3209,9 +3180,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let id = DeploymentId::new("deploy-inprogress-no-results".to_string());
         let err = {
             h.store.fault_registry().arm_write_results(id.as_str());
-            push_main_with_id(&h, &id)
-                .err()
-                .expect("push must abort when write_results fails")
+            push_main_with_id(&h, &id).expect_err("push must abort when write_results fails")
         };
         assert!(err.to_string().contains("write_results"));
 
@@ -3285,8 +3254,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 .fault_registry()
                 .arm_append_transition_pending(id.as_str());
             push_main_with_id(&h, &id)
-                .err()
-                .expect("push must abort when the finalize marker append fails")
+                .expect_err("push must abort when the finalize marker append fails")
         };
         assert!(
             err.to_string().contains("append_transition"),
@@ -4048,9 +4016,7 @@ interval_seconds = 0
             h.store
                 .fault_registry()
                 .arm_append_transition_successful(id.as_str());
-            push_main_with_id(&h, &id)
-                .err()
-                .expect("first faulted push must abort")
+            push_main_with_id(&h, &id).expect_err("first faulted push must abort")
         };
         assert!(err.to_string().contains("append_transition"));
         assert_eq!(
@@ -4065,9 +4031,7 @@ interval_seconds = 0
             h.store
                 .fault_registry()
                 .arm_append_transition_successful(id.as_str());
-            push_clean(&h)
-                .err()
-                .expect("second faulted replay must abort")
+            push_clean(&h).expect_err("second faulted replay must abort")
         };
         assert!(err2.to_string().contains("append_transition"));
         assert_eq!(
@@ -4598,8 +4562,7 @@ interval_seconds = 0
                 ref_token: Some("t1@f0".to_string()),
             },
         )
-        .err()
-        .expect("membership change must refuse exact fleet rollback");
+        .expect_err("membership change must refuse exact fleet rollback");
         assert!(
             err.to_string().contains("target membership changed"),
             "error must state the membership-change refusal, got: {err}"
@@ -4648,7 +4611,7 @@ interval_seconds = 0
         let f0_tree = f0.artifact.tree.clone();
         let f0_gen = f0.generation.clone().expect("f0 generation");
 
-        let store_before = snapshot_files(&h.store.base());
+        let store_before = snapshot_files(h.store.base());
         let remotes_before = snapshot_files(&h.remotes_base);
         let rf = h.remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
@@ -4687,7 +4650,7 @@ interval_seconds = 0
         // generation, no new generation was minted remotely).
         assert_eq!(
             store_before,
-            snapshot_files(&h.store.base()),
+            snapshot_files(h.store.base()),
             "a historical dry run must not write a single store byte"
         );
         assert_eq!(
@@ -4721,7 +4684,7 @@ interval_seconds = 0
         let release = f0.artifact.release.clone();
         let tree = f0.artifact.tree.clone();
 
-        let store_before = snapshot_files(&h.store.base());
+        let store_before = snapshot_files(h.store.base());
         let remotes_before = snapshot_files(&h.remotes_base);
         let rf = h.remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
@@ -4756,7 +4719,7 @@ interval_seconds = 0
         );
         assert_eq!(
             store_before,
-            snapshot_files(&h.store.base()),
+            snapshot_files(h.store.base()),
             "a historical release dry run must not write a single store byte"
         );
         assert_eq!(
@@ -5726,8 +5689,7 @@ interval_seconds = 0
                 ref_token: None,
             },
         )
-        .err()
-        .expect("capacity preflight must fail the push");
+        .expect_err("capacity preflight must fail the push");
         assert!(
             err.to_string().contains("insufficient capacity"),
             "expected a capacity preflight error, got: {err}"
@@ -5822,8 +5784,7 @@ interval_seconds = 0
                 ref_token: None,
             },
         )
-        .err()
-        .expect("staging failure must fail the push");
+        .expect_err("staging failure must fail the push");
         assert!(
             err.to_string()
                 .contains("incoming staging write forced to fail"),
@@ -6004,8 +5965,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 ref_token: None,
             },
         )
-        .err()
-        .expect("the later staging failure must fail the push");
+        .expect_err("the later staging failure must fail the push");
         assert!(
             err.to_string()
                 .contains("incoming staging write forced to fail"),
@@ -6136,8 +6096,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 ref_token: None,
             },
         )
-        .err()
-        .expect("a release without its behavior snapshot must fail preflight");
+        .expect_err("a release without its behavior snapshot must fail preflight");
         assert!(
             err.to_string().contains("historical behavior")
                 && err.to_string().contains("unavailable"),
@@ -6179,8 +6138,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 ref_token: None,
             },
         )
-        .err()
-        .expect("a corrupt behavior snapshot must also fail preflight");
+        .expect_err("a corrupt behavior snapshot must also fail preflight");
         assert!(
             err2.to_string().contains("historical behavior")
                 && err2.to_string().contains("unavailable"),

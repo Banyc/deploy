@@ -372,17 +372,17 @@ pub(crate) enum TamperKind {
     /// component replaced (variant or release), keeping the other two. The
     /// tree component is tampered via [`Fixture::tamper_stored_tree`] with a
     /// real tree digest so the history stays consistent.
-    StoredAssignmentVariant,
-    StoredAssignmentRelease,
+    AssignmentVariant,
+    AssignmentRelease,
     /// Rewrite the stored `behavior.json` of the release the current
     /// generation runs (one identity-bearing field changed), so the historical
     /// behavior read and the publication path must fail closed.
-    StoredBehaviorJson,
+    BehaviorJson,
     /// Rewrite the STORED release record's `release_schema_version` to a
     /// non-canonical value: the record must fail closed on every read and
     /// block the next push (see
     /// `integrity_stored_release_schema_version_tamper_fails_closed`).
-    StoredReleaseSchemaVersion,
+    ReleaseSchemaVersion,
 }
 
 /// The outcome of one applied action.
@@ -979,7 +979,7 @@ impl Fixture {
 
     /// Tamper the CURRENT generation's stored assignment on the remote.
     fn tamper(&self, kind: TamperKind) {
-        if kind == TamperKind::StoredBehaviorJson {
+        if kind == TamperKind::BehaviorJson {
             return self.tamper_stored_behavior_json();
         }
         let asn = self
@@ -994,14 +994,14 @@ impl Fixture {
         let mut stored: GenerationAssignment =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         match kind {
-            TamperKind::StoredAssignmentVariant => {
+            TamperKind::AssignmentVariant => {
                 stored.artifact.variant = VariantName::new("canary".to_string())
             }
-            TamperKind::StoredAssignmentRelease => {
+            TamperKind::AssignmentRelease => {
                 stored.artifact.release = ReleaseId::new("rel-sha256-tampered".to_string())
             }
-            TamperKind::StoredBehaviorJson => unreachable!("handled above"),
-            TamperKind::StoredReleaseSchemaVersion => {
+            TamperKind::BehaviorJson => unreachable!("handled above"),
+            TamperKind::ReleaseSchemaVersion => {
                 // Rewrite the stored release record's version field to a
                 // non-canonical value; the record must fail closed on read.
                 self.tamper_stored_release(|v| {
@@ -1308,18 +1308,18 @@ impl Fixture {
     /// (content-address verified by path).
     fn check_integrity(&self) {
         self.with_helper(|helper| {
-            if let Ok(status) = helper.status() {
-                if let Some(g) = &status.current_generation {
-                    let asn = helper
-                        .read_assignment(g)
-                        .expect("current generation assignment must parse");
-                    assert!(
-                        helper
-                            .remote()
-                            .exists(&layout::tree_root(asn.artifact.tree.as_str())),
-                        "current generation's tree object must exist on the remote"
-                    );
-                }
+            if let Ok(status) = helper.status()
+                && let Some(g) = &status.current_generation
+            {
+                let asn = helper
+                    .read_assignment(g)
+                    .expect("current generation assignment must parse");
+                assert!(
+                    helper
+                        .remote()
+                        .exists(&layout::tree_root(asn.artifact.tree.as_str())),
+                    "current generation's tree object must exist on the remote"
+                );
             }
         });
     }
@@ -1380,7 +1380,7 @@ fn identity_artifact_component_change_prevents_noop() {
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
     let noop = f.push("t1").expect("unchanged push succeeds");
     assert_eq!(noop.message, "Everything up to date");
-    f.apply(Action::Tamper(TamperKind::StoredAssignmentVariant));
+    f.apply(Action::Tamper(TamperKind::AssignmentVariant));
     let r2 = f.push("t1").expect("a variant tamper forces a real push");
     assert_ne!(
         r2.message, "Everything up to date",
@@ -1412,7 +1412,7 @@ fn identity_artifact_component_change_prevents_noop() {
     // (c) RELEASE: tamper the stored release id.
     let f = Fixture::new();
     f.push("t1").expect("first push");
-    f.apply(Action::Tamper(TamperKind::StoredAssignmentRelease));
+    f.apply(Action::Tamper(TamperKind::AssignmentRelease));
     let r2 = f.push("t1").expect("a release tamper forces a real push");
     assert_ne!(
         r2.message, "Everything up to date",
@@ -1682,15 +1682,14 @@ fn state_machine_lifecycle_intent_persist_leaves_remote_untouched() {
     let err = {
         f.arm_store_fault(FailureStep::IntentPersist, &id);
         f.push_with_id("t1", &id)
-            .err()
-            .expect("the intent persist fault must abort the push")
+            .expect_err("the intent persist fault must abort the push")
     };
     assert!(
         err.to_string().contains("append_attempt"),
         "error must name the injected fault, got: {err}"
     );
     assert!(
-        !f.remote().exists(&layout::current()),
+        !f.remote().exists(layout::current()),
         "no remote current pointer before the intent is durable"
     );
     assert_eq!(
@@ -1828,8 +1827,7 @@ fn observed_scope_crash_before_refresh_recovered_by_noop_retry() {
     let err = {
         f.arm_store_fault(FailureStep::ResultsWrite, &id);
         f.push_with_id("t1", &id)
-            .err()
-            .expect("the faulted push aborts before the observed refresh")
+            .expect_err("the faulted push aborts before the observed refresh")
     };
     assert!(
         err.to_string().contains("test fault"),
@@ -1843,7 +1841,7 @@ fn observed_scope_crash_before_refresh_recovered_by_noop_retry() {
     for t in ["t1", "t2"] {
         let observed = f.store.read_observed(t).unwrap();
         assert!(
-            observed.slots.get(&PlacementSlotId::new("p1")).is_none(),
+            !observed.slots.contains_key(&PlacementSlotId::new("p1")),
             "{t}: the crash window must leave the shared slot's observed entry absent"
         );
     }
@@ -1905,8 +1903,7 @@ fn observed_scope_preflight_failure_leaves_observed_equal() {
     let err = {
         f.arm_store_fault(FailureStep::IntentPersist, &id);
         f.push_with_id("t2", &id)
-            .err()
-            .expect("the preflight failure aborts before any remote mutation")
+            .expect_err("the preflight failure aborts before any remote mutation")
     };
     assert!(
         err.to_string().contains("append_attempt"),
@@ -1975,8 +1972,7 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     let err = {
         f.arm_store_fault(FailureStep::IntentPersist, &id_p);
         f.push_with_id("t2", &id_p)
-            .err()
-            .expect("the preflight push aborts before mutation")
+            .expect_err("the preflight push aborts before mutation")
     };
     assert!(err.to_string().contains("append_attempt"), "{err}");
     f.assert_observed_scope_property();
@@ -2007,8 +2003,7 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     let err = {
         f.arm_store_fault(FailureStep::ResultsWrite, &id_c);
         f.push_with_id("t1", &id_c)
-            .err()
-            .expect("the crash aborts before the observed refresh")
+            .expect_err("the crash aborts before the observed refresh")
     };
     assert!(err.to_string().contains("test fault"), "{err}");
     let after_crash = f.current_assignment().expect("remote advanced");
@@ -2345,8 +2340,7 @@ fn lifecycle_store_fault_matrix_recovers_without_duplicate_history() {
         let err = {
             f.arm_store_fault(step, &id);
             f.push_with_id("t1", &id)
-                .err()
-                .expect("the injected persistence fault must abort the push")
+                .expect_err("the injected persistence fault must abort the push")
         };
         assert!(
             err.to_string().contains("test fault"),
@@ -2891,8 +2885,7 @@ fn integrity_digest_unchanged_after_tamper_fails_closed() {
     let err = f
         .store
         .read_release(&id)
-        .err()
-        .expect("content tamper with retained digest must fail");
+        .expect_err("content tamper with retained digest must fail");
     assert!(
         err.to_string().contains("identity mismatch"),
         "error must name the mismatch, got: {err}"
@@ -2913,8 +2906,7 @@ fn integrity_digest_unchanged_after_tamper_fails_closed() {
         Ok(()) => {
             let err = store2
                 .read_release(&ReleaseId::new(rec.release_id.clone()))
-                .err()
-                .expect("a tampered record written to a fresh store must fail at read");
+                .expect_err("a tampered record written to a fresh store must fail at read");
             assert!(err.to_string().contains("identity mismatch"));
         }
     }
@@ -2990,8 +2982,7 @@ fn integrity_tampered_stored_release_blocks_historical_push() {
 
     let err = f
         .push_ref_impl("t1", id.as_str())
-        .err()
-        .expect("a historical push against a tampered stored release must fail closed");
+        .expect_err("a historical push against a tampered stored release must fail closed");
     assert!(
         err.to_string().contains("identity mismatch"),
         "error must name the identity mismatch, got: {err}"
@@ -3006,7 +2997,7 @@ fn integrity_tampered_stored_release_blocks_historical_push() {
 fn integrity_tampered_stored_behavior_json_blocks_historical_push() {
     let f = Fixture::new();
     f.apply(Action::Push("t1"));
-    f.tamper(TamperKind::StoredBehaviorJson);
+    f.tamper(TamperKind::BehaviorJson);
 
     // The tampered snapshot's canonical digest no longer matches the release
     // record's provenance: the historical read fails closed with an integrity
@@ -3021,8 +3012,7 @@ fn integrity_tampered_stored_behavior_json_blocks_historical_push() {
     let id = ReleaseId::new(dir.file_name().to_string_lossy().into_owned());
     let err = f
         .push_ref_impl("t1", id.as_str())
-        .err()
-        .expect("a historical push against a tampered behavior snapshot must fail closed");
+        .expect_err("a historical push against a tampered behavior snapshot must fail closed");
     let msg = err.to_string();
     assert!(
         msg.contains("digest mismatch"),
@@ -3036,8 +3026,7 @@ fn integrity_tampered_stored_behavior_json_blocks_historical_push() {
     let rerr = f
         .store
         .read_release_behaviors(&id)
-        .err()
-        .expect("the historical behavior read must fail closed");
+        .expect_err("the historical behavior read must fail closed");
     assert!(
         rerr.to_string().contains("digest mismatch"),
         "read error must name the digest mismatch, got: {rerr}"
@@ -3048,7 +3037,7 @@ fn integrity_tampered_stored_behavior_json_blocks_historical_push() {
 /// `release_schema_version` was rewritten to any arbitrary `u32` value other
 /// than [`crate::model::RELEASE_RECORD_SCHEMA_VERSION`] must fail closed on
 /// every read and block the next push — never silently accepted, never
-/// republished. The dedicated [`TamperKind::StoredReleaseSchemaVersion`]
+/// republished. The dedicated [`TamperKind::ReleaseSchemaVersion`]
 /// action rewrites the field; the matrix here sweeps the full representative
 /// arbitrary-u32 set (0, version - 1, version + 1, 3, u32::MAX).
 #[test]
@@ -3088,8 +3077,7 @@ fn integrity_stored_release_schema_version_tamper_fails_closed() {
         let err = f
             .store
             .read_release(&id)
-            .err()
-            .expect("a non-canonical record version must fail closed on read");
+            .expect_err("a non-canonical record version must fail closed on read");
         let msg = err.to_string();
         assert!(
             msg.contains("release_schema_version"),
@@ -3105,8 +3093,7 @@ fn integrity_stored_release_schema_version_tamper_fails_closed() {
         );
         let push_err = f
             .push_ref_impl("t1", id.as_str())
-            .err()
-            .expect("a push against a tampered record version must fail closed");
+            .expect_err("a push against a tampered record version must fail closed");
         assert!(
             push_err.to_string().contains("release_schema_version"),
             "push error must name the version mismatch, got: {push_err}"
@@ -3125,7 +3112,7 @@ fn integrity_stored_release_schema_version_tamper_fails_closed() {
     // And the dedicated Tamper action rewrites the field the same way.
     let f2 = Fixture::new();
     f2.apply(Action::Push("t1"));
-    f2.apply(Action::Tamper(TamperKind::StoredReleaseSchemaVersion));
+    f2.apply(Action::Tamper(TamperKind::ReleaseSchemaVersion));
     let releases_root = f2.store.base().join(layout::RELEASES);
     let dir = std::fs::read_dir(&releases_root)
         .unwrap()
@@ -3136,8 +3123,7 @@ fn integrity_stored_release_schema_version_tamper_fails_closed() {
     let err = f2
         .store
         .read_release(&id)
-        .err()
-        .expect("the Tamper action's rewritten version must fail closed on read");
+        .expect_err("the Tamper action's rewritten version must fail closed on read");
     assert!(
         err.to_string().contains("release_schema_version"),
         "error must name the version field, got: {err}"
@@ -3717,8 +3703,8 @@ fn action_strategy() -> impl Strategy<Value = Action> {
         // live generation exists (the fixture's tamper requires one), and the
         // system's own checks defer until the next real push.
         1 => prop::sample::select([
-            TamperKind::StoredAssignmentVariant,
-            TamperKind::StoredAssignmentRelease,
+            TamperKind::AssignmentVariant,
+            TamperKind::AssignmentRelease,
         ]
         .as_slice())
         .prop_map(Action::Tamper),

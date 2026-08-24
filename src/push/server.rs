@@ -40,6 +40,13 @@ pub(crate) struct ServerProc {
     pub(crate) error: Option<String>,
 }
 
+// 13 parameters: the per-server deployment is the full publication context
+// (data: store, remote, helper, op_id, deployment_id, target_name, artifact,
+// new_gen, expected_gen; policy: behavior, behavior_sha256, template_vars,
+// config). Bundling the policy half into one settings struct is a dedicated
+// refactor (deferred: `process_server` is the single hottest function in the
+// push path and every caller would change with no behavioral gain); the allow
+// documents the deliberate choice.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_server(
     store: &LocalStore,
@@ -346,6 +353,9 @@ pub(crate) fn process_server(
 /// slot context (deploy_dir, application, ...); the VARIANT is overridden with
 /// the prior assignment's variant, because compensation re-runs the PRIOR
 /// generation's contract. Returns true if compensation restored prior state.
+// 11 parameters mirror `process_server` (same rationale: a settings-struct
+// consolidation of the trailing config/vars args is a dedicated refactor;
+// the allow documents the deliberate choice).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compensate_server(
     _store: &LocalStore,
@@ -596,10 +606,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// CURRENT-format record carrying its OWN canonical slot snapshot (slot
     /// p1 -> variant `standard`, matching the harness config's NONE_VARIANT
     /// declaration) with the identity RECOMPUTED from the stored content, so
-    /// the publish path's recompute-and-verify accepts it. `harness_release_id`
-    /// exposes the resulting identity-derived id (the `rel-sha256-<digest>`
-    /// that tests thread through artifact refs and the publish path); the
-    /// empty-snapshot legacy shape is rejected by verification. The provenance
+    /// the publish path's recompute-and-verify accepts it. The provenance
     /// `behavior_sha256` must be the canonical digest of the behavior payload
     /// published alongside the record (computed from the harness's own
     /// configured contract), or the publish path refuses the pair.
@@ -637,14 +644,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .as_str()
             .to_string();
         rec
-    }
-
-    fn harness_release_json(behavior_sha: &str) -> String {
-        serde_json::to_string(&harness_release_record(behavior_sha)).unwrap()
-    }
-
-    fn harness_release_id(behavior_sha: &str) -> crate::model::ReleaseId {
-        crate::model::ReleaseId::new(harness_release_record(behavior_sha).release_id)
     }
 
     struct Harness {
@@ -946,7 +945,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             std::env::set_var("XDG_CONFIG_HOME", &config_home);
         }
 
-        let outcome = (|| {
+        let outcome = {
             let h = Harness::new(
                 SYSTEMD_TOML,
                 SYSTEMD_VARIANT,
@@ -1008,7 +1007,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "[Service]\nExecStart=/srv/eng/current/app/server\n"
             );
             Ok::<(), String>(())
-        })();
+        };
         match old_path {
             Some(p) => unsafe { std::env::set_var("PATH", p) },
             None => unsafe { std::env::remove_var("PATH") },

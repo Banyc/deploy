@@ -1077,8 +1077,7 @@ mod tests {
         // Required-field deletions: activation.adapter (default "none" now
         // differs from the stored "systemd"), verification.argv (missing
         // required field -> unparseable).
-        let mut v: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         let mut del = v.clone();
         del["standard"]["activation"]
             .as_object_mut()

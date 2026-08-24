@@ -833,7 +833,6 @@ mod tests {
             port: Some(2222),
             known_hosts: Some(PathBuf::from("/etc/ssh/known_hosts")),
             host_key_fingerprint: None,
-            ..Default::default()
         };
         let report = init_project(&proj, &opts).unwrap();
         let config = crate::config::Config::load(&report.target.join("deploy.toml")).unwrap();

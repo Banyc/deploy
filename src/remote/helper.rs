@@ -681,7 +681,7 @@ pub fn copy_host_tree_to_remote(host: &Path, rel_dest: &Path, remote: &dyn Remot
     }
     // Phase 2: finalize directory modes deepest-first, so a read-only parent
     // is chmodded only after all of its children are finalized.
-    dirs.sort_by(|a, b| b.2.cmp(&a.2));
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.2));
     for (dest, mode, _depth) in dirs {
         remote.set_mode(&dest, mode)?;
     }
@@ -723,6 +723,11 @@ mod tests {
     use super::*;
     use crate::remote::transport::LocalTransport;
     use std::os::unix::fs::PermissionsExt;
+
+    /// A named (label, mutator) pair driving the publish-rejection mutation
+    /// matrices: the label names the tamper in failure messages, the mutator
+    /// rewrites one field of the serialized release/behavior JSON.
+    type JsonMutation = (&'static str, fn(&mut serde_json::Value));
 
     fn assignment(gen_id: &str, tree: &str) -> GenerationAssignment {
         GenerationAssignment {
@@ -900,7 +905,7 @@ mod tests {
     #[test]
     fn republish_content_verifies_existing_remote_record() {
         // (a) One identity-bearing mutation at a time -> every republish fails.
-        let identity_mutations: [(&str, fn(&mut serde_json::Value)); 7] = [
+        let identity_mutations: [JsonMutation; 7] = [
             (
                 "per-variant mappings digest",
                 |v: &mut serde_json::Value| {
@@ -933,7 +938,7 @@ mod tests {
             }),
         ];
         for (name, mutate) in identity_mutations {
-            let (dir, remote, rec, release_json, behavior_json) = published_release_fixture();
+            let (_dir, remote, rec, release_json, behavior_json) = published_release_fixture();
             let mut stored = serde_json::to_value(&rec).unwrap();
             mutate(&mut stored);
             // The identity-bearing content mutated, digest fields retained at
@@ -970,7 +975,7 @@ mod tests {
         // A corrupted remote behavior.json fails the republish via the
         // snapshot's own create-or-compare content check (release.json is
         // untouched here, so the failure is pinned to behavior.json).
-        let (dir, remote, rec, release_json, behavior_json) = published_release_fixture();
+        let (_dir, remote, rec, release_json, behavior_json) = published_release_fixture();
         let bpath = layout::remote_release(rec.release_id.as_str()).join("behavior.json");
         remote.write(&bpath, b"{\"tampered\":", 0o644).unwrap();
         let helper = RemoteHelper::new(&remote);
@@ -984,7 +989,7 @@ mod tests {
 
         // Malformed existing release.json is refused outright, never silently
         // replaced.
-        let (dir, remote, rec, release_json, behavior_json) = published_release_fixture();
+        let (_dir, remote, rec, release_json, behavior_json) = published_release_fixture();
         let rel = layout::remote_release(rec.release_id.as_str()).join("release.json");
         remote.write(&rel, b"{ not json", 0o644).unwrap();
         let helper = RemoteHelper::new(&remote);
@@ -1001,7 +1006,7 @@ mod tests {
         // `provenance.git_revision`) are excluded from the digest: republishing
         // against a record that differs ONLY in those fields is still an
         // idempotent no-op.
-        let metadata_mutations: [(&str, fn(&mut serde_json::Value)); 2] = [
+        let metadata_mutations: [JsonMutation; 2] = [
             ("created_at", |v: &mut serde_json::Value| {
                 v["created_at"] = serde_json::json!("2099-01-01T00:00:00Z");
             }),
@@ -1010,7 +1015,7 @@ mod tests {
             }),
         ];
         for (name, mutate) in metadata_mutations {
-            let (dir, remote, rec, release_json, behavior_json) = published_release_fixture();
+            let (_dir, remote, rec, release_json, behavior_json) = published_release_fixture();
             let mut stored = serde_json::to_value(&rec).unwrap();
             mutate(&mut stored);
             let rel = layout::remote_release(rec.release_id.as_str()).join("release.json");
@@ -1059,7 +1064,7 @@ mod tests {
             );
         };
 
-        let mut v: serde_json::Value = serde_json::from_str(&behavior_json).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&behavior_json).unwrap();
         // Required-field deletions: activation.adapter, verification.argv, a
         // whole variant's contract, the variant key itself.
         let mut del = v.clone();
@@ -1225,11 +1230,11 @@ mod tests {
         std::fs::write(ro.join("app"), b"read-only app\n").unwrap();
         std::fs::write(ro.join("nested/data"), b"nested data\n").unwrap();
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
-        std::fs::set_permissions(&ro.join("nested"), std::fs::Permissions::from_mode(0o555))
+        std::fs::set_permissions(ro.join("nested"), std::fs::Permissions::from_mode(0o555))
             .unwrap();
-        std::fs::set_permissions(&ro.join("app"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(ro.join("app"), std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::set_permissions(
-            &ro.join("nested/data"),
+            ro.join("nested/data"),
             std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
@@ -1290,8 +1295,7 @@ mod tests {
         std::fs::create_dir_all(&sg).unwrap();
         std::fs::write(sg.join("suid"), b"setuid binary\n").unwrap();
         std::fs::set_permissions(&sg, std::fs::Permissions::from_mode(0o2755)).unwrap();
-        std::fs::set_permissions(&sg.join("suid"), std::fs::Permissions::from_mode(0o4755))
-            .unwrap();
+        std::fs::set_permissions(sg.join("suid"), std::fs::Permissions::from_mode(0o4755)).unwrap();
         let st = host.join("st");
         std::fs::create_dir_all(&st).unwrap();
         std::fs::set_permissions(&st, std::fs::Permissions::from_mode(0o1777)).unwrap();

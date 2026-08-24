@@ -67,7 +67,7 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
         systemd.activation.scope,
         deploy::config::ActivationScope::User
     );
-    assert_eq!(systemd.activation.reconcile_managed_units, true);
+    assert!(systemd.activation.reconcile_managed_units);
     assert_eq!(systemd.activation.units.len(), 1, "one managed unit");
     assert_eq!(systemd.activation.units[0].name, "example.service");
     assert_eq!(

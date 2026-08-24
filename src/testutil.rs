@@ -129,17 +129,21 @@ pub(crate) mod test_faults {
 
     /// A per-fixture one-shot fault registry.
     ///
-    /// Storage: a `Mutex<BTreeMap<(FaultKind, String, Option<String>), ()>>`
-    /// mapping each armed (kind, deployment-id[, target]) key to a one-shot
-    /// marker. Arming inserts the key; the matching consume removes it and
-    /// returns `true` (the fault FIRED and is now disarmed); any other
-    /// consume returns `false` and leaves the key armed. The map is
-    /// deterministic (BTreeMap) and the mutex makes the registry safe to
-    /// share; two registries are always disjoint objects, so two fixtures can
-    /// never interfere.
+    /// Storage: a `Mutex<BTreeMap<FaultKey, ()>>` mapping each armed
+    /// (kind, deployment-id[, target]) key to a one-shot marker. Arming
+    /// inserts the key; the matching consume removes it and returns `true`
+    /// (the fault FIRED and is now disarmed); any other consume returns
+    /// `false` and leaves the key armed. The map is deterministic (BTreeMap)
+    /// and the mutex makes the registry safe to share; two registries are
+    /// always disjoint objects, so two fixtures can never interfere.
+    ///
+    /// `FaultKey` names the armed (kind, deployment-id[, target]) triple
+    /// (factored out so the registry's storage type stays readable).
+    type FaultKey = (FaultKind, String, Option<String>);
+
     #[derive(Default)]
     pub(crate) struct FaultRegistry {
-        inner: Mutex<BTreeMap<(FaultKind, String, Option<String>), ()>>,
+        inner: Mutex<BTreeMap<FaultKey, ()>>,
     }
 
     impl FaultRegistry {
