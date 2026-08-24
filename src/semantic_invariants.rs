@@ -35,6 +35,18 @@
 //! A second layer is the per-class property suite (digest reordering,
 //! per-field record tampering, the u128 bounds grid, retention monotonicity).
 //!
+//! A THIRD layer is the **model-based property test**: a deterministic
+//! [`Model`] oracle (same-module, below) is driven by the SAME bounded RANDOM
+//! action stream as the [`Fixture`] (proptest, fixed seed + bounded cases so
+//! every run is reproducible). The model tracks, purely from the actions, the
+//! invariants' ground truth — the remote current generation, every member
+//! target's observed projection, the per-target fleet-snapshot and
+//! deployment-attempt logs, pending-commit and rotation-debt state — and
+//! [`assert_semantic_invariants`] cross-checks it against the system's
+//! observable state after every action while re-evaluating all five
+//! invariant groups. Random vectors with shrinking find interleaving bugs the
+//! fixed sequences miss, and minimize any failing vector to its core.
+//!
 //! The five mutations the harness applies one at a time (and reverts) each
 //! kill at least one test in this module or the suite it feeds:
 //!
@@ -65,6 +77,8 @@ use crate::remote::transport::{
 };
 use crate::rotation::compute_retained;
 use crate::store::local::LocalStore;
+use proptest::prelude::*;
+use proptest::test_runner::RngSeed;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -643,8 +657,16 @@ impl Fixture {
                 });
                 return;
             }
+            _ => {}
         }
         std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+    }
+
+    /// Whether a live current generation exists on the remote (a
+    /// [`Action::Tamper`] requires one; the property test skips generated
+    /// tampers on an empty remote).
+    fn has_current_generation(&self) -> bool {
+        self.current_assignment().is_some()
     }
 
     /// Tamper the CURRENT generation's stored assignment TREE to `tree`
@@ -2448,4 +2470,603 @@ fn bounds_capacity_edge_corners_fail_safely() {
     assert!(!capacity_fits(u64::MAX, u64::MAX, u64::MAX));
     assert!(!capacity_fits(u64::MAX, 1, u64::MAX));
     assert!(capacity_fits(u64::MAX, 0, u64::MAX));
+}
+
+// ===========================================================================
+// Property-based state machine — Model oracle + bounded random action vectors
+// ===========================================================================
+
+/// The MODEL oracle for the state machine: a lightweight, deterministic
+/// reimplementation of the semantic ground truth the five invariant groups
+/// pin down, driven by the SAME [`Action`] stream as the [`Fixture`].
+///
+/// It does NOT reimplement the engine; it tracks only the invariants'
+/// expected observable state:
+///
+/// * [`Model::head_version`] — the artifact content version the next HEAD
+///   push materializes (updated by [`Action::Build`]);
+/// * the remote `current` generation's expected content version;
+/// * each member target's expected observed projection (a completed
+///   push/rollback propagates the shared slot to BOTH members);
+/// * the per-target fleet-snapshot log (`t@f{i}` rollback refs) and the
+///   deployment-attempt log (one entry per real deployment);
+/// * pending-commit state — a CommitMarker-write fault leaves the attempt
+///   un-finalized until the next push of that target reconciles it (or
+///   degrades it, when the remote current has since diverged);
+/// * rotation-debt markers — an inventory-write fault after commit defers
+///   the post-commit rotation to a later push (including no-ops, which
+///   service the marker);
+/// * the tamper flag — [`Action::Tamper`] deliberately breaks the live
+///   assignment's identity until the next real push replaces the record.
+///
+/// Everything is derived from the action stream ALONE (the one-shot remote
+/// faults are simulated with the engine's semantics), so the model is a
+/// deterministic oracle the fixture can be cross-checked against. Digest
+/// identities (release id, tree sha) are NOT recomputed: the
+/// version→artifact join is performed by [`assert_semantic_invariants`]
+/// against the system's durable snapshots and attempts.
+#[derive(Clone, Debug)]
+struct Model {
+    /// Content version the next HEAD push materializes. The fixture writes
+    /// version 1 at construction.
+    head_version: u32,
+    /// One-shot remote fault armed by [`Action::InjectFailure`]; consumed by
+    /// the next write to the matching path.
+    armed_fault: Option<FailureStep>,
+    /// An action or fault kind this oracle cannot simulate (added by a
+    /// sibling feature): cross-system equality assertions are suspended
+    /// (the fixture's own five invariant groups still run each step).
+    unknown: bool,
+    /// The remote `current` generation's expected artifact content version.
+    current: Option<u32>,
+    /// A [`Action::Tamper`] edited the live assignment: the current's
+    /// identity is deliberately inconsistent and the identity comparison
+    /// defers until the next real push replaces the record.
+    current_tampered: bool,
+    /// Expected per-target observed projection (content version), or `None`
+    /// before the first completed mutation.
+    observed: BTreeMap<&'static str, Option<u32>>,
+    /// Per-target fleet snapshot log: content version per snapshot index.
+    snapshots: BTreeMap<&'static str, Vec<u32>>,
+    /// Per-target deployment-attempt log: content version per attempt.
+    attempts: BTreeMap<&'static str, Vec<u32>>,
+    /// Un-finalized (PendingCommit) deployment per target: (content version,
+    /// the generation counter of the minted generation).
+    pending: BTreeMap<&'static str, (u32, u64)>,
+    /// Monotone counter of deployed generations: every real deployment
+    /// (push, rollback, or faulted push) mints exactly one new generation,
+    /// and a pending attempt finalizes only while its OWN generation is
+    /// still the remote current (the engine compares generation IDs, not
+    /// versions — a same-version redeploy diverges the pending attempt).
+    current_gen: u64,
+    /// Expected rotation-debt marker presence per target.
+    debt: BTreeMap<&'static str, bool>,
+    /// True when the previous action was a deliberate tamper (the system's
+    /// own invariant checks are skipped for that step too).
+    last_was_tamper: bool,
+    /// Actions applied so far; used to name the failing step in panics.
+    index: usize,
+}
+
+impl Model {
+    fn new() -> Model {
+        Model {
+            head_version: 1,
+            armed_fault: None,
+            unknown: false,
+            current: None,
+            current_tampered: false,
+            observed: BTreeMap::from([("t1", None), ("t2", None)]),
+            snapshots: BTreeMap::from([("t1", Vec::new()), ("t2", Vec::new())]),
+            attempts: BTreeMap::from([("t1", Vec::new()), ("t2", Vec::new())]),
+            pending: BTreeMap::new(),
+            current_gen: 0,
+            debt: BTreeMap::from([("t1", false), ("t2", false)]),
+            last_was_tamper: false,
+            index: 0,
+        }
+    }
+
+    /// Advance the oracle by one action. Kept ADAPTIVE: unknown `Action`
+    /// variants and `FailureStep` kinds added by sibling features fall into
+    /// `_` arms that suspend the cross-comparisons instead of breaking the
+    /// build or false-failing the invariant groups.
+    fn apply(&mut self, action: &Action) {
+        self.index += 1;
+        self.last_was_tamper = false;
+        match action {
+            Action::Build(v) => self.head_version = *v,
+            Action::Push(t) | Action::Retry(t) => self.deploy(t, None),
+            Action::Rollback(t, i) => self.rollback(t, *i),
+            Action::Rotate => self.rotate(),
+            Action::InjectFailure(step) => match step {
+                FailureStep::CommitMarkerWrite | FailureStep::RotationInventoryWrite => {
+                    self.armed_fault = Some(*step)
+                }
+                _ => {
+                    // A sibling feature's new injectable step: the model cannot
+                    // simulate its consumption; suspend cross-comparisons.
+                    self.armed_fault = None;
+                    self.unknown = true;
+                }
+            },
+            Action::Tamper(_) => {
+                if self.current.is_some() {
+                    // The fixture requires a live generation to tamper; with
+                    // none, the property test skips the action entirely.
+                    self.current_tampered = true;
+                    self.last_was_tamper = true;
+                }
+            }
+            _ => {
+                // New action variant from a sibling feature: unknown effect.
+                // Treat the step like a tamper (skip the system's own checks
+                // for it too) and stop cross-comparing.
+                self.unknown = true;
+                self.last_was_tamper = true;
+            }
+        }
+    }
+
+    /// Reconcile a pending attempt of `t` at the START of a push/rollback,
+    /// mirroring `reconcile_pending_commits` (which runs before the early
+    /// no-op check): verify the attempt's generation, then write its missing
+    /// fleet-commit marker. The marker write is a commit-path write, so an
+    /// armed CommitMarker fault is consumed there and the attempt stays
+    /// pending.
+    fn reconcile(&mut self, t: &'static str) {
+        let Some((pv, pg)) = self.pending.remove(t) else {
+            return;
+        };
+        // The engine's reconciliation FIRST verifies the pending attempt's
+        // generation against the remote current (before any marker write): a
+        // diverged generation degrades the attempt with NO marker write, so
+        // an armed fault is NOT consumed.
+        if self.current_gen != pg {
+            return;
+        }
+        match self.armed_fault {
+            Some(FailureStep::CommitMarkerWrite) => {
+                // The pending attempt's marker write consumes the armed fault
+                // and fails, so the attempt stays pending.
+                self.armed_fault = None;
+                self.pending.insert(t, (pv, pg));
+            }
+            Some(_) => {
+                self.armed_fault = None;
+                self.unknown = true;
+                self.pending.insert(t, (pv, pg));
+            }
+            None => {
+                // The pending deployment's OWN generation is still the remote
+                // current: the attempt finalizes (snapshot appended, refs
+                // advanced).
+                self.snapshots.entry(t).or_default().push(pv);
+            }
+        }
+    }
+
+    /// A fleet-rollback to snapshot `i`. Out-of-range refs are rejected by
+    /// the engine's plan BEFORE reconcile or any mutation: model no-op.
+    fn rollback(&mut self, t: &'static str, i: u64) {
+        let Some(v) = self
+            .snapshots
+            .get(t)
+            .and_then(|snaps| snaps.get(i as usize))
+            .copied()
+        else {
+            return;
+        };
+        self.deploy(t, Some(v));
+    }
+
+    /// A HEAD push / no-op retry (`Push` and `Retry` are the same operation
+    /// in the fixture) or a valid fleet-rollback (deploying `rollback_version`).
+    fn deploy(&mut self, t: &'static str, rollback_version: Option<u32>) {
+        self.reconcile(t);
+        let version = match rollback_version {
+            Some(v) => Some(v),
+            None => {
+                // HEAD push: deploy exactly when the remote current no longer
+                // equals the materialized head (the engine's complete
+                // ArtifactRef equality — a tampered current forces a real push).
+                if self.current_tampered || self.current != Some(self.head_version) {
+                    Some(self.head_version)
+                } else {
+                    None
+                }
+            }
+        };
+        let Some(v) = version else {
+            // Up-to-date no-op: no records, no remote writes except the
+            // deferred-maintenance hook (which services rotation debt).
+            self.noop_maintenance(t);
+            return;
+        };
+        let fault = self.armed_fault.take();
+        let had_debt = self.debt.get(t).copied().unwrap_or(false);
+        self.current_gen += 1;
+        self.current = Some(v);
+        self.current_tampered = false;
+        // The shared slot's observed entry is refreshed in EVERY member
+        // target whenever it changes.
+        self.observed.insert("t1", Some(v));
+        self.observed.insert("t2", Some(v));
+        self.attempts.entry(t).or_default().push(v);
+        match fault {
+            Some(FailureStep::CommitMarkerWrite) => {
+                // Fleet-commit marker write fails: the deployment is recorded
+                // PendingCommit; `current` advanced and observed refreshed
+                // (steps 15/16), but the snapshot/ref finalization is deferred
+                // to the next push of this target. Step-17 rotation still
+                // succeeds (the fault is spent), so no debt.
+                self.pending.insert(t, (v, self.current_gen));
+                self.debt.insert(t, false);
+            }
+            Some(FailureStep::RotationInventoryWrite) => {
+                // Post-commit maintenance: step 17 retries an EXISTING debt
+                // marker FIRST — that servicing write consumes the fault and
+                // fails, then the push's own slot rotation succeeds and
+                // CLEARS the marker. With no prior marker, the fault hits the
+                // push's own rotation, which defers it as a new marker.
+                self.snapshots.entry(t).or_default().push(v);
+                self.debt.insert(t, !had_debt);
+            }
+            Some(_) => {
+                // Unknown fault kind: assume a fully committed push and stop
+                // cross-comparing.
+                self.snapshots.entry(t).or_default().push(v);
+                self.debt.insert(t, false);
+                self.unknown = true;
+            }
+            None => {
+                self.snapshots.entry(t).or_default().push(v);
+                self.debt.insert(t, false);
+            }
+        }
+    }
+
+    /// The no-op retry path: `retry_deferred_rotations` services the debt
+    /// marker (writing the inventory), and that write consumes an armed
+    /// RotationInventory fault — failing, the marker stays. Commit-marker
+    /// faults do not match the inventory write, so the rotation succeeds and
+    /// clears the debt.
+    fn noop_maintenance(&mut self, t: &'static str) {
+        if !self.debt.get(t).copied().unwrap_or(false) {
+            return;
+        }
+        match self.armed_fault {
+            Some(FailureStep::RotationInventoryWrite) => {
+                self.armed_fault = None;
+                // rotation failed; the debt marker stays
+            }
+            Some(FailureStep::CommitMarkerWrite) => {
+                self.debt.insert(t, false);
+            }
+            Some(_) => {
+                self.armed_fault = None;
+                self.debt.insert(t, false);
+                self.unknown = true;
+            }
+            None => {
+                self.debt.insert(t, false);
+            }
+        }
+    }
+
+    /// Whether `action` would replace the tampered current record with a new
+    /// pristine generation. Only a REAL deployment does: a HEAD push/retry
+    /// always deploys after a tamper (the tampered artifact never equals the
+    /// materialized head), while a fleet-rollback repairs only when its ref
+    /// resolves — an out-of-range index errors at plan time, before any
+    /// mutation, leaving the tampered record in place.
+    fn repairs_tamper(&self, action: &Action) -> bool {
+        match action {
+            Action::Push(_) | Action::Retry(_) => true,
+            Action::Rollback(t, i) => self
+                .snapshots
+                .get(t)
+                .map(|s| (*i as usize) < s.len())
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    /// A standalone union rotation. The fixture's `rotate_union` runs over a
+    /// PLAIN `LocalTransport` (not the fault-injecting wrapper the pushes
+    /// use), so it neither fails nor consumes an armed fault; it leaves the
+    /// remote current, observed projections, and pending/debt state
+    /// untouched. Faults stay armed for the next real push.
+    fn rotate(&mut self) {
+        let _ = &self.armed_fault;
+    }
+}
+
+/// The bounded action strategy: every generated action stays inside the
+/// 1-slot / 2-target / 3-generation fixture (versions 0..=3, rollback indices
+/// 0..=1 — out-of-range refs are rejected by the plan, not panics). Only the
+/// two REMOTE [`FailureStep`]s are injectable: the fixture's
+/// `set_remote_fault` refuses store-level steps by design.
+fn action_strategy() -> impl Strategy<Value = Action> {
+    prop_oneof![
+        // Rewrite the artifact sources; the next HEAD push materializes this
+        // content version.
+        4 => (0u32..=3).prop_map(Action::Build),
+        // A HEAD push under t1 (aggressive retention) or t2 (conservative).
+        4 => prop::sample::select(["t1", "t2"].as_slice()).prop_map(Action::Push),
+        // Up-to-date retry (no-op or reconcile) — the same engine call.
+        2 => prop::sample::select(["t1", "t2"].as_slice()).prop_map(Action::Retry),
+        // Fleet rollback to snapshot index 0 or 1 of the target.
+        2 => (prop::sample::select(["t1", "t2"].as_slice()), 0u64..2)
+            .prop_map(|(t, i)| Action::Rollback(t, i)),
+        // Standalone rotation under the full member-policy union.
+        1 => Just(Action::Rotate),
+        // One-shot REMOTE fault (commit marker / rotation inventory).
+        3 => prop::sample::select([
+            FailureStep::CommitMarkerWrite,
+            FailureStep::RotationInventoryWrite,
+        ]
+        .as_slice())
+        .prop_map(Action::InjectFailure),
+        // Deliberate integrity violation; the property loop skips it while no
+        // live generation exists (the fixture's tamper requires one), and the
+        // system's own checks defer until the next real push.
+        1 => prop::sample::select([
+            TamperKind::StoredAssignmentVariant,
+            TamperKind::StoredAssignmentRelease,
+        ]
+        .as_slice())
+        .prop_map(Action::Tamper),
+    ]
+}
+
+/// Whether the system has a deployment attempt for `t` still eligible for
+/// reconciliation (latest transition `PendingCommit` / `InProgress`).
+fn system_has_pending(system: &Fixture, t: &str) -> bool {
+    system
+        .store
+        .read_attempts(t)
+        .unwrap_or_default()
+        .iter()
+        .any(|a| {
+            matches!(
+                system
+                    .store
+                    .latest_status(a.deployment_id.as_str())
+                    .ok()
+                    .flatten(),
+                Some(DeploymentStatus::PendingCommit) | Some(DeploymentStatus::InProgress)
+            )
+        })
+}
+
+/// Record `art` as the artifact for content version `v`. Every source (a
+/// fleet snapshot, an attempt's desired assignment, the remote current, an
+/// observed projection) must agree: the same version materializing into two
+/// different artifacts is exactly the interleaving/state bug the oracle
+/// exists to catch.
+fn learn_artifact(
+    learned: &mut BTreeMap<u32, ArtifactRef>,
+    ctx: &str,
+    v: u32,
+    art: ArtifactRef,
+    src: &str,
+) {
+    if let Some(prev) = learned.get(&v) {
+        assert_eq!(
+            prev, &art,
+            "{ctx}: version {v} must materialize into exactly ONE artifact; {src} disagrees with an earlier source"
+        );
+    } else {
+        learned.insert(v, art);
+    }
+}
+
+/// Assert the model-vs-system agreement for ONE action step:
+/// (a) re-run the fixture's five invariant groups — skipped after a
+/// deliberate [`Action::Tamper`], which intentionally breaks the Integrity
+/// group — and
+/// (b) cross-check the model's expected state against the system's
+/// observable state: the remote current generation (existence + artifact
+/// identity), every member target's observed projection, the per-target
+/// snapshot/attempt logs, pending-commit state, and rotation-debt markers.
+///
+/// The version→artifact identity join comes from the SYSTEM's durable
+/// records (snapshots and attempts carry the deployed [`ArtifactRef`]): every
+/// version the model ever deployed must have materialized into exactly ONE
+/// artifact. Any divergence between sources for the same version, or between
+/// the model's expected version and the system's actual artifact, is the
+/// interleaving bug this layer exists to find — proptest then shrinks the
+/// failing action vector to its minimal core. Panics name the failing action
+/// index ([`Model::index`]) for debugging.
+fn assert_semantic_invariants(model: &Model, system: &Fixture) {
+    let ctx = format!("after action {}", model.index);
+    if model.last_was_tamper || model.unknown {
+        // A tamper deliberately broke identity (the fixture's apply skipped
+        // its own checks too) and the model defers to the next real push that
+        // replaces the tampered record; an UNKNOWN action/fault kind from a
+        // sibling feature cannot be cross-checked either (the fixture's apply
+        // already ran its own invariant checks for it). Both suspend the
+        // comparisons without weakening them.
+        return;
+    }
+    // (a) The five invariant groups (the system's own ground truth).
+    system.check_invariants();
+
+    let pid = PlacementSlotId::new("p1");
+    let mut learned: BTreeMap<u32, ArtifactRef> = BTreeMap::new();
+
+    // Fleet-snapshot logs: count + per-index artifact/version join.
+    for t in ["t1", "t2"] {
+        let sys_snaps = system.store.read_snapshots(t).unwrap_or_default();
+        let want = model.snapshots.get(t).cloned().unwrap_or_default();
+        assert_eq!(
+            sys_snaps.len(),
+            want.len(),
+            "{ctx}: snapshot count for {t} must match the model ({sys} vs {model})",
+            sys = sys_snaps.len(),
+            model = want.len(),
+        );
+        for (i, (ss, mv)) in sys_snaps.iter().zip(&want).enumerate() {
+            assert_eq!(ss.index, i as u64, "{ctx}: snapshot index order for {t}");
+            let art = ss.slots[&pid].assignment.artifact.clone();
+            learn_artifact(&mut learned, &ctx, *mv, art, &format!("snapshot {t}@f{i}"));
+        }
+    }
+    // Deployment-attempt logs: exactly one record per real deployment.
+    for t in ["t1", "t2"] {
+        let sys_att = system.store.read_attempts(t).unwrap_or_default();
+        let want = model.attempts.get(t).cloned().unwrap_or_default();
+        assert_eq!(
+            sys_att.len(),
+            want.len(),
+            "{ctx}: attempt count for {t} must match the model"
+        );
+        for (sa, mv) in sys_att.iter().zip(&want) {
+            let art = sa.desired[&pid].assignment.artifact.clone();
+            learn_artifact(&mut learned, &ctx, *mv, art, "attempt {t}");
+        }
+    }
+
+    // Remote current generation: existence + artifact identity. The identity
+    // check is skipped while the live record was tampered.
+    let sys_current = system.current_assignment();
+    match (model.current, sys_current) {
+        (None, None) => {}
+        (None, Some(asn)) => panic!(
+            "{ctx}: unexpected remote current generation {}",
+            asn.generation_id
+        ),
+        (Some(_), None) => {
+            panic!("{ctx}: model expects a remote current generation, none present")
+        }
+        (Some(v), Some(asn)) => {
+            if !model.current_tampered {
+                let want = learned.get(&v).cloned().unwrap_or_else(|| {
+                    panic!(
+                        "{ctx}: current generation version {v} has no recorded attempt/snapshot in the system"
+                    )
+                });
+                assert_eq!(
+                    asn.artifact, want,
+                    "{ctx}: the remote current generation must deploy the model's expected artifact for version {v}"
+                );
+            }
+            // The current generation is the freshest identity source (e.g. a
+            // still-pending deployment has a current but no snapshot yet).
+            learn_artifact(
+                &mut learned,
+                &ctx,
+                v,
+                asn.artifact.clone(),
+                "remote current",
+            );
+        }
+    }
+
+    // Observed projection for EVERY member target of the shared slot.
+    for t in ["t1", "t2"] {
+        let obs = system.store.read_observed(t).unwrap_or_default();
+        let entry = obs.slots.get(&pid);
+        match (model.observed[t], entry) {
+            (None, None) => {}
+            (None, Some(_)) => panic!("{ctx}: {t} observed an unexpected p1 entry"),
+            (Some(_), None) => {
+                panic!("{ctx}: {t} is missing its observed p1 entry though the model expects one")
+            }
+            (Some(v), Some(slot)) => {
+                let art = slot.artifact.clone().expect("{ctx}: observed artifact");
+                assert!(
+                    slot.generation.is_some(),
+                    "{ctx}: {t} observed generation must be present"
+                );
+                let want = learned.get(&v).cloned().unwrap_or_else(|| {
+                    panic!(
+                        "{ctx}: observed version {v} for {t} has no recorded artifact in the system"
+                    )
+                });
+                assert_eq!(
+                    art, want,
+                    "{ctx}: {t} observed projection must match the model's expected version {v}"
+                );
+            }
+        }
+    }
+    // Pending-commit state per target.
+    for t in ["t1", "t2"] {
+        let sys_pending = system_has_pending(system, t);
+        assert_eq!(
+            model.pending.contains_key(t),
+            sys_pending,
+            "{ctx}: pending-commit state for {t}"
+        );
+        if let Some((pv, _)) = model.pending.get(t) {
+            // The pending attempt need not be the target's NEWEST attempt: a
+            // later deployment can commit after the pending one (e.g. its
+            // reconcile marker write consumed a newly-armed fault), so the
+            // pending version must simply have a recorded attempt.
+            assert!(
+                model.attempts[t].contains(pv),
+                "{ctx}: the pending deployment version {pv} must have a recorded attempt"
+            );
+        }
+    }
+
+    // Rotation-debt markers per target.
+    for t in ["t1", "t2"] {
+        let sys_debt = !system
+            .store
+            .read_rotation_debt(t)
+            .unwrap_or_default()
+            .is_empty();
+        assert_eq!(
+            model.debt[t], sys_debt,
+            "{ctx}: rotation-debt marker for {t}"
+        );
+    }
+}
+
+// Property-based state machine: bounded RANDOM action vectors (1..20
+// actions) drive a fresh [`Model`] oracle and [`Fixture`] in lockstep. After
+// EVERY action [`assert_semantic_invariants`] cross-checks the model's
+// expected state against the system's observable state and re-evaluates all
+// five invariant groups — the same contract as the fixed `state_machine_*`
+// sequences, but the generator explores interleavings the hand-written
+// sequences miss and the shrinker minimizes any failing vector to its core.
+//
+// Determinism: the config pins a fixed seed and a bounded case count, and
+// shrinking never consults the wall clock — two `cargo test` runs reproduce
+// the identical vectors.
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 128,
+        rng_seed: RngSeed::Fixed(0x5EED_5EED),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn semantic_state_machine(actions in prop::collection::vec(action_strategy(), 1..20)) {
+        let mut model = Model::new();
+        let system = Fixture::new();
+        for action in actions {
+            // A Tamper needs a live generation (it edits the CURRENT
+            // assignment); generated tampers before the first deployment are
+            // skipped rather than panicking the fixture by construction.
+            if matches!(&action, Action::Tamper(_)) && !system.has_current_generation() {
+                continue;
+            }
+            // After a tamper the fixture's OWN invariant checks cannot run
+            // until a real push replaces the tampered assignment (the tamper
+            // deliberately breaks current-vs-observed identity and the stored
+            // release binding). Non-repairing actions in between are skipped
+            // so the next applied action is always the repair.
+            if model.current_tampered && !model.repairs_tamper(&action) {
+                continue;
+            }
+            model.apply(&action);
+            system.apply(action);
+            assert_semantic_invariants(&model, &system);
+        }
+    }
 }
