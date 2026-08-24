@@ -26,7 +26,7 @@ use crate::records::{
     AttemptServer, DeploymentAttempt, DeploymentPlan, DeploymentResults, DeploymentStatus,
     ObservedServer, ObservedTarget, ServerOutcomeKind, ServerPlan, ServerResult,
 };
-use crate::remote::helper::RemoteHelper;
+use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::transport::Remote;
 use crate::rotation::compute_retained;
 use crate::store::local::LocalStore;
@@ -546,6 +546,12 @@ fn push_inner(
     // any plan/status record so an up-to-date no-op leaves no dangling
     // `in_progress` deployment behind.
     if matches!(pref, PushRef::Head) {
+        // Retain the CURRENT generation assignment for every matching slot: the
+        // no-op verification below renders the EXISTING generation's identities
+        // (deployment_id/generation_id/artifact) — the running service was
+        // deployed with those, and the no-op creates no records, so the NEW
+        // deployment/generation ids would be fabricated.
+        let mut existing: BTreeMap<PlacementSlotId, GenerationAssignment> = BTreeMap::new();
         let mut all_match = true;
         for a in &assignments {
             let st = statuses.get(&a.placement_slot).expect("status present");
@@ -556,8 +562,12 @@ fn push_inner(
                     helpers[&a.placement_slot]
                         .read_assignment(g)
                         .map(|asn| {
-                            asn.artifact.tree == a.artifact.tree
-                                && asn.artifact.release == a.artifact.release
+                            let ok = asn.artifact.tree == a.artifact.tree
+                                && asn.artifact.release == a.artifact.release;
+                            if ok {
+                                existing.insert(a.placement_slot.clone(), asn);
+                            }
+                            ok
                         })
                         .unwrap_or(false)
                 })
@@ -568,7 +578,14 @@ fn push_inner(
             }
         }
         if all_match {
-            // Verify the running services to confirm true up-to-date state.
+            // Verify the running services to confirm true up-to-date state. The
+            // template vars render the EXISTING generation's identities from
+            // the retained assignment (deployment_id/generation_id/artifact) —
+            // the no-op creates no records, so the NEW deployment/generation ids
+            // would be fabricated. The behavior contract to verify against stays
+            // the DESIRED variant's contract: in a true no-op the existing
+            // generation's variant equals the desired one (the comparison above
+            // already proved tree+release match).
             let mut verified = true;
             for a in &assignments {
                 let remote = remotes[&a.placement_slot].as_ref();
@@ -580,14 +597,21 @@ fn push_inner(
                     verified = false;
                     break;
                 };
+                let Some(asn) = existing.get(&a.placement_slot) else {
+                    // A matching slot must have retained its assignment above; a
+                    // miss means the up-to-date claim cannot be established.
+                    // Fall through to a real push rather than panicking.
+                    verified = false;
+                    break;
+                };
                 let vars = slot_vars(
                     &members,
                     config,
                     target_name,
                     &a.placement_slot,
-                    &a.artifact,
-                    Some(deployment_id),
-                    Some(&new_gen[&a.placement_slot]),
+                    &asn.artifact,
+                    Some(&asn.deployment_id),
+                    Some(&asn.generation_id),
                 )?;
                 if run_verification(remote, &variant_behavior.verification, &vars).is_err() {
                     verified = false;
@@ -1305,10 +1329,11 @@ impl std::ops::Drop for FileLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::remote::transport::LocalTransport;
+    use crate::remote::transport::{FsBytes, LocalTransport};
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     const NONE_VARIANT: &str = r#"
@@ -1784,12 +1809,18 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     impl RecoveryHarness {
         fn new() -> RecoveryHarness {
+            RecoveryHarness::with_variant(NONE_VARIANT)
+        }
+
+        /// A harness whose variant file carries the given TOML (so a test can
+        /// install a verification argv that renders template variables).
+        fn with_variant(variant_toml: &str) -> RecoveryHarness {
             let dir = tempfile::tempdir().unwrap();
             let project = dir.path().join("proj");
             std::fs::create_dir_all(&project).unwrap();
             let release_dir = project.join("releases").join("v1");
             std::fs::create_dir_all(&release_dir).unwrap();
-            std::fs::write(release_dir.join("standard.toml"), NONE_VARIANT).unwrap();
+            std::fs::write(release_dir.join("standard.toml"), variant_toml).unwrap();
             std::fs::write(project.join("deploy.toml"), NONE_TOML).unwrap();
             let artifacts_dir = release_dir.join("artifacts");
             for (p, c) in [
@@ -1863,6 +1894,82 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "last-successful must not point at a pending attempt"
         );
         attempt
+    }
+
+    /// A remote that records every `exec` argv it is handed (delegating all
+    /// other operations to the wrapped `LocalTransport`), so a test can assert
+    /// the RENDERED verification command vector without spawning a process.
+    struct RecordingRemote {
+        inner: LocalTransport,
+        executed: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl RecordingRemote {
+        fn new(base: PathBuf, executed: Arc<Mutex<Vec<Vec<String>>>>) -> Result<Self> {
+            Ok(RecordingRemote {
+                inner: LocalTransport::new(base)?,
+                executed,
+            })
+        }
+    }
+
+    impl Remote for RecordingRemote {
+        fn root(&self) -> &Path {
+            self.inner.root()
+        }
+        fn read(&self, rel: &Path) -> Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &Path) -> Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &Path) -> Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(&self, rel: &Path) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &Path) -> Result<PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &Path) -> Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &Path) -> Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &Path) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &Path) -> Result<crate::remote::transport::RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn exec(
+            &self,
+            argv: &[String],
+            timeout: std::time::Duration,
+        ) -> Result<crate::remote::transport::ExecOutcome> {
+            self.executed.lock().unwrap().push(argv.to_vec());
+            self.inner.exec(argv, timeout)
+        }
+        fn filesystem_bytes(&self) -> Result<FsBytes> {
+            self.inner.filesystem_bytes()
+        }
     }
 
     /// A push with a healthy `LocalTransport` remote.
@@ -2976,6 +3083,191 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(
             observed.slots[&PlacementSlotId::new("p1")].generation,
             r1.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")].generation
+        );
+    }
+
+    /// A variant whose verification argv renders the per-deployment identity
+    /// templates (`{{ deployment_id }}` / `{{ generation }}` / `{{ tree }}`)
+    /// so a no-op push's verification can be captured and asserted.
+    const VERIFY_IDENTITY_VARIANT: &str = r#"
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+deploy_dir = "/srv/eng"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[[artifact.mappings]]
+from = "artifacts/deployment/common/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true", "{{ deployment_id }}", "{{ generation }}", "{{ tree }}"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+
+    /// A no-op push's verification must render the EXISTING generation's
+    /// identities — deployment_id, generation_id, and tree from the running
+    /// generation's assignment — never the NEW deployment/generation ids: the
+    /// no-op creates no records, so those would be fabricated. The rendered
+    /// argv is captured via a recording remote wrapper and asserted to equal
+    /// the first push's assignment; the no-op must create no records at all
+    /// (no attempt, no transition, no snapshot, `refs/last-successful` and
+    /// `observed.json` unchanged).
+    #[test]
+    fn no_op_verification_renders_existing_generation_identities() {
+        let h = RecoveryHarness::with_variant(VERIFY_IDENTITY_VARIANT);
+        let executed: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let rf = h.remotes_base.clone();
+        let recorded = executed.clone();
+        let factory = move |s: &crate::config::ServerDef,
+                            _slot: &crate::config::SlotDef|
+              -> Result<Box<dyn Remote>> {
+            Ok(Box::new(RecordingRemote::new(
+                rf.join(&s.id),
+                recorded.clone(),
+            )?))
+        };
+
+        // Push 1: a real push. Its verification argv renders the NEW
+        // deployment's identities (those records ARE created), so it is not
+        // the subject here — the no-op's argv is captured separately below.
+        let r1 = push(
+            &h.cfg_path,
+            &h.store,
+            &factory,
+            "t1",
+            &h.config,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+        let first_attempt = r1.attempt.as_ref().expect("attempt recorded");
+
+        // The EXISTING generation's assignment: what the running service was
+        // actually deployed with — the ground truth the no-op must render.
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let status = RemoteHelper::new(&remote).status().unwrap();
+        let cur = status
+            .current_generation
+            .expect("first push must leave a current generation");
+        let assignment: crate::remote::helper::GenerationAssignment = serde_json::from_slice(
+            &remote
+                .read(
+                    &crate::layout::generations()
+                        .join(&cur)
+                        .join("assignment.json"),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            assignment.deployment_id, first_attempt.deployment_id,
+            "the generation assignment must carry the deployment that created it"
+        );
+        assert_eq!(
+            assignment.generation_id.as_str(),
+            cur,
+            "the assignment must be the current generation's"
+        );
+
+        // Push 2: the no-op. Capture ONLY the no-op's verification argv.
+        let target_dir = h.store.target_dir("t1");
+        let before = snapshot_files(&target_dir);
+        executed.lock().unwrap().clear();
+        let r2 = push(
+            &h.cfg_path,
+            &h.store,
+            &factory,
+            "t1",
+            &h.config,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(r2.status, None, "no-op push creates no attempt");
+        assert_eq!(r2.message, "Everything up to date");
+
+        let recorded = executed.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the no-op runs verification exactly once, got: {recorded:?}"
+        );
+        let argv = &recorded[0];
+        // argv = ["true", "<deployment_id>", "<generation>", "<tree>"]
+        assert_eq!(argv.len(), 4, "argv: {argv:?}");
+        assert_eq!(
+            argv[1],
+            assignment.deployment_id.as_str(),
+            "the no-op verification must render the EXISTING generation's deployment id, not a fabricated one"
+        );
+        assert_eq!(
+            argv[2],
+            assignment.generation_id.as_str(),
+            "the no-op verification must render the EXISTING generation id, not a fabricated one"
+        );
+        assert_eq!(
+            argv[3],
+            assignment.artifact.tree.as_str(),
+            "the no-op verification must render the EXISTING generation's tree"
+        );
+        drop(recorded);
+
+        // The no-op creates NO records: no new attempt, no new transition, no
+        // new snapshot, `refs/last-successful` unchanged, observed.json
+        // unchanged (the whole per-target store is byte-for-byte identical).
+        let after = snapshot_files(&target_dir);
+        assert_eq!(
+            before, after,
+            "the no-op push must not touch any store file (attempts, transitions, observed, refs)"
+        );
+        assert_eq!(
+            h.store.read_attempts("t1").unwrap().len(),
+            1,
+            "no new attempt may be recorded by the no-op"
+        );
+        assert_eq!(
+            h.store.read_snapshots("t1").unwrap().len(),
+            1,
+            "no new snapshot may be appended by the no-op"
+        );
+        assert_eq!(
+            h.store.read_last_successful("t1").unwrap(),
+            first_attempt.deployment_id.as_str(),
+            "refs/last-successful must be unchanged"
+        );
+        assert_eq!(
+            h.store
+                .read_transitions(first_attempt.deployment_id.as_str())
+                .unwrap()
+                .len(),
+            3,
+            "no new transition may be appended to the first deployment"
+        );
+        let observed = h.store.read_observed("t1").unwrap();
+        assert_eq!(
+            observed.slots[&PlacementSlotId::new("p1")]
+                .generation
+                .as_ref(),
+            Some(&assignment.generation_id),
+            "observed.json must be unchanged"
         );
     }
 

@@ -494,7 +494,7 @@ The tool never claims fleet-wide atomicity. It reports `successful`, `pending_co
 
 The local target lock prevents competing pushes from the same local store. Expected-generation and compensation compare-and-swap checks prevent a second controller from being silently overwritten. Concurrent controllers can still cause a visible failed or degraded fleet attempt, but cannot create a lost update on an individual server.
 
-If materialization produces an existing release and reconciliation finds the exact desired generation healthy on every server, the command prints `Everything up to date` without creating a deployment attempt. Existing local
+If materialization produces an existing release and reconciliation finds the exact desired generation healthy on every server, the command prints `Everything up to date` without creating a deployment attempt. The no-op still verifies the running services, and that verification renders the EXISTING generation's identities — the deployment id, generation id, and tree from the running generation's stored assignment — never the new deployment/generation ids, which would be fabricated because the no-op creates no records. Existing local
 content never suppresses required remote repair.
 
 `--dry-run` materializes and inspects local content and performs read-only remote status queries in disposable staging. It does not publish local objects, recover remote transactions, upload, publish remotely, activate, execute application verification, write history, or rotate. Instead, it reports any recovery that a real push would have to perform.
