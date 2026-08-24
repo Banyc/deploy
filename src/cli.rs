@@ -359,6 +359,9 @@ fn print_report(report: &PushReport) {
         println!("status: {status:?}");
     }
     println!("{}", report.message);
+    if let Some(warning) = &report.warning {
+        println!("warning: {warning}");
+    }
     if let Some(attempt) = &report.attempt {
         for (slot_id, s) in &attempt.slots {
             println!(

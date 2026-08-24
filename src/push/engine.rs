@@ -8,7 +8,7 @@
 //! per-server rotation.
 
 use crate::adapter::verify::run_verification;
-use crate::config::{Config, Mapping, SlotDef};
+use crate::config::{Config, Mapping, Pin, RotationConfig, SlotDef};
 use crate::error::{Error, Result};
 use crate::history::{self, PushRef};
 use crate::layout;
@@ -45,6 +45,12 @@ pub struct PushReport {
     pub status: Option<DeploymentStatus>,
     pub attempt: Option<DeploymentAttempt>,
     pub message: String,
+    /// Warning about post-commit maintenance deferred on this push (e.g. a
+    /// per-slot rotation that failed after the deployment already committed).
+    /// The push itself is unaffected — its status/attempt are the real
+    /// outcome — and the deferred work is retried on later pushes, including
+    /// no-ops. `None` when no maintenance is outstanding.
+    pub warning: Option<String>,
     pub dry_run: bool,
 }
 
@@ -530,6 +536,7 @@ fn push_inner(
             status: None,
             attempt: None,
             message: format!("dry-run plan:\n{msg}"),
+            warning: None,
             dry_run: true,
         });
     }
@@ -626,10 +633,26 @@ fn push_inner(
                 }
             }
             if verified {
+                // Post-commit maintenance hook for the no-op path: a no-op push
+                // creates no records and skips step 17, so any rotation debt
+                // left by an earlier push would never be serviced here — retry
+                // it explicitly before reporting "Everything up to date".
+                // Best-effort: a failure keeps the marker and surfaces as a
+                // warning; the no-op report itself is unchanged.
+                let deferred = retry_deferred_rotations(
+                    store,
+                    config,
+                    target,
+                    target_name,
+                    &helpers,
+                    op_id,
+                    deployment_id,
+                )?;
                 return Ok(PushReport {
                     status: None,
                     attempt: None,
                     message: "Everything up to date".to_string(),
+                    warning: maintenance_warning(&deferred),
                     dry_run: false,
                 });
             }
@@ -946,6 +969,14 @@ fn push_inner(
             let helper = &helpers[sid];
             // Hold the lock for the whole commit step so a failure cannot leak it
             // (a `?` on a manual lock would otherwise leave the lock held).
+            // The slot's FULL member target list (union retention), resolved
+            // from the current config.
+            let slot_targets: Vec<String> = config
+                .slot_defs()
+                .iter()
+                .find(|s| s.id.as_str() == sid.as_str())
+                .map(|s| s.targets.clone())
+                .unwrap_or_default();
             let _guard = match helper.acquire_lock_guard(op_id.as_str()) {
                 Ok(g) => g,
                 Err(_) => {
@@ -1173,6 +1204,10 @@ fn push_inner(
 
     // 17. Per-slot rotation under each slot's mutation lock. Rotation uses
     // the slot's ACTUAL final assignment (read after any compensation), not
+    // the desired plan: a compensated slot restored its prior variant. The
+    // retention policy is the target's `rotation` configuration from
+    // `deploy.toml`, so it applies uniformly regardless of which variant each
+    // slot ended up running.
     // the desired plan: a compensated slot restored its prior variant. A slot
     // may belong to SEVERAL targets with DIFFERENT retention policies; the
     // retained set is the UNION of every member target's policy applied to
@@ -1181,27 +1216,69 @@ fn push_inner(
     // artifact another member target's policy retains. The policies resolve
     // from the caller's current `deploy.toml` (retention is never part of a
     // release snapshot).
+
+    // the desired plan: a compensated slot restored its prior variant. The
+    // retention policy is the target's `rotation` configuration from
+    // `deploy.toml`, so it applies uniformly regardless of which variant each
+    // slot ended up running.
+    //
+    // POST-COMMIT MAINTENANCE: by this point the deployment has ALREADY
+    // committed (servers advanced, snapshot recorded, attempt recorded), so a
+    // rotation failure must NOT change the reported outcome — the push still
+    // returns `Ok` with the real `commit_status`. A failure is instead
+    // recorded as a PERSISTENT debt marker (per target+slot, under the local
+    // store) and surfaced as a warning on the report; later pushes —
+    // including no-ops — retry the maintenance and clear the marker once the
+    // rotation succeeds. The capacity-path preflight rotation in
+    // `capacity.rs` is already best-effort with `.ok()`; this step-17 path is
+    // what used to propagate rotation errors as push failures.
+    //
+    // The mutation lock is held via an RAII guard for the whole rotation
+    // block, so an error from `compute_retained` or `rotate` releases the
+    // lock on drop instead of leaking it (a manual acquire/release pair would
+    // strand every later operation on this slot with "mutation lock held by
+    // ..."). A lock acquisition conflict (held by another operation) skips
+    // the rotation silently, exactly as before.
+    let mut maintenance: Vec<String> = Vec::new();
+    // Retry any debt left by earlier pushes FIRST (before this push's own
+    // rotation), so a marker that succeeds here is cleared without re-rotating
+    // the same slot immediately after a fresh step-17 failure.
+    maintenance.extend(retry_deferred_rotations(
+        store,
+        config,
+        target,
+        target_name,
+        &helpers,
+        op_id,
+        deployment_id,
+    )?);
     for sid in &servers_order {
         let helper = &helpers[sid];
-        // The mutation lock is held via an RAII guard for the whole rotation
-        // block, so a `?` error from `compute_retained` or `rotate` releases
-        // the lock on drop instead of leaking it (a manual acquire/release
-        // pair would strand every later operation on this slot with "mutation
-        // lock held by ..."). Rotation errors still propagate exactly as
-        // before; only the lock discipline changes.
+        // The slot's FULL member target list (union retention), resolved from
+        // the current config.
+        let slot_targets: Vec<String> = config
+            .slot_defs()
+            .iter()
+            .find(|s| s.id.as_str() == sid.as_str())
+            .map(|s| s.targets.clone())
+            .unwrap_or_default();
         if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
-            // The slot's FULL member target list (not just this push's
-            // target): a shared slot's retention is the union of every
-            // member's policy.
-            let slot_targets: Vec<String> = config
-                .slot_defs()
-                .iter()
-                .find(|s| s.id.as_str() == sid.as_str())
-                .map(|s| s.targets.clone())
-                .unwrap_or_default();
-            let retained = compute_retained(helper, &config.pins, store, config, &slot_targets)?;
-            let active_incoming = HashSet::from([deployment_id.as_str().to_string()]);
-            helper.rotate(&retained, &active_incoming)?;
+            match rotate_slot_locked(helper, &config.pins, store, config, &slot_targets, deployment_id) {
+                Ok(()) => {
+                    // Maintenance done for this slot: clear any marker left by
+                    // an earlier push whose rotation failed after commit.
+                    clear_rotation_deferred(store, target_name, sid)?;
+                }
+                Err(e) => {
+                    // The deployment already committed; defer the maintenance
+                    // (marker + warning) instead of failing the push.
+                    set_rotation_deferred(store, target_name, sid, &e.to_string())?;
+                    maintenance.push(format!(
+                        "rotation deferred for slot '{}': {e}",
+                        sid.as_str()
+                    ));
+                }
+            }
         }
         // Clean up this deployment's incoming directory. Best-effort by
         // design: the push already succeeded, so a leftover here cannot change
@@ -1217,8 +1294,134 @@ fn push_inner(
         status: Some(commit_status),
         attempt: Some(attempt),
         message,
+        warning: maintenance_warning(&maintenance),
         dry_run: false,
     })
+}
+
+/// Run one slot's rotation — retained-set computation plus mark-and-sweep —
+/// for a caller already holding the slot's mutation lock (RAII guard). The
+/// single rotation block shared by step 17 and by deferred-maintenance
+/// retries, so both paths apply the same retention semantics and the same
+/// lock discipline. `deployment_id` marks this operation's incoming
+/// directory as active so rotation never sweeps a deployment currently being
+/// published.
+fn rotate_slot_locked(
+    helper: &RemoteHelper,
+    pins: &[Pin],
+    store: &LocalStore,
+    config: &Config,
+    slot_targets: &[String],
+    deployment_id: &DeploymentId,
+) -> Result<()> {
+    let retained = compute_retained(helper, pins, store, config, slot_targets)?;
+    let active_incoming = HashSet::from([deployment_id.as_str().to_string()]);
+    helper.rotate(&retained, &active_incoming)?;
+    Ok(())
+}
+
+/// Record a deferred-rotation debt marker for one slot (keyed by
+/// target+slot). Called only when the rotation failed after the deployment
+/// already committed.
+fn set_rotation_deferred(
+    store: &LocalStore,
+    target: &str,
+    slot: &PlacementSlotId,
+    reason: &str,
+) -> Result<()> {
+    let mut debt = store.read_rotation_debt(target)?;
+    debt.insert(slot.as_str().to_string(), reason.to_string());
+    store.write_rotation_debt(target, &debt)
+}
+
+/// Clear a slot's deferred-rotation debt marker once the rotation succeeded.
+fn clear_rotation_deferred(store: &LocalStore, target: &str, slot: &PlacementSlotId) -> Result<()> {
+    let mut debt = store.read_rotation_debt(target)?;
+    if debt.remove(slot.as_str()).is_some() {
+        store.write_rotation_debt(target, &debt)?;
+    }
+    Ok(())
+}
+
+/// Retry deferred post-commit rotation maintenance for `target`: every slot
+/// carrying a debt marker gets its rotation re-attempted under the slot's
+/// mutation lock (the same RAII-guarded block as step 17). Success clears the
+/// marker; failure keeps it and refreshes its reason. Runs on later pushes —
+/// before step 17 on the normal path and at the no-op return — because
+/// rotation is maintenance that must never change a deployment's reported
+/// outcome. Best-effort: this function NEVER fails the push. Returns the
+/// slots still deferred, for the push report's warning.
+fn retry_deferred_rotations(
+    store: &LocalStore,
+    config: &Config,
+    target: &crate::config::TargetDef,
+    target_name: &str,
+    helpers: &HashMap<PlacementSlotId, RemoteHelper>,
+    op_id: &OperationId,
+    deployment_id: &DeploymentId,
+) -> Result<Vec<String>> {
+    let mut debt = store.read_rotation_debt(target_name)?;
+    if debt.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut still_deferred: Vec<String> = Vec::new();
+    let mut serviced: Vec<String> = Vec::new();
+    for slot_str in debt.keys().cloned().collect::<Vec<_>>() {
+        let sid = PlacementSlotId::new(slot_str.clone());
+        let Some(helper) = helpers.get(&sid) else {
+            // The slot is no longer a member of this target, so its rotation
+            // cannot be serviced from here; keep the marker and say so.
+            still_deferred.push(format!(
+                "rotation still deferred for slot '{slot_str}' (no longer a member of target \
+                 '{target_name}')"
+            ));
+            continue;
+        };
+        if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
+            // The slot's FULL member target list (union retention), resolved
+            // from the current config.
+            let slot_targets: Vec<String> = config
+                .slot_defs()
+                .iter()
+                .find(|s| s.id.as_str() == slot_str.as_str())
+                .map(|s| s.targets.clone())
+                .unwrap_or_default();
+            match rotate_slot_locked(helper, &config.pins, store, config, &slot_targets, deployment_id) {
+                Ok(()) => serviced.push(slot_str.clone()),
+                Err(e) => {
+                    // Keep the marker with the fresh reason.
+                    debt.insert(slot_str.clone(), e.to_string());
+                    still_deferred.push(format!(
+                        "rotation still deferred for slot '{slot_str}': {e}"
+                    ));
+                }
+            }
+        } else {
+            still_deferred.push(format!(
+                "rotation still deferred for slot '{slot_str}': slot lock held by another \
+                 operation"
+            ));
+        }
+    }
+    for s in &serviced {
+        debt.remove(s);
+    }
+    store.write_rotation_debt(target_name, &debt)?;
+    Ok(still_deferred)
+}
+
+/// Build the report's `warning` from deferred-maintenance entries: `None`
+/// when nothing is outstanding, otherwise one message describing the deferred
+/// work.
+fn maintenance_warning(deferred: &[String]) -> Option<String> {
+    if deferred.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "post-commit maintenance deferred: {}",
+            deferred.join("; ")
+        ))
+    }
 }
 
 /// Download a tree from a server into the local object store if missing.

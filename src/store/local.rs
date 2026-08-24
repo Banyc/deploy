@@ -11,7 +11,7 @@
 //! <base>/
 //!   objects/sha256/<digest>/root/ , tree.json
 //!   releases/<release-id>/mapping.toml, behavior.json, release.json
-//!   targets/<target>/observed.json, attempts.jsonl, refs/last-successful, refs/snapshots.jsonl
+//!   targets/<target>/observed.json, rotation-debt.json, attempts.jsonl, refs/last-successful, refs/snapshots.jsonl
 //!   servers/<server-id>.json
 //!   deployments/<deployment-id>/plan.json, results.json, transitions.jsonl
 //! ```
@@ -372,6 +372,50 @@ impl LocalStore {
                 slots: Default::default(),
             })
         }
+    }
+
+    // ---- rotation maintenance debt ---------------------------------------
+
+    /// Path of the target's deferred-rotation debt marker file.
+    ///
+    /// Rotation is POST-COMMIT maintenance: a rotation failure after the
+    /// deployment already committed must not change the reported outcome.
+    /// Instead the failure is recorded here — keyed by target (the file's
+    /// location under `targets/<target>/`) and by placement slot (the map
+    /// key) — so later pushes retry the maintenance and clear the marker
+    /// once the rotation succeeds. The marker is intentionally a separate,
+    /// small record: it does not ride along in `observed.json` (which
+    /// describes the deployed state, not pending controller work) and it
+    /// survives across pushes.
+    pub fn rotation_debt_path(&self, target: &str) -> PathBuf {
+        self.target_dir(target).join("rotation-debt.json")
+    }
+
+    /// Read the target's deferred-rotation markers: a map of placement slot
+    /// id to the reason the rotation was deferred. Empty when no maintenance
+    /// is pending.
+    pub fn read_rotation_debt(&self, target: &str) -> Result<BTreeMap<String, String>> {
+        let p = self.rotation_debt_path(target);
+        if p.exists() {
+            read_json(&p)
+        } else {
+            Ok(BTreeMap::new())
+        }
+    }
+
+    /// Persist the target's deferred-rotation markers. An EMPTY map removes
+    /// the marker file, so a fully-serviced target leaves no trace.
+    pub fn write_rotation_debt(&self, target: &str, debt: &BTreeMap<String, String>) -> Result<()> {
+        let p = self.rotation_debt_path(target);
+        if debt.is_empty() {
+            if p.exists() {
+                std::fs::remove_file(&p).map_err(|e| {
+                    Error::store(format!("remove rotation debt {}: {e}", p.display()))
+                })?;
+            }
+            return Ok(());
+        }
+        write_json(&p, debt)
     }
 
     pub fn append_attempt(&self, target: &str, attempt: &DeploymentAttempt) -> Result<()> {

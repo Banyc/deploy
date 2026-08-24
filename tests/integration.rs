@@ -2422,13 +2422,19 @@ fn capacity_rotation_compute_retained_failure_releases_lock() -> Result<()> {
 }
 
 /// A successful push whose step-17 per-slot rotation fails inside `rotate` (a
-/// transient inventory-write error) must NOT leak the server mutation lock:
-/// the rotation block holds the lock via an RAII guard, so the error path
-/// releases it on drop. The push still reports the rotation error (step 17
-/// propagates it), and a later operation — including a fresh push — can
-/// acquire the lock again.
+/// transient inventory-write error) must NOT fail the push nor leak the server
+/// mutation lock. Rotation is POST-COMMIT maintenance: the deployment already
+/// committed (servers advanced, snapshot and attempt recorded) before step 17
+/// runs, so a rotation failure changes nothing about the outcome. It defers
+/// the maintenance — a PERSISTENT debt marker is written under the local
+/// store (keyed by target+slot) and the report carries a warning — and the
+/// push returns `Ok` with the real `Successful` status. A later push (here an
+/// unchanged-content NO-OP, "Everything up to date") retries the maintenance
+/// with the one-shot fault consumed, clears the marker, and reports no
+/// warning. The mutation lock must be released on the error path: the RAII
+/// guard drops it, so a later operation can re-acquire it.
 #[test]
-fn step17_rotation_failure_releases_lock() -> Result<()> {
+fn step17_rotation_failure_defers_maintenance_until_noop_retry() -> Result<()> {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
@@ -2458,9 +2464,11 @@ fn step17_rotation_failure_releases_lock() -> Result<()> {
         )
     };
 
-    // The push deploys everything but fails at step 17: the first slot's
-    // `rotate` hits the injected inventory-write failure and propagates it.
-    let err = push(
+    // Push 1: the deployment COMMITS, but the first slot's step-17 `rotate`
+    // hits the injected inventory-write failure. The push must still return
+    // Ok with the committed status — a completed deployment is never reported
+    // as failed because its cleanup rotation failed.
+    let r1 = push(
         &config_path,
         &store,
         &fault_factory,
@@ -2470,12 +2478,43 @@ fn step17_rotation_failure_releases_lock() -> Result<()> {
             dry_run: false,
             ref_token: None,
         },
-    )
-    .err()
-    .expect("the injected rotate failure must fail the push");
+    )?;
+    assert_eq!(
+        r1.status,
+        Some(DeploymentStatus::Successful),
+        "the deployment committed; a step-17 rotation failure must not change its outcome"
+    );
     assert!(
-        err.to_string().contains("inventory.json"),
-        "expected the injected rotation write failure, got: {err}"
+        r1.attempt.is_some(),
+        "the committed deployment records its attempt"
+    );
+    let warning1 = r1
+        .warning
+        .as_ref()
+        .expect("the push must warn about the deferred rotation");
+    assert!(
+        warning1.contains("rotation deferred"),
+        "the warning describes the deferred rotation, got: {warning1}"
+    );
+    assert!(
+        warning1.contains("inventory.json"),
+        "the warning names the injected failure, got: {warning1}"
+    );
+
+    // The debt marker is PERSISTENT (a file under the store, keyed by
+    // target+slot) and records the failure reason, so a later push can retry.
+    let debt = store.read_rotation_debt("production")?;
+    assert!(
+        !debt.is_empty(),
+        "a debt marker must be recorded when step-17 rotation fails"
+    );
+    assert!(
+        debt.values().any(|v| v.contains("inventory.json")),
+        "the marker records the failure reason, got: {debt:?}"
+    );
+    assert!(
+        store.rotation_debt_path("production").exists(),
+        "the marker survives across pushes as a file under the store"
     );
 
     // The mutation lock was released on the error path: no server carries a
@@ -2497,9 +2536,10 @@ fn step17_rotation_failure_releases_lock() -> Result<()> {
         helper.release_lock("op-after")?;
     }
 
-    // End-to-end: a second push (a fresh operation) reconciles and reports
-    // "Everything up to date" — it would have failed with "mutation lock held
-    // by ..." during reconciliation if the step-17 error had leaked the lock.
+    // Push 2: unchanged content, so this is an up-to-date NO-OP — but the
+    // no-op path retries the deferred maintenance before reporting. The
+    // one-shot fault was consumed by push 1, so the retry succeeds: the marker
+    // is cleared and the no-op report carries no warning.
     let r2 = push(
         &config_path,
         &store,
@@ -2512,6 +2552,133 @@ fn step17_rotation_failure_releases_lock() -> Result<()> {
         },
     )?;
     assert_eq!(r2.message, "Everything up to date");
+    assert_eq!(r2.status, None, "the retrying push is an up-to-date no-op");
+    assert!(r2.attempt.is_none(), "the no-op creates no attempt");
+    assert!(
+        r2.warning.is_none(),
+        "the maintenance succeeded on the no-op retry, so no warning remains, got: {:?}",
+        r2.warning
+    );
+    assert!(
+        store.read_rotation_debt("production")?.is_empty(),
+        "the debt marker must be cleared once the rotation succeeds"
+    );
+    assert!(
+        !store.rotation_debt_path("production").exists(),
+        "a cleared debt marker leaves no file behind"
+    );
+    Ok(())
+}
+
+/// The no-op maintenance retry is best-effort: if the deferred rotation STILL
+/// fails (the fault is re-armed), the no-op still reports "Everything up to
+/// date" with a warning and the marker is KEPT; a later no-op (fault consumed)
+/// retries again and finally clears it. At no point does a rotation failure
+/// turn a push into an error.
+#[test]
+fn noop_retry_keeps_marker_until_rotation_succeeds() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store = LocalStore::with_base(tmp.path().join("store"))?;
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    let (config, config_path) = setup(&proj);
+
+    let armed = Arc::new(AtomicBool::new(true));
+    let armed_for_factory = armed.clone();
+    let rf = remotes_base.clone();
+    let fault_factory = move |s: &deploy::config::ServerDef,
+                              _slot: &deploy::config::SlotDef|
+          -> Result<Box<dyn Remote>> {
+        FailOnceRotationRemote::build(
+            rf.join(&s.id),
+            armed_for_factory.clone(),
+            "state/inventory.json",
+            false,    // fail_list
+            true,     // fail_write
+            u64::MAX, // avail: plenty of space, so preflight never rotates
+        )
+    };
+
+    // Push 1: the deployment commits but step-17 rotation fails; maintenance
+    // is deferred with a marker and a warning.
+    let r1 = push(
+        &config_path,
+        &store,
+        &fault_factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+    assert!(
+        r1.warning.is_some(),
+        "push 1 must warn about the deferred rotation"
+    );
+    assert!(
+        !store.read_rotation_debt("production")?.is_empty(),
+        "push 1 must record the debt marker"
+    );
+
+    // Push 2: re-arm the fault so the no-op's maintenance retry fails too.
+    // The no-op report is unchanged — "Everything up to date" plus a warning
+    // that the maintenance is still deferred — and the marker is KEPT.
+    armed.store(true, Ordering::SeqCst);
+    let r2 = push(
+        &config_path,
+        &store,
+        &fault_factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r2.message, "Everything up to date");
+    assert_eq!(r2.status, None);
+    let warning2 = r2
+        .warning
+        .as_ref()
+        .expect("a still-failing retry must keep warning about the deferred rotation");
+    assert!(
+        warning2.contains("rotation still deferred"),
+        "the warning says the maintenance is still deferred, got: {warning2}"
+    );
+    assert!(
+        !store.read_rotation_debt("production")?.is_empty(),
+        "a failed retry must keep the debt marker"
+    );
+
+    // Push 3: the fault was consumed by push 2, so the no-op retry succeeds
+    // and clears the marker; the report carries no warning.
+    let r3 = push(
+        &config_path,
+        &store,
+        &fault_factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+        },
+    )?;
+    assert_eq!(r3.message, "Everything up to date");
+    assert_eq!(r3.status, None);
+    assert!(
+        r3.warning.is_none(),
+        "the successful retry clears the warning, got: {:?}",
+        r3.warning
+    );
+    assert!(
+        store.read_rotation_debt("production")?.is_empty(),
+        "the marker must be cleared once the rotation succeeds"
+    );
     Ok(())
 }
 
