@@ -54,7 +54,7 @@ my-app/
 
 Slots are declared INSIDE the variant files: `releases/v1/standard.toml`
 carries the project's one slot (`app-1` → `server-01`, bound to the
-`production` target by its `target` field — targets derive their member slots
+`production` target by its `targets` list — targets derive their member slots
 from the slots, they do not list them).
 
 The generated files are typed TOML serialized from the same config structs
@@ -138,7 +138,7 @@ deploy push production release/rel-41da2f63:current
 deploy.toml                    # names the active release, servers, and targets (rollout + rotation)
 releases/<name>/              # the release directory named by `release:`
 releases/<name>/<variant>.toml  # every *.toml file here is a variant (file stem = name);
-                                # each variant declares its own [[slots]] (server, deploy_dir, target)
+                                # each variant declares its own [[slots]] (server, deploy_dir, targets)
 releases/<name>/artifacts/    # artifact sources referenced by variant mappings
 ```
 
@@ -151,10 +151,12 @@ releases/<name>/artifacts/    # artifact sources referenced by variant mappings
   file IS the slot's variant binding. Capacity is a per-server policy declared
   on the server entry.
 - A **deployment slot** binds one server to one workload under an ID, names the
-  absolute `deploy_dir` on the server, and declares the ONE target it belongs
-  to (`target = "..."`). A **target** carries the rollout and rotation policy;
-  its member slots are DERIVED from the slots' `target` fields — targets do
-  not list their slots.
+  absolute `deploy_dir` on the server, and declares the targets it belongs to
+  (`targets = ["..."]`). A slot may be a member of several targets, and two
+  slots may share one server in different targets, but within a single target
+  each server appears at most once. A **target** carries the rollout and
+  rotation policy; its member slots are DERIVED from the slots' `targets`
+  lists — targets do not list their slots.
 - Retention (`rotation`) belongs to the target, not the variant.
 
 ## Config reference (condensed)
@@ -176,7 +178,7 @@ capacity = { reserve_bytes = 0, reserve_percent = 0 }  # per-server headroom, ze
 
 [targets.production]         # targets carry rollout + rotation only: their member
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-                            # slots are derived from the slots' `target` fields
+                            # slots are derived from the slots' `targets` lists
 
 [targets.production.rotation.per_server]   # retention is per target
 keep_distinct_artifacts = 5
@@ -191,12 +193,12 @@ plus the variant's deployment slots:
 description = "Standard deployment"
 
 # This variant's deployment slots: one slot = one server + this variant, under
-# an ID, with an absolute deploy_dir, belonging to exactly ONE target (targets
+# an ID, with an absolute deploy_dir, belonging to one or more targets (targets
 # derive their members from these declarations).
 [[slots]]
 id = "app-1"
 server = "server-01"
-target = "production"
+targets = ["production"]
 deploy_dir = "/srv/deploy/my-app"   # absolute path on the server
 
 [[artifact.mappings]]
@@ -246,9 +248,10 @@ resolved from this file at preflight time — it is never part of a release.
 
 Validation is strict: `deploy_dir` and `known_hosts` must be absolute paths,
 server/slot IDs must be unique (slot IDs across every variant's slots), each
-slot's server must be a declared `[[servers]]` entry, each slot's `target`
-must be a declared `[targets.<name>]` key, and each target must have at least
-one member slot. Every SSH-shaped server address must configure
+slot's server must be a declared `[[servers]]` entry, every target in a slot's
+`targets` list must be a declared `[targets.<name>]` key (and the list must
+not be empty), and each target must have at least one member slot. Every
+SSH-shaped server address must configure
 EXACTLY ONE of `known_hosts` or `host_key_fingerprint` (neither means
 trust-on-first-use, which is refused; both are ambiguous) — `local://`
 addresses are exempt. A config that fails validation is rejected at load time,
@@ -261,8 +264,9 @@ before anything is touched.
 - **Add a server**: add a `[[servers]]` entry to `deploy.toml`, then a
   `[[slots]]` entry inside the variant file that owns the workload (server,
   absolute `deploy_dir`, `target`).
-- **Add a slot to a target**: the slot's `target` field is the membership —
-  set it (and only it) to the target's name; targets do not list slots.
+- **Add a slot to a target**: the slot's `targets` list is the membership —
+  add the target's name to it (a slot may belong to several targets); targets
+  do not list slots.
 - **Cut a release**: copy the release directory (e.g. `releases/v1` →
   `releases/v2`), edit the variant files (new mappings, verification, etc.),
   and set `release = "v2"` in `deploy.toml`. Old releases stay deployable via

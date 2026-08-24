@@ -99,8 +99,9 @@ pub fn normalize_deploy_dir(path: &Path) -> String {
 /// Canonicalize a variant's declared `[[slots]]` into the sorted, normalized
 /// identity form: exactly the four identity-bearing fields of [`SlotDef`]
 /// (`id`, `server`, `deploy_dir` as a lexically-normalized absolute path
-/// string, `target`), sorted by slot id. Server-level policy (user, address,
-/// port, capacity) is deliberately absent — it is not release identity.
+/// string, `targets` SORTED), sorted by slot id. Server-level policy (user,
+/// address, port, capacity) is deliberately absent — it is not release
+/// identity.
 pub fn canonicalize_slots(slots: &[SlotDef]) -> CanonicalSlots {
     let mut out: Vec<CanonicalSlot> = slots
         .iter()
@@ -108,7 +109,11 @@ pub fn canonicalize_slots(slots: &[SlotDef]) -> CanonicalSlots {
             id: s.id.clone(),
             server: s.server.clone(),
             deploy_dir: normalize_deploy_dir(&s.deploy_dir),
-            target: s.target.clone(),
+            targets: {
+                let mut t = s.targets.clone();
+                t.sort();
+                t
+            },
         })
         .collect();
     out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -117,11 +122,13 @@ pub fn canonicalize_slots(slots: &[SlotDef]) -> CanonicalSlots {
 
 /// Canonical digest over name-sorted per-variant slot declarations. Each
 /// variant's slots are canonicalized (the four identity fields, `deploy_dir`
-/// lexically normalized) and sorted by slot id; the variants are name-sorted
-/// by the `BTreeMap`. Two releases share this digest only when every declared
-/// variant declares the same slots — a rebind, `deploy_dir` move, or retarget
-/// changes it, while a reordering of slot declarations (or of variants) does
-/// not. Server-level policy (user/address/port/capacity) is not part of it.
+/// lexically normalized, `targets` sorted) and sorted by slot id; the
+/// variants are name-sorted by the `BTreeMap`. Two releases share this digest
+/// only when every declared variant declares the same slots — a rebind,
+/// `deploy_dir` move, or target-membership change alters it, while a
+/// reordering of slot declarations (or of variants, or of a slot's `targets`
+/// list) does not. Server-level policy (user/address/port/capacity) is not
+/// part of it.
 pub fn variant_slots_digest(slots: &BTreeMap<String, Vec<SlotDef>>) -> String {
     let canonical: BTreeMap<String, CanonicalSlots> = slots
         .iter()
@@ -210,7 +217,7 @@ mod tests {
             id: id.to_string(),
             server: server.to_string(),
             deploy_dir: PathBuf::from(deploy_dir),
-            target: target.to_string(),
+            targets: vec![target.to_string()],
         }
     }
 
@@ -294,6 +301,55 @@ mod tests {
                 "every slot field change must alter the digest"
             );
         }
+    }
+
+    /// The `targets` membership list is part of the identity: adding a target
+    /// to a slot's list changes the digest, while REORDERING the list does
+    /// not (the canonical form sorts it).
+    #[test]
+    fn variant_slots_digest_is_sensitive_to_targets_list() {
+        let base: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+            "standard".to_string(),
+            vec![SlotDef {
+                id: "p1".to_string(),
+                server: "server-01".to_string(),
+                deploy_dir: PathBuf::from("/srv/deploy/example"),
+                targets: vec!["production".to_string()],
+            }],
+        )]);
+        let base_sha = variant_slots_digest(&base);
+
+        // Adding a second target to the list changes the digest.
+        let added: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+            "standard".to_string(),
+            vec![SlotDef {
+                id: "p1".to_string(),
+                server: "server-01".to_string(),
+                deploy_dir: PathBuf::from("/srv/deploy/example"),
+                targets: vec!["production".to_string(), "staging".to_string()],
+            }],
+        )]);
+        assert_ne!(
+            variant_slots_digest(&added),
+            base_sha,
+            "a target-membership change must alter the digest"
+        );
+
+        // Reordering the same list canonicalizes identically.
+        let reordered: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+            "standard".to_string(),
+            vec![SlotDef {
+                id: "p1".to_string(),
+                server: "server-01".to_string(),
+                deploy_dir: PathBuf::from("/srv/deploy/example"),
+                targets: vec!["staging".to_string(), "production".to_string()],
+            }],
+        )]);
+        assert_eq!(
+            variant_slots_digest(&reordered),
+            variant_slots_digest(&added),
+            "targets list order must not affect the digest"
+        );
     }
 
     /// `deploy_dir` canonicalization collapses slashes, resolves `.`/`..`
@@ -440,6 +496,29 @@ mod tests {
             base.as_str(),
             sb.as_str(),
             "canonical-slot change must re-digest"
+        );
+
+        // Target-membership change -> new digest: a slot-only change to the
+        // `targets` list creates a new ReleaseId.
+        let s3: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+            "standard".to_string(),
+            vec![SlotDef {
+                id: "p1".to_string(),
+                server: "server-01".to_string(),
+                deploy_dir: PathBuf::from("/srv/deploy/example"),
+                targets: vec!["production".to_string(), "staging".to_string()],
+            }],
+        )]);
+        let st = release_digest(
+            "mapping-sha",
+            "behavior-sha",
+            &variant_slots_digest(&s3),
+            &bindings,
+        );
+        assert_ne!(
+            base.as_str(),
+            st.as_str(),
+            "a targets-list change must re-digest"
         );
 
         // The built release record follows the digest: identical inputs build

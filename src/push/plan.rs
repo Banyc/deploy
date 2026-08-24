@@ -272,7 +272,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 [[slots]]
 id = "p1"
 server = "s1"
-target = "t1"
+targets = ["t1"]
 deploy_dir = "/srv/plan"
 
 [[artifact.mappings]]
@@ -391,7 +391,7 @@ interval_seconds = 0
                     id: "pX".to_string(),
                     server: "s1".to_string(),
                     deploy_dir: "/srv/other".to_string(),
-                    target: "t1".to_string(),
+                    targets: vec!["t1".to_string()],
                 }],
             },
         )]);
@@ -465,7 +465,7 @@ interval_seconds = 0
                         id: "p1".to_string(),
                         server: "s1".to_string(),
                         deploy_dir: "/srv/plan".to_string(),
-                        target: "t1".to_string(),
+                        targets: vec!["t1".to_string()],
                     }],
                 },
             )]),
@@ -524,7 +524,7 @@ interval_seconds = 0
                         id: "p1".to_string(),
                         server: "s1".to_string(),
                         deploy_dir: "/srv/plan".to_string(),
-                        target: "t1".to_string(),
+                        targets: vec!["t1".to_string()],
                     }],
                 },
             )]),
@@ -604,7 +604,7 @@ interval_seconds = 0
                         id: "p1".to_string(),
                         server: "s1".to_string(),
                         deploy_dir: "/srv/plan".to_string(),
-                        target: "t1".to_string(),
+                        targets: vec!["t1".to_string()],
                     }],
                 },
             )]),
@@ -684,7 +684,7 @@ interval_seconds = 0
                             id: "p1".to_string(),
                             server: "s1".to_string(),
                             deploy_dir: "/srv/plan".to_string(),
-                            target: "t1".to_string(),
+                            targets: vec!["t1".to_string()],
                         }],
                     },
                 )]),

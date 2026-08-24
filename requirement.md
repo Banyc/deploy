@@ -28,9 +28,9 @@ variant     = a name bound to one tree within a release
 artifact    = the immutable release + variant + tree binding
 release     = an immutable map of every declared variant to a tree digest plus the release's own canonical per-variant slot declarations (the slot snapshot, folded into the ReleaseId)
 server      = a durable machine identity: a stable ID plus its current address
-deployment slot = a binding of one top-level server to one variant under an ID, with an absolute deploy_dir, declared inside the variant file that owns the workload; its `target` field binds it to exactly one target
+deployment slot = a binding of one top-level server to one variant under an ID, with an absolute deploy_dir, declared inside the variant file that owns the workload; its `targets` list binds it to one or more targets
 physical binding = a slot's `{server, deploy_dir}` pair at a point in time: the exact on-host deployment location; snapshots record it so exact rollback can verify a slot still lives where it was deployed
-target      = a named group of slots (derived from the slots' `target` fields) plus its rollout and retention policy
+target      = a named group of slots (derived from the slots' `targets` lists) plus its rollout and retention policy
 deployment  = an attempted push and its exact per-server assignments
 generation  = one placement slot's durable activation record for one assignment
 ```
@@ -39,7 +39,7 @@ Deployment, operation, and generation IDs are opaque collision-resistant IDs (UU
 
 Tree objects contain no release- or variant-specific metadata, so identical trees can be deduplicated safely. Release records bind variants to trees and freeze the release's own canonical per-variant slot declarations (the slot snapshot).
 
-The canonical release ID is derived from a versioned canonical identity payload covering the name-sorted per-variant mapping digests, the name-sorted per-variant SLOT DECLARATION digest (each variant's `[[slots]]` entries canonicalized to their four identity fields `id`/`server`/`deploy_dir`/`target` — `deploy_dir` lexically normalized — and sorted by slot id), all declared `variant → tree digest` bindings, and the name-sorted per-variant activation and verification behavior-contract digest. It explicitly excludes the resulting release ID, creation time, display name, and provenance, avoiding a circular hash. Two variants may share tree bytes while still requiring different activation and verification behavior, so behavior is captured per variant rather than once per release. A slot-only change — rebinding a slot to another server, moving its `deploy_dir`, or retargeting it — produces a NEW release ID: the canonical slot declarations are part of the identity, and the release record persists them as its slot snapshot. Capacity is NOT part of the release identity: it is a per-server policy declared on the server entry and resolved from the caller's current configuration at preflight time, so a server-capacity change never produces a new release. Its stored form is `rel-sha256-<release-digest>`; the CLI may display and accept an unambiguous digest prefix. Git revision and creation time are provenance only because mapped inputs can include generated or untracked files.
+The canonical release ID is derived from a versioned canonical identity payload covering the name-sorted per-variant mapping digests, the name-sorted per-variant SLOT DECLARATION digest (each variant's `[[slots]]` entries canonicalized to their four identity fields `id`/`server`/`deploy_dir`/`targets` — `deploy_dir` lexically normalized, `targets` sorted — and sorted by slot id), all declared `variant → tree digest` bindings, and the name-sorted per-variant activation and verification behavior-contract digest. It explicitly excludes the resulting release ID, creation time, display name, and provenance, avoiding a circular hash. Two variants may share tree bytes while still requiring different activation and verification behavior, so behavior is captured per variant rather than once per release. A slot-only change — rebinding a slot to another server, moving its `deploy_dir`, or changing its target membership — produces a NEW release ID: the canonical slot declarations are part of the identity, and the release record persists them as its slot snapshot. Capacity is NOT part of the release identity: it is a per-server policy declared on the server entry and resolved from the caller's current configuration at preflight time, so a server-capacity change never produces a new release. Its stored form is `rel-sha256-<release-digest>`; the CLI may display and accept an unambiguous digest prefix. Git revision and creation time are provenance only because mapped inputs can include generated or untracked files.
 
 Mapping and behavior digests are computed from versioned canonical data after schema defaults, path normalization, and validation, not from TOML formatting, comments, or key order. The original configuration remains available as provenance, while `behavior.json` records the canonical behavior contract. Snapshot files are written atomically and immutably with create-or-compare semantics: an identical rewrite is an idempotent no-op, and replacing an existing release's `behavior.json` with different content fails. A historical deployment restores the variant's original activation and verification behavior from this snapshot (so a variant renamed or removed after the release was created still rolls back exactly), and resolution fails closed: a missing or corrupt historical behavior snapshot aborts the attempt during preflight rather than silently substituting the caller's current configuration or defaults. Capacity headroom, by contrast, is a per-server policy that is never snapshotted: servers have no per-release history, so every push — HEAD or historical — resolves it from the caller's current `deploy.toml`. Retention (`rotation`) is target-level configuration declared within each target of the project file, not a per-variant or global setting, and is read from the caller's current configuration on every push.
 
@@ -118,7 +118,7 @@ protect_previous = true
 protect_deployments = 2
 
 # Servers are declared once; slots are declared inside the variant files and
-# bind themselves to a target with their `target` field (a target's members
+# bind themselves to targets with their `targets` lists (a target's members
 # are derived from the slots). Capacity is a per-server policy, shared by
 # every deployment slot on the server and resolved from this file at preflight
 # time — it is never part of a release.
@@ -147,12 +147,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 Servers and targets are declared once at the top level of `deploy.toml`;
 slots are declared inside the variant files. Each slot binds one server to the
 variant whose file declares it, names an absolute `deploy_dir`, and carries a
-`target` field naming the ONE target it belongs to — a target's member slots
+`targets` list naming the targets it belongs to — a target's member slots
 are DERIVED by scanning every variant's slots for that target name. A slot
-belongs to exactly one target (its on-server `deploy_dir` state is single;
-the per-target records keyed by slot ID cannot attribute it otherwise), and
-this is STRUCTURAL: a slot has a single `target` field, so it cannot be a
-member of two targets. Two slots may share one server in different targets,
+may be a member of several targets (its on-server `deploy_dir` state is
+shared across them), and two slots may share one server in different targets,
 but within a single target each server appears at most once (one running
 generation per server). Besides `id`,
 `address`, and `user`, every server accepts an
@@ -179,8 +177,8 @@ Each variant is described by its own file inside the release directory (e.g.
 `releases/v1/standard.toml`); there is no explicit variant list to keep in
 sync. A variant file owns its artifact mappings, its deployment policies
 (activation, verification), AND its deployment slots — the `[[slots]]`
-entries of the file, whose `target` field binds each slot to exactly one
-top-level target; rotation is declared once per target:
+entries of the file, whose `targets` list binds each slot to one or more
+top-level targets; rotation is declared once per target:
 
 ```toml
 # releases/v1/standard.toml
@@ -194,13 +192,13 @@ description = "Standard deployment"
 [[slots]]
 id = "app-1"
 server = "server-01"
-target = "production"
+targets = ["production"]
 deploy_dir = "/srv/deploy/example"
 
 [[slots]]
 id = "app-2"
 server = "server-02"
-target = "production"
+targets = ["production"]
 deploy_dir = "/srv/deploy/example"
 
 [[artifact.mappings]]
@@ -392,7 +390,7 @@ metadata lives outside the tree object. For example, `release.json` is:
 }
 ```
 
-This separation allows two releases or variants with identical bytes to share one tree safely. The `slots` member is the release's OWN canonical per-variant slot snapshot — each variant's `[[slots]]` declarations in canonical form (`id`/`server`/`deploy_dir`/`target`, `deploy_dir` lexically normalized, slots sorted by id) — frozen into the record and folded into the release digest. Historical and rollback pushes resolve slot→variant bindings from this snapshot rather than the caller's current variant files; a record written before the snapshot existed (`slots` absent) falls back to the current configuration. Release records and tree objects are immutable; attempts to replace an existing ID or digest with different content fail.
+This separation allows two releases or variants with identical bytes to share one tree safely. The `slots` member is the release's OWN canonical per-variant slot snapshot — each variant's `[[slots]]` declarations in canonical form (`id`/`server`/`deploy_dir`/`targets`, `deploy_dir` lexically normalized, `targets` sorted, slots sorted by id) — frozen into the record and folded into the release digest. Historical and rollback pushes resolve slot→variant bindings from this snapshot rather than the caller's current variant files; a record written before the snapshot existed (`slots` absent) falls back to the current configuration. Release records and tree objects are immutable; attempts to replace an existing ID or digest with different content fail.
 
 Local target state is a mirror and cache, not unquestioned authority. Before a mutating operation, the tool reconciles it with the actual remote generation, object inventory, and in-progress transaction state. If a remote retains a
 verified tree that is missing locally, reconciliation downloads it into local staging, verifies its canonical digest, and republishes it into the local object store. Local-store rotation is PLANNED, not yet implemented: it must never remove an object still retained on a known remote server. Today rotation is remote-only — per server, under the mutation lock — so the local object store never deletes published trees and always keeps them recoverable.

@@ -201,7 +201,7 @@ mappings = []
 [[slots]]
 id = "p1"
 server = "s1"
-target = "t1"
+targets = ["t1"]
 deploy_dir = "/srv"
 
 [activation]

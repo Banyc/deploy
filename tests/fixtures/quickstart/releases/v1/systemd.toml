@@ -8,8 +8,8 @@
 # enabled, and restarted after `current` is swapped.
 #
 # It declares NO slots: to use it, add a [[slots]] entry (id, server,
-# deploy_dir, target) like standard.toml's — the `target` field binds the
-# slot to one target.
+# deploy_dir, targets) like standard.toml's — the `targets` list binds the
+# slot to one or more targets.
 #
 # `standard.toml` documents every setting made live here, including the
 # caveats: artifact-controlled unit files assume `scope = "user"`

@@ -21,8 +21,8 @@
 //! state, fleet snapshots, commit markers). [`ServerId`] is the ACTUAL SERVER
 //! identity used for transport addressing (user@host lives on `ServerDef`).
 //! They are distinct concepts: a server can host slots in multiple targets,
-//! while a slot belongs to exactly one target and carries its own
-//! `deploy_dir`. Today one target runs at most one slot per server, so the
+//! and a slot may be a member of several targets (each carrying its own
+//! `deploy_dir`). Today one target runs at most one slot per server, so the
 //! two ID spaces are interchangeable within a target, but the model keys
 //! assignments by [`PlacementSlotId`] and addresses transports by
 //! [`ServerId`].
@@ -195,23 +195,28 @@ pub struct CanonicalBehavior {
 
 /// One canonical slot declaration: the four identity-bearing fields of a
 /// [`crate::config::SlotDef`], with `deploy_dir` reduced to a lexically
-/// normalized absolute path string. Server-level policy (user, address, port,
-/// capacity) is deliberately absent: it is a per-server policy resolved from
-/// the caller's current configuration, never part of a release identity.
+/// normalized absolute path string and `targets` SORTED (the canonical form —
+/// and therefore the release identity digest — must be order-independent).
+/// Server-level policy (user, address, port, capacity) is deliberately
+/// absent: it is a per-server policy resolved from the caller's current
+/// configuration, never part of a release identity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalSlot {
     pub id: String,
     pub server: String,
     pub deploy_dir: String,
-    pub target: String,
+    /// The slot's target membership list, sorted so the canonical form is
+    /// order-independent: `["staging", "production"]` and
+    /// `["production", "staging"]` canonicalize identically.
+    pub targets: Vec<String>,
 }
 
 /// The canonicalized slot declaration set of one variant: its slots sorted by
 /// slot id. A variant's slot declarations ARE release identity — rebinding a
-/// slot to another server, moving its `deploy_dir`, or retargeting it changes
-/// the release — so this snapshot is frozen into the release record and
-/// digest. It carries exactly the four [`CanonicalSlot`] fields and no derived
-/// state.
+/// slot to another server, moving its `deploy_dir`, or changing its target
+/// membership changes the release — so this snapshot is frozen into the
+/// release record and digest. It carries exactly the four [`CanonicalSlot`]
+/// fields and no derived state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalSlots {
     pub slots: Vec<CanonicalSlot>,

@@ -7,19 +7,19 @@ description = "Standard deployment"
 
 # This variant's deployment slots. Each slot binds a server (declared in
 # deploy.toml) to this variant under an ID, names the absolute on-server
-# deploy_dir, and declares the ONE target it belongs to — a target's members
-# are derived from the slots' `target` fields (targets no longer list their
+# deploy_dir, and declares the targets it belongs to — a target's members
+# are derived from the slots' `targets` lists (targets no longer list their
 # slots). Both slots belong to `production`.
 [[slots]]
 id = "app-1"
 server = "server-01"
-target = "production"
+targets = ["production"]
 deploy_dir = "/srv/deploy/example"
 
 [[slots]]
 id = "app-2"
 server = "server-02"
-target = "production"
+targets = ["production"]
 deploy_dir = "/srv/deploy/example"
 
 [[artifact.mappings]]

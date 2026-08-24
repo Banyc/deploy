@@ -480,7 +480,7 @@ mod tests {
 [[slots]]
 id = "p1"
 server = "s1"
-target = "t1"
+targets = ["t1"]
 deploy_dir = "/srv/eng"
 
 [[artifact.mappings]]
@@ -531,7 +531,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 [[slots]]
 id = "p1"
 server = "s1"
-target = "t1"
+targets = ["t1"]
 deploy_dir = "/srv/eng"
 
 [[artifact.mappings]]

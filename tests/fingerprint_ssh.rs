@@ -304,12 +304,12 @@ rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_
 
 /// Set up a single-slot project (deploy.toml + variant file + artifact inputs),
 /// return the loaded config and the config path. The slot is declared inside
-/// the variant file and binds itself to `production` with its `target` field.
+/// the variant file and binds itself to `production` with its `targets` list.
 fn setup_project(proj: &Path, address: &str, deploy_dir: &str) -> (Config, PathBuf) {
     write_file(&proj.join("deploy.toml"), &single_target_toml(address));
     let release_dir = proj.join("releases").join("v1");
     let slot_toml = format!(
-        "\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntarget = \"production\"\ndeploy_dir = \"{deploy_dir}\"\n"
+        "\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntargets = [\"production\"]\ndeploy_dir = \"{deploy_dir}\"\n"
     );
     write_file(
         &release_dir.join("standard.toml"),

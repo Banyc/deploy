@@ -66,7 +66,7 @@ releases/ tree):\n\
 \n\
 Slots are declared INSIDE the variant files: releases/v1/standard.toml\n\
 carries the project's one slot (app-1 -> server-01, bound to target\n\
-`production` by its `target` field — targets derive their members from the\n\
+`production` by its `targets` list — targets derive their members from the\n\
 slots, they do not list them).\n\
 \n\
 The generated files are typed TOML serialized from the same config structs\n\
@@ -471,7 +471,7 @@ mod tests {
             r#"[[slots]]
 id = "p1"
 server = "s1"
-target = "production"
+targets = ["production"]
 deploy_dir = "/srv/status"
 
 [[artifact.mappings]]

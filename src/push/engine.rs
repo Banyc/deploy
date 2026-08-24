@@ -1340,7 +1340,7 @@ mod tests {
 [[slots]]
 id = "p1"
 server = "s1"
-target = "t1"
+targets = ["t1"]
 deploy_dir = "/srv/eng"
 
 [[artifact.mappings]]
@@ -3093,7 +3093,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 [[slots]]
 id = "p1"
 server = "s1"
-target = "t1"
+targets = ["t1"]
 deploy_dir = "/srv/eng"
 
 [[artifact.mappings]]
@@ -3700,13 +3700,13 @@ rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "rollback_c
 [[slots]]
 id = "p1"
 server = "s1"
-target = "t1"
+targets = ["t1"]
 deploy_dir = "/srv/p1"
 
 [[slots]]
 id = "p2"
 server = "s2"
-target = "t1"
+targets = ["t1"]
 deploy_dir = "/srv/p2"
 
 [[artifact.mappings]]
@@ -3728,13 +3728,13 @@ interval_seconds = 0
 [[slots]]
 id = "p3"
 server = "s3"
-target = "t1"
+targets = ["t1"]
 deploy_dir = "/srv/p3"
 
 [[slots]]
 id = "p4"
 server = "s4"
-target = "t1"
+targets = ["t1"]
 deploy_dir = "/srv/p4"
 
 [[artifact.mappings]]
@@ -4247,7 +4247,7 @@ interval_seconds = 0
         // exact-rollback physical-binding check still passes).
         std::fs::remove_file(release_dir.join("other.toml")).unwrap();
         let renamed = format!(
-            "[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntarget = \"t1\"\ndeploy_dir = \"/srv/eng\"\n\n{}",
+            "[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntargets = [\"t1\"]\ndeploy_dir = \"/srv/eng\"\n\n{}",
             std::fs::read_to_string(release_dir.join("standard.toml")).unwrap()
         );
         std::fs::write(release_dir.join("standard.toml"), renamed).unwrap();
@@ -4366,7 +4366,7 @@ interval_seconds = 0
 [[slots]]
 id = "p1"
 server = "s1"
-target = "t1"
+targets = ["t1"]
 deploy_dir = "/srv/sysd"
 
 [[artifact.mappings]]
@@ -5265,13 +5265,13 @@ interval_seconds = 0
 [[slots]]
 id = "p1"
 server = "s1"
-target = "t1"
+targets = ["t1"]
 deploy_dir = "/srv/p1"
 
 [[slots]]
 id = "p2"
 server = "s2"
-target = "t1"
+targets = ["t1"]
 deploy_dir = "/srv/p2"
 
 [[artifact.mappings]]
@@ -5747,13 +5747,13 @@ rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "leave_chan
 [[slots]]
 id = "p1"
 server = "s1"
-target = "t1"
+targets = ["t1"]
 deploy_dir = "/srv/p1"
 
 [[slots]]
 id = "p2"
 server = "s2"
-target = "t1"
+targets = ["t1"]
 deploy_dir = "/srv/p2"
 
 [[artifact.mappings]]
@@ -5775,13 +5775,13 @@ interval_seconds = 0
 [[slots]]
 id = "p3"
 server = "s3"
-target = "t1"
+targets = ["t1"]
 deploy_dir = "/srv/p3"
 
 [[slots]]
 id = "p4"
 server = "s4"
-target = "t1"
+targets = ["t1"]
 deploy_dir = "/srv/p4"
 
 [[artifact.mappings]]

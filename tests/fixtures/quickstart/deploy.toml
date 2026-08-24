@@ -7,7 +7,7 @@ application = "example"
 release = "v1"
 
 # Servers are declared once; slots are declared inside the variant files and
-# bind themselves to a target with their `target` field (a target's members
+# bind themselves to targets with their `targets` lists (a target's members
 # are derived from the slots). Capacity is a per-server policy (shared by
 # every deployment slot on the server), resolved from the caller's current
 # configuration — never part of the release identity.
@@ -32,7 +32,7 @@ host_key_fingerprint = "SHA256:quickstart-placeholder"
 capacity = { reserve_bytes = 1073741824, reserve_percent = 0 }  # keep at least 1 GiB free
 
 # Targets declare rollout + rotation policy only: their member slots are
-# derived from the slots' `target` field (see releases/v1/standard.toml).
+# derived from the slots' `targets` lists (see releases/v1/standard.toml).
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 

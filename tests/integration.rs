@@ -81,18 +81,18 @@ rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "rollback_c
 
 /// Slots declared inside the `standard` variant file: p1/p2 on server-01/02,
 /// both bound to target `production` (a target's members are derived from the
-/// slots' `target` field).
+/// slots' `targets` lists).
 const STANDARD_SLOTS: &str = r#"
 [[slots]]
 id = "p1"
 server = "server-01"
-target = "production"
+targets = ["production"]
 deploy_dir = "/srv/deploy/example"
 
 [[slots]]
 id = "p2"
 server = "server-02"
-target = "production"
+targets = ["production"]
 deploy_dir = "/srv/deploy/example"
 "#;
 
@@ -102,7 +102,7 @@ const HC_SLOTS: &str = r#"
 [[slots]]
 id = "p3"
 server = "server-03"
-target = "production"
+targets = ["production"]
 deploy_dir = "/srv/deploy/example"
 "#;
 
@@ -114,7 +114,7 @@ const SLOT_MOVED_BODY: &str = r#"
 [[slots]]
 id = "p1"
 server = "server-01"
-target = "production"
+targets = ["production"]
 deploy_dir = "/srv/deploy/example"
 "#;
 
@@ -405,7 +405,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &proj,
         "standard",
         &format!(
-            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntarget = \"production\"\ndeploy_dir = \"/srv/deploy/rebind\"\n"
+            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntargets = [\"production\"]\ndeploy_dir = \"/srv/deploy/rebind\"\n"
         ),
     );
     let artifacts = proj.join("releases").join("v1").join("artifacts");
@@ -459,7 +459,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // deploy_dir, different physical server. The config stays valid (exactly
     // one slot, one server per target).
     let rebound_variant = format!(
-        "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-02\"\ntarget = \"production\"\ndeploy_dir = \"/srv/deploy/rebind\"\n"
+        "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-02\"\ntargets = [\"production\"]\ndeploy_dir = \"/srv/deploy/rebind\"\n"
     );
     write_variant_file(&proj, "standard", &rebound_variant);
     let config2 = Config::load(&config_path)?;
@@ -578,7 +578,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &proj,
         "standard",
         &format!(
-            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntarget = \"production\"\ndeploy_dir = \"/srv/move/movedir-a\"\n"
+            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntargets = [\"production\"]\ndeploy_dir = \"/srv/move/movedir-a\"\n"
         ),
     );
     let artifacts = proj.join("releases").join("v1").join("artifacts");
@@ -630,7 +630,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // physical server, different on-server location. The config stays valid
     // (exactly one slot, one server per target).
     let moved_variant = format!(
-        "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntarget = \"production\"\ndeploy_dir = \"/srv/move/movedir-b\"\n"
+        "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntargets = [\"production\"]\ndeploy_dir = \"/srv/move/movedir-b\"\n"
     );
     write_variant_file(&proj, "standard", &moved_variant);
     let config2 = Config::load(&config_path)?;
@@ -774,7 +774,7 @@ rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_
         &proj,
         "old",
         &format!(
-            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntarget = \"production\"\ndeploy_dir = \"/srv/deploy/example\"\n"
+            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntargets = [\"production\"]\ndeploy_dir = \"/srv/deploy/example\"\n"
         ),
     );
     let artifacts = proj.join("releases").join("v1").join("artifacts");
@@ -817,7 +817,7 @@ rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_
         &proj,
         "new",
         &format!(
-            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntarget = \"production\"\ndeploy_dir = \"/srv/deploy/example\"\n"
+            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntargets = [\"production\"]\ndeploy_dir = \"/srv/deploy/example\"\n"
         ),
     );
     write_file(&artifacts.join("deployment/variants/new/extra"), "new\n");
@@ -1524,7 +1524,7 @@ fn single_variant_body(verify_argv: &str) -> String {
 [[slots]]
 id = "p1"
 server = "server-01"
-target = "production"
+targets = ["production"]
 deploy_dir = "/srv/deploy/example"
 
 [[artifact.mappings]]
@@ -1553,7 +1553,7 @@ interval_seconds = 0
 /// Minimal deploy.toml body with a single `standard` variant and
 /// `activation: none`. Rotation is a top-level setting of `deploy.toml`;
 /// targets carry rollout + rotation only (their members are derived from the
-/// slots' `target` field).
+/// slots' `targets` lists).
 fn single_target_toml(stop_on_failure: bool, batch_size: u32) -> String {
     format!(
         r#"
@@ -1636,7 +1636,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 [[slots]]
 id = "p1"
 server = "server-01"
-target = "production"
+targets = ["production"]
 deploy_dir = "/srv/deploy/example"
 
 [[artifact.mappings]]
@@ -2168,19 +2168,19 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 [[slots]]
 id = "p1"
 server = "server-01"
-target = "production"
+targets = ["production"]
 deploy_dir = "/srv/deploy/example"
 
 [[slots]]
 id = "p2"
 server = "server-02"
-target = "production"
+targets = ["production"]
 deploy_dir = "/srv/deploy/example"
 
 [[slots]]
 id = "p3"
 server = "server-03"
-target = "production"
+targets = ["production"]
 deploy_dir = "/srv/deploy/example"
 
 [[artifact.mappings]]
@@ -3256,7 +3256,7 @@ fn slot_only_variant_body(server: &str) -> String {
 [[slots]]
 id = "p1"
 server = "{server}"
-target = "production"
+targets = ["production"]
 deploy_dir = "/srv/deploy/example"
 
 [[artifact.mappings]]
@@ -4015,5 +4015,199 @@ interval_seconds = 0
         .flatten()
         .collect();
     assert_eq!(remote_objs.len(), 1, "one remote tree object");
+    Ok(())
+}
+
+/// A slot may be a member of SEVERAL targets: pushing each target deploys the
+/// slot independently, with per-target attempts/snapshots/observed, and `@f0`
+/// rollback works on each target's own snapshot.
+#[test]
+fn slot_in_two_targets_deploys_per_target_and_rolls_back_each() -> Result<()> {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let store_base = tmp.path().join("store");
+    let remotes_base = tmp.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+
+    // One slot p1 on server-01, declared in the `standard` variant, belonging
+    // to BOTH `production` and `staging`.
+    let variant = format!(
+        r#"
+[[slots]]
+id = "p1"
+server = "server-01"
+targets = ["production", "staging"]
+deploy_dir = "/srv/deploy/example"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#
+    );
+    write_variant_file(&proj, "standard", &variant);
+    let manifest = format!(
+        r#"
+schema_version = 1
+application = "example"
+release = "v1"
+
+[targets.production.rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[targets.production.rotation.fleet]
+protect_deployments = 2
+
+[targets.staging.rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[targets.staging.rotation.fleet]
+protect_deployments = 2
+
+[[servers]]
+id = "server-01"
+address = "server-01.example.com"
+user = "deploy"
+host_key_fingerprint = "SHA256:test"
+
+[targets.production]
+rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
+
+[targets.staging]
+rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }}
+"#
+    );
+    write_file(&proj.join("deploy.toml"), &manifest);
+    let artifacts = proj.join("releases").join("v1").join("artifacts");
+    write_file(&artifacts.join("build/output/app/server"), "server-v1\n");
+
+    let config = Config::load(&proj.join("deploy.toml"))?;
+    // The slot is a member of BOTH targets.
+    assert_eq!(config.target_slot_ids("production")?, vec!["p1"]);
+    assert_eq!(config.target_slot_ids("staging")?, vec!["p1"]);
+
+    let store = LocalStore::with_base(store_base.clone())?;
+    let rf = remotes_base.clone();
+    let factory = move |s: &deploy::config::ServerDef,
+                        _slot: &deploy::config::SlotDef|
+          -> Result<Box<dyn Remote>> {
+        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+    };
+    let push_opt = |_target: &str| PushOptions {
+        dry_run: false,
+        ref_token: None,
+    };
+
+    // Push `production` (content v1): deploys p1, records production's f0.
+    let rp = push(
+        &proj.join("deploy.toml"),
+        &store,
+        &factory,
+        "production",
+        &config,
+        &push_opt("production"),
+    )?;
+    assert_eq!(rp.status, Some(DeploymentStatus::Successful));
+    let prod_v1 = rp.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")]
+        .artifact
+        .tree
+        .clone();
+
+    // Change content, then push `staging` (content v2): the SAME slot deploys
+    // independently for staging, with its own per-target attempt/snapshot.
+    write_file(&artifacts.join("build/output/app/server"), "server-v2\n");
+    let rs = push(
+        &proj.join("deploy.toml"),
+        &store,
+        &factory,
+        "staging",
+        &config,
+        &push_opt("staging"),
+    )?;
+    assert_eq!(rs.status, Some(DeploymentStatus::Successful));
+    let staging_v2 = rs.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")]
+        .artifact
+        .tree
+        .clone();
+    assert_ne!(prod_v1, staging_v2, "staging deployed the newer content");
+
+    // Per-target records are separate: each target has its own attempt and
+    // its own observed state.
+    assert_eq!(store.read_attempts("production")?.len(), 1);
+    assert_eq!(store.read_attempts("staging")?.len(), 1);
+    let prod_observed = store.read_observed("production")?;
+    let staging_observed = store.read_observed("staging")?;
+    assert!(
+        prod_observed.slots[&PlacementSlotId::new("p1")]
+            .artifact
+            .is_some()
+    );
+    assert!(
+        staging_observed.slots[&PlacementSlotId::new("p1")]
+            .artifact
+            .is_some()
+    );
+
+    // `@f0` rollback on EACH target restores that target's own f0 tree.
+    let rrb_prod = push(
+        &proj.join("deploy.toml"),
+        &store,
+        &factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: Some("production@f0".to_string()),
+        },
+    )?;
+    assert_eq!(rrb_prod.status, Some(DeploymentStatus::Successful));
+    let restored_prod = store.read_observed("production")?;
+    assert_eq!(
+        restored_prod.slots[&PlacementSlotId::new("p1")]
+            .artifact
+            .as_ref()
+            .unwrap()
+            .tree,
+        prod_v1,
+        "production rolled back to its own f0 tree"
+    );
+
+    let rrb_staging = push(
+        &proj.join("deploy.toml"),
+        &store,
+        &factory,
+        "staging",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: Some("staging@f0".to_string()),
+        },
+    )?;
+    assert_eq!(rrb_staging.status, Some(DeploymentStatus::Successful));
+    let restored_staging = store.read_observed("staging")?;
+    assert_eq!(
+        restored_staging.slots[&PlacementSlotId::new("p1")]
+            .artifact
+            .as_ref()
+            .unwrap()
+            .tree,
+        staging_v2,
+        "staging rolled back to its own f0 tree"
+    );
     Ok(())
 }
