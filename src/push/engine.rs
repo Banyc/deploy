@@ -5673,23 +5673,41 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let h = RecoveryHarness::new();
         // A release record whose behavior snapshot was never written:
         // `write_release` persists `release.json` only; the aux
-        // `behavior.json` is absent.
-        let release = crate::model::ReleaseId::new("rel-sha256-no-behavior".to_string());
-        h.store
-            .write_release(&crate::model::ReleaseRecord {
-                release_schema_version: 1,
-                release_id: release.as_str().to_string(),
-                release_sha256: "rel-sha256-no-behavior".to_string(),
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                provenance: crate::model::Provenance {
-                    git_revision: None,
-                    mapping_sha256: "m".to_string(),
-                    behavior_sha256: "b".to_string(),
+        // `behavior.json` is absent. The record itself must be a
+        // content-verifiable current-format record (its OWN slot snapshot,
+        // identity recomputed from that content) or `write_release` refuses
+        // it: an empty slot snapshot cannot be verified (fail closed).
+        let mut rec = crate::model::ReleaseRecord {
+            release_schema_version: 1,
+            release_id: String::new(),
+            release_sha256: String::new(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            provenance: crate::model::Provenance {
+                git_revision: None,
+                mapping_sha256: "m".to_string(),
+                behavior_sha256: "b".to_string(),
+            },
+            variants: BTreeMap::from([("standard".to_string(), "tree-x".to_string())]),
+            slots: BTreeMap::from([(
+                "standard".to_string(),
+                crate::model::CanonicalSlots {
+                    slots: vec![crate::model::CanonicalSlot {
+                        id: "p1".to_string(),
+                        server: "s1".to_string(),
+                        deploy_dir: "/srv/eng".to_string(),
+                        targets: vec!["t1".to_string()],
+                    }],
                 },
-                variants: BTreeMap::from([("standard".to_string(), "tree-x".to_string())]),
-                slots: BTreeMap::new(),
-            })
-            .unwrap();
+            )]),
+        };
+        let digest = crate::release::recompute_release_digest(&rec)
+            .expect("test release must carry a slot snapshot");
+        rec.release_sha256 = digest.as_str().to_string();
+        rec.release_id = crate::model::ReleaseId::from_digest(&digest)
+            .as_str()
+            .to_string();
+        let release = crate::model::ReleaseId::new(rec.release_id.clone());
+        h.store.write_release(&rec).unwrap();
 
         let project_root = h.config.project_root(&h.cfg_path);
         let target = h.config.targets.get("t1").expect("harness target");

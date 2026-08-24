@@ -464,11 +464,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let helper = RemoteHelper::new(&remote);
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
-        // A release with two variants, persisted in the local store.
-        let rec = crate::model::ReleaseRecord {
+        // A release with two variants, persisted in the local store. The
+        // record must be a content-verifiable CURRENT-format record (its OWN
+        // slot snapshot, identity recomputed from that content): an empty
+        // slot snapshot is rejected by `write_release` (fail closed).
+        let mut rec = crate::model::ReleaseRecord {
             release_schema_version: 1,
-            release_id: "rel-sha256-pin-test".into(),
-            release_sha256: "pin-test".into(),
+            release_id: String::new(),
+            release_sha256: String::new(),
             created_at: "2020-01-01T00:00:00Z".into(),
             provenance: crate::model::Provenance {
                 git_revision: None,
@@ -479,13 +482,29 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 ("a".to_string(), "tree-a".to_string()),
                 ("b".to_string(), "tree-b".to_string()),
             ]),
-            slots: std::collections::BTreeMap::new(),
+            slots: std::collections::BTreeMap::from([(
+                "standard".to_string(),
+                crate::model::CanonicalSlots {
+                    slots: vec![crate::model::CanonicalSlot {
+                        id: "p1".to_string(),
+                        server: "s1".to_string(),
+                        deploy_dir: "/srv/pin".to_string(),
+                        targets: vec!["t1".to_string()],
+                    }],
+                },
+            )]),
         };
+        let digest = crate::release::recompute_release_digest(&rec)
+            .expect("pin-test release must carry a slot snapshot");
+        rec.release_sha256 = digest.as_str().to_string();
+        rec.release_id = crate::model::ReleaseId::from_digest(&digest)
+            .as_str()
+            .to_string();
         store.write_release(&rec).unwrap();
 
         let c = cfg();
         let pinned = [Pin {
-            release: "rel-sha256-pin-test".into(),
+            release: rec.release_id.clone(),
             reason: "known-good".into(),
         }];
 

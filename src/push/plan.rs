@@ -304,10 +304,15 @@ interval_seconds = 0
         (dir, config)
     }
 
-    /// A release record whose stored canonical slot snapshot is EMPTY — the
-    /// shape written before the slots-into-identity refactor (records from
-    /// older code deserialize with `#[serde(default)]` on `slots`). It still
-    /// carries the per-variant tree bindings.
+    /// A release record in the pre-snapshot SHAPE: an EMPTY `slots` map (the
+    /// shape written before the slots-into-identity refactor, and what
+    /// `#[serde(default)]` yields for records without a `slots` member). The
+    /// store now REJECTS empty slot snapshots at write and read (an empty
+    /// snapshot cannot be verified from content), so fixtures that need a
+    /// WRITABLE record must fill `slots` and recompute the identity with
+    /// [`consistent`]. The bare empty-snapshot record is used directly only
+    /// when a test needs the on-disk legacy shape. It still carries the
+    /// per-variant tree bindings.
     fn legacy_record(id: &str, tree: &str) -> ReleaseRecord {
         ReleaseRecord {
             release_schema_version: 1,
@@ -339,20 +344,34 @@ interval_seconds = 0
         ReleaseId::new(rec.release_id.clone())
     }
 
-    /// A `PushRef::Release` resolution against a LEGACY release record (empty
-    /// stored slot snapshot) must fall back to the CURRENT configuration's
-    /// declaring file for each slot's variant binding
-    /// (`config.slot_variant(&slot.id)`), while the tree still comes from the
-    /// record's own per-variant bindings. The assignment keeps the release's
-    /// identity and resolves as `ReleaseRef`.
+    /// A `PushRef::Release` resolution against a release record that carries
+    /// its OWN stored canonical snapshot: each slot's variant binding resolves
+    /// from the snapshot, the tree from the record's own per-variant
+    /// bindings, and the assignment keeps the release's identity and resolves
+    /// as `ReleaseRef`. (Empty-snapshot records are now REJECTED at the store
+    /// boundary — see `empty_slot_snapshot_record_fails_closed_at_read` — so
+    /// every writable release record carries its snapshot.)
     #[test]
-    fn legacy_empty_slots_snapshot_falls_back_to_current_config_variant() {
+    fn release_snapshot_resolves_variant_and_tree() {
         let (_dir, config) = project_with_config();
         let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
-        let release = ReleaseId::new("rel-sha256-legacy".to_string());
-        store
-            .write_release(&legacy_record(release.as_str(), "tree-legacy"))
-            .unwrap();
+        // The release's OWN snapshot declares p1 -> `standard` (matching the
+        // current config's declaring file, `config.slot_variant`); the tree
+        // comes from the record's own bindings.
+        let mut rec = legacy_record("unused", "tree-legacy");
+        rec.slots = BTreeMap::from([(
+            "standard".to_string(),
+            CanonicalSlots {
+                slots: vec![CanonicalSlot {
+                    id: "p1".to_string(),
+                    server: "s1".to_string(),
+                    deploy_dir: "/srv/plan".to_string(),
+                    targets: vec!["t1".to_string()],
+                }],
+            },
+        )]);
+        let release = consistent(&mut rec);
+        store.write_release(&rec).unwrap();
         // The current config declares p1 inside the `standard` variant file.
         assert_eq!(config.slot_variant("p1").unwrap(), "standard");
 
@@ -367,7 +386,7 @@ interval_seconds = 0
             &store,
             &config,
         )
-        .expect("legacy release resolves");
+        .expect("snapshot-carrying release resolves");
 
         assert_eq!(assignments.len(), 1);
         let a = &assignments[0];
@@ -375,7 +394,7 @@ interval_seconds = 0
         assert_eq!(
             a.artifact.variant.as_str(),
             "standard",
-            "the variant must come from the CURRENT declaring file, not a stored snapshot (none exists)"
+            "the variant must come from the release's OWN stored snapshot"
         );
         assert_eq!(
             a.artifact.tree.as_str(),
@@ -385,6 +404,47 @@ interval_seconds = 0
         assert_eq!(a.artifact.release, release);
         assert_eq!(desired, release);
         assert_eq!(source, PlanSource::ReleaseRef(release));
+    }
+
+    /// An on-disk record with an EMPTY stored slot snapshot (the pre-snapshot
+    /// legacy shape) fails closed at the STORE: `read_release` refuses it
+    /// (an empty snapshot cannot be recomputed into an identity), so a
+    /// `PushRef::Release` ref pointing at it surfaces as the release-rollback
+    /// error and can never silently fall back to the caller's current
+    /// configuration.
+    #[test]
+    fn empty_slot_snapshot_record_fails_closed_at_read() {
+        let (_dir, config) = project_with_config();
+        let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
+        let release = ReleaseId::new("rel-sha256-legacy".to_string());
+        // `write_release` refuses empty-snapshot records, so install the
+        // legacy-shaped record directly (as pre-refactor on-disk data would
+        // appear).
+        let rec = legacy_record(release.as_str(), "tree-legacy");
+        let dir = store.release_dir(&release);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("release.json"),
+            serde_json::to_vec_pretty(&rec).unwrap(),
+        )
+        .unwrap();
+
+        let err = plan_assignments(
+            "t1",
+            &PushRef::Release {
+                release: release.clone(),
+                current_variant: false,
+            },
+            &ReleaseId::new("unused-local".to_string()),
+            &BTreeMap::new(),
+            &store,
+            &config,
+        )
+        .expect_err("an empty-slot-snapshot release must fail closed at read");
+        assert!(
+            err.to_string().contains("not available locally"),
+            "the refusal must surface as the release-resolution rollback error, got: {err}"
+        );
     }
 
     /// A NON-legacy release record whose stored slot snapshot does NOT declare
@@ -430,17 +490,29 @@ interval_seconds = 0
         );
     }
 
-    /// The legacy fallback resolves the variant from the current config, but
-    /// the TREE must still come from the release record: a legacy record whose
-    /// variant bindings lack the resolved variant fails closed with a rollback
-    /// error naming the release.
+    /// The TREE must come from the release record's own variant bindings: a
+    /// release whose bindings lack the snapshot-resolved variant fails closed
+    /// with a rollback error naming the release.
     #[test]
-    fn legacy_fallback_missing_variant_tree_fails_rollback() {
+    fn release_missing_variant_tree_fails_rollback() {
         let (_dir, config) = project_with_config();
         let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
-        let release = ReleaseId::new("rel-sha256-no-tree".to_string());
-        let mut rec = legacy_record(release.as_str(), "tree-x");
+        let mut rec = legacy_record("unused", "tree-x");
+        rec.slots = BTreeMap::from([(
+            "standard".to_string(),
+            CanonicalSlots {
+                slots: vec![CanonicalSlot {
+                    id: "p1".to_string(),
+                    server: "s1".to_string(),
+                    deploy_dir: "/srv/plan".to_string(),
+                    targets: vec!["t1".to_string()],
+                }],
+            },
+        )]);
         rec.variants.clear(); // no variant bindings at all
+        // Recompute the identity from the ACTUAL stored content (empty
+        // bindings + snapshot) so the record verifies on write and read.
+        let release = consistent(&mut rec);
         store.write_release(&rec).unwrap();
 
         let err = plan_assignments(
@@ -454,7 +526,7 @@ interval_seconds = 0
             &store,
             &config,
         )
-        .expect_err("a legacy release without the resolved variant's tree must refuse");
+        .expect_err("a release without the resolved variant's tree must refuse");
         assert!(
             err.to_string().contains("lacks variant 'standard'"),
             "error must name the missing variant tree, got: {err}"

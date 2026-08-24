@@ -216,10 +216,12 @@ pub fn build_release(
 /// Recompute the canonical release digest from a stored record's OWN content:
 /// the per-variant canonical slot snapshot, the `variant -> tree digest`
 /// bindings, and the provenance digests — exactly the inputs `build_release`
-/// folds into the identity. Returns `None` for legacy records that carry no
-/// canonical slot snapshot (written before the slots-into-identity refactor):
-/// their slot declarations were not persisted, so the digest cannot be
-/// recomputed from the record alone and the existing fallback semantics apply.
+/// folds into the identity. Returns `None` when the record carries no
+/// canonical slot snapshot (empty `slots` map): such a record's slot
+/// declarations were not persisted, so the digest cannot be recomputed from
+/// the record alone. Verification (`verify_release_identity`) treats that
+/// `None` as an integrity failure — an empty slot snapshot is rejected, with
+/// no legacy escape hatch.
 pub fn recompute_release_digest(rec: &ReleaseRecord) -> Option<ReleaseDigest> {
     if rec.slots.is_empty() {
         return None;
@@ -260,13 +262,26 @@ pub fn recompute_release_digest(rec: &ReleaseRecord) -> Option<ReleaseDigest> {
 /// recomputed from the record's own content. The digest is never trusted from
 /// the stored fields: a tampered record whose content was edited while the
 /// digest fields were left unchanged fails closed with an integrity error
-/// naming the release and the expected vs recomputed digest. Legacy records
-/// without a canonical slot snapshot cannot be re-verified from their own
-/// content and are accepted (the existing fallback semantics apply).
+/// naming the release and the expected vs recomputed digest.
+///
+/// An EMPTY canonical slot snapshot is rejected outright: a current-format
+/// release record must carry its own slot declarations, without which the
+/// identity cannot be recomputed from the record — accepting one would let a
+/// tampered record whose `slots` map was emptied bypass verification
+/// entirely. There is deliberately NO legacy escape hatch:
+/// `release_schema_version` is 1 for both current and pre-snapshot records,
+/// so an empty snapshot cannot be proven "genuinely legacy" and is treated
+/// as tampering (fail closed).
 pub fn verify_release_identity(rec: &ReleaseRecord) -> Result<()> {
-    let Some(recomputed) = recompute_release_digest(rec) else {
-        return Ok(());
-    };
+    // Reject an empty slot snapshot before anything else: a record that
+    // carries no canonical slot declarations cannot be verified from its own
+    // content, so its identity is not trustworthy.
+    let recomputed = recompute_release_digest(rec).ok_or_else(|| {
+        Error::integrity(format!(
+            "release {} carries an empty canonical slot snapshot: a release record must persist its slot declarations to be verifiable (fail closed)",
+            rec.release_id
+        ))
+    })?;
     let expected_id = ReleaseId::from_digest(&recomputed);
     if rec.release_sha256 != recomputed.as_str() || rec.release_id != expected_id.as_str() {
         return Err(Error::integrity(format!(
@@ -666,9 +681,8 @@ mod tests {
     /// record's OWN content and checks it against BOTH stored identity fields:
     /// a pristine record verifies, a record whose slot declaration or variant
     /// binding was edited while the digest fields were retained fails closed
-    /// with an integrity error naming the mismatch, and a legacy record
-    /// without a slot snapshot (digest not recomputable from the record alone)
-    /// is accepted.
+    /// with an integrity error naming the mismatch, and a record whose slot
+    /// snapshot was EMPTIED fails closed (no legacy escape hatch).
     #[test]
     fn verify_release_identity_recomputes_from_content() {
         let variants: BTreeMap<VariantName, TreeDigest> =
@@ -708,11 +722,53 @@ mod tests {
             .expect_err("tampered variant binding must fail verification");
         assert!(err2.to_string().contains("identity mismatch"));
 
-        // Legacy record (no slot snapshot): accepted — the digest cannot be
-        // recomputed from the record alone.
-        let mut legacy = rec.clone();
-        legacy.slots.clear();
-        verify_release_identity(&legacy)
-            .expect("legacy record without a slot snapshot is accepted");
+        // Empty slot snapshot: rejected outright (fail closed) — a record
+        // whose `slots` map was emptied cannot be verified from its own
+        // content, and there is no legacy escape hatch.
+        let mut empty_slots = rec.clone();
+        empty_slots.slots.clear();
+        let err = verify_release_identity(&empty_slots)
+            .expect_err("an empty slot snapshot must fail verification");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("slot snapshot"),
+            "error must name the empty slot snapshot, got: {msg}"
+        );
+        assert!(
+            msg.contains("fail closed"),
+            "error must explain the fail-closed rejection, got: {msg}"
+        );
+    }
+
+    /// A current-format record whose slot snapshot was EMPTIED while the
+    /// digest fields were left unchanged (the classic empty-snapshot bypass)
+    /// must fail verification with an integrity error: the digest fields are
+    /// re-derived from the record content, and the emptied snapshot makes the
+    /// record unverifiable.
+    #[test]
+    fn verify_release_identity_rejects_empty_slot_snapshot_even_with_retained_digests() {
+        let variants: BTreeMap<VariantName, TreeDigest> =
+            BTreeMap::from([(VariantName::new("standard"), TreeDigest::new("t1"))]);
+        let slots: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+            "standard".to_string(),
+            vec![sdef("p1", "server-01", "/srv/deploy/example", "production")],
+        )]);
+        let rec = build_release("m", "b", &variants, &slots, Path::new("."));
+        verify_release_identity(&rec).expect("pristine record verifies");
+
+        // Tamper: empty the slots map but RETAIN the stored digest fields.
+        let mut tampered = rec.clone();
+        tampered.slots.clear();
+        assert_eq!(
+            tampered.release_sha256, rec.release_sha256,
+            "digest retained"
+        );
+        assert_eq!(tampered.release_id, rec.release_id, "release id retained");
+        let err = verify_release_identity(&tampered)
+            .expect_err("an emptied slot snapshot must fail verification");
+        assert!(
+            err.to_string().contains("fail closed"),
+            "error must explain the fail-closed rejection, got: {err}"
+        );
     }
 }

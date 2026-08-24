@@ -592,16 +592,19 @@ host_key_fingerprint = "SHA256:test"
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 "#;
 
-    /// A minimal release record for the harness's synthetic `rel-sha256-r1`
-    /// release: legacy shape (no canonical slot snapshot), so the publish
-    /// path's recompute-and-verify accepts it (the digest cannot be recomputed
-    /// from a record that carries no slot declarations) while `behavior.json`
-    /// still carries the real per-variant contracts.
-    fn harness_release_json() -> String {
-        let rec = crate::model::ReleaseRecord {
+    /// A minimal release record for the harness's synthetic release: a
+    /// CURRENT-format record carrying its OWN canonical slot snapshot (slot
+    /// p1 -> variant `standard`, matching the harness config's NONE_VARIANT
+    /// declaration) with the identity RECOMPUTED from the stored content, so
+    /// the publish path's recompute-and-verify accepts it. `harness_release_id`
+    /// exposes the resulting identity-derived id (the `rel-sha256-<digest>`
+    /// that tests thread through artifact refs and the publish path); the
+    /// empty-snapshot legacy shape is rejected by verification.
+    fn harness_release_record() -> crate::model::ReleaseRecord {
+        let mut rec = crate::model::ReleaseRecord {
             release_schema_version: 1,
-            release_id: "rel-sha256-r1".to_string(),
-            release_sha256: "r1".to_string(),
+            release_id: String::new(),
+            release_sha256: String::new(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             provenance: crate::model::Provenance {
                 git_revision: None,
@@ -612,9 +615,33 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "standard".to_string(),
                 "tree".to_string(),
             )]),
-            slots: std::collections::BTreeMap::new(),
+            slots: std::collections::BTreeMap::from([(
+                "standard".to_string(),
+                crate::model::CanonicalSlots {
+                    slots: vec![crate::model::CanonicalSlot {
+                        id: "p1".to_string(),
+                        server: "s1".to_string(),
+                        deploy_dir: "/srv/eng".to_string(),
+                        targets: vec!["t1".to_string()],
+                    }],
+                },
+            )]),
         };
-        serde_json::to_string(&rec).unwrap()
+        let digest = crate::release::recompute_release_digest(&rec)
+            .expect("harness release must carry a slot snapshot");
+        rec.release_sha256 = digest.as_str().to_string();
+        rec.release_id = crate::model::ReleaseId::from_digest(&digest)
+            .as_str()
+            .to_string();
+        rec
+    }
+
+    fn harness_release_json() -> String {
+        serde_json::to_string(&harness_release_record()).unwrap()
+    }
+
+    fn harness_release_id() -> crate::model::ReleaseId {
+        crate::model::ReleaseId::new(harness_release_record().release_id)
     }
 
     struct Harness {
@@ -706,7 +733,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // processed like the engine's `slot_vars`: release/variant/tree
             // come from the ArtifactRef, never the config release name.
             let artifact = ArtifactRef {
-                release: ReleaseId::new("rel-sha256-r1"),
+                release: harness_release_id(),
                 variant: VariantName::new("standard"),
                 tree: self.tree.clone(),
             };
@@ -1015,7 +1042,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 ],
             );
             // First deploy: establishes the PRIOR generation whose assignment
-            // carries the immutable release id `rel-sha256-r1` and the PRIOR
+            // carries the immutable release id of the PRIOR assignment and the PRIOR
             // deployment identity (deployment_id + generation_id).
             let first = h.run(None);
             assert_eq!(
@@ -1070,7 +1097,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 std::collections::BTreeMap::from([("standard".to_string(), h.behave())]);
             helper
                 .publish_release(
-                    "rel-sha256-r1",
+                    harness_release_id().as_str(),
                     &harness_release_json(),
                     &serde_json::to_string(&behaviors).unwrap(),
                 )
@@ -1179,7 +1206,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     deployment_id: "d2".to_string().into(),
                     generation_id: g2.clone(),
                     artifact: ArtifactRef {
-                        release: ReleaseId::new("rel-sha256-r1"),
+                        release: harness_release_id(),
                         variant: crate::model::VariantName::new("standard"),
                         tree: h.tree.clone(),
                     },
@@ -1203,7 +1230,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     deployment_id: "d3".to_string().into(),
                     generation_id: g3.clone(),
                     artifact: ArtifactRef {
-                        release: ReleaseId::new("rel-sha256-r1"),
+                        release: harness_release_id(),
                         variant: crate::model::VariantName::new("standard"),
                         tree: h.tree.clone(),
                     },
@@ -1223,7 +1250,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let behaviors = std::collections::BTreeMap::from([("standard".to_string(), h.behave())]);
         helper
             .publish_release(
-                "rel-sha256-r1",
+                harness_release_id().as_str(),
                 &harness_release_json(),
                 &serde_json::to_string(&behaviors).unwrap(),
             )

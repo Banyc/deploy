@@ -293,10 +293,26 @@ impl LocalStore {
 
     /// Write an immutable release record. Replacing an existing ID with
     /// different content fails.
+    ///
+    /// The INCOMING record is verified from its OWN content BEFORE anything
+    /// is written: an unverifiable record (digest fields inconsistent with
+    /// the slot snapshot/bindings/provenance, or an empty slot snapshot) is
+    /// never persisted — fail closed before the release directory or file is
+    /// created. When the directory already exists, the EXISTING record is
+    /// verified from its content as well, and the comparison is between the
+    /// two content-verified identities (each record's `release_sha256` after
+    /// recompute-and-verify): a same-id record with different content still
+    /// fails, but never by trusting the stored digest fields.
     pub fn write_release(&self, rec: &ReleaseRecord) -> Result<()> {
+        // (a) Verify the incoming record from its content before any write.
+        crate::release::verify_release_identity(rec)?;
         let dir = self.release_dir(&ReleaseId::new(rec.release_id.clone()));
         if dir.exists() {
+            // (b) Verify the EXISTING record from its content too, then
+            // compare the recomputed identities (both records verified above,
+            // so `release_sha256` equals the recomputed digest in each).
             let existing: ReleaseRecord = read_json(&dir.join("release.json"))?;
+            crate::release::verify_release_identity(&existing)?;
             if existing.release_sha256 != rec.release_sha256 {
                 return Err(Error::store(format!(
                     "release {} already exists with different content",
@@ -311,14 +327,37 @@ impl LocalStore {
         write_atomic_cas(&dir.join("release.json"), &bytes)
     }
 
+    /// Read and verify a release record by its canonical id.
+    ///
+    /// The record's identity is recomputed from its OWN content (slot
+    /// snapshot, bindings, provenance digests), never trusted from the stored
+    /// `release_sha256`/`release_id` fields — a tampered record whose content
+    /// was edited while the digest fields were left unchanged fails closed
+    /// with an integrity error. An empty slot snapshot is rejected outright
+    /// (a current-format record must persist its slot declarations).
+    ///
+    /// Additionally, the STORED record's `release_id` must equal the `id` the
+    /// caller asked for (the directory path): a record swapped into the wrong
+    /// release directory — its `release_id` edited to a consistent-but-
+    /// different id, or the file relocated — is refused with an integrity
+    /// error naming both ids instead of being returned as if it were `id`.
     pub fn read_release(&self, id: &ReleaseId) -> Result<ReleaseRecord> {
         let rec: ReleaseRecord = read_json(&self.release_dir(id).join("release.json"))?;
         // Recompute-and-verify: the release's canonical digest is derived from
         // its own content (slot snapshot, bindings, provenance digests), never
         // trusted from the stored `release_sha256`/`release_id` fields. A
-        // tampered record whose content was edited while the digest fields were
-        // left unchanged fails closed with an integrity error.
+        // tampered record whose content was edited while the digest fields
+        // were left unchanged fails closed with an integrity error, and an
+        // empty slot snapshot is rejected outright.
         crate::release::verify_release_identity(&rec)?;
+        // Bind the record to the read path: the stored record must actually
+        // BE the release the caller asked for.
+        if rec.release_id != id.as_str() {
+            return Err(Error::integrity(format!(
+                "release record read from {id} declares release_id {}: the stored record's identity does not match the requested release id (a record swapped into the wrong release directory)",
+                rec.release_id
+            )));
+        }
         Ok(rec)
     }
 
@@ -857,8 +896,9 @@ mod tests {
 
         // Tamper: change a slot's deploy_dir in the STORED record while
         // retaining the old digest fields (the bug: content edited, digest
-        // trusted). `write_release` compares only the digest field, so the
-        // tampered record must be installed by writing the file directly.
+        // trusted). `write_release` now verifies the incoming record from its
+        // content before any write, so the tampered record must be installed
+        // by writing the file directly.
         let mut tampered = read.clone();
         tampered.slots.get_mut("standard").unwrap().slots[0].deploy_dir =
             "/srv/elsewhere".to_string();
@@ -881,6 +921,186 @@ mod tests {
         assert!(
             msg.contains(&rec.release_sha256),
             "error must name the stored digest, got: {msg}"
+        );
+    }
+
+    /// `write_release` verifies the INCOMING record from its OWN content
+    /// before any write: a record whose content was edited while the digest
+    /// fields were retained is refused with an integrity error, and NOTHING
+    /// is written — the release directory is never even created. An incoming
+    /// record with an EMPTY slot snapshot is refused the same way (fail
+    /// closed: a current-format record must persist its slot declarations).
+    #[test]
+    fn write_release_rejects_tampered_incoming_record_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let rec = crate::release::build_release(
+            "m",
+            "b",
+            &BTreeMap::from([(
+                crate::model::VariantName::new("standard"),
+                crate::model::TreeDigest::new("t1"),
+            )]),
+            &BTreeMap::from([(
+                "standard".to_string(),
+                vec![crate::config::SlotDef {
+                    id: "p1".to_string(),
+                    server: "s1".to_string(),
+                    deploy_dir: PathBuf::from("/srv/deploy/p1"),
+                    targets: vec!["t1".to_string()],
+                }],
+            )]),
+            Path::new("."),
+        );
+        let id = ReleaseId::new(rec.release_id.clone());
+
+        // Tampered incoming: content edited, digest fields retained.
+        let mut tampered = rec.clone();
+        tampered.slots.get_mut("standard").unwrap().slots[0].deploy_dir =
+            "/srv/elsewhere".to_string();
+        assert_eq!(
+            tampered.release_sha256, rec.release_sha256,
+            "digest retained"
+        );
+        let err = store
+            .write_release(&tampered)
+            .expect_err("a tampered incoming record must be refused before any write");
+        assert!(
+            err.to_string().contains("identity mismatch"),
+            "error must name the content-vs-digest mismatch, got: {err}"
+        );
+        assert!(
+            !store.release_dir(&id).exists(),
+            "nothing may be written for a tampered incoming record"
+        );
+
+        // Empty slot snapshot: rejected outright, nothing written.
+        let mut empty = rec.clone();
+        empty.slots.clear();
+        let err = store
+            .write_release(&empty)
+            .expect_err("an empty slot snapshot must be refused before any write");
+        assert!(
+            err.to_string().contains("fail closed"),
+            "error must explain the fail-closed rejection, got: {err}"
+        );
+        assert!(
+            !store.release_dir(&id).exists(),
+            "nothing may be written for an empty-slot-snapshot record"
+        );
+
+        // The pristine record still writes fine afterwards.
+        store.write_release(&rec).expect("pristine record writes");
+        assert!(store.release_dir(&id).exists());
+    }
+
+    /// `write_release` on an already-existing directory verifies the EXISTING
+    /// record from its content before comparing identities: an existing record
+    /// that was tampered (content edited, digest fields retained) fails with
+    /// an integrity error even when the incoming record is pristine — the
+    /// same-id comparison never trusts the stored digest fields.
+    #[test]
+    fn write_release_verifies_existing_record_before_comparing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let rec = crate::release::build_release(
+            "m",
+            "b",
+            &BTreeMap::from([(
+                crate::model::VariantName::new("standard"),
+                crate::model::TreeDigest::new("t1"),
+            )]),
+            &BTreeMap::from([(
+                "standard".to_string(),
+                vec![crate::config::SlotDef {
+                    id: "p1".to_string(),
+                    server: "s1".to_string(),
+                    deploy_dir: PathBuf::from("/srv/deploy/p1"),
+                    targets: vec!["t1".to_string()],
+                }],
+            )]),
+            Path::new("."),
+        );
+        let id = ReleaseId::new(rec.release_id.clone());
+        store.write_release(&rec).expect("pristine record writes");
+
+        // Tamper the EXISTING record on disk: content edited, digests
+        // retained (written directly, since write_release refuses it now).
+        let mut tampered = rec.clone();
+        tampered.slots.get_mut("standard").unwrap().slots[0].deploy_dir =
+            "/srv/elsewhere".to_string();
+        let path = store.release_dir(&id).join("release.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+
+        let err = store
+            .write_release(&rec)
+            .expect_err("a tampered existing record must fail content verification");
+        assert!(
+            err.to_string().contains("identity mismatch"),
+            "error must name the existing record's content-vs-digest mismatch, got: {err}"
+        );
+
+        // A genuinely different (but self-consistent) record with the same id
+        // is impossible under verification, so the same-id idempotent rewrite
+        // of the pristine record still passes after restoring it.
+        std::fs::write(&path, serde_json::to_vec_pretty(&rec).unwrap()).unwrap();
+        store
+            .write_release(&rec)
+            .expect("identical rewrite of the restored record is idempotent");
+    }
+
+    /// `read_release(id)` must verify that the STORED record's `release_id`
+    /// equals the `id` the caller asked for (the directory path): a record
+    /// relocated into (or swapped into) a different release directory passes
+    /// content verification but is refused with an integrity error naming
+    /// both ids instead of being returned as if it were `id`.
+    #[test]
+    fn read_release_binds_stored_release_id_to_the_read_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let rec = crate::release::build_release(
+            "m",
+            "b",
+            &BTreeMap::from([(
+                crate::model::VariantName::new("standard"),
+                crate::model::TreeDigest::new("t1"),
+            )]),
+            &BTreeMap::from([(
+                "standard".to_string(),
+                vec![crate::config::SlotDef {
+                    id: "p1".to_string(),
+                    server: "s1".to_string(),
+                    deploy_dir: PathBuf::from("/srv/deploy/p1"),
+                    targets: vec!["t1".to_string()],
+                }],
+            )]),
+            Path::new("."),
+        );
+        let id = ReleaseId::new(rec.release_id.clone());
+        store.write_release(&rec).expect("pristine record writes");
+        store
+            .read_release(&id)
+            .expect("the record reads fine from its own directory");
+
+        // Plant the same (content-verified) record under a DIFFERENT release
+        // directory: its release_id still names `id`, not the read path.
+        let other = ReleaseId::new("rel-sha256-swapped".to_string());
+        assert_ne!(other.as_str(), id.as_str());
+        let other_dir = store.release_dir(&other);
+        std::fs::create_dir_all(&other_dir).unwrap();
+        std::fs::write(
+            other_dir.join("release.json"),
+            serde_json::to_vec_pretty(&rec).unwrap(),
+        )
+        .unwrap();
+
+        let err = store
+            .read_release(&other)
+            .expect_err("a record whose release_id differs from the read path must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rel-sha256-swapped") && msg.contains(&rec.release_id),
+            "error must name the requested id and the record's actual release_id, got: {msg}"
         );
     }
 
