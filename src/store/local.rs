@@ -396,6 +396,20 @@ impl LocalStore {
     }
 
     pub fn write_observed(&self, target: &str, observed: &ObservedTarget) -> Result<()> {
+        // Post-commit observed-refresh fault injection: the observed refresh
+        // runs AFTER the deployment is durably committed, so a fault here is
+        // reported as a maintenance warning by the engine, never a push error.
+        #[cfg(test)]
+        if observed
+            .slots
+            .values()
+            .filter_map(|s| s.last_deployment.as_ref())
+            .any(|d| test_faults::consume2(&test_faults::FAIL_WRITE_OBSERVED, d.as_str(), target))
+        {
+            return Err(Error::store(
+                "test fault: write_observed forced to fail once",
+            ));
+        }
         let dir = self.target_dir(target);
         ensure_private_dir(&dir)?;
         write_json(&dir.join("observed.json"), observed)
@@ -583,6 +597,22 @@ impl LocalStore {
     // ---- servers ----------------------------------------------------------
 
     pub fn write_server(&self, state: &ServerState) -> Result<()> {
+        // Post-commit observed-refresh fault injection, keyed by the recorded
+        // deployment id AND target (see `write_observed`).
+        #[cfg(test)]
+        if let (Some(deployment_id), Some(target)) = (
+            state
+                .last_observed
+                .as_ref()
+                .and_then(|o| o.last_deployment.as_ref()),
+            state.last_seen_target.as_ref(),
+        ) && test_faults::consume2(
+            &test_faults::FAIL_WRITE_SERVER,
+            deployment_id.as_str(),
+            target.as_str(),
+        ) {
+            return Err(Error::store("test fault: write_server forced to fail once"));
+        }
         let p = self
             .base
             .join("servers")

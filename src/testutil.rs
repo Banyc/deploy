@@ -43,13 +43,27 @@ pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// Faults exist for the intent persist (`arm_append_attempt`), the outcomes
 /// store (`arm_write_results`), the snapshot append, `refs/last-successful`,
 /// and status-qualified transition appends (`arm_append_transition`,
-/// `arm_append_transition_successful`, `arm_append_transition_pending`).
+/// `arm_append_transition_successful`, `arm_append_transition_pending`). The
+/// post-commit observed-refresh faults (`arm_write_server`,
+/// `arm_write_observed`) are additionally keyed by TARGET, so a test can arm
+/// the primary target's `write_observed` (the push's own target) or an other
+/// member target's independently.
 #[cfg(test)]
 pub(crate) mod test_faults {
     use std::sync::Mutex;
 
     fn arm(fault: &Mutex<Option<String>>, deployment_id: &str) {
         *fault.lock().unwrap() = Some(deployment_id.to_string());
+    }
+
+    /// Arm a one-shot fault keyed by deployment id AND target. The observed
+    /// refresh writes several per-target records after the commit point; the
+    /// target half of the key lets a test fault exactly the operation it
+    /// means to (e.g. the primary target's `write_observed` vs. an other
+    /// member's) without a concurrent test pushing the same target with a
+    /// different deployment id ever consuming it.
+    fn arm2(fault: &Mutex<Option<(String, String)>>, deployment_id: &str, target: &str) {
+        *fault.lock().unwrap() = Some((deployment_id.to_string(), target.to_string()));
     }
 
     /// Arm the next `append_snapshot` call for `deployment_id` to fail once.
@@ -106,11 +120,50 @@ pub(crate) mod test_faults {
         arm(&FAIL_APPEND_TRANSITION_PENDING, deployment_id);
     }
 
+    /// Arm the next `write_server` call that records `deployment_id` (its
+    /// `last_observed.last_deployment`) under `target` (its
+    /// `last_seen_target`) to fail once. This is the post-commit
+    /// observed-refresh per-server record write; the fault fires only when
+    /// BOTH the deployment id and the target match, so the `servers/` writes
+    /// of unrelated concurrent tests pass through untouched.
+    pub(crate) fn arm_write_server(deployment_id: &str, target: &str) {
+        arm2(&FAIL_WRITE_SERVER, deployment_id, target);
+    }
+
+    /// Arm the next `write_observed` call that writes `deployment_id`'s slot
+    /// into `target`'s observed record to fail once. The primary-target write
+    /// is the last observed-refresh operation; the other-member writes happen
+    /// per shared slot inside the propagation loop. The target half of the
+    /// key selects exactly one of them.
+    pub(crate) fn arm_write_observed(deployment_id: &str, target: &str) {
+        arm2(&FAIL_WRITE_OBSERVED, deployment_id, target);
+    }
+
     /// Consume the one-shot fault for `deployment_id` if armed. Returns `true`
     /// when the fault fired (and is now disarmed).
     pub(crate) fn consume(fault: &Mutex<Option<String>>, deployment_id: &str) -> bool {
         let mut guard = fault.lock().unwrap();
         if guard.as_deref() == Some(deployment_id) {
+            *guard = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Consume the one-shot `(deployment_id, target)` fault if armed. Returns
+    /// `true` only when BOTH halves match (and disarms it); a non-matching
+    /// call leaves the fault armed for the next matching call.
+    pub(crate) fn consume2(
+        fault: &Mutex<Option<(String, String)>>,
+        deployment_id: &str,
+        target: &str,
+    ) -> bool {
+        let mut guard = fault.lock().unwrap();
+        if guard
+            .as_ref()
+            .is_some_and(|(d, t)| d == deployment_id && t == target)
+        {
             *guard = None;
             true
         } else {
@@ -125,4 +178,10 @@ pub(crate) mod test_faults {
     pub(crate) static FAIL_APPEND_ATTEMPT: Mutex<Option<String>> = Mutex::new(None);
     pub(crate) static FAIL_WRITE_RESULTS: Mutex<Option<String>> = Mutex::new(None);
     pub(crate) static FAIL_APPEND_TRANSITION_PENDING: Mutex<Option<String>> = Mutex::new(None);
+    /// One-shot `(deployment_id, target)` fault for the post-commit
+    /// observed-refresh `write_server` call.
+    pub(crate) static FAIL_WRITE_SERVER: Mutex<Option<(String, String)>> = Mutex::new(None);
+    /// One-shot `(deployment_id, target)` fault for the post-commit
+    /// observed-refresh `write_observed` call.
+    pub(crate) static FAIL_WRITE_OBSERVED: Mutex<Option<(String, String)>> = Mutex::new(None);
 }

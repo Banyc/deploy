@@ -166,6 +166,15 @@ pub(crate) enum FailureStep {
     TransitionSuccessful,
     /// Recoverable `PendingCommit` marker transition append.
     TransitionPending,
+    /// Post-commit observed-refresh `write_server` (store) — runs after the
+    /// deployment is durably committed.
+    ObservedWriteServer,
+    /// Post-commit observed-refresh `write_observed` for the PUSH'S OWN target
+    /// (store) — the last write of the refresh, after the durable commit point.
+    ObservedPrimaryWrite,
+    /// Post-commit observed-refresh `write_observed` for the OTHER member
+    /// target of the shared slot (store) — the shared-slot propagation.
+    ObservedOtherWrite,
 }
 
 /// Remote-side fault configuration, shared between the fixture and the remote
@@ -473,6 +482,12 @@ impl Fixture {
                 faults::arm_append_transition_successful(id.as_str())
             }
             FailureStep::TransitionPending => faults::arm_append_transition_pending(id.as_str()),
+            // The post-commit observed-refresh faults are keyed by deployment
+            // id AND target: the fixture's single shared slot (`p1`) belongs to
+            // `t1` (the pushed target) and `t2` (the other member).
+            FailureStep::ObservedWriteServer => faults::arm_write_server(id.as_str(), "t1"),
+            FailureStep::ObservedPrimaryWrite => faults::arm_write_observed(id.as_str(), "t1"),
+            FailureStep::ObservedOtherWrite => faults::arm_write_observed(id.as_str(), "t2"),
             other => panic!("{other:?} is a remote step, not a store step"),
         }
     }
@@ -1454,6 +1469,119 @@ fn lifecycle_store_fault_matrix_recovers_without_duplicate_history() {
             "{step:?}: the replay must not record a new attempt"
         );
         // Idempotent replay: no duplicate history.
+        let r3 = f.push("t1").unwrap();
+        assert_eq!(r3.status, None);
+        assert_eq!(f.store.read_snapshots("t1").unwrap().len(), 1);
+        f.check_invariants();
+    }
+}
+
+/// Lifecycle: EVERY store operation in the observed-refresh block — the code
+/// AFTER the durable commit point — is post-commit maintenance. Armed one at
+/// a time (the per-server `write_server`, the push's OWN target
+/// `write_observed`, and the OTHER member target's `write_observed` via the
+/// shared-slot propagation), a one-shot store fault must NEVER turn the push
+/// into an `Err`: the deployment is already durably `Successful` (snapshot,
+/// attempt, and terminal transition recorded BEFORE the refresh runs), so the
+/// push returns `Ok` with that status and the report carries a warning naming
+/// the deferred observed refresh. No persistent debt marker is needed (unlike
+/// rotation): the observed maps are projections of already-durable facts, and
+/// a clean no-op retry converges WITHOUT duplicate history — snapshot count,
+/// attempt count, transition stream, and `refs/last-successful` all stay
+/// exactly-once.
+#[test]
+fn lifecycle_observed_refresh_faults_never_fail_after_commit() {
+    for (i, step) in [
+        FailureStep::ObservedWriteServer,
+        FailureStep::ObservedPrimaryWrite,
+        FailureStep::ObservedOtherWrite,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let f = Fixture::new();
+        let id = DeploymentId::new(format!("si-obs-fault-{i}"));
+        f.arm_store_fault(step, &id);
+        let r1 = f
+            .push_with_id("t1", &id)
+            .expect("{step:?}: a push past the durable commit point must never fail");
+        assert_eq!(
+            r1.status,
+            Some(DeploymentStatus::Successful),
+            "{step:?}: the deployment committed; the observed fault must not change its outcome"
+        );
+        assert!(
+            r1.attempt.is_some(),
+            "{step:?}: the committed deployment records its attempt"
+        );
+        let warning = r1
+            .warning
+            .as_ref()
+            .expect("{step:?}: the push must warn about the deferred observed refresh");
+        assert!(
+            warning.contains("observed refresh deferred"),
+            "{step:?}: the warning names the deferred observed refresh, got: {warning}"
+        );
+        // Durable state is exactly-once: one snapshot, one attempt, the
+        // terminal Successful transition, and `refs/last-successful` bound.
+        assert_eq!(
+            f.store.read_snapshots("t1").unwrap().len(),
+            1,
+            "{step:?}: exactly one snapshot entry"
+        );
+        assert_eq!(
+            f.store.read_attempts("t1").unwrap().len(),
+            1,
+            "{step:?}: exactly one attempt record"
+        );
+        assert_eq!(
+            f.store.latest_status(id.as_str()).unwrap(),
+            Some(DeploymentStatus::Successful),
+            "{step:?}: the terminal transition is Successful"
+        );
+        assert_eq!(
+            f.store.read_transitions(id.as_str()).unwrap().len(),
+            3,
+            "{step:?}: exactly InProgress + PendingCommit + Successful — no duplicate transitions"
+        );
+        assert_eq!(
+            f.store.read_last_successful("t1").as_deref(),
+            Some(id.as_str()),
+            "{step:?}: refs/last-successful points at the committed attempt"
+        );
+        assert!(
+            f.store.read_rotation_debt("t1").unwrap().is_empty(),
+            "{step:?}: observed refresh needs no persistent debt marker — the next real push \
+             re-projects from durable facts"
+        );
+        f.check_invariants();
+
+        // The faulted-then-clean NO-OP retry converges without duplicate
+        // history: the no-op path creates no records, so the durable history
+        // stays exactly-once and `refs/last-successful` is stable.
+        let r2 = f.push("t1").expect("{step:?}: the retrying push succeeds");
+        assert_eq!(r2.message, "Everything up to date");
+        assert_eq!(
+            r2.status, None,
+            "{step:?}: the retry is an up-to-date no-op"
+        );
+        assert!(
+            r2.warning.is_none(),
+            "{step:?}: the no-op retry creates no new maintenance and does not re-warn"
+        );
+        assert_eq!(f.store.read_snapshots("t1").unwrap().len(), 1);
+        assert_eq!(f.store.read_attempts("t1").unwrap().len(), 1);
+        assert_eq!(
+            f.store.read_last_successful("t1").as_deref(),
+            Some(id.as_str()),
+            "{step:?}: refs/last-successful unchanged by the retry"
+        );
+        assert_eq!(
+            f.store.read_transitions(id.as_str()).unwrap().len(),
+            3,
+            "{step:?}: no duplicate transitions after the retry"
+        );
+        // A further retry is fully idempotent too.
         let r3 = f.push("t1").unwrap();
         assert_eq!(r3.status, None);
         assert_eq!(f.store.read_snapshots("t1").unwrap().len(), 1);

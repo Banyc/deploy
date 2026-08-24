@@ -1199,6 +1199,30 @@ fn push_inner(
     // consumer of that target's observed.json see the CURRENT assignment
     // (generation, artifact, last deployment), never a stale one left by an
     // earlier push to another target.
+    //
+    // POST-COMMIT MAINTENANCE: this refresh runs AFTER the terminal transition
+    // was written — for a Successful attempt the shared finalizer already
+    // appended the snapshot, `refs/last-successful`, and the terminal
+    // `Successful` transition — so the deployment is DURABLY committed here.
+    // A local store fault in this block (a `write_server`, `read_observed`, or
+    // `write_observed` failure) must therefore NEVER turn the push into an
+    // `Err`: it is recorded as a warning on the report (merged into the same
+    // `maintenance` channel as rotation) and the push still returns `Ok` with
+    // the committed status.
+    //
+    // Unlike rotation there is deliberately NO persistent debt marker. The
+    // observed maps are exactly that — PROJECTIONS of already-durable facts
+    // (generations, artifacts, deployments), none of which depend on this
+    // refresh — so a failure is only a projection lag. Convergence needs no
+    // marker to retry: the next real push re-projects from current state, and
+    // the refresh is not incremental — the primary write rebuilds the FULL
+    // observed map from `actual_servers`, and the other-member propagation
+    // (which reads the member's existing map and merges this slot's CURRENT
+    // observed value into it) is refreshed by the next real push to ANY member
+    // target of the shared slot, which re-runs the same propagation. Retries
+    // therefore converge without duplicate history: the projection refresh
+    // never re-records an attempt, snapshot, or transition.
+    let mut observed_warnings: Vec<String> = Vec::new();
     let mut observed = ObservedTarget {
         target: TargetName::new(target_name.to_string()),
         slots: Default::default(),
@@ -1216,27 +1240,60 @@ fn push_inner(
         observed
             .slots
             .insert(slot_id.clone(), observed_server.clone());
-        store.write_server(&crate::records::ServerState {
+        if let Err(e) = store.write_server(&crate::records::ServerState {
             id: crate::model::ServerId::new(sdef.id.clone()),
             last_seen_target: Some(TargetName::new(target_name.to_string())),
             last_observed: Some(observed_server.clone()),
-        })?;
-        // Propagate the refreshed slot to EVERY other member target of the
+        }) {
+            // The durable facts are recorded; only the per-server projection
+            // is stale. Warn and continue — a later push's refresh rewrites it.
+            observed_warnings.push(format!(
+                "observed refresh deferred for server '{}': {e}",
+                sdef.id.as_str()
+            ));
+        }
+        // Propagate the refreshed slot to every OTHER member target of the
         // shared slot (single-target slots have no other members and are
         // skipped harmlessly). The slot's server is the same physical server
         // across all member targets, so no per-server record semantics change.
+        // The read of the member's existing map and the merged write are both
+        // post-commit maintenance: a fault leaves that member's projection
+        // stale, and the next real push to ANY member target of the shared
+        // slot re-runs this propagation and repairs it.
         for other_target in &slot.targets {
             if other_target == target_name {
                 continue;
             }
-            let mut other_observed = store.read_observed(other_target)?;
-            other_observed
-                .slots
-                .insert(slot_id.clone(), observed_server.clone());
-            store.write_observed(other_target, &other_observed)?;
+            match store.read_observed(other_target) {
+                Ok(mut other_observed) => {
+                    other_observed
+                        .slots
+                        .insert(slot_id.clone(), observed_server.clone());
+                    if let Err(e) = store.write_observed(other_target, &other_observed) {
+                        observed_warnings.push(format!(
+                            "observed refresh deferred for target '{}': {e}",
+                            other_target.as_str()
+                        ));
+                    }
+                }
+                Err(e) => {
+                    observed_warnings.push(format!(
+                        "observed refresh deferred for target '{}': {e}",
+                        other_target.as_str()
+                    ));
+                }
+            }
         }
     }
-    store.write_observed(target_name, &observed)?;
+    if let Err(e) = store.write_observed(target_name, &observed) {
+        // The push's OWN target projection is the last write; a fault leaves
+        // only this target's map stale. The next real push rebuilds the map
+        // from scratch, so convergence needs no marker.
+        observed_warnings.push(format!(
+            "observed refresh deferred for target '{}': {e}",
+            target_name
+        ));
+    }
 
     // 17. Per-slot rotation under each slot's mutation lock. Rotation uses
     // the slot's ACTUAL final assignment (read after any compensation), not
@@ -1276,6 +1333,10 @@ fn push_inner(
     // ..."). A lock acquisition conflict (held by another operation) skips
     // the rotation silently, exactly as before.
     let mut maintenance: Vec<String> = Vec::new();
+    // Observed-refresh deferrals (post-commit projection lag) ride the same
+    // warning channel as rotation; unlike rotation there is no debt marker to
+    // retry — the next real push re-projects from durable facts.
+    maintenance.extend(observed_warnings);
     // Retry any debt left by earlier pushes FIRST (before this push's own
     // rotation), so a marker that succeeds here is cleared without re-rotating
     // the same slot immediately after a fresh step-17 failure.
