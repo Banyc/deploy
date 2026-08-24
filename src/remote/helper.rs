@@ -547,8 +547,28 @@ fn json_semantically_equal(a: &[u8], b: &[u8]) -> bool {
     }
 }
 
+/// Copy a host-local tree into a remote-relative path, reconstructing symlinks
+/// and modes.
+///
+/// The upload is TWO-PHASE so a read-only directory can never block the upload
+/// of its own contents:
+///
+/// 1. **Walk** (depth-first, parents before children): every directory is
+///    created with OWNER-WRITE permission (`mode | 0o200`), so files and
+///    symlinks beneath it can be written even when the directory's FINAL mode
+///    is read-only (e.g. 0o555). Files keep their final mode via
+///    `remote.write(..., mode & 0o7777)`; symlinks are created as-is.
+/// 2. **Finalize** (after the walk): the FINAL directory modes are applied in
+///    REVERSE DEPTH order (deepest first), so a parent is chmodded to its
+///    final mode only after every child has been finalized — a read-only
+///    parent never blocks a pending child operation.
+///
+/// Modes are masked to the full 0o7777 (setuid/setgid/sticky included), not
+/// 0o777, so the uploaded tree matches the canonical tree digest exactly.
 pub fn copy_host_tree_to_remote(host: &Path, rel_dest: &Path, remote: &dyn Remote) -> Result<()> {
     remote.create_dir_all(rel_dest)?;
+    // (dest, final_mode, depth) collected during the walk for phase 2.
+    let mut dirs: Vec<(std::path::PathBuf, u32, usize)> = Vec::new();
     for entry in WalkDir::new(host).min_depth(1).into_iter() {
         let entry = entry.map_err(|e| Error::remote(format!("walk: {e}")))?;
         let path = entry.path();
@@ -561,10 +581,14 @@ pub fn copy_host_tree_to_remote(host: &Path, rel_dest: &Path, remote: &dyn Remot
             .map_err(|e| Error::remote(format!("stat {}: {e}", path.display())))?;
         if meta.is_dir() {
             remote.create_dir(&dest)?;
-            // Preserve the canonical mode explicitly: a bare `mkdir` inherits
-            // the remote umask (e.g. 0775 on umask-0002 hosts), which would
-            // change the tree digest and fail the post-upload integrity check.
-            remote.set_mode(&dest, meta.mode() & 0o777)?;
+            // Phase 1: force owner-write so the directory's contents can be
+            // uploaded regardless of the final (possibly read-only) mode. A
+            // bare `mkdir` would also inherit the remote umask (e.g. 0775 on
+            // umask-0002 hosts), changing the tree digest; the explicit mode
+            // keeps the create deterministic. The FINAL mode is applied in
+            // phase 2, after every child has been uploaded.
+            remote.set_mode(&dest, (meta.mode() | 0o200) & 0o7777)?;
+            dirs.push((dest, meta.mode() & 0o7777, entry.depth()));
         } else if meta.file_type().is_symlink() {
             let target = std::fs::read_link(path)
                 .map_err(|e| Error::remote(format!("readlink {}: {e}", path.display())))?;
@@ -572,8 +596,14 @@ pub fn copy_host_tree_to_remote(host: &Path, rel_dest: &Path, remote: &dyn Remot
         } else {
             let data = std::fs::read(path)
                 .map_err(|e| Error::remote(format!("read {}: {e}", path.display())))?;
-            remote.write(&dest, &data, meta.mode() & 0o777)?;
+            remote.write(&dest, &data, meta.mode() & 0o7777)?;
         }
+    }
+    // Phase 2: finalize directory modes deepest-first, so a read-only parent
+    // is chmodded only after all of its children are finalized.
+    dirs.sort_by(|a, b| b.2.cmp(&a.2));
+    for (dest, mode, _depth) in dirs {
+        remote.set_mode(&dest, mode)?;
     }
     Ok(())
 }
@@ -612,6 +642,7 @@ pub fn now_rfc3339() -> String {
 mod tests {
     use super::*;
     use crate::remote::transport::LocalTransport;
+    use std::os::unix::fs::PermissionsExt;
 
     fn assignment(gen_id: &str, tree: &str) -> GenerationAssignment {
         GenerationAssignment {
@@ -664,7 +695,6 @@ mod tests {
             "generation root symlink must exist"
         );
     }
-
     /// The RAII lock guard releases the server mutation lock on drop, even
     /// when the guarded block exits through an error path (no explicit
     /// release): after the guard drops, a fresh operation can acquire the
@@ -698,6 +728,129 @@ mod tests {
         assert!(
             helper.acquire_lock("op-2", false).is_ok(),
             "the lock must be released when the guard drops"
+        );
+    }
+    /// A tree containing a READ-ONLY directory uploads successfully: directories
+    /// are created owner-writable during the walk and only chmodded to their
+    /// final (possibly read-only) mode after every child has been uploaded,
+    /// deepest first. The uploaded tree's canonical digest equals the host's.
+    #[test]
+    fn copy_host_tree_to_remote_round_trips_read_only_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host");
+        // Top-level read-only directory (0o555) with a nested read-only
+        // directory and files inside both: the parent must stay writable until
+        // the nested subtree is fully uploaded, and the parent's read-only
+        // mode must be applied only after the nested one is finalized.
+        let ro = host.join("ro");
+        std::fs::create_dir_all(ro.join("nested")).unwrap();
+        std::fs::write(ro.join("app"), b"read-only app\n").unwrap();
+        std::fs::write(ro.join("nested/data"), b"nested data\n").unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::set_permissions(&ro.join("nested"), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+        std::fs::set_permissions(&ro.join("app"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(
+            &ro.join("nested/data"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let dest = Path::new("objects/sha256/x/root");
+        copy_host_tree_to_remote(&host, dest, &remote)
+            .expect("a tree with read-only directories must upload");
+
+        // Final directory modes are the host's read-only modes, not the
+        // writable create modes; file modes match exactly.
+        let remote_root = remote.root().join(dest);
+        let ro_meta = std::fs::symlink_metadata(remote_root.join("ro")).unwrap();
+        assert_eq!(
+            ro_meta.mode() & 0o7777,
+            0o555,
+            "read-only directory mode must be preserved"
+        );
+        let nested_meta = std::fs::symlink_metadata(remote_root.join("ro/nested")).unwrap();
+        assert_eq!(
+            nested_meta.mode() & 0o7777,
+            0o555,
+            "nested read-only directory mode must be preserved"
+        );
+        let app_meta = std::fs::symlink_metadata(remote_root.join("ro/app")).unwrap();
+        assert_eq!(
+            app_meta.mode() & 0o7777,
+            0o644,
+            "file mode must be preserved"
+        );
+        let data_meta = std::fs::symlink_metadata(remote_root.join("ro/nested/data")).unwrap();
+        assert_eq!(
+            data_meta.mode() & 0o7777,
+            0o600,
+            "nested file mode must be preserved"
+        );
+
+        // Post-upload integrity: the uploaded tree canonicalizes to the host's
+        // digest.
+        let host_meta = crate::tree::canonicalize_tree(&host).unwrap();
+        let remote_meta = crate::tree::canonicalize_tree(&remote_root).unwrap();
+        assert_eq!(
+            remote_meta.tree_sha256, host_meta.tree_sha256,
+            "uploaded tree must match the host tree digest"
+        );
+    }
+
+    /// Setuid/setgid/sticky bits survive the round trip: modes are masked to
+    /// the full 0o7777 (not 0o777), so the uploaded tree preserves the exact
+    /// special bits and canonicalizes to the host's digest.
+    #[test]
+    fn copy_host_tree_to_remote_round_trips_special_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host");
+        // setgid directory (0o2755) containing a setuid file (0o4755), plus a
+        // sticky world-writable directory (0o1777).
+        let sg = host.join("sg");
+        std::fs::create_dir_all(&sg).unwrap();
+        std::fs::write(sg.join("suid"), b"setuid binary\n").unwrap();
+        std::fs::set_permissions(&sg, std::fs::Permissions::from_mode(0o2755)).unwrap();
+        std::fs::set_permissions(&sg.join("suid"), std::fs::Permissions::from_mode(0o4755))
+            .unwrap();
+        let st = host.join("st");
+        std::fs::create_dir_all(&st).unwrap();
+        std::fs::set_permissions(&st, std::fs::Permissions::from_mode(0o1777)).unwrap();
+
+        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let dest = Path::new("objects/sha256/y/root");
+        copy_host_tree_to_remote(&host, dest, &remote)
+            .expect("a tree with special modes must upload");
+
+        // Exact modes, not masked to 0o777.
+        let remote_root = remote.root().join(dest);
+        let sg_meta = std::fs::symlink_metadata(remote_root.join("sg")).unwrap();
+        assert_eq!(
+            sg_meta.mode() & 0o7777,
+            0o2755,
+            "setgid bit must be preserved"
+        );
+        let suid_meta = std::fs::symlink_metadata(remote_root.join("sg/suid")).unwrap();
+        assert_eq!(
+            suid_meta.mode() & 0o7777,
+            0o4755,
+            "setuid bit must be preserved (not masked to 0o777)"
+        );
+        let st_meta = std::fs::symlink_metadata(remote_root.join("st")).unwrap();
+        assert_eq!(
+            st_meta.mode() & 0o7777,
+            0o1777,
+            "sticky bit must be preserved"
+        );
+
+        // Post-upload integrity: the uploaded tree canonicalizes to the host's
+        // digest.
+        let host_meta = crate::tree::canonicalize_tree(&host).unwrap();
+        let remote_meta = crate::tree::canonicalize_tree(&remote_root).unwrap();
+        assert_eq!(
+            remote_meta.tree_sha256, host_meta.tree_sha256,
+            "uploaded tree must match the host tree digest"
         );
     }
 }
