@@ -183,6 +183,42 @@ pub fn push(
     result
 }
 
+/// Test-only entry point: drive [`push_inner`] for a HEAD push with a
+/// caller-supplied deployment id, so the state-machine / fault-matrix tests
+/// can arm the one-shot store faults (keyed by deployment id) BEFORE the push
+/// runs. Mirrors the recovery tests' `push_main_with_id`; exposed crate-wide
+/// for the [`crate::semantic_invariants`] fixture. Same as [`push`] minus the
+/// advisory-lock acquisition (irrelevant to the fault matrix).
+#[cfg(test)]
+pub(crate) fn push_with_id(
+    config_path: &Path,
+    store: &LocalStore,
+    factory: &RemoteFactory,
+    target_name: &str,
+    config: &Config,
+    opts: &PushOptions,
+    deployment_id: &DeploymentId,
+) -> Result<PushReport> {
+    let op_id = OperationId::new(format!("op-{}", deployment_id.as_str()));
+    let target = config
+        .targets
+        .get(target_name)
+        .ok_or_else(|| Error::not_found(format!("target '{target_name}'")))?;
+    let project_root = config.project_root(config_path);
+    push_inner(
+        &project_root,
+        store,
+        factory,
+        target_name,
+        &PushRef::Head,
+        deployment_id,
+        &op_id,
+        config,
+        target,
+        opts,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_inner(
     project_root: &Path,
@@ -1263,7 +1299,14 @@ fn push_inner(
             .map(|s| s.targets.clone())
             .unwrap_or_default();
         if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
-            match rotate_slot_locked(helper, &config.pins, store, config, &slot_targets, deployment_id) {
+            match rotate_slot_locked(
+                helper,
+                &config.pins,
+                store,
+                config,
+                &slot_targets,
+                deployment_id,
+            ) {
                 Ok(()) => {
                     // Maintenance done for this slot: clear any marker left by
                     // an earlier push whose rotation failed after commit.
@@ -1386,7 +1429,14 @@ fn retry_deferred_rotations(
                 .find(|s| s.id.as_str() == slot_str.as_str())
                 .map(|s| s.targets.clone())
                 .unwrap_or_default();
-            match rotate_slot_locked(helper, &config.pins, store, config, &slot_targets, deployment_id) {
+            match rotate_slot_locked(
+                helper,
+                &config.pins,
+                store,
+                config,
+                &slot_targets,
+                deployment_id,
+            ) {
                 Ok(()) => serviced.push(slot_str.clone()),
                 Err(e) => {
                     // Keep the marker with the fresh reason.

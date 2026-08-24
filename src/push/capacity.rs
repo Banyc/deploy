@@ -67,13 +67,11 @@ pub(crate) fn capacity_preflight(
         // not of the currently available space: a small available amount on a
         // large filesystem must still reserve `total * percent / 100`.
         let reserve = reserve_bytes.max(percent_of_total(fs.total, reserve_percent));
-        // Overflow-free headroom comparison: `need + reserve` could wrap u64
-        // (e.g. `reserve_bytes = u64::MAX`), silently passing a push that must
-        // fail — or panicking in a debug build. The disjunctive form never
-        // adds: the first arm short-circuits on `reserve > available`, and the
-        // second arm `need > available - reserve` is only evaluated when
-        // `reserve <= available`, so the subtraction cannot underflow.
-        if reserve > fs.available || need > fs.available - reserve {
+        // Overflow-free decision: `need + reserve` could wrap u64 (e.g.
+        // `reserve_bytes = u64::MAX`), silently passing a push that must fail —
+        // or panicking in a debug build. `capacity_fits` never adds (see the
+        // helper for the disjunctive form).
+        if !capacity_fits(need, reserve, fs.available) {
             // Run protected rotation under the slot's FULL member-target
             // policy union, then recheck capacity directly rather than failing
             // the restore. Best-effort by design: rotation is only an
@@ -100,8 +98,8 @@ pub(crate) fn capacity_preflight(
                 available: 0,
             });
             let reserve2 = reserve_bytes.max(percent_of_total(fs2.total, reserve_percent));
-            // Same overflow-free form as the primary check above.
-            if reserve2 > fs2.available || need > fs2.available - reserve2 {
+            // Same overflow-free decision as the primary check above.
+            if !capacity_fits(need, reserve2, fs2.available) {
                 return Err(Error::preflight(format!(
                     "insufficient capacity on slot {}: need {} + reserve {} > avail {}",
                     a.placement_slot, need, reserve2, fs2.available
@@ -110,6 +108,18 @@ pub(crate) fn capacity_preflight(
         }
     }
     Ok(())
+}
+
+/// Overflow-free headroom decision: `true` exactly when `need + reserve` fits
+/// in `available`, computed WITHOUT any u64 addition that could wrap. The
+/// disjunctive form never adds: the first arm short-circuits on
+/// `reserve > available`, and the second arm `need > available - reserve` is
+/// only evaluated when `reserve <= available`, so the subtraction cannot
+/// underflow. Mathematically `!(reserve > avail || need > avail - reserve)`
+/// is equivalent to `need + reserve <= avail` computed in wider integers
+/// (the u128 reference model the Bounds property tests compare against).
+pub(crate) fn capacity_fits(need: u64, reserve: u64, available: u64) -> bool {
+    !(reserve > available || need > available - reserve)
 }
 
 /// `total * percent / 100` in u128 so a large filesystem size times a

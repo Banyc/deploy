@@ -1,0 +1,1806 @@
+//! Semantic-invariant test suite.
+//!
+//! Classifies failures by the VIOLATED SEMANTIC INVARIANT, not by the
+//! returned [`crate::error::Error`] variant. Several important bugs return
+//! `Ok`.
+//!
+//! Five semantic error classes are each pinned by a core invariant:
+//!
+//! * **Identity** — semantically equal inputs have the same identity; unequal
+//!   assignments must not no-op.
+//! * **Scope** — decisions and projections include every owner of shared
+//!   state (a slot shared between targets is never decided under one target's
+//!   policy, and every member's observed projection stays equal to the remote
+//!   assignment).
+//! * **Lifecycle** — the returned outcome agrees with the durable transaction
+//!   phase; retry converges without duplicating history.
+//! * **Integrity** — stored identity is never trusted; content, structure,
+//!   and storage path are verified, and every mutation fails closed.
+//! * **Bounds** — resource calculations are total, overflow-free, and fail
+//!   safely (checked against a u128 reference model).
+//!
+//! The bulk of the suite runs a tiny **state-machine fixture**: 1 physical
+//! slot on 1 server, 2 targets (`t1` aggressive / `t2` conservative retention
+//! over a shared slot), 2 variants materializing the same tree bytes, and 3+
+//! tree generations via artifact-content versions. Actions are short
+//! deterministic sequences (no sleeps, no network; every transport is a local
+//! filesystem transport) and after every action the five invariant groups are
+//! evaluated over the fixture state — interleaving bugs show up more cheaply
+//! than one scenario per anticipated defect.
+//!
+//! A second layer is the per-class property suite (digest reordering,
+//! per-field record tampering, the u128 bounds grid, retention monotonicity).
+//!
+//! The five mutations the harness applies one at a time (and reverts) each
+//! kill at least one test in this module or the suite it feeds:
+//!
+//! | Mutant | Killer(s) |
+//! |---|---|
+//! | Identity: no-op compares tree+release only | `identity_artifact_component_change_prevents_noop` |
+//! | Scope: rotation uses only the pushing target's policy | `scope_retained_is_union_of_member_policies`, `state_machine_scope_projection_and_rotation_union` |
+//! | Lifecycle: step-17 rotation `?` after commit | `state_machine_lifecycle_cleanup_failure_after_commit` |
+//! | Integrity: `verify_release_identity` trusts stored digest | `integrity_digest_unchanged_after_tamper_fails_closed`, `integrity_tampered_stored_release_blocks_historical_push`, `integrity_identity_field_change_fails_closed` |
+//! | Bounds: `need + reserve > available` wraps | `bounds_capacity_matches_u128_reference_over_grid` |
+
+use crate::config::{Config, SlotDef};
+use crate::error::Result;
+use crate::layout;
+use crate::model::{
+    ArtifactRef, DeploymentId, OperationId, PlacementSlotId, ReleaseId, TreeDigest, VariantName,
+};
+use crate::push::capacity::capacity_fits;
+use crate::push::engine::{PushOptions, PushReport, push, push_with_id};
+use crate::records::DeploymentStatus;
+use crate::release::{
+    canonicalize_slots, release_digest, variant_slots_digest, verify_release_identity,
+};
+use crate::remote::helper::{GenerationAssignment, RemoteHelper};
+use crate::remote::transport::{
+    ExecOutcome, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
+};
+use crate::rotation::compute_retained;
+use crate::store::local::LocalStore;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+// ---------------------------------------------------------------------------
+// Fixture project
+// ---------------------------------------------------------------------------
+
+/// Both variants map the same artifact sources, so `standard` and `canary`
+/// ALWAYS materialize the SAME tree bytes: a variant switch never changes the
+/// tree — the exact shape that pins the complete-ArtifactRef no-op comparison
+/// (variant is the only differing component).
+const VARIANT_BODY: &str = r#"
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[[artifact.mappings]]
+from = "artifacts/deployment/common/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+
+/// The single physical slot: server `s1`, member of BOTH targets.
+const SLOT_BODY: &str = r#"
+[[slots]]
+id = "p1"
+server = "s1"
+targets = ["t1", "t2"]
+deploy_dir = "/srv/si"
+"#;
+
+/// Two CONTRASTING rotation policies over the shared slot: `t1` is AGGRESSIVE
+/// (newest 1 distinct binding, no age window, no previous protection, 1 fleet
+/// deployment) while `t2` is CONSERVATIVE (newest 5 distinct bindings, 30
+/// days of age, the protected previous, 2 fleet deployments). The union is
+/// strictly larger than either policy alone, so a rotation that consults only
+/// the pushing target's policy sweeps content the other member retains.
+const DEPLOY_TOML: &str = r#"
+schema_version = 1
+application = "si"
+release = "v1"
+
+[targets.t1.rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = false
+
+[targets.t1.rotation.fleet]
+protect_deployments = 1
+
+[targets.t2.rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 30
+protect_previous = true
+
+[targets.t2.rotation.fleet]
+protect_deployments = 2
+
+[[servers]]
+id = "s1"
+address = "a"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+
+[targets.t2]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#;
+
+// ---------------------------------------------------------------------------
+// Fault injection
+// ---------------------------------------------------------------------------
+
+/// The I/O boundaries the Lifecycle class injects failures at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailureStep {
+    /// Fleet-commit marker write on the remote (`state/commits/<id>.json`).
+    CommitMarkerWrite,
+    /// Post-commit rotation's inventory write (`state/inventory.json`).
+    RotationInventoryWrite,
+    /// Local intent persist (`append_attempt`) — BEFORE any remote mutation.
+    IntentPersist,
+    /// Local outcomes store (`write_results`) — after servers advanced.
+    ResultsWrite,
+    /// Local snapshot append (first step of replay-safe finalization).
+    SnapshotAppend,
+    /// `refs/last-successful` write.
+    LastSuccessfulWrite,
+    /// Terminal `Successful` transition append.
+    TransitionSuccessful,
+    /// Recoverable `PendingCommit` marker transition append.
+    TransitionPending,
+}
+
+/// Remote-side fault configuration, shared between the fixture and the remote
+/// wrappers the factory hands out.
+#[derive(Clone, Debug, Default)]
+struct RemoteFault {
+    /// Fail the next WRITE whose path ends with this suffix exactly once.
+    fail_write_once: Option<String>,
+}
+
+/// A transport that fails selected writes once, then passes through. Wraps
+/// `LocalTransport`; deterministic, no sleeps.
+struct FailOnceRemote {
+    inner: LocalTransport,
+    fault: Arc<Mutex<RemoteFault>>,
+}
+
+impl FailOnceRemote {
+    fn build(base: PathBuf, fault: Arc<Mutex<RemoteFault>>) -> Result<Box<dyn Remote>> {
+        Ok(Box::new(FailOnceRemote {
+            inner: LocalTransport::new(base)?,
+            fault,
+        }))
+    }
+    fn should_fail(&self, rel: &Path) -> bool {
+        let mut f = self.fault.lock().unwrap();
+        if let Some(marker) = &f.fail_write_once {
+            let rel = rel.to_string_lossy().to_string();
+            // Commit-marker faults name the `state/commits/` DIRECTORY
+            // (prefix match); the rotation-inventory fault names the exact
+            // file. The fault is consumed ONLY by a matching write — a write
+            // to any other path must leave it armed.
+            if rel.starts_with(marker) || rel.ends_with(marker) {
+                f.fail_write_once = None;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl Remote for FailOnceRemote {
+    fn root(&self) -> &Path {
+        self.inner.root()
+    }
+    fn read(&self, rel: &Path) -> Result<Vec<u8>> {
+        self.inner.read(rel)
+    }
+    fn write(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
+        if self.should_fail(rel) {
+            return Err(crate::error::Error::transport(format!(
+                "injected write failure at {}",
+                rel.display()
+            )));
+        }
+        self.inner.write(rel, data, mode)
+    }
+    fn try_write_new(&self, rel: &Path, data: &[u8]) -> Result<bool> {
+        if self.should_fail(rel) {
+            return Err(crate::error::Error::transport(format!(
+                "injected write failure at {}",
+                rel.display()
+            )));
+        }
+        self.inner.try_write_new(rel, data)
+    }
+    fn create_dir(&self, rel: &Path) -> Result<()> {
+        self.inner.create_dir(rel)
+    }
+    fn create_dir_all(&self, rel: &Path) -> Result<()> {
+        self.inner.create_dir_all(rel)
+    }
+    fn set_mode(&self, rel: &Path, mode: u32) -> Result<()> {
+        self.inner.set_mode(rel, mode)
+    }
+    fn list(&self, rel: &Path) -> Result<Vec<RemoteEntry>> {
+        self.inner.list(rel)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn symlink(&self, target: &Path, link: &Path) -> Result<()> {
+        self.inner.symlink(target, link)
+    }
+    fn read_link(&self, rel: &Path) -> Result<PathBuf> {
+        self.inner.read_link(rel)
+    }
+    fn remove_file(&self, rel: &Path) -> Result<()> {
+        self.inner.remove_file(rel)
+    }
+    fn remove_dir_all(&self, rel: &Path) -> Result<()> {
+        self.inner.remove_dir_all(rel)
+    }
+    fn exists(&self, rel: &Path) -> bool {
+        self.inner.exists(rel)
+    }
+    fn metadata(&self, rel: &Path) -> Result<RemoteMeta> {
+        self.inner.metadata(rel)
+    }
+    fn exec(&self, argv: &[String], timeout: std::time::Duration) -> Result<ExecOutcome> {
+        self.inner.exec(argv, timeout)
+    }
+    fn filesystem_bytes(&self) -> Result<FsBytes> {
+        self.inner.filesystem_bytes()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Actions
+// ---------------------------------------------------------------------------
+
+/// The state-machine actions. `Build` + `Push` map onto the real pipeline: a
+/// HEAD push materializes the current artifact sources into a content-
+/// addressed tree and release.
+#[derive(Clone, Debug)]
+pub(crate) enum Action {
+    /// Rewrite the artifact source content (the next push materializes a new
+    /// tree generation).
+    Build(u32),
+    /// Push target `t1` or `t2`.
+    Push(&'static str),
+    /// An up-to-date retry push on the target (no-op or reconcile).
+    Retry(&'static str),
+    /// Roll the target back to fleet snapshot index `n`.
+    Rollback(&'static str, u64),
+    /// Run a standalone rotation pass under the FULL member policy union.
+    Rotate,
+    /// Arm a one-shot remote failure for the next push.
+    InjectFailure(FailureStep),
+    /// Tamper with a specific record. Deliberately VIOLATES the Integrity
+    /// group; used only by the dedicated integrity property tests, which run
+    /// the specific detection assertions instead of the generic checks.
+    Tamper(TamperKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TamperKind {
+    /// Rewrite the CURRENT generation's stored assignment with ONE artifact
+    /// component replaced (variant or release), keeping the other two. The
+    /// tree component is tampered via [`Fixture::tamper_stored_tree`] with a
+    /// real tree digest so the history stays consistent.
+    StoredAssignmentVariant,
+    StoredAssignmentRelease,
+}
+
+/// The outcome of one applied action.
+pub(crate) enum Outcome {
+    Push(Result<PushReport>),
+    Ok,
+    Tampered,
+}
+
+// ---------------------------------------------------------------------------
+// Fixture
+// ---------------------------------------------------------------------------
+
+/// The tiny state machine. `apply` runs an action and then evaluates all five
+/// invariant groups (except after a deliberate [`Action::Tamper`]).
+pub(crate) struct Fixture {
+    _dir: tempfile::TempDir,
+    project: PathBuf,
+    cfg_path: PathBuf,
+    config: Config,
+    store: LocalStore,
+    remotes_base: PathBuf,
+    fault: Arc<Mutex<RemoteFault>>,
+}
+
+impl Fixture {
+    fn new() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        std::fs::write(
+            release_dir.join("standard.toml"),
+            format!("{VARIANT_BODY}\n{SLOT_BODY}"),
+        )
+        .unwrap();
+        // canary declares no slots; identical mappings -> same tree bytes.
+        std::fs::write(release_dir.join("canary.toml"), VARIANT_BODY).unwrap();
+        let cfg_path = project.join("deploy.toml");
+        std::fs::write(&cfg_path, DEPLOY_TOML).unwrap();
+        let artifacts_dir = release_dir.join("artifacts");
+        let common_dir = artifacts_dir.join("deployment/common");
+        std::fs::create_dir_all(&common_dir).unwrap();
+        std::fs::write(common_dir.join("README"), "common\n").unwrap();
+        let config = Config::load(&cfg_path).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let remotes_base = dir.path().join("remotes");
+        std::fs::create_dir_all(&remotes_base).unwrap();
+        let fixture = Fixture {
+            _dir: dir,
+            project,
+            cfg_path,
+            config,
+            store,
+            remotes_base,
+            fault: Arc::new(Mutex::new(RemoteFault::default())),
+        };
+        fixture.write_artifacts(1);
+        fixture
+    }
+
+    fn artifacts_dir(&self) -> PathBuf {
+        self.project.join("releases").join("v1").join("artifacts")
+    }
+
+    /// Write artifact content for the given tree generation (1..=3).
+    fn write_artifacts(&self, version: u32) {
+        let p = self.artifacts_dir().join("build/output/app/server");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, format!("server-v{version}\n")).unwrap();
+    }
+
+    fn remote_factory(
+        &self,
+    ) -> impl Fn(&crate::config::ServerDef, &crate::config::SlotDef) -> Result<Box<dyn Remote>> + 'static
+    {
+        let rf = self.remotes_base.clone();
+        let fault = self.fault.clone();
+        move |s: &crate::config::ServerDef, _slot: &crate::config::SlotDef| {
+            FailOnceRemote::build(rf.join(&s.id), fault.clone())
+        }
+    }
+
+    /// A transport handle over the server's remote directory. The directory
+    /// is created on demand so reads work before the first push.
+    fn remote(&self) -> Box<dyn Remote> {
+        let p = self.remotes_base.join("s1");
+        std::fs::create_dir_all(&p).unwrap();
+        Box::new(LocalTransport::new(p).unwrap())
+    }
+
+    /// Run `f` with a live `RemoteHelper` over the server's remote directory.
+    fn with_helper<R>(&self, f: impl FnOnce(RemoteHelper<'_>) -> R) -> R {
+        let remote = self.remote();
+        f(RemoteHelper::new(remote.as_ref()))
+    }
+
+    /// The current generation's stored assignment for the single slot, if any.
+    fn current_assignment(&self) -> Option<GenerationAssignment> {
+        self.with_helper(|helper| {
+            let status = helper.status().ok()?;
+            let g = status.current_generation?;
+            helper.read_assignment(&g).ok()
+        })
+    }
+
+    fn push(&self, target_name: &str) -> Result<PushReport> {
+        push(
+            &self.cfg_path,
+            &self.store,
+            &self.remote_factory(),
+            target_name,
+            &self.config,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+    }
+
+    /// Push with a caller-supplied deployment id (for arming the one-shot
+    /// store faults keyed by id).
+    fn push_with_id(&self, target_name: &str, id: &DeploymentId) -> Result<PushReport> {
+        push_with_id(
+            &self.cfg_path,
+            &self.store,
+            &self.remote_factory(),
+            target_name,
+            &self.config,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+            id,
+        )
+    }
+
+    fn push_ref(&self, target_name: &str, ref_token: &str) -> Result<PushReport> {
+        push(
+            &self.cfg_path,
+            &self.store,
+            &self.remote_factory(),
+            target_name,
+            &self.config,
+            &PushOptions {
+                dry_run: false,
+                ref_token: Some(ref_token.to_string()),
+            },
+        )
+    }
+
+    /// Arm a one-shot store fault for a fixed deployment id.
+    fn arm_store_fault(&self, step: FailureStep, id: &DeploymentId) {
+        use crate::testutil::test_faults as faults;
+        match step {
+            FailureStep::IntentPersist => faults::arm_append_attempt(id.as_str()),
+            FailureStep::ResultsWrite => faults::arm_write_results(id.as_str()),
+            FailureStep::SnapshotAppend => faults::arm_append_snapshot(id.as_str()),
+            FailureStep::LastSuccessfulWrite => faults::arm_write_last_successful(id.as_str()),
+            FailureStep::TransitionSuccessful => {
+                faults::arm_append_transition_successful(id.as_str())
+            }
+            FailureStep::TransitionPending => faults::arm_append_transition_pending(id.as_str()),
+            other => panic!("{other:?} is a remote step, not a store step"),
+        }
+    }
+
+    fn set_remote_fault(&self, step: FailureStep) {
+        let suffix = match step {
+            FailureStep::CommitMarkerWrite => "state/commits/".to_string(),
+            FailureStep::RotationInventoryWrite => "state/inventory.json".to_string(),
+            other => panic!("{other:?} is a store step, not a remote step"),
+        };
+        self.fault.lock().unwrap().fail_write_once = Some(suffix);
+    }
+
+    /// Apply one action, then evaluate every invariant group (unless the
+    /// action was a deliberate tamper).
+    fn apply(&self, action: Action) -> Outcome {
+        let outcome = match action {
+            Action::Build(v) => {
+                self.write_artifacts(v);
+                Outcome::Ok
+            }
+            Action::Push(t) | Action::Retry(t) => Outcome::Push(self.push(t)),
+            Action::Rollback(t, i) => Outcome::Push(self.push_ref(t, &format!("{t}@f{i}"))),
+            Action::Rotate => {
+                self.rotate_union().expect("standalone rotation succeeds");
+                Outcome::Ok
+            }
+            Action::InjectFailure(step) => {
+                self.set_remote_fault(step);
+                Outcome::Ok
+            }
+            Action::Tamper(kind) => {
+                self.tamper(kind);
+                return Outcome::Tampered;
+            }
+        };
+        self.check_invariants();
+        outcome
+    }
+
+    fn push_ref_impl(&self, target_name: &str, ref_token: &str) -> Result<PushReport> {
+        push(
+            &self.cfg_path,
+            &self.store,
+            &self.remote_factory(),
+            target_name,
+            &self.config,
+            &PushOptions {
+                dry_run: false,
+                ref_token: Some(ref_token.to_string()),
+            },
+        )
+    }
+
+    /// Standalone rotation under the FULL member policy union, exactly as
+    /// step 17 runs it (mutation lock + union retained set).
+    fn rotate_union(&self) -> Result<()> {
+        self.with_helper(|helper| {
+            let op = OperationId::generate();
+            let _guard = helper.acquire_lock_guard(op.as_str())?;
+            let retained = compute_retained(
+                &helper,
+                &self.config.pins,
+                &self.store,
+                &self.config,
+                &["t1".to_string(), "t2".to_string()],
+            )?;
+            helper.rotate(&retained, &HashSet::new())
+        })
+    }
+
+    /// Tamper the CURRENT generation's stored assignment on the remote.
+    fn tamper(&self, kind: TamperKind) {
+        let asn = self
+            .current_assignment()
+            .expect("a current generation exists");
+        let gen_id = asn.generation_id;
+        let path = self
+            .remotes_base
+            .join("s1")
+            .join(layout::generation(gen_id.as_str()))
+            .join("assignment.json");
+        let mut stored: GenerationAssignment =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        match kind {
+            TamperKind::StoredAssignmentVariant => {
+                stored.artifact.variant = VariantName::new("canary".to_string())
+            }
+            TamperKind::StoredAssignmentRelease => {
+                stored.artifact.release = ReleaseId::new("rel-sha256-tampered".to_string())
+            }
+        }
+        std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+    }
+
+    /// Tamper the CURRENT generation's stored assignment TREE to `tree`
+    /// (release + variant untouched).
+    fn tamper_stored_tree(&self, tree: &TreeDigest) {
+        let asn = self
+            .current_assignment()
+            .expect("a current generation exists");
+        let gen_id = asn.generation_id;
+        let path = self
+            .remotes_base
+            .join("s1")
+            .join(layout::generation(gen_id.as_str()))
+            .join("assignment.json");
+        let mut stored: GenerationAssignment =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        stored.artifact.tree = tree.clone();
+        std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+    }
+
+    /// Tamper the single stored release record via a JSON-level mutation.
+    fn tamper_stored_release(&self, mutate: impl FnOnce(&mut serde_json::Value)) {
+        let releases_root = self.store.base().join(layout::RELEASES);
+        let dirs: Vec<_> = std::fs::read_dir(&releases_root)
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(dirs.len(), 1, "exactly one stored release in the fixture");
+        let p = dirs[0].path().join("release.json");
+        let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        mutate(&mut v);
+        std::fs::write(&p, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    }
+
+    // ---- invariant groups --------------------------------------------------
+
+    /// Evaluate all five invariant groups against the fixture state.
+    fn check_invariants(&self) {
+        self.check_identity();
+        self.check_scope();
+        self.check_lifecycle();
+        self.check_integrity();
+        self.check_bounds();
+    }
+
+    /// Identity: every stored release record's identity is recomputed and
+    /// consistent; the live generation's assignment artifact references a
+    /// locally stored, verified release.
+    fn check_identity(&self) {
+        let releases_root = self.store.base().join(layout::RELEASES);
+        if let Ok(entries) = std::fs::read_dir(&releases_root) {
+            for e in entries.flatten() {
+                let id = ReleaseId::new(e.file_name().to_string_lossy().into_owned());
+                let rec = self
+                    .store
+                    .read_release(&id)
+                    .expect("every stored release record must read and verify");
+                verify_release_identity(&rec).expect("release identity verifies");
+                assert_eq!(
+                    rec.release_id,
+                    id.as_str(),
+                    "stored release must be bound to its read path"
+                );
+            }
+        }
+        if let Some(asn) = self.current_assignment() {
+            let rec = self
+                .store
+                .read_release(&asn.artifact.release)
+                .expect("live assignment's release must exist locally and verify");
+            assert!(
+                rec.variants.contains_key(asn.artifact.variant.as_str()),
+                "live assignment's variant must be a binding of its release"
+            );
+        }
+    }
+
+    /// Scope: (1) every member target's observed projection equals the remote
+    /// assignment; (2) the shared slot's retained set is the union of every
+    /// member's policy; (3) every tree the union retains actually survives
+    /// the post-push rotation.
+    fn check_scope(&self) {
+        if let Some(asn) = self.current_assignment() {
+            for target in ["t1", "t2"] {
+                let observed = self.store.read_observed(target).expect("observed reads");
+                let Some(slot) = observed.slots.get(&PlacementSlotId::new("p1")) else {
+                    // Crash-window state: a push that aborted before the
+                    // step-16 observed refresh (and was then recovered by a
+                    // no-op retry, which never refreshes observed) legitimately
+                    // leaves the member's observed entry absent. The Lifecycle
+                    // checks cover the durable-phase agreement; the projection
+                    // invariant applies to COMPLETED mutations.
+                    continue;
+                };
+                assert_eq!(
+                    slot.artifact.as_ref(),
+                    Some(&asn.artifact),
+                    "{target}: observed projection must equal the remote assignment"
+                );
+                assert_eq!(
+                    slot.generation.as_ref(),
+                    Some(&asn.generation_id),
+                    "{target}: observed generation must equal the remote generation"
+                );
+            }
+        }
+        let (single_t1, single_t2, full) = self.with_helper(|helper| {
+            let single_t1 = compute_retained(
+                &helper,
+                &self.config.pins,
+                &self.store,
+                &self.config,
+                &["t1".to_string()],
+            )
+            .expect("retained under t1");
+            let single_t2 = compute_retained(
+                &helper,
+                &self.config.pins,
+                &self.store,
+                &self.config,
+                &["t2".to_string()],
+            )
+            .expect("retained under t2");
+            let full = compute_retained(
+                &helper,
+                &self.config.pins,
+                &self.store,
+                &self.config,
+                &["t1".to_string(), "t2".to_string()],
+            )
+            .expect("retained under the full union");
+            (single_t1, single_t2, full)
+        });
+        let union: HashSet<String> = single_t1.union(&single_t2).cloned().collect();
+        assert_eq!(
+            full, union,
+            "the shared slot's retained set must be the union of every member target's policy"
+        );
+        // Every tree the union retains must actually survive the rotation the
+        // last push (or standalone rotate) performed.
+        for tree in &full {
+            assert!(
+                self.remote().exists(&layout::tree_root(tree)),
+                "union-retained tree {tree} must survive rotation"
+            );
+        }
+    }
+
+    /// Lifecycle: every recorded attempt's latest transition agrees with its
+    /// durable artifacts; no snapshot is ever duplicated; no locks linger.
+    fn check_lifecycle(&self) {
+        for target in ["t1", "t2"] {
+            let attempts = self.store.read_attempts(target).unwrap_or_default();
+            let snapshots = self.store.read_snapshots(target).unwrap_or_default();
+            let last_ok = self.store.read_last_successful(target);
+            let mut seen: HashSet<String> = HashSet::new();
+            for snap in &snapshots {
+                assert!(
+                    seen.insert(snap.deployment_id.as_str().to_string()),
+                    "no snapshot may be recorded twice for one deployment ({})",
+                    snap.deployment_id
+                );
+            }
+            for attempt in &attempts {
+                let latest = self
+                    .store
+                    .latest_status(attempt.deployment_id.as_str())
+                    .expect("transition stream readable")
+                    .expect("every recorded attempt has a transition");
+                let id = attempt.deployment_id.as_str();
+                let snapshot_exists = snapshots.iter().any(|s| s.deployment_id.as_str() == id);
+                match latest {
+                    DeploymentStatus::Successful => {
+                        assert!(
+                            snapshot_exists,
+                            "Successful attempt {id} must have a snapshot entry"
+                        );
+                        assert!(
+                            self.remote().exists(&layout::commit_marker(id)),
+                            "Successful attempt {id} must have a durable commit marker"
+                        );
+                    }
+                    DeploymentStatus::PendingCommit => {
+                        assert!(
+                            !snapshot_exists,
+                            "PendingCommit attempt {id} must NOT have a snapshot yet"
+                        );
+                        assert!(
+                            self.store.read_results(id).is_ok(),
+                            "PendingCommit attempt {id} must be recoverable from durable outcomes"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            // `refs/last-successful` points at the NEWEST successful attempt
+            // (older successful attempts keep their own snapshot/marker).
+            let newest_successful = attempts
+                .iter()
+                .filter(|a| {
+                    self.store
+                        .latest_status(a.deployment_id.as_str())
+                        .ok()
+                        .flatten()
+                        == Some(DeploymentStatus::Successful)
+                })
+                .map(|a| a.deployment_id.as_str())
+                .max_by_key(|a| *a);
+            match (newest_successful, last_ok.as_deref()) {
+                (Some(newest), Some(ok)) => assert_eq!(
+                    newest, ok,
+                    "refs/last-successful must point at the newest successful attempt"
+                ),
+                (None, None) => {}
+                (None, Some(ok)) => panic!(
+                    "refs/last-successful points at {ok} but no successful attempt is recorded"
+                ),
+                (Some(_), None) => {
+                    panic!("refs/last-successful is missing after a successful attempt")
+                }
+            }
+            assert!(
+                !self.remote().exists(&layout::operation_lock()),
+                "no stale operation lock may remain after an action"
+            );
+        }
+    }
+
+    /// Integrity: stored identity is never trusted — the current link
+    /// resolves to a parseable assignment and the live tree object exists
+    /// (content-address verified by path).
+    fn check_integrity(&self) {
+        self.with_helper(|helper| {
+            if let Ok(status) = helper.status() {
+                if let Some(g) = &status.current_generation {
+                    let asn = helper
+                        .read_assignment(g)
+                        .expect("current generation assignment must parse");
+                    assert!(
+                        helper
+                            .remote()
+                            .exists(&layout::tree_root(asn.artifact.tree.as_str())),
+                        "current generation's tree object must exist on the remote"
+                    );
+                }
+            }
+        });
+    }
+
+    /// Bounds: the capacity decision never panics or wraps and agrees with the
+    /// u128 reference model on the boundary grid.
+    fn check_bounds(&self) {
+        for (need, reserve, avail) in bounds_grid() {
+            let fits = capacity_fits(need, reserve, avail);
+            let reference = (need as u128) + (reserve as u128) <= avail as u128;
+            assert_eq!(
+                fits, reference,
+                "capacity decision for need={need} reserve={reserve} avail={avail} must match the u128 reference"
+            );
+        }
+    }
+}
+
+/// The Bounds value grid: 0, 1, avail-1, avail, avail+1, u64::MAX-1, u64::MAX
+/// crossed over avail in {0, 1, 1000, MAX-1, MAX}.
+fn bounds_grid() -> Vec<(u64, u64, u64)> {
+    let mut out = Vec::new();
+    for avail in [0u64, 1, 1000, u64::MAX - 1, u64::MAX] {
+        let mut vals = vec![
+            0u64,
+            1,
+            avail.saturating_sub(1),
+            avail,
+            avail.saturating_add(1),
+        ];
+        vals.extend([u64::MAX - 1, u64::MAX]);
+        for &need in &vals {
+            for &reserve in &vals {
+                out.push((need, reserve, avail));
+            }
+        }
+    }
+    out
+}
+
+// ===========================================================================
+// State-machine tests (short fixed sequences, invariant checks after each)
+// ===========================================================================
+
+/// Identity mutant killer: the early "Everything up to date" comparison must
+/// be sensitive to EVERY ArtifactRef component. We tamper the CURRENT
+/// generation's stored assignment on the remote, changing exactly one
+/// component (release / variant / tree) and keeping the other two identical,
+/// then push HEAD: the push must be a REAL push, never a no-op. A tree+release
+/// comparison would falsely no-op on the VARIANT tamper (release and tree are
+/// untouched), silently keeping the service "claimed up to date".
+#[test]
+fn identity_artifact_component_change_prevents_noop() {
+    // (a) VARIANT: release + tree identical, only the variant differs — the
+    // mutant-killing case.
+    let f = Fixture::new();
+    let r1 = f.push("t1").expect("first push succeeds");
+    assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+    let noop = f.push("t1").expect("unchanged push succeeds");
+    assert_eq!(noop.message, "Everything up to date");
+    f.apply(Action::Tamper(TamperKind::StoredAssignmentVariant));
+    let r2 = f.push("t1").expect("a variant tamper forces a real push");
+    assert_ne!(
+        r2.message, "Everything up to date",
+        "changing the variant component must prevent a no-op"
+    );
+    assert_eq!(r2.status, Some(DeploymentStatus::Successful));
+    assert!(r2.attempt.is_some(), "a real push records an attempt");
+    f.check_invariants();
+
+    // (b) TREE: tamper the stored tree to a DIFFERENT REAL tree (the repair
+    // push keeps the history consistent, so the invariant checks still hold).
+    let f = Fixture::new();
+    let r1 = f.push("t1").expect("push v1");
+    let first_tree = r1.attempt.as_ref().expect("attempt").slots[&PlacementSlotId::new("p1")]
+        .artifact
+        .tree
+        .clone();
+    f.apply(Action::Build(2));
+    f.push("t1").expect("push v2 (current is now T2)");
+    f.tamper_stored_tree(&first_tree);
+    let r2 = f.push("t1").expect("a tree tamper forces a real push");
+    assert_ne!(
+        r2.message, "Everything up to date",
+        "changing the tree component must prevent a no-op"
+    );
+    assert!(r2.attempt.is_some());
+    f.check_invariants();
+
+    // (c) RELEASE: tamper the stored release id.
+    let f = Fixture::new();
+    f.push("t1").expect("first push");
+    f.apply(Action::Tamper(TamperKind::StoredAssignmentRelease));
+    let r2 = f.push("t1").expect("a release tamper forces a real push");
+    assert_ne!(
+        r2.message, "Everything up to date",
+        "changing the release component must prevent a no-op"
+    );
+    assert!(r2.attempt.is_some());
+    f.check_invariants();
+}
+
+/// Scope: interleaved pushes over the shared slot; after EVERY action the
+/// observed projection in both member targets equals the remote assignment and
+/// every union-retained tree survives rotation. The final push runs under the
+/// AGGRESSIVE target `t1`, whose policy alone would sweep the trees the
+/// conservative member `t2` retains — the union check catches exactly that.
+#[test]
+fn state_machine_scope_projection_and_rotation_union() {
+    let f = Fixture::new();
+    for (version, target) in [
+        (1u32, "t1"),
+        (2, "t2"),
+        (3, "t1"),
+        (4, "t2"),
+        (5, "t1"),
+        (6, "t2"),
+        (7, "t1"),
+    ] {
+        f.apply(Action::Build(version));
+        let r = f.apply(Action::Push(target));
+        let Outcome::Push(res) = r else {
+            panic!("expected a push outcome");
+        };
+        let report = res.expect("every push in the sequence succeeds");
+        assert_eq!(
+            report.status,
+            Some(DeploymentStatus::Successful),
+            "push {version} on {target} must succeed"
+        );
+    }
+    // A standalone rotate under the union, then the same checks.
+    f.apply(Action::Rotate);
+    f.check_invariants();
+}
+
+/// Lifecycle mutant: after the deployment has durably committed, a post-commit
+/// rotation failure must NOT turn the deployment into a deployment failure —
+/// the push still returns Ok with the committed status, records a persistent
+/// debt marker, and warns. The mutant (`?` instead of debt-marker+warning)
+/// would make this push return Err.
+#[test]
+fn state_machine_lifecycle_cleanup_failure_after_commit() {
+    let f = Fixture::new();
+    f.apply(Action::InjectFailure(FailureStep::RotationInventoryWrite));
+    let Outcome::Push(res) = f.apply(Action::Push("t1")) else {
+        panic!("expected a push outcome");
+    };
+    let r1 =
+        res.expect("a committed deployment must never fail because its cleanup rotation failed");
+    assert_eq!(
+        r1.status,
+        Some(DeploymentStatus::Successful),
+        "the deployment committed; step-17 rotation failure must not change its outcome"
+    );
+    assert!(
+        r1.attempt.is_some(),
+        "the committed deployment records its attempt"
+    );
+    let warning = r1
+        .warning
+        .as_ref()
+        .expect("the push must warn about the deferred rotation");
+    assert!(
+        warning.contains("rotation deferred"),
+        "the warning describes the deferred rotation, got: {warning}"
+    );
+    assert!(
+        !f.store.read_rotation_debt("t1").unwrap().is_empty(),
+        "a persistent debt marker must be recorded"
+    );
+
+    // An up-to-date no-op retry services the maintenance: marker cleared, no
+    // warning remains, no attempt created.
+    let r2 = f.push("t1").expect("the retrying push succeeds");
+    assert_eq!(r2.message, "Everything up to date");
+    assert_eq!(r2.status, None, "the retrying push is an up-to-date no-op");
+    assert!(
+        r2.warning.is_none(),
+        "the maintenance succeeded on the no-op retry, so no warning remains"
+    );
+    assert!(
+        f.store.read_rotation_debt("t1").unwrap().is_empty(),
+        "the debt marker must be cleared once the rotation succeeds"
+    );
+    f.check_invariants();
+}
+
+/// Lifecycle: a failure at the FIRST I/O boundary (the intent persist) must
+/// abort BEFORE any remote mutation — no `current`, no generation — and a
+/// clean retry succeeds.
+#[test]
+fn state_machine_lifecycle_intent_persist_leaves_remote_untouched() {
+    let f = Fixture::new();
+    let id = DeploymentId::new("si-intent-fault".to_string());
+    f.arm_store_fault(FailureStep::IntentPersist, &id);
+    let err = f
+        .push_with_id("t1", &id)
+        .err()
+        .expect("the intent persist fault must abort the push");
+    assert!(
+        err.to_string().contains("append_attempt"),
+        "error must name the injected fault, got: {err}"
+    );
+    assert!(
+        !f.remote().exists(&layout::current()),
+        "no remote current pointer before the intent is durable"
+    );
+    assert_eq!(
+        f.remote().list(layout::generations()).unwrap().len(),
+        0,
+        "no generation may be created before the intent is durable"
+    );
+    assert!(
+        f.store.read_attempts("t1").unwrap().is_empty(),
+        "no attempt record when the intent persist failed"
+    );
+    // A clean push proceeds normally and every invariant holds.
+    let r = f.push("t1").expect("the clean follow-up push succeeds");
+    assert_eq!(r.status, Some(DeploymentStatus::Successful));
+    f.check_invariants();
+}
+
+/// Lifecycle: a failure at the fleet-commit marker write (after activation,
+/// before durable commit) leaves the attempt PendingCommit — never reported
+/// fully successful anywhere — and a retry converges to exactly one snapshot
+/// with no duplicated history.
+#[test]
+fn state_machine_lifecycle_pending_commit_recovery_no_duplicate_history() {
+    let f = Fixture::new();
+    f.apply(Action::InjectFailure(FailureStep::CommitMarkerWrite));
+    let Outcome::Push(res) = f.apply(Action::Push("t1")) else {
+        panic!("expected a push outcome");
+    };
+    let r1 = res.expect("marker-write failure is reported, not fatal");
+    assert_eq!(
+        r1.status,
+        Some(DeploymentStatus::PendingCommit),
+        "the failed fleet commit must be reported PendingCommit"
+    );
+    let attempt = r1.attempt.expect("the attempt is recorded");
+    let id = attempt.deployment_id.clone();
+    // Not reported fully successful ANYWHERE.
+    assert!(
+        f.store.read_snapshots("t1").unwrap().is_empty(),
+        "no snapshot for a pending attempt"
+    );
+    assert!(
+        f.store.read_last_successful("t1").is_none(),
+        "refs/last-successful must not point at a pending attempt"
+    );
+    assert_eq!(
+        f.store.latest_status(id.as_str()).unwrap(),
+        Some(DeploymentStatus::PendingCommit)
+    );
+    // Recoverable: intent and outcomes are durable.
+    assert!(
+        f.store.read_results(id.as_str()).is_ok(),
+        "outcomes durable"
+    );
+    f.check_invariants();
+
+    // The no-op retry reconciles and finalizes exactly once.
+    let r2 = f.push("t1").expect("the retrying push succeeds");
+    assert_eq!(r2.message, "Everything up to date");
+    assert_eq!(r2.status, None);
+    let snapshots = f.store.read_snapshots("t1").unwrap();
+    assert_eq!(snapshots.len(), 1, "exactly one snapshot after recovery");
+    assert_eq!(
+        f.store.read_last_successful("t1").as_deref(),
+        Some(id.as_str())
+    );
+    assert_eq!(
+        f.store.latest_status(id.as_str()).unwrap(),
+        Some(DeploymentStatus::Successful)
+    );
+    f.check_invariants();
+
+    // A further retry is fully idempotent: no duplicate history.
+    let r3 = f.push("t1").expect("third push succeeds");
+    assert_eq!(r3.status, None);
+    assert_eq!(f.store.read_snapshots("t1").unwrap().len(), 1);
+    assert_eq!(f.store.read_attempts("t1").unwrap().len(), 1);
+    f.check_invariants();
+}
+
+/// One SHORT mixed sequence: build -> push -> rollback -> rotate -> retry,
+/// checking all five invariant groups after every action.
+#[test]
+fn state_machine_mixed_sequence_invariants() {
+    let f = Fixture::new();
+    f.apply(Action::Build(1));
+    let r = f.apply(Action::Push("t1"));
+    let Outcome::Push(res) = r else {
+        panic!("expected push")
+    };
+    res.expect("push t1 succeeds");
+
+    f.apply(Action::Build(2));
+    let r = f.apply(Action::Push("t2"));
+    let Outcome::Push(res) = r else {
+        panic!("expected push")
+    };
+    res.expect("push t2 succeeds");
+
+    // Rollback t1 to its own f0 (tree v1) and t2 to f0 (tree v2).
+    let r = f.apply(Action::Rollback("t1", 0));
+    let Outcome::Push(res) = r else {
+        panic!("expected push")
+    };
+    res.expect("rollback t1 succeeds");
+
+    let r = f.apply(Action::Rotate);
+    assert!(matches!(r, Outcome::Ok));
+
+    let r = f.apply(Action::Retry("t2"));
+    let Outcome::Push(res) = r else {
+        panic!("expected push")
+    };
+    res.expect("no-op retry succeeds");
+    f.check_invariants();
+}
+
+// ===========================================================================
+// Property tests — Identity
+// ===========================================================================
+
+fn sdef(id: &str, server: &str, dir: &str, targets: &[&str]) -> SlotDef {
+    SlotDef {
+        id: id.to_string(),
+        server: server.to_string(),
+        deploy_dir: PathBuf::from(dir),
+        targets: targets.iter().map(|t| t.to_string()).collect(),
+    }
+}
+
+/// Reordering slots, variants, or a slot's targets list preserves the digest.
+#[test]
+fn identity_reordering_preserves_digest() {
+    let mut a: BTreeMap<String, Vec<SlotDef>> = BTreeMap::new();
+    a.insert(
+        "standard".to_string(),
+        vec![
+            sdef("p2", "s2", "/srv/p2", &["t1", "t2"]),
+            sdef("p1", "s1", "/srv/p1", &["t2", "t1"]),
+        ],
+    );
+    a.insert(
+        "canary".to_string(),
+        vec![sdef("c1", "s3", "/srv/c1", &["t3"])],
+    );
+
+    // Same declarations: slots in the opposite file order, targets lists in
+    // the opposite order, variants inserted in the opposite order.
+    let mut b: BTreeMap<String, Vec<SlotDef>> = BTreeMap::new();
+    b.insert(
+        "canary".to_string(),
+        vec![sdef("c1", "s3", "/srv/c1", &["t3"])],
+    );
+    b.insert(
+        "standard".to_string(),
+        vec![
+            sdef("p1", "s1", "/srv/p1", &["t2", "t1"]),
+            sdef("p2", "s2", "/srv/p2", &["t1", "t2"]),
+        ],
+    );
+    assert_eq!(
+        variant_slots_digest(&a),
+        variant_slots_digest(&b),
+        "slot/variant/target reordering must not change the digest"
+    );
+
+    // The release identity digests agree too.
+    let bindings: BTreeMap<String, String> = BTreeMap::from([
+        ("standard".to_string(), "t1".to_string()),
+        ("canary".to_string(), "t2".to_string()),
+    ]);
+    assert_eq!(
+        release_digest("m", "b", &variant_slots_digest(&a), &bindings),
+        release_digest("m", "b", &variant_slots_digest(&b), &bindings)
+    );
+}
+
+/// Duplicate targets in a slot's declaration are rejected at config load, and
+/// a list carrying a duplicate canonicalizes to the same identity as the
+/// deduplicated list.
+#[test]
+fn identity_duplicates_are_rejected_and_canonicalize_identically() {
+    // Config-level rejection.
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("proj");
+    let release_dir = project.join("releases").join("v1");
+    std::fs::create_dir_all(&release_dir).unwrap();
+    let dup_variant = format!(
+        "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntargets = [\"t1\", \"t1\"]\ndeploy_dir = \"/srv/si\"\n"
+    );
+    std::fs::write(release_dir.join("standard.toml"), dup_variant).unwrap();
+    std::fs::write(project.join("deploy.toml"), DEPLOY_TOML).unwrap();
+    assert!(
+        Config::load(&project.join("deploy.toml")).is_err(),
+        "a slot with a duplicated target name must be rejected"
+    );
+
+    // Digest-level: duplicate target names in the list canonicalize to the
+    // same identity as the deduplicated list.
+    let mut dedup: BTreeMap<String, Vec<SlotDef>> = BTreeMap::new();
+    dedup.insert(
+        "standard".to_string(),
+        vec![sdef("p1", "s1", "/srv/si", &["t1", "t2"])],
+    );
+    let mut dup: BTreeMap<String, Vec<SlotDef>> = BTreeMap::new();
+    dup.insert(
+        "standard".to_string(),
+        vec![sdef("p1", "s1", "/srv/si", &["t1", "t2", "t1"])],
+    );
+    assert_eq!(
+        variant_slots_digest(&dedup),
+        variant_slots_digest(&dup),
+        "duplicate target names must canonicalize identically"
+    );
+    assert_eq!(
+        canonicalize_slots(&dup["standard"]).slots[0].targets,
+        vec!["t1".to_string(), "t2".to_string()]
+    );
+}
+
+/// Canonical serialization round-trips to the same identity: an ArtifactRef
+/// (and a release id) survives a serialize/deserialize cycle unchanged.
+#[test]
+fn identity_canonical_serialization_round_trips() {
+    let art = ArtifactRef {
+        release: ReleaseId::new("rel-sha256-abc".to_string()),
+        variant: VariantName::new("standard".to_string()),
+        tree: TreeDigest::new("tree-1".to_string()),
+    };
+    let bytes = serde_json::to_vec(&art).unwrap();
+    let back: ArtifactRef = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        art, back,
+        "ArtifactRef must round-trip to the same identity"
+    );
+    assert_eq!(
+        serde_json::to_vec(&art).unwrap(),
+        serde_json::to_vec(&back).unwrap(),
+        "canonical serialization is stable"
+    );
+    let rid = ReleaseId::parse("rel-sha256-abc");
+    assert_eq!(rid.as_str(), "rel-sha256-abc");
+    assert_eq!(
+        ReleaseId::from_digest(&rid.digest()),
+        rid,
+        "release id digest round-trips"
+    );
+}
+
+// ===========================================================================
+// Property tests — Scope
+// ===========================================================================
+
+/// The shared slot's retained set is the union of every member target's
+/// policy: computing with the full member list equals the union of the
+/// per-member computations.
+#[test]
+fn scope_retained_is_union_of_member_policies() {
+    let f = Fixture::new();
+    // Build history interleaved across both targets.
+    for (v, t) in [(1u32, "t1"), (2, "t2"), (3, "t1"), (4, "t2"), (5, "t1")] {
+        f.apply(Action::Build(v));
+        f.apply(Action::Push(t));
+    }
+    let (t1, t2, full) = f.with_helper(|helper| {
+        let t1 = compute_retained(
+            &helper,
+            &f.config.pins,
+            &f.store,
+            &f.config,
+            &["t1".to_string()],
+        )
+        .unwrap();
+        let t2 = compute_retained(
+            &helper,
+            &f.config.pins,
+            &f.store,
+            &f.config,
+            &["t2".to_string()],
+        )
+        .unwrap();
+        let full = compute_retained(
+            &helper,
+            &f.config.pins,
+            &f.store,
+            &f.config,
+            &["t1".to_string(), "t2".to_string()],
+        )
+        .unwrap();
+        (t1, t2, full)
+    });
+    let union: HashSet<String> = t1.union(&t2).cloned().collect();
+    assert_eq!(
+        full, union,
+        "the shared slot's retained set must be the union of every member's policy"
+    );
+}
+
+/// Strengthening a retention policy — more distinct artifacts, a wider age
+/// window, protecting the previous — never REDUCES the retained set; neither
+/// does adding a member target.
+#[test]
+fn scope_strengthening_policy_never_reduces_retained() {
+    let f = Fixture::new();
+    for (v, t) in [(1u32, "t1"), (2, "t2"), (3, "t1"), (4, "t2")] {
+        f.apply(Action::Build(v));
+        f.apply(Action::Push(t));
+    }
+    let baseline = |cfg: &Config| -> HashSet<String> {
+        f.with_helper(|helper| {
+            compute_retained(
+                &helper,
+                &cfg.pins,
+                &f.store,
+                cfg,
+                &["t1".to_string(), "t2".to_string()],
+            )
+            .unwrap()
+        })
+    };
+    let weak = baseline(&f.config);
+
+    // Strengthen t1's policy: keep 5 distinct (was 1), protect the previous,
+    // protect 2 fleet deployments.
+    let mut strong_config = f.config.clone();
+    let r = strong_config.targets.get_mut("t1").unwrap();
+    r.rotation.per_server.keep_distinct_artifacts = 5;
+    r.rotation.per_server.protect_previous = true;
+    r.rotation.fleet.protect_deployments = 2;
+    let strong = baseline(&mut strong_config);
+    assert!(
+        strong.is_superset(&weak),
+        "strengthening a retention policy must never reduce the retained set"
+    );
+
+    // Widening the age window is monotone too.
+    let mut wider = strong_config.clone();
+    wider
+        .targets
+        .get_mut("t1")
+        .unwrap()
+        .rotation
+        .per_server
+        .keep_days = 90;
+    let wider_retained = baseline(&mut wider);
+    assert!(
+        wider_retained.is_superset(&strong),
+        "widening keep_days must never reduce the retained set"
+    );
+
+    // Adding a member target never reduces the retained set.
+    let single: HashSet<String> = f.with_helper(|helper| {
+        compute_retained(
+            &helper,
+            &f.config.pins,
+            &f.store,
+            &f.config,
+            &["t1".to_string()],
+        )
+        .unwrap()
+    });
+    assert!(
+        weak.is_superset(&single),
+        "adding a member target must never reduce the retained set"
+    );
+}
+
+// ===========================================================================
+// Property tests — Lifecycle
+// ===========================================================================
+
+/// Inject a one-shot store failure at EVERY post-activation persistence step
+/// (outcomes, snapshot, last-successful, terminal Successful transition, the
+/// recoverable PendingCommit marker). Each leaves the attempt recoverable and
+/// never reported fully successful; a clean retry converges to exactly one
+/// snapshot / ref / marker / Successful transition — no duplicate history.
+#[test]
+fn lifecycle_store_fault_matrix_recovers_without_duplicate_history() {
+    for (i, step) in [
+        FailureStep::ResultsWrite,
+        FailureStep::SnapshotAppend,
+        FailureStep::LastSuccessfulWrite,
+        FailureStep::TransitionSuccessful,
+        FailureStep::TransitionPending,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let f = Fixture::new();
+        let id = DeploymentId::new(format!("si-lc-fault-{i}"));
+        f.arm_store_fault(step, &id);
+        let err = f
+            .push_with_id("t1", &id)
+            .err()
+            .expect("the injected persistence fault must abort the push");
+        assert!(
+            err.to_string().contains("test fault"),
+            "{step:?}: error must name the injected fault, got: {err}"
+        );
+        // Never reported fully successful anywhere: the LATEST transition is
+        // recoverable (PendingCommit / InProgress), never `Successful`. (For
+        // the later finalization steps the snapshot / last-successful may
+        // already be durable — the attempt is still not terminal.)
+        assert!(
+            matches!(
+                f.store.latest_status(id.as_str()).unwrap(),
+                Some(DeploymentStatus::PendingCommit) | Some(DeploymentStatus::InProgress)
+            ),
+            "{step:?}: the crash window must leave the attempt recoverable, never Successful"
+        );
+
+        // Clean retry converges to exactly one final state.
+        let r2 = f.push("t1").expect("the retrying push succeeds");
+        assert_eq!(r2.message, "Everything up to date");
+        assert_eq!(r2.status, None, "{step:?}: retry is an up-to-date no-op");
+        let snapshots = f.store.read_snapshots("t1").unwrap();
+        assert_eq!(
+            snapshots.len(),
+            1,
+            "{step:?}: exactly one snapshot after recovery"
+        );
+        assert_eq!(
+            f.store.read_last_successful("t1").as_deref(),
+            Some(id.as_str()),
+            "{step:?}: refs/last-successful points at the recovered attempt"
+        );
+        assert_eq!(
+            f.store.latest_status(id.as_str()).unwrap(),
+            Some(DeploymentStatus::Successful),
+            "{step:?}: latest transition finalized as Successful"
+        );
+        assert_eq!(
+            f.store.read_attempts("t1").unwrap().len(),
+            1,
+            "{step:?}: the replay must not record a new attempt"
+        );
+        // Idempotent replay: no duplicate history.
+        let r3 = f.push("t1").unwrap();
+        assert_eq!(r3.status, None);
+        assert_eq!(f.store.read_snapshots("t1").unwrap().len(), 1);
+        f.check_invariants();
+    }
+}
+
+// ===========================================================================
+// Property tests — Integrity
+// ===========================================================================
+
+/// Delete each required field of a stored release record individually: the
+/// record must fail closed (unreadable or unverifiable), never silently
+/// accepted.
+#[test]
+fn integrity_stored_release_per_field_deletion_fails_closed() {
+    let f = Fixture::new();
+    f.apply(Action::Push("t1"));
+    let releases_root = f.store.base().join(layout::RELEASES);
+    let p = std::fs::read_dir(&releases_root)
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path()
+        .join("release.json");
+    for field in [
+        "release_schema_version",
+        "release_id",
+        "release_sha256",
+        "created_at",
+        "provenance",
+        "variants",
+    ] {
+        let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove(field);
+        let tampered = serde_json::to_string(&v).unwrap();
+        // Deleting a required field makes the record unreadable or
+        // unverifiable — never silently accepted.
+        let result = (|| -> Result<()> {
+            let rec: crate::model::ReleaseRecord = serde_json::from_str(&tampered)?;
+            verify_release_identity(&rec)?;
+            Ok(())
+        })();
+        assert!(
+            result.is_err(),
+            "deleting field '{field}' must fail closed (deserialization or verification)"
+        );
+    }
+}
+
+/// Change each identity-bearing field of a stored release record individually
+/// (digest fields, variant binding, slot snapshot): the record must fail
+/// closed.
+#[test]
+fn integrity_identity_field_change_fails_closed() {
+    let f = Fixture::new();
+    f.apply(Action::Push("t1"));
+    let releases_root = f.store.base().join(layout::RELEASES);
+    let dir = std::fs::read_dir(&releases_root)
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap();
+    let id = ReleaseId::new(dir.file_name().to_string_lossy().into_owned());
+    let p = dir.path().join("release.json");
+
+    let original: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+    let write = |v: &serde_json::Value| {
+        std::fs::write(&p, serde_json::to_vec_pretty(v).unwrap()).unwrap();
+    };
+
+    // (a) release_sha256 edited.
+    let mut v = original.clone();
+    v["release_sha256"] = serde_json::json!("deadbeef".repeat(8));
+    write(&v);
+    let err = f
+        .store
+        .read_release(&id)
+        .expect_err("edited digest must fail");
+    assert!(err.to_string().contains("identity mismatch"));
+
+    // (b) release_id edited (self-consistent new id would need recompute; a
+    // bare edit mismatches the recomputed identity).
+    let mut v = original.clone();
+    v["release_id"] = serde_json::json!(
+        "rel-sha256-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    );
+    write(&v);
+    let err = f
+        .store
+        .read_release(&id)
+        .expect_err("edited release id must fail");
+    assert!(err.to_string().contains("identity mismatch"));
+
+    // (c) variant binding edited while the digest fields were left unchanged.
+    let mut v = original.clone();
+    v["variants"]["standard"] = serde_json::json!("tree-other");
+    write(&v);
+    let err = f
+        .store
+        .read_release(&id)
+        .expect_err("edited binding must fail");
+    assert!(err.to_string().contains("identity mismatch"));
+
+    // (d) slot snapshot edited (deploy_dir moved) with digests retained.
+    let mut v = original.clone();
+    v["slots"]["standard"]["slots"][0]["deploy_dir"] = serde_json::json!("/srv/elsewhere");
+    write(&v);
+    let err = f
+        .store
+        .read_release(&id)
+        .expect_err("edited slot snapshot must fail");
+    assert!(err.to_string().contains("identity mismatch"));
+
+    // Restore: the fixture's own checks pass again.
+    write(&original);
+    f.check_invariants();
+}
+
+/// Tampering stored content while leaving the digest fields unchanged must
+/// fail closed: the digest is never trusted from the stored fields.
+#[test]
+fn integrity_digest_unchanged_after_tamper_fails_closed() {
+    let f = Fixture::new();
+    f.apply(Action::Push("t1"));
+    let releases_root = f.store.base().join(layout::RELEASES);
+    let dir = std::fs::read_dir(&releases_root)
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap();
+    let id = ReleaseId::new(dir.file_name().to_string_lossy().into_owned());
+    let p = dir.path().join("release.json");
+    let original: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+    let sha = original["release_sha256"].clone();
+    let rid = original["release_id"].clone();
+
+    let mut tampered = original.clone();
+    tampered["variants"]["standard"] = serde_json::json!("tree-tampered");
+    // The digest fields are explicitly retained — exactly the "trust the
+    // stored digest" bug.
+    tampered["release_sha256"] = sha.clone();
+    tampered["release_id"] = rid.clone();
+    std::fs::write(&p, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+    let err = f
+        .store
+        .read_release(&id)
+        .err()
+        .expect("content tamper with retained digest must fail");
+    assert!(
+        err.to_string().contains("identity mismatch"),
+        "error must name the mismatch, got: {err}"
+    );
+
+    // An INCOMING tampered record must fail closed at one of the store's two
+    // boundaries: `write_release` refuses it before writing (strict behavior)
+    // or, if the write is accepted, the read recomputes and refuses it.
+    let rec: crate::model::ReleaseRecord =
+        serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+    let fresh = tempfile::tempdir().unwrap();
+    let store2 = LocalStore::with_base(fresh.path().join("store")).unwrap();
+    match store2.write_release(&rec) {
+        Err(e) => assert!(
+            e.to_string().contains("identity mismatch"),
+            "incoming verification must refuse the tampered record, got: {e}"
+        ),
+        Ok(()) => {
+            let err = store2
+                .read_release(&ReleaseId::new(rec.release_id.clone()))
+                .err()
+                .expect("a tampered record written to a fresh store must fail at read");
+            assert!(err.to_string().contains("identity mismatch"));
+        }
+    }
+
+    // Restore, and the store verifies again.
+    std::fs::write(&p, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+    f.store.read_release(&id).expect("restored record verifies");
+}
+
+/// A VALID record (self-consistent content) placed under the WRONG release
+/// path must never be usable as that path's release: the read either fails
+/// closed (the strict store binds the record to its read path) or hands the
+/// caller a record whose `release_id` is provably NOT the requested id — in
+/// no case is a caller handed a record masquerading as the requested release.
+#[test]
+fn integrity_valid_record_under_wrong_release_path_fails_closed() {
+    let f = Fixture::new();
+    f.apply(Action::Push("t1"));
+    let releases_root = f.store.base().join(layout::RELEASES);
+    let dir = std::fs::read_dir(&releases_root)
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap();
+    let real_id = ReleaseId::new(dir.file_name().to_string_lossy().into_owned());
+    let bytes = std::fs::read(dir.path().join("release.json")).unwrap();
+    // Relocate the VALID record under a different release path.
+    let other_id = ReleaseId::new(
+        "rel-sha256-0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+    );
+    let other_dir = f.store.release_dir(&other_id);
+    std::fs::create_dir_all(&other_dir).unwrap();
+    std::fs::write(other_dir.join("release.json"), &bytes).unwrap();
+    match f.store.read_release(&other_id) {
+        Err(e) => assert!(
+            e.to_string()
+                .contains("does not match the requested release id"),
+            "a record under the wrong release path must fail closed, got: {e}"
+        ),
+        Ok(rec) => assert_ne!(
+            rec.release_id,
+            other_id.as_str(),
+            "the store must never return a record masquerading as the requested release"
+        ),
+    }
+    // The original path still reads fine.
+    f.store
+        .read_release(&real_id)
+        .expect("the true path still verifies");
+}
+
+/// A tampered stored release record blocks a historical push end-to-end: the
+/// rollback/release-ref preflight fails closed instead of deploying the
+/// tampered identity.
+#[test]
+fn integrity_tampered_stored_release_blocks_historical_push() {
+    let f = Fixture::new();
+    f.apply(Action::Push("t1"));
+    let releases_root = f.store.base().join(layout::RELEASES);
+    let dir = std::fs::read_dir(&releases_root)
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap();
+    let id = ReleaseId::new(dir.file_name().to_string_lossy().into_owned());
+    let p = dir.path().join("release.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+    // Tamper the slot snapshot (an identity-bearing field) with digests
+    // retained. The push reads the release through `read_release`, which
+    // recomputes and verifies — it must fail closed before anything deploys.
+    v["slots"]["standard"]["slots"][0]["deploy_dir"] = serde_json::json!("/srv/elsewhere");
+    std::fs::write(&p, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+
+    let err = f
+        .push_ref_impl("t1", id.as_str())
+        .err()
+        .expect("a historical push against a tampered stored release must fail closed");
+    assert!(
+        err.to_string().contains("identity mismatch"),
+        "error must name the identity mismatch, got: {err}"
+    );
+}
+
+/// Incoming (not yet stored) attempt and transition records reject every
+/// required-field deletion: a torn record never deserializes into a usable
+/// fact.
+#[test]
+fn integrity_incoming_record_field_deletion_fails_closed() {
+    let f = Fixture::new();
+    f.apply(Action::Push("t1"));
+    let attempts_path = f.store.target_dir("t1").join("attempts.jsonl");
+    let line = std::fs::read_to_string(&attempts_path).unwrap();
+    for field in [
+        "deployment_id",
+        "target",
+        "slot_ids",
+        "behavior_sha256",
+        "attempted_at",
+        "desired",
+        "pre_push",
+    ] {
+        let mut v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        v.as_object_mut().unwrap().remove(field);
+        let tampered = serde_json::to_string(&v).unwrap();
+        let rec: std::result::Result<crate::records::DeploymentAttempt, _> =
+            serde_json::from_str(&tampered);
+        assert!(
+            rec.is_err(),
+            "deleting attempt field '{field}' must fail deserialization"
+        );
+    }
+    // Transitions: every required field rejected individually.
+    let attempts = f.store.read_attempts("t1").unwrap();
+    let dep_id = attempts[0].deployment_id.as_str();
+    let transitions_path = f.store.deployment_dir(dep_id).join("transitions.jsonl");
+    let lines: Vec<String> = std::fs::read_to_string(&transitions_path)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    for field in ["deployment_id", "status", "recorded_at"] {
+        let mut v: serde_json::Value = serde_json::from_str(lines[0].trim()).unwrap();
+        v.as_object_mut().unwrap().remove(field);
+        let tampered = serde_json::to_string(&v).unwrap();
+        let rec: std::result::Result<crate::records::DeploymentTransition, _> =
+            serde_json::from_str(&tampered);
+        assert!(
+            rec.is_err(),
+            "deleting transition field '{field}' must fail deserialization"
+        );
+    }
+}
+
+// ===========================================================================
+// Property tests — Bounds
+// ===========================================================================
+
+/// Compare the production capacity decision against a u128 reference model
+/// over the full value grid (0, 1, avail-1, avail, avail+1, MAX-1, MAX across
+/// avail in {0, 1, 1000, MAX-1, MAX}): the decision must agree with the
+/// overflow-free u128 addition everywhere, and no input may panic or wrap.
+#[test]
+fn bounds_capacity_matches_u128_reference_over_grid() {
+    for (need, reserve, avail) in bounds_grid() {
+        let fits = capacity_fits(need, reserve, avail);
+        let reference = (need as u128) + (reserve as u128) <= avail as u128;
+        assert_eq!(
+            fits, reference,
+            "capacity decision for need={need} reserve={reserve} avail={avail} must match the u128 reference model"
+        );
+    }
+}
+
+/// Explicit boundary corners: the decision is total (every input), exact at
+/// the boundary, and the extreme values fail safely.
+#[test]
+fn bounds_capacity_edge_corners_fail_safely() {
+    // No reserve, no need: fits.
+    assert!(capacity_fits(0, 0, 0));
+    assert!(capacity_fits(1, 0, 1));
+    assert!(!capacity_fits(1, 0, 0), "need > avail must fail");
+    // Reserve alone exceeds available.
+    assert!(!capacity_fits(0, 1, 0));
+    // Exact boundary: need + reserve == available fits.
+    assert!(capacity_fits(6000, 4000, 10_000));
+    // One more byte fails.
+    assert!(!capacity_fits(6000, 4001, 10_000));
+    // u64::MAX-sized filesystem: exact fit and one past it.
+    assert!(capacity_fits(u64::MAX - 6000, 0, u64::MAX));
+    assert!(capacity_fits(0, u64::MAX, u64::MAX));
+    assert!(
+        !capacity_fits(1, u64::MAX, u64::MAX),
+        "need+reserve must never wrap past MAX"
+    );
+    assert!(!capacity_fits(u64::MAX, u64::MAX, u64::MAX));
+    assert!(!capacity_fits(u64::MAX, 1, u64::MAX));
+    assert!(capacity_fits(u64::MAX, 0, u64::MAX));
+}

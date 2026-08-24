@@ -22,4 +22,6 @@ pub mod template;
 pub mod tree;
 
 #[cfg(test)]
+pub(crate) mod semantic_invariants;
+#[cfg(test)]
 pub(crate) mod testutil;
