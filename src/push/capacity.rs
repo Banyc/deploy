@@ -67,7 +67,13 @@ pub(crate) fn capacity_preflight(
         // not of the currently available space: a small available amount on a
         // large filesystem must still reserve `total * percent / 100`.
         let reserve = reserve_bytes.max(percent_of_total(fs.total, reserve_percent));
-        if need + reserve > fs.available {
+        // Overflow-free headroom comparison: `need + reserve` could wrap u64
+        // (e.g. `reserve_bytes = u64::MAX`), silently passing a push that must
+        // fail — or panicking in a debug build. The disjunctive form never
+        // adds: the first arm short-circuits on `reserve > available`, and the
+        // second arm `need > available - reserve` is only evaluated when
+        // `reserve <= available`, so the subtraction cannot underflow.
+        if reserve > fs.available || need > fs.available - reserve {
             // Run protected rotation using the target's rotation policy, then
             // recheck capacity directly rather than failing the restore.
             // Best-effort by design: rotation is only an optimization to free
@@ -92,7 +98,8 @@ pub(crate) fn capacity_preflight(
                 available: 0,
             });
             let reserve2 = reserve_bytes.max(percent_of_total(fs2.total, reserve_percent));
-            if need + reserve2 > fs2.available {
+            // Same overflow-free form as the primary check above.
+            if reserve2 > fs2.available || need > fs2.available - reserve2 {
                 return Err(Error::preflight(format!(
                     "insufficient capacity on slot {}: need {} + reserve {} > avail {}",
                     a.placement_slot, need, reserve2, fs2.available
@@ -383,5 +390,90 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &rotation,
         )
         .expect("an already-present tree skips the headroom check");
+    }
+
+    /// Run `capacity_preflight` against a fresh 6000-byte tree with the given
+    /// filesystem total/available bytes and capacity policy, returning the
+    /// result. The fake remote reports fixed bytes, so rotation's recheck sees
+    /// the same numbers as the primary check.
+    fn run_preflight(
+        total: u64,
+        avail: u64,
+        reserve_bytes: u64,
+        reserve_percent: u8,
+    ) -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        // Fabricate a local object whose tree totals exactly 6000 bytes.
+        let tree = TreeDigest::new("tree-6000".to_string());
+        let obj_root = store.object_root(&tree);
+        std::fs::create_dir_all(obj_root.join("app")).unwrap();
+        std::fs::write(obj_root.join("app/file"), vec![b'x'; 6000]).unwrap();
+
+        let remote = FakeCapacityRemote::build(dir.path().join("remote"), total, avail).unwrap();
+        remote.provision_layout().unwrap();
+        let helper = RemoteHelper::new(remote.as_ref());
+        let helpers = HashMap::from([(PlacementSlotId::new("p1".to_string()), helper)]);
+
+        let mut config = cfg();
+        let rotation = config.targets["t1"].rotation.clone();
+        config.servers[0].capacity = crate::config::CapacityConfig {
+            reserve_bytes,
+            reserve_percent,
+        };
+        let assignment = PlannedAssignment {
+            placement_slot: PlacementSlotId::new("p1".to_string()),
+            artifact: ArtifactRef {
+                release: ReleaseId::new("rel-sha256-cap".to_string()),
+                variant: VariantName::new("standard".to_string()),
+                tree,
+            },
+        };
+        let op_id = OperationId::generate();
+        let deployment_id = DeploymentId::generate();
+        capacity_preflight(
+            &store,
+            &[assignment],
+            &helpers,
+            &op_id,
+            &deployment_id,
+            &config,
+            &rotation,
+        )
+    }
+
+    /// `reserve_bytes = u64::MAX` must fail the preflight LOUDLY, not wrap:
+    /// the old `need + reserve` arithmetic would overflow u64 (panic in a
+    /// debug build, silently pass in a release build) and let an impossible
+    /// push through. The overflow-free form `reserve > available || need >
+    /// available - reserve` fails immediately because MAX > available, and
+    /// the rotation recheck reports the same fixed available bytes.
+    #[test]
+    fn reserve_u64_max_fails_without_overflow() {
+        let err = run_preflight(100_000, 10_000, u64::MAX, 0)
+            .expect_err("u64::MAX reserve must fail the preflight");
+        assert!(
+            err.to_string().contains("insufficient capacity"),
+            "expected a capacity preflight failure, got: {err}"
+        );
+    }
+
+    /// Boundary of the overflow-free comparison against a u64::MAX-sized
+    /// filesystem: `reserve = available - need` exactly fits, and
+    /// `reserve = available - need + 1` must fail. The old `need + reserve`
+    /// form would overflow for the failing case (`6000 + (u64::MAX - 5999)`
+    /// wraps past u64::MAX), so this pins the new arithmetic on both sides
+    /// of the line.
+    #[test]
+    fn reserve_boundary_on_max_filesystem_is_exact() {
+        run_preflight(u64::MAX, u64::MAX, u64::MAX - 6000, 0)
+            .expect("reserve exactly available - need fits");
+
+        let err = run_preflight(u64::MAX, u64::MAX, u64::MAX - 5999, 0)
+            .expect_err("reserve available - need + 1 must fail");
+        assert!(
+            err.to_string().contains("insufficient capacity"),
+            "expected a capacity preflight failure, got: {err}"
+        );
     }
 }
