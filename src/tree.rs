@@ -16,7 +16,7 @@
 
 use crate::digest::sha256_bytes;
 use crate::error::{Error, Result};
-use crate::model::{TreeEntry, TreeMetadata};
+use crate::model::{TREE_SCHEMA_VERSION, TreeEntry, TreeMetadata};
 use std::collections::BTreeSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -155,7 +155,7 @@ pub fn canonicalize_tree(root: &Path) -> Result<TreeMetadata> {
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     let mut meta = TreeMetadata {
-        tree_schema_version: 1,
+        tree_schema_version: TREE_SCHEMA_VERSION,
         hash_algorithm: "sha256".to_string(),
         tree_sha256: String::new(),
         entries,

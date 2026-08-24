@@ -14,7 +14,8 @@ use crate::digest::sha256_bytes;
 use crate::error::{Error, Result};
 use crate::model::{
     BehaviorContract, CanonicalReleasePayload, CanonicalSlot, CanonicalSlots, Provenance,
-    ReleaseDigest, ReleaseId, ReleaseRecord, TreeDigest, VariantName,
+    RELEASE_PAYLOAD_SCHEMA_VERSION, RELEASE_RECORD_SCHEMA_VERSION, ReleaseDigest, ReleaseId,
+    ReleaseRecord, TreeDigest, VariantName,
 };
 use chrono::Utc;
 use std::collections::BTreeMap;
@@ -183,7 +184,7 @@ pub fn release_digest(
     variants: &BTreeMap<String, String>,
 ) -> ReleaseDigest {
     let payload = CanonicalReleasePayload {
-        schema_version: 2,
+        schema_version: RELEASE_PAYLOAD_SCHEMA_VERSION,
         mapping_sha256: mapping_sha.to_string(),
         behavior_sha256: behavior_sha.to_string(),
         slots_digest: slots_sha.to_string(),
@@ -231,7 +232,7 @@ pub fn build_release(
     let digest = release_digest(mapping_sha, behavior_sha, &slots_digest, &bindings);
     let id = ReleaseId::from_digest(&digest);
     ReleaseRecord {
-        release_schema_version: 1,
+        release_schema_version: RELEASE_RECORD_SCHEMA_VERSION,
         release_id: id.as_str().to_string(),
         release_sha256: digest.as_str().to_string(),
         created_at: Utc::now().to_rfc3339(),
@@ -296,6 +297,15 @@ pub fn recompute_release_digest(rec: &ReleaseRecord) -> Option<ReleaseDigest> {
 /// digest fields were left unchanged fails closed with an integrity error
 /// naming the release and the expected vs recomputed digest.
 ///
+/// The record's `release_schema_version` is checked FIRST and must be
+/// exactly [`RELEASE_RECORD_SCHEMA_VERSION`]: a record carrying any other
+/// version is refused outright (fail closed, naming the version) before any
+/// digest work — only the current record format is ever interpreted. The
+/// identity payload version ([`RELEASE_PAYLOAD_SCHEMA_VERSION`]) is enforced
+/// implicitly by the recompute below, which re-derives the digest with
+/// exactly that payload version: a release whose identity was derived from
+/// any other payload version fails the recompute-and-verify check.
+///
 /// An EMPTY canonical slot snapshot is rejected outright: a current-format
 /// release record must carry its own slot declarations, without which the
 /// identity cannot be recomputed from the record — accepting one would let a
@@ -305,6 +315,14 @@ pub fn recompute_release_digest(rec: &ReleaseRecord) -> Option<ReleaseDigest> {
 /// so an empty snapshot cannot be proven "genuinely legacy" and is treated
 /// as tampering (fail closed).
 pub fn verify_release_identity(rec: &ReleaseRecord) -> Result<()> {
+    // The record format version must be exactly the canonical constant: a
+    // record from any other version is refused before any digest work.
+    if rec.release_schema_version != RELEASE_RECORD_SCHEMA_VERSION {
+        return Err(Error::integrity(format!(
+            "release {} carries unsupported release_schema_version {} (expected {RELEASE_RECORD_SCHEMA_VERSION}): only RELEASE_RECORD_SCHEMA_VERSION is accepted",
+            rec.release_id, rec.release_schema_version
+        )));
+    }
     // Reject an empty slot snapshot before anything else: a record that
     // carries no canonical slot declarations cannot be verified from its own
     // content, so its identity is not trustworthy.
@@ -803,7 +821,6 @@ mod tests {
             "error must explain the fail-closed rejection, got: {err}"
         );
     }
-
     /// A tampered behavior.json whose canonical digest does not match the
     /// provenance `behavior_sha256` fails closed, while a payload that parses
     /// to the SAME canonical contract set (JSON key reordering) passes.
@@ -869,5 +886,133 @@ mod tests {
         let err = verify_behavior_json(b"{ not json", "rel-x", &sha)
             .expect_err("malformed bytes must fail closed");
         assert!(err.to_string().contains("malformed"));
+    }
+    /// The schema-version property for the RELEASE RECORD: generate arbitrary
+    /// `u32` `release_schema_version` values; ONLY
+    /// `RELEASE_RECORD_SCHEMA_VERSION` verifies, every other version fails
+    /// closed with an integrity error naming the version (checked BEFORE any
+    /// digest work — never a panic, never silent acceptance).
+    #[test]
+    fn verify_release_identity_accepts_only_record_schema_version() {
+        let variants: BTreeMap<VariantName, TreeDigest> =
+            BTreeMap::from([(VariantName::new("standard"), TreeDigest::new("t1"))]);
+        let slots: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+            "standard".to_string(),
+            vec![sdef("p1", "server-01", "/srv/deploy/example", "production")],
+        )]);
+        let rec = build_release("m", "b", &variants, &slots, Path::new("."));
+        verify_release_identity(&rec).expect("the canonical version verifies");
+        // Representative arbitrary-u32 set: 0, version - 1, version,
+        // version + 1, 3, u32::MAX (duplicates harmless).
+        let versions = [
+            0u32,
+            RELEASE_RECORD_SCHEMA_VERSION.wrapping_sub(1),
+            RELEASE_RECORD_SCHEMA_VERSION,
+            RELEASE_RECORD_SCHEMA_VERSION.wrapping_add(1),
+            3,
+            u32::MAX,
+        ];
+        for v in versions {
+            let mut r = rec.clone();
+            r.release_schema_version = v;
+            if v == RELEASE_RECORD_SCHEMA_VERSION {
+                verify_release_identity(&r).expect("the canonical version verifies");
+            } else {
+                let err = verify_release_identity(&r)
+                    .expect_err("a record from any other version must fail closed");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("release_schema_version"),
+                    "error must name the version field, got: {msg}"
+                );
+                assert!(
+                    msg.contains(&format!("{v}")),
+                    "error must name the stored version {v}, got: {msg}"
+                );
+                assert!(
+                    msg.contains("RELEASE_RECORD_SCHEMA_VERSION"),
+                    "error must name the accepted version, got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// The schema-version property for the RELEASE IDENTITY PAYLOAD: the
+    /// payload version is FROZEN into the release digest, so a release whose
+    /// identity was derived with any `u32` version other than
+    /// `RELEASE_PAYLOAD_SCHEMA_VERSION` fails the recompute-and-verify check
+    /// (the stored digest never matches the digest re-derived with the
+    /// canonical payload version). Only the canonical version produces a
+    /// self-consistent, verifiable release.
+    #[test]
+    fn verify_release_identity_accepts_only_payload_schema_version() {
+        let variants: BTreeMap<VariantName, TreeDigest> =
+            BTreeMap::from([(VariantName::new("standard"), TreeDigest::new("t1"))]);
+        let slots: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+            "standard".to_string(),
+            vec![sdef("p1", "server-01", "/srv/deploy/example", "production")],
+        )]);
+        let bindings: BTreeMap<String, String> = variants
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
+            .collect();
+        let rec = build_release("m", "b", &variants, &slots, Path::new("."));
+        let slots_digest = variant_slots_digest(&slots);
+        // Representative arbitrary-u32 set over the payload version.
+        let versions = [
+            0u32,
+            RELEASE_PAYLOAD_SCHEMA_VERSION.wrapping_sub(1),
+            RELEASE_PAYLOAD_SCHEMA_VERSION,
+            RELEASE_PAYLOAD_SCHEMA_VERSION.wrapping_add(1),
+            3,
+            u32::MAX,
+        ];
+        let mut digest_by_version: BTreeMap<u32, String> = BTreeMap::new();
+        for v in versions {
+            // Simulate a release whose identity was derived from a payload
+            // carrying version `v` (the digest is the sha256 of the payload).
+            let payload = CanonicalReleasePayload {
+                schema_version: v,
+                mapping_sha256: "m".to_string(),
+                behavior_sha256: "b".to_string(),
+                slots_digest: slots_digest.clone(),
+                variants: bindings.clone(),
+            };
+            let digest = sha256_bytes(&serde_json::to_vec(&payload).expect("payload serializes"));
+            let mut r = rec.clone();
+            r.release_sha256 = digest.clone();
+            r.release_id = format!("rel-sha256-{digest}");
+            if v == RELEASE_PAYLOAD_SCHEMA_VERSION {
+                verify_release_identity(&r).expect("a payload with the canonical version verifies");
+            } else {
+                let err = verify_release_identity(&r).expect_err(
+                    "a payload from any other version must fail the recompute-and-verify check",
+                );
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("identity mismatch"),
+                    "error must name the recompute-and-verify mismatch, got: {msg}"
+                );
+                assert!(
+                    msg.contains(&r.release_sha256),
+                    "error must name the stored (payload-derived) digest, got: {msg}"
+                );
+            }
+            // Every version in the set produces a DISTINCT identity digest:
+            // the payload version is part of the hash, so each arbitrary
+            // version is distinguishable from the canonical one.
+            digest_by_version.insert(v, digest);
+        }
+        // All digests distinct across the representative set.
+        let canonical = &digest_by_version[&RELEASE_PAYLOAD_SCHEMA_VERSION];
+        for (v, d) in &digest_by_version {
+            if *v == RELEASE_PAYLOAD_SCHEMA_VERSION {
+                continue;
+            }
+            assert_ne!(
+                d, canonical,
+                "payload version {v} must produce a different digest than the canonical version"
+            );
+        }
     }
 }

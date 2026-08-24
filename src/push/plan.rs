@@ -239,7 +239,8 @@ mod tests {
     use super::*;
     use crate::model::{
         ArtifactRef, CanonicalSlot, CanonicalSlots, DeploymentId, GenerationId, GenerationRef,
-        Provenance, ReleaseRecord, ServerId, TargetName, TreeDigest, VariantName,
+        Provenance, RELEASE_RECORD_SCHEMA_VERSION, ReleaseRecord, ServerId, TargetName, TreeDigest,
+        VariantName,
     };
     use crate::records::{DeploymentSnapshot, PhysicalBinding};
 
@@ -315,7 +316,7 @@ interval_seconds = 0
     /// per-variant tree bindings.
     fn legacy_record(id: &str, tree: &str) -> ReleaseRecord {
         ReleaseRecord {
-            release_schema_version: 1,
+            release_schema_version: RELEASE_RECORD_SCHEMA_VERSION,
             release_id: id.to_string(),
             release_sha256: format!("sha256-{id}"),
             created_at: "2026-01-01T00:00:00Z".to_string(),

@@ -33,7 +33,46 @@ use std::fmt;
 use uuid::Uuid;
 
 /// The schema version understood by this implementation.
+///
+/// `SCHEMA_VERSION` is the SINGLE authoritative schema version for every
+/// versioned record family that uses it: the user-facing `deploy.toml`
+/// configuration (`Config.schema_version`, validated in
+/// [`crate::config::Config::validate`]) AND the deployment records
+/// (`DeploymentAttempt.deployment_schema_version`, validated on every read
+/// in [`crate::store::local::LocalStore::read_attempts`]). Every writer
+/// emits exactly `SCHEMA_VERSION`; every reader refuses any other version
+/// (fail closed — a mismatched record is never silently interpreted).
+///
+/// The current format is version 1: deployment records use the canonical
+/// placement-slot-keyed shape (`BTreeMap<PlacementSlotId, _>` maps, nested
+/// artifact/generation refs). A hypothetical pre-rekeying shape that keyed
+/// these maps by server ID with flat artifact fields is NOT the current
+/// schema and never loads.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// The canonical release identity PAYLOAD version
+/// (`CanonicalReleasePayload.schema_version`), FROZEN INTO the release
+/// digest: the field is part of the hashed identity payload, so its value
+/// can never change without producing a new release ID. Version 2 is the
+/// slots-into-identity payload: it adds the per-variant canonical slot
+/// declaration digest (`slots_digest`) alongside the mapping and behavior
+/// digests. Read-side enforcement is implicit and fail-closed:
+/// `verify_release_identity` recomputes the digest using exactly this
+/// version, so a release whose identity was derived from any other payload
+/// version fails the recompute-and-verify check.
+pub const RELEASE_PAYLOAD_SCHEMA_VERSION: u32 = 2;
+
+/// The `release.json` record format version
+/// (`ReleaseRecord.release_schema_version`). `build_release` emits exactly
+/// this value and [`crate::release::verify_release_identity`] refuses any
+/// other version (fail closed) on every write and read path.
+pub const RELEASE_RECORD_SCHEMA_VERSION: u32 = 1;
+
+/// The `tree.json` metadata format version (`TreeMetadata.tree_schema_version`).
+/// [`crate::tree::canonicalize_tree`] emits exactly this value and
+/// [`crate::store::local::LocalStore::read_tree_meta`] refuses any other
+/// version (fail closed).
+pub const TREE_SCHEMA_VERSION: u32 = 1;
 
 fn new_uuid_v7() -> String {
     Uuid::now_v7().to_string()
@@ -171,7 +210,8 @@ pub struct TreeEntry {
     pub symlink_target: Option<String>,
 }
 
-/// Canonical tree metadata (the `tree.json` payload).
+/// Canonical tree metadata (the `tree.json` payload). `tree_schema_version`
+/// is [`TREE_SCHEMA_VERSION`]; readers refuse any other value.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeMetadata {
     pub tree_schema_version: u32,
@@ -236,8 +276,11 @@ pub struct CanonicalSlots {
 /// resolved from the caller's current configuration, so a server-capacity
 /// change does NOT produce a new release.
 ///
-/// Schema version 2: the identity payload now includes the per-variant slot
-/// declaration digest (added alongside the mappings/behavior digests).
+/// Schema version 2 ([`RELEASE_PAYLOAD_SCHEMA_VERSION`]): the identity
+/// payload includes the per-variant slot declaration digest (added
+/// alongside the mappings/behavior digests). The version is frozen into the
+/// release digest; `verify_release_identity` recomputes it with exactly
+/// this constant, so any other payload version fails verification.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalReleasePayload {
     pub schema_version: u32,
@@ -258,7 +301,9 @@ pub struct Provenance {
     pub behavior_sha256: String,
 }
 
-/// Immutable release record (`release.json`).
+/// Immutable release record (`release.json`). `release_schema_version` is
+/// [`RELEASE_RECORD_SCHEMA_VERSION`]; readers (`verify_release_identity`)
+/// refuse any other version (fail closed).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseRecord {
     pub release_schema_version: u32,

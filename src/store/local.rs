@@ -19,7 +19,8 @@
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::model::{
-    BehaviorContract, DeploymentId, ReleaseId, ReleaseRecord, TreeDigest, TreeMetadata,
+    BehaviorContract, DeploymentId, ReleaseId, ReleaseRecord, SCHEMA_VERSION, TREE_SCHEMA_VERSION,
+    TreeDigest, TreeMetadata,
 };
 use crate::records::{
     DeploymentAttempt, DeploymentResults, DeploymentSnapshot, DeploymentStatus,
@@ -278,7 +279,18 @@ impl LocalStore {
     }
 
     pub fn read_tree_meta(&self, digest: &TreeDigest) -> Result<TreeMetadata> {
-        read_json(&self.object_tree_json(digest))
+        let meta: TreeMetadata = read_json(&self.object_tree_json(digest))?;
+        // Fail closed on the tree metadata format version: only
+        // `TREE_SCHEMA_VERSION` is accepted, any other version is refused
+        // (a tree.json written by a different schema is never interpreted).
+        if meta.tree_schema_version != TREE_SCHEMA_VERSION {
+            return Err(Error::integrity(format!(
+                "tree {} carries unsupported tree_schema_version {} (expected {TREE_SCHEMA_VERSION}): only TREE_SCHEMA_VERSION is accepted",
+                digest.as_str(),
+                meta.tree_schema_version
+            )));
+        }
+        Ok(meta)
     }
 
     // ---- releases ---------------------------------------------------------
@@ -529,10 +541,19 @@ impl LocalStore {
             if line.trim().is_empty() {
                 continue;
             }
-            out.push(
-                serde_json::from_str::<DeploymentAttempt>(line)
-                    .map_err(|e| Error::store(format!("parse attempt: {e}")))?,
-            );
+            let attempt: DeploymentAttempt = serde_json::from_str(line)
+                .map_err(|e| Error::store(format!("parse attempt: {e}")))?;
+            // Fail closed on the record schema version: only `SCHEMA_VERSION`
+            // is accepted, any other version is refused with an error naming
+            // the version (a record from a different schema is never
+            // silently interpreted).
+            if attempt.deployment_schema_version != SCHEMA_VERSION {
+                return Err(Error::store(format!(
+                    "attempt {} carries unsupported deployment_schema_version {} (expected {SCHEMA_VERSION}): only SCHEMA_VERSION is accepted",
+                    attempt.deployment_id, attempt.deployment_schema_version
+                )));
+            }
+            out.push(attempt);
         }
         Ok(out)
     }
@@ -1351,7 +1372,7 @@ mod tests {
         let target = "t1";
         let id = "deploy-fault-arms";
         let attempt = DeploymentAttempt {
-            deployment_schema_version: 2,
+            deployment_schema_version: SCHEMA_VERSION,
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new(target.to_string()),
             slot_ids: vec![],
@@ -1461,7 +1482,7 @@ mod tests {
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
         let attempt = DeploymentAttempt {
-            deployment_schema_version: 2,
+            deployment_schema_version: SCHEMA_VERSION,
             deployment_id: DeploymentId::new("deploy-dup".to_string()),
             target: TargetName::new(target.to_string()),
             slot_ids: vec![],
@@ -1487,6 +1508,121 @@ mod tests {
         assert_eq!(attempts[0].deployment_id, attempts[1].deployment_id);
         assert_eq!(attempts[0].attempted_at, "2026-01-01T00:00:00Z");
         assert_eq!(attempts[1].attempted_at, "2026-01-02T00:00:00Z");
+    }
+
+    /// The schema-version property for DEPLOYMENT records: generate arbitrary
+    /// `u32` versions and write an `attempts.jsonl` line carrying each one
+    /// directly into the store. ONLY `SCHEMA_VERSION` loads; every other
+    /// version fails closed with a store error naming the version — never a
+    /// panic, never silent acceptance.
+    #[test]
+    fn read_attempts_accepts_only_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let target = "t1";
+        let p = store.target_dir(target).join("attempts.jsonl");
+        let base = DeploymentAttempt {
+            deployment_schema_version: SCHEMA_VERSION,
+            deployment_id: DeploymentId::new("deploy-versions".to_string()),
+            target: TargetName::new(target.to_string()),
+            slot_ids: vec![],
+            behavior_sha256: "sha256-aa".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            desired: BTreeMap::new(),
+            pre_push: BTreeMap::new(),
+            slots: BTreeMap::new(),
+        };
+        // Representative arbitrary-u32 set: 0, SCHEMA_VERSION - 1,
+        // SCHEMA_VERSION, SCHEMA_VERSION + 1, 3, u32::MAX (duplicates in the
+        // set are harmless).
+        let versions = [
+            0u32,
+            SCHEMA_VERSION.wrapping_sub(1),
+            SCHEMA_VERSION,
+            SCHEMA_VERSION.wrapping_add(1),
+            3,
+            u32::MAX,
+        ];
+        for v in versions {
+            // A fresh stream per version: one line carrying exactly `v`.
+            std::fs::remove_file(&p).ok();
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            let attempt = DeploymentAttempt {
+                deployment_schema_version: v,
+                ..base.clone()
+            };
+            std::fs::write(
+                &p,
+                format!("{}\n", serde_json::to_string(&attempt).unwrap()),
+            )
+            .unwrap();
+            if v == SCHEMA_VERSION {
+                let read = store.read_attempts(target).unwrap();
+                assert_eq!(read.len(), 1, "the canonical version loads");
+                assert_eq!(read[0].deployment_schema_version, SCHEMA_VERSION);
+            } else {
+                let err = store.read_attempts(target).unwrap_err();
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("deployment_schema_version"),
+                    "error must name the version field, got: {msg}"
+                );
+                assert!(
+                    msg.contains(&format!("{v}")),
+                    "error must name the stored version {v}, got: {msg}"
+                );
+                assert!(
+                    msg.contains("SCHEMA_VERSION"),
+                    "error must name the accepted version, got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// The schema-version property for TREE metadata: generate arbitrary `u32`
+    /// `tree_schema_version` values in a stored `tree.json`; ONLY
+    /// `TREE_SCHEMA_VERSION` loads, every other version fails closed with an
+    /// integrity error naming the version.
+    #[test]
+    fn read_tree_meta_accepts_only_tree_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let digest = TreeDigest::new("t-versions".to_string());
+        let p = store.object_tree_json(&digest);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let versions = [
+            0u32,
+            TREE_SCHEMA_VERSION.wrapping_sub(1),
+            TREE_SCHEMA_VERSION,
+            TREE_SCHEMA_VERSION.wrapping_add(1),
+            3,
+            u32::MAX,
+        ];
+        for v in versions {
+            let meta = TreeMetadata {
+                tree_schema_version: v,
+                hash_algorithm: "sha256".to_string(),
+                tree_sha256: "x".to_string(),
+                entries: vec![],
+            };
+            std::fs::write(&p, serde_json::to_vec(&meta).unwrap()).unwrap();
+            if v == TREE_SCHEMA_VERSION {
+                store
+                    .read_tree_meta(&digest)
+                    .expect("the canonical tree schema version reads");
+            } else {
+                let err = store.read_tree_meta(&digest).unwrap_err();
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("tree_schema_version"),
+                    "error must name the version field, got: {msg}"
+                );
+                assert!(
+                    msg.contains(&format!("{v}")),
+                    "error must name the stored version {v}, got: {msg}"
+                );
+            }
+        }
     }
 
     /// `arm_append_transition_successful` is status-qualified and one-shot:

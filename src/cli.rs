@@ -375,14 +375,15 @@ fn print_report(report: &PushReport) {
 mod tests {
     use super::*;
     use crate::model::{
-        DeploymentId, GenerationId, PlacementSlotId, ReleaseId, TargetName, TreeDigest, VariantName,
+        DeploymentId, GenerationId, PlacementSlotId, ReleaseId, SCHEMA_VERSION, TargetName,
+        TreeDigest, VariantName,
     };
     use crate::records::{ObservedServer, ObservedTarget};
     use std::collections::BTreeMap;
 
     fn pending_attempt(id: &str) -> DeploymentAttempt {
         DeploymentAttempt {
-            deployment_schema_version: 2,
+            deployment_schema_version: SCHEMA_VERSION,
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new("production".to_string()),
             slot_ids: vec![PlacementSlotId::new("p1".to_string())],

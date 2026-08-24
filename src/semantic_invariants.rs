@@ -44,6 +44,7 @@
 //! | Scope: rotation uses only the pushing target's policy | `scope_retained_is_union_of_member_policies`, `state_machine_scope_projection_and_rotation_union` |
 //! | Lifecycle: step-17 rotation `?` after commit | `state_machine_lifecycle_cleanup_failure_after_commit` |
 //! | Integrity: `verify_release_identity` trusts stored digest | `integrity_digest_unchanged_after_tamper_fails_closed`, `integrity_tampered_stored_release_blocks_historical_push`, `integrity_identity_field_change_fails_closed` |
+//! | Integrity: stored records carry only `SCHEMA_VERSION` | `integrity_stored_release_schema_version_tamper_fails_closed` |
 //! | Bounds: `need + reserve > available` wraps | `bounds_capacity_matches_u128_reference_over_grid` |
 
 use crate::config::{Config, SlotDef};
@@ -334,6 +335,11 @@ pub(crate) enum TamperKind {
     /// generation runs (one identity-bearing field changed), so the historical
     /// behavior read and the publication path must fail closed.
     StoredBehaviorJson,
+    /// Rewrite the STORED release record's `release_schema_version` to a
+    /// non-canonical value: the record must fail closed on every read and
+    /// block the next push (see
+    /// `integrity_stored_release_schema_version_tamper_fails_closed`).
+    StoredReleaseSchemaVersion,
 }
 
 /// The outcome of one applied action.
@@ -627,6 +633,16 @@ impl Fixture {
                 stored.artifact.release = ReleaseId::new("rel-sha256-tampered".to_string())
             }
             TamperKind::StoredBehaviorJson => unreachable!("handled above"),
+            TamperKind::StoredReleaseSchemaVersion => {
+                // Rewrite the stored release record's version field to a
+                // non-canonical value; the record must fail closed on read.
+                self.tamper_stored_release(|v| {
+                    v["release_schema_version"] = serde_json::json!(
+                        crate::model::RELEASE_RECORD_SCHEMA_VERSION.wrapping_add(1)
+                    );
+                });
+                return;
+            }
         }
         std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
     }
@@ -2235,6 +2251,106 @@ fn integrity_tampered_stored_behavior_json_blocks_historical_push() {
     assert!(
         rerr.to_string().contains("digest mismatch"),
         "read error must name the digest mismatch, got: {rerr}"
+    );
+}
+
+/// The schema-version property, end-to-end: a stored release record whose
+/// `release_schema_version` was rewritten to any arbitrary `u32` value other
+/// than [`crate::model::RELEASE_RECORD_SCHEMA_VERSION`] must fail closed on
+/// every read and block the next push — never silently accepted, never
+/// republished. The dedicated [`TamperKind::StoredReleaseSchemaVersion`]
+/// action rewrites the field; the matrix here sweeps the full representative
+/// arbitrary-u32 set (0, version - 1, version + 1, 3, u32::MAX).
+#[test]
+fn integrity_stored_release_schema_version_tamper_fails_closed() {
+    let f = Fixture::new();
+    f.apply(Action::Push("t1"));
+    let releases_root = f.store.base().join(layout::RELEASES);
+    let dir = std::fs::read_dir(&releases_root)
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap();
+    let id = ReleaseId::new(dir.file_name().to_string_lossy().into_owned());
+    let p = dir.path().join("release.json");
+
+    // The pristine record reads fine.
+    f.store.read_release(&id).expect("pristine record reads");
+
+    // Sweep every non-canonical member of the arbitrary-u32 set: the read
+    // must fail closed naming the version, and a historical push against the
+    // tampered record must fail closed too.
+    let write_version = |v: u32| {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        value["release_schema_version"] = serde_json::json!(v);
+        std::fs::write(&p, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    };
+    let versions = [
+        0u32,
+        crate::model::RELEASE_RECORD_SCHEMA_VERSION.wrapping_sub(1),
+        crate::model::RELEASE_RECORD_SCHEMA_VERSION.wrapping_add(1),
+        3,
+        u32::MAX,
+    ];
+    for v in versions {
+        write_version(v);
+        let err = f
+            .store
+            .read_release(&id)
+            .err()
+            .expect("a non-canonical record version must fail closed on read");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("release_schema_version"),
+            "error must name the version field, got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{v}")),
+            "error must name the stored version {v}, got: {msg}"
+        );
+        assert!(
+            msg.contains("RELEASE_RECORD_SCHEMA_VERSION"),
+            "error must name the accepted version, got: {msg}"
+        );
+        let push_err = f
+            .push_ref_impl("t1", id.as_str())
+            .err()
+            .expect("a push against a tampered record version must fail closed");
+        assert!(
+            push_err.to_string().contains("release_schema_version"),
+            "push error must name the version mismatch, got: {push_err}"
+        );
+    }
+
+    // Restoring the canonical version restores readability (the tamper is
+    // reversible; the record itself is unchanged otherwise).
+    write_version(crate::model::RELEASE_RECORD_SCHEMA_VERSION);
+    f.store
+        .read_release(&id)
+        .expect("the canonical version reads");
+    f.push_ref_impl("t1", id.as_str())
+        .expect("a push against the restored record succeeds");
+
+    // And the dedicated Tamper action rewrites the field the same way.
+    let f2 = Fixture::new();
+    f2.apply(Action::Push("t1"));
+    f2.apply(Action::Tamper(TamperKind::StoredReleaseSchemaVersion));
+    let releases_root = f2.store.base().join(layout::RELEASES);
+    let dir = std::fs::read_dir(&releases_root)
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap();
+    let id = ReleaseId::new(dir.file_name().to_string_lossy().into_owned());
+    let err = f2
+        .store
+        .read_release(&id)
+        .err()
+        .expect("the Tamper action's rewritten version must fail closed on read");
+    assert!(
+        err.to_string().contains("release_schema_version"),
+        "error must name the version field, got: {err}"
     );
 }
 

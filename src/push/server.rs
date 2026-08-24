@@ -474,7 +474,7 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{TreeDigest, VariantName};
+    use crate::model::{RELEASE_RECORD_SCHEMA_VERSION, TreeDigest, VariantName};
     use crate::remote::transport::LocalTransport;
     use std::path::PathBuf;
 
@@ -605,7 +605,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// configured contract), or the publish path refuses the pair.
     fn harness_release_record(behavior_sha: &str) -> crate::model::ReleaseRecord {
         let mut rec = crate::model::ReleaseRecord {
-            release_schema_version: 1,
+            release_schema_version: RELEASE_RECORD_SCHEMA_VERSION,
             release_id: String::new(),
             release_sha256: String::new(),
             created_at: "2026-01-01T00:00:00Z".to_string(),

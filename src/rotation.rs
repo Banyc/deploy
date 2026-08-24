@@ -270,6 +270,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::layout;
+    use crate::model::RELEASE_RECORD_SCHEMA_VERSION;
     use crate::remote::helper::{GenerationAssignment, RemoteHelper};
     use crate::remote::transport::LocalTransport;
     use crate::store::local::LocalStore;
@@ -469,7 +470,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // slot snapshot, identity recomputed from that content): an empty
         // slot snapshot is rejected by `write_release` (fail closed).
         let mut rec = crate::model::ReleaseRecord {
-            release_schema_version: 1,
+            release_schema_version: RELEASE_RECORD_SCHEMA_VERSION,
             release_id: String::new(),
             release_sha256: String::new(),
             created_at: "2020-01-01T00:00:00Z".into(),

@@ -14,7 +14,7 @@ use crate::history::{self, PushRef};
 use crate::layout;
 use crate::model::{
     ArtifactRef, BehaviorContract, DeploymentId, GenerationId, GenerationRef, OperationId,
-    PlacementSlotId, ReleaseId, TargetName, TreeDigest, VariantName,
+    PlacementSlotId, ReleaseId, SCHEMA_VERSION, TargetName, TreeDigest, VariantName,
 };
 use crate::push::capacity::capacity_preflight;
 use crate::push::reconcile::reconcile_pending_commits;
@@ -774,7 +774,7 @@ fn push_inner(
         })
         .collect();
     let attempt_intent = DeploymentAttempt {
-        deployment_schema_version: 2,
+        deployment_schema_version: SCHEMA_VERSION,
         deployment_id: deployment_id.clone(),
         target: TargetName::new(target_name.to_string()),
         slot_ids,
@@ -1768,6 +1768,7 @@ impl std::ops::Drop for FileLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::RELEASE_RECORD_SCHEMA_VERSION;
     use crate::remote::transport::{FsBytes, LocalTransport};
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -3167,7 +3168,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let id_a = DeploymentId::new("deploy-inprogress-diverged".to_string());
         let desired_ref = baseline.desired[&PlacementSlotId::new("p1")].clone();
         let intent = DeploymentAttempt {
-            deployment_schema_version: 2,
+            deployment_schema_version: SCHEMA_VERSION,
             deployment_id: id_a.clone(),
             target: TargetName::new("t1".to_string()),
             slot_ids: vec![PlacementSlotId::new("p1".to_string())],
@@ -3728,7 +3729,7 @@ interval_seconds = 0
         let id_a = DeploymentId::new("deploy-no-status".to_string());
         let desired_ref = baseline.desired[&PlacementSlotId::new("p1")].clone();
         let intent = DeploymentAttempt {
-            deployment_schema_version: 2,
+            deployment_schema_version: SCHEMA_VERSION,
             deployment_id: id_a.clone(),
             target: TargetName::new("t1".to_string()),
             slot_ids: vec![PlacementSlotId::new("p1".to_string())],
@@ -3783,7 +3784,7 @@ interval_seconds = 0
         let desired_ref = baseline.desired[&PlacementSlotId::new("p1")].clone();
 
         let mk = |id: &str| DeploymentAttempt {
-            deployment_schema_version: 2,
+            deployment_schema_version: SCHEMA_VERSION,
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new("t1".to_string()),
             slot_ids: vec![PlacementSlotId::new("p1".to_string())],
@@ -5880,7 +5881,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // identity recomputed from that content) or `write_release` refuses
         // it: an empty slot snapshot cannot be verified (fail closed).
         let mut rec = crate::model::ReleaseRecord {
-            release_schema_version: 1,
+            release_schema_version: RELEASE_RECORD_SCHEMA_VERSION,
             release_id: String::new(),
             release_sha256: String::new(),
             created_at: "2026-01-01T00:00:00Z".to_string(),

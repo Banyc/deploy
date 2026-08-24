@@ -346,7 +346,8 @@ pub fn snapshot_index(
 mod tests {
     use super::*;
     use crate::model::{
-        ArtifactRef, DeploymentId, GenerationId, PlacementSlotId, ReleaseId, ServerId,
+        ArtifactRef, DeploymentId, GenerationId, PlacementSlotId, ReleaseId, SCHEMA_VERSION,
+        ServerId,
     };
     use std::collections::BTreeMap;
 
@@ -456,7 +457,7 @@ mod tests {
             },
         )]);
         let attempt = DeploymentAttempt {
-            deployment_schema_version: 2,
+            deployment_schema_version: SCHEMA_VERSION,
             deployment_id: DeploymentId::new("deploy-idempotent".to_string()),
             target: target.clone(),
             slot_ids: vec![PlacementSlotId::new("p1".to_string())],
@@ -497,7 +498,7 @@ mod tests {
     fn build_snapshot_records_each_slots_physical_binding() {
         let slot = PlacementSlotId::new("p1".to_string());
         let attempt = DeploymentAttempt {
-            deployment_schema_version: 2,
+            deployment_schema_version: SCHEMA_VERSION,
             deployment_id: DeploymentId::new("deploy-binding-map".to_string()),
             target: TargetName::new("production".to_string()),
             slot_ids: vec![slot.clone()],

@@ -115,9 +115,14 @@ pub struct AttemptServer {
 ///
 /// Every slot→assignment map is keyed by [`PlacementSlotId`]; `slot_ids` is
 /// the deployment's membership (mirroring the fleet-commit marker `slots`
-/// payload). Schema version 2: v1 keyed these maps by server ID and stored
-/// the artifact triple as flat fields; v2 rekeys to placement slots and nests
-/// the artifact under `artifact` (or `assignment` for [`GenerationRef`]).
+/// payload). The record carries `deployment_schema_version`, which must be
+/// exactly [`crate::model::SCHEMA_VERSION`]: writers emit the constant and
+/// readers (e.g. [`crate::store::local::LocalStore::read_attempts`]) refuse
+/// any other version with an error naming the version (fail closed — a
+/// mismatched record is never silently interpreted). The current v1 shape is
+/// the canonical placement-slot-keyed form (`BTreeMap<PlacementSlotId, _>`
+/// maps with nested `artifact`/`assignment` refs); an older server-keyed
+/// flat-artifact shape is NOT the current schema and never loads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentAttempt {
     pub deployment_schema_version: u32,

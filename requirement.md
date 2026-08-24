@@ -447,7 +447,37 @@ Every datatype below carries an immutability semantic. For each one: what must n
    *Guarantee*: content-addressed identity; an existing object is re-canonicalized before reuse (`store.store_object`), freshly stored content is verified after copy and deleted on mismatch; staged uploads land in deployment-scoped `incoming/<deployment>/<digest>.partial` and become visible via a single same-filesystem rename (`helper.publish_from_incoming`); every activation re-canonicalizes the downloaded tree before `current` moves (`process_server` integrity check).
 2. **Release record** — local `releases/<id>/release.json`.
    *Semantic*: a release ID permanently denotes one mapping set, per-variant slot-declaration set, behavior-contract set, and variant→tree binding set.
-   *Guarantee*: the ID is derived from the canonical identity payload covering the mapping, slot-declaration, behavior, and binding digests (`release.release_digest`, schema version 2 with `slots_digest`); the record freezes the canonical per-variant slot snapshot it was built from, so a slot-only change (rebind, `deploy_dir` move, retarget) produces a new release ID and historical pushes resolve slot→variant bindings from the stored snapshot; `store.write_release` refuses to replace an existing ID with different content and treats identical rewrite as idempotent: the INCOMING record is verified from its own content before anything is written (an unverifiable record — tampered digest fields or an EMPTY slot snapshot — never even creates the release directory), and an already-existing record is re-verified from its content before the two content-derived identities are compared. The digest is recomputed and verified on every read and publish: `store.read_release` and `helper.publish_release` re-derive the canonical digest from the record's own content (slot snapshot, bindings, provenance digests) and check it against both `release_sha256` and `release_id`, failing closed with an integrity error on any mismatch, so a tampered record whose content was edited while the digest fields were left unchanged is never read or published — and an empty slot snapshot is rejected outright (no legacy escape hatch). REPUBLISHING against an already-present remote record content-verifies the EXISTING remote `release.json` the same way before treating it as the same release: `helper.publish_release` re-derives the existing record's digest from its own content and compares that recomputed identity with the incoming record's, so a corrupted existing remote record (identity-bearing content — mapping digest, behavior digest, slot snapshot, variant→tree bindings — mutated while `release_sha256`/`release_id` were retained at the original values) ALWAYS fails closed with an integrity error naming the remote release and the mismatch, and malformed existing JSON is refused outright, never silently replaced — republishing against a corrupted remote record can never pass undetected. `store.read_release(id)` also binds the stored record to the read path: `rec.release_id` must equal the requested `id`, else an integrity error names both ids (a record swapped into the wrong release directory is refused, not returned). Capacity is deliberately excluded: it is per-server live configuration, not a release property.
+*Guarantee*: the ID is derived from the canonical identity payload covering the mapping, slot-declaration,
+behavior, and binding digests (`release.release_digest`, schema version 2 with `slots_digest`); the record
+freezes the canonical per-variant slot snapshot it was built from, so a slot-only change (rebind, `deploy_dir`
+move, retarget) produces a new release ID and historical pushes resolve slot→variant bindings from the stored
+snapshot; `store.write_release` refuses to replace an existing ID with different content and treats identical
+rewrite as idempotent: the INCOMING record is verified from its own content before anything is written (an
+unverifiable record — tampered digest fields or an EMPTY slot snapshot — never even creates the release
+directory), and an already-existing record is re-verified from its content before the two content-derived
+identities are compared. The digest is recomputed and verified on every read and publish: `store.read_release`
+and `helper.publish_release` re-derive the canonical digest from the record's own content (slot snapshot,
+bindings, provenance digests) and check it against both `release_sha256` and `release_id`, failing closed with
+an integrity error on any mismatch, so a tampered record whose content was edited while the digest fields were
+left unchanged is never read or published — and an empty slot snapshot is rejected outright (no legacy escape
+hatch). REPUBLISHING against an already-present remote record content-verifies the EXISTING remote
+`release.json` the same way before treating it as the same release: `helper.publish_release` re-derives the
+existing record's digest from its own content and compares that recomputed identity with the incoming
+record's, so a corrupted existing remote record (identity-bearing content — mapping digest, behavior digest,
+slot snapshot, variant→tree bindings — mutated while `release_sha256`/`release_id` were retained at the
+original values) ALWAYS fails closed with an integrity error naming the remote release and the mismatch, and
+malformed existing JSON is refused outright, never silently replaced — republishing against a corrupted remote
+record can never pass undetected. `store.read_release(id)` also binds the stored record to the read path:
+`rec.release_id` must equal the requested `id`, else an integrity error names both ids (a record swapped into
+the wrong release directory is refused, not returned). Capacity is deliberately excluded: it is per-server
+live configuration, not a release property. Every release record also carries `release_schema_version =
+RELEASE_RECORD_SCHEMA_VERSION`, and readers refuse any other version with an error naming it (fail closed),
+while the identity payload version (`RELEASE_PAYLOAD_SCHEMA_VERSION`) is frozen into the digest:
+`verify_release_identity` re-derives the digest with exactly that payload version, so a release whose identity
+was derived from any other payload version fails verification. `store.read_release(id)` also binds the stored
+record to the read path: `rec.release_id` must equal the requested `id`, else an integrity error names both
+ids (a record swapped into the wrong release directory is refused, not returned). Capacity is deliberately
+excluded: it is per-server live configuration, not a release property.
 3. **Release snapshots** — `mapping.toml`, `behavior.json` beside the release record.
    *Semantic*: the frozen inputs behind a release ID can never be rewritten in place, not even partially.
    *Guarantee*: atomic create-or-compare writes (`store.write_atomic_cas`: temp file + rename for atomicity; existing content must match byte-for-byte or the write fails); remotely mirrored by `helper.publish_release_file` (exclusive create via `try_write_new`, then semantic-JSON or byte comparison, refuse replace). There is no capacity snapshot: capacity headroom is live per-server configuration read from the caller's current `deploy.toml`.
@@ -502,11 +532,11 @@ content never suppresses required remote repair.
 `--dry-run` materializes and inspects local content and performs read-only remote status queries in disposable staging. It does not publish local objects, recover remote transactions, upload, publish remotely, activate, execute application verification, write history, or rotate. Instead, it reports any recovery that a real push would have to perform.
 
 ## Fleet history and rollback
-Every deployment attempt records its immutable intent: target snapshot, behavior contract, pre-push state, desired state, and actual result — carrying NO status (the status lives in the deployment's transition stream). Assignment relationships are expressed through the canonical model types (`ArtifactRef` = release+variant+tree, `GenerationRef` = generation + placement-slot assignment); every per-location map is keyed by the deployment slot ID. A successful example (attempt record schema version 2) is:
+Every deployment attempt records its immutable intent: target snapshot, behavior contract, pre-push state, desired state, and actual result — carrying NO status (the status lives in the deployment's transition stream). Assignment relationships are expressed through the canonical model types (`ArtifactRef` = release+variant+tree, `GenerationRef` = generation + placement-slot assignment); every per-location map is keyed by the deployment slot ID. Every record carries `deployment_schema_version = SCHEMA_VERSION` and readers accept ONLY that version: a record with any other `deployment_schema_version` is refused at read time with an error naming the version (fail closed — a record from a different schema is never silently interpreted). A successful example is:
 
 ```json
 {
-  "deployment_schema_version": 2,
+  "deployment_schema_version": 1,
   "deployment_id": "deploy-20260821T102000Z",
   "target": "production",
   "slot_ids": ["p1", "p2", "p3"],
