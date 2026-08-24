@@ -1973,9 +1973,11 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
     Ok(())
 }
 
-// ---- A corrupted historical behavior snapshot that PARSSES but is missing a
-// planned variant's contract must fail in preflight BEFORE any remote mutation,
-// rather than panic mid-rollout after staging.
+// ---- A tampered historical behavior snapshot (here: an EMPTIED contract map
+// that still parses) must fail in preflight BEFORE any remote mutation, rather
+// than deploying the tampered contract. The snapshot's canonical digest no
+// longer matches the release record's provenance `behavior_sha256`, so the
+// historical read fails closed with an integrity error.
 
 /// Snapshot of a remote directory: sorted (relative path, kind+content digest)
 /// pairs, including symlink targets. Two fingerprints are equal iff the
@@ -2056,8 +2058,9 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
         .as_str()
         .to_string();
 
-    // Corrupt the historical release's immutable behavior.json so it PARSEs but
-    // does not cover the planned `standard` variant.
+    // Corrupt the historical release's immutable behavior.json so it still
+    // PARSEs but its canonical contract set no longer digests to the release
+    // record's provenance `behavior_sha256`.
     let behavior_path = store
         .base()
         .join("releases")
@@ -2074,7 +2077,7 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
     let attempts_before = store.read_attempts("production")?.len();
 
     // Roll back to f0 under a DIFFERENT current configuration (behavior B). The
-    // push must fail closed in preflight, NOT fall back to B and NOT panic.
+    // push must fail closed in preflight, NOT fall back to B.
     let config_b = setup_single(&proj, "false", true, 1);
     let rrb = push(
         &proj.join("deploy.toml"),
@@ -2090,7 +2093,7 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
     let err = match rrb {
         Err(e) => e.to_string(),
         Ok(r) => panic!(
-            "rollback with an incomplete behavior snapshot must fail, got {:?}",
+            "rollback with a tampered behavior snapshot must fail, got {:?}",
             r.status
         ),
     };
@@ -2099,8 +2102,8 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
         "failure must be a preflight error, got: {err}"
     );
     assert!(
-        err.contains("incomplete") && err.contains("standard"),
-        "error must name the missing variant and the incomplete snapshot, got: {err}"
+        err.contains("digest mismatch") && err.contains("fail closed"),
+        "error must name the behavior digest mismatch, got: {err}"
     );
 
     // No remote state changed: the fingerprint is byte-for-byte identical.

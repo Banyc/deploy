@@ -11,7 +11,11 @@
 //! * **Scope** — decisions and projections include every owner of shared
 //!   state (a slot shared between targets is never decided under one target's
 //!   policy, and every member's observed projection stays equal to the remote
-//!   assignment).
+//!   assignment). The observed projection is refreshed by the real-push path
+//!   AND by the no-op path (a crash-window push recovered by an up-to-date
+//!   retry must not leave the shared slot's projection stale/absent), so after
+//!   ANY completed or recovered mutation every member target's observed slot
+//!   equals the remote assignment (generation + artifact).
 //! * **Lifecycle** — the returned outcome agrees with the durable transaction
 //!   phase; retry converges without duplicating history.
 //! * **Integrity** — stored identity is never trusted; content, structure,
@@ -63,6 +67,14 @@ use crate::store::local::LocalStore;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+/// Serializes every test in this module that arms a SHARED one-shot store
+/// fault ([`crate::testutil::test_faults`]): `arm` OVERWRITES the static
+/// slot, so two tests arming the same slot concurrently clobber each other's
+/// fault (the deployment-id keying only protects the CONSUME side). Holding
+/// this lock for the arm+push keeps the fixture's push/fail/retry sequences
+/// deterministic under parallel `cargo test`.
+static FAULT_LOCK: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------
 // Fixture project
@@ -318,6 +330,10 @@ pub(crate) enum TamperKind {
     /// real tree digest so the history stays consistent.
     StoredAssignmentVariant,
     StoredAssignmentRelease,
+    /// Rewrite the stored `behavior.json` of the release the current
+    /// generation runs (one identity-bearing field changed), so the historical
+    /// behavior read and the publication path must fail closed.
+    StoredBehaviorJson,
 }
 
 /// The outcome of one applied action.
@@ -501,6 +517,34 @@ impl Fixture {
         self.fault.lock().unwrap().fail_write_once = Some(suffix);
     }
 
+    /// The observed-scope property, asserted explicitly by the property
+    /// sequences: every member target's observed slot for the shared
+    /// placement `p1` equals the CURRENT remote assignment (generation +
+    /// artifact) — no absent, stale, or partial entries. Requires a remote
+    /// assignment to exist (call after the first completed push).
+    fn assert_observed_scope_property(&self) {
+        let asn = self
+            .current_assignment()
+            .expect("a remote assignment exists");
+        for target in ["t1", "t2"] {
+            let observed = self.store.read_observed(target).expect("observed reads");
+            let slot = observed
+                .slots
+                .get(&PlacementSlotId::new("p1"))
+                .unwrap_or_else(|| panic!("{target}: observed p1 entry must be present"));
+            assert_eq!(
+                slot.generation.as_ref(),
+                Some(&asn.generation_id),
+                "{target}: observed generation must equal the remote generation"
+            );
+            assert_eq!(
+                slot.artifact.as_ref(),
+                Some(&asn.artifact),
+                "{target}: observed artifact must equal the remote assignment"
+            );
+        }
+    }
+
     /// Apply one action, then evaluate every invariant group (unless the
     /// action was a deliberate tamper).
     fn apply(&self, action: Action) -> Outcome {
@@ -561,6 +605,9 @@ impl Fixture {
 
     /// Tamper the CURRENT generation's stored assignment on the remote.
     fn tamper(&self, kind: TamperKind) {
+        if kind == TamperKind::StoredBehaviorJson {
+            return self.tamper_stored_behavior_json();
+        }
         let asn = self
             .current_assignment()
             .expect("a current generation exists");
@@ -579,6 +626,7 @@ impl Fixture {
             TamperKind::StoredAssignmentRelease => {
                 stored.artifact.release = ReleaseId::new("rel-sha256-tampered".to_string())
             }
+            TamperKind::StoredBehaviorJson => unreachable!("handled above"),
         }
         std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
     }
@@ -612,6 +660,24 @@ impl Fixture {
         let p = dirs[0].path().join("release.json");
         let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
         mutate(&mut v);
+        std::fs::write(&p, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    }
+
+    /// Tamper the stored `behavior.json` of the fixture's single release:
+    /// change one identity-bearing field (the activation adapter) while the
+    /// release record's provenance `behavior_sha256` is left untouched — the
+    /// exact "behavior JSON tampered while the digest is retained" case the
+    /// historical read and the publication path must fail closed against.
+    fn tamper_stored_behavior_json(&self) {
+        let releases_root = self.store.base().join(layout::RELEASES);
+        let dirs: Vec<_> = std::fs::read_dir(&releases_root)
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(dirs.len(), 1, "exactly one stored release in the fixture");
+        let p = dirs[0].path().join("behavior.json");
+        let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        v["standard"]["activation"]["adapter"] = serde_json::json!("tampered");
         std::fs::write(&p, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
     }
 
@@ -659,21 +725,31 @@ impl Fixture {
     }
 
     /// Scope: (1) every member target's observed projection equals the remote
-    /// assignment; (2) the shared slot's retained set is the union of every
-    /// member's policy; (3) every tree the union retains actually survives
-    /// the post-push rotation.
+    /// assignment — STRICTLY, with no absent-entry exception: after ANY
+    /// completed or recovered mutation (a real push, a no-op retry, a
+    /// rollback) every member target's observed slot for the shared placement
+    /// is present and equals the remote assignment (generation + artifact).
+    /// The only state in which an entry may legitimately be absent is the
+    /// crash window — a push that aborted AFTER the remote advanced but
+    /// BEFORE the observed refresh — which the fixture only ever enters via
+    /// [`Fixture::push_with_id`] mid-sequence and never evaluates here; the
+    /// recovery action that closes the window refreshes the projections (the
+    /// no-op retry path does too), so by the time `check_invariants` runs the
+    /// entry must exist; (2) the shared slot's retained set is the union of
+    /// every member's policy; (3) every tree the union retains actually
+    /// survives the post-push rotation.
     fn check_scope(&self) {
         if let Some(asn) = self.current_assignment() {
             for target in ["t1", "t2"] {
                 let observed = self.store.read_observed(target).expect("observed reads");
-                let Some(slot) = observed.slots.get(&PlacementSlotId::new("p1")) else {
-                    // Crash-window state: a push that aborted before the
-                    // step-16 observed refresh (and was then recovered by a
-                    // no-op retry, which never refreshes observed) legitimately
-                    // leaves the member's observed entry absent. The Lifecycle
-                    // checks cover the durable-phase agreement; the projection
-                    // invariant applies to COMPLETED mutations.
-                    continue;
+                let slot = match observed.slots.get(&PlacementSlotId::new("p1")) {
+                    Some(slot) => slot,
+                    None => panic!(
+                        "{target}: observed projection for p1 must be present after any \
+                         completed/recovered mutation (a no-op retry refreshes observed; the \
+                         crash window is entered only mid-sequence via push_with_id, never \
+                         evaluated by check_invariants)"
+                    ),
                 };
                 assert_eq!(
                     slot.artifact.as_ref(),
@@ -1021,11 +1097,13 @@ fn state_machine_lifecycle_cleanup_failure_after_commit() {
 fn state_machine_lifecycle_intent_persist_leaves_remote_untouched() {
     let f = Fixture::new();
     let id = DeploymentId::new("si-intent-fault".to_string());
-    f.arm_store_fault(FailureStep::IntentPersist, &id);
-    let err = f
-        .push_with_id("t1", &id)
-        .err()
-        .expect("the intent persist fault must abort the push");
+    let err = {
+        let _fault_guard = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        f.arm_store_fault(FailureStep::IntentPersist, &id);
+        f.push_with_id("t1", &id)
+            .err()
+            .expect("the intent persist fault must abort the push")
+    };
     assert!(
         err.to_string().contains("append_attempt"),
         "error must name the injected fault, got: {err}"
@@ -1146,6 +1224,271 @@ fn state_machine_mixed_sequence_invariants() {
         panic!("expected push")
     };
     res.expect("no-op retry succeeds");
+    f.check_invariants();
+}
+
+// ===========================================================================
+// Property tests — Observed scope (push / fail / retry / rollback sequences)
+// ===========================================================================
+
+/// (a) Crash BEFORE the observed refresh on a SHARED slot: the very first
+/// push on t1 aborts AFTER the remote advanced but BEFORE the observed
+/// refresh (a faulted `write_results`), so the shared slot's observed entry
+/// is ABSENT in BOTH member targets (t1 never refreshed, t2 never saw a
+/// propagation). The recovery is an up-to-date no-op retry (reconcile then
+/// "Everything up to date"); the no-op path must refresh the projections, so
+/// after recovery every member target's observed slot for `p1` equals the
+/// remote assignment.
+#[test]
+fn observed_scope_crash_before_refresh_recovered_by_noop_retry() {
+    let f = Fixture::new();
+    f.apply(Action::Build(1));
+    let id = DeploymentId::new("si-obs-crash-before-refresh");
+    let err = {
+        let _fault_guard = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        f.arm_store_fault(FailureStep::ResultsWrite, &id);
+        f.push_with_id("t1", &id)
+            .err()
+            .expect("the faulted push aborts before the observed refresh")
+    };
+    assert!(
+        err.to_string().contains("test fault"),
+        "error must name the injected fault, got: {err}"
+    );
+    // The crash window: the remote advanced (an assignment exists) but the
+    // observed projections were never refreshed — both member targets have no
+    // entry for the shared slot.
+    f.current_assignment()
+        .expect("remote advanced past the crash");
+    for t in ["t1", "t2"] {
+        let observed = f.store.read_observed(t).unwrap();
+        assert!(
+            observed.slots.get(&PlacementSlotId::new("p1")).is_none(),
+            "{t}: the crash window must leave the shared slot's observed entry absent"
+        );
+    }
+
+    // Recovery: the no-op retry reconciles the aborted attempt and returns
+    // "Everything up to date" — and must refresh the observed projection in
+    // BOTH member targets.
+    let r = f.apply(Action::Retry("t1"));
+    let Outcome::Push(res) = r else {
+        panic!("expected a push outcome");
+    };
+    let report = res.expect("the no-op retry succeeds");
+    assert_eq!(report.message, "Everything up to date");
+    assert_eq!(report.status, None);
+    f.assert_observed_scope_property();
+    f.check_invariants();
+}
+
+/// (b) Rollback on ONE target: a fleet rollback is a REAL push; its observed
+/// refresh must land the rolled-back assignment in EVERY member target's
+/// projection, so after rolling t1 back to its own `@f0` both t1 and t2
+/// observe the restored assignment (generation + artifact).
+#[test]
+fn observed_scope_rollback_refreshes_every_member_projection() {
+    let f = Fixture::new();
+    f.apply(Action::Build(1));
+    f.apply(Action::Push("t1")); // remote v1
+    f.apply(Action::Build(2));
+    f.apply(Action::Push("t2")); // remote v2
+    f.assert_observed_scope_property();
+
+    let r = f.apply(Action::Rollback("t1", 0)); // back to tree v1
+    let Outcome::Push(res) = r else {
+        panic!("expected a push outcome");
+    };
+    let report = res.expect("rollback t1 succeeds");
+    assert_eq!(report.status, Some(DeploymentStatus::Successful));
+    f.assert_observed_scope_property();
+    f.check_invariants();
+}
+
+/// (c) Failed push BEFORE any remote mutation (a preflight failure): the
+/// observed projections must be untouched — and they still equal the
+/// UNCHANGED remote assignment (no stale entry from the failed attempt).
+#[test]
+fn observed_scope_preflight_failure_leaves_observed_equal() {
+    let f = Fixture::new();
+    f.apply(Action::Build(1));
+    f.apply(Action::Push("t1"));
+    f.assert_observed_scope_property();
+    let t1_before = f.store.read_observed("t1").unwrap();
+    let t2_before = f.store.read_observed("t2").unwrap();
+
+    // HEAD advances to v2 so the t2 push is a REAL push (not an up-to-date
+    // no-op, which never persists an attempt) — it then fails at the intent
+    // persist, BEFORE any remote mutation.
+    f.apply(Action::Build(2));
+    let id = DeploymentId::new("si-obs-preflight");
+    let err = {
+        let _fault_guard = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        f.arm_store_fault(FailureStep::IntentPersist, &id);
+        f.push_with_id("t2", &id)
+            .err()
+            .expect("the preflight failure aborts before any remote mutation")
+    };
+    assert!(
+        err.to_string().contains("append_attempt"),
+        "error must name the injected fault, got: {err}"
+    );
+    assert_eq!(
+        f.store.read_observed("t1").unwrap(),
+        t1_before,
+        "a failed preflight must not change t1's observed"
+    );
+    assert_eq!(
+        f.store.read_observed("t2").unwrap(),
+        t2_before,
+        "a failed preflight must not change t2's observed"
+    );
+    f.assert_observed_scope_property();
+    f.check_invariants();
+}
+
+/// (d) A LONGER interleaved sequence mixing every action across the two
+/// shared targets: push t1 -> push t2 -> preflight failure -> rollback ->
+/// crash before the observed refresh -> no-op retry recovery -> no-op retry
+/// -> mid-flight failure that still returns `Ok` (PendingCommit) -> recovery
+/// -> rotate. After EVERY completed action and after EVERY recovery the
+/// property holds: each member target's observed slot for `p1` equals the
+/// remote assignment (generation + artifact) — no absent or stale entries.
+/// The faulted pushes use `push_with_id` directly (the fixture never
+/// evaluates invariants inside the crash window), and every recovery asserts
+/// the property explicitly. The faulted attempts use fixed `si-…` ids that
+/// sort AFTER the engine's auto-generated `deploy-…` ids, so once a fixed-id
+/// attempt is finalized on a target no later auto-id push runs on that target
+/// (the lifecycle "newest successful" check orders ids lexicographically).
+#[test]
+fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
+    let f = Fixture::new();
+
+    // t1 deploys tree v1 on the shared slot.
+    f.apply(Action::Build(1));
+    let r = f.apply(Action::Push("t1"));
+    let Outcome::Push(res) = r else {
+        panic!("expected a push outcome");
+    };
+    assert_eq!(
+        res.expect("push t1 succeeds").status,
+        Some(DeploymentStatus::Successful)
+    );
+    f.assert_observed_scope_property();
+
+    // t2 deploys tree v2 on the shared slot.
+    f.apply(Action::Build(2));
+    let r = f.apply(Action::Push("t2"));
+    let Outcome::Push(res) = r else {
+        panic!("expected a push outcome");
+    };
+    assert_eq!(
+        res.expect("push t2 succeeds").status,
+        Some(DeploymentStatus::Successful)
+    );
+    f.assert_observed_scope_property();
+
+    // (c) Preflight failure on t2: HEAD advances to v3 so the t2 push is a
+    // real one; it fails at the intent persist BEFORE any remote mutation, so
+    // the observed projections stay equal to the unchanged v2 assignment.
+    f.apply(Action::Build(3));
+    let id_p = DeploymentId::new("si-obs-seq-preflight");
+    let err = {
+        let _fault_guard = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        f.arm_store_fault(FailureStep::IntentPersist, &id_p);
+        f.push_with_id("t2", &id_p)
+            .err()
+            .expect("the preflight push aborts before mutation")
+    };
+    assert!(err.to_string().contains("append_attempt"), "{err}");
+    f.assert_observed_scope_property();
+
+    // (b) Rollback t1 to its own `@f0` (tree v1): a real push whose refresh
+    // propagates the restored assignment to BOTH member targets.
+    let r = f.apply(Action::Rollback("t1", 0));
+    let Outcome::Push(res) = r else {
+        panic!("expected a push outcome");
+    };
+    let report = res.expect("rollback t1 succeeds");
+    assert_eq!(report.status, Some(DeploymentStatus::Successful));
+    f.assert_observed_scope_property();
+
+    // (a) Crash mid-flight on t1: the remote advances to v3 but the observed
+    // refresh never runs — both member projections go stale (they still show
+    // the rolled-back v1 assignment).
+    let stale = f
+        .store
+        .read_observed("t1")
+        .unwrap()
+        .slots
+        .get(&PlacementSlotId::new("p1"))
+        .expect("observed p1 exists from the earlier push")
+        .generation
+        .clone();
+    let id_c = DeploymentId::new("si-obs-seq-crash");
+    let err = {
+        let _fault_guard = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        f.arm_store_fault(FailureStep::ResultsWrite, &id_c);
+        f.push_with_id("t1", &id_c)
+            .err()
+            .expect("the crash aborts before the observed refresh")
+    };
+    assert!(err.to_string().contains("test fault"), "{err}");
+    let after_crash = f.current_assignment().expect("remote advanced");
+    assert_ne!(
+        stale.as_ref(),
+        Some(&after_crash.generation_id),
+        "the crash window must leave the projection stale"
+    );
+
+    // Recovery: the no-op retry reconciles and refreshes BOTH member
+    // projections to the v3 assignment. No further t1 push runs after this
+    // (the fixed `si-obs-seq-crash` id is then the lexicographically newest).
+    let r = f.apply(Action::Retry("t1"));
+    let Outcome::Push(res) = r else {
+        panic!("expected a push outcome");
+    };
+    let report = res.expect("the recovery retry succeeds");
+    assert_eq!(report.message, "Everything up to date");
+    f.assert_observed_scope_property();
+
+    // A no-op retry on t2 (remote already at v3): the shared projection
+    // refreshes again.
+    let r = f.apply(Action::Retry("t2"));
+    let Outcome::Push(res) = r else {
+        panic!("expected a push outcome");
+    };
+    assert_eq!(
+        res.expect("the no-op retry succeeds").message,
+        "Everything up to date"
+    );
+    f.assert_observed_scope_property();
+
+    // A mid-flight failure that STILL returns Ok: the fleet-commit marker
+    // write fails on a fresh t2 push (v4) -> PendingCommit. The observed
+    // refresh has already run on that push, so the next retry finalizes and
+    // keeps the projections current.
+    f.apply(Action::InjectFailure(FailureStep::CommitMarkerWrite));
+    f.apply(Action::Build(4));
+    let r = f.apply(Action::Push("t2"));
+    let Outcome::Push(res) = r else {
+        panic!("expected a push outcome");
+    };
+    let report = res.expect("the pending-commit push succeeds");
+    assert_eq!(report.status, Some(DeploymentStatus::PendingCommit));
+    f.assert_observed_scope_property();
+    let r = f.apply(Action::Retry("t2"));
+    let Outcome::Push(res) = r else {
+        panic!("expected a push outcome");
+    };
+    assert_eq!(
+        res.expect("the recovery retry succeeds").message,
+        "Everything up to date"
+    );
+    f.assert_observed_scope_property();
+
+    // Wrap up with a standalone rotation under the full member union.
+    f.apply(Action::Rotate);
     f.check_invariants();
 }
 
@@ -1422,11 +1765,13 @@ fn lifecycle_store_fault_matrix_recovers_without_duplicate_history() {
     {
         let f = Fixture::new();
         let id = DeploymentId::new(format!("si-lc-fault-{i}"));
-        f.arm_store_fault(step, &id);
-        let err = f
-            .push_with_id("t1", &id)
-            .err()
-            .expect("the injected persistence fault must abort the push");
+        let err = {
+            let _fault_guard = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            f.arm_store_fault(step, &id);
+            f.push_with_id("t1", &id)
+                .err()
+                .expect("the injected persistence fault must abort the push")
+        };
         assert!(
             err.to_string().contains("test fault"),
             "{step:?}: error must name the injected fault, got: {err}"
@@ -1554,7 +1899,13 @@ fn lifecycle_observed_refresh_faults_never_fail_after_commit() {
             "{step:?}: observed refresh needs no persistent debt marker — the next real push \
              re-projects from durable facts"
         );
-        f.check_invariants();
+        // `check_invariants` is deliberately NOT evaluated in the crash-window
+        // state here: the faulted refresh deferred the projection (the strict
+        // `check_scope` contract permits absence only inside the crash window,
+        // "never evaluated by check_invariants"). The no-op retry below closes
+        // the window by re-projecting from the EXISTING assignment; the
+        // invariant is checked AFTER it, where every member target's projection
+        // must be present.
 
         // The faulted-then-clean NO-OP retry converges without duplicate
         // history: the no-op path creates no records, so the durable history
@@ -1581,6 +1932,10 @@ fn lifecycle_observed_refresh_faults_never_fail_after_commit() {
             3,
             "{step:?}: no duplicate transitions after the retry"
         );
+        // The no-op retry refreshed every member target's projection from the
+        // EXISTING assignment (the fault is one-shot and consumed), so the full
+        // invariant set — including the strict observed-scope contract — holds.
+        f.check_invariants();
         // A further retry is fully idempotent too.
         let r3 = f.push("t1").unwrap();
         assert_eq!(r3.status, None);
@@ -1834,6 +2189,52 @@ fn integrity_tampered_stored_release_blocks_historical_push() {
     assert!(
         err.to_string().contains("identity mismatch"),
         "error must name the identity mismatch, got: {err}"
+    );
+}
+
+/// A tampered stored `behavior.json` (an identity-bearing field changed while
+/// the release record's provenance `behavior_sha256` is retained) blocks a
+/// historical push end-to-end: the release-ref preflight fails closed instead
+/// of restoring the tampered contract.
+#[test]
+fn integrity_tampered_stored_behavior_json_blocks_historical_push() {
+    let f = Fixture::new();
+    f.apply(Action::Push("t1"));
+    f.tamper(TamperKind::StoredBehaviorJson);
+
+    // The tampered snapshot's canonical digest no longer matches the release
+    // record's provenance: the historical read fails closed with an integrity
+    // error naming the mismatch, surfaced through the historical-behavior
+    // preflight.
+    let releases_root = f.store.base().join(layout::RELEASES);
+    let dir = std::fs::read_dir(&releases_root)
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap();
+    let id = ReleaseId::new(dir.file_name().to_string_lossy().into_owned());
+    let err = f
+        .push_ref_impl("t1", id.as_str())
+        .err()
+        .expect("a historical push against a tampered behavior snapshot must fail closed");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("digest mismatch"),
+        "error must name the behavior digest mismatch, got: {msg}"
+    );
+    assert!(
+        msg.contains("historical behavior"),
+        "error must surface through the historical-behavior preflight, got: {msg}"
+    );
+    // And the direct historical read fails closed too.
+    let rerr = f
+        .store
+        .read_release_behaviors(&id)
+        .err()
+        .expect("the historical behavior read must fail closed");
+    assert!(
+        rerr.to_string().contains("digest mismatch"),
+        "read error must name the digest mismatch, got: {rerr}"
     );
 }
 

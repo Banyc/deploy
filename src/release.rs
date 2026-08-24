@@ -69,6 +69,38 @@ pub fn behavior_contracts_from_json(
     serde_json::from_slice(bytes)
 }
 
+/// Verify a serialized `behavior.json` payload against the canonical digest
+/// recorded in a release's provenance (`behavior_sha256`), which is itself
+/// part of the release identity (`release_sha256`). The payload is parsed and
+/// the canonical digest recomputed over the name-sorted per-variant contract
+/// map ([`variant_behaviors_digest`]); an UNPARSEABLE payload fails closed
+/// with an integrity error, and so does a payload whose recomputed digest
+/// differs from the provenance — a tampered `behavior.json` never yields a
+/// historical contract that does not match the release it is stored under.
+/// Only a payload that PARSES TO THE SAME canonical contract set (e.g. JSON
+/// key reordering that deserializes identically, or any change that leaves
+/// the contract set equal) passes — that is the "unless the canonical
+/// behavior digest remains equal" clause. On success the parsed contracts
+/// are returned so callers never parse twice.
+pub fn verify_behavior_json(
+    bytes: &[u8],
+    release_id: &str,
+    expected_digest: &str,
+) -> Result<BTreeMap<String, BehaviorContract>> {
+    let contracts = behavior_contracts_from_json(bytes).map_err(|e| {
+        Error::integrity(format!(
+            "release {release_id} behavior.json is malformed: {e}"
+        ))
+    })?;
+    let recomputed = variant_behaviors_digest(&contracts);
+    if recomputed != expected_digest {
+        return Err(Error::integrity(format!(
+            "release {release_id} behavior.json digest mismatch: stored provenance behavior_sha256 {expected_digest} does not match the digest {recomputed} recomputed from the behavior contracts (fail closed)"
+        )));
+    }
+    Ok(contracts)
+}
+
 /// Lexically normalize an on-server `deploy_dir` into its canonical string
 /// form: collapse repeated slashes, resolve `.` and `..` components
 /// lexically (no filesystem access), and strip any trailing slash. Two
@@ -770,5 +802,72 @@ mod tests {
             err.to_string().contains("fail closed"),
             "error must explain the fail-closed rejection, got: {err}"
         );
+    }
+
+    /// A tampered behavior.json whose canonical digest does not match the
+    /// provenance `behavior_sha256` fails closed, while a payload that parses
+    /// to the SAME canonical contract set (JSON key reordering) passes.
+    #[test]
+    fn verify_behavior_json_matches_provenance_digest() {
+        let mut contracts: BTreeMap<String, BehaviorContract> = BTreeMap::new();
+        contracts.insert(
+            "standard".to_string(),
+            BehaviorContract {
+                activation: crate::config::ActivationConfig {
+                    adapter: "systemd".to_string(),
+                    scope: crate::config::ActivationScope::System,
+                    reconcile_managed_units: true,
+                    units: vec![crate::config::UnitDef {
+                        name: "app.service".to_string(),
+                        artifact_path: "integration/systemd/app.service".to_string(),
+                        enable: true,
+                        restart: true,
+                    }],
+                },
+                verification: crate::config::VerificationConfig {
+                    adapter: "command".to_string(),
+                    argv: vec!["true".to_string()],
+                    timeout_seconds: 30,
+                    attempts: 2,
+                    interval_seconds: 1,
+                },
+            },
+        );
+        let sha = variant_behaviors_digest(&contracts);
+        let canonical = serde_json::to_vec(&contracts).unwrap();
+
+        // The canonical payload verifies.
+        verify_behavior_json(&canonical, "rel-x", &sha).expect("canonical payload verifies");
+
+        // Key reordering in the raw bytes parses to the SAME contract set, so
+        // the digest stays equal and verification passes (the "unless the
+        // canonical behavior digest remains equal" clause).
+        let reordered = br#"{"standard":{"verification":{"adapter":"command","argv":["true"],"timeout_seconds":30,"attempts":2,"interval_seconds":1},"activation":{"adapter":"systemd","scope":"system","reconcile_managed_units":true,"units":[{"name":"app.service","artifact_path":"integration/systemd/app.service","enable":true,"restart":true}]}}}"#;
+        verify_behavior_json(reordered, "rel-x", &sha).expect("reordered JSON passes");
+
+        // Every identity-bearing change alters the digest -> fail closed.
+        let mutations: Vec<serde_json::Value> = vec![
+            serde_json::json!({"standard": {"activation": {"adapter": "none", "scope": "system", "reconcile_managed_units": true, "units": []}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": []}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": []}, "verification": {"adapter": "command", "argv": ["false"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": []}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 31, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"standard": {"activation": {"adapter": "systemd", "scope": "user", "reconcile_managed_units": true, "units": []}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({"canary": {"activation": {"adapter": "systemd", "scope": "system", "reconcile_managed_units": true, "units": []}, "verification": {"adapter": "command", "argv": ["true"], "timeout_seconds": 30, "attempts": 2, "interval_seconds": 1}}}),
+            serde_json::json!({}),
+        ];
+        for (i, m) in mutations.iter().enumerate() {
+            let bytes = serde_json::to_vec(m).unwrap();
+            let err = verify_behavior_json(&bytes, "rel-x", &sha)
+                .expect_err("every contract change must fail verification");
+            assert!(
+                err.to_string().contains("digest mismatch"),
+                "mutation {i} must name the digest mismatch, got: {err}"
+            );
+        }
+
+        // Unparseable bytes fail closed as malformed.
+        let err = verify_behavior_json(b"{ not json", "rel-x", &sha)
+            .expect_err("malformed bytes must fail closed");
+        assert!(err.to_string().contains("malformed"));
     }
 }

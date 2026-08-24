@@ -378,15 +378,35 @@ impl LocalStore {
 
     /// Read the name-keyed per-variant behavior contracts stored alongside a
     /// release record.
+    ///
+    /// The release record is read and identity-verified FIRST (its canonical
+    /// digest is recomputed from its own content); its provenance
+    /// `behavior_sha256` — itself part of the release identity — is then the
+    /// digest the `behavior.json` snapshot must match. The snapshot is parsed
+    /// and re-digested and compared against that provenance digest: a
+    /// tampered `behavior.json` whose canonical contract set digests to
+    /// anything else fails closed with an integrity error naming the release
+    /// and the expected vs recomputed digest, and an unparseable snapshot
+    /// fails closed too. Only a payload that yields the SAME canonical
+    /// contract set (e.g. JSON key reordering) passes — the historical
+    /// contract is never returned unverified.
     pub fn read_release_behaviors(
         &self,
         id: &ReleaseId,
     ) -> Result<BTreeMap<String, BehaviorContract>> {
+        // Verify the release record first: its provenance `behavior_sha256` is
+        // the canonical digest the behavior snapshot must match, and the
+        // record's own identity is recomputed-and-verified before its
+        // provenance is trusted.
+        let rec = self.read_release(id)?;
         let p = self.release_dir(id).join("behavior.json");
         let bytes = std::fs::read(&p)
             .map_err(|e| Error::store(format!("read behavior {}: {e}", p.display())))?;
-        crate::release::behavior_contracts_from_json(&bytes)
-            .map_err(|e| Error::store(format!("parse behavior {}: {e}", p.display())))
+        crate::release::verify_behavior_json(
+            &bytes,
+            &rec.release_id,
+            &rec.provenance.behavior_sha256,
+        )
     }
 
     // ---- targets ----------------------------------------------------------
@@ -834,32 +854,74 @@ mod tests {
         );
     }
 
+    /// A canonical behavior fixture: adapter `systemd` (a NON-default value,
+    /// so deleting `activation.adapter` changes the contract), a system scope,
+    /// one managed unit, and a command verification with a distinctive argv.
+    /// `behavior_digest` is its canonical name-sorted per-variant digest.
+    fn behavior_fixture() -> (BTreeMap<String, BehaviorContract>, String) {
+        let contracts: BTreeMap<String, BehaviorContract> = BTreeMap::from([(
+            "standard".to_string(),
+            BehaviorContract {
+                activation: crate::config::ActivationConfig {
+                    adapter: "systemd".to_string(),
+                    scope: crate::config::ActivationScope::System,
+                    reconcile_managed_units: true,
+                    units: vec![crate::config::UnitDef {
+                        name: "app.service".to_string(),
+                        artifact_path: "integration/systemd/app.service".to_string(),
+                        enable: true,
+                        restart: true,
+                    }],
+                },
+                verification: crate::config::VerificationConfig {
+                    adapter: "command".to_string(),
+                    argv: vec!["true".to_string()],
+                    timeout_seconds: 30,
+                    attempts: 2,
+                    interval_seconds: 1,
+                },
+            },
+        )]);
+        let sha = crate::release::variant_behaviors_digest(&contracts);
+        (contracts, sha)
+    }
+
+    /// Store a release record whose provenance `behavior_sha256` matches the
+    /// canonical digest of [`behavior_fixture`] and write its aux snapshot.
+    fn write_behavior_fixture(
+        store: &LocalStore,
+    ) -> (ReleaseId, BTreeMap<String, BehaviorContract>, String) {
+        let (contracts, sha) = behavior_fixture();
+        let variants: BTreeMap<crate::model::VariantName, crate::model::TreeDigest> =
+            BTreeMap::from([(
+                crate::model::VariantName::new("standard"),
+                crate::model::TreeDigest::new("t1"),
+            )]);
+        let slots: BTreeMap<String, Vec<crate::config::SlotDef>> = BTreeMap::from([(
+            "standard".to_string(),
+            vec![crate::config::SlotDef {
+                id: "p1".to_string(),
+                server: "s1".to_string(),
+                deploy_dir: PathBuf::from("/srv/deploy/p1"),
+                targets: vec!["t1".to_string()],
+            }],
+        )]);
+        let rec = crate::release::build_release("m", &sha, &variants, &slots, Path::new("."));
+        let id = ReleaseId::new(rec.release_id.clone());
+        store.write_release(&rec).unwrap();
+        let behavior_json = serde_json::to_value(&contracts).unwrap();
+        store
+            .write_release_aux(&id, "mapping", &behavior_json)
+            .expect("behavior snapshot writes");
+        (id, contracts, sha)
+    }
+
     #[test]
     fn release_aux_snapshots_are_immutable_and_atomic() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let id = ReleaseId::new("rel-sha256-aa".to_string());
-        let behavior = serde_json::json!({
-            "standard": {
-                "activation": {
-                    "adapter": "none",
-                    "scope": "user",
-                    "reconcile_managed_units": true,
-                    "units": []
-                },
-                "verification": {
-                    "adapter": "command",
-                    "argv": ["true"],
-                    "timeout_seconds": 5,
-                    "attempts": 1,
-                    "interval_seconds": 0
-                }
-            }
-        });
-
-        store
-            .write_release_aux(&id, "mapping", &behavior)
-            .expect("first write creates the snapshot");
+        let (id, _contracts, _sha) = write_behavior_fixture(&store);
+        let behavior = serde_json::to_value(behavior_fixture().0).unwrap();
 
         // Identical rewrite is an idempotent success.
         store
@@ -869,7 +931,7 @@ mod tests {
         // Replacing the behavior snapshot with different content fails...
         let conflicting = serde_json::json!({
             "standard": {
-                "activation": { "adapter": "systemd", "scope": "user", "reconcile_managed_units": true, "units": [] },
+                "activation": { "adapter": "none", "scope": "user", "reconcile_managed_units": true, "units": [] },
                 "verification": {
                     "adapter": "command",
                     "argv": ["true"],
@@ -889,7 +951,113 @@ mod tests {
 
         // ...and the stored snapshot is untouched (no torn write).
         let read = store.read_release_behaviors(&id).expect("snapshot exists");
-        assert_eq!(read["standard"].activation.adapter, "none");
+        assert_eq!(read["standard"].activation.adapter, "systemd");
+    }
+
+    /// Mutation matrix over a stored release's `behavior.json`: deleting each
+    /// required field, changing each identity-bearing field, or corrupting the
+    /// bytes must make the historical read FAIL CLOSED with an integrity error
+    /// (the canonical digest no longer matches the release's provenance
+    /// `behavior_sha256`), while a mutation that keeps the canonical contract
+    /// set equal (JSON key reordering) MUST PASS — that is the "unless the
+    /// canonical behavior digest remains equal" clause.
+    #[test]
+    fn read_release_behaviors_verifies_behavior_json_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let (id, _contracts, _sha) = write_behavior_fixture(&store);
+        let path = store.release_dir(&id).join("behavior.json");
+
+        // Baseline: the pristine snapshot reads.
+        store.read_release_behaviors(&id).expect("pristine reads");
+
+        let write = |v: &serde_json::Value| {
+            std::fs::write(&path, serde_json::to_vec_pretty(v).unwrap()).unwrap()
+        };
+        let read = |label: &str| {
+            let err = store
+                .read_release_behaviors(&id)
+                .expect_err("a digest-changing mutation must fail closed");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("digest mismatch") || msg.contains("malformed"),
+                "mutation '{label}' must fail with an integrity error, got: {msg}"
+            );
+        };
+
+        // Required-field deletions: activation.adapter (default "none" now
+        // differs from the stored "systemd"), verification.argv (missing
+        // required field -> unparseable).
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut del = v.clone();
+        del["standard"]["activation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("adapter");
+        write(&del);
+        read("delete activation.adapter");
+        let mut del = v.clone();
+        del["standard"]["verification"]
+            .as_object_mut()
+            .unwrap()
+            .remove("argv");
+        write(&del);
+        read("delete verification.argv");
+        let mut del = v.clone();
+        del.as_object_mut().unwrap().remove("standard");
+        write(&del);
+        read("delete a whole variant's contract");
+        let mut del = v.clone();
+        del.as_object_mut().unwrap().remove("standard");
+        write(&del);
+        read("delete the variant key itself");
+
+        // Identity-bearing field changes: adapter, argv element, timeout,
+        // scope, variant renamed.
+        let mut c = v.clone();
+        c["standard"]["activation"]["adapter"] = serde_json::json!("none");
+        write(&c);
+        read("change activation.adapter");
+        let mut c = v.clone();
+        c["standard"]["verification"]["argv"][0] = serde_json::json!("false");
+        write(&c);
+        read("change verification.argv element");
+        let mut c = v.clone();
+        c["standard"]["verification"]["timeout_seconds"] = serde_json::json!(31);
+        write(&c);
+        read("change verification.timeout_seconds");
+        let mut c = v.clone();
+        c["standard"]["activation"]["scope"] = serde_json::json!("user");
+        write(&c);
+        read("change activation.scope");
+        let mut c = v.clone();
+        let standard = v["standard"].clone();
+        c.as_object_mut().unwrap().remove("standard");
+        c["renamed"] = standard;
+        write(&c);
+        read("rename the variant");
+
+        // Corrupt bytes: unparseable -> fail closed.
+        std::fs::write(&path, b"{ not json !").unwrap();
+        let err = store
+            .read_release_behaviors(&id)
+            .expect_err("corrupt bytes must fail closed");
+        assert!(
+            err.to_string().contains("malformed"),
+            "error must name the malformed snapshot, got: {err}"
+        );
+
+        // Digest-equal mutation: reorder JSON keys so the bytes differ but the
+        // parsed contract set is identical. The canonical digest stays equal,
+        // so the read MUST PASS.
+        let reordered = br#"{"standard":{"verification":{"adapter":"command","argv":["true"],"timeout_seconds":30,"attempts":2,"interval_seconds":1},"activation":{"adapter":"systemd","scope":"system","reconcile_managed_units":true,"units":[{"name":"app.service","artifact_path":"integration/systemd/app.service","enable":true,"restart":true}]}}}"#;
+        std::fs::write(&path, reordered).unwrap();
+        let read = store
+            .read_release_behaviors(&id)
+            .expect("a digest-equal key reorder must pass");
+        assert_eq!(read["standard"].activation.adapter, "systemd");
+        assert_eq!(read["standard"].verification.timeout_seconds, 30);
     }
 
     /// `read_release` recomputes the canonical digest from the record's own

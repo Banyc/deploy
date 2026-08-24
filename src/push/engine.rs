@@ -684,11 +684,49 @@ fn push_inner(
                     op_id,
                     deployment_id,
                 )?;
+                // Refresh observed state on the NO-OP path (the same
+                // [`refresh_observed`] helper and projection as the real-push
+                // path). A crash-window push — one that aborted AFTER the
+                // remote advanced but BEFORE the observed refresh (e.g. a
+                // faulted `write_results`) — was finalized by the reconcile
+                // above and now matches here as "Everything up to date";
+                // without this refresh the shared slot's observed projection
+                // would stay stale/absent in every member target. The
+                // projections are rebuilt from the EXISTING generation's
+                // assignment (the no-op creates no records), so after ANY
+                // completed or recovered mutation every member target's
+                // observed projection equals the remote assignment. Best-effort
+                // per the post-commit lifecycle: a refresh failure warns but
+                // never converts the no-op into an error — the report below
+                // stays "Everything up to date".
+                let mut observed_servers: BTreeMap<PlacementSlotId, ObservedServer> =
+                    BTreeMap::new();
+                for (slot_id, asn) in &existing {
+                    observed_servers.insert(
+                        slot_id.clone(),
+                        ObservedServer {
+                            generation: Some(asn.generation_id.clone()),
+                            artifact: Some(asn.artifact.clone()),
+                            last_deployment: Some(asn.deployment_id.clone()),
+                        },
+                    );
+                }
+                let mut observed_warnings: Vec<String> = Vec::new();
+                refresh_observed(
+                    store,
+                    target_name,
+                    &members,
+                    &observed_servers,
+                    &mut observed_warnings,
+                );
+                let mut maintenance = deferred;
+                maintenance.extend(observed_warnings);
+                let warning = maintenance_warning(&maintenance);
                 return Ok(PushReport {
                     status: None,
                     attempt: None,
                     message: "Everything up to date".to_string(),
-                    warning: maintenance_warning(&deferred),
+                    warning,
                     dry_run: false,
                 });
             }
@@ -1190,12 +1228,14 @@ fn push_inner(
         store.append_transition(deployment_id.as_str(), &commit_status, commit_reason)?;
     }
 
-    // Refresh observed state. Observed maps are keyed by placement slot (the
+    // Refresh observed state — the shared [`refresh_observed`] helper, also
+    // used by the no-op path so the projection is IDENTICAL whichever path
+    // last touched a slot. Observed maps are keyed by placement slot (the
     // deployment-location identity); the per-server record (`servers/<id>.json`)
     // keeps the actual [`crate::model::ServerId`] for transport identity. A slot
     // may be a member of SEVERAL targets (its on-server `deploy_dir` state is
     // shared across them): a shared slot's observed entry is refreshed in EVERY
-    // member target whenever it changes, so `deploy status <other>` and any
+    // member target whenever it changes, so that `deploy status <other>` and any
     // consumer of that target's observed.json see the CURRENT assignment
     // (generation, artifact, last deployment), never a stale one left by an
     // earlier push to another target.
@@ -1223,77 +1263,28 @@ fn push_inner(
     // therefore converge without duplicate history: the projection refresh
     // never re-records an attempt, snapshot, or transition.
     let mut observed_warnings: Vec<String> = Vec::new();
-    let mut observed = ObservedTarget {
-        target: TargetName::new(target_name.to_string()),
-        slots: Default::default(),
-    };
-    for (slot, sdef) in &members {
+    let mut observed_servers: BTreeMap<PlacementSlotId, ObservedServer> = BTreeMap::new();
+    for (slot, _sdef) in &members {
         let slot_id = PlacementSlotId::new(slot.id.clone());
         let Some(asv) = actual_servers.get(&slot_id) else {
             continue;
         };
-        let observed_server = ObservedServer {
-            generation: asv.generation.clone(),
-            artifact: Some(asv.artifact.clone()),
-            last_deployment: Some(deployment_id.clone()),
-        };
-        observed
-            .slots
-            .insert(slot_id.clone(), observed_server.clone());
-        if let Err(e) = store.write_server(&crate::records::ServerState {
-            id: crate::model::ServerId::new(sdef.id.clone()),
-            last_seen_target: Some(TargetName::new(target_name.to_string())),
-            last_observed: Some(observed_server.clone()),
-        }) {
-            // The durable facts are recorded; only the per-server projection
-            // is stale. Warn and continue — a later push's refresh rewrites it.
-            observed_warnings.push(format!(
-                "observed refresh deferred for server '{}': {e}",
-                sdef.id.as_str()
-            ));
-        }
-        // Propagate the refreshed slot to every OTHER member target of the
-        // shared slot (single-target slots have no other members and are
-        // skipped harmlessly). The slot's server is the same physical server
-        // across all member targets, so no per-server record semantics change.
-        // The read of the member's existing map and the merged write are both
-        // post-commit maintenance: a fault leaves that member's projection
-        // stale, and the next real push to ANY member target of the shared
-        // slot re-runs this propagation and repairs it.
-        for other_target in &slot.targets {
-            if other_target == target_name {
-                continue;
-            }
-            match store.read_observed(other_target) {
-                Ok(mut other_observed) => {
-                    other_observed
-                        .slots
-                        .insert(slot_id.clone(), observed_server.clone());
-                    if let Err(e) = store.write_observed(other_target, &other_observed) {
-                        observed_warnings.push(format!(
-                            "observed refresh deferred for target '{}': {e}",
-                            other_target.as_str()
-                        ));
-                    }
-                }
-                Err(e) => {
-                    observed_warnings.push(format!(
-                        "observed refresh deferred for target '{}': {e}",
-                        other_target.as_str()
-                    ));
-                }
-            }
-        }
+        observed_servers.insert(
+            slot_id.clone(),
+            ObservedServer {
+                generation: asv.generation.clone(),
+                artifact: Some(asv.artifact.clone()),
+                last_deployment: Some(deployment_id.clone()),
+            },
+        );
     }
-    if let Err(e) = store.write_observed(target_name, &observed) {
-        // The push's OWN target projection is the last write; a fault leaves
-        // only this target's map stale. The next real push rebuilds the map
-        // from scratch, so convergence needs no marker.
-        observed_warnings.push(format!(
-            "observed refresh deferred for target '{}': {e}",
-            target_name
-        ));
-    }
+    refresh_observed(
+        store,
+        target_name,
+        &members,
+        &observed_servers,
+        &mut observed_warnings,
+    );
 
     // 17. Per-slot rotation under each slot's mutation lock. Rotation uses
     // the slot's ACTUAL final assignment (read after any compensation), not
@@ -1455,6 +1446,106 @@ fn clear_rotation_deferred(store: &LocalStore, target: &str, slot: &PlacementSlo
 /// rotation is maintenance that must never change a deployment's reported
 /// outcome. Best-effort: this function NEVER fails the push. Returns the
 /// slots still deferred, for the push report's warning.
+///
+/// Refresh `observed.json` for `target_name` from a caller-supplied per-slot
+/// observed projection, and propagate every shared slot's entry to EACH of its
+/// member targets. Every store fault in this block is WARNING-ONLY: the
+/// refresh runs after the deployment durably committed, so a fault must never
+/// change the push's reported outcome. The warnings are pushed into
+/// `observed_warnings` (merged into the report's `maintenance` warning
+/// channel); this function NEVER returns `Err`.
+///
+/// The single source of truth for the observed refresh: the REAL-push path
+/// (which feeds it the actual post-mutation state) and the NO-OP path (which
+/// feeds it the EXISTING generation's assignment, since an up-to-date push
+/// creates no records) both run this exact block, so a shared slot's
+/// projection in every member target is refreshed identically by whichever
+/// path last touched it. Observed maps are keyed by placement slot (the
+/// deployment-location identity); the per-server record (`servers/<id>.json`)
+/// keeps the actual [`crate::model::ServerId`] for transport identity. A slot
+/// may be a member of SEVERAL targets (its on-server `deploy_dir` state is
+/// shared across them): a shared slot's observed entry is refreshed in EVERY
+/// member target whenever it changes, so `deploy status <other>` and any
+/// consumer of that target's observed.json see the CURRENT assignment
+/// (generation, artifact, last deployment), never a stale one left by an
+/// earlier push to another target. A member slot with no entry in
+/// `observed_servers` is skipped (single-target slots whose projection is
+/// absent, e.g. a slot the caller's push did not plan).
+fn refresh_observed(
+    store: &LocalStore,
+    target_name: &str,
+    members: &[(&crate::config::SlotDef, &crate::config::ServerDef)],
+    observed_servers: &BTreeMap<PlacementSlotId, ObservedServer>,
+    observed_warnings: &mut Vec<String>,
+) {
+    let mut observed = ObservedTarget {
+        target: TargetName::new(target_name.to_string()),
+        slots: Default::default(),
+    };
+    for (slot, sdef) in members {
+        let slot_id = PlacementSlotId::new(slot.id.clone());
+        let Some(observed_server) = observed_servers.get(&slot_id) else {
+            continue;
+        };
+        observed
+            .slots
+            .insert(slot_id.clone(), observed_server.clone());
+        if let Err(e) = store.write_server(&crate::records::ServerState {
+            id: crate::model::ServerId::new(sdef.id.clone()),
+            last_seen_target: Some(TargetName::new(target_name.to_string())),
+            last_observed: Some(observed_server.clone()),
+        }) {
+            // The durable facts are recorded; only the per-server projection
+            // is stale. Warn and continue — a later push's refresh rewrites it.
+            observed_warnings.push(format!(
+                "observed refresh deferred for server '{}': {e}",
+                sdef.id.as_str()
+            ));
+        }
+        // Propagate the refreshed slot to EVERY other member target of the
+        // shared slot (single-target slots have no other members and are
+        // skipped harmlessly). The slot's server is the same physical server
+        // across all member targets, so no per-server record semantics change.
+        // The read of the member's existing map and the merged write are both
+        // post-commit maintenance: a fault leaves that member's projection
+        // stale, and the next real push to ANY member target of the shared
+        // slot re-runs this propagation and repairs it.
+        for other_target in &slot.targets {
+            if other_target == target_name {
+                continue;
+            }
+            match store.read_observed(other_target) {
+                Ok(mut other_observed) => {
+                    other_observed
+                        .slots
+                        .insert(slot_id.clone(), observed_server.clone());
+                    if let Err(e) = store.write_observed(other_target, &other_observed) {
+                        observed_warnings.push(format!(
+                            "observed refresh deferred for target '{}': {e}",
+                            other_target.as_str()
+                        ));
+                    }
+                }
+                Err(e) => {
+                    observed_warnings.push(format!(
+                        "observed refresh deferred for target '{}': {e}",
+                        other_target.as_str()
+                    ));
+                }
+            }
+        }
+    }
+    if let Err(e) = store.write_observed(target_name, &observed) {
+        // The push's OWN target projection is the last write; a fault leaves
+        // only this target's map stale. The next real push rebuilds the map
+        // from scratch, so convergence needs no marker.
+        observed_warnings.push(format!(
+            "observed refresh deferred for target '{}': {e}",
+            target_name
+        ));
+    }
+}
+
 fn retry_deferred_rotations(
     store: &LocalStore,
     config: &Config,

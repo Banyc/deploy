@@ -163,11 +163,37 @@ impl<'a> RemoteHelper<'a> {
     /// release's `behavior.json` stores one contract per declared variant; the
     /// assigned variant is selected explicitly rather than falling back to the
     /// caller's current configuration.
+    ///
+    /// The published release record is read and identity-verified FIRST (its
+    /// canonical digest is recomputed from its own content); its provenance
+    /// `behavior_sha256` is then the digest the remote `behavior.json` must
+    /// match. A tampered behavior document fails closed with an integrity
+    /// error — the historical contract is never returned unverified.
     pub fn read_behavior(&self, release_id: &ReleaseId, variant: &str) -> Result<BehaviorContract> {
         let p = layout::remote_release(release_id.as_str()).join("behavior.json");
         let data = self.remote.read(&p)?;
-        let behaviors = crate::release::behavior_contracts_from_json(&data)
-            .map_err(|e| Error::remote(format!("parse behavior for {release_id}: {e}")))?;
+        // Verify the published release record (its own identity is recomputed
+        // from its content) and bind it to the requested release path; its
+        // provenance `behavior_sha256` is the canonical digest the behavior
+        // snapshot must match.
+        let rec: ReleaseRecord = serde_json::from_slice(
+            &self
+                .remote
+                .read(&layout::remote_release(release_id.as_str()).join("release.json"))?,
+        )
+        .map_err(|e| Error::integrity(format!("malformed release record for {release_id}: {e}")))?;
+        crate::release::verify_release_identity(&rec)?;
+        if rec.release_id != release_id.as_str() {
+            return Err(Error::integrity(format!(
+                "release record identity {} does not match the read path {release_id}",
+                rec.release_id
+            )));
+        }
+        let behaviors = crate::release::verify_behavior_json(
+            &data,
+            &rec.release_id,
+            &rec.provenance.behavior_sha256,
+        )?;
         behaviors.get(variant).cloned().ok_or_else(|| {
             Error::remote(format!(
                 "release {release_id} has no behavior for variant '{variant}'"
@@ -263,22 +289,56 @@ impl<'a> RemoteHelper<'a> {
                 rec.release_id
             )));
         }
+        // The behavior.json payload must digest to the release identity's
+        // provenance `behavior_sha256` BEFORE anything is written: an
+        // unparseable behavior document — or one whose canonical contract set
+        // digests to anything else — is never installed on the remote (fail
+        // closed), so a release never publishes a behavior snapshot that does
+        // not match the release it is stored under. A payload that parses to
+        // the SAME canonical contract set (e.g. key reordering) passes.
+        crate::release::verify_behavior_json(
+            behavior_json.as_bytes(),
+            &rec.release_id,
+            &rec.provenance.behavior_sha256,
+        )?;
         let dir = layout::remote_release(release_id);
         // The release record is identified by its canonical digest
         // (`release_sha256`), not by semantic equality of the full document:
         // metadata fields such as `created_at` (and `provenance.git_revision`)
         // legitimately differ between runs of the same canonical release, so
         // byte/semantic comparison of the whole record would falsely reject
-        // idempotent re-publication. Two records with the same
-        // `release_sha256` are the same release.
+        // idempotent re-publication. Two records with the same recomputed
+        // digest are the same release.
         let rel = dir.join("release.json");
         if !self.remote.exists(&rel) {
             self.publish_release_file(&rel, release_json.as_bytes())?;
         } else {
+            // The remote already carries a record under this release id.
+            // NEVER trust its stored `release_sha256`/`release_id` fields to
+            // declare it the same release: content-verify the EXISTING record
+            // by recomputing the canonical digest from its own content (slot
+            // snapshot, bindings, provenance digests) and checking both
+            // identity fields, exactly as incoming records are verified. A
+            // corrupted record whose identity-bearing content was mutated
+            // while the digest fields were retained at the original values
+            // FAILS here with an integrity error naming the remote release
+            // and the mismatch — republishing against a corrupted remote
+            // record always fails closed, never silently accepting it as
+            // identical. Malformed existing JSON is an integrity error, never
+            // a silent replace. Only a content-verified record whose
+            // recomputed identity equals the incoming record's identity is an
+            // idempotent no-op (metadata such as `created_at` and
+            // `provenance.git_revision` is excluded from the digest, so it
+            // may differ between runs of the same canonical release).
             let existing = self.remote.read(&rel)?;
-            if Self::release_identity_of(&existing)
-                != Self::release_identity_of(release_json.as_bytes())
-            {
+            let existing_rec: ReleaseRecord = serde_json::from_slice(&existing).map_err(|e| {
+                Error::integrity(format!(
+                    "malformed existing release record at {}: {e}",
+                    rel.display()
+                ))
+            })?;
+            crate::release::verify_release_identity(&existing_rec)?;
+            if existing_rec.release_sha256 != rec.release_sha256 {
                 return Err(Error::integrity(format!(
                     "refusing to replace existing {} with a different release",
                     rel.display()
@@ -305,15 +365,6 @@ impl<'a> RemoteHelper<'a> {
             "refusing to replace existing {} with different content",
             rel.display()
         )))
-    }
-
-    /// Extract the canonical release identity (`release_sha256`) from a
-    /// serialized release record, or `None` when the payload is not a valid
-    /// release record carrying that field.
-    fn release_identity_of(record: &[u8]) -> Option<String> {
-        serde_json::from_slice::<serde_json::Value>(record)
-            .ok()
-            .and_then(|v| v.get("release_sha256")?.as_str().map(|s| s.to_string()))
     }
 
     /// Create a generation record and its `root` symlink. Does not move
@@ -689,18 +740,37 @@ mod tests {
         }
     }
 
-    /// `publish_release` recomputes the canonical digest from the serialized
-    /// record's content and verifies it against the stored identity before
-    /// installing anything: a pristine record publishes (and re-publishes
-    /// idempotently), while a record whose slot declaration was edited with the
-    /// old `release_sha256`/`release_id` retained fails closed with an
-    /// integrity error — a release whose identity does not match its content is
-    /// never published.
-    #[test]
-    fn publish_release_recomputes_and_verifies_identity() {
-        let dir = tempfile::tempdir().unwrap();
-        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
-        let helper = RemoteHelper::new(&remote);
+    /// A publish fixture: a release record whose provenance `behavior_sha256`
+    /// is the canonical digest of a real per-variant behavior contract set
+    /// (adapter `systemd` — non-default, so field deletions change the
+    /// digest — plus a command verification), and the serialized behavior JSON
+    /// for that same set.
+    fn publish_fixture() -> (crate::model::ReleaseRecord, String) {
+        let contracts: std::collections::BTreeMap<String, crate::model::BehaviorContract> =
+            std::collections::BTreeMap::from([(
+                "standard".to_string(),
+                crate::model::BehaviorContract {
+                    activation: crate::config::ActivationConfig {
+                        adapter: "systemd".to_string(),
+                        scope: crate::config::ActivationScope::System,
+                        reconcile_managed_units: true,
+                        units: vec![crate::config::UnitDef {
+                            name: "app.service".to_string(),
+                            artifact_path: "integration/systemd/app.service".to_string(),
+                            enable: true,
+                            restart: true,
+                        }],
+                    },
+                    verification: crate::config::VerificationConfig {
+                        adapter: "command".to_string(),
+                        argv: vec!["true".to_string()],
+                        timeout_seconds: 30,
+                        attempts: 2,
+                        interval_seconds: 1,
+                    },
+                },
+            )]);
+        let behavior_sha = crate::release::variant_behaviors_digest(&contracts);
         let variants: std::collections::BTreeMap<
             crate::model::VariantName,
             crate::model::TreeDigest,
@@ -718,11 +788,31 @@ mod tests {
                     targets: vec!["t1".to_string()],
                 }],
             )]);
-        let rec =
-            crate::release::build_release("m", "b", &variants, &slots, std::path::Path::new("."));
+        let rec = crate::release::build_release(
+            "m",
+            &behavior_sha,
+            &variants,
+            &slots,
+            std::path::Path::new("."),
+        );
+        let behavior_json = serde_json::to_string(&contracts).unwrap();
+        (rec, behavior_json)
+    }
+
+    /// `publish_release` recomputes the canonical digest from the serialized
+    /// record's content and verifies it against the stored identity before
+    /// installing anything: a pristine record publishes (and re-publishes
+    /// idempotently), while a record whose slot declaration was edited with the
+    /// old `release_sha256`/`release_id` retained fails closed with an
+    /// integrity error — a release whose identity does not match its content is
+    /// never published.
+    #[test]
+    fn publish_release_recomputes_and_verifies_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        let (rec, behavior_json) = publish_fixture();
         let release_json = serde_json::to_string(&rec).unwrap();
-        let behaviors = serde_json::json!({});
-        let behavior_json = behaviors.to_string();
 
         // Positive case: the pristine record publishes, and re-publishing the
         // identical release is an idempotent no-op.
@@ -764,6 +854,287 @@ mod tests {
             .publish_release(rec.release_id.as_str(), "{}", &behavior_json)
             .expect_err("a malformed release record must be refused");
         assert!(err.to_string().contains("malformed release record"));
+    }
+
+    /// A fresh remote already carrying the pristine record under
+    /// `releases/<id>/release.json` (+ `behavior.json`), plus the pristine
+    /// serialized record and behavior JSON for republishing. The behavior
+    /// payload is DIGEST-CONSISTENT: it is serialized from the same
+    /// per-variant contract set whose canonical digest is frozen into the
+    /// release's provenance `behavior_sha256` (see `publish_fixture`), so
+    /// `publish_release`'s behavior.json digest verification accepts the
+    /// pristine record. Each case builds its own fixture so the mutation
+    /// matrix stays deterministic.
+    fn published_release_fixture() -> (
+        tempfile::TempDir,
+        LocalTransport,
+        ReleaseRecord,
+        String,
+        String,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        let (rec, behavior_json) = publish_fixture();
+        let release_json = serde_json::to_string(&rec).unwrap();
+        helper
+            .publish_release(rec.release_id.as_str(), &release_json, &behavior_json)
+            .expect("pristine record publishes");
+        (dir, remote, rec, release_json, behavior_json)
+    }
+
+    /// Republishing against an EXISTING remote record that was CORRUPTED must
+    /// ALWAYS fail closed: mutate each identity-bearing field of the stored
+    /// remote `release.json` one at a time (written directly to the remote
+    /// path, bypassing the verified publish path) while retaining
+    /// `release_sha256`/`release_id` at the ORIGINAL values, then republish
+    /// the CORRECT original release. The mutation matrix covers the
+    /// per-variant mappings digest, the behavior digest, the slot snapshot
+    /// (`deploy_dir`/targets), the variant→tree bindings, a variant renamed
+    /// or removed, and the identity-bearing provenance fields. Every case
+    /// must fail with an integrity error naming the remote release and the
+    /// content-vs-digest mismatch — a corrupted remote record is never
+    /// silently accepted as the same release. Metadata-only differences
+    /// (`created_at`, `provenance.git_revision` — excluded from the digest)
+    /// still no-op idempotently.
+    #[test]
+    fn republish_content_verifies_existing_remote_record() {
+        // (a) One identity-bearing mutation at a time -> every republish fails.
+        let identity_mutations: [(&str, fn(&mut serde_json::Value)); 7] = [
+            (
+                "per-variant mappings digest",
+                |v: &mut serde_json::Value| {
+                    v["provenance"]["mapping_sha256"] = serde_json::json!("tampered-mapping");
+                },
+            ),
+            ("behavior digest", |v: &mut serde_json::Value| {
+                v["provenance"]["behavior_sha256"] = serde_json::json!("tampered-behavior");
+            }),
+            ("slot deploy_dir", |v: &mut serde_json::Value| {
+                v["slots"]["standard"]["slots"][0]["deploy_dir"] =
+                    serde_json::json!("/srv/elsewhere");
+            }),
+            ("slot targets membership", |v: &mut serde_json::Value| {
+                v["slots"]["standard"]["slots"][0]["targets"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!("tampered-target"));
+            }),
+            ("variant->tree binding", |v: &mut serde_json::Value| {
+                v["variants"]["standard"] = serde_json::json!("tree-tampered");
+            }),
+            ("variant renamed", |v: &mut serde_json::Value| {
+                let tree = v["variants"]["standard"].clone();
+                v["variants"].as_object_mut().unwrap().remove("standard");
+                v["variants"]["tampered-variant"] = tree;
+            }),
+            ("variant removed", |v: &mut serde_json::Value| {
+                v["variants"].as_object_mut().unwrap().remove("standard");
+            }),
+        ];
+        for (name, mutate) in identity_mutations {
+            let (dir, remote, rec, release_json, behavior_json) = published_release_fixture();
+            let mut stored = serde_json::to_value(&rec).unwrap();
+            mutate(&mut stored);
+            // The identity-bearing content mutated, digest fields retained at
+            // the original values.
+            assert_eq!(
+                stored["release_sha256"], rec.release_sha256,
+                "{name}: digest must be retained"
+            );
+            assert_eq!(
+                stored["release_id"], rec.release_id,
+                "{name}: release id must be retained"
+            );
+            let rel = layout::remote_release(rec.release_id.as_str()).join("release.json");
+            remote
+                .write(&rel, &serde_json::to_vec(&stored).unwrap(), 0o644)
+                .unwrap();
+            let helper = RemoteHelper::new(&remote);
+            let fail_msg =
+                format!("{name}: republishing against a corrupted remote record must fail closed");
+            let err = helper
+                .publish_release(rec.release_id.as_str(), &release_json, &behavior_json)
+                .expect_err(&fail_msg);
+            let msg = err.to_string();
+            assert!(
+                msg.contains("identity mismatch"),
+                "{name}: error must name the content-vs-digest mismatch, got: {msg}"
+            );
+            assert!(
+                msg.contains(&rec.release_sha256),
+                "{name}: error must name the stored digest, got: {msg}"
+            );
+        }
+
+        // A corrupted remote behavior.json fails the republish via the
+        // snapshot's own create-or-compare content check (release.json is
+        // untouched here, so the failure is pinned to behavior.json).
+        let (dir, remote, rec, release_json, behavior_json) = published_release_fixture();
+        let bpath = layout::remote_release(rec.release_id.as_str()).join("behavior.json");
+        remote.write(&bpath, b"{\"tampered\":", 0o644).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        let err = helper
+            .publish_release(rec.release_id.as_str(), &release_json, &behavior_json)
+            .expect_err("a corrupted remote behavior.json must fail republish");
+        assert!(
+            err.to_string().contains("different content"),
+            "error must name the create-or-compare refusal, got: {err}"
+        );
+
+        // Malformed existing release.json is refused outright, never silently
+        // replaced.
+        let (dir, remote, rec, release_json, behavior_json) = published_release_fixture();
+        let rel = layout::remote_release(rec.release_id.as_str()).join("release.json");
+        remote.write(&rel, b"{ not json", 0o644).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        let err = helper
+            .publish_release(rec.release_id.as_str(), &release_json, &behavior_json)
+            .expect_err("malformed existing release.json must be refused, not silently replaced");
+        assert!(
+            err.to_string()
+                .contains("malformed existing release record"),
+            "error must name the malformed existing record, got: {err}"
+        );
+
+        // Metadata-only differences in the EXISTING record (`created_at`,
+        // `provenance.git_revision`) are excluded from the digest: republishing
+        // against a record that differs ONLY in those fields is still an
+        // idempotent no-op.
+        let metadata_mutations: [(&str, fn(&mut serde_json::Value)); 2] = [
+            ("created_at", |v: &mut serde_json::Value| {
+                v["created_at"] = serde_json::json!("2099-01-01T00:00:00Z");
+            }),
+            ("provenance.git_revision", |v: &mut serde_json::Value| {
+                v["provenance"]["git_revision"] = serde_json::json!("tampered-git");
+            }),
+        ];
+        for (name, mutate) in metadata_mutations {
+            let (dir, remote, rec, release_json, behavior_json) = published_release_fixture();
+            let mut stored = serde_json::to_value(&rec).unwrap();
+            mutate(&mut stored);
+            let rel = layout::remote_release(rec.release_id.as_str()).join("release.json");
+            remote
+                .write(&rel, &serde_json::to_vec(&stored).unwrap(), 0o644)
+                .unwrap();
+            let helper = RemoteHelper::new(&remote);
+            let ok_msg =
+                format!("{name}: a metadata-only difference keeps the republish idempotent");
+            helper
+                .publish_release(rec.release_id.as_str(), &release_json, &behavior_json)
+                .expect(&ok_msg);
+        }
+    }
+
+    /// Mutation matrix over the behavior JSON handed to `publish_release`:
+    /// deleting each required field, changing each identity-bearing field, or
+    /// corrupting the bytes must make the publication FAIL CLOSED with an
+    /// integrity error (the canonical digest no longer matches the release
+    /// identity's provenance `behavior_sha256`), while a mutation that keeps
+    /// the canonical contract set equal (JSON key reordering) MUST publish —
+    /// that is the "unless the canonical behavior digest remains equal"
+    /// clause.
+    #[test]
+    fn publish_release_verifies_behavior_json_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        let (rec, behavior_json) = publish_fixture();
+        let release_json = serde_json::to_string(&rec).unwrap();
+        let rid = rec.release_id.as_str();
+
+        // Baseline: the canonical behavior payload publishes.
+        helper
+            .publish_release(rid, &release_json, &behavior_json)
+            .expect("pristine behavior publishes");
+
+        let publish = |label: &str, payload: &str| {
+            let err = helper
+                .publish_release(rid, &release_json, payload)
+                .expect_err("a digest-changing behavior payload must fail closed");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("digest mismatch") || msg.contains("malformed"),
+                "mutation '{label}' must fail with an integrity error, got: {msg}"
+            );
+        };
+
+        let mut v: serde_json::Value = serde_json::from_str(&behavior_json).unwrap();
+        // Required-field deletions: activation.adapter, verification.argv, a
+        // whole variant's contract, the variant key itself.
+        let mut del = v.clone();
+        del["standard"]["activation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("adapter");
+        publish(
+            "delete activation.adapter",
+            &serde_json::to_string(&del).unwrap(),
+        );
+        let mut del = v.clone();
+        del["standard"]["verification"]
+            .as_object_mut()
+            .unwrap()
+            .remove("argv");
+        publish(
+            "delete verification.argv",
+            &serde_json::to_string(&del).unwrap(),
+        );
+        let mut del = v.clone();
+        del.as_object_mut().unwrap().remove("standard");
+        publish(
+            "delete a whole variant's contract",
+            &serde_json::to_string(&del).unwrap(),
+        );
+        let mut del = v.clone();
+        del.as_object_mut().unwrap().remove("standard");
+        publish(
+            "delete the variant key itself",
+            &serde_json::to_string(&del).unwrap(),
+        );
+
+        // Identity-bearing field changes: adapter, argv element, timeout,
+        // scope, variant renamed.
+        let mut c = v.clone();
+        c["standard"]["activation"]["adapter"] = serde_json::json!("none");
+        publish(
+            "change activation.adapter",
+            &serde_json::to_string(&c).unwrap(),
+        );
+        let mut c = v.clone();
+        c["standard"]["verification"]["argv"][0] = serde_json::json!("false");
+        publish(
+            "change verification.argv element",
+            &serde_json::to_string(&c).unwrap(),
+        );
+        let mut c = v.clone();
+        c["standard"]["verification"]["timeout_seconds"] = serde_json::json!(31);
+        publish(
+            "change verification.timeout_seconds",
+            &serde_json::to_string(&c).unwrap(),
+        );
+        let mut c = v.clone();
+        c["standard"]["activation"]["scope"] = serde_json::json!("user");
+        publish(
+            "change activation.scope",
+            &serde_json::to_string(&c).unwrap(),
+        );
+        let mut c = v.clone();
+        let standard = v["standard"].clone();
+        c.as_object_mut().unwrap().remove("standard");
+        c["renamed"] = standard;
+        publish("rename the variant", &serde_json::to_string(&c).unwrap());
+
+        // Corrupt bytes: unparseable -> fail closed as malformed.
+        publish("corrupt bytes", "{ not json !");
+
+        // Digest-equal mutation: reorder JSON keys so the bytes differ but the
+        // parsed contract set is identical; the canonical digest stays equal,
+        // so the publication MUST succeed.
+        let reordered = r#"{"standard":{"verification":{"adapter":"command","argv":["true"],"timeout_seconds":30,"attempts":2,"interval_seconds":1},"activation":{"adapter":"systemd","scope":"system","reconcile_managed_units":true,"units":[{"name":"app.service","artifact_path":"integration/systemd/app.service","enable":true,"restart":true}]}}}"#;
+        helper
+            .publish_release(rid, &release_json, reordered)
+            .expect("a digest-equal key reorder must publish");
     }
 
     /// A generation record is immutable: installed with create-or-compare, so
