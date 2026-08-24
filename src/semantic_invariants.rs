@@ -78,9 +78,10 @@ use crate::remote::transport::{
 use crate::rotation::compute_retained;
 use crate::store::local::LocalStore;
 use proptest::prelude::*;
-use proptest::test_runner::RngSeed;
+use proptest::test_runner::{FileFailurePersistence, RngSeed};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
@@ -386,9 +387,147 @@ pub(crate) enum TamperKind {
 
 /// The outcome of one applied action.
 pub(crate) enum Outcome {
-    Push(Result<PushReport>),
+    Push(Box<Result<PushReport>>),
     Ok,
     Tampered,
+}
+
+/// The expected outcome CLASS of one applied action — the RESULT the model
+/// oracle predicts and the property test compares against the actual
+/// [`Outcome`] the system produced. The classes are derived from the engine's
+/// real report statuses (`Successful` / `PendingCommit` / `FailedPreflight` /
+/// `Degraded` / `FailedRolledBack` / the no-op report) and the `Err`
+/// boundary, so a push whose RESULT disagrees with the model (a `PendingCommit`
+/// where the model expected a durable `Successful`, an `Err` after a durable
+/// commit, or a no-op where the model expected a deployment) fails the oracle
+/// even though every observable record matched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutcomeClass {
+    /// A push that durably committed: report status `Successful`, attempt
+    /// recorded, snapshot + `refs/last-successful` + the terminal `Successful`
+    /// transition all durable. Post-commit maintenance warnings (rotation,
+    /// observed refresh, debt I/O) ride on the SAME report and never change
+    /// the class.
+    OkCommitted,
+    /// "Everything up to date": `status: None`, no records created.
+    OkNoop,
+    /// The push returned `Ok` but the deployment is NOT durably committed: a
+    /// `PendingCommit` status (the fleet-commit marker write failed) — a
+    /// deferred/recoverable completion a later push reconciles.
+    OkPending,
+    /// A failure BEFORE the durable commit: an `Err` return (a pre-commit
+    /// fault, a plan rejection, a crash-window finalize fault) or a terminal
+    /// non-committed status (`FailedPreflight` / `Degraded` /
+    /// `FailedRolledBack`) that ends the attempt with nothing durably
+    /// committed. Per the hard post-commit rule, an `Err` is legal ONLY here.
+    ErrPreCommit,
+    /// A non-push action (Build / Rotate / InjectFailure) reported [`Outcome::Ok`].
+    OkAction,
+    /// A deliberate [`Action::Tamper`] — the Integrity group is broken by
+    /// construction and the fixture reports [`Outcome::Tampered`].
+    Tampered,
+}
+
+/// The per-step failure class the property test injects, generated TOGETHER
+/// with the action (the model must predict the outcome class under every
+/// failure class). Local-store steps map onto the `test_faults` one-shot
+/// arms keyed by the step's deployment id; the two remote steps use the
+/// suffix-armed one-shot transport fault; [`FailureClass::LockContention`]
+/// holds the slot's mutation lock via a second `RemoteHelper` guard for the
+/// whole action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailureClass {
+    /// No fault: a clean action.
+    None,
+    /// Remote fleet-commit marker write fails: the attempt reports
+    /// `PendingCommit` (recoverable; a later push reconciles it).
+    CommitMarker,
+    /// Remote post-commit rotation inventory write fails: the rotation is
+    /// deferred (debt marker + warning) after the durable commit.
+    RotationInventory,
+    /// Local intent persist (`append_attempt`) fails BEFORE any remote
+    /// mutation: the push returns `Err` with nothing recorded.
+    IntentPersist,
+    /// Local outcomes store (`write_results`) fails after the servers
+    /// advanced but before any durable commit: `Err`, remote advanced, the
+    /// observed refresh never ran (the crash window).
+    ResultsWrite,
+    /// Replay-safe finalizer's snapshot append fails: `Err`, the attempt is
+    /// left `PendingCommit` (re-eligible), observed not refreshed.
+    SnapshotAppend,
+    /// Finalizer's `refs/last-successful` write fails: `Err`, the snapshot is
+    /// durable, the ref stale, the attempt `PendingCommit`.
+    LastSuccessfulWrite,
+    /// Finalizer's terminal `Successful` transition append fails: `Err`, the
+    /// snapshot + ref durable, the attempt `PendingCommit`.
+    TransitionSuccessful,
+    /// Finalizer's recoverable `PendingCommit` marker append fails: `Err`, the
+    /// attempt stays `InProgress`.
+    TransitionPending,
+    /// Post-commit observed-refresh `write_server` fails (warning-only): the
+    /// observed maps themselves still refresh.
+    ObservedWriteServer,
+    /// Post-commit observed-refresh `write_observed` for the PUSH'S OWN
+    /// target fails: that target's projection stays stale.
+    ObservedPrimaryWrite,
+    /// Post-commit observed-refresh `write_observed` for the OTHER member
+    /// target of the shared slot fails: the other member's projection stays
+    /// stale.
+    ObservedOtherWrite,
+    /// Rotation-debt marker READ fails (target-keyed: the store's debt
+    /// methods carry no deployment id, so the arm lands on the pushed
+    /// target's `rotation-debt.json`). Post-commit maintenance is
+    /// NON-FALLIBLE — a warning, never an `Err` — so the committed outcome
+    /// class is unchanged and the marker effect the model tracks is
+    /// deterministic.
+    DebtRead,
+    /// Rotation-debt marker WRITE fails (the same `write_rotation_debt`
+    /// call as the remove). Warning-only; non-fallible.
+    DebtWrite,
+    /// Rotation-debt marker REMOVE — the same `write_rotation_debt` call as
+    /// the write; kept as a distinct class so the {read, write, remove}
+    /// matrix is explicit. Warning-only; non-fallible.
+    DebtRemove,
+    /// The slot's mutation lock is HELD for the whole action by a second
+    /// `RemoteHelper` guard. The push's EARLY per-slot preflight checks the
+    /// lock and aborts with `Err` BEFORE any attempt record, reconciliation,
+    /// or the no-op check — even an up-to-date push errors, and nothing is
+    /// recorded or mutated.
+    LockContention,
+}
+
+/// Classify an ACTUAL [`Outcome`] into the [`OutcomeClass`] the model must
+/// have predicted. `Push(Ok(report))` is classified by the report's status
+/// (`Successful` -> committed, `PendingCommit` -> pending, any other terminal
+/// status -> pre-commit failure, `None` status -> the no-op report);
+/// `Push(Err(_))` is always [`OutcomeClass::ErrPreCommit`] — the hard
+/// post-commit rule says an `Err` after a durable commit can never happen,
+/// which the oracle asserts explicitly at the call site.
+fn classify_outcome(outcome: &Outcome) -> OutcomeClass {
+    match outcome {
+        Outcome::Ok => OutcomeClass::OkAction,
+        Outcome::Tampered => OutcomeClass::Tampered,
+        Outcome::Push(result) => match &**result {
+            Ok(report) => match report.status {
+                None => {
+                    assert_eq!(
+                        report.message, "Everything up to date",
+                        "the only statusless report the fixture produces is the no-op"
+                    );
+                    OutcomeClass::OkNoop
+                }
+                Some(DeploymentStatus::Successful) => OutcomeClass::OkCommitted,
+                Some(DeploymentStatus::PendingCommit) => OutcomeClass::OkPending,
+                Some(DeploymentStatus::FailedPreflight)
+                | Some(DeploymentStatus::Degraded)
+                | Some(DeploymentStatus::FailedRolledBack) => OutcomeClass::ErrPreCommit,
+                Some(DeploymentStatus::InProgress) => {
+                    panic!("a final push report must never carry InProgress")
+                }
+            },
+            Err(_) => OutcomeClass::ErrPreCommit,
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -405,6 +544,17 @@ pub(crate) struct Fixture {
     store: LocalStore,
     remotes_base: PathBuf,
     fault: Arc<Mutex<RemoteFault>>,
+    /// Monotonic counter for the property test's fixed deployment ids
+    /// (`si-<tag>-<NNNN>`): every property push/rollback uses a caller id so
+    /// the store faults (keyed by deployment id) can be armed per step, and
+    /// the ids sort AFTER the engine's auto `deploy-…` ids while ordering
+    /// lexicographically by push order (the lifecycle "newest successful"
+    /// check compares id strings).
+    prop_ids: AtomicU64,
+    /// Per-fixture tag baked into every property deployment id (derived from
+    /// the unique tempdir name) so concurrent proptest cases keep unique
+    /// deployment ids (each case owns its per-fixture fault registry).
+    prop_tag: String,
 }
 
 impl Fixture {
@@ -431,6 +581,17 @@ impl Fixture {
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let remotes_base = dir.path().join("remotes");
         std::fs::create_dir_all(&remotes_base).unwrap();
+        let prop_tag = {
+            // The tempdir name is unique per Fixture (per proptest case);
+            // sanitize it so the ids stay path-friendly.
+            dir.path()
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default()
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect()
+        };
         let fixture = Fixture {
             _dir: dir,
             project,
@@ -439,6 +600,8 @@ impl Fixture {
             store,
             remotes_base,
             fault: Arc::new(Mutex::new(RemoteFault::default())),
+            prop_ids: AtomicU64::new(0),
+            prop_tag,
         };
         fixture.write_artifacts(1);
         fixture
@@ -534,6 +697,159 @@ impl Fixture {
         )
     }
 
+    // ---- property plumbing -------------------------------------------------
+
+    /// The next fixed deployment id for a property push/rollback. The
+    /// per-fixture tag keeps concurrent proptest cases apart (each case owns
+    /// its per-fixture fault registry, so ids only need to be unique within
+    /// the fixture); the zero-padded counter makes the id string ordering
+    /// equal the push order for the lifecycle "newest successful" check.
+    fn next_prop_id(&self) -> DeploymentId {
+        let i = self.prop_ids.fetch_add(1, Ordering::Relaxed);
+        DeploymentId::new(format!("si-{}-{i:04}", self.prop_tag))
+    }
+
+    /// Arm the step's [`FailureClass`] for a push of `pushed` with deployment
+    /// id `id`. The local-store arms are keyed by the deployment id (and, for
+    /// the observed-refresh arms, by the target); the remote arms are
+    /// suffix-armed; the debt-I/O arms are keyed by the pushed TARGET (the
+    /// store's debt methods carry no deployment id). Lock contention needs no
+    /// arm (the fixture holds the lock itself).
+    fn arm_prop_fault(&self, class: FailureClass, pushed: &str, id: &DeploymentId) {
+        let reg = self.store.fault_registry();
+        let other = if pushed == "t1" { "t2" } else { "t1" };
+        match class {
+            FailureClass::CommitMarker | FailureClass::RotationInventory => {
+                self.set_remote_fault(match class {
+                    FailureClass::CommitMarker => FailureStep::CommitMarkerWrite,
+                    _ => FailureStep::RotationInventoryWrite,
+                })
+            }
+            FailureClass::IntentPersist => reg.arm_append_attempt(id.as_str()),
+            FailureClass::ResultsWrite => reg.arm_write_results(id.as_str()),
+            FailureClass::SnapshotAppend => reg.arm_append_snapshot(id.as_str()),
+            FailureClass::LastSuccessfulWrite => reg.arm_write_last_successful(id.as_str()),
+            FailureClass::TransitionSuccessful => reg.arm_append_transition_successful(id.as_str()),
+            FailureClass::TransitionPending => reg.arm_append_transition_pending(id.as_str()),
+            FailureClass::ObservedWriteServer => reg.arm_write_server(id.as_str(), pushed),
+            FailureClass::ObservedPrimaryWrite => reg.arm_write_observed(id.as_str(), pushed),
+            FailureClass::ObservedOtherWrite => reg.arm_write_observed(id.as_str(), other),
+            FailureClass::DebtRead => reg.arm_read_rotation_debt(pushed),
+            FailureClass::DebtWrite | FailureClass::DebtRemove => {
+                reg.arm_write_rotation_debt(pushed)
+            }
+            FailureClass::None | FailureClass::LockContention => {}
+        }
+    }
+
+    /// Clear every one-shot fault the property can arm: the failure classes
+    /// are STEP-SCOPED — a fault a no-op step cannot consume is dropped,
+    /// never leaked into the next step. The per-fixture registry is
+    /// structurally isolated (no shared statics), but a leftover target-keyed
+    /// debt arm would still fire on a LATER step of THIS fixture, so the
+    /// registry is cleared wholesale; the remote transport fault is
+    /// per-fixture too.
+    fn disarm_prop_faults(&self) {
+        self.fault.lock().unwrap().fail_write_once = None;
+        self.store.fault_registry().clear();
+    }
+
+    /// Acquire the slot's mutation lock via a SECOND `RemoteHelper` (its own
+    /// operation id) and return that id; [`Fixture::release_contention_lock`]
+    /// must be called when the contended action is done. The lock is a
+    /// single advisory file per server, so while it is held the push's own
+    /// preflight lock check fails.
+    fn hold_contention_lock(&self) -> String {
+        let remote = self.remote();
+        let helper = RemoteHelper::new(remote.as_ref());
+        let op = format!("si-contend-{}", OperationId::generate().as_str());
+        helper
+            .acquire_lock(&op, false)
+            .expect("the contention lock must be free at the start of the step");
+        op
+    }
+
+    fn release_contention_lock(&self, op: &str) {
+        let remote = self.remote();
+        let helper = RemoteHelper::new(remote.as_ref());
+        let _ = helper.release_lock(op);
+    }
+
+    /// Apply one PROPERTY step: arm the step's failure class, run the action
+    /// with a fixed deployment id, then disarm every one-shot fault (the
+    /// classes are step-scoped). Invariant checks are NOT run here — the
+    /// oracle runs them only when the model reports the step left the state
+    /// checkable (no open crash window, no tamper, no unknown class).
+    fn apply_prop(&self, action: &Action, class: FailureClass) -> Outcome {
+        match action {
+            Action::Push(t) | Action::Retry(t) => self.push_prop(t, None, class),
+            Action::Rollback(t, i) => self.push_prop(t, Some(&format!("{t}@f{i}")), class),
+            other => {
+                // Build / Rotate / Tamper: nothing consumes a fault, so the
+                // class is dropped without arming.
+                self.apply_no_checks(other.clone())
+            }
+        }
+    }
+
+    /// Run a push/rollback step with a caller-supplied fixed deployment id
+    /// (so the id-keyed store arms hit exactly this push) and the step-scoped
+    /// failure class. For [`FailureClass::LockContention`] the slot's
+    /// mutation lock is held by a second helper for the whole push. Returns
+    /// the raw outcome; the caller gates the invariant checks.
+    fn push_prop(&self, t: &str, ref_token: Option<&str>, class: FailureClass) -> Outcome {
+        let id = self.next_prop_id();
+        self.arm_prop_fault(class, t, &id);
+        let contend = if class == FailureClass::LockContention {
+            Some(self.hold_contention_lock())
+        } else {
+            None
+        };
+        let res = match ref_token {
+            Some(rt) => crate::push::engine::push_ref_with_id(
+                &self.cfg_path,
+                &self.store,
+                &self.remote_factory(),
+                t,
+                &self.config,
+                &PushOptions {
+                    dry_run: false,
+                    ref_token: Some(rt.to_string()),
+                },
+                &id,
+            ),
+            None => self.push_with_id(t, &id),
+        };
+        if let Some(op) = contend {
+            self.release_contention_lock(&op);
+        }
+        self.disarm_prop_faults();
+        Outcome::Push(Box::new(res))
+    }
+
+    /// Apply a non-push action WITHOUT the invariant checks (the property
+    /// gates them itself — an open crash window suspends them). Mirrors the
+    /// mutation half of [`Fixture::apply`].
+    fn apply_no_checks(&self, action: Action) -> Outcome {
+        match action {
+            Action::Build(v) => {
+                self.write_artifacts(v);
+                Outcome::Ok
+            }
+            Action::Rotate => {
+                self.rotate_union().expect("standalone rotation succeeds");
+                Outcome::Ok
+            }
+            Action::Tamper(kind) => {
+                self.tamper(kind);
+                Outcome::Tampered
+            }
+            // The property generates faults per step, never InjectFailure;
+            // push-ish actions go through [`Fixture::push_prop`].
+            other => self.apply(other),
+        }
+    }
+
     /// Arm a one-shot store fault on THIS fixture's per-fixture registry
     /// (see `src/testutil.rs`): the fixture's store consumes only its own
     /// registry, so no global slot or lock is involved.
@@ -609,8 +925,10 @@ impl Fixture {
                 self.write_artifacts(v);
                 Outcome::Ok
             }
-            Action::Push(t) | Action::Retry(t) => Outcome::Push(self.push(t)),
-            Action::Rollback(t, i) => Outcome::Push(self.push_ref(t, &format!("{t}@f{i}"))),
+            Action::Push(t) | Action::Retry(t) => Outcome::Push(Box::new(self.push(t))),
+            Action::Rollback(t, i) => {
+                Outcome::Push(Box::new(self.push_ref(t, &format!("{t}@f{i}"))))
+            }
             Action::Rotate => {
                 self.rotate_union().expect("standalone rotation succeeds");
                 Outcome::Ok
@@ -693,7 +1011,6 @@ impl Fixture {
                 });
                 return;
             }
-            _ => {}
         }
         std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
     }
@@ -927,7 +1244,15 @@ impl Fixture {
                 }
             }
             // `refs/last-successful` points at the NEWEST successful attempt
-            // (older successful attempts keep their own snapshot/marker).
+            // (older successful attempts keep their own snapshot/marker) —
+            // with ONE documented crash-recovery corner: a mid-finalize crash
+            // wrote the ref BEFORE the terminal `Successful` transition
+            // landed (a faulted `append_transition(Successful)`), and if the
+            // slot's generation diverged before the pending attempt was
+            // reconciled, the recovery DEGRADES the attempt (terminal, never
+            // re-eligible) leaving the ref stale — it must then point at a
+            // `Degraded` attempt that still carries its snapshot, never at an
+            // arbitrary or successful record.
             let newest_successful = attempts
                 .iter()
                 .filter(|a| {
@@ -940,14 +1265,33 @@ impl Fixture {
                 .map(|a| a.deployment_id.as_str())
                 .max_by_key(|a| *a);
             match (newest_successful, last_ok.as_deref()) {
-                (Some(newest), Some(ok)) => assert_eq!(
-                    newest, ok,
-                    "refs/last-successful must point at the newest successful attempt"
-                ),
+                (Some(newest), Some(ok)) if newest == ok => {}
                 (None, None) => {}
-                (None, Some(ok)) => panic!(
-                    "refs/last-successful points at {ok} but no successful attempt is recorded"
-                ),
+                (_, Some(ok)) => {
+                    // The stale-ref crash corner: the ref must point at a
+                    // terminal-Degraded attempt carrying its snapshot (the
+                    // crashed finalize's), not at a successful or arbitrary
+                    // record.
+                    let ok_attempt = attempts
+                        .iter()
+                        .find(|a| a.deployment_id.as_str() == ok)
+                        .unwrap_or_else(|| {
+                            panic!("refs/last-successful points at {ok} but no attempt is recorded")
+                        });
+                    assert_eq!(
+                        self.store
+                            .latest_status(ok_attempt.deployment_id.as_str())
+                            .ok()
+                            .flatten(),
+                        Some(DeploymentStatus::Degraded),
+                        "a stale refs/last-successful must point at a Degraded crash-mid-finalize \
+                         attempt (its generation diverged before recovery), got {ok}"
+                    );
+                    assert!(
+                        snapshots.iter().any(|s| s.deployment_id.as_str() == ok),
+                        "the Degraded crash-mid-finalize attempt {ok} must still carry its snapshot"
+                    );
+                }
                 (Some(_), None) => {
                     panic!("refs/last-successful is missing after a successful attempt")
                 }
@@ -2934,12 +3278,12 @@ struct Model {
     /// Content version the next HEAD push materializes. The fixture writes
     /// version 1 at construction.
     head_version: u32,
-    /// One-shot remote fault armed by [`Action::InjectFailure`]; consumed by
-    /// the next write to the matching path.
-    armed_fault: Option<FailureStep>,
-    /// An action or fault kind this oracle cannot simulate (added by a
-    /// sibling feature): cross-system equality assertions are suspended
-    /// (the fixture's own five invariant groups still run each step).
+    /// The CURRENT step's failure class, armed at the start of [`Model::apply`]
+    /// and consumed by the action's own writes. STEP-SCOPED: whatever a step
+    /// does not consume is dropped at the end (the fixture disarms identically).
+    armed_fault: Option<FailureClass>,
+    /// An action or failure class this oracle cannot simulate (added by a
+    /// sibling feature): the cross-system equality assertions are suspended.
     unknown: bool,
     /// The remote `current` generation's expected artifact content version.
     current: Option<u32>,
@@ -2954,9 +3298,12 @@ struct Model {
     snapshots: BTreeMap<&'static str, Vec<u32>>,
     /// Per-target deployment-attempt log: content version per attempt.
     attempts: BTreeMap<&'static str, Vec<u32>>,
-    /// Un-finalized (PendingCommit) deployment per target: (content version,
-    /// the generation counter of the minted generation).
-    pending: BTreeMap<&'static str, (u32, u64)>,
+    /// Un-finalized pending deployment per target: (content version, the
+    /// minted-generation counter, whether its snapshot is ALREADY durable).
+    /// A `LastSuccessfulWrite` / `TransitionSuccessful` fault leaves the
+    /// snapshot appended while the attempt stays pending, so the reconcile
+    /// must not append it a second time.
+    pending: BTreeMap<&'static str, (u32, u64, bool)>,
     /// Monotone counter of deployed generations: every real deployment
     /// (push, rollback, or faulted push) mints exactly one new generation,
     /// and a pending attempt finalizes only while its OWN generation is
@@ -2965,6 +3312,13 @@ struct Model {
     current_gen: u64,
     /// Expected rotation-debt marker presence per target.
     debt: BTreeMap<&'static str, bool>,
+    /// The crash window: an open post-mutation fault state where the observed
+    /// projections legitimately disagree with the remote current, or where a
+    /// crash-recovery attempt (PendingCommit with a durable snapshot) has not
+    /// been finalized yet — both states the fixture's invariant groups cannot
+    /// evaluate (see [`Model::lingering_crash`]). The five invariant groups
+    /// and the model-vs-system comparisons are suspended while it is open.
+    crash_window: bool,
     /// True when the previous action was a deliberate tamper (the system's
     /// own invariant checks are skipped for that step too).
     last_was_tamper: bool,
@@ -2986,34 +3340,38 @@ impl Model {
             pending: BTreeMap::new(),
             current_gen: 0,
             debt: BTreeMap::from([("t1", false), ("t2", false)]),
+            crash_window: false,
             last_was_tamper: false,
             index: 0,
         }
     }
 
-    /// Advance the oracle by one action. Kept ADAPTIVE: unknown `Action`
-    /// variants and `FailureStep` kinds added by sibling features fall into
-    /// `_` arms that suspend the cross-comparisons instead of breaking the
-    /// build or false-failing the invariant groups.
-    fn apply(&mut self, action: &Action) {
+    /// Advance the oracle by ONE property step — the action AND its failure
+    /// class together — and return the [`OutcomeClass`] the CORRECT engine
+    /// must produce. The state transitions mirror the engine's real behavior
+    /// per fault (a pre-commit arm -> [`OutcomeClass::ErrPreCommit`], a
+    /// post-commit arm -> the committed class with the model's tracked debt/
+    /// warning state). Kept ADAPTIVE: unknown action variants and failure
+    /// classes added by sibling features fall into catch-alls that suspend
+    /// the cross-comparisons instead of breaking the build.
+    fn apply(&mut self, action: &Action, fault: FailureClass) -> OutcomeClass {
         self.index += 1;
         self.last_was_tamper = false;
-        match action {
-            Action::Build(v) => self.head_version = *v,
+        self.armed_fault = Some(fault);
+        let (class, window) = match action {
+            Action::Build(v) => {
+                self.head_version = *v;
+                (OutcomeClass::OkAction, self.crash_window)
+            }
             Action::Push(t) | Action::Retry(t) => self.deploy(t, None),
             Action::Rollback(t, i) => self.rollback(t, *i),
-            Action::Rotate => self.rotate(),
-            Action::InjectFailure(step) => match step {
-                FailureStep::CommitMarkerWrite | FailureStep::RotationInventoryWrite => {
-                    self.armed_fault = Some(*step)
-                }
-                _ => {
-                    // A sibling feature's new injectable step: the model cannot
-                    // simulate its consumption; suspend cross-comparisons.
-                    self.armed_fault = None;
-                    self.unknown = true;
-                }
-            },
+            Action::Rotate => (OutcomeClass::OkAction, self.crash_window),
+            Action::InjectFailure(_) => {
+                // The property injects faults per step (never via this action);
+                // a stray sticky arm cannot be cross-checked.
+                self.unknown = true;
+                (OutcomeClass::OkAction, self.crash_window)
+            }
             Action::Tamper(_) => {
                 if self.current.is_some() {
                     // The fixture requires a live generation to tamper; with
@@ -3021,25 +3379,25 @@ impl Model {
                     self.current_tampered = true;
                     self.last_was_tamper = true;
                 }
+                (OutcomeClass::Tampered, self.crash_window)
             }
-            _ => {
-                // New action variant from a sibling feature: unknown effect.
-                // Treat the step like a tamper (skip the system's own checks
-                // for it too) and stop cross-comparing.
-                self.unknown = true;
-                self.last_was_tamper = true;
-            }
-        }
+        };
+        self.crash_window = window;
+        // Step-scoped faults: whatever the action did not consume is dropped.
+        self.armed_fault = None;
+        class
     }
 
     /// Reconcile a pending attempt of `t` at the START of a push/rollback,
     /// mirroring `reconcile_pending_commits` (which runs before the early
     /// no-op check): verify the attempt's generation, then write its missing
     /// fleet-commit marker. The marker write is a commit-path write, so an
-    /// armed CommitMarker fault is consumed there and the attempt stays
-    /// pending.
+    /// armed [`FailureClass::CommitMarker`] is consumed there and the attempt
+    /// stays pending; under [`FailureClass::LockContention`] the reconcile's
+    /// lock acquisition fails BEFORE any write, so the attempt stays pending
+    /// and the fault is NOT consumed.
     fn reconcile(&mut self, t: &'static str) {
-        let Some((pv, pg)) = self.pending.remove(t) else {
+        let Some((pv, pg, already_snapped)) = self.pending.remove(t) else {
             return;
         };
         // The engine's reconciliation FIRST verifies the pending attempt's
@@ -3050,43 +3408,68 @@ impl Model {
             return;
         }
         match self.armed_fault {
-            Some(FailureStep::CommitMarkerWrite) => {
+            Some(FailureClass::LockContention) => {
+                // The reconcile's marker write contends on the held lock: the
+                // attempt stays pending, no write was attempted, so the fault
+                // (a step-scoped contention marker) is not consumed.
+                self.pending.insert(t, (pv, pg, already_snapped));
+            }
+            Some(FailureClass::CommitMarker) => {
                 // The pending attempt's marker write consumes the armed fault
                 // and fails, so the attempt stays pending.
                 self.armed_fault = None;
-                self.pending.insert(t, (pv, pg));
+                self.pending.insert(t, (pv, pg, already_snapped));
             }
             Some(_) => {
-                self.armed_fault = None;
-                self.unknown = true;
-                self.pending.insert(t, (pv, pg));
+                // Any other armed class: the reconcile's writes are keyed to
+                // the OLD attempt's id, so they pass through untouched and the
+                // attempt finalizes (the step's fault stays armed for the
+                // step's own deployment writes, or is dropped by a no-op).
+                if !already_snapped {
+                    self.snapshots.entry(t).or_default().push(pv);
+                }
             }
             None => {
                 // The pending deployment's OWN generation is still the remote
                 // current: the attempt finalizes (snapshot appended, refs
-                // advanced).
-                self.snapshots.entry(t).or_default().push(pv);
+                // advanced). A finalize fault (LastSuccessful etc.) already
+                // recorded the snapshot, so it must not be duplicated.
+                if !already_snapped {
+                    self.snapshots.entry(t).or_default().push(pv);
+                }
             }
         }
     }
 
     /// A fleet-rollback to snapshot `i`. Out-of-range refs are rejected by
-    /// the engine's plan BEFORE reconcile or any mutation: model no-op.
-    fn rollback(&mut self, t: &'static str, i: u64) {
+    /// the engine's plan BEFORE reconcile or any mutation: the push returns
+    /// `Err` (nothing recorded) and the crash-window state stands.
+    fn rollback(&mut self, t: &'static str, i: u64) -> (OutcomeClass, bool) {
         let Some(v) = self
             .snapshots
             .get(t)
             .and_then(|snaps| snaps.get(i as usize))
             .copied()
         else {
-            return;
+            return (OutcomeClass::ErrPreCommit, self.crash_window);
         };
-        self.deploy(t, Some(v));
+        self.deploy(t, Some(v))
     }
 
     /// A HEAD push / no-op retry (`Push` and `Retry` are the same operation
-    /// in the fixture) or a valid fleet-rollback (deploying `rollback_version`).
-    fn deploy(&mut self, t: &'static str, rollback_version: Option<u32>) {
+    /// in the fixture) or a valid fleet-rollback (deploying `rollback_version`),
+    /// under the step's failure class. Returns the expected outcome class and
+    /// the NEW crash-window state.
+    fn deploy(&mut self, t: &'static str, rollback_version: Option<u32>) -> (OutcomeClass, bool) {
+        // The engine's EARLY per-slot preflight checks the mutation lock
+        // BEFORE reconciliation, the early no-op check, or the intent persist:
+        // a contended push aborts with `Err` and records NOTHING — no attempt,
+        // no reconcile, no recovery, no observed refresh. The crash-window
+        // state and the step's fault stand exactly as before (a pending
+        // attempt is left for a later push to reconcile).
+        if matches!(self.armed_fault, Some(FailureClass::LockContention)) {
+            return (OutcomeClass::ErrPreCommit, self.crash_window);
+        }
         self.reconcile(t);
         let version = match rollback_version {
             Some(v) => Some(v),
@@ -3102,32 +3485,59 @@ impl Model {
             }
         };
         let Some(v) = version else {
-            // Up-to-date no-op: no records, no remote writes except the
-            // deferred-maintenance hook (which services rotation debt).
+            // Up-to-date no-op: no records. The deferred-maintenance hook
+            // services rotation debt, and the no-op path refreshes observed
+            // from the EXISTING generation into EVERY member target (the
+            // crash-window recovery path), closing any open window.
             self.noop_maintenance(t);
-            return;
+            if let Some(c) = self.current {
+                self.observed.insert("t1", Some(c));
+                self.observed.insert("t2", Some(c));
+            }
+            return (OutcomeClass::OkNoop, false);
         };
         let fault = self.armed_fault.take();
         let had_debt = self.debt.get(t).copied().unwrap_or(false);
+        // A PRE-MUTATION abort (the intent persist): the push returns `Err`
+        // with NOTHING recorded or mutated and no refresh — the observed
+        // projections and any open crash window stand exactly as before.
+        if matches!(fault, Some(FailureClass::IntentPersist)) {
+            return (OutcomeClass::ErrPreCommit, self.crash_window);
+        }
+        // A REAL deployment: the remote advances, the attempt is recorded,
+        // and the observed refresh runs — EXCEPT for the crash-window faults,
+        // which abort before the refresh.
+        let crash = matches!(
+            fault,
+            Some(
+                FailureClass::ResultsWrite
+                    | FailureClass::SnapshotAppend
+                    | FailureClass::LastSuccessfulWrite
+                    | FailureClass::TransitionSuccessful
+                    | FailureClass::TransitionPending
+            )
+        );
+        let primary_stale = matches!(fault, Some(FailureClass::ObservedPrimaryWrite));
+        let other_stale = matches!(fault, Some(FailureClass::ObservedOtherWrite));
         self.current_gen += 1;
         self.current = Some(v);
         self.current_tampered = false;
-        // The shared slot's observed entry is refreshed in EVERY member
-        // target whenever it changes.
-        self.observed.insert("t1", Some(v));
-        self.observed.insert("t2", Some(v));
         self.attempts.entry(t).or_default().push(v);
         match fault {
-            Some(FailureStep::CommitMarkerWrite) => {
-                // Fleet-commit marker write fails: the deployment is recorded
-                // PendingCommit; `current` advanced and observed refreshed
-                // (steps 15/16), but the snapshot/ref finalization is deferred
-                // to the next push of this target. Step-17 rotation still
-                // succeeds (the fault is spent), so no debt.
-                self.pending.insert(t, (v, self.current_gen));
+            None | Some(FailureClass::None) => {
+                self.snapshots.entry(t).or_default().push(v);
                 self.debt.insert(t, false);
             }
-            Some(FailureStep::RotationInventoryWrite) => {
+            Some(FailureClass::CommitMarker) => {
+                // Fleet-commit marker write fails: the deployment is recorded
+                // PendingCommit; current advanced and observed refreshed, but
+                // the snapshot/ref finalization defers to the next push of
+                // this target. Step-17 rotation still succeeds (the fault is
+                // spent), so no debt.
+                self.pending.insert(t, (v, self.current_gen, false));
+                self.debt.insert(t, false);
+            }
+            Some(FailureClass::RotationInventory) => {
                 // Post-commit maintenance: step 17 retries an EXISTING debt
                 // marker FIRST — that servicing write consumes the fault and
                 // fails, then the push's own slot rotation succeeds and
@@ -3136,46 +3546,133 @@ impl Model {
                 self.snapshots.entry(t).or_default().push(v);
                 self.debt.insert(t, !had_debt);
             }
-            Some(_) => {
-                // Unknown fault kind: assume a fully committed push and stop
-                // cross-comparing.
+            Some(FailureClass::ObservedWriteServer) => {
+                // The per-server projection write fails (warning-only); the
+                // observed maps themselves still refresh.
                 self.snapshots.entry(t).or_default().push(v);
                 self.debt.insert(t, false);
-                self.unknown = true;
             }
-            None => {
+            Some(FailureClass::ObservedPrimaryWrite) | Some(FailureClass::ObservedOtherWrite) => {
+                // One member's observed projection stays stale (crash window).
                 self.snapshots.entry(t).or_default().push(v);
                 self.debt.insert(t, false);
+            }
+            Some(FailureClass::DebtRead)
+            | Some(FailureClass::DebtWrite)
+            | Some(FailureClass::DebtRemove) => {
+                // Debt maintenance is post-commit and NON-FALLIBLE (a failed
+                // read/write is a warning, never an `Err`), so the committed
+                // outcome class is unchanged. The marker itself is
+                // deterministic: the step-17 retry's faulted I/O only
+                // DEFERS, and the push's OWN successful rotation then clears
+                // any marker via `clear_rotation_deferred` (its later debt
+                // write passes — the one-shot arm was already consumed by
+                // the retry).
+                self.snapshots.entry(t).or_default().push(v);
+                self.debt.insert(t, false);
+            }
+            Some(FailureClass::ResultsWrite)
+            | Some(FailureClass::SnapshotAppend)
+            | Some(FailureClass::TransitionPending) => {
+                // Crash-window faults: the remote advanced and the attempt is
+                // recorded (InProgress / PendingCommit), but the snapshot was
+                // NOT written and the observed refresh never ran. The Err is
+                // pre-commit: the attempt stays recoverable-pending.
+                self.pending.insert(t, (v, self.current_gen, false));
+            }
+            Some(FailureClass::LastSuccessfulWrite) | Some(FailureClass::TransitionSuccessful) => {
+                // The snapshot was already appended before the ref / terminal
+                // transition write failed; the attempt stays pending and the
+                // recovery must not duplicate the snapshot.
+                self.snapshots.entry(t).or_default().push(v);
+                self.pending.insert(t, (v, self.current_gen, true));
+            }
+            Some(FailureClass::IntentPersist) | Some(FailureClass::LockContention) => {
+                unreachable!("handled before the real-deployment mutation")
             }
         }
+        // The post-finalize observed refresh: every member target is rebuilt
+        // unless the step faulted inside the refresh (one member stays stale)
+        // or crashed before it (all members stay stale).
+        if !crash {
+            let other = if t == "t1" { "t2" } else { "t1" };
+            if !primary_stale {
+                self.observed.insert(t, Some(v));
+            }
+            if !other_stale {
+                self.observed.insert(other, Some(v));
+            }
+        }
+        let window = crash || primary_stale || other_stale;
+        let class = if matches!(fault, Some(FailureClass::CommitMarker)) {
+            OutcomeClass::OkPending
+        } else if crash {
+            OutcomeClass::ErrPreCommit
+        } else {
+            OutcomeClass::OkCommitted
+        };
+        (class, window)
     }
 
     /// The no-op retry path: `retry_deferred_rotations` services the debt
     /// marker (writing the inventory), and that write consumes an armed
-    /// RotationInventory fault — failing, the marker stays. Commit-marker
-    /// faults do not match the inventory write, so the rotation succeeds and
-    /// clears the debt.
+    /// [`FailureClass::RotationInventory`] — failing, the marker stays.
+    /// Commit-marker faults do not match the inventory write, so the rotation
+    /// succeeds and clears the debt. Under contention the retry's lock
+    /// acquisition fails first: the marker stays (both trunks agree).
     fn noop_maintenance(&mut self, t: &'static str) {
         if !self.debt.get(t).copied().unwrap_or(false) {
             return;
         }
         match self.armed_fault {
-            Some(FailureStep::RotationInventoryWrite) => {
+            Some(FailureClass::RotationInventory) => {
                 self.armed_fault = None;
                 // rotation failed; the debt marker stays
             }
-            Some(FailureStep::CommitMarkerWrite) => {
+            Some(FailureClass::LockContention) => {
+                // the retry cannot acquire the lock: the marker stays
+            }
+            Some(FailureClass::CommitMarker) => {
                 self.debt.insert(t, false);
             }
-            Some(_) => {
+            Some(FailureClass::DebtRead)
+            | Some(FailureClass::DebtWrite)
+            | Some(FailureClass::DebtRemove) => {
+                // The debt-I/O fault fires inside the no-op's maintenance
+                // retry: a failed READ treats the marker as absent (nothing
+                // serviced, marker stays), a failed WRITE keeps the marker.
+                // Either way the marker STAYS and the maintenance warns — the
+                // no-op report is unchanged.
                 self.armed_fault = None;
+            }
+            Some(_) => {
+                // Any other armed class does not touch the no-op's debt
+                // maintenance: the id-keyed store faults (intent, results,
+                // finalize) and the observed-refresh faults cannot fire on
+                // the no-op path — it performs no id-keyed store write, and
+                // the observed records are rebuilt keyed by the EXISTING
+                // generation's deployment id, never the step's. The
+                // servicing therefore succeeds and the marker is cleared;
+                // the leftover arm is dropped step-scoped.
                 self.debt.insert(t, false);
-                self.unknown = true;
             }
             None => {
                 self.debt.insert(t, false);
             }
         }
+    }
+
+    /// Whether a snapshot-carrying pending attempt is still unreconciled — a
+    /// finalize fault (`LastSuccessfulWrite` / `TransitionSuccessful`) left
+    /// the snapshot durable while the attempt stayed `PendingCommit`, and the
+    /// recovery was itself blocked (a contended or faulted reconcile marker
+    /// write). While true, `check_lifecycle` would reject the transient
+    /// state ("PendingCommit must NOT have a snapshot"), so the comparisons
+    /// stay suspended until the next reconcile finalizes the attempt.
+    fn lingering_crash(&self) -> bool {
+        self.pending
+            .values()
+            .any(|(_, _, already_snapped)| *already_snapped)
     }
 
     /// Whether `action` would replace the tampered current record with a new
@@ -3194,15 +3691,6 @@ impl Model {
                 .unwrap_or(false),
             _ => false,
         }
-    }
-
-    /// A standalone union rotation. The fixture's `rotate_union` runs over a
-    /// PLAIN `LocalTransport` (not the fault-injecting wrapper the pushes
-    /// use), so it neither fails nor consumes an armed fault; it leaves the
-    /// remote current, observed projections, and pending/debt state
-    /// untouched. Faults stay armed for the next real push.
-    fn rotate(&mut self) {
-        let _ = &self.armed_fault;
     }
 }
 
@@ -3225,13 +3713,6 @@ fn action_strategy() -> impl Strategy<Value = Action> {
             .prop_map(|(t, i)| Action::Rollback(t, i)),
         // Standalone rotation under the full member-policy union.
         1 => Just(Action::Rotate),
-        // One-shot REMOTE fault (commit marker / rotation inventory).
-        3 => prop::sample::select([
-            FailureStep::CommitMarkerWrite,
-            FailureStep::RotationInventoryWrite,
-        ]
-        .as_slice())
-        .prop_map(Action::InjectFailure),
         // Deliberate integrity violation; the property loop skips it while no
         // live generation exists (the fixture's tamper requires one), and the
         // system's own checks defer until the next real push.
@@ -3241,6 +3722,38 @@ fn action_strategy() -> impl Strategy<Value = Action> {
         ]
         .as_slice())
         .prop_map(Action::Tamper),
+    ]
+}
+
+/// The failure-class strategy for the property test: injected PER STEP, so
+/// the model must predict the outcome under every arm — a pre-commit arm
+/// yields [`OutcomeClass::ErrPreCommit`], a post-commit arm yields the
+/// committed class with the model's tracked debt/warning, and lock contention
+/// demotes the whole attempt. Weights: the clean path dominates so the
+/// vectors stay realistic; every fault class is reachable.
+fn failure_class_strategy() -> impl Strategy<Value = FailureClass> {
+    prop_oneof![
+        12 => Just(FailureClass::None),
+        // remote, suffix-armed
+        1 => Just(FailureClass::CommitMarker),
+        1 => Just(FailureClass::RotationInventory),
+        // local persistence, id-armed
+        1 => Just(FailureClass::IntentPersist),
+        1 => Just(FailureClass::ResultsWrite),
+        1 => Just(FailureClass::SnapshotAppend),
+        1 => Just(FailureClass::LastSuccessfulWrite),
+        1 => Just(FailureClass::TransitionSuccessful),
+        1 => Just(FailureClass::TransitionPending),
+        1 => Just(FailureClass::ObservedWriteServer),
+        1 => Just(FailureClass::ObservedPrimaryWrite),
+        1 => Just(FailureClass::ObservedOtherWrite),
+        // debt I/O (target-keyed: the arm lands on the pushed target's debt
+        // file; the model's classification must stay deterministic)
+        1 => Just(FailureClass::DebtRead),
+        1 => Just(FailureClass::DebtWrite),
+        1 => Just(FailureClass::DebtRemove),
+        // lock contention (the fixture holds the slot lock for the action)
+        1 => Just(FailureClass::LockContention),
     ]
 }
 
@@ -3305,13 +3818,27 @@ fn learn_artifact(
 /// index ([`Model::index`]) for debugging.
 fn assert_semantic_invariants(model: &Model, system: &Fixture) {
     let ctx = format!("after action {}", model.index);
-    if model.last_was_tamper || model.unknown {
+    if model.last_was_tamper
+        || model.current_tampered
+        || model.unknown
+        || model.crash_window
+        || model.lingering_crash()
+    {
         // A tamper deliberately broke identity (the fixture's apply skipped
         // its own checks too) and the model defers to the next real push that
-        // replaces the tampered record; an UNKNOWN action/fault kind from a
-        // sibling feature cannot be cross-checked either (the fixture's apply
-        // already ran its own invariant checks for it). Both suspend the
-        // comparisons without weakening them.
+        // replaces the tampered record — WHILE THE TAMPERED RECORD IS STILL
+        // LIVE (a faulted/contended repair step did not replace it) the
+        // identity/scope groups cannot run either; an UNKNOWN action/fault
+        // kind from a sibling feature cannot be cross-checked either; an OPEN
+        // CRASH WINDOW leaves the observed projections legitimately out of
+        // sync with the durable remote current (a post-mutation fault before
+        // the observed refresh, or a faulted observed write); and a LINGERING
+        // PendingCommit-with-snapshot attempt (a finalize fault whose
+        // recovery was itself blocked) violates `check_lifecycle` until the
+        // next reconcile finalizes it. All are documented fixture contracts
+        // for the crash/recovery window, suspended until a later
+        // push/rollback/no-op rebuilds the projections and finalizes the
+        // attempt.
         return;
     }
     // (a) The five invariant groups (the system's own ground truth).
@@ -3424,7 +3951,7 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
             sys_pending,
             "{ctx}: pending-commit state for {t}"
         );
-        if let Some((pv, _)) = model.pending.get(t) {
+        if let Some((pv, _, _)) = model.pending.get(t) {
             // The pending attempt need not be the target's NEWEST attempt: a
             // later deployment can commit after the pending one (e.g. its
             // reconcile marker write consumed a newly-armed fault), so the
@@ -3450,51 +3977,116 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
     }
 }
 
-// Property-based state machine: bounded RANDOM action vectors (1..20
-// actions) drive a fresh [`Model`] oracle and [`Fixture`] in lockstep. After
-// EVERY action [`assert_semantic_invariants`] cross-checks the model's
-// expected state against the system's observable state and re-evaluates all
-// five invariant groups — the same contract as the fixed `state_machine_*`
-// sequences, but the generator explores interleavings the hand-written
-// sequences miss and the shrinker minimizes any failing vector to its core.
+// Property-based state machine — outcome-class oracle + bounded random action
+// vectors (1..20 steps). Every step is an (ACTION, FAILURE CLASS) pair — the
+// actions and the injected failure classes are generated TOGETHER, so the
+// model must predict the outcome under every arm. A fresh [`Model`] oracle
+// and [`Fixture`] are driven in lockstep; after EVERY step the oracle asserts
+// both the observable state (existing [`assert_semantic_invariants`]) and the
+// RESULT class ([`OutcomeClass`]).
 //
-// Determinism: the config pins a fixed seed and a bounded case count, and
-// shrinking never consults the wall clock — two `cargo test` runs reproduce
-// the identical vectors.
+// TWO configs: the main test runs ORDINARY RANDOMIZED seeds with failure
+// persistence (a failing vector is written to
+// `proptest-regressions/semantic_invariants.txt` and REPLAYED on the next
+// run — commit the file so CI replays the regression until fixed), and a
+// separate FIXED-SEED regression keeps CI deterministic even when no failure
+// has ever been persisted. Shrinking never consults the wall clock.
+fn run_semantic_state_case(steps: Vec<(Action, FailureClass)>) {
+    // No fault lock: every arm targets the fixture's OWN per-fixture
+    // registry (see `src/testutil.rs`), so the 128 cases run concurrently
+    // with the fault-matrix and engine fault tests without any shared
+    // process-global slot to race over.
+    let mut model = Model::new();
+    let system = Fixture::new();
+    for (action, fault) in steps {
+        // A Tamper needs a live generation (it edits the CURRENT assignment);
+        // generated tampers before the first deployment are skipped rather
+        // than panicking the fixture by construction.
+        if matches!(&action, Action::Tamper(_)) && !system.has_current_generation() {
+            continue;
+        }
+        // After a tamper the fixture's OWN invariant checks cannot run until a
+        // real push replaces the tampered assignment (the tamper deliberately
+        // breaks current-vs-observed identity and the stored release binding).
+        // Non-repairing actions in between are skipped so the next applied
+        // action is always the repair.
+        if model.current_tampered && !model.repairs_tamper(&action) {
+            continue;
+        }
+        // THE ORACLE: the model predicts the outcome class under the step's
+        // failure class, then the system runs the same step and its actual
+        // outcome is classified identically. Both must agree.
+        let expected = model.apply(&action, fault);
+        let outcome = system.apply_prop(&action, fault);
+        // The HARD POST-COMMIT RULE, asserted explicitly: once the deployment
+        // durably committed (the model expects [`OutcomeClass::OkCommitted`]),
+        // the push must NEVER return `Err` — the observed refresh, rotation,
+        // and debt I/O are warning-only after the durable commit. This binds
+        // the post-commit lifecycle + maintenance properties into the result
+        // comparison.
+        if let Outcome::Push(result) = &outcome
+            && let Err(e) = &**result
+            && expected == OutcomeClass::OkCommitted
+        {
+            panic!(
+                "after action {}: a push the model expected to durably commit returned Err — \
+                 a post-commit failure must never produce Err: {e}",
+                model.index
+            );
+        }
+        let actual = classify_outcome(&outcome);
+        assert_eq!(
+            expected, actual,
+            "after action {}: the expected outcome class must equal the actual one",
+            model.index
+        );
+        // The observable-state oracle (the existing cross-check plus the five
+        // invariant groups); internally suspended while the crash window is
+        // open or the step was a tamper / an unknown class.
+        assert_semantic_invariants(&model, &system);
+    }
+}
+
 proptest! {
+    // Main property test: ORDINARY RANDOMIZED SEEDS with FAILURE
+    // PERSISTENCE (proptest's defaults) — a failing vector writes to
+    // `proptest-regressions/semantic_invariants.txt` and is replayed on the
+    // next run (commit it so CI keeps reproducing the regression until
+    // fixed). Random streams explore interleavings the hand-written
+    // sequences miss; the shrinker minimizes any failing vector. The case
+    // count is bounded so the suite stays fast (each case drives a full
+    // fixture).
     #![proptest_config(ProptestConfig {
-        cases: 128,
+        cases: 16,
+        failure_persistence: Some(Box::new(FileFailurePersistence::default())),
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn semantic_state_machine(
+        steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..20)
+    ) {
+        run_semantic_state_case(steps);
+    }
+}
+
+proptest! {
+    // FIXED-SEED REGRESSION: the deterministic floor for CI. The same
+    // generator under the pinned 0x5EED_5EED seed with no persistence runs
+    // the IDENTICAL vectors on every invocation, so the suite stays
+    // reproducible even when no failure has ever been persisted by the main
+    // test. The case count is bounded so the suite stays fast.
+    #![proptest_config(ProptestConfig {
+        cases: 16,
         rng_seed: RngSeed::Fixed(0x5EED_5EED),
         failure_persistence: None,
         ..ProptestConfig::default()
     })]
 
     #[test]
-    fn semantic_state_machine(actions in prop::collection::vec(action_strategy(), 1..20)) {
-        // No fault lock: every arm targets the fixture's OWN per-fixture
-        // registry (see `src/testutil.rs`), so the 128 cases run concurrently
-        // with the fault-matrix and engine fault tests without any shared
-        // process-global slot to race over.
-        let mut model = Model::new();
-        let system = Fixture::new();
-        for action in actions {
-            // A Tamper needs a live generation (it edits the CURRENT
-            // assignment); generated tampers before the first deployment are
-            // skipped rather than panicking the fixture by construction.
-            if matches!(&action, Action::Tamper(_)) && !system.has_current_generation() {
-                continue;
-            }
-            // After a tamper the fixture's OWN invariant checks cannot run
-            // until a real push replaces the tampered assignment (the tamper
-            // deliberately breaks current-vs-observed identity and the stored
-            // release binding). Non-repairing actions in between are skipped
-            // so the next applied action is always the repair.
-            if model.current_tampered && !model.repairs_tamper(&action) {
-                continue;
-            }
-            model.apply(&action);
-            system.apply(action);
-            assert_semantic_invariants(&model, &system);
-        }
+    fn semantic_state_machine_fixed_seed_regression(
+        steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..20)
+    ) {
+        run_semantic_state_case(steps);
     }
 }

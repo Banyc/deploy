@@ -200,6 +200,15 @@ pub(crate) mod test_faults {
             self.inner.lock().unwrap().len()
         }
 
+        /// Remove EVERY armed fault in this registry. The outcome-oracle
+        /// property test arms one fault per step and disarms the leftovers
+        /// between steps: the target-keyed debt arms are not deployment-id
+        /// scoped, so a fault a step did not consume would otherwise fire on
+        /// a later step of the same fixture.
+        pub(crate) fn clear(&self) {
+            self.inner.lock().unwrap().clear();
+        }
+
         // ---- arm_* convenience surface (historical API) --------------
         //
         // These mirror the historical module-level `arm_<kind>(id)` /
@@ -399,11 +408,11 @@ mod registry_property_tests {
         }
     }
 
-    /// Property test: arbitrary interleavings of arms and consumes over two
-    /// distinct keys. Oracle: each fault is consumed EXACTLY ONCE by its
-    /// matching (kind, id) consume; re-consume does not fire again; a
-    /// mismatched kind or id NEVER fires. Fixed seed + bounded cases for
-    /// deterministic `cargo test` runs (like `src/semantic_invariants.rs`).
+    // Property test: arbitrary interleavings of arms and consumes over two
+    // distinct keys. Oracle: each fault is consumed EXACTLY ONCE by its
+    // matching (kind, id) consume; re-consume does not fire again; a
+    // mismatched kind or id NEVER fires. Fixed seed + bounded cases for
+    // deterministic `cargo test` runs (like `src/semantic_invariants.rs`).
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 256,

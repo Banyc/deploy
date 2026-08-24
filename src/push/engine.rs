@@ -219,6 +219,51 @@ pub(crate) fn push_with_id(
     )
 }
 
+/// Test-only entry point: drive [`push_inner`] for a caller-supplied ref
+/// (`@fN` rollback etc.) with a caller-supplied deployment id, mirroring
+/// [`push_with_id`] for the ref-token path. Lets the state-machine fixture
+/// arm the one-shot store faults (keyed by deployment id) BEFORE a rollback
+/// push runs, so rollback steps can carry the same per-step failure classes
+/// as HEAD pushes.
+#[cfg(test)]
+pub(crate) fn push_ref_with_id(
+    config_path: &Path,
+    store: &LocalStore,
+    factory: &RemoteFactory,
+    target_name: &str,
+    config: &Config,
+    opts: &PushOptions,
+    deployment_id: &DeploymentId,
+) -> Result<PushReport> {
+    let op_id = OperationId::new(format!("op-{}", deployment_id.as_str()));
+    let target = config
+        .targets
+        .get(target_name)
+        .ok_or_else(|| Error::not_found(format!("target '{target_name}'")))?;
+    let project_root = config.project_root(config_path);
+    let mut pref = match &opts.ref_token {
+        Some(t) => history::parse_push_ref(t)?,
+        None => PushRef::Head,
+    };
+    if let PushRef::Fleet { target, .. } = &mut pref
+        && target.as_str().is_empty()
+    {
+        *target = TargetName::new(target_name.to_string());
+    }
+    push_inner(
+        &project_root,
+        store,
+        factory,
+        target_name,
+        &pref,
+        deployment_id,
+        &op_id,
+        config,
+        target,
+        opts,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_inner(
     project_root: &Path,
