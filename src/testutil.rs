@@ -25,20 +25,31 @@
 //! and cannot race the lib tests, so it only needs its own lock to serialize
 //! its own tests within that binary.
 //!
-//! # The fault-arm lock invariant
+//! # Fault injection: per-fixture registries, no process-global slots
 //!
-//! ANY test that ARMS a one-shot [`test_faults`] fault (any `arm_*` call)
-//! must hold [`FAULT_LOCK`] for the entire window from the arm through the
-//! operation that consumes it (the push / store call that must fail). The arm
-//! OVERWRITES the process-global static slot, so two tests arming the same
-//! slot concurrently clobber each other's fault — the deployment-id keying
-//! only protects the CONSUME side, never the arm. The lifecycle fault-matrix
-//! suite, the engine fault tests, and the store fault tests all run
-//! concurrently in ONE process; a private per-module lock does not protect
-//! against the other modules, so every arm+consume window serializes on THIS
-//! single lock (exactly like [`ENV_LOCK`] serializes env mutation). The
-//! consume calls inside the store methods never take the lock themselves;
-//! the arm+consume window the test holds it for covers them.
+//! One-shot store-fault injection lives in [`test_faults`] as a
+//! **per-fixture fault registry** ([`test_faults::FaultRegistry`]) owned by
+//! the [`crate::store::local::LocalStore`] of the fixture under test, NOT in
+//! process-global statics. There are no shared slots and no `FAULT_LOCK`:
+//! two fixtures' registries are distinct objects, so a fault armed in one
+//! fixture can never be consumed (or clobbered) by another fixture's store —
+//! isolation is structural, by construction, and holds under any interleaving
+//! of parallel `cargo test` threads. A store only sees faults ARMED ON ITS
+//! OWN registry (`store.fault_registry().arm_*`), and its store methods
+//! consult exactly that registry (`self.fault_registry.consume(...)`).
+//!
+//! The registry is created empty by `LocalStore::with_base`; a test that
+//! wants an injected fault arms its store's registry immediately before the
+//! operation that must fail. Because the registry is per-fixture, the arm and
+//! the consuming push no longer need to be wrapped in a lock window.
+//!
+//! Mechanical conversion for sibling fault work (e.g. the rotation-debt arms
+//! `arm_read_rotation_debt` / `arm_write_rotation_debt`): the registry keeps
+//! the historical `arm_<kind>(id)` (and `arm_<kind>(id, target)`) method
+//! surface, so a call site `test_faults::arm_<kind>(id)` converts by changing
+//! only the receiver: `store.fault_registry().arm_<kind>(id)`. The store
+//! method's consume hook converts to a one-line registry call:
+//! `self.fault_registry.consume(FaultKind::<Kind>, id)`.
 
 use std::sync::Mutex;
 
@@ -46,211 +57,419 @@ use std::sync::Mutex;
 /// module docs for the invariant.
 pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// THE lock guarding every test that arms a [`test_faults`] one-shot fault
-/// in the lib test binary. See the module docs for the invariant: hold it
-/// from the `arm_*` call through the consuming operation, so no concurrently
-/// running test can clobber the armed slot (or consume an arm meant for
-/// another deployment id).
-pub(crate) static FAULT_LOCK: Mutex<()> = Mutex::new(());
-
 /// Test-only one-shot fault injection for crash-mid-finalization tests.
 ///
-/// Arm a fault keyed by the DEPLOYMENT ID of the attempt under test; the NEXT
-/// matching store call fails exactly once (and disarms itself), while every
-/// other call — including identical methods for different deployment IDs from
-/// concurrently running tests — passes through untouched. Keying by deployment
-/// ID keeps the in-crate engine tests deterministic under parallel `cargo test`
-/// execution: no other test can consume a fault armed for a specific attempt.
+/// A fault is a one-shot arm keyed by the DEPLOYMENT ID of the attempt under
+/// test (the two-part faults additionally by TARGET): the NEXT matching store
+/// call fails exactly once (and disarms itself), while every other call —
+/// including identical methods for different deployment IDs from any other
+/// fixture, concurrently running — passes through untouched.
 ///
-/// Faults exist for the intent persist (`arm_append_attempt`), the outcomes
-/// store (`arm_write_results`), the snapshot append, `refs/last-successful`,
-/// and status-qualified transition appends (`arm_append_transition`,
-/// `arm_append_transition_successful`, `arm_append_transition_pending`). The
-/// post-commit observed-refresh faults (`arm_write_server`,
-/// `arm_write_observed`) are additionally keyed by TARGET, so a test can arm
-/// the primary target's `write_observed` (the push's own target) or an other
-/// member target's independently. The post-commit rotation-debt faults
-/// (`arm_read_rotation_debt`, `arm_write_rotation_debt`) are keyed by TARGET
-/// alone — the debt methods carry no deployment id — so an arming test must
-/// hold [`FAULT_LOCK`] for the arm->consume window AND push a target no other
-/// test pushes, keeping the target-keyed consume deterministic.
+/// Faults exist for the `IntentPersist` ([`FaultKind::AppendAttempt`]), the
+/// outcomes store ([`FaultKind::WriteResults`]), the snapshot append, the
+/// `refs/last-successful` write, and the status-qualified transition appends
+/// ([`FaultKind::AppendTransition`],
+/// [`FaultKind::AppendTransitionSuccessful`],
+/// [`FaultKind::AppendTransitionPending`]). The post-commit observed-refresh
+/// faults ([`FaultKind::WriteServer`], [`FaultKind::WriteObserved`]) are
+/// additionally keyed by TARGET, so a test can fault the primary target's
+/// `write_observed` (the push's own target) or an other member target's
+/// independently. The rotation-maintenance arms
+/// ([`FaultKind::ReadRotationDebt`], [`FaultKind::WriteRotationDebt`]) are
+/// keyed by TARGET (the debt file lives under `targets/<target>/`).
 ///
-/// The keying protects the CONSUME side only: the `arm_*` functions
-/// OVERWRITE the slot, so every arming test must hold [`FAULT_LOCK`] from the
-/// arm through the consuming operation (see the module docs).
+/// ISOLATION IS STRUCTURAL: a [`FaultRegistry`] belongs to exactly one
+/// fixture (via its store); there are no process-global slots and no
+/// FAULT_LOCK-style lock to hold. Two fixtures' arms can never interact,
+/// so the fault-matrix, engine, and store fault tests run safely in parallel.
 #[cfg(test)]
 pub(crate) mod test_faults {
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
-    fn arm(fault: &Mutex<Option<String>>, deployment_id: &str) {
-        *fault.lock().unwrap() = Some(deployment_id.to_string());
+    /// The distinct store operations that can be faulted. Each kind is armed
+    /// and consumed on a single [`FaultRegistry`], keyed by deployment id
+    /// (and, for the observed-refresh kinds, additionally by target).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub(crate) enum FaultKind {
+        /// `append_attempt` — the intent persist, the FIRST store I/O of a
+        /// push (before any remote mutation).
+        AppendAttempt,
+        /// `write_results` — the outcomes store, written once after the
+        /// mutation loop.
+        WriteResults,
+        /// `append_snapshot` — the first persistence step of the shared
+        /// replay-safe finalizer.
+        AppendSnapshot,
+        /// `write_last_successful` — the second persistence step of the
+        /// shared finalizer.
+        WriteLastSuccessful,
+        /// `append_transition` — any transition append.
+        AppendTransition,
+        /// `append_transition` recording a `Successful` status (the terminal
+        /// finalizer step).
+        AppendTransitionSuccessful,
+        /// `append_transition` recording a `PendingCommit` status (the
+        /// recoverable finalize marker).
+        AppendTransitionPending,
+        /// Post-commit observed-refresh per-server record write
+        /// (`servers/<id>.json`), keyed by (deployment id, target).
+        WriteServer,
+        /// Post-commit observed-refresh observed record write
+        /// (`targets/<target>/observed.json`), keyed by (deployment id,
+        /// target).
+        WriteObserved,
+        /// `read_rotation_debt` (rotation maintenance debt read), keyed by
+        /// target.
+        ReadRotationDebt,
+        /// `write_rotation_debt` (rotation maintenance debt write), keyed by
+        /// target.
+        WriteRotationDebt,
     }
 
-    /// Arm a one-shot fault keyed by deployment id AND target. The observed
-    /// refresh writes several per-target records after the commit point; the
-    /// target half of the key lets a test fault exactly the operation it
-    /// means to (e.g. the primary target's `write_observed` vs. an other
-    /// member's) without a concurrent test pushing the same target with a
-    /// different deployment id ever consuming it.
-    fn arm2(fault: &Mutex<Option<(String, String)>>, deployment_id: &str, target: &str) {
-        *fault.lock().unwrap() = Some((deployment_id.to_string(), target.to_string()));
+    /// A per-fixture one-shot fault registry.
+    ///
+    /// Storage: a `Mutex<BTreeMap<(FaultKind, String, Option<String>), ()>>`
+    /// mapping each armed (kind, deployment-id[, target]) key to a one-shot
+    /// marker. Arming inserts the key; the matching consume removes it and
+    /// returns `true` (the fault FIRED and is now disarmed); any other
+    /// consume returns `false` and leaves the key armed. The map is
+    /// deterministic (BTreeMap) and the mutex makes the registry safe to
+    /// share; two registries are always disjoint objects, so two fixtures can
+    /// never interfere.
+    #[derive(Default)]
+    pub(crate) struct FaultRegistry {
+        inner: Mutex<BTreeMap<(FaultKind, String, Option<String>), ()>>,
     }
 
-    /// Arm the next `append_snapshot` call for `deployment_id` to fail once.
-    pub(crate) fn arm_append_snapshot(deployment_id: &str) {
-        arm(&FAIL_APPEND_SNAPSHOT, deployment_id);
+    impl FaultRegistry {
+        /// Arm a one-shot fault keyed by deployment id (no target half).
+        pub(crate) fn arm(&self, kind: FaultKind, deployment_id: &str) {
+            self.inner
+                .lock()
+                .unwrap()
+                .insert((kind, deployment_id.to_string(), None), ());
+        }
+
+        /// Arm a one-shot fault keyed by deployment id AND target.
+        pub(crate) fn arm_target(&self, kind: FaultKind, deployment_id: &str, target: &str) {
+            self.inner.lock().unwrap().insert(
+                (kind, deployment_id.to_string(), Some(target.to_string())),
+                (),
+            );
+        }
+
+        /// Consume the one-shot deployment-id fault for `kind`; returns `true`
+        /// only when it was armed (and disarms it).
+        pub(crate) fn consume(&self, kind: FaultKind, deployment_id: &str) -> bool {
+            self.inner
+                .lock()
+                .unwrap()
+                .remove(&(kind, deployment_id.to_string(), None))
+                .is_some()
+        }
+
+        /// Consume the one-shot `(deployment_id, target)` fault; returns
+        /// `true` only when BOTH halves match (and disarms it); a
+        /// non-matching call leaves the fault armed for the next matching
+        /// call.
+        pub(crate) fn consume_target(
+            &self,
+            kind: FaultKind,
+            deployment_id: &str,
+            target: &str,
+        ) -> bool {
+            self.inner
+                .lock()
+                .unwrap()
+                .remove(&(kind, deployment_id.to_string(), Some(target.to_string())))
+                .is_some()
+        }
+
+        /// Whether a one-shot (kind, deployment id) fault is currently armed.
+        pub(crate) fn is_armed(&self, kind: FaultKind, deployment_id: &str) -> bool {
+            self.inner
+                .lock()
+                .unwrap()
+                .contains_key(&(kind, deployment_id.to_string(), None))
+        }
+
+        /// The number of currently armed faults in THIS registry (property
+        /// tests assert the count tracks the oracle exactly).
+        pub(crate) fn armed_len(&self) -> usize {
+            self.inner.lock().unwrap().len()
+        }
+
+        // ---- arm_* convenience surface (historical API) --------------
+        //
+        // These mirror the historical module-level `arm_<kind>(id)` /
+        // `arm_<kind>(id, target)` functions one-to-one, so a call site that
+        // used to read `test_faults::arm_<kind>(id)` converts mechanically to
+        // `store.fault_registry().arm_<kind>(id)` (only the receiver
+        // changes).
+
+        /// Arm the next `append_snapshot` call for `deployment_id` to fail once.
+        pub(crate) fn arm_append_snapshot(&self, deployment_id: &str) {
+            self.arm(FaultKind::AppendSnapshot, deployment_id);
+        }
+
+        /// Arm the next `write_last_successful` call for `deployment_id` to
+        /// fail once.
+        pub(crate) fn arm_write_last_successful(&self, deployment_id: &str) {
+            self.arm(FaultKind::WriteLastSuccessful, deployment_id);
+        }
+
+        /// Arm the next `append_transition` call for `deployment_id` to fail
+        /// once.
+        pub(crate) fn arm_append_transition(&self, deployment_id: &str) {
+            self.arm(FaultKind::AppendTransition, deployment_id);
+        }
+
+        /// Arm the next `append_transition` call recording a `Successful`
+        /// status for `deployment_id` to fail once. The replay-safe
+        /// finalizer ([`crate::history::finalize_successful_attempt`]) writes
+        /// the recoverable `PendingCommit` marker FIRST and the terminal
+        /// `Successful` transition LAST, so faulting the terminal transition
+        /// (rather than the earlier marker) requires qualifying on the
+        /// recorded status: the `PendingCommit` marker append passes through
+        /// untouched.
+        pub(crate) fn arm_append_transition_successful(&self, deployment_id: &str) {
+            self.arm(FaultKind::AppendTransitionSuccessful, deployment_id);
+        }
+
+        /// Arm the next `append_attempt` call for `deployment_id` to fail
+        /// once. The attempt intent is persisted BEFORE any remote mutation,
+        /// so a one-shot failure here leaves the remote untouched (no
+        /// generation, no `current` change).
+        pub(crate) fn arm_append_attempt(&self, deployment_id: &str) {
+            self.arm(FaultKind::AppendAttempt, deployment_id);
+        }
+
+        /// Arm the next `write_results` call for `deployment_id` to fail
+        /// once. The outcomes store (`deployments/<id>/results.json`) is then
+        /// absent; a later recovery finalizes from the verified desired state
+        /// instead.
+        pub(crate) fn arm_write_results(&self, deployment_id: &str) {
+            self.arm(FaultKind::WriteResults, deployment_id);
+        }
+
+        /// Arm the next `append_transition` call recording a `PendingCommit`
+        /// status for `deployment_id` to fail once. Qualifies on the recorded
+        /// status, mirroring [`FaultRegistry::arm_append_transition_successful`]:
+        /// the earlier `InProgress` transition (and every non-pending
+        /// transition) passes through untouched, and the one-shot fires ONLY
+        /// at the recoverable `PendingCommit` marker — the first step of the
+        /// shared finalizer ([`crate::history::finalize_successful_attempt`])
+        /// — leaving the attempt's latest transition `InProgress` with intent
+        /// + outcomes durable.
+        pub(crate) fn arm_append_transition_pending(&self, deployment_id: &str) {
+            self.arm(FaultKind::AppendTransitionPending, deployment_id);
+        }
+
+        /// Arm the next `write_server` call that records `deployment_id`
+        /// (its `last_observed.last_deployment`) under `target` (its
+        /// `last_seen_target`) to fail once. This is the post-commit
+        /// observed-refresh per-server record write; the fault fires only
+        /// when BOTH the deployment id and the target match, so the
+        /// `servers/` writes of unrelated concurrent tests pass through
+        /// untouched.
+        pub(crate) fn arm_write_server(&self, deployment_id: &str, target: &str) {
+            self.arm_target(FaultKind::WriteServer, deployment_id, target);
+        }
+
+        /// Arm the next `write_observed` call that writes `deployment_id`'s
+        /// slot into `target`'s observed record to fail once. The
+        /// primary-target write is the last observed-refresh operation; the
+        /// other-member writes happen per shared slot inside the propagation
+        /// loop. The target half of the key selects exactly one of them.
+        pub(crate) fn arm_write_observed(&self, deployment_id: &str, target: &str) {
+            self.arm_target(FaultKind::WriteObserved, deployment_id, target);
+        }
+
+        /// Arm the next `read_rotation_debt` call for `target` to fail once
+        /// (rotation-maintenance debt, keyed by target). Absorbs the
+        /// debt-I/O sibling agent's `arm_read_rotation_debt`.
+        pub(crate) fn arm_read_rotation_debt(&self, target: &str) {
+            self.arm(FaultKind::ReadRotationDebt, target);
+        }
+
+        /// Arm the next `write_rotation_debt` call for `target` to fail once
+        /// (rotation-maintenance debt, keyed by target). Absorbs the
+        /// debt-I/O sibling agent's `arm_write_rotation_debt`.
+        pub(crate) fn arm_write_rotation_debt(&self, target: &str) {
+            self.arm(FaultKind::WriteRotationDebt, target);
+        }
+    }
+}
+
+#[cfg(test)]
+mod registry_property_tests {
+    // Property tests for the per-fixture fault registry: two DISTINCT fault
+    // keys, interleaved arm/consume operations, and the exact-once oracle.
+
+    use super::test_faults::{FaultKind, FaultRegistry};
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+    use std::collections::BTreeSet;
+
+    const ID_A: &str = "deploy-prop-a";
+    const ID_B: &str = "deploy-prop-b";
+    const ID_FOREIGN: &str = "deploy-prop-foreign";
+
+    /// A registry operation over the two distinct keys. `WrongKindConsume`
+    /// consumes a DIFFERENT fault kind under key A (the "other operation"),
+    /// and `ForeignIdConsume` consumes key A's kind under a third, never-armed
+    /// id — both must never fire and never disarm.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RegOp {
+        ArmA,
+        ArmB,
+        ConsumeA,
+        ConsumeB,
+        WrongKindConsume,
+        ForeignIdConsume,
     }
 
-    /// Arm the next `write_last_successful` call for `deployment_id` to fail once.
-    pub(crate) fn arm_write_last_successful(deployment_id: &str) {
-        arm(&FAIL_WRITE_LAST_SUCCESSFUL, deployment_id);
+    fn reg_op_strategy() -> impl Strategy<Value = RegOp> {
+        prop_oneof![
+            Just(RegOp::ArmA),
+            Just(RegOp::ArmB),
+            Just(RegOp::ConsumeA),
+            Just(RegOp::ConsumeB),
+            Just(RegOp::WrongKindConsume),
+            Just(RegOp::ForeignIdConsume),
+        ]
     }
 
-    /// Arm the next `append_transition` call for `deployment_id` to fail once.
-    pub(crate) fn arm_append_transition(deployment_id: &str) {
-        arm(&FAIL_APPEND_TRANSITION, deployment_id);
-    }
-
-    /// Arm the next `append_transition` call recording a `Successful` status
-    /// for `deployment_id` to fail once. The replay-safe finalizer
-    /// ([`crate::history::finalize_successful_attempt`]) writes the
-    /// recoverable `PendingCommit` marker FIRST and the terminal `Successful`
-    /// transition LAST, so faulting the terminal transition (rather than the
-    /// earlier marker) requires qualifying on the recorded status: the
-    /// `PendingCommit` marker append passes through untouched.
-    pub(crate) fn arm_append_transition_successful(deployment_id: &str) {
-        arm(&FAIL_APPEND_TRANSITION_SUCCESSFUL, deployment_id);
-    }
-
-    /// Arm the next `append_attempt` call for `deployment_id` to fail once.
-    /// The attempt intent is persisted BEFORE any remote mutation, so a
-    /// one-shot failure here leaves the remote untouched (no generation, no
-    /// `current` change).
-    pub(crate) fn arm_append_attempt(deployment_id: &str) {
-        arm(&FAIL_APPEND_ATTEMPT, deployment_id);
-    }
-
-    /// Arm the next `write_results` call for `deployment_id` to fail once.
-    /// The outcomes store (`deployments/<id>/results.json`) is then absent; a
-    /// later recovery finalizes from the verified desired state instead.
-    pub(crate) fn arm_write_results(deployment_id: &str) {
-        arm(&FAIL_WRITE_RESULTS, deployment_id);
-    }
-
-    /// Arm the next `append_transition` call recording a `PendingCommit`
-    /// status for `deployment_id` to fail once. Qualifies on the recorded
-    /// status, mirroring [`arm_append_transition_successful`]: the earlier
-    /// `InProgress` transition (and every non-pending transition) passes
-    /// through untouched, and the one-shot fires ONLY at the recoverable
-    /// `PendingCommit` marker — the first step of the shared finalizer
-    /// ([`crate::history::finalize_successful_attempt`]) — leaving the
-    /// attempt's latest transition `InProgress` with intent + outcomes
-    /// durable.
-    pub(crate) fn arm_append_transition_pending(deployment_id: &str) {
-        arm(&FAIL_APPEND_TRANSITION_PENDING, deployment_id);
-    }
-
-    /// Arm the next `write_server` call that records `deployment_id` (its
-    /// `last_observed.last_deployment`) under `target` (its
-    /// `last_seen_target`) to fail once. This is the post-commit
-    /// observed-refresh per-server record write; the fault fires only when
-    /// BOTH the deployment id and the target match, so the `servers/` writes
-    /// of unrelated concurrent tests pass through untouched.
-    pub(crate) fn arm_write_server(deployment_id: &str, target: &str) {
-        arm2(&FAIL_WRITE_SERVER, deployment_id, target);
-    }
-
-    /// Arm the next `write_observed` call that writes `deployment_id`'s slot
-    /// into `target`'s observed record to fail once. The primary-target write
-    /// is the last observed-refresh operation; the other-member writes happen
-    /// per shared slot inside the propagation loop. The target half of the
-    /// key selects exactly one of them.
-    pub(crate) fn arm_write_observed(deployment_id: &str, target: &str) {
-        arm2(&FAIL_WRITE_OBSERVED, deployment_id, target);
-    }
-
-    /// Arm the next `read_rotation_debt` call for `target` to fail once. The
-    /// rotation-debt marker is read during POST-COMMIT maintenance (the
-    /// deferred-rotation retry and the step-17 clear/defer), so a fault here
-    /// is warning-only in the engine, never a push error. The arm is keyed by
-    /// TARGET (the only identity the debt methods carry): the arming test must
-    /// hold [`crate::testutil::FAULT_LOCK`] for the whole arm->consume window
-    /// and push a target no other test pushes, so no concurrent push can
-    /// consume the arm.
-    pub(crate) fn arm_read_rotation_debt(target: &str) {
-        arm(&FAIL_READ_ROTATION_DEBT, target);
-    }
-
-    /// Arm the next `write_rotation_debt` call for `target` to fail once. The
-    /// marker's persist AND its removal (the empty-map delete that clears a
-    /// serviced marker) both go through `LocalStore::write_rotation_debt`, so
-    /// the "debt remove" fault is the same arm. Post-commit maintenance:
-    /// warning-only in the engine, never a push error. See
-    /// [`arm_read_rotation_debt`] for the target-keying / lock contract.
-    pub(crate) fn arm_write_rotation_debt(target: &str) {
-        arm(&FAIL_WRITE_ROTATION_DEBT, target);
-    }
-
-    /// Clear a one-shot TARGET-keyed arm without consuming it. A fault armed
-    /// for a case whose push never performs the operation (e.g. a debt-write
-    /// arm on an empty-debt case that never writes) would otherwise stay armed
-    /// and be consumed by the NEXT case's pre-seed write of the same target.
-    /// The matrix test holds [`crate::testutil::FAULT_LOCK`] for the whole
-    /// test and calls this between cases.
-    pub(crate) fn clear_rotation_debt_faults() {
-        *FAIL_READ_ROTATION_DEBT.lock().unwrap() = None;
-        *FAIL_WRITE_ROTATION_DEBT.lock().unwrap() = None;
-    }
-
-    /// Consume the one-shot fault for `deployment_id` if armed. Returns `true`
-    /// when the fault fired (and is now disarmed).
-    pub(crate) fn consume(fault: &Mutex<Option<String>>, deployment_id: &str) -> bool {
-        let mut guard = fault.lock().unwrap();
-        if guard.as_deref() == Some(deployment_id) {
-            *guard = None;
-            true
-        } else {
-            false
+    /// Apply one op to the real registry and to the oracle set; every step
+    /// must agree (fire/not-fire, disarm/not-disarm).
+    fn apply(op: RegOp, reg: &FaultRegistry, oracle: &mut BTreeSet<(FaultKind, String)>) {
+        let key_a = (FaultKind::AppendAttempt, ID_A.to_string());
+        let key_b = (FaultKind::AppendAttempt, ID_B.to_string());
+        match op {
+            RegOp::ArmA => {
+                reg.arm(FaultKind::AppendAttempt, ID_A);
+                oracle.insert(key_a);
+            }
+            RegOp::ArmB => {
+                reg.arm(FaultKind::AppendAttempt, ID_B);
+                oracle.insert(key_b);
+            }
+            RegOp::ConsumeA => {
+                let fired = reg.consume(FaultKind::AppendAttempt, ID_A);
+                let expected = oracle.remove(&key_a);
+                assert_eq!(
+                    fired, expected,
+                    "A fires exactly when its own arm is pending (one-shot)"
+                );
+            }
+            RegOp::ConsumeB => {
+                let fired = reg.consume(FaultKind::AppendAttempt, ID_B);
+                let expected = oracle.remove(&key_b);
+                assert_eq!(
+                    fired, expected,
+                    "B fires exactly when its own arm is pending (one-shot)"
+                );
+            }
+            RegOp::WrongKindConsume => {
+                // The OTHER operation (write_results) on key A: never fires
+                // the AppendAttempt arm and never disarms it.
+                assert!(
+                    !reg.consume(FaultKind::WriteResults, ID_A),
+                    "a different fault kind must never fire A's arm"
+                );
+            }
+            RegOp::ForeignIdConsume => {
+                assert!(
+                    !reg.consume(FaultKind::AppendAttempt, ID_FOREIGN),
+                    "a never-armed id must never fire either key"
+                );
+            }
+        }
+        assert_eq!(
+            reg.armed_len(),
+            oracle.len(),
+            "the registry's armed set must track the oracle exactly"
+        );
+        for (kind, id) in oracle.iter() {
+            assert!(
+                reg.is_armed(*kind, id),
+                "{id}: an oracle-armed key must be armed in the registry"
+            );
         }
     }
 
-    /// Consume the one-shot `(deployment_id, target)` fault if armed. Returns
-    /// `true` only when BOTH halves match (and disarms it); a non-matching
-    /// call leaves the fault armed for the next matching call.
-    pub(crate) fn consume2(
-        fault: &Mutex<Option<(String, String)>>,
-        deployment_id: &str,
-        target: &str,
-    ) -> bool {
-        let mut guard = fault.lock().unwrap();
-        if guard
-            .as_ref()
-            .is_some_and(|(d, t)| d == deployment_id && t == target)
-        {
-            *guard = None;
-            true
-        } else {
-            false
+    /// Property test: arbitrary interleavings of arms and consumes over two
+    /// distinct keys. Oracle: each fault is consumed EXACTLY ONCE by its
+    /// matching (kind, id) consume; re-consume does not fire again; a
+    /// mismatched kind or id NEVER fires. Fixed seed + bounded cases for
+    /// deterministic `cargo test` runs (like `src/semantic_invariants.rs`).
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(0xFA17_FA17),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn two_key_fault_interleavings_consume_exactly_once(
+            ops in prop::collection::vec(reg_op_strategy(), 0..24),
+        ) {
+            let reg = FaultRegistry::default();
+            let mut oracle: BTreeSet<(FaultKind, String)> = BTreeSet::new();
+            for op in ops {
+                apply(op, &reg, &mut oracle);
+            }
         }
     }
 
-    pub(crate) static FAIL_APPEND_SNAPSHOT: Mutex<Option<String>> = Mutex::new(None);
-    pub(crate) static FAIL_WRITE_LAST_SUCCESSFUL: Mutex<Option<String>> = Mutex::new(None);
-    pub(crate) static FAIL_APPEND_TRANSITION: Mutex<Option<String>> = Mutex::new(None);
-    pub(crate) static FAIL_APPEND_TRANSITION_SUCCESSFUL: Mutex<Option<String>> = Mutex::new(None);
-    pub(crate) static FAIL_APPEND_ATTEMPT: Mutex<Option<String>> = Mutex::new(None);
-    pub(crate) static FAIL_WRITE_RESULTS: Mutex<Option<String>> = Mutex::new(None);
-    pub(crate) static FAIL_APPEND_TRANSITION_PENDING: Mutex<Option<String>> = Mutex::new(None);
-    /// One-shot `(deployment_id, target)` fault for the post-commit
-    /// observed-refresh `write_server` call.
-    pub(crate) static FAIL_WRITE_SERVER: Mutex<Option<(String, String)>> = Mutex::new(None);
-    /// One-shot `(deployment_id, target)` fault for the post-commit
-    /// observed-refresh `write_observed` call.
-    pub(crate) static FAIL_WRITE_OBSERVED: Mutex<Option<(String, String)>> = Mutex::new(None);
-    /// One-shot TARGET-keyed fault for the post-commit rotation-debt `read`.
-    pub(crate) static FAIL_READ_ROTATION_DEBT: Mutex<Option<String>> = Mutex::new(None);
-    /// One-shot TARGET-keyed fault for the post-commit rotation-debt `write`
-    /// (a marker persist or the cleared-marker removal — both go through
-    /// `LocalStore::write_rotation_debt`).
-    pub(crate) static FAIL_WRITE_ROTATION_DEBT: Mutex<Option<String>> = Mutex::new(None);
+    /// Exhaustive check of the strongest interleaving: every ordering that
+    /// merges two sequences — arm A then two consumes of A (the second must
+    /// NOT fire), arm B then two consumes of B — while preserving each
+    /// sequence's internal order. All C(6,3) = 20 orderings must satisfy the
+    /// exact-once oracle: each fault is consumed exactly once by its matching
+    /// key and never fires for the other.
+    #[test]
+    fn two_key_exhaustive_interleavings_consume_each_arm_exactly_once() {
+        let seq_a = [RegOp::ArmA, RegOp::ConsumeA, RegOp::ConsumeA];
+        let seq_b = [RegOp::ArmB, RegOp::ConsumeB, RegOp::ConsumeB];
+        let mut orderings = vec![];
+        interleave(&mut orderings, &seq_a, &seq_b, 0, 0, &mut vec![]);
+        assert_eq!(orderings.len(), 20, "C(6,3) order-preserving merges");
+        for ops in orderings {
+            let reg = FaultRegistry::default();
+            let mut oracle: BTreeSet<(FaultKind, String)> = BTreeSet::new();
+            for op in ops {
+                apply(op, &reg, &mut oracle);
+            }
+            assert_eq!(oracle.len(), 0, "both arms consumed exactly once");
+        }
+    }
+
+    /// Every order-preserving merge of `a` and `b` (each element keeps its
+    /// relative position within its own sequence).
+    fn interleave(
+        out: &mut Vec<Vec<RegOp>>,
+        a: &[RegOp],
+        b: &[RegOp],
+        i: usize,
+        j: usize,
+        acc: &mut Vec<RegOp>,
+    ) {
+        if i == a.len() && j == b.len() {
+            out.push(acc.clone());
+            return;
+        }
+        if i < a.len() {
+            acc.push(a[i]);
+            interleave(out, a, b, i + 1, j, acc);
+            acc.pop();
+        }
+        if j < b.len() {
+            acc.push(b[j]);
+            interleave(out, a, b, i, j + 1, acc);
+            acc.pop();
+        }
+    }
 }

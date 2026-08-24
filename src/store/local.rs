@@ -15,6 +15,18 @@
 //!   servers/<server-id>.json
 //!   deployments/<deployment-id>/plan.json, results.json, transitions.jsonl
 //! ```
+//!
+//! # Test-only fault injection (per-fixture registry)
+//!
+//! Under `#[cfg(test)]` each [`LocalStore`] owns a per-fixture
+//! [`crate::testutil::test_faults::FaultRegistry`] (created empty by
+//! [`LocalStore::with_base`]); the store methods consult ONLY that registry
+//! (`self.fault_registry.consume(...)`). Tests arm the fixture's registry via
+//! [`LocalStore::fault_registry`] (`store.fault_registry().arm_append_attempt(id)`
+//! etc.). There are NO process-global fault slots and NO shared fault lock:
+//! two fixtures' registries are disjoint by construction, so a fault armed by
+//! one test can never fire in another's push — structural isolation that
+//! holds under any parallel `cargo test` interleaving.
 
 use crate::error::{Error, Result};
 use crate::layout;
@@ -33,7 +45,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
-use crate::testutil::test_faults;
+use crate::testutil::test_faults::{FaultKind, FaultRegistry};
+#[cfg(test)]
+use std::sync::Arc;
 
 fn default_base() -> PathBuf {
     let data = std::env::var("XDG_DATA_HOME")
@@ -192,6 +206,14 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 
 pub struct LocalStore {
     base: PathBuf,
+    /// Per-fixture one-shot fault registry (test-only). Created EMPTY by
+    /// [`LocalStore::with_base`]; tests that want an injected store fault arm
+    /// it via [`LocalStore::fault_registry`]. There are no process-global
+    /// fault slots and no shared fault lock: the store's methods consult ONLY
+    /// this fixture's registry, so two fixtures can never interfere regardless
+    /// of threading. See `src/testutil.rs` for the design.
+    #[cfg(test)]
+    fault_registry: Arc<FaultRegistry>,
 }
 
 impl LocalStore {
@@ -211,7 +233,20 @@ impl LocalStore {
         ensure_private_dir(&base.join("servers"))?;
         ensure_private_dir(&base.join("deployments"))?;
         ensure_private_dir(&base.join("staging"))?;
-        Ok(LocalStore { base })
+        Ok(LocalStore {
+            base,
+            #[cfg(test)]
+            fault_registry: Arc::new(FaultRegistry::default()),
+        })
+    }
+
+    /// The fixture's per-fixture one-shot fault registry. A test arms faults
+    /// here (`store.fault_registry().arm_append_attempt(id)` etc.) and the
+    /// store methods consume them from the SAME registry — never from any
+    /// other fixture's, and never from a process-global slot.
+    #[cfg(test)]
+    pub(crate) fn fault_registry(&self) -> &Arc<FaultRegistry> {
+        &self.fault_registry
     }
 
     pub fn base(&self) -> &Path {
@@ -436,7 +471,10 @@ impl LocalStore {
             .slots
             .values()
             .filter_map(|s| s.last_deployment.as_ref())
-            .any(|d| test_faults::consume2(&test_faults::FAIL_WRITE_OBSERVED, d.as_str(), target))
+            .any(|d| {
+                self.fault_registry
+                    .consume_target(FaultKind::WriteObserved, d.as_str(), target)
+            })
         {
             return Err(Error::store(
                 "test fault: write_observed forced to fail once",
@@ -480,15 +518,14 @@ impl LocalStore {
     /// id to the reason the rotation was deferred. Empty when no maintenance
     /// is pending.
     pub fn read_rotation_debt(&self, target: &str) -> Result<BTreeMap<String, String>> {
-        // Post-commit debt-maintenance fault injection: the rotation-debt
-        // marker is read during post-commit maintenance (the deferred-rotation
-        // retry, the step-17 clear/defer), so a fault here is reported as a
-        // maintenance warning by the engine, never a push error. Keyed by
-        // target (the only identity the debt methods carry); the arming test
-        // holds FAULT_LOCK for the whole arm->consume window and pushes a
-        // target unique to the fixture so no other test can consume the arm.
+        // Post-commit maintenance fault injection, keyed by target (the debt
+        // file lives under `targets/<target>/`). Absorbs the debt-I/O
+        // sibling agent's `arm_read_rotation_debt`.
         #[cfg(test)]
-        if test_faults::consume(&test_faults::FAIL_READ_ROTATION_DEBT, target) {
+        if self
+            .fault_registry
+            .consume(FaultKind::ReadRotationDebt, target)
+        {
             return Err(Error::store(
                 "test fault: read_rotation_debt forced to fail once",
             ));
@@ -504,13 +541,13 @@ impl LocalStore {
     /// Persist the target's deferred-rotation markers. An EMPTY map removes
     /// the marker file, so a fully-serviced target leaves no trace.
     pub fn write_rotation_debt(&self, target: &str, debt: &BTreeMap<String, String>) -> Result<()> {
-        // Post-commit debt-maintenance fault injection: the marker's persist
-        // AND its removal (the empty-map delete below) both go through this
-        // one write, so the "debt remove" fault uses the same arm. A fault
-        // here is reported as a maintenance warning by the engine, never a
-        // push error. See [`LocalStore::read_rotation_debt`] for the keying.
+        // Post-commit maintenance write fault, keyed by target. Absorbs the
+        // debt-I/O sibling agent's `arm_write_rotation_debt`.
         #[cfg(test)]
-        if test_faults::consume(&test_faults::FAIL_WRITE_ROTATION_DEBT, target) {
+        if self
+            .fault_registry
+            .consume(FaultKind::WriteRotationDebt, target)
+        {
             return Err(Error::store(
                 "test fault: write_rotation_debt forced to fail once",
             ));
@@ -529,10 +566,10 @@ impl LocalStore {
 
     pub fn append_attempt(&self, target: &str, attempt: &DeploymentAttempt) -> Result<()> {
         #[cfg(test)]
-        if test_faults::consume(
-            &test_faults::FAIL_APPEND_ATTEMPT,
-            attempt.deployment_id.as_str(),
-        ) {
+        if self
+            .fault_registry
+            .consume(FaultKind::AppendAttempt, attempt.deployment_id.as_str())
+        {
             return Err(Error::store(
                 "test fault: append_attempt forced to fail once",
             ));
@@ -590,7 +627,10 @@ impl LocalStore {
 
     pub fn write_last_successful(&self, target: &str, deployment_id: &str) -> Result<()> {
         #[cfg(test)]
-        if test_faults::consume(&test_faults::FAIL_WRITE_LAST_SUCCESSFUL, deployment_id) {
+        if self
+            .fault_registry
+            .consume(FaultKind::WriteLastSuccessful, deployment_id)
+        {
             return Err(Error::store(
                 "test fault: write_last_successful forced to fail once",
             ));
@@ -615,10 +655,10 @@ impl LocalStore {
     /// (`<target>@fN`); only successful deployments produce them.
     pub fn append_snapshot(&self, target: &str, entry: &DeploymentSnapshot) -> Result<()> {
         #[cfg(test)]
-        if test_faults::consume(
-            &test_faults::FAIL_APPEND_SNAPSHOT,
-            entry.deployment_id.as_str(),
-        ) {
+        if self
+            .fault_registry
+            .consume(FaultKind::AppendSnapshot, entry.deployment_id.as_str())
+        {
             return Err(Error::store(
                 "test fault: append_snapshot forced to fail once",
             ));
@@ -671,8 +711,8 @@ impl LocalStore {
                 .as_ref()
                 .and_then(|o| o.last_deployment.as_ref()),
             state.last_seen_target.as_ref(),
-        ) && test_faults::consume2(
-            &test_faults::FAIL_WRITE_SERVER,
+        ) && self.fault_registry.consume_target(
+            FaultKind::WriteServer,
             deployment_id.as_str(),
             target.as_str(),
         ) {
@@ -719,7 +759,7 @@ impl LocalStore {
 
     pub fn write_results(&self, id: &str, results: &DeploymentResults) -> Result<()> {
         #[cfg(test)]
-        if test_faults::consume(&test_faults::FAIL_WRITE_RESULTS, id) {
+        if self.fault_registry.consume(FaultKind::WriteResults, id) {
             return Err(Error::store(
                 "test fault: write_results forced to fail once",
             ));
@@ -750,14 +790,16 @@ impl LocalStore {
         reason: Option<&str>,
     ) -> Result<()> {
         #[cfg(test)]
-        if test_faults::consume(&test_faults::FAIL_APPEND_TRANSITION, id) {
+        if self.fault_registry.consume(FaultKind::AppendTransition, id) {
             return Err(Error::store(
                 "test fault: append_transition forced to fail once",
             ));
         }
         #[cfg(test)]
         if status == &DeploymentStatus::Successful
-            && test_faults::consume(&test_faults::FAIL_APPEND_TRANSITION_SUCCESSFUL, id)
+            && self
+                .fault_registry
+                .consume(FaultKind::AppendTransitionSuccessful, id)
         {
             return Err(Error::store(
                 "test fault: append_transition(Successful) forced to fail once",
@@ -765,7 +807,9 @@ impl LocalStore {
         }
         #[cfg(test)]
         if status == &DeploymentStatus::PendingCommit
-            && test_faults::consume(&test_faults::FAIL_APPEND_TRANSITION_PENDING, id)
+            && self
+                .fault_registry
+                .consume(FaultKind::AppendTransitionPending, id)
         {
             return Err(Error::store(
                 "test fault: append_transition(PendingCommit) forced to fail once",
@@ -1389,13 +1433,15 @@ mod tests {
     /// `write_results`; `arm_append_transition_pending` fails ONLY the first
     /// `PendingCommit` transition append (the recoverable finalize marker) —
     /// an earlier `InProgress` (or any other status) append passes through.
+    ///
+    /// Faults are armed on THIS store's per-fixture registry
+    /// ([`LocalStore::fault_registry`]); no process-global slot is involved,
+    /// so no lock window is needed.
     #[test]
     fn new_fault_arms_are_one_shot_and_status_qualified() {
-        let _fault_guard = crate::testutil::FAULT_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let registry = store.fault_registry().clone();
         let target = "t1";
         let id = "deploy-fault-arms";
         let attempt = DeploymentAttempt {
@@ -1411,13 +1457,13 @@ mod tests {
         };
 
         // arm_append_attempt: one-shot, fails once, then passes.
-        test_faults::arm_append_attempt(id);
+        registry.arm_append_attempt(id);
         let err = store.append_attempt(target, &attempt).unwrap_err();
         assert!(err.to_string().contains("append_attempt"));
         store.append_attempt(target, &attempt).expect("disarmed");
 
         // arm_write_results: one-shot.
-        test_faults::arm_write_results(id);
+        registry.arm_write_results(id);
         let results = DeploymentResults {
             deployment_id: DeploymentId::from(id.to_string()),
             target: TargetName::from(target.to_string()),
@@ -1429,7 +1475,7 @@ mod tests {
 
         // arm_append_transition_pending: status-qualified — an InProgress
         // append passes through; the first PendingCommit append fails once.
-        test_faults::arm_append_transition_pending(id);
+        registry.arm_append_transition_pending(id);
         store
             .append_transition(id, &DeploymentStatus::InProgress, Some("attempt started"))
             .expect("InProgress append passes through untouched");
@@ -1655,17 +1701,16 @@ mod tests {
     /// `arm_append_transition_successful` is status-qualified and one-shot:
     /// non-`Successful` appends (the recoverable `PendingCommit` marker, an
     /// `InProgress` overlay) pass through untouched, the FIRST `Successful`
-    /// append fails, and a later `Successful` append passes.
+    /// append fails, and a later `Successful` append passes. The arm lives on
+    /// this store's own per-fixture registry; no lock window is needed.
     #[test]
     fn transition_successful_fault_is_status_qualified_and_one_shot() {
-        let _fault_guard = crate::testutil::FAULT_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let registry = store.fault_registry().clone();
         let id = "deploy-txn-success-fault";
 
-        test_faults::arm_append_transition_successful(id);
+        registry.arm_append_transition_successful(id);
         // The recoverable finalize marker passes through (status-qualified).
         store
             .append_transition(
@@ -1685,7 +1730,7 @@ mod tests {
             .expect("disarmed");
 
         // Re-arm: an InProgress overlay must not consume the arm.
-        test_faults::arm_append_transition_successful(id);
+        registry.arm_append_transition_successful(id);
         store
             .append_transition(id, &DeploymentStatus::InProgress, None)
             .expect("InProgress append does not consume the arm");
@@ -1695,5 +1740,186 @@ mod tests {
         store
             .append_transition(id, &DeploymentStatus::Successful, None)
             .expect("disarmed again");
+    }
+
+    /// Two DISTINCT fault keys (two deployment ids) armed on ONE fixture,
+    /// consumed in interleaved order through the real store methods. Oracle:
+    /// each fault fires EXACTLY ONCE and only for its own key; the other
+    /// operation passes through untouched (even when interleaved), and a
+    /// re-run of the same consume does NOT fire again (one-shot). The store
+    /// records exactly one attempt per id — the post-fault re-runs — so the
+    /// observable history also matches the oracle.
+    #[test]
+    fn two_key_interleaved_store_faults_fire_exactly_once_per_matching_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let registry = store.fault_registry();
+        let target = "t1";
+        let id_a = "deploy-key-a";
+        let id_b = "deploy-key-b";
+        let attempt = |id: &str| DeploymentAttempt {
+            deployment_schema_version: SCHEMA_VERSION,
+            deployment_id: DeploymentId::new(id.to_string()),
+            target: TargetName::new(target.to_string()),
+            slot_ids: vec![],
+            behavior_sha256: "sha256-aa".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            desired: BTreeMap::new(),
+            pre_push: BTreeMap::new(),
+            slots: BTreeMap::new(),
+        };
+
+        // Arm TWO distinct keys on the same registry.
+        registry.arm_append_attempt(id_a);
+        registry.arm_append_attempt(id_b);
+        assert_eq!(registry.armed_len(), 2, "both faults armed");
+
+        // Interleaved consume, B FIRST: B's append fires B and must NOT fire
+        // (or disarm) A.
+        let err = store.append_attempt(target, &attempt(id_b)).unwrap_err();
+        assert!(err.to_string().contains("append_attempt"), "B fired");
+        assert!(
+            registry.is_armed(FaultKind::AppendAttempt, id_a),
+            "A stays armed"
+        );
+        assert!(
+            !registry.is_armed(FaultKind::AppendAttempt, id_b),
+            "B disarmed"
+        );
+
+        // Then A's append fires A exactly once.
+        let err = store.append_attempt(target, &attempt(id_a)).unwrap_err();
+        assert!(err.to_string().contains("append_attempt"), "A fired");
+        assert!(
+            !registry.is_armed(FaultKind::AppendAttempt, id_a),
+            "A disarmed"
+        );
+
+        // Re-running the same consumes does NOT fire again (one-shot), and a
+        // matching-store operation for a NEVER-armed third key passes through.
+        store
+            .append_attempt(target, &attempt(id_b))
+            .expect("B disarmed");
+        store
+            .append_attempt(target, &attempt(id_a))
+            .expect("A disarmed");
+        store
+            .append_attempt(target, &attempt("deploy-key-c"))
+            .expect("never-armed key passes through");
+
+        // Observable oracle: exactly one durable attempt per key (the post-
+        // fault re-runs), never a duplicate from the faulted calls.
+        let attempts = store.read_attempts(target).unwrap();
+        let mut ids: Vec<_> = attempts.iter().map(|a| a.deployment_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["deploy-key-a", "deploy-key-b", "deploy-key-c"]);
+        assert_eq!(registry.armed_len(), 0, "no arms left");
+    }
+
+    /// The structural isolation property: arming a fault on fixture 1's
+    /// registry cannot be consumed by fixture 2's store — even with the SAME
+    /// deployment id — and survives for fixture 1's own store to fire.
+    #[test]
+    fn arming_one_fixture_cannot_be_consumed_by_another_fixtures_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_a = LocalStore::with_base(dir.path().join("a")).unwrap();
+        let store_b = LocalStore::with_base(dir.path().join("b")).unwrap();
+        let id = "deploy-cross-fixture";
+        let attempt = DeploymentAttempt {
+            deployment_schema_version: SCHEMA_VERSION,
+            deployment_id: DeploymentId::new(id.to_string()),
+            target: TargetName::new("t1".to_string()),
+            slot_ids: vec![],
+            behavior_sha256: "sha256-aa".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            desired: BTreeMap::new(),
+            pre_push: BTreeMap::new(),
+            slots: BTreeMap::new(),
+        };
+
+        // Fixture A arms; fixture B's store is its OWN empty registry.
+        store_a.fault_registry().arm_append_attempt(id);
+        assert!(
+            !store_b
+                .fault_registry()
+                .is_armed(FaultKind::AppendAttempt, id),
+            "B's registry is disjoint from A's"
+        );
+
+        // B's identical append passes through untouched, and A's arm SURVIVES.
+        store_b
+            .append_attempt("t1", &attempt)
+            .expect("B passes through");
+        assert!(
+            store_a
+                .fault_registry()
+                .is_armed(FaultKind::AppendAttempt, id),
+            "A's arm must not have been consumed by B's push"
+        );
+        // A's OWN matching append fires exactly once.
+        store_a
+            .append_attempt("t1", &attempt)
+            .expect_err("A's own append fires the fault");
+        assert!(
+            !store_a
+                .fault_registry()
+                .is_armed(FaultKind::AppendAttempt, id)
+        );
+    }
+
+    /// Threaded interleaving across TWO fixtures: each thread arms its own
+    /// key on its OWN store's registry, then both consume through the real
+    /// store methods concurrently (a barrier maximizes overlap). Oracle: each
+    /// fault fires EXACTLY ONCE in its own fixture and NEVER in the other's;
+    /// each store ends with exactly one durable attempt for its own id.
+    #[test]
+    fn two_key_threaded_interleaving_isolation_between_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_a = LocalStore::with_base(dir.path().join("a")).unwrap();
+        let store_b = LocalStore::with_base(dir.path().join("b")).unwrap();
+        let (id_a, id_b) = ("deploy-thread-a", "deploy-thread-b");
+        let attempt = |id: &str| DeploymentAttempt {
+            deployment_schema_version: SCHEMA_VERSION,
+            deployment_id: DeploymentId::new(id.to_string()),
+            target: TargetName::new("t1".to_string()),
+            slot_ids: vec![],
+            behavior_sha256: "sha256-aa".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            desired: BTreeMap::new(),
+            pre_push: BTreeMap::new(),
+            slots: BTreeMap::new(),
+        };
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        std::thread::scope(|s| {
+            for (store, id) in [(&store_a, id_a), (&store_b, id_b)] {
+                let barrier = barrier.clone();
+                s.spawn(move || {
+                    // Arm on THIS fixture's registry, then consume through
+                    // THIS fixture's store — the other thread is doing the
+                    // same concurrently, and the registries are disjoint.
+                    store.fault_registry().arm_append_attempt(id);
+                    barrier.wait();
+                    let err = store
+                        .append_attempt("t1", &attempt(id))
+                        .expect_err("the matching append fires exactly once");
+                    assert!(err.to_string().contains("append_attempt"));
+                    store
+                        .append_attempt("t1", &attempt(id))
+                        .expect("disarmed: the re-run passes");
+                });
+            }
+            barrier.wait();
+        });
+
+        // Both faults fired exactly once in their OWN fixture; the other
+        // fixture was never affected: each store holds exactly one attempt,
+        // its own id.
+        let only = |store: &LocalStore| {
+            let attempts = store.read_attempts("t1").unwrap();
+            assert_eq!(attempts.len(), 1, "exactly one durable attempt");
+            attempts[0].deployment_id.as_str().to_string()
+        };
+        assert_eq!(only(&store_a), id_a);
+        assert_eq!(only(&store_b), id_b);
     }
 }

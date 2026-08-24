@@ -534,32 +534,31 @@ impl Fixture {
         )
     }
 
-    /// Arm a one-shot store fault for a fixed deployment id.
+    /// Arm a one-shot store fault on THIS fixture's per-fixture registry
+    /// (see `src/testutil.rs`): the fixture's store consumes only its own
+    /// registry, so no global slot or lock is involved.
     fn arm_store_fault(&self, step: FailureStep, id: &DeploymentId) {
-        use crate::testutil::test_faults as faults;
+        let reg = self.store.fault_registry();
         match step {
-            FailureStep::IntentPersist => faults::arm_append_attempt(id.as_str()),
-            FailureStep::ResultsWrite => faults::arm_write_results(id.as_str()),
-            FailureStep::SnapshotAppend => faults::arm_append_snapshot(id.as_str()),
-            FailureStep::LastSuccessfulWrite => faults::arm_write_last_successful(id.as_str()),
-            FailureStep::TransitionSuccessful => {
-                faults::arm_append_transition_successful(id.as_str())
-            }
-            FailureStep::TransitionPending => faults::arm_append_transition_pending(id.as_str()),
+            FailureStep::IntentPersist => reg.arm_append_attempt(id.as_str()),
+            FailureStep::ResultsWrite => reg.arm_write_results(id.as_str()),
+            FailureStep::SnapshotAppend => reg.arm_append_snapshot(id.as_str()),
+            FailureStep::LastSuccessfulWrite => reg.arm_write_last_successful(id.as_str()),
+            FailureStep::TransitionSuccessful => reg.arm_append_transition_successful(id.as_str()),
+            FailureStep::TransitionPending => reg.arm_append_transition_pending(id.as_str()),
             // The post-commit observed-refresh faults are keyed by deployment
             // id AND target: the fixture's single shared slot (`p1`) belongs to
             // `t1` (the pushed target) and `t2` (the other member).
-            FailureStep::ObservedWriteServer => faults::arm_write_server(id.as_str(), "t1"),
-            FailureStep::ObservedPrimaryWrite => faults::arm_write_observed(id.as_str(), "t1"),
-            FailureStep::ObservedOtherWrite => faults::arm_write_observed(id.as_str(), "t2"),
+            FailureStep::ObservedWriteServer => reg.arm_write_server(id.as_str(), "t1"),
+            FailureStep::ObservedPrimaryWrite => reg.arm_write_observed(id.as_str(), "t1"),
+            FailureStep::ObservedOtherWrite => reg.arm_write_observed(id.as_str(), "t2"),
             // The rotation-debt faults are keyed by the TARGET only (the debt
             // methods carry no deployment id) and fire on `debtfx` — the
             // fixture target no other test pushes — so no concurrent test's
-            // push can consume the arm (the arming test holds FAULT_LOCK for
-            // the whole arm->consume window).
-            FailureStep::DebtRead => faults::arm_read_rotation_debt("debtfx"),
+            // push can consume the arm.
+            FailureStep::DebtRead => reg.arm_read_rotation_debt("debtfx"),
             FailureStep::DebtWrite | FailureStep::DebtRemove => {
-                faults::arm_write_rotation_debt("debtfx")
+                reg.arm_write_rotation_debt("debtfx")
             }
             other => panic!("{other:?} is a remote step, not a store step"),
         }
@@ -1165,6 +1164,170 @@ fn state_machine_lifecycle_cleanup_failure_after_commit() {
     f.check_invariants();
 }
 
+/// Lifecycle: a FRESH step-17 rotation whose slot mutation lock is CONTENDED
+/// (held by another operation) must never be skipped SILENTLY. The push still
+/// succeeds (the deployment already committed), records a best-effort debt
+/// marker, and surfaces a warning naming the slot — "rotation deferred for
+/// slot 'p1': slot lock held by another operation". Then the maintenance
+/// lifecycle over the same marker: an up-to-date no-op whose retry ALSO finds
+/// the lock held stays deferred and keeps warning; the FIRST no-op with the
+/// lock FREE services the rotation (marker cleared) and reports no warning.
+///
+/// Determinism: the contention is created by a SECOND RemoteHelper's lock
+/// guard held directly (no sleeps, no wall clock). The push runs in a scoped
+/// thread; the guard is acquired the moment the engine's own step-15 guard
+/// drops (synchronized on the durable fleet-commit marker + the lock file's
+/// release), long before step 17 — the engine still has its whole
+/// finalize + observed-refresh window to run, so the acquire wins the race by
+/// a wide margin. If the engine's own rotation ever wins instead (oracle
+/// branch (a): the slot was rotated, no debt), the scenario is re-run on a
+/// fresh fixture — the assertion below only accepts the debt+warning branch.
+#[test]
+fn state_machine_lifecycle_rotation_lock_contention_defers_not_silent() {
+    let id = DeploymentId::new("si-lockcont-push".to_string());
+    let holder = "op-lockcont-holder";
+    for attempt in 0..16 {
+        let f = Fixture::new();
+        let remote = f.remote();
+        let helper = RemoteHelper::new(remote.as_ref());
+
+        // ---- Step 1: PUSH with the mutation lock held from step 17 on.
+        // The push runs in a scoped thread; the main thread waits for the
+        // fleet-commit marker (the engine passed preflight, the batch, and
+        // step 15), then acquires the lock via the second helper the moment
+        // the engine's own guard drops. Step 17's `acquire_lock_guard` then
+        // contends and the maintenance is deferred (debt + warning), never
+        // silent, never an `Err`.
+        let report1 = std::thread::scope(|s| {
+            let push = s.spawn(|| f.push_with_id("t1", &id));
+            let _guard = {
+                let marker = layout::commit_marker(id.as_str());
+                let mut spins = 0u64;
+                while !remote.exists(&marker) {
+                    std::thread::yield_now();
+                    spins += 1;
+                    assert!(
+                        spins < 20_000_000,
+                        "attempt {attempt}: the push never wrote its fleet-commit marker (step 15)"
+                    );
+                }
+                // The marker is written UNDER the engine's own guard; wait for
+                // that guard to drop (lock file gone), then hold it ourselves.
+                loop {
+                    if !remote.exists(&layout::operation_lock())
+                        && let Ok(g) = helper.acquire_lock_guard(holder)
+                    {
+                        break g;
+                    }
+                    std::thread::yield_now();
+                    spins += 1;
+                    assert!(
+                        spins < 20_000_000,
+                        "attempt {attempt}: the push never released the mutation lock after step 15"
+                    );
+                }
+            };
+            push.join().expect("push thread panicked")
+        });
+        // Oracle after the successful push: (b) the slot carries debt AND the
+        // report warns naming it — never silent, never Err. (If the engine's
+        // own rotation won the lock, oracle branch (a) holds instead: the slot
+        // was rotated with no debt; retry the scenario on a fresh fixture.)
+        let Ok(report1) = report1 else {
+            panic!(
+                "attempt {attempt}: a committed deployment must never fail (post-commit maintenance)"
+            )
+        };
+        let warning1 = report1.warning.as_deref().unwrap_or("");
+        let contended = report1.status == Some(DeploymentStatus::Successful)
+            && warning1.contains("rotation deferred for slot 'p1'")
+            && warning1.contains("slot lock held by another operation")
+            && !f.store.read_rotation_debt("t1").unwrap().is_empty();
+        if !contended {
+            continue;
+        }
+
+        // ---- Step 2: NO-OP with the lock HELD — the deferred maintenance
+        // stays deferred (marker kept) and keeps warning. The lock must be
+        // held AFTER this push's preflight (which reads the lock fresh) but
+        // BEFORE the no-op's deferred-maintenance retry: the write-once
+        // protocol marker is removed first so the push's handshake re-creates
+        // it as a fresh mid-push signal that the status read is done.
+        remote
+            .remove_file(&layout::protocol_marker())
+            .expect("remove protocol marker for a fresh handshake signal");
+        let report2 = std::thread::scope(|s| {
+            let push = s.spawn(|| f.push_with_id("t1", &id));
+            let _guard = {
+                let marker = layout::protocol_marker();
+                let mut spins = 0u64;
+                while !remote.exists(&marker) {
+                    std::thread::yield_now();
+                    spins += 1;
+                    assert!(
+                        spins < 20_000_000,
+                        "attempt {attempt}: the no-op push never handshaked"
+                    );
+                }
+                // The no-op path holds the lock nowhere before its deferred-
+                // maintenance retry, so the acquire lands immediately and is
+                // certain to precede the retry (the no-op check still runs its
+                // verification subprocess in between).
+                loop {
+                    if let Ok(g) = helper.acquire_lock_guard(holder) {
+                        break g;
+                    }
+                    std::thread::yield_now();
+                    spins += 1;
+                    assert!(
+                        spins < 20_000_000,
+                        "attempt {attempt}: the mutation lock stayed acquired"
+                    );
+                }
+            };
+            push.join().expect("push thread panicked")
+        });
+        let Ok(report2) = report2 else {
+            panic!(
+                "attempt {attempt}: the no-op must never fail because its maintenance retry contended"
+            )
+        };
+        let warning2 = report2.warning.as_deref().unwrap_or("");
+        let still_deferred = report2.message == "Everything up to date"
+            && report2.status.is_none()
+            && warning2.contains("rotation still deferred for slot 'p1'")
+            && warning2.contains("slot lock held by another operation")
+            && !f.store.read_rotation_debt("t1").unwrap().is_empty();
+        if !still_deferred {
+            continue;
+        }
+        // Step 2's guard drops here (lock released).
+
+        // ---- Step 3: the FIRST no-op with the lock FREE services the
+        // deferred rotation: the marker is cleared, no warning remains.
+        let report3 = f.push("t1").expect("the retrying push succeeds");
+        assert_eq!(report3.message, "Everything up to date");
+        assert_eq!(
+            report3.status, None,
+            "the retrying push is an up-to-date no-op"
+        );
+        assert!(
+            report3.warning.is_none(),
+            "the maintenance succeeded on the unlocked no-op, so no warning remains"
+        );
+        assert!(
+            f.store.read_rotation_debt("t1").unwrap().is_empty(),
+            "the debt marker must be cleared once the rotation succeeds"
+        );
+        f.check_invariants();
+        return;
+    }
+    panic!(
+        "the held-lock step-17 contention was never observed in 16 attempts; \
+         the engine's own rotation kept winning the lock race"
+    );
+}
+
 /// Lifecycle: a failure at the FIRST I/O boundary (the intent persist) must
 /// abort BEFORE any remote mutation — no `current`, no generation — and a
 /// clean retry succeeds.
@@ -1173,9 +1336,6 @@ fn state_machine_lifecycle_intent_persist_leaves_remote_untouched() {
     let f = Fixture::new();
     let id = DeploymentId::new("si-intent-fault".to_string());
     let err = {
-        let _fault_guard = crate::testutil::FAULT_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         f.arm_store_fault(FailureStep::IntentPersist, &id);
         f.push_with_id("t1", &id)
             .err()
@@ -1322,9 +1482,6 @@ fn observed_scope_crash_before_refresh_recovered_by_noop_retry() {
     f.apply(Action::Build(1));
     let id = DeploymentId::new("si-obs-crash-before-refresh");
     let err = {
-        let _fault_guard = crate::testutil::FAULT_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         f.arm_store_fault(FailureStep::ResultsWrite, &id);
         f.push_with_id("t1", &id)
             .err()
@@ -1402,9 +1559,6 @@ fn observed_scope_preflight_failure_leaves_observed_equal() {
     f.apply(Action::Build(2));
     let id = DeploymentId::new("si-obs-preflight");
     let err = {
-        let _fault_guard = crate::testutil::FAULT_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         f.arm_store_fault(FailureStep::IntentPersist, &id);
         f.push_with_id("t2", &id)
             .err()
@@ -1475,9 +1629,6 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     f.apply(Action::Build(3));
     let id_p = DeploymentId::new("si-obs-seq-preflight");
     let err = {
-        let _fault_guard = crate::testutil::FAULT_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         f.arm_store_fault(FailureStep::IntentPersist, &id_p);
         f.push_with_id("t2", &id_p)
             .err()
@@ -1510,9 +1661,6 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
         .clone();
     let id_c = DeploymentId::new("si-obs-seq-crash");
     let err = {
-        let _fault_guard = crate::testutil::FAULT_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         f.arm_store_fault(FailureStep::ResultsWrite, &id_c);
         f.push_with_id("t1", &id_c)
             .err()
@@ -1851,9 +1999,6 @@ fn lifecycle_store_fault_matrix_recovers_without_duplicate_history() {
         let f = Fixture::new();
         let id = DeploymentId::new(format!("si-lc-fault-{i}"));
         let err = {
-            let _fault_guard = crate::testutil::FAULT_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
             f.arm_store_fault(step, &id);
             f.push_with_id("t1", &id)
                 .err()
@@ -1921,6 +2066,13 @@ fn lifecycle_store_fault_matrix_recovers_without_duplicate_history() {
 /// a clean no-op retry converges WITHOUT duplicate history — snapshot count,
 /// attempt count, transition stream, and `refs/last-successful` all stay
 /// exactly-once.
+///
+/// AUDIT NOTE (the previously-missed fault matrix): with the old
+/// process-global slots, this matrix armed its observed-refresh faults
+/// WITHOUT holding FAULT_LOCK — a concurrent test could clobber or
+/// consume the armed slot. The per-fixture registry makes the matrix
+/// structurally safe: the arm lives on THIS fixture's registry and only THIS
+/// fixture's store can consume it, so no lock window is needed.
 #[test]
 fn lifecycle_observed_refresh_faults_never_fail_after_commit() {
     for (i, step) in [
@@ -2053,19 +2205,18 @@ fn lifecycle_observed_refresh_faults_never_fail_after_commit() {
 ///     fault is one-shot, so the later clear write succeeds) — the warning
 ///     from the faulted retry stays on the report.
 ///
-/// The `debtfx` fixture target is pushed ONLY by this test, and every
-/// arm→push window holds [`crate::testutil::FAULT_LOCK`], so the target-keyed
-/// one-shot arms (`arm_read_rotation_debt` / `arm_write_rotation_debt`)
-/// cannot be consumed by a concurrent test's push.
+/// The `debtfx` fixture target is pushed ONLY by this test, so the
+/// target-keyed one-shot arms (`arm_read_rotation_debt` /
+/// `arm_write_rotation_debt`) cannot be consumed by a concurrent test's
+/// push. Each case arms THIS fixture's per-fixture registry (a fresh store
+/// per case), so no arm can leak between cases or tests either — no lock
+/// window and no global slots.
 #[test]
 fn lifecycle_debt_fault_matrix_never_fails_after_commit() {
     const SLOT: &str = "pdx";
-    // One shared guard for the WHOLE matrix: every arm->push window (and the
-    // inter-case clears) must never interleave with another fault-arming test
-    // in the same process.
-    let _fault_guard = crate::testutil::FAULT_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    // Each case owns a fresh fixture whose store holds its own empty
+    // registry; arms die with the fixture, so nothing needs clearing and
+    // nothing can interleave with another fault-arming test.
     for (i, step) in [
         FailureStep::DebtRead,
         FailureStep::DebtWrite,
@@ -2164,9 +2315,9 @@ fn lifecycle_debt_fault_matrix_never_fails_after_commit() {
                     "{ctx}: a retained debt marker must be explicitly warned"
                 );
                 // The arm may not have fired (an empty-debt write case never
-                // writes); clear it so the next case's pre-seed write cannot
-                // consume a stale arm.
-                crate::testutil::test_faults::clear_rotation_debt_faults();
+                // writes); the stale arm dies with the fixture's registry at
+                // the end of this block — the next case starts a fresh fixture
+                // with a fresh, empty registry.
             }
             // ---- NO-OP: push once clean, seed the debt (existing cases),
             // arm, then an up-to-date no-op push whose maintenance hook retries
@@ -2250,7 +2401,6 @@ fn lifecycle_debt_fault_matrix_never_fails_after_commit() {
                     debt.is_empty() || r2.warning.is_some(),
                     "{ctx}: a retained marker must be explicitly warned — never silently deferred"
                 );
-                crate::testutil::test_faults::clear_rotation_debt_faults();
             }
         }
     }
@@ -3321,11 +3471,10 @@ proptest! {
 
     #[test]
     fn semantic_state_machine(actions in prop::collection::vec(action_strategy(), 1..20)) {
-        // Hold the shared fault lock for the WHOLE case: the case's pushes
-        // (and any arm it performs) must never interleave with another test's
-        // armed store fault — the 128 cases run concurrently with the
-        // fault-matrix and engine fault tests in the same process.
-        let _fault_guard = crate::testutil::FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // No fault lock: every arm targets the fixture's OWN per-fixture
+        // registry (see `src/testutil.rs`), so the 128 cases run concurrently
+        // with the fault-matrix and engine fault tests without any shared
+        // process-global slot to race over.
         let mut model = Model::new();
         let system = Fixture::new();
         for action in actions {

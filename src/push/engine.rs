@@ -1324,8 +1324,13 @@ fn push_inner(
     // block, so an error from `compute_retained` or `rotate` releases the
     // lock on drop instead of leaking it (a manual acquire/release pair would
     // strand every later operation on this slot with "mutation lock held by
-    // ..."). A lock acquisition conflict (held by another operation) skips
-    // the rotation silently, exactly as before.
+    // ..."). A lock acquisition conflict (held by another operation) NEVER
+    // skips silently: it defers the maintenance the same way a rotation
+    // failure does — a best-effort debt marker plus an explicit warning
+    // naming the slot — so after a successful push every slot is either
+    // ROTATED or carries debt + a warning, and a later push (including a
+    // no-op) services the marker once the lock is free.
+    //
     let mut maintenance: Vec<String> = Vec::new();
     // Observed-refresh deferrals (post-commit projection lag) ride the same
     // warning channel as rotation; unlike rotation there is no debt marker to
@@ -1390,6 +1395,31 @@ fn push_inner(
                     ));
                 }
             }
+        } else {
+            // The slot's mutation lock is CONTENDED (held by another
+            // operation), so the rotation cannot run now. The deployment has
+            // already committed, so this must NEVER fail the push: record the
+            // deferral as best-effort debt (persistence faults are
+            // warning-only per the post-commit lifecycle) and surface an
+            // explicit warning naming the slot. The marker makes the
+            // deferral retryable — a later push (including an up-to-date
+            // no-op) services the maintenance once the lock is free and
+            // clears the marker.
+            maintenance.push(format!(
+                "rotation deferred for slot '{}': slot lock held by another operation",
+                sid.as_str()
+            ));
+            // Best-effort debt record; NEVER propagates an error out of
+            // post-commit maintenance. Merge seam: when the debt I/O lands
+            // non-fallible (warning-collecting), this line extends
+            // `maintenance` with the returned warnings — the `Result` here
+            // is discarded either way.
+            let _ = set_rotation_deferred(
+                store,
+                target_name,
+                sid,
+                "slot lock held by another operation",
+            );
         }
         // Clean up this deployment's incoming directory. Best-effort by
         // design: the push already succeeded, so a leftover here cannot change
@@ -2220,7 +2250,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // re-eligible, and a follow-up push must complete exactly the remaining
     // steps without duplicating the snapshot. These tests arm a one-shot
     // store fault keyed by the pending attempt's deployment ID (see
-    // `src/store/local.rs::test_faults`) on each persistence step, run a push
+    // `src/store/local.rs`'s per-fixture fault registry) on each persistence
+    // step, run a push
     // that aborts mid-finalization, then run a clean push and assert
     // exactly-one semantics: one snapshot entry, `refs/last-successful`
     // pointing at the attempt, latest transition `Successful`, markers
@@ -2569,10 +2600,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // Push 2: the snapshot append (first persistence step of finalization)
         // fails once -> the push aborts with Err and nothing is durable yet.
         let err = {
-            let _fault_guard = crate::testutil::FAULT_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            crate::testutil::test_faults::arm_append_snapshot(attempt.deployment_id.as_str());
+            h.store
+                .fault_registry()
+                .arm_append_snapshot(attempt.deployment_id.as_str());
             push_clean(&h)
                 .err()
                 .expect("push must abort when the snapshot append fails")
@@ -2606,10 +2636,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // second persistence step) fails once -> Err; the snapshot exists
         // but the ref is stale and the attempt stays `PendingCommit`.
         let err = {
-            let _fault_guard = crate::testutil::FAULT_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            crate::testutil::test_faults::arm_write_last_successful(attempt.deployment_id.as_str());
+            h.store
+                .fault_registry()
+                .arm_write_last_successful(attempt.deployment_id.as_str());
             push_clean(&h)
                 .err()
                 .expect("push must abort when the last-successful write fails")
@@ -2643,10 +2672,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // final `Successful` transition append fails -> Err; the attempt
         // stays `PendingCommit`, so it is still eligible for the next push.
         let err = {
-            let _fault_guard = crate::testutil::FAULT_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            crate::testutil::test_faults::arm_append_transition(attempt.deployment_id.as_str());
+            h.store
+                .fault_registry()
+                .arm_append_transition(attempt.deployment_id.as_str());
             push_clean(&h)
                 .err()
                 .expect("push must abort when the final transition append fails")
@@ -2716,7 +2744,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // `push_inner` DIRECTLY with a fixed id (the test module is inside
     // `engine.rs`, so it can): the one-shot `arm_*` faults stay keyed by
     // deployment id exactly like the recovery tests — deterministic under
-    // parallel `cargo test`.
+    // parallel `cargo test`, because each harness arms ITS OWN store's
+    // per-fixture fault registry (no process-global slots, no lock).
 
     /// A normal single-server push with a caller-supplied deployment id over
     /// healthy `LocalTransport` remotes (no injected remote faults). Drives
@@ -2773,10 +2802,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // `PendingCommit` (never `Successful`), no snapshot entry, no
         // `refs/last-successful`.
         let err = {
-            let _fault_guard = crate::testutil::FAULT_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            crate::testutil::test_faults::arm_append_snapshot(id.as_str());
+            h.store.fault_registry().arm_append_snapshot(id.as_str());
             push_main_with_id(&h, &id)
                 .err()
                 .expect("push must abort when the snapshot append fails")
@@ -2821,10 +2847,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // entry exists but the ref is stale and the attempt stays
         // `PendingCommit`.
         let err = {
-            let _fault_guard = crate::testutil::FAULT_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            crate::testutil::test_faults::arm_write_last_successful(id.as_str());
+            h.store
+                .fault_registry()
+                .arm_write_last_successful(id.as_str());
             push_main_with_id(&h, &id)
                 .err()
                 .expect("push must abort when the last-successful write fails")
@@ -2863,10 +2888,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // `PendingCommit` marker append passes through; the attempt stays
         // `PendingCommit` and remains eligible.
         let err = {
-            let _fault_guard = crate::testutil::FAULT_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            crate::testutil::test_faults::arm_append_transition_successful(id.as_str());
+            h.store
+                .fault_registry()
+                .arm_append_transition_successful(id.as_str());
             push_main_with_id(&h, &id)
                 .err()
                 .expect("push must abort when the final transition append fails")
@@ -3085,10 +3109,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let h = RecoveryHarness::new();
         let id = DeploymentId::new("deploy-intent-fault".to_string());
         let err = {
-            let _fault_guard = crate::testutil::FAULT_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            crate::testutil::test_faults::arm_append_attempt(id.as_str());
+            h.store.fault_registry().arm_append_attempt(id.as_str());
             push_main_with_id(&h, &id)
                 .err()
                 .expect("push must abort when the intent persist fails")
@@ -3142,10 +3163,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let h = RecoveryHarness::new();
         let id = DeploymentId::new("deploy-inprogress-no-results".to_string());
         let err = {
-            let _fault_guard = crate::testutil::FAULT_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            crate::testutil::test_faults::arm_write_results(id.as_str());
+            h.store.fault_registry().arm_write_results(id.as_str());
             push_main_with_id(&h, &id)
                 .err()
                 .expect("push must abort when write_results fails")
@@ -3218,10 +3236,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let h = RecoveryHarness::new();
         let id = DeploymentId::new("deploy-inprogress-window".to_string());
         let err = {
-            let _fault_guard = crate::testutil::FAULT_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            crate::testutil::test_faults::arm_append_transition_pending(id.as_str());
+            h.store
+                .fault_registry()
+                .arm_append_transition_pending(id.as_str());
             push_main_with_id(&h, &id)
                 .err()
                 .expect("push must abort when the finalize marker append fails")
@@ -3983,10 +4000,9 @@ interval_seconds = 0
 
         // Push 1: the terminal Successful transition fails once -> PendingCommit.
         let err = {
-            let _fault_guard = crate::testutil::FAULT_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            crate::testutil::test_faults::arm_append_transition_successful(id.as_str());
+            h.store
+                .fault_registry()
+                .arm_append_transition_successful(id.as_str());
             push_main_with_id(&h, &id)
                 .err()
                 .expect("first faulted push must abort")
@@ -4001,10 +4017,9 @@ interval_seconds = 0
         // Push 2: the REPLAY faults the SAME step again -> still PendingCommit,
         // still exactly one snapshot (idempotent ensure, no duplicate).
         let err2 = {
-            let _fault_guard = crate::testutil::FAULT_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            crate::testutil::test_faults::arm_append_transition_successful(id.as_str());
+            h.store
+                .fault_registry()
+                .arm_append_transition_successful(id.as_str());
             push_clean(&h)
                 .err()
                 .expect("second faulted replay must abort")
