@@ -662,43 +662,61 @@ fn push_inner(
     // exactly as a HEAD push does. Only the variant behavior contract resolves
     // from the immutable snapshot (see `desired_behaviors` above).
     //
-    // A PREFLIGHT failure here happens AFTER the attempt intent and its
-    // initial `InProgress` transition were persisted (requirement.md step 14
-    // orders the intent before capacity, step 8). The attempt must therefore
-    // end terminal `FailedPreflight` — "an attempt that fails before any
-    // `current` change is `failed_preflight`" — never stranded `InProgress`
-    // (which would be misreported later as a recoverable/pending attempt or
-    // falsely degraded as "generation diverged" by a later reconcile).
+    // Capacity AND staging form ONE pre-mutation result block: a failure in
+    // EITHER phase happens AFTER the attempt intent and its initial
+    // `InProgress` transition were persisted (requirement.md step 14 orders
+    // the intent before capacity, step 8) and BEFORE any `current` change, so
+    // the attempt must end terminal `FailedPreflight` — "an attempt that
+    // fails before any `current` change is `failed_preflight`" — never
+    // stranded `InProgress` (which would be misreported later as a
+    // recoverable/pending attempt or falsely degraded as "generation
+    // diverged" by a later reconcile). On EVERY error in the block the
+    // terminal `FailedPreflight` transition is appended (the reason names the
+    // failing phase), any incoming directories the staging phase may have
+    // created on the remotes are removed best-effort (mirroring the
+    // post-push cleanup below), and the ORIGINAL error is returned unchanged.
     // Failures BEFORE the intent is persisted (plan resolution, historical
     // behavior snapshot, handshake) surface as the push error with no attempt
     // record at all.
-    capacity_preflight(
-        store,
-        &assignments,
-        &helpers,
-        op_id,
-        deployment_id,
-        config,
-        &target.rotation,
-    )
-    .map_err(|e| {
-        if matches!(e, Error::Preflight(_)) {
-            let _ = store.append_transition(
-                deployment_id.as_str(),
-                &DeploymentStatus::FailedPreflight,
-                Some("preflight failed"),
-            );
+    let mut preflight_reason = "preflight failed";
+    let preflight = (|| -> Result<()> {
+        capacity_preflight(
+            store,
+            &assignments,
+            &helpers,
+            op_id,
+            deployment_id,
+            config,
+            &target.rotation,
+        )?;
+        // Stage every needed tree into operation-unique incoming paths.
+        preflight_reason = "staging failed";
+        for a in &assignments {
+            let _remote = remotes[&a.placement_slot].as_ref();
+            let helper = &helpers[&a.placement_slot];
+            if !helper.tree_exists(a.artifact.tree.as_str()) {
+                let host_obj = store.object_root(&a.artifact.tree);
+                helper.stage_incoming(
+                    deployment_id.as_str(),
+                    a.artifact.tree.as_str(),
+                    &host_obj,
+                )?;
+            }
         }
-        e
-    })?;
-    // Stage every needed tree into operation-unique incoming paths.
-    for a in &assignments {
-        let _remote = remotes[&a.placement_slot].as_ref();
-        let helper = &helpers[&a.placement_slot];
-        if !helper.tree_exists(a.artifact.tree.as_str()) {
-            let host_obj = store.object_root(&a.artifact.tree);
-            helper.stage_incoming(deployment_id.as_str(), a.artifact.tree.as_str(), &host_obj)?;
+        Ok(())
+    })();
+    if let Err(e) = preflight {
+        let _ = store.append_transition(
+            deployment_id.as_str(),
+            &DeploymentStatus::FailedPreflight,
+            Some(preflight_reason),
+        );
+        for a in &assignments {
+            helpers[&a.placement_slot]
+                .remove_incoming(deployment_id.as_str())
+                .ok();
         }
+        return Err(e);
     }
 
     // 10-13. Process slots in batches.
@@ -4551,6 +4569,103 @@ interval_seconds = 0
         }
     }
 
+    /// A transport wrapper that fails the FIRST file write under `incoming/`
+    /// (the staging upload) once, letting a test inject a staging failure
+    /// deterministically. Mirrors the `FailOnceMarkerRemote` pattern from
+    /// tests/integration.rs: the fault fires on the first `write` whose path
+    /// starts with `incoming/` and disarms itself, while every other call —
+    /// including the `create_dir_all` that creates the incoming directory and
+    /// the `control/`/`state/` writes of the handshake — passes through
+    /// untouched. Failing the file WRITE (rather than the directory create)
+    /// leaves a real partial upload behind, so a test can assert the
+    /// best-effort incoming cleanup removed it.
+    struct FailOnceStagingRemote {
+        inner: LocalTransport,
+        armed: Arc<AtomicBool>,
+    }
+
+    impl FailOnceStagingRemote {
+        fn build(base: PathBuf, armed: Arc<AtomicBool>) -> Result<Box<dyn Remote>> {
+            Ok(Box::new(FailOnceStagingRemote {
+                inner: LocalTransport::new(base)?,
+                armed,
+            }))
+        }
+        fn fail_staging_write(&self, rel: &std::path::Path) -> bool {
+            self.armed.load(Ordering::SeqCst) && rel.to_string_lossy().starts_with("incoming/")
+        }
+    }
+
+    impl Remote for FailOnceStagingRemote {
+        fn root(&self) -> &std::path::Path {
+            self.inner.root()
+        }
+        fn provision_layout(&self) -> Result<()> {
+            self.inner.provision_layout()
+        }
+        fn read(&self, rel: &std::path::Path) -> Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
+            if self.fail_staging_write(rel) {
+                self.armed.store(false, Ordering::SeqCst);
+                return Err(Error::remote(
+                    "FailOnceStagingRemote: incoming staging write forced to fail (once)",
+                ));
+            }
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<bool> {
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &std::path::Path, mode: u32) -> Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(
+            &self,
+            rel: &std::path::Path,
+        ) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &std::path::Path) -> Result<std::path::PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &std::path::Path) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &std::path::Path) -> Result<crate::remote::transport::RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn exec(
+            &self,
+            argv: &[String],
+            timeout: std::time::Duration,
+        ) -> Result<crate::remote::transport::ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+        fn available_bytes(&self) -> Result<u64> {
+            self.inner.available_bytes()
+        }
+    }
+
     /// FIRST-DEPLOY activation failure: there is no prior generation to
     /// restore, so compensation removes `current` — compare-and-swap style,
     /// only while it still points at the generation this attempt advanced
@@ -4721,6 +4836,291 @@ interval_seconds = 0
             remote.list(crate::layout::objects()).unwrap().is_empty(),
             "no tree object may be published"
         );
+    }
+
+    /// A STAGING failure (after the intent is durable, before any `current`
+    /// change) must end the attempt `FailedPreflight` — the same terminal
+    /// status as a capacity failure — never a stranded `InProgress`.
+    /// Regression: the staging loop used `?` directly, so ANY staging error
+    /// (a remote write failure, a store fault, a transport error) propagated
+    /// as the push error with the attempt's latest transition still
+    /// `InProgress`; a later reconcile would then misreport it (generation
+    /// never minted → falsely "degraded as diverged") instead of the
+    /// documented "an attempt that fails before any `current` change is
+    /// `failed_preflight`". The staging phase may have uploaded partial
+    /// incoming content; that content is removed best-effort, and no
+    /// generation/`current`/object is published.
+    #[test]
+    fn staging_failure_records_failed_preflight_status() {
+        let h = RecoveryHarness::new();
+        let id = DeploymentId::new("deploy-staging-fail".to_string());
+        let project_root = h.config.project_root(&h.cfg_path);
+        let target = h.config.targets.get("t1").expect("harness target");
+        let op_id = OperationId::new(format!("op-{}", id.as_str()));
+        // One-shot fault: the FIRST incoming file write of the staging upload
+        // fails (after the incoming dir and its `app/` subdir were created),
+        // so a real partial upload exists for the cleanup to remove.
+        let armed = Arc::new(AtomicBool::new(true));
+        let armed_for_factory = armed.clone();
+        let rf = h.remotes_base.clone();
+        let factory = move |s: &crate::config::ServerDef,
+                            _slot: &crate::config::SlotDef|
+              -> Result<Box<dyn Remote>> {
+            FailOnceStagingRemote::build(rf.join(&s.id), armed_for_factory.clone())
+        };
+        let err = push_inner(
+            &project_root,
+            &h.store,
+            &factory,
+            "t1",
+            &PushRef::Head,
+            &id,
+            &op_id,
+            &h.config,
+            target,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .err()
+        .expect("staging failure must fail the push");
+        assert!(
+            err.to_string()
+                .contains("incoming staging write forced to fail"),
+            "the ORIGINAL staging error must surface, got: {err}"
+        );
+        assert!(
+            !armed.load(Ordering::SeqCst),
+            "the one-shot staging fault must have fired"
+        );
+
+        // The intent is durable and the attempt's LATEST status is the
+        // terminal `FailedPreflight` — never stranded `InProgress`.
+        let attempts = h.store.read_attempts("t1").unwrap();
+        assert_eq!(attempts.len(), 1, "intent must be persisted before staging");
+        assert_eq!(
+            latest_status(&h, id.as_str()),
+            DeploymentStatus::FailedPreflight,
+            "a staging failure after intent must end FailedPreflight"
+        );
+        let transitions = h.store.read_transitions(id.as_str()).unwrap();
+        let statuses: Vec<DeploymentStatus> =
+            transitions.iter().map(|t| t.status.clone()).collect();
+        assert_eq!(
+            statuses,
+            vec![
+                DeploymentStatus::InProgress,
+                DeploymentStatus::FailedPreflight,
+            ],
+            "the attempt must evolve InProgress -> FailedPreflight"
+        );
+
+        // No reflog/snapshot, and NO remote deployment mutation: no `current`,
+        // no generation record, no published object.
+        assert!(h.store.read_snapshots("t1").unwrap().is_empty());
+        assert!(h.store.read_last_successful("t1").is_none());
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        assert!(!remote.exists(crate::layout::current()), "no current");
+        assert!(
+            remote
+                .list(crate::layout::generations())
+                .unwrap()
+                .is_empty(),
+            "no generation record may be durable"
+        );
+        assert!(
+            remote.list(crate::layout::objects()).unwrap().is_empty(),
+            "no tree object may be published"
+        );
+
+        // The partially-created incoming directory was cleaned best-effort:
+        // the fault fired on the first file write, AFTER the incoming dir and
+        // its `app/` subdir were created, so a real partial upload existed and
+        // must be gone.
+        assert!(
+            !remote.exists(&crate::layout::incoming_dir(id.as_str())),
+            "the partial incoming upload must be cleaned best-effort"
+        );
+    }
+
+    /// A staging failure on a LATER assignment (the first assignment's tree
+    /// staged fine) must still end the attempt `FailedPreflight`, and the
+    /// best-effort incoming cleanup must remove the FIRST assignment's
+    /// already-staged incoming directory too — a partial fleet staging is
+    /// never left behind for a later reconcile to trip over.
+    #[test]
+    fn staging_failure_on_later_assignment_cleans_earlier_incoming() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        // One variant declaring p1 (s1) and p2 (s2); both servers are fresh,
+        // so BOTH assignments need staging, in slot order p1 then p2.
+        let two_slot_variant = r#"
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+deploy_dir = "/srv/p1"
+
+[[slots]]
+id = "p2"
+server = "s2"
+target = "t1"
+deploy_dir = "/srv/p2"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+        std::fs::write(release_dir.join("standard.toml"), two_slot_variant).unwrap();
+        let artifacts_dir = release_dir.join("artifacts");
+        for (p, c) in [
+            ("build/output/app/server", "v1\n"),
+            ("deployment/common/README", "common\n"),
+        ] {
+            let fp = artifacts_dir.join(p);
+            std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
+            std::fs::write(&fp, c).unwrap();
+        }
+        let two_slot_toml = r#"
+schema_version = 1
+application = "two-slot"
+release = "v1"
+
+[targets.t1.rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[targets.t1.rotation.fleet]
+protect_deployments = 1
+
+[[servers]]
+id = "s1"
+address = "a"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s2"
+address = "b"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#;
+        let cfg_path = project.join("deploy.toml");
+        std::fs::write(&cfg_path, two_slot_toml).unwrap();
+        let config = Config::load(&cfg_path).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let remotes_base = dir.path().join("remotes");
+        std::fs::create_dir_all(&remotes_base).unwrap();
+
+        let id = DeploymentId::new("deploy-staging-later".to_string());
+        let project_root = config.project_root(&cfg_path);
+        let target = config.targets.get("t1").expect("target t1");
+        let op_id = OperationId::new(format!("op-{}", id.as_str()));
+        // Arm the fault ONLY on s2 (the LATER assignment): s1's staging must
+        // complete, then s2's first incoming write fails.
+        let armed = Arc::new(AtomicBool::new(true));
+        let armed_for_factory = armed.clone();
+        let rf = remotes_base.clone();
+        let factory = move |s: &crate::config::ServerDef,
+                            _slot: &crate::config::SlotDef|
+              -> Result<Box<dyn Remote>> {
+            let arm = if s.id == "s2" {
+                armed_for_factory.clone()
+            } else {
+                Arc::new(AtomicBool::new(false))
+            };
+            FailOnceStagingRemote::build(rf.join(&s.id), arm)
+        };
+        let err = push_inner(
+            &project_root,
+            &store,
+            &factory,
+            "t1",
+            &PushRef::Head,
+            &id,
+            &op_id,
+            &config,
+            target,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .err()
+        .expect("the later staging failure must fail the push");
+        assert!(
+            err.to_string()
+                .contains("incoming staging write forced to fail"),
+            "the ORIGINAL staging error must surface, got: {err}"
+        );
+        assert!(
+            !armed.load(Ordering::SeqCst),
+            "the one-shot staging fault on s2 must have fired"
+        );
+
+        // The attempt ends terminal FailedPreflight, never stranded
+        // InProgress.
+        assert_eq!(
+            store.latest_status(id.as_str()).unwrap(),
+            Some(DeploymentStatus::FailedPreflight),
+            "a later staging failure must end FailedPreflight"
+        );
+        let transitions = store.read_transitions(id.as_str()).unwrap();
+        let statuses: Vec<DeploymentStatus> =
+            transitions.iter().map(|t| t.status.clone()).collect();
+        assert_eq!(
+            statuses,
+            vec![
+                DeploymentStatus::InProgress,
+                DeploymentStatus::FailedPreflight,
+            ],
+            "the attempt must evolve InProgress -> FailedPreflight"
+        );
+
+        // The FIRST assignment's already-staged incoming dir was cleaned
+        // best-effort, and the second's partial upload too; no `current`,
+        // generation, or published object on either server.
+        for sname in ["s1", "s2"] {
+            let remote = LocalTransport::new(remotes_base.join(sname)).unwrap();
+            assert!(
+                !remote.exists(&crate::layout::incoming_dir(id.as_str())),
+                "slot {sname}'s incoming dir must be cleaned best-effort"
+            );
+            assert!(
+                !remote.exists(crate::layout::current()),
+                "no current on {sname}"
+            );
+            assert!(
+                remote
+                    .list(crate::layout::generations())
+                    .unwrap()
+                    .is_empty(),
+                "no generation record on {sname}"
+            );
+            assert!(
+                remote.list(crate::layout::objects()).unwrap().is_empty(),
+                "no published object on {sname}"
+            );
+        }
     }
 
     /// A HISTORICAL push whose release's behavior snapshot is missing (or
