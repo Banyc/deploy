@@ -25,7 +25,11 @@
 //! [`crate::records::HistoryFloor`]) for a target: the floor marker is
 //! written FIRST, durably and FAIL-CLOSED (private temp → fsync → rename →
 //! parent-dir fsync with errors propagated — any stage failure leaves NO
-//! floor, see [`LocalStore::write_history_floor`]), then physical
+//! floor on a first-ever checkpoint; ADVANCING an existing floor A to a
+//! later deployment B is TRANSACTIONAL — A is moved aside to a durable
+//! backup (`history-floor.json.prev`) and restored if B fails before its
+//! commit point, so a failed advancement never erases the previously
+//! durable floor, see [`LocalStore::write_history_floor`]), then physical
 //! compaction rewrites the jsonl logs to the suffix at/after the floor and
 //! deletes `deployments/<id>/` dirs strictly before it. EVERY read path in
 //! this module is gated by the floor ([`LocalStore::read_attempts`],
@@ -235,6 +239,38 @@ fn write_atomic_cas(path: &Path, bytes: &[u8]) -> Result<()> {
         && let Ok(dir) = std::fs::File::open(parent)
     {
         let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// The durable backup name of a history-floor marker: the marker name with
+/// a `.prev` suffix, in the SAME directory. A TRANSACTIONAL floor ADVANCE
+/// ([`LocalStore::write_history_floor`]) moves the current floor A here
+/// BEFORE B's marker can overwrite the marker name, and a failed advance
+/// renames it back; the reader ([`LocalStore::read_history_floor`]) fails
+/// closed when the marker is ABSENT but this backup exists (a torn
+/// advance: A was moved aside, its restore failed — never "no floor",
+/// which would expose the below-floor prefix).
+fn floor_backup_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        "{}.prev",
+        path.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default()
+    ))
+}
+
+/// DURABLY fsync the parent directory of `path` (open + sync_all, errors
+/// PROPAGATED). A rename is not durable until its directory entry is
+/// synced, so this is the commit point of every atomic marker replace in
+/// [`LocalStore::write_history_floor`]: B's commit point, the backup's
+/// durability, and the restore's durability all sync through here.
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        let dir = std::fs::File::open(parent)
+            .map_err(|e| Error::store(format!("open dir {}: {e}", parent.display())))?;
+        dir.sync_all()
+            .map_err(|e| Error::store(format!("fsync dir {}: {e}", parent.display())))?;
     }
     Ok(())
 }
@@ -898,7 +934,8 @@ impl LocalStore {
     /// Write the target's history floor marker with the checkpoint's
     /// FAIL-CLOSED durability protocol (its OWN sequence, not the shared
     /// [`write_atomic_replace`] — the per-stage fault slots must fire
-    /// between the steps):
+    /// between the steps). The FIRST floor (no existing marker) follows the
+    /// original sequence:
     ///
     /// 1. write the marker bytes to a UNIQUE temp file in the same
     ///    directory,
@@ -908,18 +945,38 @@ impl LocalStore {
     /// 4. rename it into place (atomic on POSIX),
     /// 5. DURABLY fsync the parent directory, errors PROPAGATED.
     ///
-    /// Every stage error is returned from THIS method (PRE-marker): the
-    /// durability commit point is the parent-directory sync, so a failure
-    /// at ANY stage means NO floor and therefore NO compaction. The
-    /// parent-sync failure is special: the marker may already be renamed
-    /// into place by then, so it is UNLINKED (no floor may exist), the
-    /// parent is best-effort re-synced, and the error is returned —
-    /// mirroring the torn-record cleanup in [`write_atomic_cas`]. The
-    /// checkpoint flow writes this FIRST — before any compaction — so the
-    /// floor is durable before anything is discarded.
+    /// ADVANCING the floor (an existing marker A is replaced by a later
+    /// deployment B) is TRANSACTIONAL — a failed advancement must NEVER
+    /// erase the previously durable floor A:
+    ///
+    /// 1. entry fault → `Err`, A untouched,
+    /// 2. stage B's temp (write + chmod private + fsync); a fault → `Err`,
+    ///    A untouched (no rename has happened yet),
+    /// 3. move A aside to the durable backup `history-floor.json.prev` in
+    ///    the same directory, then fsync the parent so the BACKUP is
+    ///    durable BEFORE B can overwrite the marker name; a fault or a real
+    ///    backup-sync error → restore A from the backup + `Err`,
+    /// 4. rename B's temp into place (atomic); a fault → restore A + `Err`,
+    /// 5. fsync the parent directory — B's DURABILITY COMMIT POINT — errors
+    ///    PROPAGATED; a fault (the marker may already be renamed into
+    ///    place) → unlink B's marker, restore A from the backup, and
+    ///    `Err`: B never committed, A is durable again,
+    /// 6. committed: remove the backup (best-effort — a stale `.prev` is
+    ///    harmless: every read is keyed on the marker, never the backup),
+    ///    then fsync the parent so the removal is durable.
+    ///
+    /// The RESTORE ([`LocalStore::restore_floor_backup`]) is the
+    /// fail-closed half: a restore failure leaves the marker absent while
+    /// `.prev` still holds A — the readers
+    /// ([`LocalStore::read_history_floor`]) then fail closed (a `.prev`
+    /// with no marker is a torn advance, never "no floor", which would
+    /// expose the below-floor prefix). Every stage error is returned from
+    /// THIS method (PRE-commit): B is never reported established unless its
+    /// parent-dir sync succeeded.
     pub(crate) fn write_history_floor(&self, target: &str, floor: &HistoryFloor) -> Result<()> {
         // Entry-point fault (existing): fired BEFORE any durability I/O, so
-        // a failure here leaves no marker, no temp, no compaction.
+        // a failure here leaves no marker, no temp, no backup, no
+        // compaction — the previous floor A (if any) is untouched.
         #[cfg(test)]
         if self
             .fault_registry
@@ -936,6 +993,13 @@ impl LocalStore {
             std::fs::create_dir_all(parent)
                 .map_err(|e| Error::store(format!("mkdir {}: {e}", parent.display())))?;
         }
+        // The durable backup of the CURRENT floor (if any), in the same
+        // directory. An ADVANCE moves A here before B can overwrite the
+        // marker name, so a failed advancement can always rename A back:
+        // the previously durable floor is never erased by an advance B
+        // cannot finish.
+        let backup = floor_backup_path(&path);
+        let had_floor = path.exists();
         let tmp = temp_name_for(&path);
         {
             let mut f = std::fs::OpenOptions::new()
@@ -949,7 +1013,8 @@ impl LocalStore {
             // point, so the marker is never observed with default perms
             // (the shared helper's old post-rename chmod opened a window).
             set_private(&tmp)?;
-            // Stage fault: the temp-file fsync.
+            // Stage fault: the temp-file fsync (B's temp — no rename has
+            // happened yet, so the existing floor A is untouched).
             #[cfg(test)]
             if self
                 .fault_registry
@@ -963,55 +1028,166 @@ impl LocalStore {
             f.sync_all()
                 .map_err(|e| Error::store(format!("fsync {}: {e}", tmp.display())))?;
         }
-        // Stage fault: the rename into place.
+
+        if had_floor {
+            // ---- TRANSACTIONAL ADVANCE, stage 1: BACKUP A ----------------
+            // Move the current floor A aside to the durable backup BEFORE B
+            // can overwrite the marker name, and make the backup durable
+            // (parent fsync) first: from here on, any failure can rename A
+            // back — the pre-advance state is never lost. The fault fires
+            // BEFORE the rename (A still in place); a real rename or sync
+            // failure restores A and fails the advance.
+            #[cfg(test)]
+            if self
+                .fault_registry
+                .consume(FaultKind::RenameFloorBackup, floor.deployment_id.as_str())
+            {
+                // A never moved (the fault fires before the rename): there
+                // is nothing to restore — drop B's staged temp and fail.
+                // The previous floor A stands untouched.
+                let _ = std::fs::remove_file(&tmp);
+                return Err(Error::store(
+                    "test fault: history-floor backup rename forced to fail once",
+                ));
+            }
+            std::fs::rename(&path, &backup).map_err(|e| {
+                // A may or may not have moved; attempt the restore either
+                // way so the failed advance leaves the pre-advance state
+                // (floor A durable — or, if the restore itself fails, a
+                // torn state every read fails closed on).
+                let restore =
+                    self.restore_floor_backup(&path, &backup, floor.deployment_id.as_str());
+                match restore {
+                    Ok(()) => Error::store(format!("rename floor {}: {e}", path.display())),
+                    Err(re) => Error::store(format!(
+                        "rename floor {}: {e}; restore of the previous floor failed ({re}) — the marker is left in a torn state and every read fails closed",
+                        path.display()
+                    )),
+                }
+            })?;
+            // The BACKUP must be durable before B can overwrite the marker
+            // name: without this sync, a later failure could leave the
+            // marker name empty with A only in a not-yet-durable backup.
+            if let Err(e) = sync_parent_dir(&path) {
+                let restore =
+                    self.restore_floor_backup(&path, &backup, floor.deployment_id.as_str());
+                return Err(match restore {
+                    Ok(()) => e,
+                    Err(re) => Error::store(format!(
+                        "history-floor advance: backup parent sync failed ({e}); restore of the previous floor failed ({re}) — the marker is left in a torn state and every read fails closed"
+                    )),
+                });
+            }
+        }
+
+        // Stage fault: the rename into place (B's temp → the marker name).
+        // Fires BEFORE the rename; A is safe at the backup, so the failed
+        // advance restores A and fails.
         #[cfg(test)]
         if self
             .fault_registry
             .consume(FaultKind::RenameFloor, floor.deployment_id.as_str())
         {
             let _ = std::fs::remove_file(&tmp);
-            return Err(Error::store(
-                "test fault: history-floor rename forced to fail once",
-            ));
+            let restore = self.restore_floor_backup(&path, &backup, floor.deployment_id.as_str());
+            return Err(match restore {
+                Ok(()) => Error::store("test fault: history-floor rename forced to fail once"),
+                Err(re) => Error::store(format!(
+                    "test fault: history-floor rename forced to fail once; restore of the previous floor failed ({re}) — the marker is left in a torn state and every read fails closed"
+                )),
+            });
         }
         std::fs::rename(&tmp, &path)
             .map_err(|e| Error::store(format!("rename {}: {e}", path.display())))?;
-        // The parent-directory fsync is the DURABILITY COMMIT POINT: it is
-        // what makes the rename survive power loss. Fail-closed — a
-        // failure (fault or real) propagates AFTER the already-renamed
-        // marker is unlinked so NO floor exists (no floor, no compaction).
-        let dir_sync: Result<()> = (|| {
-            #[cfg(test)]
-            if self
-                .fault_registry
-                .consume(FaultKind::SyncFloorParent, floor.deployment_id.as_str())
-            {
-                return Err(Error::store(
-                    "test fault: history-floor parent sync forced to fail once",
-                ));
-            }
-            if let Some(parent) = path.parent() {
-                let dir = std::fs::File::open(parent)
-                    .map_err(|e| Error::store(format!("open dir {}: {e}", parent.display())))?;
-                dir.sync_all()
-                    .map_err(|e| Error::store(format!("fsync dir {}: {e}", parent.display())))?;
-            }
-            Ok(())
-        })();
-        if let Err(e) = dir_sync {
-            // The marker may already be renamed into place: remove it so no
-            // floor exists, then best-effort fsync the parent again
-            // (mirror the torn-record cleanup) before reporting the sync
-            // failure.
+
+        // Stage fault: B's commit-point parent fsync (the durability
+        // COMMIT POINT — B's marker may already be renamed into place when
+        // this fires). Fail-closed: B never committed, so B's marker is
+        // unlinked and A is restored from the backup — the failed
+        // advancement leaves EXACTLY the pre-advance state (floor A
+        // durable, same visible suffix, no compaction side effects).
+        #[cfg(test)]
+        if self
+            .fault_registry
+            .consume(FaultKind::SyncFloorParent, floor.deployment_id.as_str())
+        {
+            // B may already be renamed into place: remove B's marker so no
+            // B exists, then restore A from the backup (the marker name
+            // reverts to the pre-advance floor). If the restore ITSELF
+            // fails, the marker is left absent while `.prev` holds A — a
+            // torn state every read fails closed on.
             let _ = std::fs::remove_file(&path);
-            if let Some(parent) = path.parent()
-                && let Ok(dir) = std::fs::File::open(parent)
-            {
-                let _ = dir.sync_all();
-            }
-            return Err(e);
+            let restore = self.restore_floor_backup(&path, &backup, floor.deployment_id.as_str());
+            return Err(match restore {
+                Ok(()) => Error::store("test fault: history-floor parent sync forced to fail once"),
+                Err(re) => Error::store(format!(
+                    "test fault: history-floor parent sync forced to fail once; restore of the previous floor failed ({re}) — the marker is left in a torn state and every read fails closed"
+                )),
+            });
+        }
+        // The parent-directory fsync is B's DURABILITY COMMIT POINT: it is
+        // what makes B's rename survive power loss. Fail-closed — a real
+        // sync failure means B never committed, so B's marker is unlinked
+        // and A is restored from the backup (mirror the torn-record
+        // cleanup).
+        if let Err(e) = sync_parent_dir(&path) {
+            let _ = std::fs::remove_file(&path);
+            let restore = self.restore_floor_backup(&path, &backup, floor.deployment_id.as_str());
+            return Err(match restore {
+                Ok(()) => e,
+                Err(re) => Error::store(format!(
+                    "history-floor advance: parent sync failed ({e}); restore of the previous floor failed ({re}) — the marker is left in a torn state and every read fails closed"
+                )),
+            });
+        }
+        // COMMITTED: B is durable. Remove the backup — best-effort (a stale
+        // `.prev` is harmless: every read is keyed on the marker, never the
+        // backup), then fsync the parent so the removal itself is durable.
+        // A removal failure is absorbed: the next advance overwrites any
+        // stale `.prev` when it moves the new floor aside.
+        if had_floor && std::fs::remove_file(&backup).is_ok() {
+            let _ = sync_parent_dir(&path);
         }
         Ok(())
+    }
+
+    /// Restore the PRE-ADVANCE floor A after a failed ADVANCE (A → B):
+    /// rename the durable backup `history-floor.json.prev` back over the
+    /// marker name (atomic on POSIX — it overwrites any half-installed B
+    /// marker) and fsync the parent so the restore is durable. A no-op when
+    /// no backup exists (the advance failed before A was ever moved aside —
+    /// A is still the durable marker).
+    ///
+    /// FAIL-CLOSED: the [`FaultKind::RestoreFloor`] fault (and any real
+    /// rename/sync error) makes the restore itself fail: A stays in the
+    /// backup and the marker keeps the failed stage's state — possibly
+    /// ABSENT. The readers ([`LocalStore::read_history_floor`]) then fail
+    /// closed with an integrity error (a `.prev` with no marker is a torn
+    /// advance, never "no floor" — which would expose the below-floor
+    /// prefix), so a double failure can never expose history below A.
+    fn restore_floor_backup(&self, path: &Path, backup: &Path, _deployment_id: &str) -> Result<()> {
+        // Stage fault: the RESTORE itself (keyed by the checkpoint
+        // deployment id, matching every other floor stage). Fires BEFORE
+        // any restore I/O — the restore could not even begin, so `.prev`
+        // still holds A and the marker keeps whatever state the failed
+        // stage left.
+        #[cfg(test)]
+        if self
+            .fault_registry
+            .consume(FaultKind::RestoreFloor, _deployment_id)
+        {
+            return Err(Error::store(
+                "test fault: history-floor restore forced to fail once",
+            ));
+        }
+        if !backup.exists() {
+            // The advance failed before A was moved aside: A is still the
+            // durable marker — nothing to restore.
+            return Ok(());
+        }
+        std::fs::rename(backup, path)
+            .map_err(|e| Error::store(format!("restore floor {}: {e}", path.display())))?;
+        sync_parent_dir(path)
     }
 
     /// Read the target's history-floor marker, or `None` when no checkpoint
@@ -1037,6 +1213,16 @@ impl LocalStore {
     /// * (c) an attempt must exist with `deployment_id ==
     ///   marker.deployment_id` (the floor's own deployment must be in the
     ///   target's attempts log).
+    /// * (d) TORN ADVANCE: when the marker is ABSENT but its durable backup
+    ///   (`history-floor.json.prev`, the transactional-advance artifact of
+    ///   [`LocalStore::write_history_floor`]) exists, an ADVANCE was
+    ///   interrupted mid-flight and its restore of the previous floor A
+    ///   failed — the marker cannot be trusted. This state is NEVER treated
+    ///   as "no floor" (which would expose the below-floor prefix): it
+    ///   fails closed with an integrity error. (A marker PRESENT alongside
+    ///   a stale `.prev` is fine — the success path removes the backup
+    ///   best-effort, and reads are keyed on the marker, never the
+    ///   backup.)
     ///
     /// Each violation is an [`Error::integrity`] error, so a corrupted or
     /// tampered marker is NEVER silently treated as "no floor" (which would
@@ -1046,6 +1232,22 @@ impl LocalStore {
     /// gated readers, never the marker directly.
     pub(crate) fn read_history_floor(&self, target: &str) -> Result<Option<HistoryFloor>> {
         let p = self.history_floor_path(target);
+        // TORN-ADVANCE FAIL-CLOSED CHECK (the transactional-replacement
+        // counterpart): when an ADVANCE (A → B) failed before B's durability
+        // commit point AND the restore of A also failed, the marker may be
+        // left ABSENT while the pre-advance floor A still sits in the
+        // durable backup. The backup's presence with no marker means an
+        // advance was interrupted mid-flight and the marker cannot be
+        // trusted — fail closed (never "no floor", which would expose the
+        // below-floor prefix). A marker PRESENT alongside a stale `.prev` is
+        // fine: the success path removes the backup best-effort, and reads
+        // are keyed on the marker, never the backup.
+        if !p.exists() && floor_backup_path(&p).exists() {
+            return Err(Error::integrity(format!(
+                "history floor for target '{target}' is missing but its durable backup {} exists: a floor ADVANCE was interrupted and its restore failed — refusing to treat this as 'no floor' (which would expose the below-floor prefix)",
+                floor_backup_path(&p).display()
+            )));
+        }
         if !p.exists() {
             return Ok(None);
         }

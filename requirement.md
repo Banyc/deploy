@@ -400,17 +400,37 @@ files, never visible history below the durable floor. The checkpoint snapshot
 itself stays resolvable; stepping below it fails closed with a history-floor
 ref error. Repeated checkpointing of the same deployment is idempotent (a
 no-op, or a repair that finishes an interrupted compaction); advancing to a
-later deployment updates the floor; an EARLIER deployment than the current
-floor is refused (a checkpoint can never move backward after older history
-has been discarded). The CLI requires an explicit deployment id and `--yes`
-for the real operation; `--dry-run` enumerates exactly what would be
-discarded and touches nothing. Only `deployments/<id>/` dirs strictly before
-the floor are ever deleted: release records, tree objects, remote
-generations, and pinned artifacts are never removed, and checkpointing one
-target never changes another target's history. The raw (unfiltered) readers
-are the internal index-minting view: snapshot indices are always
-`max(index) + 1` over the physical log, so compaction can never reuse an
-index and appends after a checkpoint stay unique and increasing.
+later deployment updates the floor TRANSACTIONALLY (below); an EARLIER
+deployment than the current floor is refused (a checkpoint can never move
+backward after older history has been discarded). The CLI requires an
+explicit deployment id and `--yes` for the real operation; `--dry-run`
+enumerates exactly what would be discarded and touches nothing. Only
+`deployments/<id>/` dirs strictly before the floor are ever deleted: release
+records, tree objects, remote generations, and pinned artifacts are never
+removed, and checkpointing one target never changes another target's
+history. The raw (unfiltered) readers are the internal index-minting view:
+snapshot indices are always `max(index) + 1` over the physical log, so
+compaction can never reuse an index and appends after a checkpoint stay
+unique and increasing.
+
+Advancing the floor is TRANSACTIONAL — replacing the marker must never
+erase the previously durable floor. `write_history_floor` stages B's marker
+(private temp + fsync), moves the current floor A aside to a durable backup
+(`history-floor.json.prev`, renamed + parent-dir fsynced BEFORE B can
+overwrite the marker name), renames B into place, and fsyncs the parent
+directory — B's durability commit point. A failure at ANY stage before that
+commit point RESTORES A from the backup (rename back + parent fsync): a
+failed advancement leaves exactly the pre-advance state — floor A durable,
+the same visible suffix, no compaction side effects — so advancing a
+checkpoint can never erase the previously durable floor. If the restore of A
+itself ALSO fails, the marker may be left absent while `.prev` still holds
+A; every read then fails closed with an integrity error (a torn advance is
+never treated as "no floor", which would expose the below-floor prefix) —
+recovery is to remove the stale `.prev` and re-checkpoint (reads then
+report no floor, and the next checkpoint re-establishes one). After B
+commits, the backup is removed best-effort and the parent is re-synced; a
+stale `.prev` is harmless (reads are keyed on the marker, never the
+backup).
 
 Tree metadata is identity-neutral. For example,
 

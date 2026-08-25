@@ -152,9 +152,29 @@ pub(crate) mod test_faults {
         /// durability stage of `write_history_floor` (keyed by the
         /// checkpoint deployment id), the durability COMMIT POINT. A
         /// failure (fault or real) is returned from `write_history_floor`
-        /// AFTER the already-renamed marker is unlinked, so no floor
-        /// exists and no compaction can run.
+        /// AFTER the already-renamed marker is unlinked; on an ADVANCE the
+        /// previous floor A is then restored from the backup, so no B
+        /// exists and A is durable again (a failed advancement never erases
+        /// the previously durable floor).
         SyncFloorParent,
+        /// The checkpoint floor marker's BACKUP RENAME (`history-floor.json`
+        /// → `history-floor.json.prev`) — the first stage of a
+        /// TRANSACTIONAL floor ADVANCE (keyed by the checkpoint deployment
+        /// id), running BEFORE the new marker can overwrite the old one. A
+        /// fault here fires BEFORE the rename (A still in place): the
+        /// staged temp is dropped, A stands untouched, and the advance
+        /// fails with `Err`.
+        RenameFloorBackup,
+        /// The checkpoint floor marker's RESTORE (`history-floor.json.prev`
+        /// → `history-floor.json`) — the fail-closed half of a
+        /// TRANSACTIONAL floor ADVANCE (keyed by the checkpoint deployment
+        /// id), attempted whenever an advance fails before B's durability
+        /// commit point. A fault here means the restore itself failed: the
+        /// previous floor A stays in the backup and the marker may be left
+        /// ABSENT — every read then fails closed with an integrity error (a
+        /// `.prev` with no marker is a torn advance, never "no floor",
+        /// which would expose the below-floor prefix).
+        RestoreFloor,
         /// The checkpoint's attempts.jsonl suffix rewrite (a compaction
         /// phase after the floor marker is already durable and the
         /// below-floor deployment dirs are deleted).
@@ -385,10 +405,34 @@ pub(crate) mod test_faults {
         /// third durability stage of `write_history_floor` — the durability
         /// commit point, keyed by the checkpoint deployment id) to fail
         /// once. The marker may already be renamed into place when this
-        /// fires; `write_history_floor` unlinks it (no floor exists, no
-        /// compaction) and returns the failure.
+        /// fires; `write_history_floor` unlinks it (on an ADVANCE it then
+        /// restores the previous floor A from the backup, so a failed
+        /// advancement never erases the previously durable floor) and
+        /// returns the failure.
         pub(crate) fn arm_sync_floor_parent(&self, deployment_id: &str) {
             self.arm(FaultKind::SyncFloorParent, deployment_id);
+        }
+
+        /// Arm the next checkpoint floor-marker BACKUP RENAME (the first
+        /// stage of a TRANSACTIONAL ADVANCE — `history-floor.json` →
+        /// `history-floor.json.prev`, keyed by the checkpoint deployment
+        /// id) to fail once. The fault fires BEFORE the rename, so the
+        /// previous floor A never moves: the staged temp is dropped and the
+        /// failure is returned from `write_history_floor` — the failed
+        /// advance leaves A durable.
+        pub(crate) fn arm_rename_floor_backup(&self, deployment_id: &str) {
+            self.arm(FaultKind::RenameFloorBackup, deployment_id);
+        }
+
+        /// Arm the next checkpoint floor-marker RESTORE (the fail-closed
+        /// half of a TRANSACTIONAL ADVANCE, keyed by the checkpoint
+        /// deployment id) to fail once. The restore is only attempted when
+        /// an EARLIER advance stage already failed; a fault here leaves the
+        /// previous floor A in the `.prev` backup and the marker absent —
+        /// every read then fails closed with an integrity error (a torn
+        /// advance is never "no floor").
+        pub(crate) fn arm_restore_floor(&self, deployment_id: &str) {
+            self.arm(FaultKind::RestoreFloor, deployment_id);
         }
 
         /// Arm the next checkpoint attempts.jsonl suffix rewrite for

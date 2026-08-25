@@ -45,11 +45,26 @@
 //!
 //! `run_checkpoint` propagates a failure ONLY from the floor-marker write
 //! (the commit point): a failed marker write is an ordinary `Err` and
-//! leaves NO floor (the atomic write leaves nothing). EVERY failure AFTER
-//! the marker write — enumerating the discards or any compaction phase, on
-//! the fresh path or the idempotency-repair path — is POST-COMMIT
-//! MAINTENANCE: the checkpoint already took effect, so the command reports
-//! SUCCESS with an explicit, DURABLE [`CleanupPending`] debt FLAG
+//! leaves the PREVIOUS state — no floor on a first-ever checkpoint; on an
+//! ADVANCE the replacement is TRANSACTIONAL
+//! ([`LocalStore::write_history_floor`]): B's marker is staged, the
+//! current floor A is moved aside to a durable backup
+//! (`history-floor.json.prev`), B is renamed into place, and the
+//! parent-directory fsync is B's durability commit point. A failure at ANY
+//! stage before that commit point RESTORES A from the backup, so a failed
+//! advancement leaves EXACTLY the pre-advance state (floor A durable, the
+//! same visible suffix, no compaction side effects) — advancing a
+//! checkpoint can never erase the previously durable floor. If the restore
+//! of A itself ALSO fails, the marker may be left absent while `.prev`
+//! holds A: every read fails closed with an integrity error (a torn
+//! advance is never treated as "no floor", which would expose the
+//! below-floor prefix); recovery is to remove the stale `.prev` (reads
+//! then report no floor, and the next checkpoint re-establishes one).
+//!
+//! EVERY failure AFTER the marker write — enumerating the discards or any
+//! compaction phase, on the fresh path or the idempotency-repair path — is
+//! POST-COMMIT MAINTENANCE: the checkpoint already took effect, so the
+//! command reports SUCCESS with an explicit, DURABLE [`CleanupPending`] debt
 //! (`targets/<target>/refs/cleanup-pending.json`, mirroring the
 //! rotation-debt discipline) and `CheckpointReport::cleanup_pending` set,
 //! NEVER an `Err`. The marker is a flag ONLY — it never carries a deletion
@@ -1727,6 +1742,426 @@ mod tests {
                 !store.deployment_dir(id).exists(),
                 "stage {stage}: the successful retry compacts, deleting below-floor dir {id}"
             );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // TRANSACTIONAL FLOOR REPLACEMENT (the state-machine property)
+    // ---------------------------------------------------------------------
+
+    /// One durability stage of a floor ADVANCE (A → B). Faulting it while
+    /// advancing must leave the PRE-ADVANCE state: floor A durable, the
+    /// visible suffix EXACTLY unchanged, no compaction side effects. The
+    /// RESTORE stage is the fail-closed exception: the restore is only
+    /// attempted when an EARLIER stage already failed, so the property
+    /// double-faults it (the parent-sync stage + the restore — "if IT also
+    /// fails") and asserts the reads fail CLOSED: the marker may be left
+    /// absent while `.prev` holds A — never "no floor", never a
+    /// below-floor exposure.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum AdvanceStage {
+        Entry,
+        TempSync,
+        BackupRename,
+        Rename,
+        ParentSync,
+        Restore,
+    }
+
+    /// Every durability stage of the transactional advance, in firing
+    /// order: entry → temp-sync → backup-rename → rename → parent-sync →
+    /// restore (the restore only fires after an earlier stage failed).
+    const ALL_ADVANCE_STAGES: [AdvanceStage; 6] = [
+        AdvanceStage::Entry,
+        AdvanceStage::TempSync,
+        AdvanceStage::BackupRename,
+        AdvanceStage::Rename,
+        AdvanceStage::ParentSync,
+        AdvanceStage::Restore,
+    ];
+
+    fn advance_stage_strategy() -> impl Strategy<Value = AdvanceStage> {
+        (0usize..ALL_ADVANCE_STAGES.len()).prop_map(|i| ALL_ADVANCE_STAGES[i])
+    }
+
+    /// Arm the fault(s) for one advance stage, keyed by the checkpoint
+    /// deployment id (B). The RESTORE stage is a DOUBLE fault: the
+    /// parent-sync stage (the deepest pre-commit stage — B's marker may
+    /// already be renamed into place) fails first, which forces the restore
+    /// attempt; the restore fault then makes the restore itself fail too.
+    fn arm_advance_stage(store: &LocalStore, stage: AdvanceStage, deployment_id: &str) {
+        match stage {
+            AdvanceStage::Entry => store
+                .fault_registry()
+                .arm_write_history_floor(deployment_id),
+            AdvanceStage::TempSync => store.fault_registry().arm_sync_floor_temp(deployment_id),
+            AdvanceStage::BackupRename => store
+                .fault_registry()
+                .arm_rename_floor_backup(deployment_id),
+            AdvanceStage::Rename => store.fault_registry().arm_rename_floor(deployment_id),
+            AdvanceStage::ParentSync => store.fault_registry().arm_sync_floor_parent(deployment_id),
+            AdvanceStage::Restore => {
+                store.fault_registry().arm_sync_floor_parent(deployment_id);
+                store.fault_registry().arm_restore_floor(deployment_id);
+            }
+        }
+    }
+
+    /// The ENTIRE visible state of `target` under the floor: the gated
+    /// snapshot/attempt lists, the floor's own (deployment, index), and the
+    /// below-floor ref refusal. A failed ADVANCE must leave this EXACTLY
+    /// unchanged (identical lists, the same below-floor refs refused) — the
+    /// "exactly the same visible suffix" half of the transactional
+    /// replacement invariant.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct VisibleState {
+        floor: Option<(String, u64)>,
+        snapshots: Vec<(u64, String)>,
+        attempts: Vec<String>,
+        below_floor_ref_err: Option<String>,
+    }
+
+    fn capture_visible(
+        store: &LocalStore,
+        target: &str,
+        floor: &Option<crate::records::HistoryFloor>,
+    ) -> VisibleState {
+        // The ref just below the floor must be REFUSED (never a resolved
+        // below-floor snapshot); capture the exact refusal message so the
+        // post-advance state can be compared byte-for-byte.
+        let below_floor_ref_err = match floor {
+            Some(f) if f.snapshot_index > 0 => {
+                let expr = history::parse_ref_expr(&format!("s{}", f.snapshot_index - 1)).unwrap();
+                Some(
+                    history::resolve_ref_expr(&expr, target, store)
+                        .unwrap_err()
+                        .to_string(),
+                )
+            }
+            _ => None,
+        };
+        VisibleState {
+            floor: floor
+                .as_ref()
+                .map(|f| (f.deployment_id.as_str().to_string(), f.snapshot_index)),
+            snapshots: store
+                .read_snapshots(target)
+                .unwrap()
+                .iter()
+                .map(|s| (s.index, s.deployment_id.as_str().to_string()))
+                .collect(),
+            attempts: store
+                .read_attempts(target)
+                .unwrap()
+                .iter()
+                .map(|a| a.deployment_id.as_str().to_string())
+                .collect(),
+            below_floor_ref_err,
+        }
+    }
+
+    /// One transactional-advance case: establish floor A (clean OR with an
+    /// INTERRUPTED cleanup — leftover debt + below-floor dirs, replaying the
+    /// commit-point test's seeding), capture the exact pre-advance visible
+    /// state, then fault EVERY durability stage while advancing A → B. Each
+    /// faulted advancement must return `Err` and retain A — the ORIGINAL
+    /// floor (same deployment_id + snapshot_index), never None, never B —
+    /// with the visible suffix EXACTLY unchanged (the restore stage is the
+    /// fail-closed exception: the restore also fails, so the reads fail
+    /// closed instead). Then the controls: a fault-free advancement to B
+    /// succeeds (floor = B), and A's interrupted cleanup converges after
+    /// the failed advances.
+    fn run_transactional_advance_case(
+        history_in: &[bool],
+        a_at: usize,
+        a_cleanup_interrupted: bool,
+        stage: AdvanceStage,
+    ) {
+        // Seeding (replaying the commit-point test): a guaranteed early
+        // success, a guaranteed FAILED attempt (a `deployments/<id>/` dir
+        // with no snapshot — below-floor dir material for A's interrupted
+        // cleanup), the randomized history, and a guaranteed FINAL success
+        // so B is always a strictly-later successful deployment.
+        let mut history = vec![true, false];
+        history.extend_from_slice(history_in);
+        history.push(true);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        seed_history(&store, TARGET, "deploy", &history);
+        let ok_ids: Vec<String> = history
+            .iter()
+            .enumerate()
+            .filter(|(_, ok)| **ok)
+            .map(|(n, _)| format!("deploy-{n:04}"))
+            .collect();
+        assert!(
+            ok_ids.len() >= 2,
+            "A and B both need a successful deployment"
+        );
+
+        // A: the `a_at`-th successful deployment (never the last — B owns
+        // the last success, so B is STRICTLY LATER than A). Its snapshot
+        // index is its position among the successes (snapshots are minted
+        // in order).
+        let a_id = ok_ids[a_at % (ok_ids.len() - 1)].clone();
+        let a_index = ok_ids.iter().position(|id| *id == a_id).unwrap() as u64;
+        // The position of A's attempt in the FULL history: everything
+        // before it owns a below-floor `deployments/<id>/` directory (the
+        // material an interrupted A cleanup leaves behind).
+        let a_attempt_pos = history
+            .iter()
+            .enumerate()
+            .find(|(n, _)| format!("deploy-{n:04}") == a_id)
+            .unwrap()
+            .0;
+        let b_id = ok_ids.last().unwrap().clone();
+        assert_ne!(a_id, b_id, "B must be a later deployment than A");
+        let b_index = (ok_ids.len() - 1) as u64;
+
+        // Establish A. When `a_cleanup_interrupted` AND there is material
+        // below A, arm a compaction fault (keyed by A's id) so A's
+        // checkpoint COMMITS with cleanup_pending: the durable floor A
+        // stands with leftover below-floor dirs + the debt marker (A's
+        // state is clean OR pending — replaying the commit-point test's
+        // seeding). A at the very first attempt has nothing below it, so
+        // the armed fault is unreachable and A is legitimately clean.
+        if a_cleanup_interrupted && a_attempt_pos > 0 {
+            store.fault_registry().arm_compact_deployments(&a_id);
+        }
+        let rep_a = run_checkpoint(&store, TARGET, &DeploymentId::new(a_id.clone()), false)
+            .expect("establishing A always succeeds");
+        assert!(rep_a.established, "A is established");
+        let a_floor = store.read_history_floor(TARGET).unwrap().unwrap();
+        assert_eq!(a_floor.deployment_id.as_str(), a_id);
+        assert_eq!(a_floor.snapshot_index, a_index);
+        if a_cleanup_interrupted && a_attempt_pos > 0 {
+            assert!(rep_a.cleanup_pending, "A's interrupted cleanup is pending");
+            assert!(
+                store.read_cleanup_pending(TARGET, None).unwrap().is_some(),
+                "A's interrupted cleanup records the durable debt marker"
+            );
+        } else {
+            assert!(!rep_a.cleanup_pending, "A is clean");
+        }
+
+        // PRE-ADVANCE state: the exact visible suffix under floor A.
+        let pre = capture_visible(&store, TARGET, &Some(a_floor.clone()));
+        // PRE-ADVANCE PHYSICAL state (the "no compaction side effects"
+        // half): the raw logs and the deployment-dir set must be UNCHANGED
+        // by a failed advancement. (A's OWN establishment may already have
+        // compacted the raw logs and deleted below-A dirs — that is the
+        // pre-advance baseline, not a side effect of the failed B
+        // advance.)
+        let pre_raw_attempts = store.read_attempts_raw(TARGET).unwrap().len();
+        let pre_raw_snaps = store.read_snapshots_raw(TARGET).unwrap().len();
+        let pre_dirs: Vec<String> = history
+            .iter()
+            .enumerate()
+            .filter(|(n, _)| store.deployment_dir(&format!("deploy-{n:04}")).exists())
+            .map(|(n, _)| format!("deploy-{n:04}"))
+            .collect();
+
+        // ---- FAULTED ADVANCE: the durability stage under test ------------
+        // Fault the stage while advancing A → B; the advancement MUST fail
+        // before B's durability commit point, and the PRE-ADVANCE state
+        // must survive EXACTLY (floor A, same visible suffix, same
+        // below-floor ref refusals, no compaction side effects) — except
+        // the RESTORE stage, whose restore ALSO fails: reads then fail
+        // CLOSED (a torn advance is never "no floor").
+        arm_advance_stage(&store, stage, &b_id);
+        let err = run_checkpoint(&store, TARGET, &DeploymentId::new(b_id.clone()), false)
+            .expect_err("a durability-stage fault must fail the advance before B commits");
+        assert!(
+            err.to_string().contains("test fault"),
+            "the fault is the failure cause, got: {err}"
+        );
+
+        if stage == AdvanceStage::Restore {
+            // The restore itself failed: the previous floor A stays in the
+            // durable backup and the marker was left ABSENT (B's marker was
+            // unlinked). Every read must fail CLOSED — never a downgrade to
+            // "no floor" (which would expose the below-floor prefix).
+            let e = store.read_history_floor(TARGET).unwrap_err();
+            assert!(
+                e.to_string().contains("integrity"),
+                "restore-failure reads fail closed from the loader, got: {e}"
+            );
+            let e = store.read_snapshots(TARGET).unwrap_err();
+            assert!(
+                e.to_string().contains("integrity"),
+                "read_snapshots propagates the torn-advance error, got: {e}"
+            );
+            let e = store.read_attempts(TARGET).unwrap_err();
+            assert!(
+                e.to_string().contains("integrity"),
+                "read_attempts propagates the torn-advance error, got: {e}"
+            );
+            // Below-floor refs refuse through the gated chain — never a
+            // resolved below-A snapshot.
+            for tok in ["s0", "s1", "s2"] {
+                let expr = history::parse_ref_expr(tok).unwrap();
+                let e = history::resolve_ref_expr(&expr, TARGET, &store).unwrap_err();
+                assert!(
+                    e.to_string().contains("integrity"),
+                    "resolve '{tok}' fails closed after the torn advance, got: {e}"
+                );
+            }
+            // No compaction side effects from the failed advance: the raw
+            // logs and the deployment-dir set are EXACTLY the pre-advance
+            // physical state.
+            assert_eq!(
+                store.read_snapshots_raw(TARGET).unwrap().len(),
+                pre_raw_snaps,
+                "the failed advance never touches the raw snapshot log"
+            );
+            assert_eq!(
+                store.read_attempts_raw(TARGET).unwrap().len(),
+                pre_raw_attempts,
+                "the failed advance never touches the raw attempts log"
+            );
+            let dirs: Vec<String> = history
+                .iter()
+                .enumerate()
+                .filter(|(n, _)| store.deployment_dir(&format!("deploy-{n:04}")).exists())
+                .map(|(n, _)| format!("deploy-{n:04}"))
+                .collect();
+            assert_eq!(
+                dirs, pre_dirs,
+                "the failed advance never deletes or creates a deployment dir"
+            );
+            // HEAL the torn state (the documented recovery): removing the
+            // stale `.prev` restores "no floor" — nothing was ever
+            // compacted, so the full history is intact and the fault-free
+            // advance control below re-establishes a floor.
+            std::fs::remove_file(store.refs_dir(TARGET).join("history-floor.json.prev")).unwrap();
+            assert!(
+                store.read_history_floor(TARGET).unwrap().is_none(),
+                "after healing, the torn target has no floor (never a partial one)"
+            );
+        } else {
+            // The failed advancement left EXACTLY the pre-advance state:
+            // floor A (the ORIGINAL floor — same deployment_id +
+            // snapshot_index; never None, never B) and an identical visible
+            // suffix.
+            let floor = store.read_history_floor(TARGET).unwrap();
+            let f = floor
+                .as_ref()
+                .expect("a failed advance must retain floor A — never None");
+            assert_eq!(
+                f.deployment_id.as_str(),
+                a_id,
+                "the ORIGINAL floor deployment A survives the failed {stage:?} advance"
+            );
+            assert_eq!(
+                f.snapshot_index, a_index,
+                "the ORIGINAL floor index survives the failed {stage:?} advance"
+            );
+            let post = capture_visible(&store, TARGET, &floor);
+            assert_eq!(
+                post.snapshots, pre.snapshots,
+                "{stage:?}: the visible snapshot suffix is exactly unchanged"
+            );
+            assert_eq!(
+                post.attempts, pre.attempts,
+                "{stage:?}: the visible attempts suffix is exactly unchanged"
+            );
+            assert_eq!(
+                post.below_floor_ref_err, pre.below_floor_ref_err,
+                "{stage:?}: the same below-floor refs stay refused"
+            );
+
+            // CONTROL: when A's cleanup was interrupted, re-checkpointing A
+            // after the failed advances CONVERGES the pending cleanup (the
+            // durable debt clears, the below-floor dirs are deleted).
+            if a_cleanup_interrupted && a_attempt_pos > 0 {
+                let retry = run_checkpoint(&store, TARGET, &DeploymentId::new(a_id.clone()), false)
+                    .expect("re-checkpointing A after the failed advances converges its pending cleanup");
+                assert!(
+                    !retry.cleanup_pending,
+                    "{stage:?}: A's interrupted cleanup converges after the failed advances"
+                );
+                assert!(
+                    store.read_cleanup_pending(TARGET, None).unwrap().is_none(),
+                    "{stage:?}: the debt marker clears once A's cleanup completes"
+                );
+                for (n, _) in history.iter().enumerate().take(a_attempt_pos) {
+                    assert!(
+                        !store.deployment_dir(&format!("deploy-{n:04}")).exists(),
+                        "{stage:?}: below-A dir {n} is deleted by the converged cleanup"
+                    );
+                }
+            }
+        }
+
+        // CONTROL: a fault-free advancement to B SUCCEEDS (floor = B, the
+        // advancement commits). For the restore stage this runs on the
+        // healed fixture (the first-ever-floor path).
+        let rep_b = run_checkpoint(&store, TARGET, &DeploymentId::new(b_id.clone()), false)
+            .expect("a fault-free advancement to B succeeds");
+        assert!(rep_b.established, "the advancement to B establishes B");
+        let floor_b = store.read_history_floor(TARGET).unwrap().unwrap();
+        assert_eq!(floor_b.deployment_id.as_str(), b_id);
+        assert_eq!(floor_b.snapshot_index, b_index);
+        assert!(
+            !store
+                .refs_dir(TARGET)
+                .join("history-floor.json.prev")
+                .exists(),
+            "a committed advance leaves no backup behind"
+        );
+    }
+
+    proptest! {
+        // The state-machine property for TRANSACTIONAL FLOOR REPLACEMENT:
+        // over (history shape, A's checkpoint position, whether A's cleanup
+        // was INTERRUPTED — clean OR pending, B = a strictly-later
+        // deployment), fault EVERY durability stage while advancing A → B
+        // and assert the failed advancement retains A — the ORIGINAL floor
+        // (same deployment_id + snapshot_index), never None, never B — and
+        // exposes EXACTLY the same visible suffix (identical gated lists,
+        // the same below-floor refs refused); the RESTORE-stage double
+        // fault instead asserts the reads fail CLOSED (a torn advance is
+        // never "no floor"). Then the controls: a fault-free advancement to
+        // B succeeds (floor = B) and A's pending cleanup converges after
+        // the failed advances. Fixed seed 0x5EED_5EED + bounded cases — the
+        // same vectors run on every invocation.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn failed_advance_retains_floor_a_and_visible_suffix(
+            history in prop::collection::vec(any::<bool>(), 3..7),
+            a_at in 0usize..8,
+            a_cleanup_interrupted in any::<bool>(),
+            stage in advance_stage_strategy(),
+        ) {
+            run_transactional_advance_case(&history, a_at, a_cleanup_interrupted, stage);
+        }
+    }
+
+    /// EXHAUSTIVE stage coverage: EVERY durability stage of a transactional
+    /// advance is faulted against two FIXED scenarios — one with A's
+    /// cleanup INTERRUPTED (pending debt + below-floor dirs) and one with A
+    /// at the very first attempt (clean, nothing below) — so a single
+    /// broken stage is always caught even if the bounded 16-case proptest
+    /// sample never drew that stage (mirrors
+    /// `every_floor_mutation_fails_closed_exhaustively`).
+    #[test]
+    fn every_advance_stage_fails_closed_exhaustively() {
+        for stage in ALL_ADVANCE_STAGES {
+            // A with an INTERRUPTED cleanup (pending debt + leftover
+            // below-floor dirs): every stage leaves floor A durable and the
+            // visible suffix exactly unchanged (the restore stage fails
+            // closed); the pending cleanup converges after the failed
+            // advances, then a fault-free advance to B succeeds.
+            run_transactional_advance_case(&[true, false, true], 1, true, stage);
+            // A at the very first attempt (clean, nothing below it): the
+            // interrupted-control is moot; every stage still retains A.
+            run_transactional_advance_case(&[false, false], 0, false, stage);
         }
     }
 
