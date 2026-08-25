@@ -17,7 +17,7 @@ use crate::model::{
     RELEASE_PAYLOAD_SCHEMA_VERSION, RELEASE_RECORD_SCHEMA_VERSION, ReleaseDigest, ReleaseId,
     ReleaseRecord, TreeDigest, VariantName,
 };
-use chrono::Utc;
+use jiff::Timestamp;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
@@ -257,7 +257,7 @@ pub fn build_release(
         release_schema_version: RELEASE_RECORD_SCHEMA_VERSION,
         release_id: id.as_str().to_string(),
         release_sha256: digest.as_str().to_string(),
-        created_at: Utc::now().to_rfc3339(),
+        created_at: Timestamp::now().to_string(),
         provenance: Provenance {
             git_revision: git_revision(root),
             mapping_sha256: mapping_sha.to_string(),

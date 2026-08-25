@@ -30,11 +30,11 @@ use crate::layout;
 use crate::model::{ReleaseId, TreeDigest};
 use crate::remote::helper::{RemoteHelper, RemoteStatus};
 use crate::store::local::LocalStore;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use std::collections::{BTreeMap, HashSet};
 
 struct GenRecord {
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     release: String,
     variant: String,
     tree: String,
@@ -94,9 +94,10 @@ pub fn compute_retained(
                 Ok(a) => a,
                 Err(_) => continue,
             };
-            let created = DateTime::parse_from_rfc3339(&a.created_at)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
+            let created = a
+                .created_at
+                .parse::<Timestamp>()
+                .unwrap_or_else(|_| Timestamp::now());
             gens.push(GenRecord {
                 created_at: created,
                 release: a.artifact.release.as_str().to_string(),
@@ -156,7 +157,7 @@ fn retained_for_policy(
 
     // Distinct successful artifact bindings on the server, keyed by
     // (release, variant, tree).
-    let mut distinct: BTreeMap<(String, String, String), DateTime<Utc>> = BTreeMap::new();
+    let mut distinct: BTreeMap<(String, String, String), Timestamp> = BTreeMap::new();
     for g in gens {
         let key = (g.release.clone(), g.variant.clone(), g.tree.clone());
         let slot = distinct.entry(key).or_insert(g.created_at);
@@ -165,8 +166,7 @@ fn retained_for_policy(
         }
     }
     // Sort by most recent activation descending.
-    let mut ordered: Vec<((String, String, String), DateTime<Utc>)> =
-        distinct.into_iter().collect();
+    let mut ordered: Vec<((String, String, String), Timestamp)> = distinct.into_iter().collect();
     ordered.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
 
     let keep_distinct = rotation.per_server.keep_distinct_artifacts as usize;
@@ -176,7 +176,7 @@ fn retained_for_policy(
 
     let keep_days = rotation.per_server.keep_days;
     if keep_days > 0 {
-        let cutoff = Utc::now() - chrono::Duration::days(keep_days as i64);
+        let cutoff = Timestamp::now() - jiff::SignedDuration::from_hours(keep_days as i64 * 24);
         for ((_, _, tree), ts) in &ordered {
             if *ts >= cutoff {
                 retained.insert(tree.clone());
@@ -188,14 +188,14 @@ fn retained_for_policy(
     // among the server's records.
     let protect_deployments = rotation.deployment.protect_deployments as usize;
     if protect_deployments > 0 {
-        let mut depl: BTreeMap<String, DateTime<Utc>> = BTreeMap::new();
+        let mut depl: BTreeMap<String, Timestamp> = BTreeMap::new();
         for g in gens {
             let slot = depl.entry(g.deployment_id.clone()).or_insert(g.created_at);
             if g.created_at > *slot {
                 *slot = g.created_at;
             }
         }
-        let mut depl_ordered: Vec<(String, DateTime<Utc>)> = depl.into_iter().collect();
+        let mut depl_ordered: Vec<(String, Timestamp)> = depl.into_iter().collect();
         depl_ordered.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
         let keep_ids: HashSet<String> = depl_ordered
             .iter()
@@ -536,9 +536,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let dir = tempfile::tempdir().unwrap();
         let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
         let helper = RemoteHelper::new(&remote);
-        let now = chrono::Utc::now();
-        let old = (now - chrono::Duration::days(60)).to_rfc3339();
-        let recent = (now - chrono::Duration::days(5)).to_rfc3339();
+        let now = jiff::Timestamp::now();
+        let old = (now - jiff::SignedDuration::from_hours(60 * 24)).to_string();
+        let recent = (now - jiff::SignedDuration::from_hours(5 * 24)).to_string();
         make_gen(&helper, "d1", "g1", "t-old", &old, None, None);
         make_gen(&helper, "d2", "g2", "t-recent", &recent, Some("g1"), None);
         helper.swap_current(None, "g2", "op").unwrap();
