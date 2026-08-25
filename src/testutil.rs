@@ -158,23 +158,36 @@ pub(crate) mod test_faults {
         /// the previously durable floor).
         SyncFloorParent,
         /// The checkpoint floor marker's BACKUP RENAME (`history-floor.json`
-        /// → `history-floor.json.prev`) — the first stage of a
-        /// TRANSACTIONAL floor ADVANCE (keyed by the checkpoint deployment
-        /// id), running BEFORE the new marker can overwrite the old one. A
-        /// fault here fires BEFORE the rename (A still in place): the
-        /// staged temp is dropped, A stands untouched, and the advance
-        /// fails with `Err`.
+        /// → `history-floor.json.prev.<id>`, the transaction-tagged backup
+        /// name) — the first stage of a TRANSACTIONAL floor ADVANCE (keyed
+        /// by the checkpoint deployment id), running BEFORE the new marker
+        /// can overwrite the old one. A fault here fires BEFORE the rename
+        /// (A still in place): the staged temp is dropped, A stands
+        /// untouched, and the advance fails with `Err`.
         RenameFloorBackup,
-        /// The checkpoint floor marker's RESTORE (`history-floor.json.prev`
-        /// → `history-floor.json`) — the fail-closed half of a
-        /// TRANSACTIONAL floor ADVANCE (keyed by the checkpoint deployment
-        /// id), attempted whenever an advance fails before B's durability
-        /// commit point. A fault here means the restore itself failed: the
-        /// previous floor A stays in the backup and the marker may be left
-        /// ABSENT — every read then fails closed with an integrity error (a
-        /// `.prev` with no marker is a torn advance, never "no floor",
+        /// The checkpoint floor marker's RESTORE (the tagged backup
+        /// `history-floor.json.prev.<id>` → `history-floor.json`) — the
+        /// fail-closed half of a TRANSACTIONAL floor ADVANCE (keyed by the
+        /// checkpoint deployment id), attempted whenever an advance fails
+        /// before B's durability commit point. The restore ONLY ever
+        /// renames the current transaction's tagged backup, verified to
+        /// carry the tag AND to parse and equal the pre-advance floor. A
+        /// fault here means the restore itself failed: the previous floor A
+        /// stays in the backup and the marker may be left ABSENT — every
+        /// read then fails closed with an integrity error (a leftover
+        /// backup with no marker is a torn advance, never "no floor",
         /// which would expose the below-floor prefix).
         RestoreFloor,
+        /// The checkpoint's success-path BACKUP REMOVAL — the best-effort
+        /// cleanup of THIS transaction's tagged backup
+        /// (`history-floor.json.prev.<id>`, holding the pre-advance floor)
+        /// after the floor committed (keyed by the checkpoint deployment
+        /// id). A fault here FORCES the removal to fail: the tagged backup
+        /// stays on disk — harmless by design (it is never restored by a
+        /// different transaction and the next advance reconciles it away),
+        /// but it is exactly the "stale backup left behind by a committed
+        /// advance" state the tagged scheme must make safe.
+        RemoveFloorBackup,
         /// The checkpoint's attempts.jsonl suffix rewrite (a compaction
         /// phase after the floor marker is already durable and the
         /// below-floor deployment dirs are deleted).
@@ -415,11 +428,12 @@ pub(crate) mod test_faults {
 
         /// Arm the next checkpoint floor-marker BACKUP RENAME (the first
         /// stage of a TRANSACTIONAL ADVANCE — `history-floor.json` →
-        /// `history-floor.json.prev`, keyed by the checkpoint deployment
-        /// id) to fail once. The fault fires BEFORE the rename, so the
-        /// previous floor A never moves: the staged temp is dropped and the
-        /// failure is returned from `write_history_floor` — the failed
-        /// advance leaves A durable.
+        /// `history-floor.json.prev.<id>`, the transaction-tagged backup
+        /// name, keyed by the checkpoint deployment id) to fail once. The
+        /// fault fires BEFORE the rename, so the previous floor A never
+        /// moves: the staged temp is dropped and the failure is returned
+        /// from `write_history_floor` — the failed advance leaves A
+        /// durable.
         pub(crate) fn arm_rename_floor_backup(&self, deployment_id: &str) {
             self.arm(FaultKind::RenameFloorBackup, deployment_id);
         }
@@ -428,11 +442,22 @@ pub(crate) mod test_faults {
         /// half of a TRANSACTIONAL ADVANCE, keyed by the checkpoint
         /// deployment id) to fail once. The restore is only attempted when
         /// an EARLIER advance stage already failed; a fault here leaves the
-        /// previous floor A in the `.prev` backup and the marker absent —
+        /// previous floor A in the tagged backup and the marker absent —
         /// every read then fails closed with an integrity error (a torn
         /// advance is never "no floor").
         pub(crate) fn arm_restore_floor(&self, deployment_id: &str) {
             self.arm(FaultKind::RestoreFloor, deployment_id);
+        }
+
+        /// Arm the next checkpoint floor-marker success-path BACKUP REMOVAL
+        /// (the best-effort cleanup of THIS transaction's tagged backup
+        /// after the floor committed, keyed by the checkpoint deployment
+        /// id) to fail once — the tagged backup (holding the pre-advance
+        /// floor) stays on disk. Harmless by design: it is never restored
+        /// by a different transaction and the next advance's pre-start
+        /// reconciliation removes it durably.
+        pub(crate) fn arm_remove_floor_backup(&self, deployment_id: &str) {
+            self.arm(FaultKind::RemoveFloorBackup, deployment_id);
         }
 
         /// Arm the next checkpoint attempts.jsonl suffix rewrite for

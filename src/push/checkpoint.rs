@@ -47,19 +47,25 @@
 //! (the commit point): a failed marker write is an ordinary `Err` and
 //! leaves the PREVIOUS state — no floor on a first-ever checkpoint; on an
 //! ADVANCE the replacement is TRANSACTIONAL
-//! ([`LocalStore::write_history_floor`]): B's marker is staged, the
-//! current floor A is moved aside to a durable backup
-//! (`history-floor.json.prev`), B is renamed into place, and the
+//! ([`LocalStore::write_history_floor`]): the backup slot is RECONCILED
+//! first (leftover `history-floor.json.prev*` backups of other
+//! transactions are durably removed), B's marker is staged, the current
+//! floor A is moved aside to a durable, TRANSACTION-TAGGED backup
+//! (`history-floor.json.prev.<B-id>`), B is renamed into place, and the
 //! parent-directory fsync is B's durability commit point. A failure at ANY
-//! stage before that commit point RESTORES A from the backup, so a failed
-//! advancement leaves EXACTLY the pre-advance state (floor A durable, the
-//! same visible suffix, no compaction side effects) — advancing a
-//! checkpoint can never erase the previously durable floor. If the restore
-//! of A itself ALSO fails, the marker may be left absent while `.prev`
-//! holds A: every read fails closed with an integrity error (a torn
-//! advance is never treated as "no floor", which would expose the
-//! below-floor prefix); recovery is to remove the stale `.prev` (reads
-//! then report no floor, and the next checkpoint re-establishes one).
+//! stage before that commit point RESTORES A — only from THIS transaction's
+//! tagged backup, verified to carry the tag AND to parse and equal the
+//! pre-advance floor A (a stale backup from another transaction can never
+//! roll the floor backward) — so a failed advancement leaves EXACTLY the
+//! pre-advance state (floor A durable, the same visible suffix, no
+//! compaction side effects) — advancing a checkpoint can never erase the
+//! previously durable floor. If the restore of A itself ALSO fails, the
+//! marker may be left absent while the tagged backup holds A: every read
+//! fails closed with an integrity error (a torn advance is never treated as
+//! "no floor", which would expose the below-floor prefix); recovery is to
+//! remove the leftover tagged backup (reads then report no floor, and the
+//! next checkpoint re-establishes one) — every subsequent ADVANCE
+//! reconciles leftover backups automatically before it starts.
 //!
 //! EVERY failure AFTER the marker write — enumerating the discards or any
 //! compaction phase, on the fresh path or the idempotency-repair path — is
@@ -1757,7 +1763,7 @@ mod tests {
     /// attempted when an EARLIER stage already failed, so the property
     /// double-faults it (the parent-sync stage + the restore — "if IT also
     /// fails") and asserts the reads fail CLOSED: the marker may be left
-    /// absent while `.prev` holds A — never "no floor", never a
+    /// absent while the tagged backup holds A — never "no floor", never a
     /// below-floor exposure.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum AdvanceStage {
@@ -2031,10 +2037,16 @@ mod tests {
                 "the failed advance never deletes or creates a deployment dir"
             );
             // HEAL the torn state (the documented recovery): removing the
-            // stale `.prev` restores "no floor" — nothing was ever
-            // compacted, so the full history is intact and the fault-free
-            // advance control below re-establishes a floor.
-            std::fs::remove_file(store.refs_dir(TARGET).join("history-floor.json.prev")).unwrap();
+            // leftover TAGGED backup (`.prev.<b_id>`, holding A) restores
+            // "no floor" — nothing was ever compacted, so the full history
+            // is intact and the fault-free advance control below
+            // re-establishes a floor.
+            std::fs::remove_file(
+                store
+                    .refs_dir(TARGET)
+                    .join(format!("history-floor.json.prev.{b_id}")),
+            )
+            .unwrap();
             assert!(
                 store.read_history_floor(TARGET).unwrap().is_none(),
                 "after healing, the torn target has no floor (never a partial one)"
@@ -2104,10 +2116,7 @@ mod tests {
         assert_eq!(floor_b.deployment_id.as_str(), b_id);
         assert_eq!(floor_b.snapshot_index, b_index);
         assert!(
-            !store
-                .refs_dir(TARGET)
-                .join("history-floor.json.prev")
-                .exists(),
+            floor_backup_leftovers(&store).is_empty(),
             "a committed advance leaves no backup behind"
         );
     }
@@ -2164,6 +2173,232 @@ mod tests {
             // interrupted-control is moot; every stage still retains A.
             run_transactional_advance_case(&[false, false], 0, false, stage);
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // STALE BACKUPS CAN NEVER ROLL THE FLOOR BACKWARD (the state-machine
+    // property)
+    // ---------------------------------------------------------------------
+
+    /// Every leftover `history-floor.json.prev*` sibling of the target's
+    /// floor marker (the transaction-tagged backups of the advance scheme,
+    /// plus any legacy untagged leftover), sorted. The tagged scheme leaves
+    /// NO backup behind after a committed advance (or after the next
+    /// advance's pre-start reconciliation), so an empty list is the
+    /// expected steady state.
+    fn floor_backup_leftovers(store: &LocalStore) -> Vec<std::path::PathBuf> {
+        let mut out: Vec<std::path::PathBuf> = std::fs::read_dir(store.refs_dir(TARGET))
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with("history-floor.json.prev")
+                    })
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    /// One stale-backup case: COMMIT A→B while RETAINING the stale tagged
+    /// backup (B's success-path backup cleanup is FAULTED, so
+    /// `.prev.<B-id>` holding A stays on disk — the exact "stale backup
+    /// left behind by a committed advance" state the fixed-name scheme got
+    /// wrong), then FAIL the ACTUAL B→backup rename during the B→C advance
+    /// (the [`crate::testutil::test_faults::FaultKind::RenameFloorBackup`]
+    /// stage fault keyed by C — the B→C advance target) and assert the
+    /// advance Errs with the floor REMAINING B (never A, never None — via
+    /// [`LocalStore::read_history_floor`]); then re-run B→C fault-free and
+    /// assert the floor reaches C. After EVERY transition the floor can
+    /// never regress to A: the stale A backup is reconciled away by the
+    /// next advance's pre-start cleanup — never restored (the restore only
+    /// ever renames the CURRENT transaction's tagged, content-verified
+    /// backup).
+    fn run_stale_backup_never_rolls_case(history_in: &[bool], a_at: usize) {
+        // Seeding: a guaranteed early success, a guaranteed FAILED attempt
+        // (a `deployments/<id>/` dir with no snapshot), the randomized
+        // history, a second guaranteed success, and a guaranteed FINAL
+        // success — so there are ALWAYS at least three strictly-later
+        // successful deployments A < B < C (C = the last success, B = the
+        // second-to-last).
+        let mut history = vec![true, false, true];
+        history.extend_from_slice(history_in);
+        history.push(true);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        seed_history(&store, TARGET, "deploy", &history);
+        let ok_ids: Vec<String> = history
+            .iter()
+            .enumerate()
+            .filter(|(_, ok)| **ok)
+            .map(|(n, _)| format!("deploy-{n:04}"))
+            .collect();
+        assert!(ok_ids.len() >= 3, "the seeding guarantees A < B < C");
+        let c_id = ok_ids.last().unwrap().clone();
+        let b_id = ok_ids[ok_ids.len() - 2].clone();
+        let a_id = ok_ids[a_at % (ok_ids.len() - 2)].clone();
+        assert_ne!(a_id, b_id, "A and B are distinct successes");
+        assert_ne!(b_id, c_id, "B and C are distinct successes");
+
+        // The regression guard: from the moment B is COMMITTED onward, the
+        // durable floor can NEVER regress to A — checked after every
+        // transition.
+        let assert_never_a = |store: &LocalStore, context: &str| {
+            let floor = store.read_history_floor(TARGET).unwrap();
+            let f = floor
+                .as_ref()
+                .expect("a committed floor must never regress to None");
+            assert_ne!(
+                f.deployment_id.as_str(),
+                a_id,
+                "{context}: the floor can never regress to A (currently '{}' at snapshot s{})",
+                f.deployment_id,
+                f.snapshot_index
+            );
+        };
+
+        // ---- (1) A is established, then A→B COMMITS retaining stale A ---
+        run_checkpoint(&store, TARGET, &DeploymentId::new(a_id.clone()), false)
+            .expect("establishing A always succeeds");
+        // B's success-path backup cleanup is faulted: the A→B advance still
+        // COMMITS (the cleanup is best-effort and its failure is absorbed),
+        // leaving the TAGGED backup `.prev.<B>` holding A on disk.
+        store.fault_registry().arm_remove_floor_backup(&b_id);
+        let rep_b = run_checkpoint(&store, TARGET, &DeploymentId::new(b_id.clone()), false)
+            .expect("the A→B advance commits (the cleanup fault is best-effort, absorbed)");
+        assert!(rep_b.established, "B is established");
+        let floor_b = store.read_history_floor(TARGET).unwrap().unwrap();
+        assert_eq!(floor_b.deployment_id.as_str(), b_id, "the floor is B");
+        assert_never_a(&store, "after committing B with the faulted cleanup");
+        // The stale TAGGED backup (holding A) survives the faulted cleanup
+        // — this is the state the old fixed-name scheme mishandled.
+        let stale = store
+            .refs_dir(TARGET)
+            .join(format!("history-floor.json.prev.{b_id}"));
+        assert!(
+            stale.exists(),
+            "the faulted cleanup leaves the tagged A backup on disk"
+        );
+        assert_eq!(
+            floor_backup_leftovers(&store),
+            vec![stale.clone()],
+            "exactly the stale tagged A backup is left behind"
+        );
+
+        // ---- (2) the B→C advance FAILS the actual B→backup rename -------
+        // Keyed by C (the B→C advance target). The advance's PRE-START
+        // reconciliation has already durably removed the stale A backup, so
+        // when the backup-rename fault fires (B never moved aside) there is
+        // NOTHING to restore — the floor must remain B, never A, never
+        // None.
+        store.fault_registry().arm_rename_floor_backup(&c_id);
+        let err = run_checkpoint(&store, TARGET, &DeploymentId::new(c_id.clone()), false)
+            .expect_err("the faulted B→C backup rename must fail the advance");
+        assert!(
+            err.to_string().contains("test fault"),
+            "the fault is the failure cause, got: {err}"
+        );
+        let floor = store.read_history_floor(TARGET).unwrap();
+        let f = floor.as_ref().expect(
+            "the failed B→C advance retains a floor — never None (a stale A must never be treated as 'no floor')",
+        );
+        assert_eq!(
+            f.deployment_id.as_str(),
+            b_id,
+            "the floor REMAINS B after the failed B→C backup rename — never A (a stale backup must never roll the floor backward)"
+        );
+        assert_eq!(
+            f.snapshot_index, floor_b.snapshot_index,
+            "the floor stays at B's exact snapshot"
+        );
+        assert_never_a(&store, "after the failed B→C advance");
+        // The stale A backup was reconciled away BEFORE the advance started:
+        // it is gone, so it can never be restored over B.
+        assert!(
+            floor_backup_leftovers(&store).is_empty(),
+            "the B→C advance reconciled the stale A backup before it started"
+        );
+
+        // ---- (3) any further transition can never regress to A ----------
+        // Re-run B→C fault-free: the floor advances to C (the tagged scheme
+        // changes nothing for the happy path).
+        let rep_c = run_checkpoint(&store, TARGET, &DeploymentId::new(c_id.clone()), false)
+            .expect("the fault-free B→C retry succeeds");
+        assert!(rep_c.established, "C is established");
+        let floor_c = store.read_history_floor(TARGET).unwrap().unwrap();
+        assert_eq!(floor_c.deployment_id.as_str(), c_id, "the floor is C");
+        assert_never_a(&store, "after the fault-free B→C retry");
+        // The committed C advance cleaned up its own tagged backup.
+        assert!(
+            floor_backup_leftovers(&store).is_empty(),
+            "the committed B→C advance leaves no backup behind"
+        );
+    }
+
+    proptest! {
+        // The state-machine property for TAGGED floor backups: over
+        // (history shape, A's position), COMMIT A→B while RETAINING the
+        // stale tagged A backup (B's success-path cleanup is faulted), then
+        // FAIL the actual B→backup rename during the B→C advance (the
+        // `RenameFloorBackup` stage fault keyed by C) — the advance must
+        // Err and the floor must REMAIN B (never A, never None); across the
+        // fault-free B→C retry the floor must reach C, and after EVERY
+        // transition `read_history_floor` must never regress to A. The
+        // stale A backup is reconciled away by the next advance's pre-start
+        // cleanup — never restored. Fixed seed 0x5EED_5EED + bounded cases
+        // (16): the same vectors run on every invocation.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn stale_backup_never_rolls_the_floor_backward(
+            history in prop::collection::vec(any::<bool>(), 3..7),
+            a_at in 0usize..8,
+        ) {
+            run_stale_backup_never_rolls_case(&history, a_at);
+        }
+    }
+
+    /// CONTROL: a normal A→B→C fault-free chain leaves the floor at C with
+    /// no backup leftovers — the tagged backup scheme changes nothing for
+    /// the happy path.
+    #[test]
+    fn control_fault_free_chain_leaves_floor_at_c() {
+        let mut history = vec![true, false, true, false, true];
+        history.push(true);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        seed_history(&store, TARGET, "deploy", &history);
+        let ok_ids: Vec<String> = history
+            .iter()
+            .enumerate()
+            .filter(|(_, ok)| **ok)
+            .map(|(n, _)| format!("deploy-{n:04}"))
+            .collect();
+        let a_id = ok_ids[0].clone();
+        let b_id = ok_ids[ok_ids.len() - 2].clone();
+        let c_id = ok_ids.last().unwrap().clone();
+        for id in [&a_id, &b_id, &c_id] {
+            run_checkpoint(&store, TARGET, &DeploymentId::new(id.clone()), false)
+                .expect("a fault-free advance commits");
+        }
+        let floor = store.read_history_floor(TARGET).unwrap().unwrap();
+        assert_eq!(
+            floor.deployment_id.as_str(),
+            c_id,
+            "the fault-free A→B→C chain leaves the floor at C"
+        );
+        assert!(
+            floor_backup_leftovers(&store).is_empty(),
+            "a fault-free chain leaves no backup leftovers"
+        );
     }
 
     // ---------------------------------------------------------------------
