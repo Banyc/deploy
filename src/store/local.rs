@@ -274,13 +274,19 @@ impl LocalStore {
 
     /// ENGINE-side step-17 phase barrier, called immediately BEFORE a
     /// step-17-equivalent lock acquisition (the per-slot rotation block and
-    /// the deferred-maintenance retry that shares it). A no-op in unarmed
+    /// the deferred-maintenance retry that shares it), tagged with the
+    /// [`HookPhase`] being entered so the test can tell the fresh step-17
+    /// rotation from the deferred-maintenance retry. A no-op in unarmed
     /// stores and non-matching deployment ids; the call sites in
     /// `src/push/engine.rs` are `#[cfg(test)]`, so production builds never
     /// reach this method.
     #[cfg(test)]
-    pub(crate) fn step17_hook_barrier(&self, deployment_id: &DeploymentId) {
-        self.step17_hook.barrier(deployment_id);
+    pub(crate) fn step17_hook_barrier(
+        &self,
+        deployment_id: &DeploymentId,
+        phase: crate::testutil::step17_hook::HookPhase,
+    ) {
+        self.step17_hook.barrier(deployment_id, phase);
     }
 
     pub fn base(&self) -> &Path {

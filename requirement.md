@@ -657,7 +657,11 @@ and never fails a later push. When a per-slot rotation fails after commit, the p
 marker — `targets/<target>/rotation-debt.json` in the local store, keyed by placement slot, holding the
 failure reason — and adds a warning to the push report. Every later push (including an up-to-date no-op,
 before reporting "Everything up to date") retries the deferred rotations under the slot mutation locks; a
-successful retry clears the marker, a failed retry keeps it and keeps warning. The no-op path never creates
+successful retry clears the marker, a failed retry keeps it and keeps warning. The retry is a DISTINCT PHASE
+from the push's own fresh step-17 rotation: it runs first (before step 17 on the normal path, at the no-op
+return), reads the debt marker BEFORE any lock acquisition, and shares the same RAII-guarded rotation block
+as step 17 — the test-only step-17 phase hook therefore distinguishes the two phases
+(`DeferredRetry` vs `FreshStep17`) so tests can target a phase independently. The no-op path never creates
 records, but the retry may write/remove the debt marker file itself. The debt maintenance I/O is itself
 non-fallible: a read/write/remove failure of the debt marker (post-commit) is reported as a maintenance
 warning — a failed read is treated as empty debt, a failed write/remove leaves the marker in place — and is
@@ -669,6 +673,7 @@ marker is NOT persisted and the report says so explicitly ("rotation debt mainte
 read/write rotation debt ..."); no automatic retryability is claimed for a deferral without a marker, so a
 user can tell a marker-persisted deferral (retried automatically by a later push) from an unpersisted one
 (re-deferred by a later push). The committed outcome is unchanged either way. The same
+post-commit rule covers the observed projection refresh (which runs right after the terminal status
 post-commit rule covers the observed projection refresh (which runs right after the terminal status
 transition, before rotation): every store operation there — `write_server`, the per-other-target
 `read_observed`/`write_observed` propagation, and the push's own `write_observed` — is non-fatal maintenance,

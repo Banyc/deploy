@@ -553,22 +553,31 @@ pub(crate) enum FailureClass {
     /// fixture only grabs the guard the moment the engine parks at a
     /// step-17-equivalent lock acquisition — the push's own step-17 rotation
     /// AND, when prior debt exists, the deferred-maintenance retry that runs
-    /// before it (the fixture services every park, so both contend).
+    /// before it (the fixture services every park, so both contend). The
+    /// park signal is PHASE-DISTINGUISHED ([`step17_hook::HookPhase`]): the
+    /// retry is the [`step17_hook::HookPhase::DeferredRetry`] phase, the
+    /// push's own rotation the [`step17_hook::HookPhase::FreshStep17`]
+    /// phase.
     Step17Contended,
     /// [`FailureClass::Step17Contended`] combined with a rotation-debt
-    /// marker READ fault (target-keyed registry arm) in the same push: the
-    /// retry's debt read fails FIRST (explicit "rotation debt maintenance
-    /// deferred: failed to read" warning), then step 17's contended deferral
-    /// still persists its own marker (its read passes — the one-shot arm was
-    /// spent). Warning-only; non-fallible.
+    /// marker READ fault in the same push, armed by the fixture ONLY at the
+    /// FRESH step-17 park ([`step17_hook::HookPhase::FreshStep17`]) — never
+    /// at the deferred-maintenance retry ([`step17_hook::HookPhase::DeferredRetry`]),
+    /// which reads the debt FIRST and must pass unarmed. The fresh contended
+    /// deferral's `set_rotation_deferred` read then fails (explicit "rotation
+    /// debt maintenance deferred: failed to read" warning): NO new marker is
+    /// persisted, and a PREEXISTING marker is preserved untouched. A later
+    /// push re-defers. Warning-only; non-fallible.
     Step17ContentionDebtRead,
     /// [`FailureClass::Step17Contended`] combined with a rotation-debt
-    /// marker WRITE fault (target-keyed registry arm) in the same push: the
-    /// contended deferral's `set_rotation_deferred` (or, with a prior
-    /// marker, the retry's final debt write) cannot persist the marker —
-    /// explicit "rotation debt maintenance deferred: failed to write"
-    /// warning, NO marker (no automatic retryability claim). Warning-only;
-    /// non-fallible.
+    /// marker WRITE fault (in the same push), armed by the fixture ONLY at
+    /// the FRESH phase park — the retry's earlier debt write (preexisting
+    /// marker) passes unarmed. The fresh contended deferral's
+    /// `set_rotation_deferred` cannot persist the marker — explicit
+    /// "rotation debt maintenance deferred: failed to write" warning, NO
+    /// new marker (no automatic retryability claim) and any PREEXISTING
+    /// marker preserved byte-identical (the failed write leaves the file
+    /// untouched). Warning-only; non-fallible.
     Step17ContentionDebtWrite,
 }
 
@@ -913,12 +922,18 @@ impl Fixture {
             // `None`, `LockContention` and `Step17Contended` need no registry
             // arm: contention is driven by the fixture itself (the whole-push
             // guard for `LockContention`, the step-17 phase hook for
-            // `Step17Contended`). The step-17 DEBT COMBINATIONS ride the same
-            // hook for the contention and the target-keyed registry arms for
-            // the debt half of the combination.
-            FailureClass::None | FailureClass::LockContention | FailureClass::Step17Contended => {}
-            FailureClass::Step17ContentionDebtRead => reg.arm_read_rotation_debt(pushed),
-            FailureClass::Step17ContentionDebtWrite => reg.arm_write_rotation_debt(pushed),
+            // `Step17Contended`). The step-17 DEBT COMBINATIONS also arm
+            // NOTHING here: the target-keyed debt arm must fire only at the
+            // FRESH step-17 phase (the engine's contended deferral), never at
+            // the deferred-maintenance retry that reads/writes the debt
+            // FIRST — so the fixture arms it while the engine is parked at
+            // the fresh step-17 hook ([`Fixture::push_prop_step17_contended`]
+            // matches on the [`step17_hook::HookPhase`]).
+            FailureClass::None
+            | FailureClass::LockContention
+            | FailureClass::Step17Contended
+            | FailureClass::Step17ContentionDebtRead
+            | FailureClass::Step17ContentionDebtWrite => {}
         }
     }
 
@@ -987,17 +1002,18 @@ impl Fixture {
         self.arm_prop_fault(class, t, &id);
         // Step-17 lock contention is driven by the test-only phase hook for
         // ALL three step-17 classes (the fixture holds the competing guard
-        // while the engine is parked at its step-17-equivalent lock
-        // acquisition; the debt halves of the combinations ride the
-        // target-keyed registry arms armed above), so the push runs in a
-        // scoped thread.
+        // while the engine is parked at every step-17-equivalent lock
+        // acquisition; the debt halves of the COMBINATIONS are armed by the
+        // fixture ONLY at the FRESH step-17 park, so the deferred-maintenance
+        // retry's earlier debt read/write passes unarmed), so the push runs
+        // in a scoped thread.
         if matches!(
             class,
             FailureClass::Step17Contended
                 | FailureClass::Step17ContentionDebtRead
                 | FailureClass::Step17ContentionDebtWrite
         ) {
-            let res = self.push_prop_step17_contended(t, ref_token, &id);
+            let res = self.push_prop_step17_contended(t, ref_token, &id, class);
             self.disarm_prop_faults();
             return Outcome::Push(Box::new(res));
         }
@@ -1065,16 +1081,28 @@ impl Fixture {
     /// acquisition, acquire the slot's mutation lock via a SECOND helper and
     /// hold it until the push returns — the engine's own rotation then
     /// deterministically CONTENDS (deferred: debt marker + warning naming the
-    /// slot), never silent and never via a race on the lock file. A push that
-    /// finishes WITHOUT firing the hook is an up-to-date no-op carrying no
-    /// debt (its maintenance retry never reaches a step-17 lock acquisition):
-    /// the armed hook is dropped with no contention and the step is a plain
-    /// clean no-op.
+    /// slot), never silent and never via a race on the lock file.
+    ///
+    /// PHASE DISTINCTION: the park signal carries the
+    /// [`step17_hook::HookPhase`]. The fixture services EVERY park with the
+    /// same held guard, but arms the DEBT FAULT ONLY at the
+    /// [`step17_hook::HookPhase::FreshStep17`] park — the engine's own
+    /// per-slot rotation, whose contended else-branch runs the debt
+    /// read-modify-write that must fault. The
+    /// [`step17_hook::HookPhase::DeferredRetry`] park (reached only when a
+    /// PRIOR push left a marker: the retry reads the debt FIRST, before this
+    /// park) is released WITHOUT the fault armed, so the retry's earlier
+    /// debt read/write passes and the one-shot arm is still live for the
+    /// fresh phase. A push that finishes WITHOUT firing the hook is an
+    /// up-to-date no-op carrying no debt (its maintenance retry never reaches
+    /// a step-17 lock acquisition): the armed hook is dropped with no
+    /// contention and the step is a plain clean no-op.
     fn push_prop_step17_contended(
         &self,
         t: &str,
         ref_token: Option<&str>,
         id: &DeploymentId,
+        class: FailureClass,
     ) -> Result<PushReport> {
         let hook = step17_hook::Step17Hook::arm(self.store.step17_hook(), id.as_str());
         std::thread::scope(|s| {
@@ -1102,19 +1130,24 @@ impl Fixture {
             let helper = RemoteHelper::new(remote.as_ref());
             let mut guard: Option<crate::remote::helper::LockGuard<'_>> = None;
             // Service EVERY park, not just the first: with prior debt the
-            // engine parks at the deferred-maintenance RETRY first and AGAIN
-            // at its own step-17 rotation — each is a step-17-equivalent lock
-            // acquisition, so each must find the guard held. The first park
-            // acquires the competing guard (deterministically — the engine
-            // cannot race it while parked); every park is then released. The
+            // engine parks at the deferred-maintenance RETRY first (the
+            // [`step17_hook::HookPhase::DeferredRetry`] phase) and AGAIN at
+            // its own step-17 rotation ([`step17_hook::HookPhase::FreshStep17`])
+            // — each is a step-17-equivalent lock acquisition, so each must
+            // find the guard held. The first park acquires the competing
+            // guard (deterministically — the engine cannot race it while
+            // parked); every park is then released. The DEBT FAULT IS ARMED
+            // ONLY AT THE FRESH PARK: the retry's earlier debt read/write
+            // (preexisting marker) passes, and the one-shot is consumed by
+            // the fresh phase's deferred read/write — the intended failure
+            // phase.
+            let reg = self.store.fault_registry();
             // loop exits when the push finishes WITHOUT ever reaching a
             // step-17 lock acquisition (the no-op-without-debt case, where
             // the hook can never fire). `recv_timeout` SLEEPS (it does not
             // spin), so the wait costs nothing while the engine runs.
             while !push.is_finished() {
-                if hook
-                    .wait_at_step17_bounded(std::time::Duration::from_millis(5))
-                    .is_ok()
+                if let Ok(phase) = hook.wait_at_step17_bounded(std::time::Duration::from_millis(5))
                 {
                     if guard.is_none() {
                         let holder = format!("si-step17-{}", OperationId::generate().as_str());
@@ -1122,6 +1155,23 @@ impl Fixture {
                             "the slot mutation lock must be free while the engine is parked \
                              at the step-17 hook",
                         ));
+                    }
+                    if phase == step17_hook::HookPhase::FreshStep17 {
+                        // Arm the debt half of the combination ONLY now, at
+                        // the fresh step-17 phase: the deferred-maintenance
+                        // retry (DeferredRetry) already ran its debt
+                        // read/write unarmed, so the one-shot cannot be
+                        // consumed at the wrong phase. The engine is parked
+                        // — the arm races nothing and fires at the intended
+                        // read/write inside the contended else-branch after
+                        // the release below.
+                        match class {
+                            FailureClass::Step17ContentionDebtRead => reg.arm_read_rotation_debt(t),
+                            FailureClass::Step17ContentionDebtWrite => {
+                                reg.arm_write_rotation_debt(t)
+                            }
+                            _ => {}
+                        }
                     }
                     hook.release();
                 }
@@ -3929,28 +3979,32 @@ impl Model {
                 self.snapshots.entry(t).or_default().push(v);
                 match fault {
                     Some(FailureClass::Step17ContentionDebtRead) => {
-                        // The debt READ arm fires at the retry's FIRST debt
-                        // read (the retry runs before step 17): the retry
-                        // treats the debt as empty and warns "rotation debt
-                        // maintenance deferred: failed to read". The
-                        // contended deferral's OWN read then passes (the
-                        // one-shot arm is spent) and its write persists the
-                        // marker.
-                        self.debt.insert(t, true);
+                        // The debt READ arm is armed ONLY at the fresh
+                        // step-17 park (the fixture distinguishes the phases):
+                        // the deferred-maintenance retry — which runs FIRST
+                        // and reads the debt before any park — passes
+                        // unarmed, so a preexisting marker's read succeeds
+                        // and its contended retry keeps the marker. The arm
+                        // then fires at the FRESH phase's contended deferral
+                        // (`set_rotation_deferred`'s read-modify-write): the
+                        // read fails, nothing is persisted, and the explicit
+                        // "failed to read rotation debt" notice appears —
+                        // a preexisting marker is PRESERVED untouched, and a
+                        // fresh push with no marker creates NONE.
+                        self.debt.insert(t, had_debt);
                         self.expected_warning =
                             Some(&[STEP17_CONTENTION_WARNING, DEBT_READ_WARNING]);
                     }
                     Some(FailureClass::Step17ContentionDebtWrite) => {
-                        // The debt WRITE arm fires at the FIRST debt write:
-                        // with no prior marker the retry writes nothing, so
-                        // the contended deferral's persist is the first write
-                        // — it FAILS, no marker is persisted, and the model
-                        // must NOT claim automatic retryability (the warning
-                        // carries the "rotation debt maintenance deferred:
-                        // failed to write" notice instead). With a prior
-                        // marker the retry's clearing write consumes the arm
-                        // and the deferral's re-persist succeeds, so the
-                        // marker stays.
+                        // The debt WRITE arm is armed ONLY at the fresh
+                        // step-17 park (the retry's earlier debt write passes
+                        // unarmed): the fresh contended deferral's
+                        // `set_rotation_deferred` cannot persist the marker —
+                        // explicit "rotation debt maintenance deferred:
+                        // failed to write" notice — so NO new marker is
+                        // created and any PREEXISTING marker is preserved
+                        // (the failed write leaves the file untouched). The
+                        // model must NOT claim automatic retryability.
                         self.debt.insert(t, had_debt);
                         self.expected_warning =
                             Some(&[STEP17_CONTENTION_WARNING, DEBT_WRITE_WARNING]);
@@ -4009,16 +4063,13 @@ impl Model {
     /// succeeds and clears the debt. Under contention the retry's lock
     /// acquisition fails first: the marker stays (both trunks agree).
     fn noop_maintenance(&mut self, t: &'static str) {
-        // The DebtRead combination's warning is expected EVEN with no marker:
-        // the no-op's retry reads the debt FIRST regardless, so the one-shot
-        // read arm always fires ("failed to read" notice) — set the
-        // expectation before the no-debt early return.
-        if matches!(
-            self.armed_fault,
-            Some(FailureClass::Step17ContentionDebtRead)
-        ) {
-            self.expected_warning = Some(&[DEBT_READ_WARNING]);
-        }
+        // A no-op never reaches the FRESH step-17 rotation, and the step-17
+        // DEBT COMBINATIONS arm their debt fault ONLY at that phase (the
+        // fixture leaves the deferred-maintenance retry unarmed), so the
+        // one-shot can never fire on the no-op: no "failed to read/write
+        // rotation debt" notice is expected. The no-op's only
+        // step-17-equivalent park is the DeferredRetry phase, whose lock
+        // acquisition contends on the fixture's held guard.
         if !self.debt.get(t).copied().unwrap_or(false) {
             return;
         }
@@ -4033,10 +4084,10 @@ impl Model {
             Some(FailureClass::Step17Contended) => {
                 // The no-op's deferred-maintenance retry is a
                 // step-17-equivalent lock acquisition, so the phase hook
-                // fires there: the fixture holds the lock, the retry cannot
-                // acquire, and the marker stays. (Without a marker the hook
-                // never fires and the no-op is plain — `noop_maintenance`
-                // already returned early.)
+                // fires there (the DeferredRetry phase): the fixture holds
+                // the lock, the retry cannot acquire, and the marker stays.
+                // (Without a marker the hook never fires and the no-op is
+                // plain — `noop_maintenance` already returned early.)
                 self.armed_fault = None;
             }
             Some(FailureClass::CommitMarker) => {
@@ -4054,29 +4105,15 @@ impl Model {
             }
             Some(FailureClass::Step17ContentionDebtRead)
             | Some(FailureClass::Step17ContentionDebtWrite) => {
-                // The no-op path runs no step-17 rotation, but the hook
-                // still fires at the retry's step-17-equivalent lock
-                // acquisition; each combination behaves exactly like its debt
-                // arm — the debt fault fires inside the retry: a read
-                // failure treats the marker as absent (nothing serviced,
-                // marker stays), a write failure keeps the marker — and the
-                // "rotation debt maintenance deferred: failed to ..." notice
-                // is explicit (the marker was NOT persisted / cleared, so no
-                // retryability is claimed). (The plain [`FailureClass::Step17Contended`]
-                // arm above keeps the marker via the hook contention.)
-                match self.armed_fault {
-                    Some(FailureClass::Step17ContentionDebtRead)
-                    | Some(FailureClass::Step17ContentionDebtWrite) => {
-                        if matches!(
-                            self.armed_fault,
-                            Some(FailureClass::Step17ContentionDebtWrite)
-                        ) {
-                            self.expected_warning = Some(&[DEBT_WRITE_WARNING]);
-                        }
-                        self.armed_fault = None;
-                    }
-                    _ => unreachable!("step-17 debt-combination arm"),
-                }
+                // The no-op path runs no FRESH step-17 rotation, so the
+                // debt arm (which the fixture places ONLY at the FreshStep17
+                // park) can never fire here: the retry — the DeferredRetry
+                // phase — reads and re-persists the marker unarmed, and its
+                // lock acquisition contends on the fixture's held guard, so
+                // the marker STAYS. No "failed to ... rotation debt" notice
+                // is expected (the debt I/O never faulted). The fault is
+                // dropped step-scoped.
+                self.armed_fault = None;
             }
             Some(_) => {
                 // Any other armed class does not touch the no-op's debt
@@ -4617,5 +4654,169 @@ proptest! {
         steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..20)
     ) {
         run_semantic_state_case(steps);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Step-17 contention × debt-I/O matrix property
+// ---------------------------------------------------------------------------
+
+/// The debt-I/O half of the step-17 contention matrix: WHICH debt operation
+/// the fresh step-17 deferral must fail at. Generated together with the
+/// preexisting-debt flag — the required `(preexisting_debt × Read|Write)`
+/// matrix — and every combination runs as a GUARANTEED non-no-op push.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContentionDebtFault {
+    /// The fresh deferral's `set_rotation_deferred` READ faults.
+    Read,
+    /// The fresh deferral's `set_rotation_deferred` WRITE faults.
+    Write,
+}
+
+/// One case of the step-17-contention × debt-I/O matrix for the generated
+/// `(preexisting_debt, fault)` combination. Each case is a FRESH fixture and
+/// a SINGLE push to `t1` (the shared slot `p1`) — the fixture's first push
+/// is GUARANTEED non-no-op (it mints generation 1; asserted via the recorded
+/// attempt + `Successful` status, never an up-to-date no-op). The push runs
+/// under the test-only step-17 phase hook with the fixture holding the
+/// slot's mutation guard at EVERY park; the debt fault is armed ONLY at the
+/// FreshStep17 park ([`step17_hook::HookPhase::FreshStep17`] — the fixture's
+/// own per-slot rotation, whose contended else-branch runs the debt
+/// read-modify-write that must fault), so the deferred-maintenance retry
+/// (which, with a preexisting marker, reads the debt FIRST — before its
+/// park — and must pass unarmed at the [`step17_hook::HookPhase::DeferredRetry`]
+/// phase) can never consume the one-shot at the wrong phase.
+///
+/// Per combination asserts the post-commit contract:
+/// (a) the push returns `Ok` with `Successful` — NEVER `Err`;
+/// (b) BOTH required warnings present — the contention warning
+///     (`rotation deferred for slot 'p1'`) AND the debt-I/O notice
+///     (`failed to read` / `failed to write rotation debt`, per fault);
+/// (c) FAILED PERSISTENCE creates NO new debt marker while PRESERVING any
+///     preexisting one: `preexisting_debt=true` leaves the marker file
+///     BYTE-IDENTICAL (the faulted read/write leaves the file untouched),
+///     `preexisting_debt=false` leaves no marker file at all.
+fn run_step17_contention_debt_matrix(combos: &[(bool, ContentionDebtFault)]) {
+    assert_eq!(
+        combos.len(),
+        4,
+        "the matrix case must cover all four (preexisting_debt, fault) combinations"
+    );
+    for &(preexisting_debt, fault) in combos {
+        let ctx = format!("preexisting_debt={preexisting_debt}, fault={fault:?}");
+        let f = Fixture::new();
+        let id = f.next_prop_id();
+        const TARGET: &str = "t1";
+        const SLOT: &str = "p1";
+        // Seed the preexisting debt marker with a KNOWN byte image and
+        // snapshot it BEFORE the push: a failed persistence must leave it
+        // byte-identical.
+        let marker_path = f.store.rotation_debt_path(TARGET);
+        let before = if preexisting_debt {
+            f.store
+                .write_rotation_debt(
+                    TARGET,
+                    &BTreeMap::from([(SLOT.to_string(), "seeded".to_string())]),
+                )
+                .expect("seeding the preexisting debt marker");
+            std::fs::read(&marker_path).expect("the seeded marker file must exist")
+        } else {
+            Vec::new()
+        };
+        let class = match fault {
+            ContentionDebtFault::Read => FailureClass::Step17ContentionDebtRead,
+            ContentionDebtFault::Write => FailureClass::Step17ContentionDebtWrite,
+        };
+        // The phase-distinguished hook driver arms the debt fault ONLY at
+        // the FreshStep17 park; the retry (DeferredRetry) park passes
+        // unarmed.
+        let res = f.push_prop_step17_contended(TARGET, None, &id, class);
+        f.disarm_prop_faults();
+        let report = res.expect("{ctx}: the push must never fail (post-commit maintenance)");
+        // (a) Ok + Successful, and a REAL push (attempt recorded — a new
+        // generation was minted, never an up-to-date no-op).
+        assert_eq!(
+            report.status,
+            Some(DeploymentStatus::Successful),
+            "{ctx}: the contended push must report the committed Successful status"
+        );
+        assert!(
+            report.attempt.is_some(),
+            "{ctx}: the push must be the REAL push (attempt recorded), never an up-to-date no-op"
+        );
+        // (b) BOTH required warnings: the contention warning naming the slot
+        // AND the debt-I/O notice for the faulted operation.
+        let warning = report.warning.as_deref().unwrap_or("");
+        assert!(
+            warning.contains(STEP17_CONTENTION_WARNING),
+            "{ctx}: the report must carry the contention warning 'rotation deferred for slot \
+             'p1''; got: {warning:?}"
+        );
+        let debt_notice = match fault {
+            ContentionDebtFault::Read => DEBT_READ_WARNING,
+            ContentionDebtFault::Write => DEBT_WRITE_WARNING,
+        };
+        assert!(
+            warning.contains(debt_notice),
+            "{ctx}: the report must carry the debt-I/O notice {debt_notice:?}; got: {warning:?}"
+        );
+        // (c) FAILED PERSISTENCE: no NEW marker is created, and any
+        // PREEXISTING marker is preserved byte-identical — the faulted
+        // fresh-phase read/write leaves the file untouched, and the retry's
+        // earlier unarmed write re-persisted the SAME content.
+        let after = std::fs::read(&marker_path).unwrap_or_default();
+        if preexisting_debt {
+            assert_eq!(
+                after, before,
+                "{ctx}: the preexisting debt marker must be preserved byte-identical"
+            );
+            let debt = f.store.read_rotation_debt(TARGET).unwrap();
+            assert_eq!(
+                debt.get(SLOT).map(String::as_str),
+                Some("seeded"),
+                "{ctx}: the preexisting marker must still name the seeded slot + reason"
+            );
+        } else {
+            assert!(
+                after.is_empty() && !marker_path.exists(),
+                "{ctx}: no debt marker file may appear when the fresh deferral's persistence \
+                 failed"
+            );
+        }
+    }
+}
+
+proptest! {
+    // The REQUIRED matrix property: generate `(preexisting_debt: bool, fault:
+    // Read | Write)` for a GUARANTEED NON-NO-OP push (each case is a fresh
+    // fixture whose FIRST push mints a generation — the runner asserts the
+    // attempt/status). Every case is a random PERMUTATION of all four
+    // combinations (a `subsequence` of size 4 over the 4-element matrix), so
+    // the full matrix is exercised by construction. The phase-distinguished
+    // hook is the deterministic mechanism: no sleeps beyond the 5ms
+    // `recv_timeout` polling, no races — the debt fault is armed while the
+    // engine is PARKED at the FreshStep17 barrier and released only after.
+    // Bounded cases (4) keep the suite fast; a fixed seed keeps CI
+    // deterministic (no persistence file).
+    #![proptest_config(ProptestConfig {
+        cases: 4,
+        rng_seed: RngSeed::Fixed(0x5EED_17DE),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn step17_contention_debt_matrix(
+        combos in prop::sample::subsequence(
+            vec![
+                (false, ContentionDebtFault::Read),
+                (false, ContentionDebtFault::Write),
+                (true, ContentionDebtFault::Read),
+                (true, ContentionDebtFault::Write),
+            ],
+            4,
+        )
+    ) {
+        run_step17_contention_debt_matrix(&combos);
     }
 }

@@ -316,20 +316,33 @@ pub(crate) mod test_faults {
 }
 
 /// Test-only step-17 phase hook: a per-fixture one-shot barrier that makes
-/// step-17 lock contention DETERMINISTIC.
+/// step-17 lock contention DETERMINISTIC, distinguished by PHASE.
 ///
 /// The engine calls [`Step17Hook::barrier`] immediately BEFORE a
 /// step-17-equivalent lock acquisition — its per-slot rotation block in step
 /// 17, and the deferred-maintenance retry that shares the same RAII-guarded
-/// block. When a test armed the hook for THIS deployment id, the engine (a)
-/// signals "at step-17 lock acquisition" on the armed channel, then (b)
-/// BLOCKS until the test releases it: while the engine is parked, the test
-/// acquires the slot's mutation lock via a SECOND helper, then releases the
-/// engine — whose own acquisition afterwards deterministically contends (no
-/// thread ever races on the lock file). Unarmed stores and non-matching
-/// deployment ids pass through untouched, and the whole module is
-/// `#[cfg(test)]` (the engine call sites are `#[cfg(test)]` too), so this is
-/// a NO-OP in production builds.
+/// block — and passes the PHASE it is about to run
+/// ([`HookPhase::FreshStep17`] vs [`HookPhase::DeferredRetry`]). The signal
+/// the engine sends on the armed channel CARRIES that phase, so a test can
+/// tell WHICH park it is servicing: the fresh per-slot rotation of THIS
+/// push (where the contention else-branch defers the rotation as debt) or
+/// the deferred-maintenance retry (which reads the debt FIRST). When a test
+/// armed the hook for THIS deployment id, the engine (a) signals
+/// "at step-17 lock acquisition" with the phase on the armed channel, then
+/// (b) BLOCKS until the test releases it: while the engine is parked, the
+/// test acquires the slot's mutation lock via a SECOND helper (and may arm
+/// per-phase faults), then releases the engine — whose own acquisition
+/// afterwards deterministically contends (no thread ever races on the lock
+/// file). Unarmed stores and non-matching deployment ids pass through
+/// untouched, and the whole module is `#[cfg(test)]` (the engine call sites
+/// are `#[cfg(test)]` too), so this is a NO-OP in production builds.
+///
+/// The phase distinction exists so a test can arm a debt fault ONLY at the
+/// phase that must fault: the retry phase (which reads the debt marker
+/// FIRST, before any park) parks and releases WITHOUT the fault armed, and
+/// the fresh step-17 phase (whose contended deferral runs the debt
+/// read/write) arms it — the one-shot fault then fires at the INTENDED
+/// phase instead of being consumed by the retry's earlier I/O.
 ///
 /// Like the fault registry, the hook is PER-FIXTURE — owned by each
 /// [`crate::store::local::LocalStore`], never a process-global slot: a hook
@@ -346,11 +359,33 @@ pub(crate) mod step17_hook {
 
     use crate::model::DeploymentId;
 
+    /// WHICH step-17-equivalent lock acquisition the engine is parked at.
+    /// Carried on the "at step-17" signal so the test-facing handle can
+    /// tell the phases apart and act (e.g. arm a debt fault) only at the
+    /// phase it intends to fault.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum HookPhase {
+        /// The deferred-maintenance retry ([`crate::push::engine`]'s
+        /// `retry_deferred_rotations`): the engine reads the rotation debt
+        /// FIRST (before this park), then services each slot under the
+        /// mutation lock. Runs on later pushes — before the fresh step-17
+        /// rotation on the normal path and at the no-op return — whenever a
+        /// prior push left a debt marker.
+        DeferredRetry,
+        /// The fresh per-slot rotation of THIS push (step 17): the
+        /// post-commit rotation of every slot the push's target belongs to.
+        /// Its contended else-branch defers the maintenance as a debt
+        /// marker (a debt read-modify-write) — the phase where a debt-I/O
+        /// fault is meant to fire.
+        FreshStep17,
+    }
+
     /// The armed half stored in the per-fixture slot: the ENGINE-facing ends.
     struct Armed {
         deployment_id: String,
-        /// engine -> test: fired once, the instant the engine is parked.
-        at_step17: Sender<()>,
+        /// engine -> test: fired once, the instant the engine is parked,
+        /// carrying the phase the engine is about to run.
+        at_step17: Sender<HookPhase>,
         /// test -> engine: the engine parks here until the test releases it.
         release: Receiver<()>,
     }
@@ -369,9 +404,11 @@ pub(crate) mod step17_hook {
         /// Arm the hook for `deployment_id` (replacing any prior arm — a
         /// fired handle already left the slot empty) and return the
         /// TEST-facing handle. The engine of a push carrying THIS deployment
-        /// id will now signal + park at its step-17 lock acquisition; the
-        /// test receives the signal, holds the competing lock guard, then
-        /// releases the engine via [`HookHandle::release`].
+        /// id will now signal + park at EVERY step-17-equivalent lock
+        /// acquisition (the deferred-maintenance retry AND the fresh step-17
+        /// rotation), each signal carrying its [`HookPhase`]; the test receives
+        /// each signal, holds the competing lock guard (and may arm per-phase
+        /// faults), then releases the engine via [`HookHandle::release`].
         pub(crate) fn arm(hook: &Arc<Self>, deployment_id: &str) -> HookHandle {
             let (at_tx, at_rx) = channel();
             let (rel_tx, rel_rx) = channel();
@@ -387,15 +424,16 @@ pub(crate) mod step17_hook {
             }
         }
 
-        /// ENGINE-side, called immediately BEFORE a step-17-equivalent lock
-        /// acquisition: signal "at step 17" and park until the test releases
-        /// the engine — or return immediately when unarmed / the deployment
-        /// id does not match. NEVER called from production code (the call
-        /// sites in `src/push/engine.rs` are `#[cfg(test)]`). The slot mutex
-        /// stays held while parked so a concurrently-dropped handle cannot
-        /// disarm mid-park; the handle releases the engine (non-blocking)
-        /// BEFORE its drop can take the lock.
-        pub(crate) fn barrier(&self, deployment_id: &DeploymentId) {
+        /// ENGINE-side, called immediately before a step-17-equivalent lock
+        /// acquisition: signal "at step-17" (with the phase being entered) and
+        /// park until the test releases the engine — or return immediately when
+        /// unarmed / the deployment id does not match. NEVER called from
+        /// production code (the call sites in `src/push/engine.rs` are
+        /// `#[cfg(test)]`). The slot mutex stays held while parked so a
+        /// concurrently-dropped handle cannot disarm mid-park; the handle
+        /// releases the engine (non-blocking) BEFORE its `drop` can take the
+        /// lock.
+        pub(crate) fn barrier(&self, deployment_id: &DeploymentId, phase: HookPhase) {
             let guard = self.inner.lock().unwrap();
             let Some(armed) = guard.as_ref() else {
                 return;
@@ -403,7 +441,7 @@ pub(crate) mod step17_hook {
             if armed.deployment_id != deployment_id.as_str() {
                 return;
             }
-            let _ = armed.at_step17.send(());
+            let _ = armed.at_step17.send(phase);
             let _ = armed.release.recv();
         }
     }
@@ -414,31 +452,33 @@ pub(crate) mod step17_hook {
     /// never strand the engine thread.
     pub(crate) struct HookHandle {
         hook: Arc<Step17Hook>,
-        at_step17: Receiver<()>,
+        at_step17: Receiver<HookPhase>,
         release: Sender<()>,
     }
 
     impl HookHandle {
-        /// Block until the engine signals it is parked at the step-17 lock
-        /// acquisition. The push MUST reach a step-17-equivalent barrier for
-        /// this deployment id (a real push, or a no-op retrying debt);
-        /// otherwise this blocks forever — the property test uses
+        /// Block until the engine signals it is parked at a step-17-equivalent
+        /// lock acquisition and return WHICH phase it is parked at. The push
+        /// MUST reach a step-17-equivalent barrier for this deployment id (a
+        /// real push, or a no-op retrying debt); otherwise this blocks
+        /// forever — the property test uses
         /// [`HookHandle::wait_at_step17_bounded`] for the can-never-fire
         /// case.
-        pub(crate) fn wait_at_step17(&self) {
+        pub(crate) fn wait_at_step17(&self) -> HookPhase {
             self.at_step17
                 .recv()
-                .expect("the step-17 hook fired before the handle dropped");
+                .expect("the step-17 hook fired before the handle dropped")
         }
 
         /// Like [`HookHandle::wait_at_step17`], but bounded: returns
         /// `Err(Timeout)` when the engine did not fire within `timeout` —
         /// the caller then checks whether the push already completed (the
         /// hook will never fire, e.g. an up-to-date no-op with no debt).
+        /// On success returns the [`HookPhase`] the engine is parked at.
         pub(crate) fn wait_at_step17_bounded(
             &self,
             timeout: Duration,
-        ) -> Result<(), RecvTimeoutError> {
+        ) -> Result<HookPhase, RecvTimeoutError> {
             self.at_step17.recv_timeout(timeout)
         }
 

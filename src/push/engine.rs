@@ -30,6 +30,8 @@ use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::transport::Remote;
 use crate::rotation::compute_retained;
 use crate::store::local::LocalStore;
+#[cfg(test)]
+use crate::testutil::step17_hook::HookPhase;
 use crate::tree;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::unix::io::AsRawFd;
@@ -1406,14 +1408,16 @@ fn push_inner(
             .map(|s| s.targets.clone())
             .unwrap_or_default();
         // TEST-ONLY step-17 phase hook: when a test armed the barrier for
-        // THIS deployment id, signal "at step-17 lock acquisition" and park
-        // until the test releases the engine (the fixture holds the competing
-        // guard meanwhile) — per-slot lock contention becomes DETERMINISTIC,
-        // with no thread racing the lock file. A no-op in production builds
-        // (both this call and the store method are `#[cfg(test)]`) and in
-        // unarmed tests.
+        // THIS deployment id, signal "at step-17 lock acquisition" (with the
+        // FRESH-STEP-17 phase — this push's own per-slot rotation, whose
+        // contended else-branch defers the maintenance as a debt marker) and
+        // park until the test releases the engine (the fixture holds the
+        // competing guard meanwhile) — per-slot lock contention becomes
+        // DETERMINISTIC, with no thread racing the lock file. A no-op in
+        // production builds (both this call and the store method are
+        // `#[cfg(test)]`) and in unarmed tests.
         #[cfg(test)]
-        store.step17_hook_barrier(deployment_id);
+        store.step17_hook_barrier(deployment_id, HookPhase::FreshStep17);
         if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
             match rotate_slot_locked(helper, store, config, &slot_targets, deployment_id) {
                 Ok(()) => {
@@ -1730,12 +1734,15 @@ fn retry_deferred_rotations(
         };
         // TEST-ONLY phase hook: the deferred-maintenance retry shares the
         // same RAII-guarded rotation block as step 17, so it signals + parks
-        // at the SAME barrier — a test that armed the step-17 hook for this
+        // at the SAME barrier, tagged with the DEFERRED-RETRY phase (it runs
+        // BEFORE the fresh step-17 rotation and reads the debt FIRST — a test
+        // that arms the debt fault only at the fresh step-17 phase therefore
+        // does NOT arm it here). A test that armed the step-17 hook for this
         // deployment id gets deterministic contention at the retry too (the
         // no-op path reaches a step-17-equivalent lock acquisition only
         // here). A no-op in production builds and unarmed tests.
         #[cfg(test)]
-        store.step17_hook_barrier(deployment_id);
+        store.step17_hook_barrier(deployment_id, HookPhase::DeferredRetry);
         if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
             // The slot's FULL member target list (union retention), resolved
             // from the current config.
