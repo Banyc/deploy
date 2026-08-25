@@ -1074,6 +1074,30 @@ mod tests {
         }
     }
 
+    /// The documented `parent(@, 0) ≡ @` fold holds even on an EMPTY store:
+    /// `resolve_ref_expr` short-circuits `Relative { base: At, steps: 0 }`
+    /// to `PushRef::Head` BEFORE the chain read — no store access — so the
+    /// empty chain never rejects it. This pins the fold that the
+    /// ref-grammar resolve property's oracle mirrors, and contrasts it with
+    /// a genuinely store-dependent relative (`@-`), which still fails
+    /// closed on the empty store.
+    #[test]
+    fn resolve_parent_at_0_fold_on_empty_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        for token in ["@", "parent(@, 0)"] {
+            assert_eq!(
+                resolve(token, &store).unwrap(),
+                PushRef::Head,
+                "{token:?} must fold to Head without touching the empty store"
+            );
+        }
+        assert!(
+            matches!(resolve("@-", &store), Err(Error::Ref(_))),
+            "a store-dependent relative must still fail closed on an empty store"
+        );
+    }
+
     /// The ancestor steps on the s0..s5 chain (latest = s5): `@-` = s4,
     /// `@--` = s3, `parent(@, 3)` = s2, `s3--` = s1, `parent(s5, 2)` = s3,
     /// `s1-` = s0, and the bare `s1` / `parent(s1, 0)` forms name s1 itself.
@@ -1627,7 +1651,9 @@ mod tests {
     /// error; a rejected shape never resolves; a resolved snapshot index is
     /// an actual member of the FLOORED chain at/after the floor; `@` /
     /// `release:<id>` never touch the chain (they resolve even on an EMPTY
-    /// store, while every relative form on an empty store fails closed).
+    /// store, while every relative form on an empty store fails closed —
+    /// except `parent(@, 0)`, which the oracle folds to `Head` FIRST so it
+    /// mirrors the engine's documented `Relative{At,0} ≡ Head` reduction).
     fn ref_grammar_resolve_case(chain_idx: Vec<u64>, floor: Option<u64>, token: String) {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
@@ -1663,7 +1689,13 @@ mod tests {
         // error and the expression NEVER reaches resolution (a rejected
         // shape never resolves).
         let expr = match parse_no_panic(&token) {
-            Ok(expr) => expr,
+            // Apply the engine's canonical fold to the parsed expression
+            // BEFORE resolution, so the oracle and the engine agree on the
+            // same reduced form: `parent(@, 0)` becomes `Head` (the engine
+            // short-circuits `Relative{At,0}` to `PushRef::Head` before any
+            // store read), and every other expression passes through
+            // unchanged (the fold is a no-op for them).
+            Ok(expr) => fold(expr),
             Err(err) => {
                 assert!(
                     matches!(err, Error::Ref(_)),
@@ -1686,7 +1718,9 @@ mod tests {
         }
 
         // On an EMPTY store, `@`/HEAD/`release:<id>` still resolve — no
-        // chain touch — while every relative form fails closed.
+        // chain touch — while every relative form fails closed. `expr` was
+        // already folded above, so the `parent(@, 0)` case is judged by the
+        // Head arm (exactly what the engine does before its store read).
         if chain_idx.is_empty() {
             match &expr {
                 RefExpr::Head | RefExpr::Release(_) => assert!(
