@@ -39,11 +39,17 @@
 //! The floor marker is the checkpoint's COMMIT POINT: once it is durable
 //! the checkpoint took effect, so a failure of any LATER phase is
 //! post-commit maintenance — it records the durable
-//! `refs/cleanup-pending.json` debt marker
+//! `refs/cleanup-pending.json` debt FLAG
 //! ([`crate::records::CleanupPending`], via
 //! [`LocalStore::write_cleanup_pending`]) and the command reports SUCCESS
 //! with a warning instead of an `Err`; the next same-deployment checkpoint
-//! retries the cleanup until it completes (then clears the marker).
+//! retries the cleanup until it completes (then clears the marker). The
+//! marker is a flag ONLY — it never records a deletion worklist: the
+//! delete-before-rewrite compaction order keeps the below-floor worklist in
+//! the raw logs until deletion finishes, so a retry recomputes the exact
+//! delete set from the logs via
+//! [`LocalStore::checkpoint_discards`] and converges regardless of the
+//! marker.
 //!
 //! The marker is INTEGRITY-BOUND at read time ([`LocalStore::read_history_floor`]):
 //! it must name the target it was read from AND an exact snapshot-pair
@@ -64,8 +70,8 @@
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::model::{
-    BehaviorContract, DeploymentId, ReleaseId, ReleaseRecord, SCHEMA_VERSION, TREE_SCHEMA_VERSION,
-    TreeDigest, TreeMetadata,
+    BehaviorContract, CLEANUP_PENDING_SCHEMA_VERSION, DeploymentId, ReleaseId, ReleaseRecord,
+    SCHEMA_VERSION, TREE_SCHEMA_VERSION, TreeDigest, TreeMetadata,
 };
 use crate::records::{
     CleanupPending, DeploymentAttempt, DeploymentResults, DeploymentSnapshot, DeploymentStatus,
@@ -1066,20 +1072,71 @@ impl LocalStore {
         self.refs_dir(target).join("cleanup-pending.json")
     }
 
-    /// Read the target's pending-checkpoint-cleanup marker, or `None` when
-    /// no cleanup is pending. `schema_version` must be exactly
-    /// [`SCHEMA_VERSION`]; any other version fails closed with an error
-    /// naming the version.
-    pub fn read_cleanup_pending(&self, target: &str) -> Result<Option<CleanupPending>> {
+    /// Read the target's pending-checkpoint-cleanup FLAG marker, or `None`
+    /// when no cleanup is pending. FAILS CLOSED on every integrity
+    /// violation, mirroring [`LocalStore::read_history_floor`]:
+    ///
+    /// * `schema_version` must be exactly
+    ///   [`CLEANUP_PENDING_SCHEMA_VERSION`]; any other version fails with an
+    ///   error naming the version — including the legacy version-1 shape
+    ///   that carried `pending_deployments` (serde would otherwise silently
+    ///   drop the removed field, so the version gate is what refuses it).
+    /// * the marker's `target` must match the path it was read from
+    ///   (`marker.target == target`): a marker smuggled into another
+    ///   target's `refs/` can never gate (or leak into) that target's
+    ///   cleanup decision.
+    /// * when `floor` is present, the marker's `deployment_id` and
+    ///   `snapshot_index` must EXACTLY match the floor's — the marker is the
+    ///   pending-cleanup flag FOR THAT floor, and a corrupted/tampered
+    ///   marker (arbitrary target/anchor/deployment ids) must never be
+    ///   trusted for the pending/repair decision.
+    ///
+    /// Each violation is an [`Error::integrity`] error (a schema-version
+    /// violation is an [`Error::store`] error naming the version, mirroring
+    /// the floor), so a corrupted marker is NEVER silently treated as "no
+    /// pending cleanup". The checkpoint retry treats a failed read as debt
+    /// outstanding: it recomputes the discards from the intact logs and
+    /// converges regardless, so the worst case is a self-healing re-run.
+    pub fn read_cleanup_pending(
+        &self,
+        target: &str,
+        floor: Option<&HistoryFloor>,
+    ) -> Result<Option<CleanupPending>> {
         let p = self.cleanup_pending_path(target);
         if !p.exists() {
             return Ok(None);
         }
         let pending: CleanupPending = read_json(&p)?;
-        if pending.schema_version != SCHEMA_VERSION {
+        if pending.schema_version != CLEANUP_PENDING_SCHEMA_VERSION {
             return Err(Error::store(format!(
-                "cleanup-pending marker for target '{target}' carries unsupported schema_version {} (expected {SCHEMA_VERSION}): only SCHEMA_VERSION is accepted",
+                "cleanup-pending marker for target '{target}' carries unsupported schema_version {} (expected {CLEANUP_PENDING_SCHEMA_VERSION}): only CLEANUP_PENDING_SCHEMA_VERSION is accepted (the legacy version-1 shape with pending_deployments is refused, never reinterpreted)",
                 pending.schema_version
+            )));
+        }
+        // BINDING (a): the marker must name the target directory it lives in
+        // — a marker with a foreign `target` is a tampered/corrupted marker
+        // and is refused, not interpreted for either path.
+        if pending.target.as_str() != target {
+            return Err(Error::integrity(format!(
+                "cleanup-pending marker at {} is not bound to its path: marker.target = '{}' but the marker was read for target '{target}' (a cleanup marker must name the target directory it lives in)",
+                p.display(),
+                pending.target
+            )));
+        }
+        // BINDING (b): when a floor is present, the marker must name EXACTLY
+        // that floor's deployment + snapshot index — the marker is the
+        // pending-cleanup flag for the floor it accompanies, and a corrupted
+        // anchor must never be trusted for the pending/repair decision.
+        if let Some(floor) = floor
+            && (pending.deployment_id != floor.deployment_id
+                || pending.snapshot_index != floor.snapshot_index)
+        {
+            return Err(Error::integrity(format!(
+                "cleanup-pending marker for target '{target}' is not bound to the history floor: marker names deployment '{}' at snapshot s{} but the floor names deployment '{}' at snapshot s{} (a cleanup marker must name exactly the floor it accompanies)",
+                pending.deployment_id,
+                pending.snapshot_index,
+                floor.deployment_id,
+                floor.snapshot_index
             )));
         }
         Ok(Some(pending))
@@ -1204,43 +1261,32 @@ impl LocalStore {
     /// the floor marker already gates every read path — an interruption at
     /// any point leaves the durable floor bounding the visible history (old
     /// physical files remain but are invisible below the floor). The delete
-    /// set is captured from the pre-compaction logs, plus any dirs still
-    /// recorded in the durable cleanup-pending debt marker
-    /// ([`LocalStore::read_cleanup_pending`]) for this floor — so a
-    /// compaction that finished the rewrites but faulted before the
-    /// deletions still removes the below-floor dirs on a later retry, even
-    /// though the compacted logs no longer name them (a retry converges to
-    /// no below-floor dirs/files; the marker clears once the compaction
-    /// completes).
+    /// set is EXACTLY [`LocalStore::checkpoint_discards`]'s
+    /// `discarded_deployments`, recomputed from the CURRENT logs on every
+    /// call — the cleanup-pending debt FLAG
+    /// ([`LocalStore::read_cleanup_pending`]) is never consulted for the
+    /// worklist (a corrupted/tampered marker could otherwise name retained
+    /// or unrelated deployment dirs): delete-first ordering guarantees the
+    /// logs still name the worklist whenever deletion runs, so a retry
+    /// recomputes the same list and converges (the marker only carries the
+    /// durable pending-flag / needs-repair signal, decided by
+    /// [`LocalStore::read_cleanup_pending`] in the checkpoint flow).
     pub(crate) fn checkpoint_compact(&self, target: &str, floor: &HistoryFloor) -> Result<()> {
         // Recomputed from the CURRENT (still-intact or already-rewritten)
         // logs on every call — this is what makes an interrupted compaction
         // converge on retry, so it must run BEFORE any log rewrite below.
         let discards = self.checkpoint_discards(target, floor)?;
 
-        // 1. Delete deployment dirs strictly below the floor (only the
+        // 1. Delete deployment dirs strictly below the floor (ONLY the
         //    deployment ids the target's own history names — never a
-        //    directory of another target, never releases/objects/servers).
-        //    First, while the logs still name every discarded id; a retry
-        //    recomputes this same worklist from the intact logs and
-        //    `dir.exists()` skips the dirs an interrupted pass removed.
-        //    The delete set is also the pre-compaction discard union plus
-        //    any dirs still recorded in a pending-cleanup debt marker (an
-        //    interrupted run may have compacted the logs but faulted
-        //    before the deletions — the durable marker records exactly
-        //    those dirs, so the retry finishes them even though the
-        //    compacted log no longer names them).
-        let mut dirs_to_delete = discards.discarded_deployments.clone();
-        if let Some(pending) = self.read_cleanup_pending(target)?
-            && pending.deployment_id == floor.deployment_id
-            && pending.snapshot_index == floor.snapshot_index
-        {
-            for id in &pending.pending_deployments {
-                if !dirs_to_delete.contains(id) {
-                    dirs_to_delete.push(id.clone());
-                }
-            }
-        }
+        //    directory of another target, never releases/objects/servers,
+        //    never a retained at/above-floor dir). First, while the logs
+        //    still name every discarded id; a retry recomputes this same
+        //    worklist from the intact logs and `dir.exists()` skips the
+        //    dirs an interrupted pass removed. The delete set is exactly
+        //    the log-derived discard set — a corrupted cleanup marker must
+        //    never widen it.
+        let dirs_to_delete = discards.discarded_deployments.clone();
         #[cfg(test)]
         if self
             .fault_registry
@@ -2188,46 +2234,126 @@ mod tests {
         );
     }
 
-    /// The cleanup-pending debt marker (the post-commit half of a
-    /// checkpoint) round-trips, clears, and fails closed on a foreign
-    /// `schema_version` — mirroring the history-floor marker.
+    /// The cleanup-pending debt FLAG (the post-commit half of a
+    /// checkpoint) round-trips, clears, fails closed on a foreign
+    /// `schema_version` — including the legacy version-1 shape that carried
+    /// `pending_deployments` — and is INTEGRITY-BOUND like the history
+    /// floor: a marker with a foreign `target`, or (when a floor is given)
+    /// a `deployment_id`/`snapshot_index` that does not EXACTLY match the
+    /// floor's, fails closed with an integrity error. The marker is a flag
+    /// only: the removed `pending_deployments` worklist is gone by
+    /// construction (the logs retain the worklist), so a corrupted marker
+    /// can never name retained or unrelated deployment dirs.
     #[test]
     fn cleanup_pending_marker_roundtrips_and_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t-pending";
         let id = DeploymentId::new("deploy-1".to_string());
-        assert!(
-            store.read_cleanup_pending(target).unwrap().is_none(),
-            "no marker before any pending cleanup"
-        );
-
-        let pending = CleanupPending {
+        let floor = HistoryFloor {
             schema_version: SCHEMA_VERSION,
             target: TargetName::new(target.to_string()),
             deployment_id: id.clone(),
             snapshot_index: 1,
             established_at: "2026-01-01T00:00:00Z".to_string(),
-            pending_deployments: vec!["deploy-0".to_string()],
+        };
+        assert!(
+            store
+                .read_cleanup_pending(target, Some(&floor))
+                .unwrap()
+                .is_none(),
+            "no marker before any pending cleanup"
+        );
+
+        let pending = CleanupPending {
+            schema_version: CLEANUP_PENDING_SCHEMA_VERSION,
+            target: TargetName::new(target.to_string()),
+            deployment_id: id.clone(),
+            snapshot_index: 1,
+            established_at: "2026-01-01T00:00:00Z".to_string(),
         };
         store.write_cleanup_pending(target, &pending).unwrap();
-        let read = store.read_cleanup_pending(target).unwrap().unwrap();
+        let read = store
+            .read_cleanup_pending(target, Some(&floor))
+            .unwrap()
+            .unwrap();
         assert_eq!(read, pending);
+        // The flag binds to the floor it accompanies: the same marker read
+        // WITHOUT a floor passes the target binding (no anchor to check);
+        // with a DIFFERENT floor it fails closed.
+        store
+            .read_cleanup_pending(target, None)
+            .unwrap()
+            .expect("the target binding alone holds without a floor");
+        let foreign_floor = HistoryFloor {
+            deployment_id: DeploymentId::new("deploy-other".to_string()),
+            snapshot_index: 9,
+            ..floor.clone()
+        };
+        let err = store
+            .read_cleanup_pending(target, Some(&foreign_floor))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("integrity"),
+            "a marker whose anchor does not match the floor must fail closed, got: {err}"
+        );
 
         // Clear removes the marker entirely.
         store.clear_cleanup_pending(target).unwrap();
-        assert!(store.read_cleanup_pending(target).unwrap().is_none());
+        assert!(
+            store
+                .read_cleanup_pending(target, Some(&floor))
+                .unwrap()
+                .is_none()
+        );
         assert!(!store.cleanup_pending_path(target).exists());
 
         // A foreign schema version fails closed naming it.
         store.write_cleanup_pending(target, &pending).unwrap();
         let mut foreign = pending.clone();
-        foreign.schema_version = SCHEMA_VERSION + 1;
+        foreign.schema_version = CLEANUP_PENDING_SCHEMA_VERSION + 1;
         write_json(&store.cleanup_pending_path(target), &foreign).unwrap();
-        let err = store.read_cleanup_pending(target).unwrap_err();
+        let err = store
+            .read_cleanup_pending(target, Some(&floor))
+            .unwrap_err();
         assert!(
             err.to_string().contains("schema_version"),
             "a foreign cleanup-pending schema version must fail closed, got: {err}"
+        );
+
+        // The LEGACY version-1 shape (the removed `pending_deployments`
+        // field) must NOT silently parse as a valid flag-only marker:
+        // serde would ignore the extra field, so the version gate is what
+        // refuses it — a stale marker is then cleared by the converging
+        // retry, never trusted.
+        let legacy = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "target": target,
+            "deployment_id": "deploy-1",
+            "snapshot_index": 1,
+            "established_at": "2026-01-01T00:00:00Z",
+            "pending_deployments": ["deploy-0", "deploy-foreign"],
+        });
+        write_json(&store.cleanup_pending_path(target), &legacy).unwrap();
+        let err = store
+            .read_cleanup_pending(target, Some(&floor))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("schema_version"),
+            "a legacy v1 marker carrying pending_deployments must fail closed on the version, got: {err}"
+        );
+
+        // The TARGET binding: a marker naming another target fails closed
+        // even though its version is current.
+        let mut retargeted = pending.clone();
+        retargeted.target = TargetName::new("staging".to_string());
+        write_json(&store.cleanup_pending_path(target), &retargeted).unwrap();
+        let err = store
+            .read_cleanup_pending(target, Some(&floor))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("integrity"),
+            "a cleanup marker naming a foreign target must fail closed, got: {err}"
         );
     }
 

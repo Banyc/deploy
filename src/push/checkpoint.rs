@@ -49,12 +49,17 @@
 //! the marker write — enumerating the discards or any compaction phase, on
 //! the fresh path or the idempotency-repair path — is POST-COMMIT
 //! MAINTENANCE: the checkpoint already took effect, so the command reports
-//! SUCCESS with an explicit, DURABLE [`CleanupPending`] debt marker
+//! SUCCESS with an explicit, DURABLE [`CleanupPending`] debt FLAG
 //! (`targets/<target>/refs/cleanup-pending.json`, mirroring the
 //! rotation-debt discipline) and `CheckpointReport::cleanup_pending` set,
-//! NEVER an `Err`. The next checkpoint of the SAME deployment retries the
-//! cleanup (the idempotency-repair path); once it completes, the debt
-//! marker clears and the report shows no `cleanup_pending`.
+//! NEVER an `Err`. The marker is a flag ONLY — it never carries a deletion
+//! worklist: the compaction deletes below-floor dirs BEFORE rewriting the
+//! logs, so the raw logs retain the worklist whenever a deletion fails and
+//! the retry recomputes the exact delete set from them via
+//! [`LocalStore::checkpoint_discards`]. The next checkpoint of the SAME
+//! deployment retries the cleanup (the idempotency-repair path); once it
+//! completes, the debt marker clears and the report shows no
+//! `cleanup_pending`.
 //!
 //! # Concurrency
 //!
@@ -71,7 +76,9 @@
 //! discard set the compaction would remove ([`LocalStore::checkpoint_discards`]).
 
 use crate::error::{Error, Result};
-use crate::model::{DeploymentId, OperationId, SCHEMA_VERSION, TargetName};
+use crate::model::{
+    CLEANUP_PENDING_SCHEMA_VERSION, DeploymentId, OperationId, SCHEMA_VERSION, TargetName,
+};
 use crate::push::engine::FileLock;
 use crate::records::{CleanupPending, HistoryFloor};
 use crate::store::local::{FloorDiscards, LocalStore};
@@ -243,10 +250,13 @@ fn finish_cleanup(
     floor: &HistoryFloor,
     established: bool,
 ) -> Result<CheckpointReport> {
-    // The pending-cleanup debt from an interrupted run, if any. A read
-    // failure is treated as debt outstanding: the repair re-runs the
-    // compaction and self-heals (a stale marker is then cleared).
-    let (pending, pending_read_failed) = match store.read_cleanup_pending(target) {
+    // The pending-cleanup debt from an interrupted run, if any — read
+    // INTEGRITY-BOUND to this floor (a corrupted/tampered marker with an
+    // arbitrary target/anchor/deployment id fails closed). A read failure
+    // is treated as debt outstanding: the repair re-runs the compaction
+    // from the intact logs and self-heals (a stale or corrupted marker is
+    // then cleared).
+    let (pending, pending_read_failed) = match store.read_cleanup_pending(target, Some(floor)) {
         Ok(p) => (p, false),
         Err(_) => (None, true),
     };
@@ -256,7 +266,7 @@ fn finish_cleanup(
     let discards = match store.checkpoint_discards(target, floor) {
         Ok(d) => d,
         Err(_) => {
-            record_cleanup_pending(store, target, floor, &[]);
+            record_cleanup_pending(store, target, floor);
             return Ok(cleanup_report(
                 target,
                 floor,
@@ -300,7 +310,7 @@ fn finish_cleanup(
             false
         }
         Err(_) => {
-            record_cleanup_pending(store, target, floor, &discards.discarded_deployments);
+            record_cleanup_pending(store, target, floor);
             true
         }
     };
@@ -332,25 +342,23 @@ fn cleanup_report(
     }
 }
 
-/// Record (or refresh) the durable cleanup-pending debt marker. This is
+/// Record (or refresh) the durable cleanup-pending debt FLAG. This is
 /// itself POST-COMMIT MAINTENANCE: a marker-write failure must never turn
 /// the checkpoint into an `Err` (the floor already stands, and the next
 /// same-deployment checkpoint re-runs the cleanup from the physical logs
 /// regardless of the marker), so the write error is absorbed and the report
-/// still carries the warning.
-fn record_cleanup_pending(
-    store: &LocalStore,
-    target: &str,
-    floor: &HistoryFloor,
-    pending_deployments: &[String],
-) {
+/// still carries the warning. The marker is a FLAG ONLY — it carries no
+/// deletion worklist (the logs retain it; see
+/// [`crate::store::local::LocalStore::checkpoint_compact`]) — its
+/// `target`/`deployment_id`/`snapshot_index` fields exist purely for the
+/// integrity binding on read.
+fn record_cleanup_pending(store: &LocalStore, target: &str, floor: &HistoryFloor) {
     let pending = CleanupPending {
-        schema_version: SCHEMA_VERSION,
+        schema_version: CLEANUP_PENDING_SCHEMA_VERSION,
         target: TargetName::new(target.to_string()),
         deployment_id: floor.deployment_id.clone(),
         snapshot_index: floor.snapshot_index,
         established_at: crate::remote::helper::now_rfc3339(),
-        pending_deployments: pending_deployments.to_vec(),
     };
     let _ = store.write_cleanup_pending(target, &pending);
 }
@@ -1408,7 +1416,7 @@ mod tests {
                 "a failed floor write must leave NO floor"
             );
             assert!(
-                store.read_cleanup_pending(TARGET).unwrap().is_none(),
+                store.read_cleanup_pending(TARGET, None).unwrap().is_none(),
                 "no cleanup-pending debt marker without a durable floor"
             );
             // Nothing was discarded or compacted: full history intact.
@@ -1487,7 +1495,7 @@ mod tests {
                 "a floor with nothing below it has no cleanup to pend"
             );
             assert!(
-                store.read_cleanup_pending(TARGET).unwrap().is_none(),
+                store.read_cleanup_pending(TARGET, None).unwrap().is_none(),
                 "no debt marker when there is no pending cleanup"
             );
             // The re-run stays a no-op (the armed fault is never reached).
@@ -1498,31 +1506,23 @@ mod tests {
             return;
         }
 
-        // The DURABLE debt marker records the pending cleanup and the CLI
-        // render includes the explicit warning line.
+        // The DURABLE debt FLAG records the pending cleanup and the CLI
+        // render includes the explicit warning line. The marker is a flag
+        // only: it carries NO deletion worklist (the logs retain it), so its
+        // only content assertions are the integrity-binding fields.
         assert!(
             rep.cleanup_pending,
             "the armed compaction is surfaced as cleanup_pending"
         );
         let pending = store
-            .read_cleanup_pending(TARGET)
+            .read_cleanup_pending(TARGET, Some(&floor))
             .unwrap()
-            .expect("a durable cleanup-pending marker records the debt");
-        assert_eq!(pending.schema_version, SCHEMA_VERSION);
+            .expect("a durable cleanup-pending FLAG records the debt");
+        assert_eq!(pending.schema_version, CLEANUP_PENDING_SCHEMA_VERSION);
         assert_eq!(pending.target, TargetName::new(TARGET.to_string()));
         assert_eq!(pending.deployment_id.as_str(), target_id);
         assert_eq!(pending.snapshot_index, floor_index);
         assert!(!pending.established_at.is_empty());
-        // Same SET as the below-floor dirs; the discard enumeration's
-        // documented order is snapshot-first — compare sorted.
-        let mut recorded = pending.pending_deployments.clone();
-        recorded.sort_unstable();
-        let mut expected = below_floor_ids.clone();
-        expected.sort_unstable();
-        assert_eq!(
-            recorded, expected,
-            "the marker records exactly the below-floor dirs still to delete"
-        );
         let lines = render_checkpoint_report(&rep);
         assert!(
             lines.iter().any(|l| l.contains("cleanup pending")),
@@ -1540,7 +1540,10 @@ mod tests {
             "converged: no cleanup pending on the re-run"
         );
         assert!(
-            store.read_cleanup_pending(TARGET).unwrap().is_none(),
+            store
+                .read_cleanup_pending(TARGET, Some(&floor))
+                .unwrap()
+                .is_none(),
             "the debt marker clears once the cleanup completes"
         );
         let marker_after = store.read_history_floor(TARGET).unwrap().unwrap();
@@ -2008,6 +2011,441 @@ mod tests {
             mutations in prop::collection::vec(floor_mutation_strategy(), 0..7),
         ) {
             run_floor_mutation_case(&mutations);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Cleanup-marker FLAG-ONLY + INTEGRITY BINDING (the property test)
+    // ---------------------------------------------------------------------
+
+    /// One corruption/tampering of the cleanup-pending FLAG marker. With the
+    /// `pending_deployments` worklist removed by construction (the logs
+    /// retain the worklist), every mutation targets the marker's REMAINING
+    /// fields — the target name, the deployment id, the snapshot anchor — or
+    /// rewrites a legacy-shaped / foreign-version marker. Every variant
+    /// breaks at least one check the reader verifies
+    /// ([`crate::store::local::LocalStore::read_cleanup_pending`]): the
+    /// version gate, the target-name binding, or the floor-anchor binding —
+    /// so a corrupted marker is never trusted for the pending/repair
+    /// decision and can never widen the log-derived deletion set.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CleanupMutation {
+        /// (1) Retarget the marker to a different (unrelated) target name.
+        Retarget,
+        /// (2a) `snapshot_index` BELOW the floor's real anchor.
+        IndexBelow,
+        /// (2b) `snapshot_index` ABOVE the floor's real anchor.
+        IndexAbove,
+        /// (3a) `deployment_id` → a deployment that never existed.
+        ForeignDeployment,
+        /// (3b) `deployment_id` → a REAL RETAINED at/above-floor deployment
+        /// (the corruption that must never cause its dir to be deleted).
+        ExistingDeployment,
+        /// (4) The legacy v1 shape carrying the REMOVED `pending_deployments`
+        /// worklist (stray deployment ids) — the version gate must refuse
+        /// it, never silently reinterpret it.
+        LegacyShape,
+        /// (5) A foreign marker schema version.
+        ForeignVersion,
+    }
+
+    fn cleanup_mutation_strategy() -> impl Strategy<Value = CleanupMutation> {
+        prop_oneof![
+            1 => Just(CleanupMutation::Retarget),
+            1 => Just(CleanupMutation::IndexBelow),
+            1 => Just(CleanupMutation::IndexAbove),
+            1 => Just(CleanupMutation::ForeignDeployment),
+            1 => Just(CleanupMutation::ExistingDeployment),
+            1 => Just(CleanupMutation::LegacyShape),
+            1 => Just(CleanupMutation::ForeignVersion),
+        ]
+    }
+
+    /// The pieces of one interrupted-cleanup fixture.
+    struct CleanupFixture {
+        /// The checkpoint deployment id (the floor's own deployment).
+        target_id: String,
+        /// The planned floor for that deployment.
+        floor: HistoryFloor,
+        /// `checkpoint_discards` from the STILL-INTACT logs: the EXACT set
+        /// the compaction may delete (the property's oracle).
+        ground_truth: FloorDiscards,
+        /// Every seeded deployment id NOT in the discard set (retained
+        /// at/above-floor dirs) plus the unrelated target's deployment dir.
+        retained_ids: Vec<String>,
+        /// The never-delete guard-rail identities (releases/objects/servers).
+        never: (ReleaseId, TreeDigest, String),
+    }
+
+    /// Seed a fresh fixture into the INTERRUPTED-CLEANUP debt state: a valid
+    /// checkpoint whose FIRST compaction phase (deployment-dir deletion)
+    /// faulted — the durable floor stands, the flag marker is present, and
+    /// the raw logs are still intact (delete-first ordering: the fault fires
+    /// BEFORE any deletion or rewrite, so the logs still name the full
+    /// worklist). `checkpoint_at` never selects the first success (so a real
+    /// below-floor prefix exists) nor the last one (so a retained
+    /// at/above-floor deployment exists to corrupt the marker into).
+    fn seed_interrupted_cleanup(
+        store: &LocalStore,
+        history: &[bool],
+        checkpoint_at: usize,
+    ) -> CleanupFixture {
+        seed_history(store, TARGET, "deploy", history);
+        // Guard rails that must survive EVERY cleanup: release/object/server
+        // stores plus an UNRELATED target's deployment directory.
+        let never = seed_never_delete(store);
+        let unrelated = "unrelated-target-0000";
+        std::fs::create_dir_all(store.deployment_dir(unrelated)).unwrap();
+
+        let ok_ids: Vec<String> = history
+            .iter()
+            .enumerate()
+            .filter(|(_, ok)| **ok)
+            .map(|(n, _)| format!("deploy-{n:04}"))
+            .collect();
+        assert!(
+            ok_ids.len() >= 3,
+            "the seeded prefix plus the filtered history guarantee >= 3 successes"
+        );
+        let pick = 1 + checkpoint_at % (ok_ids.len() - 2);
+        let target_id = ok_ids[pick].clone();
+        let floor = plan_floor(store, TARGET, &DeploymentId::new(target_id.clone()))
+            .expect("the checkpoint deployment is a success, so it has a snapshot");
+        let ground_truth = store
+            .checkpoint_discards(TARGET, &floor)
+            .expect("the intact logs enumerate the full discard worklist");
+        assert!(
+            !ground_truth.discarded_deployments.is_empty(),
+            "the checkpoint is never the first success, so something is discarded"
+        );
+        let retained_ids: Vec<String> = history
+            .iter()
+            .enumerate()
+            .map(|(n, _)| format!("deploy-{n:04}"))
+            .filter(|id| !ground_truth.discarded_deployments.contains(id))
+            .chain(std::iter::once(unrelated.to_string()))
+            .collect();
+
+        // Establish the checkpoint with the FIRST compaction phase faulted:
+        // the durable floor + flag marker stand, the logs stay intact, and
+        // NOTHING below the floor is deleted yet (the fault fires before the
+        // deletion loop).
+        store.fault_registry().arm_compact_deployments(&target_id);
+        let rep = run_checkpoint(store, TARGET, &DeploymentId::new(target_id.clone()), false)
+            .expect("an interrupted compaction is committed-with-warning, never an Err");
+        assert!(rep.cleanup_pending);
+        let pending = store
+            .read_cleanup_pending(TARGET, Some(&floor))
+            .unwrap()
+            .expect("the durable flag marker records the debt");
+        assert_eq!(pending.deployment_id.as_str(), target_id);
+        assert_eq!(pending.snapshot_index, floor.snapshot_index);
+        // The debt state: floor present, logs intact, all below-floor dirs
+        // still on disk.
+        assert!(store.read_history_floor(TARGET).unwrap().is_some());
+        assert_eq!(
+            store.read_attempts_raw(TARGET).unwrap().len(),
+            history.len()
+        );
+        assert_eq!(
+            store.read_snapshots_raw(TARGET).unwrap().len(),
+            ok_ids.len()
+        );
+        for id in &ground_truth.discarded_deployments {
+            assert!(
+                store.deployment_dir(id).exists(),
+                "debt state: below-floor dir {id} still exists"
+            );
+        }
+        CleanupFixture {
+            target_id,
+            floor,
+            ground_truth,
+            retained_ids,
+            never,
+        }
+    }
+
+    /// Every retained sentinel survives: at/above-floor deployment dirs, the
+    /// unrelated target's deployment dir, `releases/`, `objects/`, `servers/`.
+    fn assert_cleanup_sentinels(store: &LocalStore, fx: &CleanupFixture) {
+        for id in &fx.retained_ids {
+            assert!(
+                store.deployment_dir(id).exists(),
+                "retained deployment dir {id} must survive the cleanup"
+            );
+        }
+        assert_never_delete(store, &fx.never.0, &fx.never.1, &fx.never.2);
+    }
+
+    /// Rewrite the flag marker to a corrupted form derived from the INTACT
+    /// marker (each mutation is a fresh corruption of the intact marker,
+    /// never of a previous corruption).
+    fn apply_cleanup_mutation(
+        store: &LocalStore,
+        fx: &CleanupFixture,
+        mutation: CleanupMutation,
+        retained_anchor: &str,
+    ) {
+        match mutation {
+            CleanupMutation::LegacyShape => {
+                // The pre-change v1 shape: still carries the REMOVED
+                // `pending_deployments` worklist (stray deployment ids) under
+                // the old shared schema version — serde would silently drop
+                // the extra field, so the version gate must refuse it.
+                let legacy = serde_json::json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "target": TARGET,
+                    "deployment_id": fx.target_id,
+                    "snapshot_index": fx.floor.snapshot_index,
+                    "established_at": "2026-01-01T00:00:00Z",
+                    "pending_deployments": ["deploy-0000", "stray-foreign"],
+                });
+                std::fs::write(
+                    store.cleanup_pending_path(TARGET),
+                    serde_json::to_vec_pretty(&legacy).unwrap(),
+                )
+                .unwrap();
+            }
+            _ => {
+                let mut m = store
+                    .read_cleanup_pending(TARGET, Some(&fx.floor))
+                    .unwrap()
+                    .expect("the intact flag marker reads");
+                match mutation {
+                    CleanupMutation::Retarget => {
+                        m.target = TargetName::new("staging".to_string());
+                    }
+                    CleanupMutation::IndexBelow => {
+                        m.snapshot_index = fx.floor.snapshot_index.saturating_sub(1);
+                    }
+                    CleanupMutation::IndexAbove => {
+                        m.snapshot_index = fx.floor.snapshot_index + 1;
+                    }
+                    CleanupMutation::ForeignDeployment => {
+                        m.deployment_id = DeploymentId::new("deploy-foreign".to_string());
+                    }
+                    CleanupMutation::ExistingDeployment => {
+                        m.deployment_id = DeploymentId::new(retained_anchor.to_string());
+                    }
+                    CleanupMutation::ForeignVersion => {
+                        m.schema_version = CLEANUP_PENDING_SCHEMA_VERSION + 1;
+                    }
+                    CleanupMutation::LegacyShape => unreachable!("handled above"),
+                }
+                std::fs::write(
+                    store.cleanup_pending_path(TARGET),
+                    serde_json::to_vec_pretty(&m).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// The corrupted marker must FAIL CLOSED wherever the binding applies: a
+    /// target/anchor corruption is an integrity error; a legacy/foreign
+    /// version is a schema-version error. A `None` would be the danger — the
+    /// marker silently ignored could still gate (or clear) without scrutiny;
+    /// an `Err` forces the retry onto the log-derived worklist.
+    fn assert_cleanup_read_fails_closed(
+        store: &LocalStore,
+        fx: &CleanupFixture,
+        mutation: CleanupMutation,
+    ) {
+        let err = store
+            .read_cleanup_pending(TARGET, Some(&fx.floor))
+            .unwrap_err();
+        match mutation {
+            CleanupMutation::LegacyShape | CleanupMutation::ForeignVersion => {
+                assert!(
+                    err.to_string().contains("schema_version"),
+                    "{mutation:?} must fail closed on the schema version, got: {err}"
+                );
+            }
+            _ => {
+                assert!(
+                    err.to_string().contains("integrity"),
+                    "{mutation:?} must fail closed with an integrity error, got: {err}"
+                );
+            }
+        }
+    }
+
+    fn run_cleanup_marker_mutation_case(
+        history_in: &[bool],
+        checkpoint_at: usize,
+        mutation: CleanupMutation,
+    ) {
+        // The seeded prefix: a guaranteed success then a guaranteed FAILED
+        // attempt below any non-zero floor (a `deployments/<id>/` dir with
+        // NO snapshot line — only its attempts.jsonl line names such a dir,
+        // the worklist the logs must retain).
+        let mut history = vec![true, false];
+        history.extend_from_slice(history_in);
+        assert!(
+            history.iter().filter(|ok| **ok).count() >= 3,
+            "the fixture needs >= 3 successes for a floor that is neither first nor last"
+        );
+
+        // ---- CONTROL (c): the INTACT-marker retry converges — marker
+        // cleared, logs compacted to the suffix, exactly the log-derived
+        // discard set deleted, every retained sentinel intact.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        let fx = seed_interrupted_cleanup(&store, &history, checkpoint_at);
+        let retry = run_checkpoint(
+            &store,
+            TARGET,
+            &DeploymentId::new(fx.target_id.clone()),
+            false,
+        )
+        .expect("the intact-marker control retry converges");
+        assert!(!retry.cleanup_pending, "control: converged");
+        assert!(
+            store
+                .read_cleanup_pending(TARGET, Some(&fx.floor))
+                .unwrap()
+                .is_none(),
+            "control: the flag marker clears once the cleanup completes"
+        );
+        let attempts = store.read_attempts_raw(TARGET).unwrap();
+        assert_eq!(attempts[0].deployment_id.as_str(), fx.target_id);
+        let snaps = store.read_snapshots_raw(TARGET).unwrap();
+        assert!(snaps.iter().all(|s| s.index >= fx.floor.snapshot_index));
+        for id in &fx.ground_truth.discarded_deployments {
+            assert!(
+                !store.deployment_dir(id).exists(),
+                "control: below-floor dir {id} is deleted"
+            );
+        }
+        assert_cleanup_sentinels(&store, &fx);
+
+        // ---- MUTATION: a FRESH fixture in the same debt state, with the
+        // marker corrupted BEFORE the retry.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        let fx = seed_interrupted_cleanup(&store, &history, checkpoint_at);
+        // A retained at/above-floor deployment id — the corruption target
+        // that must never be deleted (the marker is never the floor's own id:
+        // the checkpoint is never the last attempt).
+        let retained_anchor = fx
+            .retained_ids
+            .iter()
+            .find(|id| id.starts_with("deploy-") && **id != fx.target_id)
+            .expect("a retained at/above-floor deployment exists")
+            .clone();
+        // The pre-retry physical deployment-dir inventory.
+        let before: Vec<String> = std::fs::read_dir(store.base().join("deployments"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        apply_cleanup_mutation(&store, &fx, mutation, &retained_anchor);
+        assert_cleanup_read_fails_closed(&store, &fx, mutation);
+
+        // The retry (faults disarmed) must still converge — and the ACTUAL
+        // physical deletion set is EXACTLY A SUBSET of the log-derived
+        // discard set: nothing retained, unrelated, or out-of-worklist was
+        // removed.
+        let retry = run_checkpoint(
+            &store,
+            TARGET,
+            &DeploymentId::new(fx.target_id.clone()),
+            false,
+        )
+        .expect("a corrupted marker must never turn the retry into an Err");
+        assert!(
+            !retry.cleanup_pending,
+            "the corrupted-marker retry converges (marker cleared)"
+        );
+        assert!(
+            store
+                .read_cleanup_pending(TARGET, Some(&fx.floor))
+                .unwrap()
+                .is_none(),
+            "the corrupted/stale marker is cleared by the converging retry"
+        );
+        let after: Vec<String> = std::fs::read_dir(store.base().join("deployments"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        for gone in before.iter().filter(|id| !after.contains(id)) {
+            assert!(
+                fx.ground_truth.discarded_deployments.contains(gone),
+                "the actual deletion set must be a SUBSET of checkpoint_discards: '{gone}' was deleted but is not in the log-derived discard set"
+            );
+        }
+        // (b) Every retained sentinel survives across the mutation.
+        assert_cleanup_sentinels(&store, &fx);
+        // Convergence: the logs compact to the suffix and every below-floor
+        // dir named by the intact logs is gone (the worklist came from the
+        // logs, never the marker).
+        let attempts = store.read_attempts_raw(TARGET).unwrap();
+        assert_eq!(attempts[0].deployment_id.as_str(), fx.target_id);
+        let snaps = store.read_snapshots_raw(TARGET).unwrap();
+        assert!(snaps.iter().all(|s| s.index >= fx.floor.snapshot_index));
+        for id in &fx.ground_truth.discarded_deployments {
+            assert!(
+                !store.deployment_dir(id).exists(),
+                "below-floor dir {id} converges away"
+            );
+        }
+    }
+
+    proptest! {
+        // The CLEANUP-MARKER property: a corrupted/tampered cleanup marker
+        // can NEVER widen the deletion set. Each case establishes a valid
+        // checkpoint whose compaction FAILED (durable floor + flag marker
+        // present, logs still intact), then (c) runs the intact-marker
+        // CONTROL retry — it converges (marker cleared, logs compacted to
+        // the suffix) — and injects an ARBITRARY marker mutation (foreign
+        // target name, arbitrary snapshot-index anchors, foreign or retained
+        // deployment ids, a legacy v1 marker with the removed
+        // pending_deployments worklist, a foreign schema version): the
+        // corrupted read fails closed where the binding applies, and the
+        // retry's ACTUAL physical deletion set is EXACTLY A SUBSET of
+        // `checkpoint_discards(target, floor).discarded_deployments`, with
+        // every retained sentinel surviving (at/above-floor deployment dirs,
+        // an unrelated target's deployment dir, releases/, objects/,
+        // servers/) — the deleted worklist lives in the logs, never in the
+        // marker.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn corrupted_cleanup_marker_never_widens_the_deletion_set(
+            history in prop::collection::vec(any::<bool>(), 3..7)
+                .prop_filter(
+                    "the seeded prefix plus the filtered history needs >= 3 successes",
+                    |v| v.iter().filter(|ok| **ok).count() >= 2,
+                ),
+            checkpoint_at in 0usize..8,
+            mutation in cleanup_mutation_strategy(),
+        ) {
+            run_cleanup_marker_mutation_case(&history, checkpoint_at, mutation);
+        }
+    }
+
+    /// EXHAUSTIVE coverage: every marker corruption runs against a FRESH
+    /// fixture (deterministic, independent of the proptest seed), so a
+    /// single broken binding or a single widening of the deletion set is
+    /// always caught even if the randomized sequence never sampled that
+    /// variant.
+    #[test]
+    fn every_cleanup_marker_mutation_fails_closed_exhaustively() {
+        for mutation in [
+            CleanupMutation::Retarget,
+            CleanupMutation::IndexBelow,
+            CleanupMutation::IndexAbove,
+            CleanupMutation::ForeignDeployment,
+            CleanupMutation::ExistingDeployment,
+            CleanupMutation::LegacyShape,
+            CleanupMutation::ForeignVersion,
+        ] {
+            run_cleanup_marker_mutation_case(&[true, true, false, true], 1, mutation);
         }
     }
 }

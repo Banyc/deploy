@@ -74,6 +74,20 @@ pub const RELEASE_RECORD_SCHEMA_VERSION: u32 = 1;
 /// version (fail closed).
 pub const TREE_SCHEMA_VERSION: u32 = 1;
 
+/// The `cleanup-pending.json` marker format version
+/// (`CleanupPending.schema_version`). The marker is a DURABLE FLAG ONLY — it
+/// records that a checkpoint's post-commit cleanup is outstanding, never a
+/// worklist (the deletion worklist lives in the raw logs, which the
+/// delete-before-rewrite compaction order keeps intact until deletion
+/// completes). Version 2 is the flag-only shape: the marker carries
+/// `target` / `deployment_id` / `snapshot_index` / `established_at` for
+/// integrity binding only. Version 1 was the pre-change shape that also
+/// carried `pending_deployments: Vec<String>`; a v1 marker is REFUSED
+/// (fail closed) rather than silently reinterpreted — the retry treats the
+/// failed read as debt outstanding and re-runs the compaction from the
+/// intact logs, which converges and clears the stale marker.
+pub const CLEANUP_PENDING_SCHEMA_VERSION: u32 = 2;
+
 fn new_uuid_v7() -> String {
     Uuid::now_v7().to_string()
 }
