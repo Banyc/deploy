@@ -16,6 +16,13 @@
 //! * `` (empty), `HEAD`, `@` — the current local files (the default).
 //! * `@-`, `@--` — the snapshot BEFORE the latest, the grandparent.
 //! * `parent(@, N)` — the Nth ancestor of the latest snapshot.
+//! * `release:<id>` — the DIRECT release form: deploy the named release to
+//!   the CURRENT target's slots as they are, from the release's OWN stored
+//!   slot-variant snapshot. No snapshot-chain stepping and no
+//!   deployment-snapshot membership/binding checks: cross-target capable —
+//!   the release may have been built/pushed anywhere, and the destination
+//!   needs NO snapshot history at all. The id is a full `rel-sha256-...` id
+//!   or a hex digest.
 //! * `<refid>-`, `<refid>--` — N ancestors of the refid (1 or 2 dashes).
 //! * `parent(<refid>, N)` — N ancestors of the refid (N = 0 is the refid
 //!   itself).
@@ -26,7 +33,8 @@
 //! release id (`rel-sha256-...` or a bare digest). A snapshot index resolves
 //! to the snapshot with that index; a deployment or release id resolves to
 //! the MOST RECENT snapshot that deployed that deployment / references that
-//! release. The ancestor steps then walk `s(index - N)`; stepping past the
+//! release — SNAPSHOT ANCESTRY, distinct from the direct `release:<id>` form
+//! above. The ancestor steps then walk `s(index - N)`; stepping past the
 //! start of the chain, an unresolvable refid, or an empty chain fail closed
 //! with a ref error — never underflow, never guess.
 
@@ -60,6 +68,11 @@ pub enum PushRef {
 pub enum RefExpr {
     /// `""`, `HEAD`, `@`: materialize the currently mapped local files.
     Head,
+    /// `release:<id>`: deploy the named release DIRECTLY to the current
+    /// target's slots — no snapshot-chain stepping, no deployment-snapshot
+    /// membership/binding checks. Resolves to [`PushRef::Release`] without
+    /// touching the store.
+    Release(ReleaseId),
     /// A jj-style relative reference needing the store + target.
     Relative(RelativeRef),
 }
@@ -156,6 +169,28 @@ pub fn parse_push_ref(token: &str) -> Result<RefExpr> {
         return Ok(RefExpr::Relative(RelativeRef { base, steps }));
     }
 
+    // `release:<id>` — the DIRECT release form (shell-safe: the token starts
+    // with the literal `release:` prefix, no slash): deploy the named release
+    // to the CURRENT target's slots from the release's OWN stored slot-variant
+    // snapshot. The id may be a full `rel-sha256-...` id or a hex digest; it
+    // needs no store lookup beyond shape validation (existence is verified at
+    // plan time). This is distinct from the refid forms: `parent(<id>, N)` /
+    // `<id>--` keep their SNAPSHOT-ANCESTRY semantics.
+    if let Some(id) = t.strip_prefix("release:") {
+        let valid = if let Some(rest) = id.strip_prefix("rel-sha256-") {
+            !rest.is_empty()
+        } else {
+            !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit())
+        };
+        if !valid {
+            return Err(Error::r#ref(format!(
+                "unrecognized release id '{id}' in '{token}' \
+                (expected 'release:<rel-sha256-...>' or 'release:<hex digest>')"
+            )));
+        }
+        return Ok(RefExpr::Release(ReleaseId::parse(id)));
+    }
+
     // The legacy `<target>@sN` form repeats the target and is not accepted.
     if t.contains('@') {
         return Err(Error::r#ref(format!(
@@ -167,7 +202,9 @@ pub fn parse_push_ref(token: &str) -> Result<RefExpr> {
     if let Some(_id) = t.strip_prefix("release/") {
         return Err(Error::r#ref(format!(
             "legacy 'release/<id>' reference '{token}' is no longer accepted; \
-            reference the release by its id as a refid, e.g. 'parent(<id>, N)' or '<id>--'"
+            use 'release:<id>' for the DIRECT release form, or reference the \
+            release by its id as a refid ('parent(<id>, N)' / '<id>--') for \
+            snapshot ancestry"
         )));
     }
     // The legacy `fN` snapshot-index form is not accepted (snapshot indices
@@ -278,6 +315,12 @@ pub fn resolve_push_ref(token: &str, target: &str, store: &LocalStore) -> Result
     let expr = parse_push_ref(token)?;
     match expr {
         RefExpr::Head => Ok(PushRef::Head),
+        // The DIRECT release form: `release:<id>` maps straight to a
+        // `PushRef::Release` — no snapshot-chain stepping, no target history
+        // required (cross-target capable by design; the release's own stored
+        // slot snapshot and the CURRENT target's slots are what the plan
+        // resolves against).
+        RefExpr::Release(release) => Ok(PushRef::Release { release }),
         RefExpr::Relative(rel) => {
             // `parent(@, 0)` is the same as `@` itself: the current state.
             if rel.base == RelBase::At && rel.steps == 0 {
@@ -729,6 +772,32 @@ mod tests {
         );
     }
 
+    /// `release:<id>` parses to a DIRECT release form — a full
+    /// `rel-sha256-...` id or a bare hex digest — WITHOUT touching the store,
+    /// and is distinct from the refid forms (`parent(<id>, N)`, `<id>--`)
+    /// which keep snapshot-ancestry semantics.
+    #[test]
+    fn parse_ref_direct_release_form() {
+        assert_eq!(
+            parse_push_ref("release:rel-sha256-deadbeef").unwrap(),
+            RefExpr::Release(ReleaseId::new("rel-sha256-deadbeef".to_string()))
+        );
+        // A bare digest is normalized to the full `rel-sha256-` id.
+        assert_eq!(
+            parse_push_ref("release:deadbeef").unwrap(),
+            RefExpr::Release(ReleaseId::new("rel-sha256-deadbeef".to_string()))
+        );
+        // The refid forms STILL parse as snapshot ancestry.
+        assert!(matches!(
+            parse_push_ref("rel-sha256-deadbeef--").unwrap(),
+            RefExpr::Relative(_)
+        ));
+        assert!(matches!(
+            parse_push_ref("parent(rel-sha256-deadbeef, 1)").unwrap(),
+            RefExpr::Relative(_)
+        ));
+    }
+
     /// The legacy grammar is REJECTED with a ref error, never silently
     /// re-mapped: `<target>@sN` (target repeated), `release/<id>`, bare
     /// release ids, the old `fN` snapshot-index prefix, `:current`, and
@@ -741,6 +810,10 @@ mod tests {
             "release/rel-sha256-x",
             "rel-sha256-x",
             "deadbeef",
+            "release:",
+            "release:rel-sha256-",
+            "release:not-hex",
+            "release:has/dash",
             "f3",
             "f3--",
             "parent(f5, 2)",
@@ -897,6 +970,46 @@ mod tests {
             resolve_push_ref("parent(cccc, 0)", "production", &store).unwrap(),
             snap(&target, 3)
         );
+    }
+
+    /// `release:<id>` resolves DIRECTLY to a `PushRef::Release` — with NO
+    /// store lookup and NO target snapshot history: the bare release id never
+    /// steps the deployment-snapshot chain, so a cross-target / fresh-target
+    /// direct deployment is expressible even when the destination has zero
+    /// snapshots. This is the grammar's escape hatch for
+    /// direct/cross-target release deployment.
+    #[test]
+    fn resolve_ref_direct_release_form_ignores_chain_and_store() {
+        let (_tmp, store) = chain();
+        // Even though `rel-sha256-cccc` IS referenced by snapshots in this
+        // chain, `release:` yields the bare release ref, not a snapshot.
+        assert_eq!(
+            resolve_push_ref("release:rel-sha256-cccc", "production", &store).unwrap(),
+            PushRef::Release {
+                release: ReleaseId::new("rel-sha256-cccc".to_string())
+            }
+        );
+        assert_eq!(
+            resolve_push_ref("release:cccc", "production", &store).unwrap(),
+            PushRef::Release {
+                release: ReleaseId::new("rel-sha256-cccc".to_string())
+            }
+        );
+        // A release that is NOT referenced by any snapshot — and a target
+        // with an EMPTY chain — resolve the same way: resolution never reads
+        // the store.
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        assert_eq!(
+            resolve_push_ref("release:rel-sha256-zzzz", "brand-new-target", &empty).unwrap(),
+            PushRef::Release {
+                release: ReleaseId::new("rel-sha256-zzzz".to_string())
+            }
+        );
+        // The refid form on the same empty chain still fails closed (it
+        // needs a snapshot that references the release).
+        resolve_push_ref("parent(rel-sha256-zzzz, 0)", "brand-new-target", &empty)
+            .expect_err("the refid form needs snapshot ancestry and must fail on an empty chain");
     }
 
     /// Out-of-range and unresolvable references fail closed with a ref

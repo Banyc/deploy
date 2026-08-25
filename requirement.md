@@ -600,6 +600,7 @@ Pushing an older successful reference restores its complete assignment, includin
 deploy push production @-              # the snapshot BEFORE the latest
 deploy push production @--             # two snapshots back
 deploy push production 'parent(@, 3)'    # three snapshots back from the latest
+deploy push production release:rel-sha256-2fda63a950  # DIRECT: deploy this release to the current target's slots (cross-target; no snapshot history needed)
 deploy push production s2              # the exact snapshot s2
 deploy push production s2--            # two snapshots before s2
 deploy push production 'parent(s2, 1)'   # one snapshot before s2
@@ -607,20 +608,23 @@ deploy push production 'parent(deploy-20260821T102000Z, 0)'  # the snapshot that
 deploy push production rel-sha256-41da2f63a950--  # 2 before the most recent snapshot referencing that release
 ```
 
+The DIRECT release form `release:<id>` (shell-safe: the token starts with the literal `release:` prefix, no slash; the id is a full `rel-sha256-...` id or a hex digest) deploys the named release to the CURRENT target's slots as they are — each slot's variant from the release's OWN stored slot-variant snapshot, each tree from the release's own variant bindings. It is deliberately NOT a snapshot ref: no snapshot-chain stepping, no deployment-snapshot membership or exact physical-binding checks, and NO target snapshot history required — the release may have been built and pushed anywhere (another target, another machine), and a destination with zero snapshots is fully deployable. This is the cross-target / direct-release-deployment path; scripts and persistent configuration use the full id.
+
 A refid is a snapshot index (`sN`), a deployment id (`deploy-...`), or a release id (`rel-sha256-...` or a bare digest). A snapshot index resolves to that snapshot; a deployment or release id resolves to the MOST RECENT snapshot that deployed the deployment / references the release, then the ancestor steps walk `s(index - N)` (N = 0 is the ref itself). Every resolution fails closed with a ref error — an empty chain, an unresolvable refid, or stepping before the start of the chain — never underflows and never guesses. A snapshot ref restores the snapshot's OWN historical per-slot artifacts (variant and tree together); the caller's current variant files never re-map them.
 
 Exact snapshot rollback requires the current target to contain the same stable placement-slot set as the saved deployment AND each slot's complete physical binding to match the binding the snapshot recorded (`bindings[slot]` = the `{server, deploy_dir}` pair from the slot's variant-file `[[slots]]` entry): a slot rebound to a different server — or moved to a different `deploy_dir` on the SAME server — would otherwise receive the historical generations on the wrong host or at the wrong on-server location. A legacy snapshot entry that never recorded the binding (pre-feature lines, or the intermediate server-only `servers` shape) is unverifiable and is refused the same way. Addresses may change and are taken from the current target definition after host-identity verification. If membership has changed or any slot's physical binding changed, exact rollback fails during preflight without modifying a server.
 
 Schema version 1 permits a target-history ref only as a source for that same target; cross-target deployment uses a release ref instead.
 
-The operator may instead push an old release to the new target membership by reference its id as a refid — the most recent snapshot that referenced it:
+The operator may instead push an old release to the new target membership. Two distinct forms — the direct form is SNAPSHOT-FREE; a release id used as a refid is SNAPSHOT ANCESTRY:
 
 ```sh
-deploy push production 'parent(rel-sha256-2fda63a950, 0)'
-deploy push production rel-sha256-2fda63a950--
+deploy push production 'parent(rel-sha256-2fda63a950, 0)'  # SNAPSHOT: the most recent snapshot that referenced it
+deploy push production rel-sha256-2fda63a950--           # SNAPSHOT: 2 before that snapshot
+deploy push production release:rel-sha256-2fda63a950     # DIRECT: deploy to the current slots, no history needed
 ```
 
-The release refid resolves to the MOST RECENT successful snapshot referencing that release (an unambiguous resolution by design; scripts and persistent configuration use the full ID), then applies the ancestor steps — `parent(<id>, 0)` is the snapshot itself. The exact-rollback membership and physical-binding checks apply exactly as for any snapshot ref.
+The release REFID resolves to the MOST RECENT successful snapshot referencing that release (an unambiguous resolution by design; scripts and persistent configuration use the full ID), then applies the ancestor steps — `parent(<id>, 0)` is the snapshot itself. The exact-rollback membership and physical-binding checks apply exactly as for any snapshot ref. The DIRECT `release:<id>` form by contrast skips the chain entirely: it plans against the CURRENT target's slots from the release's OWN stored slot-variant snapshot, with no deployment-snapshot membership or binding checks — cross-target capable, and valid even on a target with zero snapshot history.
 
 Rollback never rebuilds a tree. It uses the retained immutable object with the recorded digest. All required objects are checked locally and staged remotely before the first server changes. If an object is missing locally, reconciliation first attempts to recover it from a target server that retains the verified digest. If no verified copy can be recovered, preflight fails and leaves every `current` pointer unchanged.
 

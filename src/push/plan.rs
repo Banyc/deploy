@@ -191,6 +191,8 @@ mod tests {
         VariantName,
     };
     use crate::records::{DeploymentSnapshot, PhysicalBinding};
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
 
     const DEPLOY_TOML: &str = r#"
 schema_version = 1
@@ -215,6 +217,44 @@ host_key_fingerprint = "SHA256:test"
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 "#;
 
+    /// Two-target fixture for the direct-release property: `t1` is the
+    /// SOURCE (it carries the snapshot that recorded the old physical
+    /// binding), `t2` the DESTINATION with NO snapshot history (the release
+    /// was built/pushed elsewhere). Both declare the same slot `p1`.
+    const DEPLOY_TOML_TWO: &str = r#"
+schema_version = 1
+application = "plan"
+release = "v1"
+
+[targets.t1.rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[targets.t1.rotation.deployment]
+protect_deployments = 1
+
+[targets.t2.rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[targets.t2.rotation.deployment]
+protect_deployments = 1
+
+[[servers]]
+id = "s1"
+address = "a"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+
+[targets.t2]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#;
+
     /// The `standard` variant file declares slot `p1` on server `s1` for
     /// target `t1`: the declaring file is the slot's CURRENT variant binding.
     const VARIANT_TOML: &str = r#"
@@ -222,6 +262,31 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 id = "p1"
 server = "s1"
 targets = ["t1"]
+deploy_dir = "/srv/plan"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+
+    /// The direct-release property's variant: slot `p1` bound to server `s1`
+    /// at `/srv/plan` for BOTH targets `t1` (source) and `t2` (destination).
+    const VARIANT_TOML_TWO: &str = r#"
+[[slots]]
+id = "p1"
+server = "s1"
+targets = ["t1", "t2"]
 deploy_dir = "/srv/plan"
 
 [[artifact.mappings]]
@@ -688,5 +753,204 @@ interval_seconds = 0
             msg.contains("s0") || msg.contains("exact rollback"),
             "error must explain the exact-rollback verification failure, got: {msg}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // DIRECT-RELEASE PROPERTY: `release:<id>` plans where a snapshot ref
+    // cannot — changed physical bindings, or a destination with no snapshot
+    // history — while snapshot refs RETAIN their exact-binding checks.
+    // ---------------------------------------------------------------------
+
+    /// A generated change to a slot's physical binding between the source
+    /// deployment and now: either the slot was REBOUND to a different server
+    /// (same deploy_dir), or MOVED to a different deploy_dir on the SAME
+    /// server. Returns the binding the source deployment's snapshot recorded
+    /// (the OLD one); the current config binds the slot to `s1` at
+    /// `/srv/plan`, so the two always differ in at least one dimension.
+    fn old_binding_strategy() -> impl Strategy<Value = (String, String)> {
+        prop_oneof![
+            // Rebound: recorded on a different server, same deploy_dir.
+            (
+                "[a-z0-9]{6,16}".prop_map(|s: String| format!("srv-{s}")),
+                Just("/srv/plan".to_string()),
+            ),
+            // Moved: same server, a different deploy_dir.
+            (
+                Just("s1".to_string()),
+                "[a-z0-9]{2,10}".prop_map(|s: String| format!("/srv/{s}/old")),
+            ),
+        ]
+    }
+
+    /// Build the direct-release property fixture: a project with source
+    /// target `t1` and destination target `t2` (no history), a release
+    /// record whose OWN stored slot snapshot declares `p1` -> `standard`
+    /// (tree `tree-direct`), and a snapshot on `t1` that records `old` as
+    /// p1's physical binding at deployment time — the binding the CURRENT
+    /// config no longer has.
+    fn direct_release_fixture(
+        old_binding: &(String, String),
+    ) -> (tempfile::TempDir, Config, LocalStore, ReleaseId) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        std::fs::write(release_dir.join("standard.toml"), VARIANT_TOML_TWO).unwrap();
+        let cfg_path = project.join("deploy.toml");
+        std::fs::write(&cfg_path, DEPLOY_TOML_TWO).unwrap();
+        let config = Config::load(&cfg_path).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+
+        // The release's OWN stored slot-variant snapshot: p1 -> `standard`.
+        let mut rec = legacy_record("unused", "tree-direct");
+        rec.slots = BTreeMap::from([(
+            "standard".to_string(),
+            CanonicalSlots {
+                slots: vec![CanonicalSlot {
+                    id: "p1".to_string(),
+                    server: "s1".to_string(),
+                    deploy_dir: "/srv/plan".to_string(),
+                    targets: vec!["t1".to_string(), "t2".to_string()],
+                }],
+            },
+        )]);
+        let release = consistent(&mut rec);
+        store.write_release(&rec).unwrap();
+
+        // The SOURCE deployment's snapshot records the OLD binding.
+        let snapshot = DeploymentSnapshot {
+            index: 0,
+            deployment_id: DeploymentId::new("deploy-source".to_string()),
+            target: TargetName::new("t1".to_string()),
+            behavior_sha256: "sha256-aa".to_string(),
+            slots: BTreeMap::from([(
+                PlacementSlotId::new("p1".to_string()),
+                GenerationRef {
+                    generation: GenerationId::new("gen-old".to_string()),
+                    assignment: PlacementSlotAssignment {
+                        placement_slot: PlacementSlotId::new("p1".to_string()),
+                        artifact: ArtifactRef {
+                            release: release.clone(),
+                            variant: VariantName::new("standard".to_string()),
+                            tree: TreeDigest::new("tree-direct".to_string()),
+                        },
+                    },
+                },
+            )]),
+            bindings: BTreeMap::from([(
+                PlacementSlotId::new("p1".to_string()),
+                PhysicalBinding {
+                    server: ServerId::new(old_binding.0.clone()),
+                    deploy_dir: old_binding.1.clone(),
+                },
+            )]),
+        };
+        store.append_snapshot("t1", &snapshot).unwrap();
+
+        (dir, config, store, release)
+    }
+
+    // The required direct-release property: for a generated changed
+    // physical binding (a slot REBOUND to a different server, or MOVED to a
+    // different deploy_dir) — and for a source/destination pair whose
+    // destination `t2` has NO snapshot history — `release:<id>` (resolved
+    // to [`PushRef::Release`]) plans successfully against the CURRENT
+    // target's slots from the release's OWN stored slot snapshot, while the
+    // equivalent SNAPSHOT ref retains its exact physical-binding refusal
+    // (a snapshot that recorded the old binding fails closed; on the
+    // no-history destination the snapshot-family refs cannot even resolve).
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            // Bounded + fixed seed: deterministic floor, fast.
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn direct_release_plans_where_snapshot_ref_refuses(
+            old_binding in old_binding_strategy(),
+            cross_target in prop::bool::ANY,
+        ) {
+            let (_dir, config, store, release) = direct_release_fixture(&old_binding);
+            let release_ref = PushRef::Release {
+                release: release.clone(),
+            };
+
+            // DIRECT: plans successfully on the CURRENT target's slots (the
+            // source `t1` AND the no-history destination `t2` alike), the
+            // variant per slot from the release's OWN stored snapshot and the
+            // tree from its own bindings — never the caller's config, never
+            // any snapshot chain, regardless of the changed binding.
+            for dest in ["t1", "t2"] {
+                let (assignments, desired, source) = plan_assignments(
+                    dest,
+                    &release_ref,
+                    &ReleaseId::new("unused-local".to_string()),
+                    &BTreeMap::new(),
+                    &store,
+                    &config,
+                )
+                .unwrap_or_else(|e| panic!("release:<id> must plan on target {dest}: {e}"));
+                assert_eq!(assignments.len(), 1, "one slot per target");
+                let a = &assignments[0];
+                assert_eq!(a.placement_slot, PlacementSlotId::new("p1"));
+                assert_eq!(
+                    a.artifact.variant.as_str(),
+                    "standard",
+                    "the variant must come from the release's OWN stored snapshot"
+                );
+                assert_eq!(
+                    a.artifact.tree.as_str(),
+                    "tree-direct",
+                    "the tree must come from the release's own variant bindings"
+                );
+                assert_eq!(a.artifact.release, release);
+                assert_eq!(desired, release);
+                assert_eq!(source, PlanSource::ReleaseRef(release.clone()));
+            }
+
+            // The SNAPSHOT ref RETAINS the exact physical-binding checks: on
+            // the source `t1`, the snapshot recorded the generated OLD
+            // binding (rebound or moved), which no longer matches the current
+            // config, so rollback refuses with the exact-rollback error — the
+            // same refusal as before this feature.
+            let err = plan_assignments(
+                "t1",
+                &PushRef::Snapshot {
+                    target: TargetName::new("t1".to_string()),
+                    index: 0,
+                },
+                &ReleaseId::new("unused".to_string()),
+                &BTreeMap::new(),
+                &store,
+                &config,
+            )
+            .expect_err("a snapshot ref whose recorded binding changed must refuse");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("exact rollback would deploy to the wrong host") && msg.contains("p1"),
+                "snapshot ref must keep the exact-binding refusal naming the slot, got: {msg}"
+            );
+
+            // Cross-target branch: the destination `t2` has ZERO snapshot
+            // history — the release was built/pushed elsewhere. The snapshot-
+            // family refs cannot even RESOLVE there (no chain to step, no
+            // snapshot referencing the release), while the direct form works.
+            if cross_target {
+                for token in ["@-", "s0", "parent(@, 1)"] {
+                    crate::history::resolve_push_ref(token, "t2", &store)
+                        .expect_err(&format!("{token} on the no-history destination must fail"));
+                }
+                crate::history::resolve_push_ref(
+                    &format!("parent({release}, 0)"),
+                    "t2",
+                    &store,
+                )
+                .expect_err("no snapshot references the release on t2; the refid must fail");
+            }
+        }
     }
 }

@@ -113,6 +113,10 @@ deploy push production @--             # two snapshots back (the grandparent)
 # parent(...) forms contain a comma — the shell splits them at the space, so
 # quote them on the command line:
 deploy push production 'parent(@, 3)'    # three snapshots back from the latest
+# DIRECT release deploy: the named release to the CURRENT target's slots,
+# from the release's OWN stored slot snapshot — no history needed, cross-
+# target capable (release:<id>; the refid forms below are snapshot ancestry):
+deploy push production release:rel-sha256-41da2f63a950
 # refids resolve to exact snapshots, then step N ancestors (N = 0 is the
 # snapshot itself):
 deploy push production s2              # the exact 2nd successful snapshot
@@ -129,6 +133,13 @@ deploy push production rel-sha256-41da2f63--        # 2 before the most recent s
   release id (`rel-sha256-...` or a bare digest). Deployment/release refids
   resolve to the MOST RECENT snapshot that deployed the deployment /
   references the release, then walk the ancestor steps (`s(index - N)`).
+- `release:<id>` is the DIRECT release form (shell-safe, no slash): deploy
+  the named release to the current target's slots from the release's OWN
+  stored slot-variant snapshot — no snapshot-chain stepping, no
+  deployment-snapshot membership/binding checks, and no target snapshot
+  history required (the release may be built/pushed anywhere; a fresh target
+  deploys directly). The release refid forms above remain snapshot ancestry
+  and keep their exact-binding checks.
 - Out-of-range refs fail closed before anything runs: an empty chain, a
   missing refid, or walking past the start of the chain is a ref error — never
   an underflow or a guess.
@@ -275,7 +286,8 @@ before anything is touched.
 - **Cut a release**: copy the release directory (e.g. `releases/v1` →
   `releases/v2`), edit the variant files (new mappings, verification, etc.),
   and set `release = "v2"` in `deploy.toml`. Old releases stay deployable
-  via the release-refid form (`parent(<release-id>, 0)`).
+  via the direct `release:<id>` form (or the release-refid form
+  `parent(<release-id>, 0)` for snapshot ancestry).
 - **Roll back**: `deploy push production @-` restores the previous
   successful snapshot; `deploy push production 'parent(@, 3)'` the 3rd
   previous. Historical deployments restore their original behavior — they

@@ -143,6 +143,9 @@ in the reference; every relative form resolves against the target argument):\n\n
   @-                   the snapshot BEFORE the latest successful deployment\n\
   @--                  two steps back (the grandparent)\n\
   parent(@, N)         N steps back from the latest (e.g. parent(@, 2))\n\
+  release:<id>         deploy the named release DIRECTLY to the current\n\
+                       target's slots, from the release's own stored slot\n\
+                       snapshot — no snapshot history needed (cross-target)\n\
   sN                   the exact Nth successful snapshot (e.g. s3); failed\n\
                        attempts never count and never produce a snapshot\n\
   sN- / sN--            N steps back from snapshot sN\n\
@@ -164,13 +167,15 @@ reported explicitly, including partial states like `degraded`.",
   deploy push production --dry-run     # preview the plan, touch nothing\n\
   deploy push production @-            # roll back to the previous deployment\n\
   deploy push production 'parent(@, 3)'  # roll back 3 deployments\n\
-  deploy push production s3--          # 2 deployments before snapshot s3"
+  deploy push production s3--          # 2 deployments before snapshot s3\n\
+  deploy push production release:rel-sha256-2fda63a950  # DIRECT release deploy to this target (cross-target; no history needed)"
     )]
     Push {
         target: String,
         /// Optional jj-style source reference: blank/HEAD/@ (default),
-        /// @- / @-- / parent(@, N), or a refid relative (sN, <refid>--,
-        /// parent(<refid>, N)) — never repeats the target.
+        /// @- / @-- / parent(@, N), release:<id> (direct release deploy),
+        /// or a refid relative (sN, <refid>--, parent(<refid>, N)) — never
+        /// repeats the target.
         reference: Option<String>,
         #[arg(long)]
         dry_run: bool,
