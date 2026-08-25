@@ -145,6 +145,24 @@ pub fn push(
         None => RefExpr::Head,
     };
 
+    // 1b. DRY-RUN ONLY: resolve the parsed ref against the target's chain
+    // NOW — before any lock, before the remote factory is ever touched. The
+    // dry-run contract is "touches nothing — no locks, no writes, no remote";
+    // with the resolution living inside `push_inner` (after the read-only
+    // remote status and reconciliation), a dry run carrying an INVALID ref
+    // would contact every remote and only then fail with the ref error.
+    // Resolving here makes an invalid ref fail before ANY factory
+    // invocation. The chain read is the PRE-reconcile chain — but a dry run
+    // never reconciles (it touches nothing), so this is exactly the chain
+    // the dry run would plan against. Real pushes keep `resolved = None` and
+    // resolve inside `push_inner` after reconciliation appended any
+    // recovered snapshots: relative refs must see the reconciled append.
+    let resolved = if opts.dry_run {
+        Some(history::resolve_ref_expr(&ref_expr, target_name, store)?)
+    } else {
+        None
+    };
+
     // 2. Acquire local application-store lock then target lock (in that order),
     //    held as advisory (flock) locks on open file descriptors. An advisory
     //    lock is released by the kernel when the owning process dies, so a
@@ -175,6 +193,7 @@ pub fn push(
         factory,
         target_name,
         &ref_expr,
+        resolved,
         &deployment_id,
         &op_id,
         config,
@@ -217,6 +236,9 @@ pub(crate) fn push_with_id(
         factory,
         target_name,
         &RefExpr::Head,
+        // Real push (the fault-matrix entry points always push for real):
+        // resolution stays inside `push_inner`, post-reconciliation.
+        None,
         deployment_id,
         &op_id,
         config,
@@ -259,6 +281,9 @@ pub(crate) fn push_ref_with_id(
         factory,
         target_name,
         &ref_expr,
+        // Real push (the state-machine fixture never dry-runs): resolution
+        // stays inside `push_inner` after reconciliation.
+        None,
         deployment_id,
         &op_id,
         config,
@@ -282,6 +307,12 @@ fn push_inner(
     factory: &RemoteFactory,
     target_name: &str,
     ref_expr: &RefExpr,
+    // The PRE-RESOLVED ref: `Some` for a dry run (resolved by [`push`]
+    // BEFORE any lock or remote factory invocation, against the pre-reconcile
+    // chain — the only chain a dry run ever sees); `None` for a real push,
+    // which resolves at the post-reconciliation resolution point below (the
+    // relative refs must see the reconciled append).
+    resolved: Option<PushRef>,
     deployment_id: &DeploymentId,
     op_id: &OperationId,
     config: &Config,
@@ -418,14 +449,21 @@ fn push_inner(
         reconcile_pending_commits(store, config, target_name, op_id, &helpers)?;
     }
 
-    // RESOLUTION POINT — the parsed ref is resolved ONLY NOW: AFTER
-    // reconciliation appended any recovered snapshot entries (a relative ref
-    // must see the post-recovery chain: `@-` means one before the latest
-    // INCLUDING this push's reconciled append, so `parent(@, d)` selects
-    // post-reconciliation latest - d) and AFTER the locks were acquired.
-    // Parsing happened up front (store-free, before serialization); every
-    // step from here down consumes the RESOLVED form.
-    let pref = history::resolve_ref_expr(ref_expr, target_name, store)?;
+    // RESOLUTION POINT — a REAL push's parsed ref is resolved ONLY NOW:
+    // AFTER reconciliation appended any recovered snapshot entries (a
+    // relative ref must see the post-recovery chain: `@-` means one before
+    // the latest INCLUDING this push's reconciled append, so `parent(@, d)`
+    // selects post-reconciliation latest - d) and AFTER the locks were
+    // acquired. A dry run arrives with `resolved = Some(...)` from [`push`]
+    // (resolved pre-lock, pre-factory — a dry run never reconciles, so the
+    // chain it resolved against is identical) and skips this store read;
+    // only a real push reaches it. Parsing happened up front (store-free,
+    // before serialization); every step from here down consumes the RESOLVED
+    // form.
+    let pref = match resolved {
+        Some(pref) => pref,
+        None => history::resolve_ref_expr(ref_expr, target_name, store)?,
+    };
 
     // Historical and rollback pushes carry the bound release's own per-variant
     // behavior contracts; they never fall back to the caller's current config.
@@ -1989,7 +2027,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const NONE_VARIANT: &str = r#"
 [[slots]]
@@ -2864,6 +2902,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &factory,
             "t1",
             &RefExpr::Head,
+            None,
             deployment_id,
             &op_id,
             &h.config,
@@ -3649,6 +3688,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &fault_factory,
             "t1",
             &RefExpr::Head,
+            None,
             &id,
             &op_id,
             &h.config,
@@ -4197,6 +4237,7 @@ interval_seconds = 0
             &factory,
             "t1",
             &RefExpr::Head,
+            None,
             &id2,
             &op_id,
             &config2,
@@ -4451,6 +4492,7 @@ interval_seconds = 0
             &factory,
             "t1",
             &RefExpr::Head,
+            None,
             &id,
             &op_id,
             &config,
@@ -4982,6 +5024,7 @@ interval_seconds = 0
                 &factory,
                 "t1",
                 &RefExpr::Head,
+                None,
                 deployment_id,
                 &op_id,
                 &self.config,
@@ -5536,6 +5579,7 @@ interval_seconds = 0
             &factory,
             "t1",
             &RefExpr::Head,
+            None,
             &id,
             &op_id,
             &config,
@@ -5631,6 +5675,7 @@ interval_seconds = 0
             &factory,
             "t1",
             &RefExpr::Head,
+            None,
             &id,
             &op_id,
             &h.config,
@@ -5812,6 +5857,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &factory,
             "t1",
             &RefExpr::Head,
+            None,
             &id,
             &op_id,
             &config,
@@ -5976,6 +6022,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &factory,
             "t1",
             &history::parse_ref_expr("s0").unwrap(),
+            None,
             &id,
             &op_id,
             &h.config,
@@ -6020,6 +6067,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &factory,
             "t1",
             &history::parse_ref_expr("s0").unwrap(),
+            None,
             &id,
             &op_id2,
             &h.config,
@@ -6108,6 +6156,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &fault_factory,
             "t1",
             &RefExpr::Head,
+            None,
             &id2,
             &op_id,
             &h.config,
@@ -6335,6 +6384,7 @@ interval_seconds = 0
             &factory,
             "t1",
             &RefExpr::Head,
+            None,
             &id,
             &op_id,
             &config,
@@ -6775,6 +6825,164 @@ interval_seconds = 0
     // faulted at its FIRST transition — after `plan.json` is durable but
     // before staging/deployment — so the plan's resolved index is observable
     // without running the full mutation loop.
+
+    // ---- dry-run ref resolution: invalid refs never touch a remote -------
+
+    /// A remote that counts EVERY trait-method call (delegating the
+    /// operation to the wrapped `LocalTransport`), so a test can assert the
+    /// push engine never touched a remote at all: with an INVALID ref and
+    /// `--dry-run`, the counter must stay at zero.
+    struct CountingRemote {
+        inner: LocalTransport,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingRemote {
+        fn new(base: PathBuf, calls: Arc<AtomicUsize>) -> Result<Self> {
+            Ok(CountingRemote {
+                inner: LocalTransport::new(base)?,
+                calls,
+            })
+        }
+        fn tick(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Remote for CountingRemote {
+        fn root(&self) -> &std::path::Path {
+            self.inner.root()
+        }
+        fn read(&self, rel: &std::path::Path) -> Result<Vec<u8>> {
+            self.tick();
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
+            self.tick();
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<bool> {
+            self.tick();
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &std::path::Path) -> Result<()> {
+            self.tick();
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.tick();
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &std::path::Path, mode: u32) -> Result<()> {
+            self.tick();
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(
+            &self,
+            rel: &std::path::Path,
+        ) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
+            self.tick();
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+            self.tick();
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+            self.tick();
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &std::path::Path) -> Result<std::path::PathBuf> {
+            self.tick();
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &std::path::Path) -> Result<()> {
+            self.tick();
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.tick();
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &std::path::Path) -> bool {
+            self.tick();
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &std::path::Path) -> Result<crate::remote::transport::RemoteMeta> {
+            self.tick();
+            self.inner.metadata(rel)
+        }
+        fn exec(
+            &self,
+            argv: &[String],
+            timeout: std::time::Duration,
+        ) -> Result<crate::remote::transport::ExecOutcome> {
+            self.tick();
+            self.inner.exec(argv, timeout)
+        }
+        fn filesystem_bytes(&self) -> Result<crate::remote::transport::FsBytes> {
+            self.tick();
+            self.inner.filesystem_bytes()
+        }
+    }
+
+    /// A RECORDING factory: every factory invocation (each remote
+    /// construction) AND every call on the produced remotes increments a
+    /// shared counter. The remotes delegate to `LocalTransport` rooted at
+    /// `base/<server-id>` (mirroring the harness factory), so a push through
+    /// this factory behaves exactly like a real one — the counters just tell
+    /// us whether ANY remote was touched.
+    fn recording_factory(
+        base: PathBuf,
+        calls: Arc<AtomicUsize>,
+    ) -> impl Fn(&crate::config::ServerDef, &crate::config::SlotDef) -> Result<Box<dyn Remote>>
+    {
+        move |s, _slot| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(CountingRemote::new(
+                base.join(&s.id),
+                calls.clone(),
+            )?))
+        }
+    }
+
+    /// Control: a VALID ref (`@`) with the recording factory dry-runs
+    /// successfully — dry runs still contact remotes to inspect status, so
+    /// the zero-contact contract applies ONLY to the invalid-ref failure
+    /// path — and the counters DO move, proving the recording seam would
+    /// catch a regression that re-introduced remote contact before the ref
+    /// check (a counter that cannot move would make the zero-invocation
+    /// property below vacuous).
+    #[test]
+    fn dry_run_valid_ref_contacts_factory_and_plans() {
+        let h = RecoveryHarness::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory = recording_factory(h.remotes_base.clone(), calls.clone());
+        let r = push(
+            &h.cfg_path,
+            &h.store,
+            &factory,
+            "t1",
+            &h.config,
+            &PushOptions {
+                dry_run: true,
+                ref_token: None,
+            },
+        )
+        .unwrap();
+        assert!(r.dry_run);
+        assert!(
+            r.message.contains("dry-run plan"),
+            "valid dry run must plan, got: {}",
+            r.message
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) > 0,
+            "a valid dry run contacts remotes for status; the recording factory must have counted \
+             at least one invocation"
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 32,
@@ -6972,6 +7180,114 @@ interval_seconds = 0
                  POST-reconciliation selection, not the stale s{}(latest) - {depth}",
                 latest + 1,
                 latest
+            );
+        }
+    }
+
+    // THE property: a dry run with a NONEXISTENT ref returns a REF error
+    // and never contacts a remote — the recording factory reports ZERO
+    // invocations (and zero remote method calls) for every generated
+    // invalid ref. Tokens are shape-valid (they parse) but semantically
+    // unresolvable against the small fixture chain: snapshot indices beyond
+    // the chain (`s{latest+k}`), ancestor walks past the start
+    // (`parent(@, N)`), and deployment refids absent from the chain
+    // (`deploy-absent-...`). The early resolution lives in [`push`] (before
+    // any lock or factory invocation) precisely so this holds.
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn dry_run_invalid_ref_never_contacts_remotes(
+            kind in 0u32..3,
+            offset in 1u64..=4,
+        ) {
+            // Fixture: target 't1' with a three-entry snapshot chain
+            // s0..=s2 (latest = 2), each with a distinctive deployment id.
+            // Only the chain's SHAPE matters (indices + deployment ids): the
+            // generated refs fail in resolution, before any planning reads
+            // the snapshots' artifacts.
+            let h = RecoveryHarness::new();
+            let slot = PlacementSlotId::new("p1".to_string());
+            let artifact = ArtifactRef {
+                release: ReleaseId::new("rel-sha256-1111".to_string()),
+                variant: VariantName::new("p1".to_string()),
+                tree: TreeDigest::new("aa".to_string()),
+            };
+            let bindings = crate::records::PhysicalBinding {
+                server: crate::model::ServerId::new("s1".to_string()),
+                deploy_dir: "/srv/eng".to_string(),
+            };
+            for i in 0..=2u64 {
+                h.store
+                    .append_snapshot(
+                        "t1",
+                        &crate::records::DeploymentSnapshot {
+                            index: i,
+                            deployment_id: DeploymentId::new(format!("deploy-fixture-{i}")),
+                            target: TargetName::new("t1".to_string()),
+                            behavior_sha256: "bb".to_string(),
+                            slots: BTreeMap::from([(
+                                slot.clone(),
+                                GenerationRef {
+                                    generation: GenerationId::new(format!("gen-fixture-{i}")),
+                                    assignment: crate::model::PlacementSlotAssignment {
+                                        placement_slot: slot.clone(),
+                                        artifact: artifact.clone(),
+                                    },
+                                },
+                            )]),
+                            bindings: BTreeMap::from([(slot.clone(), bindings.clone())]),
+                        },
+                    )
+                    .unwrap();
+            }
+
+            // Shape-valid but semantically unresolvable: derive the token
+            // from the fixture's shape (latest = 2).
+            let token = match kind {
+                0 => format!("s{}", 2 + offset),            // index beyond the chain
+                1 => format!("parent(@, {})", 2 + offset),  // walks past the start
+                _ => format!("deploy-absent-{offset}"),     // deployment refid absent from the chain
+            };
+            // Self-check: the token parses and genuinely fails to resolve.
+            let expr = history::parse_ref_expr(&token).unwrap();
+            assert!(
+                history::resolve_ref_expr(&expr, "t1", &h.store).is_err(),
+                "generated token must be semantically unresolvable: {token}"
+            );
+
+            // The recording factory: any remote contact (construction or
+            // method call) increments `calls`.
+            let calls = Arc::new(AtomicUsize::new(0));
+            let factory = recording_factory(h.remotes_base.clone(), calls.clone());
+
+            let err = push(
+                &h.cfg_path,
+                &h.store,
+                &factory,
+                "t1",
+                &h.config,
+                &PushOptions {
+                    dry_run: true,
+                    ref_token: Some(token.clone()),
+                },
+            )
+            .expect_err("a dry run with an invalid ref must fail with a ref error");
+            assert!(
+                matches!(err, Error::Ref(_)),
+                "expected a REF error for '{token}', got: {err}"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "dry-run '{token}' must fail BEFORE any remote construction or method call \
+                 (zero factory invocations), got {}",
+                calls.load(Ordering::SeqCst)
             );
         }
     }
