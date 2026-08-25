@@ -22,11 +22,14 @@
 //! checkpoint (`deploy checkpoint <target> <deployment-id>`) establishes a
 //! monotonic HISTORY FLOOR (`refs/history-floor.json`, see
 //! [`crate::records::HistoryFloor`]) for a target: the floor marker is
-//! written FIRST (durable), then physical compaction rewrites the jsonl
-//! logs to the suffix at/after the floor and deletes `deployments/<id>/`
-//! dirs strictly before it. EVERY read path in this module is gated by the
-//! floor ([`LocalStore::read_attempts`], [`LocalStore::read_snapshots`]), so
-//! an interrupted compaction never exposes history below the durable floor;
+//! written FIRST, durably and FAIL-CLOSED (private temp → fsync → rename →
+//! parent-dir fsync with errors propagated — any stage failure leaves NO
+//! floor, see [`LocalStore::write_history_floor`]), then physical
+//! compaction rewrites the jsonl logs to the suffix at/after the floor and
+//! deletes `deployments/<id>/` dirs strictly before it. EVERY read path in
+//! this module is gated by the floor ([`LocalStore::read_attempts`],
+//! [`LocalStore::read_snapshots`]), so an interrupted compaction never
+//! exposes history below the durable floor;
 //! the raw readers ([`LocalStore::read_attempts_raw`],
 //! [`LocalStore::read_snapshots_raw`]) are the internal index-minting view
 //! (never a below-floor escape hatch — index allocation uses them so
@@ -186,30 +189,42 @@ fn write_atomic_cas(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Durably replace a mutable marker file (the history floor): write a
-/// UNIQUE temp file in the same directory, fsync it, rename over the target
-/// (atomic on POSIX — a reader never sees a torn record), then fsync the
-/// parent directory. Unlike [`write_atomic_cas`] (immutable records) this
-/// REPLACES existing content: the floor advances. The durability of this
-/// write is the checkpoint's ordering guarantee — the floor marker must be
-/// durable BEFORE the compaction deletes anything, so an interrupted
-/// compaction can never expose history below the floor.
-fn write_atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
+/// Unique temp-file name for an atomic replace of `path`: same directory,
+/// hidden dot-prefixed name carrying the process id and a process-scoped
+/// counter, so concurrent atomic writes on one store stay collision-free.
+fn temp_name_for(path: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| Error::store(format!("mkdir {}: {e}", parent.display())))?;
-    }
-    let tmp = path.with_file_name(format!(
+    path.with_file_name(format!(
         ".{}.tmp.{}.{}",
         path.file_name()
             .map(|n| n.to_string_lossy())
             .unwrap_or_default(),
         std::process::id(),
         TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
-    ));
+    ))
+}
+
+/// Durably replace a mutable marker file (the history floor): write a
+/// UNIQUE temp file in the same directory, chmod it private, fsync it,
+/// rename over the target (atomic on POSIX — a reader never sees a torn
+/// record), then fsync the parent directory WITH ERRORS PROPAGATED. The
+/// durability of this write is the checkpoint's ordering guarantee — the
+/// floor marker must be durable BEFORE the compaction deletes anything, so
+/// an interrupted compaction can never expose history below the floor.
+///
+/// Ordering: the temp file is chmodded 0o600 BEFORE the rename, so the
+/// marker never becomes visible under its final name with default
+/// permissions; and the parent-directory fsync is FAIL-CLOSED — a failed
+/// `File::open` OR a failed `sync_all` is an error (the rename may not
+/// survive power loss without the directory fsync, so swallowing it would
+/// let a checkpoint report success for a floor that can disappear).
+fn write_atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::store(format!("mkdir {}: {e}", parent.display())))?;
+    }
+    let tmp = temp_name_for(path);
     {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -221,13 +236,18 @@ fn write_atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
         f.sync_all()
             .map_err(|e| Error::store(format!("fsync {}: {e}", tmp.display())))?;
     }
+    // Private BEFORE visible: the temp carries 0o600 before the rename, so
+    // no reader ever observes the marker with default permissions.
+    set_private(&tmp)?;
     std::fs::rename(&tmp, path)
         .map_err(|e| Error::store(format!("rename {}: {e}", path.display())))?;
-    set_private(path)?;
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = std::fs::File::open(parent)
-    {
-        let _ = dir.sync_all();
+    // Durable parent sync, FAIL-CLOSED: a failed open or a failed fsync is
+    // an error — the rename may not survive power loss without it.
+    if let Some(parent) = path.parent() {
+        let dir = std::fs::File::open(parent)
+            .map_err(|e| Error::store(format!("open dir {}: {e}", parent.display())))?;
+        dir.sync_all()
+            .map_err(|e| Error::store(format!("fsync dir {}: {e}", parent.display())))?;
     }
     Ok(())
 }
@@ -819,11 +839,31 @@ impl LocalStore {
         self.refs_dir(target).join("history-floor.json")
     }
 
-    /// Write the target's history floor marker durably (atomic temp+rename;
-    /// see [`write_atomic_replace`]). The checkpoint flow writes this FIRST
-    /// — before any compaction — so the floor is durable before anything is
-    /// discarded.
+    /// Write the target's history floor marker with the checkpoint's
+    /// FAIL-CLOSED durability protocol (its OWN sequence, not the shared
+    /// [`write_atomic_replace`] — the per-stage fault slots must fire
+    /// between the steps):
+    ///
+    /// 1. write the marker bytes to a UNIQUE temp file in the same
+    ///    directory,
+    /// 2. chmod the TEMP file private (0o600) — before it can ever become
+    ///    visible under its final name,
+    /// 3. fsync the temp file,
+    /// 4. rename it into place (atomic on POSIX),
+    /// 5. DURABLY fsync the parent directory, errors PROPAGATED.
+    ///
+    /// Every stage error is returned from THIS method (PRE-marker): the
+    /// durability commit point is the parent-directory sync, so a failure
+    /// at ANY stage means NO floor and therefore NO compaction. The
+    /// parent-sync failure is special: the marker may already be renamed
+    /// into place by then, so it is UNLINKED (no floor may exist), the
+    /// parent is best-effort re-synced, and the error is returned —
+    /// mirroring the torn-record cleanup in [`write_atomic_cas`]. The
+    /// checkpoint flow writes this FIRST — before any compaction — so the
+    /// floor is durable before anything is discarded.
     pub fn write_history_floor(&self, target: &str, floor: &HistoryFloor) -> Result<()> {
+        // Entry-point fault (existing): fired BEFORE any durability I/O, so
+        // a failure here leaves no marker, no temp, no compaction.
         #[cfg(test)]
         if self
             .fault_registry
@@ -835,7 +875,87 @@ impl LocalStore {
         }
         let bytes = serde_json::to_vec_pretty(floor)
             .map_err(|e| Error::store(format!("serialize history floor: {e}")))?;
-        write_atomic_replace(&self.history_floor_path(target), &bytes)
+        let path = self.history_floor_path(target);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::store(format!("mkdir {}: {e}", parent.display())))?;
+        }
+        let tmp = temp_name_for(&path);
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map_err(|e| Error::store(format!("create {}: {e}", tmp.display())))?;
+            f.write_all(&bytes)
+                .map_err(|e| Error::store(format!("write {}: {e}", tmp.display())))?;
+            // Private BEFORE visible: the temp carries 0o600 from this
+            // point, so the marker is never observed with default perms
+            // (the shared helper's old post-rename chmod opened a window).
+            set_private(&tmp)?;
+            // Stage fault: the temp-file fsync.
+            #[cfg(test)]
+            if self
+                .fault_registry
+                .consume(FaultKind::SyncFloorTemp, floor.deployment_id.as_str())
+            {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(Error::store(
+                    "test fault: history-floor temp sync forced to fail once",
+                ));
+            }
+            f.sync_all()
+                .map_err(|e| Error::store(format!("fsync {}: {e}", tmp.display())))?;
+        }
+        // Stage fault: the rename into place.
+        #[cfg(test)]
+        if self
+            .fault_registry
+            .consume(FaultKind::RenameFloor, floor.deployment_id.as_str())
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::store(
+                "test fault: history-floor rename forced to fail once",
+            ));
+        }
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| Error::store(format!("rename {}: {e}", path.display())))?;
+        // The parent-directory fsync is the DURABILITY COMMIT POINT: it is
+        // what makes the rename survive power loss. Fail-closed — a
+        // failure (fault or real) propagates AFTER the already-renamed
+        // marker is unlinked so NO floor exists (no floor, no compaction).
+        let dir_sync: Result<()> = (|| {
+            #[cfg(test)]
+            if self
+                .fault_registry
+                .consume(FaultKind::SyncFloorParent, floor.deployment_id.as_str())
+            {
+                return Err(Error::store(
+                    "test fault: history-floor parent sync forced to fail once",
+                ));
+            }
+            if let Some(parent) = path.parent() {
+                let dir = std::fs::File::open(parent)
+                    .map_err(|e| Error::store(format!("open dir {}: {e}", parent.display())))?;
+                dir.sync_all()
+                    .map_err(|e| Error::store(format!("fsync dir {}: {e}", parent.display())))?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = dir_sync {
+            // The marker may already be renamed into place: remove it so no
+            // floor exists, then best-effort fsync the parent again
+            // (mirror the torn-record cleanup) before reporting the sync
+            // failure.
+            let _ = std::fs::remove_file(&path);
+            if let Some(parent) = path.parent()
+                && let Ok(dir) = std::fs::File::open(parent)
+            {
+                let _ = dir.sync_all();
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Read the target's history-floor marker, or `None` when no checkpoint

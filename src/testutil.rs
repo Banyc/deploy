@@ -76,7 +76,13 @@ pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// `write_observed` (the push's own target) or an other member target's
 /// independently. The rotation-maintenance arms
 /// ([`FaultKind::ReadRotationDebt`], [`FaultKind::WriteRotationDebt`]) are
-/// keyed by TARGET (the debt file lives under `targets/<target>/`).
+/// keyed by TARGET (the debt file lives under `targets/<target>/`). The
+/// checkpoint floor's durability stages ([`FaultKind::SyncFloorTemp`],
+/// [`FaultKind::RenameFloor`], [`FaultKind::SyncFloorParent`], plus the
+/// entry-point [`FaultKind::WriteHistoryFloor`]) are keyed by the
+/// CHECKPOINT deployment id; a failure at ANY of them is returned from
+/// `write_history_floor` itself (PRE-marker), so no floor exists and no
+/// compaction can run.
 ///
 /// ISOLATION IS STRUCTURAL: a [`FaultRegistry`] belongs to exactly one
 /// fixture (via its store); there are no process-global slots and no
@@ -129,6 +135,26 @@ pub(crate) mod test_faults {
         /// FIRST durable step of a checkpoint; a failure here leaves no
         /// floor (and therefore no compaction).
         WriteHistoryFloor,
+        /// The checkpoint floor marker's TEMP-FILE FSYNC — the first
+        /// durability stage of `write_history_floor` (keyed by the
+        /// checkpoint deployment id), after the temp is chmodded private
+        /// and before the rename. A failure here returns `Err` from
+        /// `write_history_floor` itself (PRE-marker: no floor, no
+        /// compaction).
+        SyncFloorTemp,
+        /// The checkpoint floor marker's RENAME-into-place — the second
+        /// durability stage of `write_history_floor` (keyed by the
+        /// checkpoint deployment id). A failure here returns `Err` from
+        /// `write_history_floor` itself (PRE-marker: no floor, no
+        /// compaction).
+        RenameFloor,
+        /// The checkpoint floor marker's PARENT-DIRECTORY FSYNC — the third
+        /// durability stage of `write_history_floor` (keyed by the
+        /// checkpoint deployment id), the durability COMMIT POINT. A
+        /// failure (fault or real) is returned from `write_history_floor`
+        /// AFTER the already-renamed marker is unlinked, so no floor
+        /// exists and no compaction can run.
+        SyncFloorParent,
         /// The checkpoint's attempts.jsonl suffix rewrite (a compaction
         /// phase after the floor marker is already durable and the
         /// below-floor deployment dirs are deleted).
@@ -335,6 +361,34 @@ pub(crate) mod test_faults {
         /// checkpoint fails cleanly with history fully intact.
         pub(crate) fn arm_write_history_floor(&self, deployment_id: &str) {
             self.arm(FaultKind::WriteHistoryFloor, deployment_id);
+        }
+
+        /// Arm the next history-floor TEMP-FILE FSYNC (the first durability
+        /// stage of `write_history_floor`, keyed by the checkpoint
+        /// deployment id) to fail once. The failure is returned from
+        /// `write_history_floor` itself — a PRE-marker failure, so no floor
+        /// exists and no compaction can run.
+        pub(crate) fn arm_sync_floor_temp(&self, deployment_id: &str) {
+            self.arm(FaultKind::SyncFloorTemp, deployment_id);
+        }
+
+        /// Arm the next checkpoint floor marker RENAME-into-place (the
+        /// second durability stage of `write_history_floor`, keyed by the
+        /// checkpoint deployment id) to fail once. The failure is returned
+        /// from `write_history_floor` itself — a PRE-marker failure, so no
+        /// floor exists and no compaction can run.
+        pub(crate) fn arm_rename_floor(&self, deployment_id: &str) {
+            self.arm(FaultKind::RenameFloor, deployment_id);
+        }
+
+        /// Arm the next checkpoint floor marker PARENT-DIRECTORY FSYNC (the
+        /// third durability stage of `write_history_floor` — the durability
+        /// commit point, keyed by the checkpoint deployment id) to fail
+        /// once. The marker may already be renamed into place when this
+        /// fires; `write_history_floor` unlinks it (no floor exists, no
+        /// compaction) and returns the failure.
+        pub(crate) fn arm_sync_floor_parent(&self, deployment_id: &str) {
+            self.arm(FaultKind::SyncFloorParent, deployment_id);
         }
 
         /// Arm the next checkpoint attempts.jsonl suffix rewrite for

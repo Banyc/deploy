@@ -1310,4 +1310,121 @@ mod tests {
             "the retry converges the snapshots log to the floor suffix"
         );
     }
+
+    proptest! {
+        // The checkpoint's durability stages are fail-closed and ORDERED:
+        // faulting ANY stage — the entry-point write (0), the temp-file
+        // fsync (1), the rename (2), or the parent-directory fsync (3) —
+        // must fail the checkpoint BEFORE any compaction. The parent-sync
+        // fault is the durability commit point: the marker may already be
+        // renamed into place, so the store unlinks it and no floor exists.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn durability_stage_fault_blocks_compaction(
+            history in prop::collection::vec(any::<bool>(), 3..7),
+            checkpoint_at in 0usize..8,
+            stage in 0usize..4,
+        ) {
+            run_durability_stage_case(&history, checkpoint_at, stage);
+        }
+    }
+
+    /// One durability-stage-fault case: seed a history, checkpoint the
+    /// `checkpoint_at`-th successful deployment with exactly ONE stage fault
+    /// armed, and assert the fail-closed contract — `Err` from the
+    /// checkpoint, NO floor (the parent-sync case included: the marker was
+    /// unlinked), the physical below-floor files UNTOUCHED (full jsonl
+    /// prefixes, below-floor deployment dirs present), and compaction
+    /// UNREACHABLE. Then the SAME checkpoint with no fault armed succeeds:
+    /// floor present, compaction done.
+    fn run_durability_stage_case(history_in: &[bool], checkpoint_at: usize, stage: usize) {
+        // Prepend a guaranteed success so the checkpoint always has a
+        // successful deployment to target.
+        let mut history = vec![true];
+        history.extend_from_slice(history_in);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        seed_history(&store, TARGET, "deploy", &history);
+        let ok_ids: Vec<String> = history
+            .iter()
+            .enumerate()
+            .filter(|(_, ok)| **ok)
+            .map(|(n, _)| format!("deploy-{n:04}"))
+            .collect();
+        assert!(
+            !ok_ids.is_empty(),
+            "a checkpoint needs at least one success"
+        );
+        let target_id = ok_ids[checkpoint_at % ok_ids.len()].clone();
+        let floor_index = ok_ids.iter().position(|id| *id == target_id).unwrap() as u64;
+
+        // Arm EXACTLY ONE durability-stage fault, keyed by the checkpoint
+        // deployment id (each fault consumes at its own stage).
+        match stage {
+            0 => store.fault_registry().arm_write_history_floor(&target_id),
+            1 => store.fault_registry().arm_sync_floor_temp(&target_id),
+            2 => store.fault_registry().arm_rename_floor(&target_id),
+            _ => store.fault_registry().arm_sync_floor_parent(&target_id),
+        }
+        let err = run_checkpoint(&store, TARGET, &DeploymentId::new(target_id.clone()), false)
+            .expect_err("a durability-stage fault must fail the checkpoint before compaction");
+        assert!(err.to_string().contains("test fault"));
+
+        // NO floor — including the parent-sync stage: the marker was
+        // renamed into place but the store unlinked it (the durability
+        // commit point is fail-closed).
+        assert!(
+            store.read_history_floor(TARGET).unwrap().is_none(),
+            "stage {stage}: a durability-stage failure must leave no floor"
+        );
+        assert!(
+            !store.history_floor_path(TARGET).exists(),
+            "stage {stage}: the marker file itself must not exist"
+        );
+
+        // The below-floor physical state is UNTOUCHED: no compaction ran.
+        assert_eq!(
+            store.read_attempts_raw(TARGET).unwrap().len(),
+            history.len(),
+            "stage {stage}: attempts.jsonl keeps its full prefix"
+        );
+        let ok_count = history.iter().filter(|ok| **ok).count();
+        assert_eq!(
+            store.read_snapshots_raw(TARGET).unwrap().len(),
+            ok_count,
+            "stage {stage}: snapshots.jsonl keeps its full prefix"
+        );
+        for id in ok_ids.iter().take(floor_index as usize) {
+            assert!(
+                store.deployment_dir(id).exists(),
+                "stage {stage}: below-floor deployment dir {id} must survive"
+            );
+        }
+
+        // The control: with NO fault armed (the one-shot was consumed), the
+        // SAME checkpoint succeeds — floor present, compaction done. This is
+        // the deterministic "compaction is unreachable unless the marker's
+        // durability stage succeeds" property.
+        let rep = run_checkpoint(&store, TARGET, &DeploymentId::new(target_id.clone()), false)
+            .expect("with the fault consumed, the same checkpoint succeeds");
+        assert!(
+            rep.established,
+            "stage {stage}: the retry establishes the floor"
+        );
+        let marker = store.read_history_floor(TARGET).unwrap().unwrap();
+        assert_eq!(marker.deployment_id.as_str(), target_id);
+        assert_eq!(marker.snapshot_index, floor_index);
+        for id in ok_ids.iter().take(floor_index as usize) {
+            assert!(
+                !store.deployment_dir(id).exists(),
+                "stage {stage}: the successful retry compacts, deleting below-floor dir {id}"
+            );
+        }
+    }
 }
