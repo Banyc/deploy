@@ -69,7 +69,7 @@ Then deploy:
 deploy push production --dry-run   # preview the plan; touches nothing
 deploy push production             # deploy (status: Successful, snapshot s0 of production)
 deploy status production           # what is actually running on each server
-deploy log production              # deployment history
+deploy log production              # deployment history (each line prefixed with its snapshot id sN)
 ```
 
 To deploy to a real server instead of the local endpoint, either pass flags at
@@ -94,7 +94,7 @@ addresses need neither.
 | --- | --- |
 | `deploy init [PATH]` | Scaffold a fresh project (see above). |
 | `deploy push <target> [ref]` | Deploy local files (or restore a ref) to every server in the target, in rollout batches. |
-| `deploy log <target>` | Deployment history — successful *and* failed attempts. |
+| `deploy log <target>` | Deployment history — successful *and* failed attempts, each line prefixed with the snapshot id (`sN`) it produced (`-` for attempts with no snapshot). |
 | `deploy status <target>` | What is actually running on each server right now (generation, release, variant, tree). |
 
 Global flag: `--config <path>` selects a different `deploy.toml` than

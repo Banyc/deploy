@@ -58,7 +58,9 @@ The normal workflow is remote-centric and intentionally small:
 deploy push production
 # Show what would change without modifying servers.
 deploy push production --dry-run
-# Inspect the target's deployment history.
+# Inspect the target's deployment history — each line is prefixed with the
+# snapshot id (sN) of the snapshot that attempt produced; `-` means the
+# attempt produced no snapshot.
 deploy log production
 # Inspect the actual generation on every server.
 deploy status production
@@ -66,6 +68,16 @@ deploy status production
 # (jj-style: the target is passed once; the reference is relative)
 deploy push production @-              # the previous successful snapshot
 deploy push production 'parent(@, 3)'    # three snapshots back
+```
+
+`deploy log` output is one line per recorded attempt, newest last, each line
+prefixed with the snapshot id (`sN`) the attempt produced (the same `sN` the
+push reference grammar accepts); attempts that produced no snapshot — failed
+or degraded — render `-` so the columns stay aligned:
+
+```
+s0  deploy-20260821T102000Z  Successful  2026-08-21T10:20:00Z
+-  deploy-20260822T091400Z  FailedPreflight  2026-08-22T09:15:00Z  (preflight failed)
 ```
 
 `production` is not a built-in environment type. It is a user-chosen target name, analogous to a Git remote name such as `origin`, except that one target may fan out to multiple servers. Other valid names include `test-lab`, `datacenter-hk`, or `customer-acme`.

@@ -183,9 +183,12 @@ reported explicitly, including partial states like `degraded`.",
     /// Show the target's deployment history (successful and failed).
     #[command(
         long_about = "Show every recorded deployment attempt for the target, newest last:\n\
-deployment ID, status, and timestamp. Failed and degraded attempts remain\n\
-visible here but are NOT valid rollback refs — only successful deployments\n\
-produce snapshots (see `deploy help push` for the reference syntax)."
+snapshot id, deployment ID, status, and timestamp. Each line is prefixed\n\
+with the snapshot id (`sN`) the attempt produced — the same `sN` notation\n\
+`deploy push` accepts as a reference — or `-` for attempts that produced no\n\
+snapshot. Failed and degraded attempts remain visible here but are NOT\n\
+valid rollback refs; only successful deployments produce snapshots (see\n\
+`deploy help push` for the reference syntax)."
     )]
     Log { target: String },
     /// Show what is actually running on every server.
@@ -294,15 +297,8 @@ where
             if attempts.is_empty() {
                 println!("no deployments for target '{target}'");
             }
-            for a in &attempts {
-                let (status, reason) = effective_status(&store, a)?;
-                match reason {
-                    Some(r) => println!(
-                        "{}  {:?}  {}  ({r})",
-                        a.deployment_id, status, a.attempted_at
-                    ),
-                    None => println!("{}  {:?}  {}", a.deployment_id, status, a.attempted_at),
-                }
+            for line in render_log(&store, &target, &attempts)? {
+                println!("{line}");
             }
         }
         Command::Status { target } => {
@@ -356,6 +352,47 @@ fn effective_status(
         None => Ok((DeploymentStatus::PendingCommit, None)),
     }
 }
+
+/// Render `deploy log <target>` output: one line per recorded attempt,
+/// newest last, each PREFIXED with the snapshot id (`sN`) of the snapshot
+/// that attempt produced — the same `sN` notation the push reference grammar
+/// accepts (`deploy push <target> sN`) — or `-` for attempts that produced
+/// no snapshot (failed/degraded attempts are visible here but are NOT valid
+/// rollback refs). The snapshot id is the snapshot record's canonical
+/// `index` (the 0-based reflog position `s0`, `s1`, ...), never a recomputed
+/// Vec position. The CLI prints exactly these lines; the unit test asserts
+/// on them directly because lib unit tests cannot capture the harness-owned
+/// stdout sink.
+pub fn render_log(
+    store: &LocalStore,
+    target: &str,
+    attempts: &[DeploymentAttempt],
+) -> Result<Vec<String>> {
+    let snapshots = store.read_snapshots(target)?;
+    let index_by_deployment: std::collections::HashMap<&str, u64> = snapshots
+        .iter()
+        .map(|s| (s.deployment_id.as_str(), s.index))
+        .collect();
+    let mut out = Vec::with_capacity(attempts.len());
+    for a in attempts {
+        let (status, reason) = effective_status(store, a)?;
+        let prefix = match index_by_deployment.get(a.deployment_id.as_str()) {
+            Some(index) => format!("s{index}"),
+            None => "-".to_string(),
+        };
+        out.push(match reason {
+            Some(r) => format!(
+                "{prefix}  {}  {status:?}  {}  ({r})",
+                a.deployment_id, a.attempted_at
+            ),
+            None => format!(
+                "{prefix}  {}  {status:?}  {}",
+                a.deployment_id, a.attempted_at
+            ),
+        });
+    }
+    Ok(out)
+}
 fn print_init_report(report: &crate::init::InitReport) {
     println!("created deploy project at {}", report.target.display());
     for f in &report.files {
@@ -394,7 +431,7 @@ mod tests {
         DeploymentId, GenerationId, PlacementSlotId, ReleaseId, SCHEMA_VERSION, TargetName,
         TreeDigest, VariantName,
     };
-    use crate::records::{ObservedServer, ObservedTarget};
+    use crate::records::{DeploymentSnapshot, ObservedServer, ObservedTarget};
     use std::collections::BTreeMap;
 
     fn pending_attempt(id: &str) -> DeploymentAttempt {
@@ -463,6 +500,71 @@ mod tests {
         assert_eq!(
             effective_status(&store, &a).unwrap(),
             (DeploymentStatus::Degraded, None)
+        );
+    }
+
+    /// `deploy log <target>` prefixes every line with the snapshot id (`sN`)
+    /// of the snapshot that attempt produced — the same `sN` notation the
+    /// push reference grammar accepts (`deploy push <target> sN`) — or `-`
+    /// when the attempt produced no snapshot. The snapshot id is the snapshot
+    /// record's canonical `index` (the 0-based reflog position `s0`, `s1`,
+    /// ...), never a recomputed Vec position. The CLI prints exactly what
+    /// [`render_log`] returns, so the test drives the real `run_with` path
+    /// and asserts the rendered lines through the helper — lib unit tests
+    /// cannot capture the harness-owned stdout sink.
+    #[test]
+    fn log_prefixes_lines_with_snapshot_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+
+        // Two attempts: the first succeeds (producing snapshot s0); the
+        // second fails in preflight (producing NO snapshot).
+        let mut a_ok = pending_attempt("deploy-log-ok");
+        a_ok.attempted_at = "2026-01-01T00:00:00Z".to_string();
+        let mut a_failed = pending_attempt("deploy-log-failed");
+        a_failed.attempted_at = "2026-01-02T00:00:00Z".to_string();
+        store.append_attempt("production", &a_ok).unwrap();
+        store.append_attempt("production", &a_failed).unwrap();
+        store
+            .append_snapshot(
+                "production",
+                &DeploymentSnapshot {
+                    index: 0,
+                    deployment_id: a_ok.deployment_id.clone(),
+                    target: TargetName::new("production".to_string()),
+                    behavior_sha256: "sha256-aa".to_string(),
+                    slots: BTreeMap::new(),
+                    bindings: BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        store
+            .append_transition(
+                a_ok.deployment_id.as_str(),
+                &DeploymentStatus::Successful,
+                Some("deployed"),
+            )
+            .unwrap();
+        store
+            .append_transition(
+                a_failed.deployment_id.as_str(),
+                &DeploymentStatus::FailedPreflight,
+                Some("preflight failed"),
+            )
+            .unwrap();
+
+        let attempts = store.read_attempts("production").unwrap();
+        let lines = render_log(&store, "production", &attempts).unwrap();
+        assert_eq!(lines.len(), 2, "one line per attempt: {lines:?}");
+        // A successful attempt renders its snapshot id (`sN`) as the prefix.
+        assert_eq!(
+            lines[0],
+            "s0  deploy-log-ok  Successful  2026-01-01T00:00:00Z  (deployed)"
+        );
+        // An attempt with no snapshot keeps the columns aligned via `-`.
+        assert_eq!(
+            lines[1],
+            "-  deploy-log-failed  FailedPreflight  2026-01-02T00:00:00Z  (preflight failed)"
         );
     }
 

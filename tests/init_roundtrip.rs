@@ -203,6 +203,23 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     );
     assert_eq!(snapshots[0].index, 0);
 
+    // `deploy log production` renders one line per attempt, each PREFIXED
+    // with the snapshot id (`sN`) of the snapshot that attempt produced —
+    // the same `sN` notation the push reference grammar accepts. This
+    // successful attempt produced the canonical `s0`.
+    let log_lines = cli::render_log(&store, "production", &attempts)?;
+    assert_eq!(log_lines.len(), 1, "one line in `deploy log production`");
+    assert!(
+        log_lines[0].starts_with(&format!("s{}  ", snapshots[0].index)),
+        "log line must be prefixed with the snapshot id: {}",
+        log_lines[0]
+    );
+    assert!(
+        log_lines[0].starts_with(&format!("s0  {}", attempt.deployment_id)),
+        "successful attempt renders its snapshot id: {}",
+        log_lines[0]
+    );
+
     let observed = store.read_observed("production")?;
     let obs = &observed.slots[&deploy::model::PlacementSlotId::new("app-1")];
     assert_eq!(
