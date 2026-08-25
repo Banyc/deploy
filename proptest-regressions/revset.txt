@@ -4,5 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 202662ea72e6c466046849ec9fabb306b73a4765a1add491c7a2017b90447679 # shrinks to (chain_idx, floor) = ([1], None), token = "@-"
-cc dd852523edff9f5e4997646f5a5155fdf9f63e19f702b8a9ba23d53216395ac5 # shrinks to (chain_idx, floor) = ([], None), token = "parent(@, 0)"
+cc 1cee5c52fc8e4dc8a00f29f8343b29c1960956f098f5e060e7a2330aec2e99f2 # shrinks to token = "parent(rel-sha256-aa0a, 0)"

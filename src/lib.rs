@@ -16,6 +16,7 @@ pub mod push;
 pub mod records;
 pub mod release;
 pub mod remote;
+pub(crate) mod revset;
 pub mod rotation;
 pub mod store;
 pub mod template;
