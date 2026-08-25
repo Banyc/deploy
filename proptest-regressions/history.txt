@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1cee5c52fc8e4dc8a00f29f8343b29c1960956f098f5e060e7a2330aec2e99f2 # shrinks to token = "parent(rel-sha256-aa0a, 0)"
+cc 202662ea72e6c466046849ec9fabb306b73a4765a1add491c7a2017b90447679 # shrinks to (chain_idx, floor) = ([1], None), token = "@-"

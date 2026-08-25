@@ -175,6 +175,15 @@ impl std::fmt::Display for RelativeRef {
             RelBase::Refid(rid) => rid.to_string(),
         };
         match self.steps {
+            // A bare release id (`rel-sha256-...` or a bare digest) is a
+            // LEGACY form the parser REJECTS, so a 0-step release refid must
+            // render as `parent(<id>, 0)` — every string `Display` prints
+            // must be re-parseable (the canonical round-trip). The `At` base
+            // keeps the bare `@` form: the documented fold
+            // `parent(@, 0) ≡ @` makes `@` the canonical rendering.
+            0 if matches!(self.base, RelBase::Refid(RefId::Release(_))) => {
+                write!(f, "parent({id}, 0)")
+            }
             0 => write!(f, "{id}"),
             1 => write!(f, "{id}-"),
             2 => write!(f, "{id}--"),
@@ -439,6 +448,25 @@ pub fn resolve_ref_expr(expr: &RefExpr, target: &str, store: &LocalStore) -> Res
                     "cannot roll back below the history floor (checkpoint {} at s{}) on target '{target}': \
                     history before the checkpoint has been discarded",
                     floor.deployment_id, floor.snapshot_index
+                )));
+            }
+            // The STEPPED index must be an actual member of the floored
+            // read chain. [`resolve_base_index`] verifies only the BASE's
+            // membership; on a GAPPED chain (e.g. [s3, s5] after checkpoint
+            // compaction) an ancestor index can land in the hole — here
+            // `@-` would step s5 → s4, an index no snapshot carries. Such a
+            // dangling index must fail CLOSED here with a ref error naming
+            // the index, never flow on to the rollback plan (which would
+            // later fail with a misleading `resolve_snapshot` error).
+            // Contiguous chains (prefix compaction + max+1 appends) are
+            // unaffected: the floor check above already bounds the walk and
+            // every index in [floor, max] is present, so this check is a
+            // no-op for them.
+            if !entries.iter().any(|e| e.index == index) {
+                return Err(Error::r#ref(format!(
+                    "'{expr}' walks {} step(s) back from snapshot s{base_index} on target '{target}' to s{index}, \
+                    which is not present in the floored snapshot chain (the chain has a gap)",
+                    rel.steps
                 )));
             }
             Ok(PushRef::Snapshot {
@@ -808,8 +836,10 @@ mod tests {
         ServerId, TreeDigest, VariantName,
     };
     use proptest::prelude::*;
-    use proptest::test_runner::RngSeed;
+    use proptest::test_runner::{FileFailurePersistence, RngSeed};
     use std::collections::BTreeMap;
+
+    use crate::records::HistoryFloor;
 
     #[test]
     fn parse_ref_head_forms() {
@@ -1417,6 +1447,371 @@ mod tests {
                     "error for '{token}' must report the out-of-range index, got: {err}"
                 );
             }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Ref-grammar property suite (parse + resolve contract)
+    // -------------------------------------------------------------------
+
+    /// One of the ancestor-count / snapshot-index magnitudes the grammar
+    /// must accept or reject by fit: the small steps {0,1,2,3}, exactly
+    /// `u64::MAX` (the largest VALID count/index), `u64::MAX + 1` (the
+    /// smallest overflow — a ref error, never a panic), and a 100-digit
+    /// string (magnitude ~10^99, far beyond `u64`).
+    fn big_num() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "0".prop_map(String::from),
+            "1".prop_map(String::from),
+            "2".prop_map(String::from),
+            "3".prop_map(String::from),
+            Just(u64::MAX.to_string()),
+            Just((u64::MAX as u128 + 1).to_string()),
+            "[1-9][0-9]{99}".prop_map(String::from),
+        ]
+    }
+
+    /// A deployment-id refid (`deploy-<id>`).
+    fn dep_id() -> impl Strategy<Value = String> {
+        "[a-z][a-z0-9]{0,7}".prop_map(|s| format!("deploy-{s}"))
+    }
+
+    /// A release refid: a full `rel-sha256-<hex>` id or a bare hex digest.
+    /// The digest is at least 4 chars so it can never collide with the
+    /// legacy `f<digits>` prefix (e.g. `f3a4` has a non-digit tail).
+    fn rel_id() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "[0-9a-f]{4,16}".prop_map(|h| format!("rel-sha256-{h}")),
+            "[0-9a-f]{4,16}".prop_map(String::from),
+        ]
+    }
+
+    /// Junk: arbitrary strings over the grammar's alphabet (alnum; the
+    /// punctuation `- @ ( ) , : space { }`; the `s f rel- deploy-` shapes
+    /// are covered by the char pool) plus unicode, length 0..30. Any of it
+    /// may parse or not; the contract is that it NEVER panics and every
+    /// failure is a ref error.
+    fn junk_strategy() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![
+                prop::sample::select(&[
+                    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p',
+                    'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'A', 'B', 'C', 'D', 'E', 'F',
+                    'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V',
+                    'W', 'X', 'Y', 'Z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+                ]),
+                prop::sample::select(&['-', '@', '(', ')', ',', ':', ' ', '{', '}']),
+                prop::sample::select(&['α', 'é', '中', '🚀', '\u{00A0}']),
+            ],
+            0..30,
+        )
+        .prop_map(|cs| cs.into_iter().collect())
+    }
+
+    /// The ref-token universe: the structured forms the grammar accepts
+    /// (including the oversized extremes it must fail closed on) plus junk.
+    fn ref_token_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            // The HEAD forms.
+            Just("".to_string()),
+            Just("HEAD".to_string()),
+            Just("@".to_string()),
+            Just("@-".to_string()),
+            Just("@--".to_string()),
+            // parent(@, N).
+            big_num().prop_map(|n| format!("parent(@, {n})")),
+            // sK / sK- / sK--.
+            big_num().prop_flat_map(|k| {
+                prop_oneof![
+                    Just(format!("s{k}")),
+                    Just(format!("s{k}-")),
+                    Just(format!("s{k}--")),
+                ]
+            }),
+            // parent(sK, M).
+            (big_num(), big_num()).prop_map(|(k, m)| format!("parent(s{k}, {m})")),
+            // deploy-<id> / deploy-<id>- / parent(deploy-<id>, M).
+            dep_id().prop_flat_map(|d| {
+                prop_oneof![
+                    Just(d.to_string()),
+                    Just(format!("{d}-")),
+                    big_num().prop_map(move |m| format!("parent({d}, {m})")),
+                ]
+            }),
+            // rel-sha256-<hex>-- / parent(rel-sha256-<hex>, M) and the bare
+            // digest equivalents.
+            rel_id().prop_flat_map(|r| {
+                prop_oneof![
+                    Just(format!("{r}--")),
+                    big_num().prop_map(move |m| format!("parent({r}, {m})")),
+                ]
+            }),
+            // release:<id> — the DIRECT release form.
+            rel_id().prop_map(|r| format!("release:{r}")),
+            // Junk.
+            junk_strategy(),
+        ]
+    }
+
+    /// The documented fold: `Relative { base: At, steps: 0 }` is the same
+    /// as `Head` (`parent(@, 0) ≡ @`), and the two display identically
+    /// (`@`).
+    fn fold(expr: RefExpr) -> RefExpr {
+        match expr {
+            RefExpr::Relative(rel) if rel.base == RelBase::At && rel.steps == 0 => RefExpr::Head,
+            other => other,
+        }
+    }
+
+    /// Assert the CANONICAL ROUND-TRIP for a successfully parsed
+    /// expression: its `Display` string must re-parse, to the SAME
+    /// expression modulo the documented `Relative{At,0} ≡ Head` fold, and
+    /// `Display` must be a fixed point.
+    fn assert_canonical_round_trip(expr: &RefExpr, token: &str) {
+        let shown = expr.to_string();
+        let reparsed = parse_no_panic(&shown).unwrap_or_else(|err| {
+            panic!("Display({token:?}) = {shown:?} must re-parse, got: {err}")
+        });
+        assert_eq!(
+            fold(reparsed.clone()),
+            fold(expr.clone()),
+            "canonical round-trip: Display({token:?}) = {shown:?} re-parses to {reparsed:?}, \
+             expected {expr:?} modulo the Relative{{At,0}} ≡ Head fold"
+        );
+        assert_eq!(
+            reparsed.to_string(),
+            shown,
+            "Display must be a fixed point for {token:?} (rendered {shown:?})"
+        );
+    }
+
+    /// A gapped snapshot-chain shape: 0..=8 indices, a sorted sample of
+    /// 0..12 (GAPS DELIBERATE — chains are seeded with caller-chosen
+    /// indices, exactly as checkpoint compaction rewrites the log), plus an
+    /// optional durable floor at a MEMBER index ≤ max (None on an empty
+    /// chain or when the generated slot overruns it).
+    fn chain_strategy() -> impl Strategy<Value = (Vec<u64>, Option<u64>)> {
+        (
+            prop::collection::vec(0u64..12, 0..=8),
+            prop::option::weighted(0.6, 0usize..9),
+        )
+            .prop_map(|(mut idx, floor_slot)| {
+                idx.sort_unstable();
+                idx.dedup();
+                let floor = floor_slot.and_then(|i| idx.get(i).copied());
+                (idx, floor)
+            })
+    }
+
+    /// A minimal attempt record for the target, enough to bind a seeded
+    /// history floor (the floor's own deployment must exist in the target's
+    /// attempts log).
+    fn attempt_entry(dep: &str) -> DeploymentAttempt {
+        DeploymentAttempt {
+            deployment_schema_version: SCHEMA_VERSION,
+            deployment_id: DeploymentId::new(dep.to_string()),
+            target: TargetName::new("production".to_string()),
+            slot_ids: vec![PlacementSlotId::new("p1".to_string())],
+            behavior_sha256: "sha256-aa".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            desired: BTreeMap::new(),
+            pre_push: BTreeMap::new(),
+            slots: BTreeMap::new(),
+        }
+    }
+
+    /// One resolve-leg case: seed a REAL store with a (possibly gapped,
+    /// possibly floored) chain, parse a generated token, and resolve it via
+    /// the engine's two-phase flow `resolve_ref_expr(&parse_ref_expr(t)?, ...)`.
+    /// Asserts: no panic anywhere; every parse AND resolve failure is a ref
+    /// error; a rejected shape never resolves; a resolved snapshot index is
+    /// an actual member of the FLOORED chain at/after the floor; `@` /
+    /// `release:<id>` never touch the chain (they resolve even on an EMPTY
+    /// store, while every relative form on an empty store fails closed).
+    fn ref_grammar_resolve_case(chain_idx: Vec<u64>, floor: Option<u64>, token: String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        for &i in &chain_idx {
+            let dep = format!("deploy-seed-{i}");
+            store
+                .append_snapshot(
+                    "production",
+                    &snapshot_entry(i, &dep, &format!("{i:02x}{i:02x}")),
+                )
+                .unwrap();
+        }
+        if let Some(fi) = floor {
+            let dep = format!("deploy-seed-{fi}");
+            store
+                .append_attempt("production", &attempt_entry(&dep))
+                .unwrap();
+            store
+                .write_history_floor(
+                    "production",
+                    &HistoryFloor {
+                        schema_version: SCHEMA_VERSION,
+                        target: TargetName::new("production".to_string()),
+                        deployment_id: DeploymentId::new(dep.clone()),
+                        snapshot_index: fi,
+                        established_at: "2026-01-01T00:00:00Z".to_string(),
+                    },
+                )
+                .unwrap();
+        }
+
+        // Two-phase engine flow: parse first — a parse failure is a ref
+        // error and the expression NEVER reaches resolution (a rejected
+        // shape never resolves).
+        let expr = match parse_no_panic(&token) {
+            Ok(expr) => expr,
+            Err(err) => {
+                assert!(
+                    matches!(err, Error::Ref(_)),
+                    "parse failure for {token:?} must be a ref error, got: {err}"
+                );
+                return;
+            }
+        };
+
+        let result = std::panic::catch_unwind(|| resolve_ref_expr(&expr, "production", &store))
+            .expect("resolve_ref_expr must never panic");
+
+        // Fail-closed: every resolve failure is a ref error (the seeded
+        // store is healthy, so only the ref contract can reject).
+        if let Err(err) = &result {
+            assert!(
+                matches!(err, Error::Ref(_)),
+                "resolve failure for {token:?} must be a ref error, got: {err}"
+            );
+        }
+
+        // On an EMPTY store, `@`/HEAD/`release:<id>` still resolve — no
+        // chain touch — while every relative form fails closed.
+        if chain_idx.is_empty() {
+            match &expr {
+                RefExpr::Head | RefExpr::Release(_) => assert!(
+                    matches!(result, Ok(PushRef::Head | PushRef::Release { .. })),
+                    "{token:?} on an empty store must resolve without touching the chain, got: {result:?}"
+                ),
+                RefExpr::Relative(_) => assert!(
+                    matches!(result, Err(Error::Ref(_))),
+                    "{token:?} on an empty store must fail closed with a ref error, got: {result:?}"
+                ),
+            }
+        }
+
+        // RESOLVE MEMBERSHIP: a resolved snapshot index is an actual member
+        // of the floored read chain, at/after the floor.
+        match result {
+            Ok(PushRef::Snapshot { target, index }) => {
+                assert_eq!(
+                    target.as_str(),
+                    "production",
+                    "{token:?} must resolve against the passed target"
+                );
+                let floored = store.read_snapshots("production").unwrap();
+                assert!(
+                    floored.iter().any(|e| e.index == index),
+                    "{token:?} resolved to s{index}, which is not an actual member of the \
+                     floored chain {floored:?}"
+                );
+                if let Some(fi) = floor {
+                    assert!(
+                        index >= fi,
+                        "{token:?} resolved below the history floor s{fi}: s{index}"
+                    );
+                }
+            }
+            Ok(PushRef::Head | PushRef::Release { .. }) => {}
+            Err(_) => {}
+        }
+    }
+
+    proptest! {
+        // The PARSE leg — pure syntax, no store: canonical round-trip for
+        // everything the parser accepts (modulo the documented fold), plus
+        // totality (never panics; every failure is a ref error). Randomized
+        // seeds with failure persistence (proptest's defaults): a failing
+        // vector writes `proptest-regressions/history.txt` and is replayed
+        // on the next run — commit it. Bounded at 256 cases; the leg is
+        // pure, so this stays fast.
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            failure_persistence: Some(Box::new(FileFailurePersistence::default())),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn ref_grammar_parse_contract(token in ref_token_strategy()) {
+            match parse_no_panic(&token) {
+                Ok(expr) => assert_canonical_round_trip(&expr, &token),
+                Err(err) => assert!(
+                    matches!(err, Error::Ref(_)),
+                    "parse failure for {token:?} must be a ref error, got: {err}"
+                ),
+            }
+        }
+    }
+
+    proptest! {
+        // FIXED-SEED REGRESSION for the parse leg: the identical generator
+        // under the pinned 0x5EED_5EED seed, no persistence, runs the same
+        // vectors on every invocation.
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn ref_grammar_parse_contract_fixed_seed(token in ref_token_strategy()) {
+            match parse_no_panic(&token) {
+                Ok(expr) => assert_canonical_round_trip(&expr, &token),
+                Err(err) => assert!(
+                    matches!(err, Error::Ref(_)),
+                    "parse failure for {token:?} must be a ref error, got: {err}"
+                ),
+            }
+        }
+    }
+
+    proptest! {
+        // The RESOLVE leg — against a REAL seeded store per case (a gapped
+        // chain with caller-chosen indices plus an optional durable floor at
+        // a member index): resolve membership and totality. Randomized seeds
+        // + failure persistence, bounded at 96 cases (each case builds a
+        // small tempdir store, so the bound keeps the suite fast).
+        #![proptest_config(ProptestConfig {
+            cases: 96,
+            failure_persistence: Some(Box::new(FileFailurePersistence::default())),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn ref_grammar_resolve_contract(
+            (chain_idx, floor) in chain_strategy(),
+            token in ref_token_strategy(),
+        ) {
+            ref_grammar_resolve_case(chain_idx, floor, token);
+        }
+    }
+
+    proptest! {
+        // FIXED-SEED REGRESSION for the resolve leg.
+        #![proptest_config(ProptestConfig {
+            cases: 96,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn ref_grammar_resolve_contract_fixed_seed(
+            (chain_idx, floor) in chain_strategy(),
+            token in ref_token_strategy(),
+        ) {
+            ref_grammar_resolve_case(chain_idx, floor, token);
         }
     }
 }
