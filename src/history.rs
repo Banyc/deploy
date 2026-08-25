@@ -1063,13 +1063,23 @@ mod tests {
         // Even though `rel-sha256-cccc` IS referenced by snapshots in this
         // chain, `release:` yields the bare release ref, not a snapshot.
         assert_eq!(
-            resolve_push_ref("release:rel-sha256-cccc", "production", &store).unwrap(),
+            resolve_ref_expr(
+                &parse_ref_expr("release:rel-sha256-cccc").expect("token must parse"),
+                "production",
+                &store
+            )
+            .unwrap(),
             PushRef::Release {
                 release: ReleaseId::new("rel-sha256-cccc".to_string())
             }
         );
         assert_eq!(
-            resolve_push_ref("release:cccc", "production", &store).unwrap(),
+            resolve_ref_expr(
+                &parse_ref_expr("release:cccc").expect("token must parse"),
+                "production",
+                &store
+            )
+            .unwrap(),
             PushRef::Release {
                 release: ReleaseId::new("rel-sha256-cccc".to_string())
             }
@@ -1080,15 +1090,24 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let empty = LocalStore::with_base(tmp.path().join("store")).unwrap();
         assert_eq!(
-            resolve_push_ref("release:rel-sha256-zzzz", "brand-new-target", &empty).unwrap(),
+            resolve_ref_expr(
+                &parse_ref_expr("release:rel-sha256-zzzz").expect("token must parse"),
+                "brand-new-target",
+                &empty
+            )
+            .unwrap(),
             PushRef::Release {
                 release: ReleaseId::new("rel-sha256-zzzz".to_string())
             }
         );
         // The refid form on the same empty chain still fails closed (it
         // needs a snapshot that references the release).
-        resolve_push_ref("parent(rel-sha256-zzzz, 0)", "brand-new-target", &empty)
-            .expect_err("the refid form needs snapshot ancestry and must fail on an empty chain");
+        resolve_ref_expr(
+            &parse_ref_expr("parent(rel-sha256-zzzz, 0)").expect("token must parse"),
+            "brand-new-target",
+            &empty,
+        )
+        .expect_err("the refid form needs snapshot ancestry and must fail on an empty chain");
     }
 
     /// Out-of-range and unresolvable references fail closed with a ref

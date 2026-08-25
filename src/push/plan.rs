@@ -941,11 +941,16 @@ interval_seconds = 0
             // snapshot referencing the release), while the direct form works.
             if cross_target {
                 for token in ["@-", "s0", "parent(@, 1)"] {
-                    crate::history::resolve_push_ref(token, "t2", &store)
-                        .expect_err(&format!("{token} on the no-history destination must fail"));
+                    crate::history::resolve_ref_expr(
+                        &crate::history::parse_ref_expr(token).expect("family tokens must parse"),
+                        "t2",
+                        &store,
+                    )
+                    .expect_err(&format!("{token} on the no-history destination must fail"));
                 }
-                crate::history::resolve_push_ref(
-                    &format!("parent({release}, 0)"),
+                crate::history::resolve_ref_expr(
+                    &crate::history::parse_ref_expr(&format!("parent({release}, 0)"))
+                        .expect("release-id parent must parse"),
                     "t2",
                     &store,
                 )
