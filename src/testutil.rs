@@ -351,6 +351,24 @@ pub(crate) mod test_faults {
 /// deployment-id half of the arm keys the barrier to exactly one push
 /// (property cases and the contention test all use unique ids), so a hook
 /// cannot even fire for a DIFFERENT push of the same fixture.
+///
+/// CANCELLATION SAFETY: dropping the handle must NEVER deadlock a parked
+/// engine. A parked `barrier` holds the slot mutex while it waits, so the
+/// drop must wake the engine BEFORE it takes that mutex to disarm. The wake
+/// is by CHANNEL DISCONNECT, not by a token: the handle owns the ONLY sender
+/// of the release channel, and [`Drop for HookHandle`] closes the channel
+/// FIRST (`self.release.take()`, which needs no lock) so every parked
+/// `recv()` returns `Err(RecvError)` unconditionally — no dependence on
+/// which recv consumes a token. The token-based scheme deadlocked exactly
+/// there: with MULTIPLE phases (deferred-maintenance retry + fresh step-17
+/// rotation), a stale release token from a prior phase could be consumed by
+/// the WRONG recv, leaving a later park waiting forever while its `barrier`
+/// held the slot mutex — and the drop's own `inner.lock()` then blocked on
+/// that held mutex, so nothing could ever release the parked engine. Only
+/// AFTER the close does the drop take the slot mutex to disarm (the parked
+/// engine has been woken and released it), and a fresh `barrier` after that
+/// is a no-op. The [`step17_hook_property_tests`] matrix asserts the
+/// guarantee across 1-4 phases × arbitrary cancellation points.
 #[cfg(test)]
 pub(crate) mod step17_hook {
     use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -420,7 +438,7 @@ pub(crate) mod step17_hook {
             HookHandle {
                 hook: Arc::clone(hook),
                 at_step17: at_rx,
-                release: rel_tx,
+                release: Some(rel_tx),
             }
         }
 
@@ -429,10 +447,21 @@ pub(crate) mod step17_hook {
         /// park until the test releases the engine — or return immediately when
         /// unarmed / the deployment id does not match. NEVER called from
         /// production code (the call sites in `src/push/engine.rs` are
-        /// `#[cfg(test)]`). The slot mutex stays held while parked so a
-        /// concurrently-dropped handle cannot disarm mid-park; the handle
-        /// releases the engine (non-blocking) BEFORE its `drop` can take the
-        /// lock.
+        /// `#[cfg(test)]`).
+        ///
+        /// The slot mutex stays held while parked so a concurrently-dropped
+        /// handle cannot disarm mid-park — but the park is woken by CHANNEL
+        /// DISCONNECT, not by a token: [`HookHandle::drop`] closes the release
+        /// channel FIRST (it drops its own sender half, taking no lock), so
+        /// this `recv` returns `Err(RecvError)` the instant the handle drops,
+        /// no matter which park is waiting or how many release tokens were
+        /// already consumed. There is no dependence on a token reaching THE
+        /// RIGHT `recv`: every parked engine wakes unconditionally, and a
+        /// barrier arriving after the close returns immediately. Because the
+        /// drop takes the slot mutex only AFTER the close, a parked engine
+        /// holding that mutex is always woken (and releases it) before the
+        /// disarm blocks on it — dropping the handle can never deadlock
+        /// against a park.
         pub(crate) fn barrier(&self, deployment_id: &DeploymentId, phase: HookPhase) {
             let guard = self.inner.lock().unwrap();
             let Some(armed) = guard.as_ref() else {
@@ -448,12 +477,16 @@ pub(crate) mod step17_hook {
 
     /// The TEST-facing handle: owns the receive end of the "at step 17"
     /// signal and the send end of the release. Dropping the handle disarms
-    /// the slot AND releases a parked engine first, so a panicked test can
-    /// never strand the engine thread.
+    /// the slot AND wakes any parked engine first, so a panicked test can
+    /// never strand the engine thread (see the module docs for the
+    /// cancellation-safe ordering).
     pub(crate) struct HookHandle {
         hook: Arc<Step17Hook>,
         at_step17: Receiver<HookPhase>,
-        release: Sender<()>,
+        /// `Some` while the handle is live; `Drop` takes it (closing the
+        /// release channel — waking every parked `recv` — without taking the
+        /// slot mutex) BEFORE disarming.
+        release: Option<Sender<()>>,
     }
 
     impl HookHandle {
@@ -484,19 +517,32 @@ pub(crate) mod step17_hook {
 
         /// Release the parked engine: its step-17 lock acquisition now runs
         /// while the fixture holds the competing guard, so it contends
-        /// deterministically. Safe to call more than once (a stale token is
-        /// dropped with the handle).
+        /// deterministically. Safe to call more than once (an extra token is
+        /// simply dropped with the handle); a no-op once the handle has been
+        /// dropped (the release sender is gone).
         pub(crate) fn release(&self) {
-            let _ = self.release.send(());
+            if let Some(tx) = &self.release {
+                let _ = tx.send(());
+            }
         }
     }
 
     impl Drop for HookHandle {
         fn drop(&mut self) {
-            // Release any parked engine first (non-blocking — the buffered
-            // channel never blocks a send) so the disarm below can take the
-            // slot mutex without waiting on a parked engine.
-            let _ = self.release.send(());
+            // CANCELLATION-SAFE ORDER: close the release channel FIRST by
+            // dropping this handle's sender half (`self.release.take()`). Any
+            // parked engine's `recv()` now returns `Err(RecvError)`
+            // immediately — the wake does NOT depend on a token reaching any
+            // particular `recv`, so a parked engine can never be left waiting
+            // (a stale token from a prior phase can no longer be consumed by
+            // the wrong park). This takes NO lock, so an engine parked with
+            // the slot mutex held can always wake and release it. Only THEN
+            // take the slot mutex to disarm: it is free (or freed within µs
+            // as the woken engine unwinds) by the time we acquire it, so the
+            // drop never blocks on a parked engine. The close also makes any
+            // LATER `barrier` — racing the disarm or arriving after it —
+            // return immediately.
+            self.release.take();
             *self.hook.inner.lock().unwrap() = None;
         }
     }
@@ -670,6 +716,231 @@ mod registry_property_tests {
             acc.push(b[j]);
             interleave(out, a, b, i, j + 1, acc);
             acc.pop();
+        }
+    }
+}
+
+#[cfg(test)]
+mod step17_hook_property_tests {
+    // Property test for CANCELLATION SAFETY of the step-17 hook: dropping
+    // the handle at an arbitrary moment — before any park, between parks, or
+    // while the engine is parked at a random phase — must never deadlock the
+    // engine, for ANY phase count (1-4, the engine's sequential barrier
+    // calls). The token-based release deadlocked exactly here: with multiple
+    // phases a stale release token could be consumed by the WRONG recv,
+    // leaving a later park waiting forever while its `barrier` held the slot
+    // mutex — and the drop's own `inner.lock()` then blocked on that held
+    // mutex. The fix closes the release channel in `Drop` (dropping the only
+    // Sender), which wakes EVERY parked recv unconditionally; every
+    // assertion below is bounded via channels/timeouts (no sleeps).
+
+    use super::step17_hook::{HookHandle, HookPhase, Step17Hook};
+    use crate::model::DeploymentId;
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+    use std::sync::Arc;
+    use std::sync::mpsc::channel;
+    use std::thread;
+    use std::time::Duration;
+
+    /// Bound for the worker to reach a park (hit only on a bug — the worker
+    /// parks at every armed barrier, so the signal always arrives in µs).
+    const PARK_BOUND: Duration = Duration::from_secs(30);
+    /// Bound for the handle drop to complete (hit only on a bug: a
+    /// cancellation-safe drop must never block on a parked engine's mutex).
+    const DROP_BOUND: Duration = Duration::from_secs(5);
+    /// Bound for the worker to exit (complete every barrier call) after the
+    /// drop — the assertion channel, not a sleep.
+    const WORKER_EXIT_BOUND: Duration = Duration::from_secs(30);
+    /// Bound for a FRESH post-disarm `barrier` to return (it must no-op).
+    const NOOP_BOUND: Duration = Duration::from_secs(5);
+
+    /// WHERE the handle is dropped for one cancellation scenario.
+    #[derive(Clone, Copy, Debug)]
+    enum CancelPoint {
+        /// Drop before observing any park: the worker may not have started,
+        /// may be mid-flight, or may already be parked — the close must let
+        /// it finish everything.
+        BeforeFirstPark,
+        /// Drop WHILE the worker is parked at park `phase` (1-based),
+        /// holding the slot mutex: the close must wake it.
+        WhileParked(usize),
+        /// Release park `phase` (1-based), then drop WITHOUT waiting for the
+        /// next park — the worker may be unwinding, re-parking, or parked:
+        /// the close must let it finish.
+        BetweenParks(usize),
+    }
+
+    /// Strategy: 1-4 phases the worker calls `barrier` for, plus a
+    /// cancellation point valid for that count. With `n` phases there are
+    /// `2n` points: one before any park, one per park (`WhileParked`), and
+    /// one between consecutive parks (`BetweenParks`).
+    fn scenario() -> impl Strategy<Value = (Vec<HookPhase>, CancelPoint)> {
+        prop::collection::vec(
+            prop_oneof![Just(HookPhase::DeferredRetry), Just(HookPhase::FreshStep17),],
+            1..=4,
+        )
+        .prop_flat_map(|phases| {
+            let n = phases.len() as u32;
+            let point = (0..(2 * n)).prop_map(move |idx| match idx {
+                0 => CancelPoint::BeforeFirstPark,
+                i if i <= n => CancelPoint::WhileParked(i as usize),
+                i => CancelPoint::BetweenParks((i - n) as usize),
+            });
+            (Just(phases), point)
+        })
+    }
+
+    /// Block (bounded) until the worker signals park `park_idx` (1-based),
+    /// and assert the signal still carries the phase the worker is about to
+    /// run — the per-phase signal is part of the hook contract and must be
+    /// unchanged by the cancellation fix.
+    fn wait_for_park(handle: &HookHandle, phases: &[HookPhase], park_idx: usize) {
+        let phase = handle
+            .wait_at_step17_bounded(PARK_BOUND)
+            .expect("the worker must reach every armed park");
+        assert_eq!(
+            phase,
+            phases[park_idx - 1],
+            "the park signal must carry the phase the worker is about to run"
+        );
+    }
+
+    /// One matrix cell: `phases` × `point`. A worker thread calls
+    /// [`Step17Hook::barrier`] once per phase and then reports completion;
+    /// the driver advances to the cancellation point, drops the handle (on a
+    /// helper thread, itself bounded), and asserts — all via bounded channel
+    /// timeouts — that the worker EXITS and a fresh post-disarm barrier is a
+    /// no-op.
+    fn run_cancellation_case(
+        hook: &Arc<Step17Hook>,
+        id: &DeploymentId,
+        phases: &[HookPhase],
+        point: CancelPoint,
+    ) {
+        let handle = Step17Hook::arm(hook, id.as_str());
+        let (done_tx, done_rx) = channel();
+        let worker_hook = Arc::clone(hook);
+        let worker_id = id.clone();
+        let worker_phases = phases.to_vec();
+        let worker = thread::spawn(move || {
+            for phase in &worker_phases {
+                worker_hook.barrier(&worker_id, *phase);
+            }
+            let _ = done_tx.send(());
+        });
+
+        // Advance to the cancellation point, servicing (releasing) every
+        // park the driver must pass through.
+        match point {
+            CancelPoint::BeforeFirstPark => {}
+            CancelPoint::WhileParked(i) => {
+                for j in 1..i {
+                    wait_for_park(&handle, phases, j);
+                    handle.release();
+                }
+                wait_for_park(&handle, phases, i);
+            }
+            CancelPoint::BetweenParks(i) => {
+                for j in 1..=i {
+                    wait_for_park(&handle, phases, j);
+                    handle.release();
+                }
+            }
+        }
+
+        // Drop on a helper thread and bound the drop itself: the close must
+        // wake any parked engine before the disarm takes the slot mutex, so
+        // `drop` can never block.
+        let (drop_tx, drop_rx) = channel();
+        let drop_thread = thread::spawn(move || {
+            drop(handle);
+            let _ = drop_tx.send(());
+        });
+        assert!(
+            drop_rx.recv_timeout(DROP_BOUND).is_ok(),
+            "dropping the handle must not block while the engine could be parked \
+             (point {point:?}, {} phases)",
+            phases.len()
+        );
+
+        // The worker must EXIT within the bound: every remaining barrier call
+        // returns (the slot is disarmed / the channel closed) and the
+        // completion message arrives.
+        assert!(
+            done_rx.recv_timeout(WORKER_EXIT_BOUND).is_ok(),
+            "the worker must complete all its barrier calls after the handle is dropped \
+             (point {point:?}, {} phases)",
+            phases.len()
+        );
+        worker.join().expect("worker thread panicked");
+        drop_thread.join().expect("drop thread panicked");
+
+        // A FRESH barrier after the disarm is a no-op: it returns
+        // immediately (asserted via a bounded completion channel).
+        let (noop_tx, noop_rx) = channel();
+        let noop_hook = Arc::clone(hook);
+        let noop_id = id.clone();
+        let noop = thread::spawn(move || {
+            noop_hook.barrier(&noop_id, HookPhase::FreshStep17);
+            let _ = noop_tx.send(());
+        });
+        assert!(
+            noop_rx.recv_timeout(NOOP_BOUND).is_ok(),
+            "a fresh barrier call after the drop must be a no-op \
+             (point {point:?}, {} phases)",
+            phases.len()
+        );
+        noop.join().expect("noop thread panicked");
+    }
+
+    // Property: for every generated (1-4 phases, arbitrary cancellation
+    // point), dropping the handle lets the worker exit within the bound and
+    // makes fresh barriers no-ops. Fixed seed + bounded cases for
+    // deterministic `cargo test` runs (like the fault-registry property).
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            rng_seed: RngSeed::Fixed(0xC0FF_EE00),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn worker_exits_after_handle_drop_at_any_cancellation_point(
+            (phases, point) in scenario(),
+        ) {
+            run_cancellation_case(&Arc::new(Step17Hook::default()), &DeploymentId::generate(), &phases, point);
+        }
+    }
+
+    // Exhaustive matrix over phase-count × cancellation-point, deterministically
+    // (independent of the proptest seed): every (n, point) combination with a
+    // canonical alternating phase pattern must satisfy the same guarantee.
+    #[test]
+    fn exhaustive_cancellation_matrix() {
+        for n in 1..=4 {
+            let phases: Vec<HookPhase> = (0..n)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        HookPhase::FreshStep17
+                    } else {
+                        HookPhase::DeferredRetry
+                    }
+                })
+                .collect();
+            // The same 2n cancellation points as the property strategy.
+            let mut points = vec![CancelPoint::BeforeFirstPark];
+            points.extend((1..=n).map(CancelPoint::WhileParked));
+            points.extend((1..n).map(CancelPoint::BetweenParks));
+            for point in points {
+                run_cancellation_case(
+                    &Arc::new(Step17Hook::default()),
+                    &DeploymentId::generate(),
+                    &phases,
+                    point,
+                );
+            }
         }
     }
 }
