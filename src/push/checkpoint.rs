@@ -99,7 +99,12 @@
 //! ([`LocalStore::clear_cleanup_pending`]: remove + parent-directory
 //! fsync, so a crash can never resurrect the marker); a clear failure
 //! leaves a STALE marker — harmless, the retry re-clears it — surfaced
-//! truthfully as `CheckpointReport::cleanup_clear_failed`.
+//! truthfully as `CheckpointReport::cleanup_clear_failed`. The SAME
+//! computation runs on the idempotent retry path: an already-compacted
+//! re-checkpoint still runs the post-commit maintenance, so a maintenance
+//! step that fails on the no-op path is reported as a warning exactly like
+//! a fresh run — an idempotent retry NEVER suppresses a cleanup warning
+//! behind a clean "nothing to discard" claim.
 //!
 //! # Concurrency
 //!
@@ -142,9 +147,11 @@ pub struct CheckpointReport {
     /// but the post-commit physical compaction did not complete: the
     /// command reports SUCCESS with this warning set, a durable
     /// [`CleanupPending`] debt marker records the pending cleanup, and the
-    /// next checkpoint of the same deployment retries it. False when the
-    /// cleanup completed, on a pure idempotent no-op, and on dry-run
-    /// previews.
+    /// next checkpoint of the same deployment retries it. The compaction
+    /// runs on EVERY path — an idempotent retry computes the same flags as
+    /// a fresh run, so a maintenance failure on the no-op path is never
+    /// suppressed. False when the cleanup completed, on a pure idempotent
+    /// no-op whose maintenance ran clean, and on dry-run previews.
     pub cleanup_pending: bool,
     /// True when the durable [`CleanupPending`] debt marker could NOT be
     /// written — the pending cleanup could not be made durable. This is
@@ -316,6 +323,15 @@ fn checkpoint_inner(
 /// same deployment retries the cleanup through this same function (the
 /// idempotency-repair path); once it completes, the debt marker clears and
 /// the report shows no `cleanup_pending`.
+///
+/// THE NO-OP PATH IS NOT A SKIP: the post-commit maintenance (the
+/// compaction, and the debt-marker clear on success / write on failure)
+/// runs on EVERY path — including the true no-op path where nothing needs
+/// repair — so an idempotent retry computes the SAME warning flags as a
+/// fresh post-commit run and can never suppress a maintenance failure
+/// behind a clean "nothing to discard" report. The clean no-op report is
+/// returned only when nothing needed repair AND every warning flag is
+/// false.
 fn finish_cleanup(
     store: &LocalStore,
     target: &str,
@@ -355,34 +371,22 @@ fn finish_cleanup(
         }
     };
 
-    let needs_repair = pending_read_failed
+    let needed_repair = pending_read_failed
         || pending.is_some()
         || !discards.discarded_attempts.is_empty()
         || !discards.discarded_snapshots.is_empty()
         || !discards.discarded_deployments.is_empty();
 
-    if !needs_repair {
-        // Pure idempotent no-op: nothing to discard, no debt outstanding.
-        // `established` is the caller's truth: a FRESH path established the
-        // floor even when there was nothing below it to discard; the
-        // same-deployment retry path is a no-op (not established).
-        return Ok(cleanup_report(
-            target,
-            floor,
-            FloorDiscards::default(),
-            established,
-            false,
-            false,
-            false,
-        ));
-    }
-
-    // Post-marker failure point #2: the compaction itself. On failure the
-    // floor stands; record the debt durably (the below-floor dirs still to
-    // delete) and report the warning. The debt marker's OWN persistence is
-    // the last failure surface: if it cannot be written, the report exposes
-    // `cleanup_persistence_failed` (truthful reporting — a crash/restart
-    // would lose the debt) instead of claiming durable debt.
+    // Post-marker failure point #2: the compaction itself. It runs on EVERY
+    // path — the repair path AND the true no-op path — so an idempotent
+    // retry computes the SAME warning flags as a fresh post-commit run: a
+    // maintenance step that fails on the no-op path is NEVER suppressed
+    // behind a clean "nothing to do" claim. On failure the floor stands;
+    // record the debt durably (the marker is a flag only — the logs retain
+    // the worklist) and report the warning. The debt marker's OWN
+    // persistence is the last failure surface: if it cannot be written, the
+    // report exposes `cleanup_persistence_failed` (truthful reporting — a
+    // crash/restart would lose the debt) instead of claiming durable debt.
     let (cleanup_pending, persist_failed, clear_failed) =
         match store.checkpoint_compact(target, floor) {
             Ok(()) => {
@@ -402,11 +406,32 @@ fn finish_cleanup(
                 (true, persist_failed, false)
             }
         };
+
+    // A TRUE no-op: nothing needed repair AND the post-commit maintenance
+    // ran clean (every warning flag false). ONLY this combination returns
+    // the clean no-op report — an idempotent retry whose maintenance step
+    // failed (or whose stale debt marker could not be cleared) falls
+    // through to the report below and surfaces the warnings exactly like a
+    // fresh post-commit run. `established` is the caller's truth: a FRESH
+    // path established the floor even when there was nothing below it to
+    // discard; the same-deployment retry path is a no-op (not established).
+    if !needed_repair && !cleanup_pending && !persist_failed && !clear_failed {
+        return Ok(cleanup_report(
+            target,
+            floor,
+            FloorDiscards::default(),
+            established,
+            false,
+            false,
+            false,
+        ));
+    }
+
     Ok(cleanup_report(
         target,
         floor,
         discards,
-        established || needs_repair,
+        established || needed_repair,
         cleanup_pending,
         persist_failed,
         clear_failed,
@@ -485,8 +510,16 @@ fn preview_checkpoint(
 /// WOULD be discarded; an established floor reports what WAS discarded; a
 /// pure idempotent no-op says so. The CLI prints exactly these lines; the
 /// unit tests assert on them directly.
+///
+/// The "nothing to discard" no-op claim is gated on ALL warning flags FALSE:
+/// when a maintenance step failed on the idempotent path the report must
+/// never print a clean/discard-free statement — the warning lines below are
+/// the truth about the non-converged cleanup.
 pub fn render_checkpoint_report(report: &CheckpointReport) -> Vec<String> {
     let mut lines = Vec::new();
+    let clean_no_op = !report.cleanup_pending
+        && !report.cleanup_persistence_failed
+        && !report.cleanup_clear_failed;
     let head = if report.dry_run {
         format!(
             "dry-run: checkpoint at snapshot s{} (deployment {}) of target {}",
@@ -497,15 +530,23 @@ pub fn render_checkpoint_report(report: &CheckpointReport) -> Vec<String> {
             "checkpoint established: history floor at snapshot s{} (deployment {}) of target {}",
             report.snapshot_index, report.deployment_id, report.target
         )
-    } else {
+    } else if clean_no_op {
         format!(
             "checkpoint already established: history floor at snapshot s{} (deployment {}) of target {} — nothing to discard",
             report.snapshot_index, report.deployment_id, report.target
         )
+    } else {
+        format!(
+            "checkpoint already established: history floor at snapshot s{} (deployment {}) of target {} — cleanup did not converge",
+            report.snapshot_index, report.deployment_id, report.target
+        )
     };
     lines.push(head);
-    // A pure idempotent no-op has nothing to enumerate.
+    // A pure idempotent no-op has nothing to enumerate — but the warning
+    // lines must STILL print when a maintenance step failed (the head
+    // already dropped the "nothing to discard" claim).
     if !report.dry_run && !report.established {
+        push_checkpoint_warnings(&mut lines, report);
         return lines;
     }
     let verb = if report.dry_run {
@@ -542,6 +583,15 @@ pub fn render_checkpoint_report(report: &CheckpointReport) -> Vec<String> {
         plural(report.discards.discarded_deployments.len()),
         report.discards.discarded_deployments.join(", ")
     ));
+    push_checkpoint_warnings(&mut lines, report);
+    lines
+}
+
+/// The checkpoint warning lines, each printed IFF its flag is set (the CLI
+/// prints exactly these lines; the unit tests assert on them directly).
+/// Every flag produces its OWN warning — a flagged report never renders as a
+/// clean no-op.
+fn push_checkpoint_warnings(lines: &mut Vec<String>, report: &CheckpointReport) {
     // A post-marker cleanup failure leaves the checkpoint committed but the
     // physical compaction unfinished: the CLI prints the explicit warning
     // (and exits SUCCESS — the checkpoint took effect) and a re-run of the
@@ -570,7 +620,6 @@ pub fn render_checkpoint_report(report: &CheckpointReport) -> Vec<String> {
             report.target, report.deployment_id
         ));
     }
-    lines
 }
 
 fn plural(n: usize) -> &'static str {
@@ -1601,23 +1650,41 @@ mod tests {
         }
 
         // Boundary case: the checkpoint sits at the very FIRST attempt (the
-        // floor is at index 0 with nothing below it), so the compaction has
-        // NOTHING to do — the armed post-marker fault is never reached and
-        // there is legitimately no pending cleanup: success, no debt marker.
+        // floor is at index 0 with nothing below it). The post-commit
+        // maintenance still RUNS (the no-op path computes the SAME flags as
+        // the real path), so the armed post-marker fault fires and the
+        // checkpoint reports committed-with-warning exactly like any
+        // post-marker failure: cleanup pending, durable debt marker.
         if below_floor_ids.is_empty() {
             assert!(
-                !rep.cleanup_pending,
-                "a floor with nothing below it has no cleanup to pend"
+                rep.cleanup_pending,
+                "the armed post-marker fault fires on the no-op maintenance path too"
             );
             assert!(
-                store.read_cleanup_pending(TARGET, None).unwrap().is_none(),
-                "no debt marker when there is no pending cleanup"
+                store
+                    .read_cleanup_pending(TARGET, Some(&floor))
+                    .unwrap()
+                    .is_some(),
+                "the durable debt flag records the pended maintenance"
             );
-            // The re-run stays a no-op (the armed fault is never reached).
+            // The re-run (fault disarmed) converges: no pending, no debt
+            // marker.
             let retry =
                 run_checkpoint(&store, TARGET, &DeploymentId::new(target_id.clone()), false)
                     .expect("the repeated checkpoint converges");
-            assert!(!retry.established && !retry.cleanup_pending);
+            assert!(
+                !retry.cleanup_pending
+                    && !retry.cleanup_persistence_failed
+                    && !retry.cleanup_clear_failed,
+                "the re-run clears the pended maintenance"
+            );
+            assert!(
+                store
+                    .read_cleanup_pending(TARGET, Some(&floor))
+                    .unwrap()
+                    .is_none(),
+                "the debt marker clears once the re-run converges"
+            );
             return;
         }
 
@@ -2052,6 +2119,228 @@ mod tests {
                         write_fails,
                         clear_fails,
                     );
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // IDEMPOTENT-RETRY TRUTHFULNESS (the retry path's matrix)
+    // -------------------------------------------------------------------
+
+    /// One idempotent-retry warning case: the FULL 2^3 matrix over (retry
+    /// compaction FAILS → cleanup_pending) × (debt-marker WRITE failure →
+    /// cleanup_persistence_failed) × (debt-marker CLEAR failure →
+    /// cleanup_clear_failed), driven through the IDEMPOTENT re-checkpoint of
+    /// the same deployment — the retry path whose floor is ALREADY durable
+    /// (`established=false`). The debt-truthfulness property above covers
+    /// the FRESH path's matrix; this targets the retry path specifically:
+    /// an idempotent re-run must compute the SAME warning flags as a fresh
+    /// post-commit run — a maintenance step that fails on the no-op path
+    /// must NEVER be suppressed behind a clean "nothing to discard" report.
+    ///
+    /// Reuses the debt-truthfulness fixtures: the pending-debt SEEDING (an
+    /// earlier interrupted checkpoint leaving the durable marker) arms the
+    /// CLEAR cells — the clear fault only fires when a marker exists — and
+    /// the fault kinds are exactly the property's (`WriteCleanupPending` for
+    /// the persistence cell, `ClearCleanupPending` for the clear cell, a
+    /// compaction phase for the pending cell).
+    fn run_idempotent_retry_warning_case(
+        cleanup_fails: bool,
+        write_fails: bool,
+        clear_fails: bool,
+    ) {
+        // Seeded prefix (mirroring the debt-truthfulness fixture): a
+        // guaranteed success then a guaranteed FAILED attempt, so the FIRST
+        // (fresh) checkpoint has genuine below-floor material to compact.
+        let history = vec![true, false, true, false, true];
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        seed_history(&store, TARGET, "deploy", &history);
+        // Checkpoint the SECOND success (s1, deploy-0002): the fresh run has
+        // a real below-floor prefix (deploy-0000 + the failed deploy-0001),
+        // so the first checkpoint genuinely compacts and converges; the
+        // re-run below is then the pure same-deployment retry path.
+        let dep = DeploymentId::new("deploy-0002".to_string());
+
+        // The CLEAR cells need a marker on disk: the clear fault only fires
+        // when a marker exists, so seed the durable-debt state via an
+        // interrupted run (mirroring the debt-truthfulness seeding) — a
+        // compaction fault with a fault-free marker write, leaving the debt
+        // marker exactly as a crash/restart would find it.
+        if clear_fails {
+            store.fault_registry().arm_compact_attempts("deploy-0002");
+            let seeded = run_checkpoint(&store, TARGET, &dep, false)
+                .expect("the seeding run commits with a warning, never an Err");
+            assert!(
+                seeded.cleanup_pending,
+                "the seeding run leaves cleanup pending"
+            );
+            assert!(
+                !seeded.cleanup_persistence_failed && !seeded.cleanup_clear_failed,
+                "the seeding run persists the debt and clears nothing"
+            );
+            assert!(
+                store.read_cleanup_pending(TARGET, None).unwrap().is_some(),
+                "the seeding run leaves the durable debt marker"
+            );
+        } else {
+            // A fault-free first run: the floor is established and the
+            // cleanup converges, so the re-run below is the PURE idempotent
+            // no-op path.
+            let first = run_checkpoint(&store, TARGET, &dep, false)
+                .expect("the clean first run establishes the floor");
+            assert!(first.established, "the first run establishes the floor");
+            assert!(
+                !first.cleanup_pending
+                    && !first.cleanup_persistence_failed
+                    && !first.cleanup_clear_failed,
+                "the first run converges cleanly"
+            );
+            assert!(
+                store.read_cleanup_pending(TARGET, None).unwrap().is_none(),
+                "no debt marker after a converged first run"
+            );
+        }
+
+        // Arm EXACTLY the matrix cell's faults on the RETRY: the compaction
+        // (cleanup_fails — the maintenance runs even on the no-op path, so
+        // the fault fires), the debt-marker write (write_fails — only
+        // reached when the compaction fails), and the debt-marker clear
+        // (clear_fails — only reached when the compaction succeeds on a
+        // marker-bearing fixture). Unreachable arms simply stay in this
+        // fixture's registry and never fire.
+        if cleanup_fails {
+            store.fault_registry().arm_compact_attempts("deploy-0002");
+        }
+        if write_fails {
+            store
+                .fault_registry()
+                .arm_write_cleanup_pending("deploy-0002");
+        }
+        if clear_fails {
+            store.fault_registry().arm_clear_cleanup_pending(TARGET);
+        }
+        let retry = run_checkpoint(&store, TARGET, &dep, false)
+            .expect("post-commit maintenance failures are committed-with-warning, never an Err");
+
+        // The idempotent re-run's established value: the floor was
+        // established by the earlier run, so the re-run reports established
+        // only when it REPAIRED the seeded pending debt.
+        assert_eq!(
+            retry.established, clear_fails,
+            "the idempotent re-run reports established iff it repaired the seeded debt"
+        );
+
+        // THE MATRIX: every set flag produces its CORRESPONDING report flag
+        // — exactly the formulas of the fresh path's debt-truthfulness
+        // matrix, now on the idempotent retry path.
+        assert_eq!(
+            retry.cleanup_pending, cleanup_fails,
+            "cleanup_pending must reflect the retry's compaction outcome"
+        );
+        assert_eq!(
+            retry.cleanup_persistence_failed,
+            cleanup_fails && write_fails,
+            "the persistence-failure flag is set iff the retry's debt-marker write faulted"
+        );
+        assert_eq!(
+            retry.cleanup_clear_failed,
+            !cleanup_fails && clear_fails,
+            "the clear-failure flag is set iff the retry's debt-marker clear faulted on the success path"
+        );
+
+        // The CLI render: the warning line prints IFF its flag is set, and
+        // the "nothing to discard" no-op wording is gated on ALL flags
+        // false.
+        let lines = render_checkpoint_report(&retry);
+        assert_eq!(
+            lines.iter().any(|l| l.contains("cleanup pending")),
+            retry.cleanup_pending,
+            "the pending warning line prints IFF cleanup_pending, got: {lines:?}"
+        );
+        assert_eq!(
+            lines.iter().any(|l| l.contains("could not be persisted")),
+            retry.cleanup_persistence_failed,
+            "the persistence warning line prints IFF cleanup_persistence_failed, got: {lines:?}"
+        );
+        assert_eq!(
+            lines.iter().any(|l| l.contains("stale marker")),
+            retry.cleanup_clear_failed,
+            "the clear warning line prints IFF cleanup_clear_failed, got: {lines:?}"
+        );
+        let clean_no_op = !retry.cleanup_pending
+            && !retry.cleanup_persistence_failed
+            && !retry.cleanup_clear_failed;
+        assert_eq!(
+            lines.iter().any(|l| l.contains("nothing to discard")),
+            clean_no_op && !retry.established,
+            "the clean no-op wording appears ONLY when all flags are false, got: {lines:?}"
+        );
+        // The no-op path is ONLY clean when all flags are false: a clean
+        // report (and no warnings) is possible only in the no-warning cells
+        // of the matrix (the unreachable write fault alone — no compaction
+        // failure — stays clean); every other cell must warn.
+        assert_eq!(
+            clean_no_op,
+            !cleanup_fails && !clear_fails,
+            "the report is clean iff the matrix cell expects no warning"
+        );
+        if clean_no_op {
+            assert!(
+                !lines.iter().any(|l| l.starts_with("warning:")),
+                "a clean report renders no warning lines, got: {lines:?}"
+            );
+        } else {
+            assert!(
+                lines.iter().any(|l| l.starts_with("warning:")),
+                "a flagged report must render its warning line(s), got: {lines:?}"
+            );
+        }
+    }
+
+    proptest! {
+        // IDEMPOTENT-RETRY TRUTHFULNESS: the bounded, fixed-seed 2^3 matrix
+        // over (retry compaction FAILS → cleanup_pending) × (debt-marker
+        // WRITE failure → cleanup_persistence_failed) × (debt-marker CLEAR
+        // failure → cleanup_clear_failed), each cell driven through the
+        // IDEMPOTENT re-checkpoint of the same deployment (the retry path
+        // — the floor is already durable, established=false). THE
+        // INVARIANT: every set flag produces its CORRESPONDING report flag
+        // AND its CLI warning line (each warning prints IFF its flag is
+        // set), and the clean "nothing to discard" no-op report appears
+        // only when ALL flags are false — an idempotent retry never
+        // suppresses a maintenance failure behind a clean no-op claim. The
+        // debt-truthfulness property covers the FRESH path's matrix; this
+        // targets the established=false retry path specifically.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn idempotent_retry_never_suppresses_cleanup_warnings(
+            cleanup_fails in any::<bool>(),
+            write_fails in any::<bool>(),
+            clear_fails in any::<bool>(),
+        ) {
+            run_idempotent_retry_warning_case(cleanup_fails, write_fails, clear_fails);
+        }
+    }
+
+    /// EXHAUSTIVE complement: all 8 cells of the idempotent-retry matrix
+    /// run against FRESH fixtures (deterministic, independent of the proptest
+    /// seed), so a suppressed warning on the retry path is always caught
+    /// even if the bounded 16-cell sample never drew that combination
+    /// (mirrors `every_debt_matrix_cell_is_truthful_and_converges_exhaustively`).
+    #[test]
+    fn every_idempotent_retry_warning_cell_is_truthful_exhaustively() {
+        for cleanup_fails in [false, true] {
+            for write_fails in [false, true] {
+                for clear_fails in [false, true] {
+                    run_idempotent_retry_warning_case(cleanup_fails, write_fails, clear_fails);
                 }
             }
         }
