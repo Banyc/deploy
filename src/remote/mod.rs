@@ -1,6 +1,8 @@
 //! Transport, remote helper, and remote adapter orchestration.
 
 pub mod helper;
+pub mod hostkey;
+pub mod runner;
 pub mod ssh;
 pub mod transport;
 
