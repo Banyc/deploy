@@ -79,7 +79,7 @@
 //! # Concurrency
 //!
 //! The real operation runs under the SAME lock discipline as pushes
-//! ([`crate::push::engine::FileLock`]): the application-store lock then the
+//! ([`crate::push::lock::FileLock`]): the application-store lock then the
 //! target lock, both advisory (flock) and released on drop. The checkpoint
 //! itself NEVER opens a remote: it is local-only by construction (no
 //! `RemoteFactory`, no helper map), so it cannot deploy, cannot reconcile
@@ -94,7 +94,7 @@ use crate::error::{Error, Result};
 use crate::model::{
     CLEANUP_PENDING_SCHEMA_VERSION, DeploymentId, OperationId, SCHEMA_VERSION, TargetName,
 };
-use crate::push::engine::FileLock;
+use crate::push::lock::FileLock;
 use crate::records::{CleanupPending, HistoryFloor};
 use crate::store::local::{FloorDiscards, LocalStore};
 
