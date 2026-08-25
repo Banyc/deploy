@@ -12,7 +12,8 @@
 //!   objects/sha256/<digest>/root/ , tree.json
 //!   releases/<release-id>/mapping.toml, behavior.json, release.json
 //!   targets/<target>/observed.json, rotation-debt.json, attempts.jsonl,
-//!     refs/last-successful, refs/snapshots.jsonl, refs/history-floor.json
+//!     refs/last-successful, refs/snapshots.jsonl, refs/history-floor.json,
+//!     refs/cleanup-pending.json
 //!   servers/<server-id>.json
 //!   deployments/<deployment-id>/plan.json, results.json, transitions.jsonl
 //! ```
@@ -35,6 +36,15 @@
 //! (never a below-floor escape hatch — index allocation uses them so
 //! compaction can never reuse an index).
 //!
+//! The floor marker is the checkpoint's COMMIT POINT: once it is durable
+//! the checkpoint took effect, so a failure of any LATER phase is
+//! post-commit maintenance — it records the durable
+//! `refs/cleanup-pending.json` debt marker
+//! ([`crate::records::CleanupPending`], via
+//! [`LocalStore::write_cleanup_pending`]) and the command reports SUCCESS
+//! with a warning instead of an `Err`; the next same-deployment checkpoint
+//! retries the cleanup until it completes (then clears the marker).
+//!
 //! # Test-only fault injection (per-fixture registry)
 //!
 //! Under `#[cfg(test)]` each [`LocalStore`] owns a per-fixture
@@ -54,7 +64,7 @@ use crate::model::{
     TreeDigest, TreeMetadata,
 };
 use crate::records::{
-    DeploymentAttempt, DeploymentResults, DeploymentSnapshot, DeploymentStatus,
+    CleanupPending, DeploymentAttempt, DeploymentResults, DeploymentSnapshot, DeploymentStatus,
     DeploymentTransition, HistoryFloor, ObservedTarget, ServerState,
 };
 use serde::Serialize;
@@ -978,6 +988,57 @@ impl LocalStore {
         Ok(Some(floor))
     }
 
+    /// Path of the target's pending-checkpoint-cleanup marker
+    /// (`refs/cleanup-pending.json`). Written AFTER the history floor is
+    /// durable (the checkpoint's commit point) when the post-commit
+    /// compaction could not finish: the checkpoint took effect, the cleanup
+    /// is recorded as durable debt. Cleared once the cleanup completes.
+    pub fn cleanup_pending_path(&self, target: &str) -> PathBuf {
+        self.refs_dir(target).join("cleanup-pending.json")
+    }
+
+    /// Read the target's pending-checkpoint-cleanup marker, or `None` when
+    /// no cleanup is pending. `schema_version` must be exactly
+    /// [`SCHEMA_VERSION`]; any other version fails closed with an error
+    /// naming the version.
+    pub fn read_cleanup_pending(&self, target: &str) -> Result<Option<CleanupPending>> {
+        let p = self.cleanup_pending_path(target);
+        if !p.exists() {
+            return Ok(None);
+        }
+        let pending: CleanupPending = read_json(&p)?;
+        if pending.schema_version != SCHEMA_VERSION {
+            return Err(Error::store(format!(
+                "cleanup-pending marker for target '{target}' carries unsupported schema_version {} (expected {SCHEMA_VERSION}): only SCHEMA_VERSION is accepted",
+                pending.schema_version
+            )));
+        }
+        Ok(Some(pending))
+    }
+
+    /// Record the target's pending-checkpoint-cleanup debt durably (atomic
+    /// temp+rename, mirroring [`LocalStore::write_history_floor`]).
+    pub fn write_cleanup_pending(&self, target: &str, pending: &CleanupPending) -> Result<()> {
+        let bytes = serde_json::to_vec_pretty(pending)
+            .map_err(|e| Error::store(format!("serialize cleanup-pending: {e}")))?;
+        write_atomic_replace(&self.cleanup_pending_path(target), &bytes)
+    }
+
+    /// Clear the target's pending-checkpoint-cleanup marker once the
+    /// physical compaction completed. A no-op when no marker exists.
+    pub fn clear_cleanup_pending(&self, target: &str) -> Result<()> {
+        let p = self.cleanup_pending_path(target);
+        if p.exists() {
+            std::fs::remove_file(&p).map_err(|e| {
+                Error::store(format!(
+                    "remove cleanup-pending marker {}: {e}",
+                    p.display()
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
     /// The exact discard set a checkpoint floor applies on `target`: the
     /// attempts before the checkpoint's own attempt, the snapshots with
     /// `index < floor.snapshot_index`, and the union of their deployment ids
@@ -1053,6 +1114,19 @@ impl LocalStore {
     /// them). Delete-first is safe because the durable floor already gates
     /// every read path (`read_attempts`/`read_snapshots`/ref resolution),
     /// so deleting first can never expose discarded history.
+    ///
+    /// Each rewrite is a temp+rename so a reader never sees a torn log, and
+    /// the floor marker already gates every read path — an interruption at
+    /// any point leaves the durable floor bounding the visible history (old
+    /// physical files remain but are invisible below the floor). The delete
+    /// set is captured from the pre-compaction logs, plus any dirs still
+    /// recorded in the durable cleanup-pending debt marker
+    /// ([`LocalStore::read_cleanup_pending`]) for this floor — so a
+    /// compaction that finished the rewrites but faulted before the
+    /// deletions still removes the below-floor dirs on a later retry, even
+    /// though the compacted logs no longer name them (a retry converges to
+    /// no below-floor dirs/files; the marker clears once the compaction
+    /// completes).
     pub fn checkpoint_compact(&self, target: &str, floor: &HistoryFloor) -> Result<()> {
         // Recomputed from the CURRENT (still-intact or already-rewritten)
         // logs on every call — this is what makes an interrupted compaction
@@ -1065,6 +1139,23 @@ impl LocalStore {
         //    First, while the logs still name every discarded id; a retry
         //    recomputes this same worklist from the intact logs and
         //    `dir.exists()` skips the dirs an interrupted pass removed.
+        //    The delete set is also the pre-compaction discard union plus
+        //    any dirs still recorded in a pending-cleanup debt marker (an
+        //    interrupted run may have compacted the logs but faulted
+        //    before the deletions — the durable marker records exactly
+        //    those dirs, so the retry finishes them even though the
+        //    compacted log no longer names them).
+        let mut dirs_to_delete = discards.discarded_deployments.clone();
+        if let Some(pending) = self.read_cleanup_pending(target)?
+            && pending.deployment_id == floor.deployment_id
+            && pending.snapshot_index == floor.snapshot_index
+        {
+            for id in &pending.pending_deployments {
+                if !dirs_to_delete.contains(id) {
+                    dirs_to_delete.push(id.clone());
+                }
+            }
+        }
         #[cfg(test)]
         if self
             .fault_registry
@@ -1074,7 +1165,7 @@ impl LocalStore {
                 "test fault: checkpoint deployment dir deletion forced to fail once",
             ));
         }
-        for id in &discards.discarded_deployments {
+        for id in &dirs_to_delete {
             let dir = self.deployment_dir(id);
             if dir.exists() {
                 std::fs::remove_dir_all(&dir).map_err(|e| {
@@ -1994,6 +2085,49 @@ mod tests {
         assert!(
             err.to_string().contains("schema_version"),
             "a foreign floor schema version must fail closed, got: {err}"
+        );
+    }
+
+    /// The cleanup-pending debt marker (the post-commit half of a
+    /// checkpoint) round-trips, clears, and fails closed on a foreign
+    /// `schema_version` — mirroring the history-floor marker.
+    #[test]
+    fn cleanup_pending_marker_roundtrips_and_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let target = "t-pending";
+        let id = DeploymentId::new("deploy-1".to_string());
+        assert!(
+            store.read_cleanup_pending(target).unwrap().is_none(),
+            "no marker before any pending cleanup"
+        );
+
+        let pending = CleanupPending {
+            schema_version: SCHEMA_VERSION,
+            target: TargetName::new(target.to_string()),
+            deployment_id: id.clone(),
+            snapshot_index: 1,
+            established_at: "2026-01-01T00:00:00Z".to_string(),
+            pending_deployments: vec!["deploy-0".to_string()],
+        };
+        store.write_cleanup_pending(target, &pending).unwrap();
+        let read = store.read_cleanup_pending(target).unwrap().unwrap();
+        assert_eq!(read, pending);
+
+        // Clear removes the marker entirely.
+        store.clear_cleanup_pending(target).unwrap();
+        assert!(store.read_cleanup_pending(target).unwrap().is_none());
+        assert!(!store.cleanup_pending_path(target).exists());
+
+        // A foreign schema version fails closed naming it.
+        store.write_cleanup_pending(target, &pending).unwrap();
+        let mut foreign = pending.clone();
+        foreign.schema_version = SCHEMA_VERSION + 1;
+        write_json(&store.cleanup_pending_path(target), &foreign).unwrap();
+        let err = store.read_cleanup_pending(target).unwrap_err();
+        assert!(
+            err.to_string().contains("schema_version"),
+            "a foreign cleanup-pending schema version must fail closed, got: {err}"
         );
     }
 

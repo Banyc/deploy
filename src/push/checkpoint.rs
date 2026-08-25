@@ -21,7 +21,8 @@
 //! # Durability ordering (the crash-safety crux)
 //!
 //! 1. The floor marker is written FIRST, durably (atomic temp+rename +
-//!    directory fsync in [`LocalStore::write_history_floor`]).
+//!    directory fsync in [`LocalStore::write_history_floor`]). THIS is the
+//!    COMMIT POINT: the instant it is durable the checkpoint took effect.
 //! 2. THEN the physical compaction runs ([`LocalStore::checkpoint_compact`]):
 //!    delete the `deployments/<id>/` dirs strictly before the floor, then
 //!    atomically rewrite `attempts.jsonl` and `snapshots.jsonl` to the
@@ -40,6 +41,21 @@
 //! checkpoint after an interruption finishes the compaction; re-running it
 //! on an already-compacted target is a pure idempotent no-op.
 //!
+//! # The failure model: the floor write is the commit point
+//!
+//! `run_checkpoint` propagates a failure ONLY from the floor-marker write
+//! (the commit point): a failed marker write is an ordinary `Err` and
+//! leaves NO floor (the atomic write leaves nothing). EVERY failure AFTER
+//! the marker write — enumerating the discards or any compaction phase, on
+//! the fresh path or the idempotency-repair path — is POST-COMMIT
+//! MAINTENANCE: the checkpoint already took effect, so the command reports
+//! SUCCESS with an explicit, DURABLE [`CleanupPending`] debt marker
+//! (`targets/<target>/refs/cleanup-pending.json`, mirroring the
+//! rotation-debt discipline) and `CheckpointReport::cleanup_pending` set,
+//! NEVER an `Err`. The next checkpoint of the SAME deployment retries the
+//! cleanup (the idempotency-repair path); once it completes, the debt
+//! marker clears and the report shows no `cleanup_pending`.
+//!
 //! # Concurrency
 //!
 //! The real operation runs under the SAME lock discipline as pushes
@@ -57,7 +73,7 @@
 use crate::error::{Error, Result};
 use crate::model::{DeploymentId, OperationId, SCHEMA_VERSION, TargetName};
 use crate::push::engine::FileLock;
-use crate::records::HistoryFloor;
+use crate::records::{CleanupPending, HistoryFloor};
 use crate::store::local::{FloorDiscards, LocalStore};
 
 /// The outcome of one checkpoint invocation (preview or real).
@@ -74,6 +90,14 @@ pub struct CheckpointReport {
     /// True when this call established (or advanced / repaired) the floor;
     /// false for a pure idempotent no-op and for dry-run previews.
     pub established: bool,
+    /// True when the checkpoint TOOK EFFECT (the durable floor was written)
+    /// but the post-commit physical compaction did not complete: the
+    /// command reports SUCCESS with this warning set, a durable
+    /// [`CleanupPending`] debt marker records the pending cleanup, and the
+    /// next checkpoint of the same deployment retries it. False when the
+    /// cleanup completed, on a pure idempotent no-op, and on dry-run
+    /// previews.
+    pub cleanup_pending: bool,
     /// True when the operation ran read-only (`--dry-run`): no locks, no
     /// writes, no compaction.
     pub dry_run: bool,
@@ -163,10 +187,10 @@ fn plan_floor(
     Ok(floor)
 }
 
-/// The real (locked) checkpoint: write the durable floor marker FIRST, then
-/// compact. An interrupted compaction (fault/crash) is self-healing: a
-/// repeated checkpoint of the same deployment finishes the pending physical
-/// compaction.
+/// The real (locked) checkpoint: write the durable floor marker FIRST (the
+/// COMMIT POINT), then run the post-commit cleanup. An interrupted cleanup
+/// (fault/crash) is self-healing: a repeated checkpoint of the same
+/// deployment finishes the pending physical compaction.
 fn checkpoint_inner(
     store: &LocalStore,
     target: &str,
@@ -176,49 +200,159 @@ fn checkpoint_inner(
 
     // Idempotency: re-checkpointing the SAME deployment id is a no-op when
     // the physical logs are already compacted, and finishes an interrupted
-    // compaction otherwise (the floor marker already bounds every read).
+    // cleanup otherwise (the floor marker already bounds every read). The
+    // floor for this deployment is ALREADY durable here, so every failure
+    // below is post-commit maintenance (committed-with-warning, never Err).
     if let Some(current) = store.read_history_floor(target)?
         && current.deployment_id == floor.deployment_id
     {
-        let discards = store.checkpoint_discards(target, &floor)?;
-        let needs_repair = !discards.discarded_attempts.is_empty()
-            || !discards.discarded_snapshots.is_empty()
-            || !discards.discarded_deployments.is_empty();
-        if needs_repair {
-            store.checkpoint_compact(target, &floor)?;
-            return Ok(CheckpointReport {
-                target: target.to_string(),
-                deployment_id: deployment_id.clone(),
-                snapshot_index: floor.snapshot_index,
-                discards,
-                established: true,
-                dry_run: false,
-            });
-        }
-        return Ok(CheckpointReport {
-            target: target.to_string(),
-            deployment_id: deployment_id.clone(),
-            snapshot_index: floor.snapshot_index,
-            discards: FloorDiscards::default(),
-            established: false,
-            dry_run: false,
-        });
+        return finish_cleanup(store, target, &floor, false);
     }
 
-    // Durability ordering: the marker is durable BEFORE anything is
-    // discarded, then the physical compaction rewrites the logs and deletes
-    // the below-floor deployment directories.
+    // THE COMMIT POINT: the durable floor marker is written FIRST (atomic
+    // temp+rename). The checkpoint takes effect HERE — a failure of this
+    // exact write is an ordinary `Err`, and the atomic write leaves NO
+    // floor (nothing was discarded, nothing is retryable).
     store.write_history_floor(target, &floor)?;
-    let discards = store.checkpoint_discards(target, &floor)?;
-    store.checkpoint_compact(target, &floor)?;
-    Ok(CheckpointReport {
+
+    // Everything after the commit point is post-commit maintenance: a
+    // failure NEVER `Err`s — the floor is already durable, so the
+    // checkpoint took effect — it records the durable cleanup-pending debt
+    // marker and the report carries the warning (retry converges).
+    finish_cleanup(store, target, &floor, true)
+}
+
+/// The post-commit half of a checkpoint: enumerate the discards, run (or
+/// finish) the physical compaction, and produce the report. The floor
+/// marker — the COMMIT POINT — is ALREADY durable when this runs (this call
+/// site is reached only after [`LocalStore::write_history_floor`], or when
+/// the same-deployment floor already exists from an earlier run).
+///
+/// FAILURE MODEL: every failure here is POST-COMMIT MAINTENANCE. The
+/// checkpoint took effect the instant the floor marker was durable, so this
+/// function NEVER returns `Err` from a cleanup failure: a post-marker
+/// failure records the durable [`CleanupPending`] debt marker (mirroring the
+/// rotation-debt discipline elsewhere in the codebase) and returns SUCCESS
+/// with `CheckpointReport::cleanup_pending` set. The next checkpoint of the
+/// same deployment retries the cleanup through this same function (the
+/// idempotency-repair path); once it completes, the debt marker clears and
+/// the report shows no `cleanup_pending`.
+fn finish_cleanup(
+    store: &LocalStore,
+    target: &str,
+    floor: &HistoryFloor,
+    established: bool,
+) -> Result<CheckpointReport> {
+    // The pending-cleanup debt from an interrupted run, if any. A read
+    // failure is treated as debt outstanding: the repair re-runs the
+    // compaction and self-heals (a stale marker is then cleared).
+    let (pending, pending_read_failed) = match store.read_cleanup_pending(target) {
+        Ok(p) => (p, false),
+        Err(_) => (None, true),
+    };
+
+    // Post-marker failure point #1: enumerating the discards is a pure read
+    // over the physical logs; a failure is committed-with-warning too.
+    let discards = match store.checkpoint_discards(target, floor) {
+        Ok(d) => d,
+        Err(_) => {
+            record_cleanup_pending(store, target, floor, &[]);
+            return Ok(cleanup_report(
+                target,
+                floor,
+                FloorDiscards::default(),
+                established || pending_read_failed || pending.is_some(),
+                true,
+            ));
+        }
+    };
+
+    let needs_repair = pending_read_failed
+        || pending.is_some()
+        || !discards.discarded_attempts.is_empty()
+        || !discards.discarded_snapshots.is_empty()
+        || !discards.discarded_deployments.is_empty();
+
+    if !needs_repair {
+        // Pure idempotent no-op: nothing to discard, no debt outstanding.
+        // `established` is the caller's truth: a FRESH path established the
+        // floor even when there was nothing below it to discard; the
+        // same-deployment retry path is a no-op (not established).
+        return Ok(cleanup_report(
+            target,
+            floor,
+            FloorDiscards::default(),
+            established,
+            false,
+        ));
+    }
+
+    // Post-marker failure point #2: the compaction itself. On failure the
+    // floor stands; record the debt durably (the below-floor dirs still to
+    // delete) and report the warning.
+    let cleanup_pending = match store.checkpoint_compact(target, floor) {
+        Ok(()) => {
+            // The physical cleanup completed: the debt marker clears. A
+            // clear failure is itself post-commit maintenance — the stale
+            // marker is retried by the next same-deployment checkpoint — so
+            // it is absorbed and the report stays success.
+            store.clear_cleanup_pending(target).ok();
+            false
+        }
+        Err(_) => {
+            record_cleanup_pending(store, target, floor, &discards.discarded_deployments);
+            true
+        }
+    };
+    Ok(cleanup_report(
+        target,
+        floor,
+        discards,
+        established || needs_repair,
+        cleanup_pending,
+    ))
+}
+
+/// Build the report for one real (non-preview) checkpoint run.
+fn cleanup_report(
+    target: &str,
+    floor: &HistoryFloor,
+    discards: FloorDiscards,
+    established: bool,
+    cleanup_pending: bool,
+) -> CheckpointReport {
+    CheckpointReport {
         target: target.to_string(),
-        deployment_id: deployment_id.clone(),
+        deployment_id: floor.deployment_id.clone(),
         snapshot_index: floor.snapshot_index,
         discards,
-        established: true,
+        established,
+        cleanup_pending,
         dry_run: false,
-    })
+    }
+}
+
+/// Record (or refresh) the durable cleanup-pending debt marker. This is
+/// itself POST-COMMIT MAINTENANCE: a marker-write failure must never turn
+/// the checkpoint into an `Err` (the floor already stands, and the next
+/// same-deployment checkpoint re-runs the cleanup from the physical logs
+/// regardless of the marker), so the write error is absorbed and the report
+/// still carries the warning.
+fn record_cleanup_pending(
+    store: &LocalStore,
+    target: &str,
+    floor: &HistoryFloor,
+    pending_deployments: &[String],
+) {
+    let pending = CleanupPending {
+        schema_version: SCHEMA_VERSION,
+        target: TargetName::new(target.to_string()),
+        deployment_id: floor.deployment_id.clone(),
+        snapshot_index: floor.snapshot_index,
+        established_at: crate::remote::helper::now_rfc3339(),
+        pending_deployments: pending_deployments.to_vec(),
+    };
+    let _ = store.write_cleanup_pending(target, &pending);
 }
 
 /// The read-only preview (`--dry-run`): the same validation (successful
@@ -237,6 +371,7 @@ fn preview_checkpoint(
         snapshot_index: floor.snapshot_index,
         discards,
         established: false,
+        cleanup_pending: false,
         dry_run: true,
     })
 }
@@ -302,6 +437,16 @@ pub fn render_checkpoint_report(report: &CheckpointReport) -> Vec<String> {
         plural(report.discards.discarded_deployments.len()),
         report.discards.discarded_deployments.join(", ")
     ));
+    // A post-marker cleanup failure leaves the checkpoint committed but the
+    // physical compaction unfinished: the CLI prints the explicit warning
+    // (and exits SUCCESS — the checkpoint took effect) and a re-run of the
+    // same checkpoint converges.
+    if report.cleanup_pending {
+        lines.push(format!(
+            "warning: checkpoint established; cleanup pending — re-run `deploy checkpoint {} {}` to converge",
+            report.target, report.deployment_id
+        ));
+    }
     lines
 }
 
@@ -687,17 +832,23 @@ mod tests {
         // Interrupted state (compaction attempts-rewrite phase faulted): the
         // floor is durable at s1 while s0's snapshot is still physically
         // present — the explicit backward guard fires with "cannot move
-        // backward".
+        // backward". The fault fires AFTER the floor (the commit point), so
+        // the checkpoint is a committed-with-warning success, never an Err.
         let s2 = LocalStore::with_base(tmp.path().join("s2")).unwrap();
         seed_history(&s2, TARGET, "deploy", &[true, true, true]);
         s2.fault_registry().arm_compact_attempts("deploy-0001");
-        run_checkpoint(
+        let rep = run_checkpoint(
             &s2,
             TARGET,
             &DeploymentId::new("deploy-0001".to_string()),
             false,
         )
-        .expect_err("the delete-phase fault interrupts the compaction");
+        .expect("a post-marker compaction fault is committed-with-warning, never an Err");
+        assert!(
+            rep.cleanup_pending,
+            "the armed compaction fault is surfaced as cleanup_pending"
+        );
+        assert!(rep.established);
         let err = run_checkpoint(
             &s2,
             TARGET,
@@ -1144,32 +1295,36 @@ mod tests {
     }
 
     proptest! {
-        // Interrupted cleanup: the compaction is faulted mid-way (deletion
-        // or rewrite phase) AFTER the floor marker is durable. The visible
-        // history must NEVER dip below the durable floor, the checkpoint
-        // snapshot stays resolvable, and the below-floor refs stay refused.
+        // The COMMIT-POINT property: the floor marker write is the commit
+        // point — a failure there is an ordinary `Err` with NO floor; EVERY
+        // post-marker failure (the three compaction phases) is a
+        // committed-with-warning success (floor durable, cleanup_pending
+        // marker written, visible history never below the floor); and after
+        // the one-shot fault disarms, re-running the SAME checkpoint
+        // converges (no cleanup_pending, debt marker cleared, physical logs
+        // compacted to the suffix, no below-floor deployment dirs).
         // The seeded history always includes a FAILED attempt (a deployment
         // dir with NO snapshot) below any non-zero floor, so the retry must
         // also converge to delete the failed-without-snapshot dirs from the
         // ORIGINAL worklist.
         #![proptest_config(ProptestConfig {
             cases: 16,
-            rng_seed: RngSeed::Fixed(0x5EED_1D57),
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
         })]
 
         #[test]
-        fn interrupted_cleanup_never_exposes_below_the_floor(
+        fn post_marker_failure_commits_with_warning_and_converges(
             history in prop::collection::vec(any::<bool>(), 3..7),
             checkpoint_at in 0usize..8,
-            phase in 0usize..3,
+            phase in 0usize..4,
         ) {
-            run_interrupted_cleanup_case(&history, checkpoint_at, phase);
+            run_commit_point_case(&history, checkpoint_at, phase);
         }
     }
 
-    fn run_interrupted_cleanup_case(history_in: &[bool], checkpoint_at: usize, phase: usize) {
+    fn run_commit_point_case(history_in: &[bool], checkpoint_at: usize, phase: usize) {
         // Prepend a guaranteed success (so the checkpoint always has a
         // successful deployment to target) followed by a guaranteed FAILED
         // attempt: a `deployments/<id>/` dir with NO snapshot line. The
@@ -1195,6 +1350,21 @@ mod tests {
         );
         let target_id = ok_ids[checkpoint_at % ok_ids.len()].clone();
         let floor_index = ok_ids.iter().position(|id| *id == target_id).unwrap() as u64;
+        // The position of the checkpoint attempt in the FULL history: every
+        // attempt (successful or failed) before it owns a below-floor
+        // `deployments/<id>/` directory.
+        let target_pos = history
+            .iter()
+            .enumerate()
+            .find(|(n, _)| format!("deploy-{n:04}") == target_id)
+            .unwrap()
+            .0;
+        let below_floor_ids: Vec<String> = history
+            .iter()
+            .enumerate()
+            .take(target_pos)
+            .map(|(n, _)| format!("deploy-{n:04}"))
+            .collect();
 
         // The ORIGINAL discard worklist, enumerated from the still-intact
         // seeded logs exactly as the compaction's first call does — this is
@@ -1216,19 +1386,58 @@ mod tests {
             );
         }
 
-        // Arm the compaction fault for the phase under test (keyed by the
-        // checkpoint deployment id).
+        // Arm the fault for the phase under test (keyed by the checkpoint
+        // deployment id). Phase 0 is the floor-marker WRITE (the commit
+        // point); phases 1-3 are the three post-marker compaction phases.
         match phase {
-            0 => store.fault_registry().arm_compact_attempts(&target_id),
-            1 => store.fault_registry().arm_compact_snapshots(&target_id),
+            0 => store.fault_registry().arm_write_history_floor(&target_id),
+            1 => store.fault_registry().arm_compact_attempts(&target_id),
+            2 => store.fault_registry().arm_compact_snapshots(&target_id),
             _ => store.fault_registry().arm_compact_deployments(&target_id),
         }
-        let err = run_checkpoint(&store, TARGET, &DeploymentId::new(target_id.clone()), false)
-            .expect_err("the armed compaction fault interrupts the checkpoint");
-        assert!(err.to_string().contains("test fault"));
+        let res = run_checkpoint(&store, TARGET, &DeploymentId::new(target_id.clone()), false);
 
-        // The floor marker is DURABLE and the readers never expose history
-        // below it — the core property.
+        if phase == 0 {
+            // (a) The FLOOR WRITE is the COMMIT POINT: a failure here is an
+            // ordinary `Err`, and NO floor exists (the atomic write leaves
+            // nothing) — nothing was discarded and nothing is retryable.
+            let err = res.expect_err("a floor-write failure is an ordinary Err");
+            assert!(err.to_string().contains("test fault"));
+            assert!(
+                store.read_history_floor(TARGET).unwrap().is_none(),
+                "a failed floor write must leave NO floor"
+            );
+            assert!(
+                store.read_cleanup_pending(TARGET).unwrap().is_none(),
+                "no cleanup-pending debt marker without a durable floor"
+            );
+            // Nothing was discarded or compacted: full history intact.
+            assert_eq!(
+                store.read_attempts_raw(TARGET).unwrap().len(),
+                history.len()
+            );
+            assert_eq!(
+                store.read_snapshots_raw(TARGET).unwrap().len(),
+                ok_ids.len()
+            );
+            for id in &below_floor_ids {
+                assert!(
+                    store.deployment_dir(id).exists(),
+                    "nothing below a nonexistent floor is ever deleted: {id}"
+                );
+            }
+            return;
+        }
+
+        // (b) EVERY post-marker failure is COMMITTED WITH A WARNING: the
+        // checkpoint took effect while the cleanup could not complete, so
+        // the command reports SUCCESS with cleanup_pending set — never Err.
+        let rep = res.expect("a post-marker failure is committed-with-warning, never an Err");
+        assert!(rep.established);
+        assert_eq!(rep.snapshot_index, floor_index);
+
+        // The floor is DURABLE and the readers never expose history below
+        // it — the core property.
         let marker = store.read_history_floor(TARGET).unwrap().unwrap();
         assert_eq!(marker.snapshot_index, floor_index);
         assert_eq!(marker.deployment_id.as_str(), target_id);
@@ -1268,19 +1477,109 @@ mod tests {
             );
         }
 
-        // Repeating the same checkpoint either finishes the interrupted
-        // compaction or is a clean no-op — never an error, never a backward
-        // move. Because the reordered compaction deletes FIRST, an
-        // interruption in ANY phase leaves the worklist re-derivable from
-        // the (intact or already-rewritten) logs; a floor at index 0 has
-        // nothing below it to repair, everything else is repaired by the
-        // repeat.
+        // Boundary case: the checkpoint sits at the very FIRST attempt (the
+        // floor is at index 0 with nothing below it), so the compaction has
+        // NOTHING to do — the armed post-marker fault is never reached and
+        // there is legitimately no pending cleanup: success, no debt marker.
+        if below_floor_ids.is_empty() {
+            assert!(
+                !rep.cleanup_pending,
+                "a floor with nothing below it has no cleanup to pend"
+            );
+            assert!(
+                store.read_cleanup_pending(TARGET).unwrap().is_none(),
+                "no debt marker when there is no pending cleanup"
+            );
+            // The re-run stays a no-op (the armed fault is never reached).
+            let retry =
+                run_checkpoint(&store, TARGET, &DeploymentId::new(target_id.clone()), false)
+                    .expect("the repeated checkpoint converges");
+            assert!(!retry.established && !retry.cleanup_pending);
+            return;
+        }
+
+        // The DURABLE debt marker records the pending cleanup and the CLI
+        // render includes the explicit warning line.
+        assert!(
+            rep.cleanup_pending,
+            "the armed compaction is surfaced as cleanup_pending"
+        );
+        let pending = store
+            .read_cleanup_pending(TARGET)
+            .unwrap()
+            .expect("a durable cleanup-pending marker records the debt");
+        assert_eq!(pending.schema_version, SCHEMA_VERSION);
+        assert_eq!(pending.target, TargetName::new(TARGET.to_string()));
+        assert_eq!(pending.deployment_id.as_str(), target_id);
+        assert_eq!(pending.snapshot_index, floor_index);
+        assert!(!pending.established_at.is_empty());
+        // Same SET as the below-floor dirs; the discard enumeration's
+        // documented order is snapshot-first — compare sorted.
+        let mut recorded = pending.pending_deployments.clone();
+        recorded.sort_unstable();
+        let mut expected = below_floor_ids.clone();
+        expected.sort_unstable();
+        assert_eq!(
+            recorded, expected,
+            "the marker records exactly the below-floor dirs still to delete"
+        );
+        let lines = render_checkpoint_report(&rep);
+        assert!(
+            lines.iter().any(|l| l.contains("cleanup pending")),
+            "the render must warn about pending cleanup, got: {lines:?}"
+        );
+
+        // (c) The fault is one-shot (now disarmed): re-running the SAME
+        // checkpoint converges — Ok, no cleanup_pending, the debt marker
+        // clears, and the physical logs are compacted to the suffix with no
+        // below-floor deployment dirs/files left.
         let retry = run_checkpoint(&store, TARGET, &DeploymentId::new(target_id.clone()), false)
             .expect("a repeated checkpoint after interruption must succeed");
+        assert!(
+            !retry.cleanup_pending,
+            "converged: no cleanup pending on the re-run"
+        );
+        assert!(
+            store.read_cleanup_pending(TARGET).unwrap().is_none(),
+            "the debt marker clears once the cleanup completes"
+        );
         let marker_after = store.read_history_floor(TARGET).unwrap().unwrap();
         assert_eq!(marker_after.snapshot_index, floor_index);
         let visible_after = store.read_snapshots(TARGET).unwrap();
         assert!(visible_after.iter().all(|s| s.index >= floor_index));
+        assert_eq!(visible_after[0].index, floor_index);
+        // Physical convergence: the RAW logs hold only the suffix and every
+        // below-floor deployment dir is deleted (the at/above-floor ones
+        // remain).
+        let raw_snaps = store.read_snapshots_raw(TARGET).unwrap();
+        assert!(
+            raw_snaps.iter().all(|s| s.index >= floor_index),
+            "no below-floor snapshot lines remain after convergence"
+        );
+        let raw_attempts = store.read_attempts_raw(TARGET).unwrap();
+        let keep_from = raw_attempts
+            .iter()
+            .position(|a| a.deployment_id.as_str() == target_id)
+            .expect("the checkpoint's own attempt is retained");
+        assert!(
+            raw_attempts[..keep_from].is_empty(),
+            "no below-floor attempt lines remain after convergence"
+        );
+        for (n, _) in history.iter().enumerate() {
+            let id = format!("deploy-{n:04}");
+            if n < target_pos {
+                assert!(
+                    !store.deployment_dir(&id).exists(),
+                    "below-floor dir {id} must be deleted on convergence"
+                );
+            } else {
+                assert!(
+                    store.deployment_dir(&id).exists(),
+                    "at/above-floor dir {id} must remain"
+                );
+            }
+        }
+
         if floor_index > 0 {
             assert!(
                 retry.established,

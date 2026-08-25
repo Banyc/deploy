@@ -250,6 +250,37 @@ pub struct HistoryFloor {
     pub established_at: String,
 }
 
+/// A durable debt marker for an INTERRUPTED checkpoint cleanup: the history
+/// floor (the COMMIT POINT) is durable, but the post-commit physical
+/// compaction did not complete. Persisted at
+/// `targets/<target>/refs/cleanup-pending.json` AFTER the floor marker is
+/// written, whenever any post-marker phase of the compaction fails — the
+/// checkpoint TOOK EFFECT while the command reports SUCCESS with this
+/// marker set. The next `deploy checkpoint <target> <deployment-id>` (the
+/// same deployment) retries the cleanup and clears the marker once it
+/// completes; the marker records exactly which below-floor
+/// `deployments/<id>/` directories still need deletion, so a retry can
+/// finish them even after the physical logs are already compacted.
+/// `schema_version` is exactly [`crate::model::SCHEMA_VERSION`]; readers
+/// refuse any other version (fail closed).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupPending {
+    pub schema_version: u32,
+    pub target: TargetName,
+    pub deployment_id: DeploymentId,
+    /// The snapshot index the floor sits at — the pending cleanup is the
+    /// compaction FOR THIS floor.
+    pub snapshot_index: u64,
+    /// When the pending cleanup was recorded (RFC 3339).
+    pub established_at: String,
+    /// The below-floor `deployments/<id>/` directories an interrupted
+    /// compaction had not yet deleted. A retry deletes exactly these (plus
+    /// anything the current physical logs still name below the floor), so
+    /// an interruption that finished the log rewrites but faulted before
+    /// the deletions still converges.
+    pub pending_deployments: Vec<String>,
+}
+
 /// Observed remote state for one placement slot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ObservedServer {
