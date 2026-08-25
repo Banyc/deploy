@@ -129,15 +129,17 @@ pub(crate) mod test_faults {
         /// FIRST durable step of a checkpoint; a failure here leaves no
         /// floor (and therefore no compaction).
         WriteHistoryFloor,
-        /// The checkpoint's attempts.jsonl suffix rewrite (the first
-        /// compaction phase, after the floor marker is already durable).
+        /// The checkpoint's attempts.jsonl suffix rewrite (a compaction
+        /// phase after the floor marker is already durable and the
+        /// below-floor deployment dirs are deleted).
         CompactAttempts,
-        /// The checkpoint's snapshots.jsonl suffix rewrite (the second
-        /// compaction phase, after the floor marker is already durable).
+        /// The checkpoint's snapshots.jsonl suffix rewrite (a compaction
+        /// phase after the floor marker is already durable and the
+        /// below-floor deployment dirs are deleted).
         CompactSnapshots,
-        /// The checkpoint's `deployments/<id>/` directory deletion (the
-        /// third compaction phase, after the floor marker is already
-        /// durable).
+        /// The checkpoint's `deployments/<id>/` directory deletion — the
+        /// FIRST compaction phase, running while the logs still name every
+        /// discarded id (the floor marker is already durable).
         CompactDeployments,
     }
 

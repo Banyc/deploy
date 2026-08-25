@@ -23,19 +23,22 @@
 //! 1. The floor marker is written FIRST, durably (atomic temp+rename +
 //!    directory fsync in [`LocalStore::write_history_floor`]).
 //! 2. THEN the physical compaction runs ([`LocalStore::checkpoint_compact`]):
+//!    delete the `deployments/<id>/` dirs strictly before the floor, then
 //!    atomically rewrite `attempts.jsonl` and `snapshots.jsonl` to the
-//!    suffix at/after the floor, then delete `deployments/<id>/` dirs
-//!    strictly before it.
+//!    suffix at/after the floor.
 //!
 //! Because the floor is durable-before-delete and EVERY read path is gated by
 //! it ([`LocalStore::read_attempts`], [`LocalStore::read_snapshots`], and
 //! ref resolution in [`crate::history::resolve_ref_expr`]), an interrupted
 //! compaction leaves either the old physical files or the compacted files —
 //! never visible history below the durable floor. The floor is the
-//! ENFORCEMENT point; the physical cleanup is best-effort (leftover
-//! below-floor artifacts are invisible and harmless). Re-running the same
-//! checkpoint after an interruption finishes the compaction; re-running it on
-//! an already-compacted target is a pure idempotent no-op.
+//! ENFORCEMENT point; the physical cleanup is best-effort. The deletion runs
+//! BEFORE the log rewrites so its worklist stays re-derivable from the logs:
+//! a retry after an interruption recomputes the same discard set from the
+//! still-intact (or already-rewritten) logs and converges — the deletion
+//! worklist is never lost to an interrupted rewrite. Re-running the same
+//! checkpoint after an interruption finishes the compaction; re-running it
+//! on an already-compacted target is a pure idempotent no-op.
 //!
 //! # Concurrency
 //!
@@ -1141,10 +1144,14 @@ mod tests {
     }
 
     proptest! {
-        // Interrupted cleanup: the compaction is faulted mid-way (rewrite or
-        // deletion phase) AFTER the floor marker is durable. The visible
+        // Interrupted cleanup: the compaction is faulted mid-way (deletion
+        // or rewrite phase) AFTER the floor marker is durable. The visible
         // history must NEVER dip below the durable floor, the checkpoint
         // snapshot stays resolvable, and the below-floor refs stay refused.
+        // The seeded history always includes a FAILED attempt (a deployment
+        // dir with NO snapshot) below any non-zero floor, so the retry must
+        // also converge to delete the failed-without-snapshot dirs from the
+        // ORIGINAL worklist.
         #![proptest_config(ProptestConfig {
             cases: 16,
             rng_seed: RngSeed::Fixed(0x5EED_1D57),
@@ -1163,9 +1170,15 @@ mod tests {
     }
 
     fn run_interrupted_cleanup_case(history_in: &[bool], checkpoint_at: usize, phase: usize) {
-        // Prepend a guaranteed success so the checkpoint always has a
-        // successful deployment to target.
-        let mut history = vec![true];
+        // Prepend a guaranteed success (so the checkpoint always has a
+        // successful deployment to target) followed by a guaranteed FAILED
+        // attempt: a `deployments/<id>/` dir with NO snapshot line. The
+        // failed attempt sits strictly below any non-zero floor, so every
+        // case that discards anything genuinely exercises the
+        // failed-attempt-without-snapshot dir cleanup (only its
+        // attempts.jsonl line names such a dir — nothing else can
+        // re-enumerate it once the log is rewritten).
+        let mut history = vec![true, false];
         history.extend_from_slice(history_in);
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
@@ -1182,6 +1195,26 @@ mod tests {
         );
         let target_id = ok_ids[checkpoint_at % ok_ids.len()].clone();
         let floor_index = ok_ids.iter().position(|id| *id == target_id).unwrap() as u64;
+
+        // The ORIGINAL discard worklist, enumerated from the still-intact
+        // seeded logs exactly as the compaction's first call does — this is
+        // the deletion list an interruption must never lose. Captured before
+        // any fault, so the retry assertions can demand every one of these
+        // dirs (including the failed-without-snapshot ones) is absent.
+        let floor = plan_floor(&store, TARGET, &DeploymentId::new(target_id.clone()))
+            .expect("the checkpoint deployment is a success, so it has a snapshot");
+        let original = store
+            .checkpoint_discards(TARGET, &floor)
+            .expect("the pre-compaction logs enumerate the full discard worklist");
+        if floor_index > 0 {
+            assert!(
+                original
+                    .discarded_deployments
+                    .iter()
+                    .any(|id| id == "deploy-0001"),
+                "the failed-without-snapshot attempt below the floor is in the original worklist"
+            );
+        }
 
         // Arm the compaction fault for the phase under test (keyed by the
         // checkpoint deployment id).
@@ -1237,22 +1270,44 @@ mod tests {
 
         // Repeating the same checkpoint either finishes the interrupted
         // compaction or is a clean no-op — never an error, never a backward
-        // move.
+        // move. Because the reordered compaction deletes FIRST, an
+        // interruption in ANY phase leaves the worklist re-derivable from
+        // the (intact or already-rewritten) logs; a floor at index 0 has
+        // nothing below it to repair, everything else is repaired by the
+        // repeat.
         let retry = run_checkpoint(&store, TARGET, &DeploymentId::new(target_id.clone()), false)
             .expect("a repeated checkpoint after interruption must succeed");
         let marker_after = store.read_history_floor(TARGET).unwrap().unwrap();
         assert_eq!(marker_after.snapshot_index, floor_index);
         let visible_after = store.read_snapshots(TARGET).unwrap();
         assert!(visible_after.iter().all(|s| s.index >= floor_index));
-        // A floor at index 0 has nothing to compact (no lines below it), so
-        // an interruption there leaves nothing to repair; a floor that
-        // discards something is repaired by the repeat (rewrite-phase
-        // interruption) or already complete (delete-phase interruption).
-        if phase != 2 && floor_index > 0 {
+        if floor_index > 0 {
             assert!(
                 retry.established,
-                "rewrite-phase interruption is repaired by the repeat"
+                "an interruption in every compaction phase is repaired by the repeat"
             );
         }
+        // The retry converges the compaction: every dir in the ORIGINAL
+        // discard worklist is gone from disk (explicitly including the
+        // failed-without-snapshot dirs, which only the attempts log names)
+        // and both logs end compacted to the suffix — the deletion worklist
+        // was never lost to the interrupted run.
+        for id in &original.discarded_deployments {
+            assert!(
+                !store.deployment_dir(id).exists(),
+                "originally-discarded deployment dir {id} must be absent after the retry"
+            );
+        }
+        let attempts_after = store.read_attempts_raw(TARGET).unwrap();
+        assert_eq!(
+            attempts_after[0].deployment_id.as_str(),
+            target_id,
+            "the retry converges the attempts log to the checkpoint suffix"
+        );
+        let snaps_after = store.read_snapshots_raw(TARGET).unwrap();
+        assert!(
+            snaps_after.iter().all(|s| s.index >= floor_index),
+            "the retry converges the snapshots log to the floor suffix"
+        );
     }
 }

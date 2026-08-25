@@ -912,62 +912,39 @@ impl LocalStore {
     /// `floor` (the compaction half of a checkpoint; the floor marker must
     /// already be durable — [`LocalStore::write_history_floor`] first):
     ///
-    /// 1. Atomically rewrite `attempts.jsonl` to the checkpoint's own
-    ///    attempt and everything after it.
-    /// 2. Atomically rewrite `snapshots.jsonl` to `index >= floor.snapshot_index`.
-    /// 3. Delete every `deployments/<id>/` directory strictly before the
+    /// 1. Delete every `deployments/<id>/` directory strictly before the
     ///    floor.
+    /// 2. Atomically rewrite `attempts.jsonl` to the checkpoint's own
+    ///    attempt and everything after it.
+    /// 3. Atomically rewrite `snapshots.jsonl` to `index >= floor.snapshot_index`.
     ///
-    /// Each rewrite is a temp+rename so a reader never sees a torn log, and
-    /// the floor marker already gates every read path — an interruption at
-    /// any point leaves the durable floor bounding the visible history (old
-    /// physical files remain but are invisible below the floor). The delete
-    /// set is captured from the pre-compaction logs, so a compaction that
-    /// finished the rewrites but crashed before deleting still removes the
-    /// below-floor snapshot dirs on a later retry (failed-attempt dirs below
-    /// the floor survive an interrupted run only as invisible, harmless
-    /// artifacts — the floor is the enforcement point, not the cleanup).
+    /// The deletion runs FIRST because it is the only phase whose worklist
+    /// lives solely in memory: [`LocalStore::checkpoint_discards`] derives
+    /// it from the RAW logs at the start of THIS call. Deleting before the
+    /// log rewrites keeps that derivation source intact, so an interruption
+    /// at ANY point (and any subsequent retry) recomputes the same list from
+    /// the still-intact — or already-rewritten — logs and converges:
+    /// already-removed dirs are skipped by `dir.exists()`, and the
+    /// temp+rename rewrites leave old-or-new logs. Reversing the order would
+    /// lose the worklist permanently: once the logs are compacted the
+    /// discarded ids are gone from them, so a retry could never re-enumerate
+    /// — let alone delete — the below-floor directories (failed attempts own
+    /// a `deployments/<id>/` dir but NO snapshot line, so nothing else names
+    /// them). Delete-first is safe because the durable floor already gates
+    /// every read path (`read_attempts`/`read_snapshots`/ref resolution),
+    /// so deleting first can never expose discarded history.
     pub fn checkpoint_compact(&self, target: &str, floor: &HistoryFloor) -> Result<()> {
+        // Recomputed from the CURRENT (still-intact or already-rewritten)
+        // logs on every call — this is what makes an interrupted compaction
+        // converge on retry, so it must run BEFORE any log rewrite below.
         let discards = self.checkpoint_discards(target, floor)?;
 
-        // 1. attempts.jsonl → the suffix from the checkpoint's own attempt.
-        #[cfg(test)]
-        if self
-            .fault_registry
-            .consume(FaultKind::CompactAttempts, floor.deployment_id.as_str())
-        {
-            return Err(Error::store(
-                "test fault: checkpoint attempts rewrite forced to fail once",
-            ));
-        }
-        let attempts = self.read_attempts_raw(target)?;
-        let pos = attempts
-            .iter()
-            .position(|a| a.deployment_id == floor.deployment_id);
-        let keep = pos.map(|p| &attempts[p..]).unwrap_or(&attempts[..]);
-        write_jsonl_atomic(&self.target_dir(target).join("attempts.jsonl"), keep)?;
-
-        // 2. snapshots.jsonl → the suffix at/after the floor.
-        #[cfg(test)]
-        if self
-            .fault_registry
-            .consume(FaultKind::CompactSnapshots, floor.deployment_id.as_str())
-        {
-            return Err(Error::store(
-                "test fault: checkpoint snapshots rewrite forced to fail once",
-            ));
-        }
-        let snapshots = self.read_snapshots_raw(target)?;
-        let keep_snaps: Vec<DeploymentSnapshot> = snapshots
-            .iter()
-            .filter(|s| s.index >= floor.snapshot_index)
-            .cloned()
-            .collect();
-        write_jsonl_atomic(&self.refs_dir(target).join("snapshots.jsonl"), &keep_snaps)?;
-
-        // 3. Delete deployment dirs strictly before the floor (only the
+        // 1. Delete deployment dirs strictly below the floor (only the
         //    deployment ids the target's own history names — never a
         //    directory of another target, never releases/objects/servers).
+        //    First, while the logs still name every discarded id; a retry
+        //    recomputes this same worklist from the intact logs and
+        //    `dir.exists()` skips the dirs an interrupted pass removed.
         #[cfg(test)]
         if self
             .fault_registry
@@ -985,6 +962,42 @@ impl LocalStore {
                 })?;
             }
         }
+
+        // 2. attempts.jsonl → the suffix from the checkpoint's own attempt.
+        #[cfg(test)]
+        if self
+            .fault_registry
+            .consume(FaultKind::CompactAttempts, floor.deployment_id.as_str())
+        {
+            return Err(Error::store(
+                "test fault: checkpoint attempts rewrite forced to fail once",
+            ));
+        }
+        let attempts = self.read_attempts_raw(target)?;
+        let pos = attempts
+            .iter()
+            .position(|a| a.deployment_id == floor.deployment_id);
+        let keep = pos.map(|p| &attempts[p..]).unwrap_or(&attempts[..]);
+        write_jsonl_atomic(&self.target_dir(target).join("attempts.jsonl"), keep)?;
+
+        // 3. snapshots.jsonl → the suffix at/after the floor.
+        #[cfg(test)]
+        if self
+            .fault_registry
+            .consume(FaultKind::CompactSnapshots, floor.deployment_id.as_str())
+        {
+            return Err(Error::store(
+                "test fault: checkpoint snapshots rewrite forced to fail once",
+            ));
+        }
+        let snapshots = self.read_snapshots_raw(target)?;
+        let keep_snaps: Vec<DeploymentSnapshot> = snapshots
+            .iter()
+            .filter(|s| s.index >= floor.snapshot_index)
+            .cloned()
+            .collect();
+        write_jsonl_atomic(&self.refs_dir(target).join("snapshots.jsonl"), &keep_snaps)?;
+
         Ok(())
     }
 
