@@ -82,7 +82,15 @@ pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// entry-point [`FaultKind::WriteHistoryFloor`]) are keyed by the
 /// CHECKPOINT deployment id; a failure at ANY of them is returned from
 /// `write_history_floor` itself (PRE-marker), so no floor exists and no
-/// compaction can run.
+/// compaction can run. The cleanup-pending debt-marker kinds are keyed by
+/// the FLOOR'S DEPLOYMENT ID for the WRITE
+/// ([`FaultKind::WriteCleanupPending`] — the marker names it) and by
+/// TARGET for the CLEAR ([`FaultKind::ClearCleanupPending`] — the marker
+/// lives under `targets/<target>/refs/`, mirroring the rotation-debt
+/// kinds). Both fire AFTER the floor marker is durable (post-commit
+/// maintenance): a write failure means the debt could not be made durable
+/// (surfaced as `cleanup_persistence_failed`), a clear failure leaves a
+/// stale marker (surfaced as `cleanup_clear_failed`).
 ///
 /// ISOLATION IS STRUCTURAL: a [`FaultRegistry`] belongs to exactly one
 /// fixture (via its store); there are no process-global slots and no
@@ -200,6 +208,24 @@ pub(crate) mod test_faults {
         /// FIRST compaction phase, running while the logs still name every
         /// discarded id (the floor marker is already durable).
         CompactDeployments,
+        /// The pending-checkpoint-cleanup FLAG marker WRITE
+        /// (`write_cleanup_pending`), keyed by the FLOOR'S DEPLOYMENT ID
+        /// (the marker names it). Post-commit maintenance: a failure here
+        /// means the cleanup debt could NOT be made durable — the report
+        /// must surface it explicitly
+        /// (`CheckpointReport::cleanup_persistence_failed`), never claim
+        /// durable debt that a crash/restart would lose (the retry
+        /// recomputes the worklist from the intact logs and converges
+        /// regardless).
+        WriteCleanupPending,
+        /// The pending-checkpoint-cleanup FLAG marker CLEAR
+        /// (`clear_cleanup_pending`), keyed by TARGET (the marker lives
+        /// under `targets/<target>/refs/`, mirroring the rotation-debt
+        /// kinds). Post-commit maintenance: a failure leaves a STALE
+        /// (harmless) marker that the next same-deployment checkpoint
+        /// re-clears; the report surfaces it truthfully as
+        /// `CheckpointReport::cleanup_clear_failed`.
+        ClearCleanupPending,
     }
 
     /// A per-fixture one-shot fault registry.
@@ -483,6 +509,27 @@ pub(crate) mod test_faults {
         /// below by the durable floor.
         pub(crate) fn arm_compact_deployments(&self, deployment_id: &str) {
             self.arm(FaultKind::CompactDeployments, deployment_id);
+        }
+
+        /// Arm the next cleanup-pending debt-marker WRITE for
+        /// `deployment_id` (the floor's deployment id the marker names) to
+        /// fail once. The write runs AFTER the floor marker is durable
+        /// (post-commit maintenance); a failure is surfaced in the report
+        /// as `cleanup_persistence_failed` — truthful reporting: the
+        /// report never claims durable debt that a crash/restart would
+        /// lose.
+        pub(crate) fn arm_write_cleanup_pending(&self, deployment_id: &str) {
+            self.arm(FaultKind::WriteCleanupPending, deployment_id);
+        }
+
+        /// Arm the next cleanup-pending debt-marker CLEAR for `target` to
+        /// fail once (keyed by target — the marker lives under
+        /// `targets/<target>/refs/`, mirroring the rotation-debt kinds).
+        /// The clear runs after the compaction completes; a failure leaves
+        /// a stale (harmless) marker that the retry re-clears, surfaced in
+        /// the report as `cleanup_clear_failed`.
+        pub(crate) fn arm_clear_cleanup_pending(&self, target: &str) {
+            self.arm(FaultKind::ClearCleanupPending, target);
         }
     }
 }

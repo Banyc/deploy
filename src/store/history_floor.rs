@@ -106,6 +106,20 @@
 //! The next checkpoint of the SAME deployment retries the cleanup; once it
 //! completes, the debt marker clears ([`LocalStore::clear_cleanup_pending`]).
 //!
+//! TRUTHFUL REPORTING: the debt marker's OWN persistence is the last
+//! post-commit failure surface. When [`LocalStore::write_cleanup_pending`]
+//! fails, the cleanup debt could NOT be made durable — the checkpoint flow
+//! must not claim durable debt that a crash/restart would lose, so it sets
+//! `CheckpointReport::cleanup_persistence_failed` while keeping the
+//! in-memory warning; the retry recomputes the worklist from the intact
+//! logs and converges regardless. The clear
+//! ([`LocalStore::clear_cleanup_pending`]) is DURABLE (remove +
+//! parent-directory fsync, so a crash can never resurrect the marker), and
+//! a clear failure is surfaced as `CheckpointReport::cleanup_clear_failed`:
+//! the stale marker stays on disk — harmless, since every read is keyed on
+//! the history floor, never this flag — and the next same-deployment
+//! checkpoint re-clears it.
+//!
 //! The durability primitives (temp naming, the fail-closed parent-dir
 //! fsync, atomic marker/JSONL replacement, parse-sensitive marker reads)
 //! live in [`crate::store::atomic`]; this module implements the
@@ -835,26 +849,75 @@ impl LocalStore {
     }
 
     /// Record the target's pending-checkpoint-cleanup debt durably (atomic
-    /// temp+rename, mirroring [`LocalStore::write_history_floor`]).
+    /// temp+rename, mirroring [`LocalStore::write_history_floor`]). The
+    /// write is itself POST-COMMIT MAINTENANCE, so a failure must NEVER
+    /// turn the checkpoint into an `Err` — the caller decides how to
+    /// surface it (the checkpoint flow sets
+    /// `CheckpointReport::cleanup_persistence_failed`: the report must NOT
+    /// claim durable debt that a crash/restart would lose). The error is
+    /// PROPAGATED here so the caller can tell a durable debt from a lost
+    /// one.
     pub fn write_cleanup_pending(&self, target: &str, pending: &CleanupPending) -> Result<()> {
+        // Fault hook (keyed by the floor's deployment id — the marker's
+        // own anchor), fired BEFORE any I/O: a failure here means the debt
+        // could not be made durable.
+        #[cfg(test)]
+        if self.fault_registry().consume(
+            FaultKind::WriteCleanupPending,
+            pending.deployment_id.as_str(),
+        ) {
+            return Err(Error::store(
+                "test fault: cleanup-pending marker write forced to fail once",
+            ));
+        }
         let bytes = serde_json::to_vec_pretty(pending)
             .map_err(|e| Error::store(format!("serialize cleanup-pending: {e}")))?;
         write_atomic_replace(&self.cleanup_pending_path(target), &bytes)
     }
 
     /// Clear the target's pending-checkpoint-cleanup marker once the
-    /// physical compaction completed. A no-op when no marker exists.
+    /// physical compaction completed. DURABLE removal: the file is removed
+    /// AND the parent directory is fsynced ([`sync_parent_dir`]) — without
+    /// the directory fsync a crash can RESURRECT the marker (the removal
+    /// is not durable until the directory entry is synced). A no-op when
+    /// no marker exists.
+    ///
+    /// A clear failure is itself POST-COMMIT MAINTENANCE: the stale marker
+    /// stays on disk (harmless — every read is keyed on the history floor,
+    /// never this flag) and the next same-deployment checkpoint re-clears
+    /// it; the checkpoint flow surfaces the failure truthfully as
+    /// `CheckpointReport::cleanup_clear_failed`. The error is PROPAGATED
+    /// here so the caller can distinguish a converged clear from a stale
+    /// marker.
     pub fn clear_cleanup_pending(&self, target: &str) -> Result<()> {
         let p = self.cleanup_pending_path(target);
         if p.exists() {
+            // Fault hook (keyed by TARGET — the marker lives under
+            // `targets/<target>/refs/`, mirroring the rotation-debt kinds),
+            // fired BEFORE any I/O: a failure here leaves the marker in
+            // place (stale but harmless).
+            #[cfg(test)]
+            if self
+                .fault_registry()
+                .consume(FaultKind::ClearCleanupPending, target)
+            {
+                return Err(Error::store(
+                    "test fault: cleanup-pending marker clear forced to fail once",
+                ));
+            }
             std::fs::remove_file(&p).map_err(|e| {
                 Error::store(format!(
                     "remove cleanup-pending marker {}: {e}",
                     p.display()
                 ))
             })?;
+            // DURABLE removal: propagate the parent-dir sync error exactly
+            // like every other durability commit point in this module — a
+            // crash must never resurrect the marker.
+            sync_parent_dir(&p)
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
     /// The exact discard set a checkpoint floor applies on `target`: the

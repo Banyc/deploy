@@ -82,6 +82,19 @@
 //! completes, the debt marker clears and the report shows no
 //! `cleanup_pending`.
 //!
+//! TRUTHFUL REPORTING: the debt marker's OWN persistence is itself
+//! post-commit maintenance. When [`LocalStore::write_cleanup_pending`]
+//! fails, the cleanup debt could NOT be made durable — the report must not
+//! claim durable debt that a crash/restart would lose — so it sets
+//! `CheckpointReport::cleanup_persistence_failed` (the CLI prints an
+//! explicit warning) while keeping `cleanup_pending` as the in-memory
+//! warning; a re-run recomputes the worklist from the intact logs and
+//! converges regardless of the marker. Marker removal is DURABLE too
+//! ([`LocalStore::clear_cleanup_pending`]: remove + parent-directory
+//! fsync, so a crash can never resurrect the marker); a clear failure
+//! leaves a STALE marker — harmless, the retry re-clears it — surfaced
+//! truthfully as `CheckpointReport::cleanup_clear_failed`.
+//!
 //! # Concurrency
 //!
 //! The real operation runs under the SAME lock discipline as pushes
@@ -127,6 +140,21 @@ pub struct CheckpointReport {
     /// cleanup completed, on a pure idempotent no-op, and on dry-run
     /// previews.
     pub cleanup_pending: bool,
+    /// True when the durable [`CleanupPending`] debt marker could NOT be
+    /// written — the pending cleanup could not be made durable. This is
+    /// TRUTHFUL REPORTING: the report must never claim durable debt that a
+    /// crash/restart would lose, so when the marker's own persistence fails
+    /// this flag is set explicitly (`cleanup_pending` keeps its in-memory
+    /// warning semantics). The retry recomputes the cleanup worklist from
+    /// the intact logs and converges regardless. False when the marker was
+    /// written, when no marker was needed, and on dry-run previews.
+    pub cleanup_persistence_failed: bool,
+    /// True when the post-commit cleanup COMPLETED but the debt marker
+    /// could not be CLEARED: a stale (harmless — every read is keyed on the
+    /// floor, never this marker) marker remains on disk, and the next
+    /// same-deployment checkpoint re-clears it. False when the clear
+    /// succeeded, when no clear was needed, and on dry-run previews.
+    pub cleanup_clear_failed: bool,
     /// True when the operation ran read-only (`--dry-run`): no locks, no
     /// writes, no compaction.
     pub dry_run: bool,
@@ -284,17 +312,23 @@ fn finish_cleanup(
     };
 
     // Post-marker failure point #1: enumerating the discards is a pure read
-    // over the physical logs; a failure is committed-with-warning too.
+    // over the physical logs; a failure is committed-with-warning too. The
+    // debt-marker write itself is ALSO post-commit maintenance: when it
+    // fails, the report must NOT claim durable debt — it exposes
+    // `cleanup_persistence_failed` instead (the retry recomputes the
+    // worklist from the intact logs and converges regardless).
     let discards = match store.checkpoint_discards(target, floor) {
         Ok(d) => d,
         Err(_) => {
-            record_cleanup_pending(store, target, floor);
+            let persist_failed = record_cleanup_pending(store, target, floor).is_err();
             return Ok(cleanup_report(
                 target,
                 floor,
                 FloorDiscards::default(),
                 established || pending_read_failed || pending.is_some(),
                 true,
+                persist_failed,
+                false,
             ));
         }
     };
@@ -316,32 +350,44 @@ fn finish_cleanup(
             FloorDiscards::default(),
             established,
             false,
+            false,
+            false,
         ));
     }
 
     // Post-marker failure point #2: the compaction itself. On failure the
     // floor stands; record the debt durably (the below-floor dirs still to
-    // delete) and report the warning.
-    let cleanup_pending = match store.checkpoint_compact(target, floor) {
-        Ok(()) => {
-            // The physical cleanup completed: the debt marker clears. A
-            // clear failure is itself post-commit maintenance — the stale
-            // marker is retried by the next same-deployment checkpoint — so
-            // it is absorbed and the report stays success.
-            store.clear_cleanup_pending(target).ok();
-            false
-        }
-        Err(_) => {
-            record_cleanup_pending(store, target, floor);
-            true
-        }
-    };
+    // delete) and report the warning. The debt marker's OWN persistence is
+    // the last failure surface: if it cannot be written, the report exposes
+    // `cleanup_persistence_failed` (truthful reporting — a crash/restart
+    // would lose the debt) instead of claiming durable debt.
+    let (cleanup_pending, persist_failed, clear_failed) =
+        match store.checkpoint_compact(target, floor) {
+            Ok(()) => {
+                // The physical cleanup completed: the debt marker clears
+                // DURABLY (remove + parent-dir fsync). A clear failure is
+                // itself post-commit maintenance — the STALE marker
+                // (harmless: every read is keyed on the floor, never the
+                // debt marker) is retried by the next same-deployment
+                // checkpoint — and is surfaced truthfully as
+                // `cleanup_clear_failed` so the report never claims a clean
+                // converged state while a stale marker is on disk.
+                let clear_failed = store.clear_cleanup_pending(target).is_err();
+                (false, false, clear_failed)
+            }
+            Err(_) => {
+                let persist_failed = record_cleanup_pending(store, target, floor).is_err();
+                (true, persist_failed, false)
+            }
+        };
     Ok(cleanup_report(
         target,
         floor,
         discards,
         established || needs_repair,
         cleanup_pending,
+        persist_failed,
+        clear_failed,
     ))
 }
 
@@ -352,6 +398,8 @@ fn cleanup_report(
     discards: FloorDiscards,
     established: bool,
     cleanup_pending: bool,
+    cleanup_persistence_failed: bool,
+    cleanup_clear_failed: bool,
 ) -> CheckpointReport {
     CheckpointReport {
         target: target.to_string(),
@@ -360,6 +408,8 @@ fn cleanup_report(
         discards,
         established,
         cleanup_pending,
+        cleanup_persistence_failed,
+        cleanup_clear_failed,
         dry_run: false,
     }
 }
@@ -368,13 +418,14 @@ fn cleanup_report(
 /// itself POST-COMMIT MAINTENANCE: a marker-write failure must never turn
 /// the checkpoint into an `Err` (the floor already stands, and the next
 /// same-deployment checkpoint re-runs the cleanup from the physical logs
-/// regardless of the marker), so the write error is absorbed and the report
-/// still carries the warning. The marker is a FLAG ONLY — it carries no
-/// deletion worklist (the logs retain it; see
+/// regardless of the marker), so the caller maps a write failure to
+/// `CheckpointReport::cleanup_persistence_failed` — the report must NOT
+/// claim durable debt that a crash/restart would lose. The marker is a
+/// FLAG ONLY — it carries no deletion worklist (the logs retain it; see
 /// [`crate::store::local::LocalStore::checkpoint_compact`]) — its
 /// `target`/`deployment_id`/`snapshot_index` fields exist purely for the
 /// integrity binding on read.
-fn record_cleanup_pending(store: &LocalStore, target: &str, floor: &HistoryFloor) {
+fn record_cleanup_pending(store: &LocalStore, target: &str, floor: &HistoryFloor) -> Result<()> {
     let pending = CleanupPending {
         schema_version: CLEANUP_PENDING_SCHEMA_VERSION,
         target: TargetName::new(target.to_string()),
@@ -382,7 +433,7 @@ fn record_cleanup_pending(store: &LocalStore, target: &str, floor: &HistoryFloor
         snapshot_index: floor.snapshot_index,
         established_at: crate::remote::helper::now_rfc3339(),
     };
-    let _ = store.write_cleanup_pending(target, &pending);
+    store.write_cleanup_pending(target, &pending)
 }
 
 /// The read-only preview (`--dry-run`): the same validation (successful
@@ -402,6 +453,8 @@ fn preview_checkpoint(
         discards,
         established: false,
         cleanup_pending: false,
+        cleanup_persistence_failed: false,
+        cleanup_clear_failed: false,
         dry_run: true,
     })
 }
@@ -474,6 +527,24 @@ pub fn render_checkpoint_report(report: &CheckpointReport) -> Vec<String> {
     if report.cleanup_pending {
         lines.push(format!(
             "warning: checkpoint established; cleanup pending — re-run `deploy checkpoint {} {}` to converge",
+            report.target, report.deployment_id
+        ));
+    }
+    // The debt marker's OWN persistence failed: the report must NOT claim
+    // durable debt — this line is the explicit, truthful signal that a
+    // crash/restart would lose the pending-cleanup state (the retry
+    // recomputes it from the logs and converges).
+    if report.cleanup_persistence_failed {
+        lines.push(format!(
+            "warning: cleanup pending but the debt marker could not be persisted — re-run `deploy checkpoint {} {}` to converge",
+            report.target, report.deployment_id
+        ));
+    }
+    // The cleanup completed but the debt-marker CLEAR failed: a stale
+    // (harmless) marker remains on disk; the retry re-clears it.
+    if report.cleanup_clear_failed {
+        lines.push(format!(
+            "warning: cleanup completed but the pending-cleanup marker could not be cleared (a stale marker remains) — re-run `deploy checkpoint {} {}` to converge",
             report.target, report.deployment_id
         ));
     }
@@ -1633,6 +1704,335 @@ mod tests {
             snaps_after.iter().all(|s| s.index >= floor_index),
             "the retry converges the snapshots log to the floor suffix"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // DURABLE-DEBT TRUTHFULNESS (the persistence-failure property)
+    // ---------------------------------------------------------------------
+
+    /// One durable-debt truthfulness case: the FULL matrix over (cleanup
+    /// outcome: SUCCESS | a compaction phase FAILS → pending) × (debt-marker
+    /// WRITE failure | success) × (debt-marker CLEAR failure | success),
+    /// with a REOPEN — after the run, a FRESH [`LocalStore`] is constructed
+    /// over the SAME base dir (simulating a crash/restart) and the durable
+    /// state is re-read.
+    ///
+    /// THE CLEAR PATH NEEDS A MARKER: a fresh run's success path clears a
+    /// marker that was never written, so the clear-failure cells first seed
+    /// the durable-debt state — an earlier interrupted checkpoint (a
+    /// compaction fault with a fault-free marker write) — exactly the state
+    /// a crash/restart would reopen into, and then run the matrix cell.
+    ///
+    /// THE INVARIANT: a run that claims cleanup debt (or reports a
+    /// marker-write/clear failure) must be TRUTHFUL — EITHER the durable
+    /// debt survives the reopen (`read_cleanup_pending` finds the marker /
+    /// `cleanup_pending_path` exists) OR the report explicitly says the
+    /// marker could not be persisted (`cleanup_persistence_failed`). The
+    /// one all-clean cell claims nothing and owes nothing. AND a RETRY
+    /// always converges: re-running the checkpoint on the reopened store
+    /// (faults disarmed — a fresh store has an empty per-fixture registry)
+    /// ends with the marker gone, the logs compacted to the suffix, and no
+    /// below-floor exposure at any point.
+    fn run_debt_truthfulness_case(
+        history_in: &[bool],
+        checkpoint_at: usize,
+        cleanup_fails: bool,
+        write_fails: bool,
+        clear_fails: bool,
+    ) {
+        // Seeded prefix (mirroring the commit-point test): a guaranteed
+        // success then a guaranteed FAILED attempt — a `deployments/<id>/`
+        // dir with NO snapshot line — so every case has below-floor material
+        // (the failed attempt's dir is named only by its attempts.jsonl
+        // line, the worklist the logs must retain).
+        let mut history = vec![true, false];
+        history.extend_from_slice(history_in);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        seed_history(&store, TARGET, "deploy", &history);
+        let ok_ids: Vec<String> = history
+            .iter()
+            .enumerate()
+            .filter(|(_, ok)| **ok)
+            .map(|(n, _)| format!("deploy-{n:04}"))
+            .collect();
+        assert!(
+            ok_ids.len() >= 2,
+            "the seeded prefix plus the filtered history guarantee >= 2 successes"
+        );
+        // Never the FIRST success: every case has a real below-floor prefix,
+        // so the compaction genuinely runs and the armed cleanup/clear
+        // faults are reachable.
+        let target_id = ok_ids[1 + checkpoint_at % (ok_ids.len() - 1)].clone();
+        let floor_index = ok_ids.iter().position(|id| *id == target_id).unwrap() as u64;
+        let target_pos = history
+            .iter()
+            .enumerate()
+            .find(|(n, _)| format!("deploy-{n:04}") == target_id)
+            .unwrap()
+            .0;
+        assert!(floor_index > 0, "the checkpoint is never the first success");
+
+        // SEED the durable-debt state when the cell faults the CLEAR: the
+        // clear is only reachable when a marker exists on disk, so first
+        // replay an EARLIER interrupted checkpoint — a compaction fault with
+        // a fault-free marker write — leaving the durable debt marker (plus
+        // intact logs and below-floor dirs already deleted) exactly as a
+        // crash/restart would find it. The one-shot compact fault is then
+        // re-armed below for the matrix cell.
+        if clear_fails {
+            store.fault_registry().arm_compact_attempts(&target_id);
+            let p1 = run_checkpoint(&store, TARGET, &DeploymentId::new(target_id.clone()), false)
+                .expect("the seeding run commits with a warning, never an Err");
+            assert!(p1.cleanup_pending, "the seeding run leaves cleanup pending");
+            assert!(
+                !p1.cleanup_persistence_failed,
+                "the seeding run persists the debt"
+            );
+            assert!(
+                !p1.cleanup_clear_failed,
+                "the seeding run has no clear failure"
+            );
+            assert!(
+                store.read_cleanup_pending(TARGET, None).unwrap().is_some(),
+                "the seeding run leaves the durable debt marker"
+            );
+        }
+
+        // Arm EXACTLY the matrix cell's faults: a compaction phase
+        // (cleanup_fails), the debt-marker write (write_fails — only reached
+        // when the cleanup fails), and the debt-marker clear (clear_fails —
+        // only reached when the cleanup succeeds on a marker-bearing
+        // fixture). Unreachable arms simply stay in this fixture's registry
+        // and never fire (the reopen uses a fresh store with an empty
+        // registry).
+        if cleanup_fails {
+            store.fault_registry().arm_compact_attempts(&target_id);
+        }
+        if write_fails {
+            store.fault_registry().arm_write_cleanup_pending(&target_id);
+        }
+        if clear_fails {
+            store.fault_registry().arm_clear_cleanup_pending(TARGET);
+        }
+        let rep = run_checkpoint(&store, TARGET, &DeploymentId::new(target_id.clone()), false)
+            .expect("post-commit maintenance failures are committed-with-warning, never an Err");
+        assert!(rep.established);
+        assert_eq!(rep.snapshot_index, floor_index);
+
+        // The report's flags EXACTLY match the matrix cell (truthful
+        // reporting in both directions — no phantom pending, no silently
+        // absorbed persistence/clear failure).
+        assert_eq!(
+            rep.cleanup_pending, cleanup_fails,
+            "cleanup_pending must reflect the compaction outcome"
+        );
+        assert_eq!(
+            rep.cleanup_persistence_failed,
+            cleanup_fails && write_fails,
+            "the persistence-failure flag is set iff the debt-marker write faulted"
+        );
+        assert_eq!(
+            rep.cleanup_clear_failed,
+            !cleanup_fails && clear_fails,
+            "the clear-failure flag is set iff the debt-marker clear faulted on the success path"
+        );
+
+        // The CLI render carries the explicit truthfulness lines: the
+        // persistence failure warns that the marker could not be made
+        // durable, and the clear failure warns that a stale marker remains.
+        let lines = render_checkpoint_report(&rep);
+        if rep.cleanup_persistence_failed {
+            assert!(
+                lines.iter().any(|l| l.contains("could not be persisted")),
+                "the render must expose the persistence failure, got: {lines:?}"
+            );
+        }
+        if rep.cleanup_clear_failed {
+            assert!(
+                lines.iter().any(|l| l.contains("stale marker")),
+                "the render must expose the clear failure, got: {lines:?}"
+            );
+        }
+
+        // REOPEN: a FRESH LocalStore over the SAME base dir — simulating a
+        // crash/restart. Its per-fixture fault registry is EMPTY, so the
+        // retry below runs fault-free by construction.
+        let reopened = LocalStore::with_base(store.base().to_path_buf()).unwrap();
+        let durable_debt = reopened
+            .read_cleanup_pending(TARGET, None)
+            .unwrap()
+            .is_some()
+            || reopened.cleanup_pending_path(TARGET).exists();
+
+        // THE INVARIANT: whenever the run claims debt (or reports a
+        // marker-write/clear failure), the durable state after a
+        // crash/restart agrees — EITHER the durable debt survives the
+        // reopen OR the report explicitly says the marker could not be
+        // persisted. A run that reports a fully clean outcome claims
+        // nothing and owes nothing.
+        if rep.cleanup_pending || rep.cleanup_clear_failed || rep.cleanup_persistence_failed {
+            assert!(
+                durable_debt || rep.cleanup_persistence_failed,
+                "matrix cell (cleanup_fails={cleanup_fails}, write_fails={write_fails}, \
+                 clear_fails={clear_fails}): the report claims cleanup debt/failure but neither \
+                 durable debt survived the reopen nor did the report say persistence failed"
+            );
+        }
+
+        // NO BELOW-FLOOR EXPOSURE AT ANY POINT: even in the write-failure
+        // cell (no debt marker on disk) the DURABLE FLOOR gates every read
+        // — the reopened store exposes exactly the suffix and refuses
+        // below-floor refs.
+        let visible = reopened.read_snapshots(TARGET).unwrap();
+        assert!(
+            visible.iter().all(|s| s.index >= floor_index),
+            "the reopened store never exposes history below the durable floor"
+        );
+        assert_eq!(visible[0].index, floor_index);
+        let attempts = reopened.read_attempts(TARGET).unwrap();
+        assert_eq!(
+            attempts[0].deployment_id.as_str(),
+            target_id,
+            "the reopened store shows the suffix from the checkpoint's own attempt"
+        );
+        let err = history::resolve_ref_expr(
+            &history::parse_ref_expr(&format!("s{}", floor_index - 1)).unwrap(),
+            TARGET,
+            &reopened,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("history floor") || err.to_string().contains("no snapshot"),
+            "below-floor refs stay refused after the reopen, got: {err}"
+        );
+
+        // RETRY (faults disarmed): re-running the SAME checkpoint on the
+        // reopened store ALWAYS converges — Ok, no pending, no
+        // persistence/clear failure, the debt marker gone, and the physical
+        // logs compacted to the suffix.
+        let retry = run_checkpoint(
+            &reopened,
+            TARGET,
+            &DeploymentId::new(target_id.clone()),
+            false,
+        )
+        .expect("the retry converges, never an Err");
+        assert!(!retry.cleanup_pending, "converged: no cleanup pending");
+        assert!(
+            !retry.cleanup_persistence_failed,
+            "converged: no persistence failure on the retry"
+        );
+        assert!(
+            !retry.cleanup_clear_failed,
+            "converged: no clear failure on the retry"
+        );
+        // A converged retry that had to REPAIR anything (a faulted first run
+        // or a stale marker to re-clear) reports established; the all-clean
+        // cell's retry is a pure idempotent no-op.
+        assert_eq!(retry.established, cleanup_fails || clear_fails);
+        assert!(
+            reopened
+                .read_cleanup_pending(TARGET, None)
+                .unwrap()
+                .is_none(),
+            "converged: no durable debt after the retry"
+        );
+        assert!(
+            !reopened.cleanup_pending_path(TARGET).exists(),
+            "converged: the debt marker file is gone"
+        );
+        let raw_attempts = reopened.read_attempts_raw(TARGET).unwrap();
+        assert_eq!(
+            raw_attempts[0].deployment_id.as_str(),
+            target_id,
+            "converged: attempts.jsonl is compacted to the checkpoint suffix"
+        );
+        let raw_snaps = reopened.read_snapshots_raw(TARGET).unwrap();
+        assert!(
+            raw_snaps.iter().all(|s| s.index >= floor_index),
+            "converged: snapshots.jsonl is compacted to the floor suffix"
+        );
+        for (n, _) in history.iter().enumerate() {
+            let id = format!("deploy-{n:04}");
+            if n < target_pos {
+                assert!(
+                    !reopened.deployment_dir(&id).exists(),
+                    "converged: below-floor dir {id} is deleted"
+                );
+            } else {
+                assert!(
+                    reopened.deployment_dir(&id).exists(),
+                    "converged: at/above-floor dir {id} is retained"
+                );
+            }
+        }
+    }
+
+    proptest! {
+        // DURABLE-DEBT TRUTHFULNESS: the bounded, fixed-seed matrix over
+        // (cleanup outcome: SUCCESS | a compaction phase FAILS → pending) ×
+        // (debt-marker WRITE failure | success) × (debt-marker CLEAR
+        // failure | success), each case followed by a REOPEN (a fresh
+        // LocalStore over the same base dir — simulating a crash/restart).
+        // THE INVARIANT: whenever the run claims cleanup debt (or reports a
+        // marker-write/clear failure), EITHER the durable debt survives the
+        // reopen OR the report explicitly says the marker could not be
+        // persisted (`cleanup_persistence_failed`) — the report never
+        // claims durable debt that a crash would lose — AND a retry always
+        // converges: re-running the checkpoint (faults disarmed) ends with
+        // the marker gone, the logs compacted to the suffix, and no
+        // below-floor exposure at any point.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn cleanup_debt_reporting_is_truthful_and_retry_converges(
+            history in prop::collection::vec(any::<bool>(), 2..5)
+                .prop_filter(
+                    "the seeded prefix plus the filtered history needs >= 2 successes",
+                    |v| v.iter().filter(|ok| **ok).count() >= 1,
+                ),
+            checkpoint_at in 0usize..8,
+            cleanup_fails in any::<bool>(),
+            write_fails in any::<bool>(),
+            clear_fails in any::<bool>(),
+        ) {
+            run_debt_truthfulness_case(
+                &history,
+                checkpoint_at,
+                cleanup_fails,
+                write_fails,
+                clear_fails,
+            );
+        }
+    }
+
+    /// EXHAUSTIVE matrix coverage: every one of the 2×2×2 cells runs
+    /// against a FRESH fixture (deterministic, independent of the proptest
+    /// seed), so a single broken cell — a phantom debt claim, a silently
+    /// absorbed persistence failure, or a retry that fails to converge — is
+    /// always caught even if the bounded 16-case sample never drew that
+    /// combination (mirrors `every_floor_mutation_fails_closed_exhaustively`).
+    #[test]
+    fn every_debt_matrix_cell_is_truthful_and_converges_exhaustively() {
+        for cleanup_fails in [false, true] {
+            for write_fails in [false, true] {
+                for clear_fails in [false, true] {
+                    run_debt_truthfulness_case(
+                        &[true, false, true],
+                        1,
+                        cleanup_fails,
+                        write_fails,
+                        clear_fails,
+                    );
+                }
+            }
+        }
     }
 
     proptest! {
