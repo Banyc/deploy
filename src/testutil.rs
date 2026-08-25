@@ -695,6 +695,432 @@ pub(crate) mod step17_hook {
     }
 }
 
+/// Test-only fake remote transports + the recording factory: the shared
+/// `LocalTransport`-wrapping fixtures that the engine and semantic test
+/// suites build fake remotes from (each wrapper delegates every trait method
+/// to an inner [`crate::remote::transport::LocalTransport`]).
+///
+/// The `FailOnce*` wrappers fail EXACTLY ONE matching operation — the
+/// commit-marker write ([`FailOnceMarkerRemote`]), the generation-record
+/// write ([`FailOnceGenerationRemote`]), or the incoming staging upload
+/// ([`FailOnceStagingRemote`]) — then disarm and pass through untouched:
+/// deterministic fault injection with no sleeps, the crate-internal mirror of
+/// the integration-test `FailOnce*Remote` family.
+///
+/// [`CountingRemote`] + [`recording_factory`] form the ZERO-FACTORY-
+/// INVOCATIONS seam: every factory invocation (each remote construction) and
+/// every call on the produced remotes increments a shared counter, so a test
+/// can assert the push engine never touched a remote at all (the dry-run ref
+/// prevalidation and direct-release membership gates run BEFORE any factory
+/// invocation).
+#[cfg(test)]
+pub(crate) mod test_remotes {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use crate::error::{Error, Result};
+    use crate::remote::transport::{LocalTransport, Remote};
+
+    /// A remote that fails commit marker writes exactly once: the first
+    /// write/create under `state/commits/` errors (leaving the marker absent),
+    /// then the wrapper behaves normally. Lets a test record a `PendingCommit`
+    /// attempt on the first push and observe the next push's reconciliation
+    /// completing the markers with the ORIGINAL deployment ID. Mirror of the
+    /// integration-test `FailOnceMarkerRemote`, kept in-crate because the
+    /// store fault hooks are `#[cfg(test)]` crate-internal.
+    pub(crate) struct FailOnceMarkerRemote {
+        inner: LocalTransport,
+        armed: Arc<AtomicBool>,
+    }
+
+    impl FailOnceMarkerRemote {
+        pub(crate) fn build(base: PathBuf, armed: Arc<AtomicBool>) -> Result<Box<dyn Remote>> {
+            Ok(Box::new(FailOnceMarkerRemote {
+                inner: LocalTransport::new(base)?,
+                armed,
+            }))
+        }
+        fn fail_marker(&self, rel: &std::path::Path) -> bool {
+            self.armed.load(Ordering::SeqCst) && rel.to_string_lossy().starts_with("state/commits/")
+        }
+    }
+
+    impl Remote for FailOnceMarkerRemote {
+        fn root(&self) -> &std::path::Path {
+            self.inner.root()
+        }
+        fn read(&self, rel: &std::path::Path) -> Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
+            if self.fail_marker(rel) {
+                self.armed.store(false, Ordering::SeqCst);
+                return Err(Error::remote(
+                    "FailOnceMarkerRemote: commit marker write forced to fail (once)",
+                ));
+            }
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<bool> {
+            if self.fail_marker(rel) {
+                self.armed.store(false, Ordering::SeqCst);
+                return Err(Error::remote(
+                    "FailOnceMarkerRemote: commit marker create forced to fail (once)",
+                ));
+            }
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &std::path::Path, mode: u32) -> Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(
+            &self,
+            rel: &std::path::Path,
+        ) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &std::path::Path) -> Result<std::path::PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &std::path::Path) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &std::path::Path) -> Result<crate::remote::transport::RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn exec(
+            &self,
+            argv: &[String],
+            timeout: std::time::Duration,
+        ) -> Result<crate::remote::transport::ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+        fn filesystem_bytes(&self) -> Result<crate::remote::transport::FsBytes> {
+            self.inner.filesystem_bytes()
+        }
+    }
+    /// A remote that fails the FIRST generation-record write exactly once
+    /// (`try_write_new` under `generations/`), then behaves normally. Fires
+    /// inside `create_generation`, i.e. AFTER the intent is durable and BEFORE
+    /// the server's `current` advances: the exact mid-mutation window.
+    pub(crate) struct FailOnceGenerationRemote {
+        inner: LocalTransport,
+        armed: Arc<AtomicBool>,
+    }
+
+    impl FailOnceGenerationRemote {
+        pub(crate) fn build(base: PathBuf, armed: Arc<AtomicBool>) -> Result<Box<dyn Remote>> {
+            Ok(Box::new(FailOnceGenerationRemote {
+                inner: LocalTransport::new(base)?,
+                armed,
+            }))
+        }
+        fn fail_generation(&self, rel: &std::path::Path) -> bool {
+            self.armed.load(Ordering::SeqCst)
+                && rel.to_string_lossy().starts_with("generations/")
+                && rel.to_string_lossy().ends_with("assignment.json")
+        }
+    }
+
+    impl Remote for FailOnceGenerationRemote {
+        fn root(&self) -> &std::path::Path {
+            self.inner.root()
+        }
+        fn read(&self, rel: &std::path::Path) -> Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<bool> {
+            if self.fail_generation(rel) {
+                self.armed.store(false, Ordering::SeqCst);
+                return Err(Error::remote(
+                    "FailOnceGenerationRemote: generation write forced to fail (once)",
+                ));
+            }
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &std::path::Path, mode: u32) -> Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(
+            &self,
+            rel: &std::path::Path,
+        ) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &std::path::Path) -> Result<std::path::PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &std::path::Path) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &std::path::Path) -> Result<crate::remote::transport::RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn exec(
+            &self,
+            argv: &[String],
+            timeout: std::time::Duration,
+        ) -> Result<crate::remote::transport::ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+        fn filesystem_bytes(&self) -> Result<crate::remote::transport::FsBytes> {
+            self.inner.filesystem_bytes()
+        }
+    }
+    /// A transport wrapper that fails the FIRST file write under `incoming/`
+    /// (the staging upload) once, letting a test inject a staging failure
+    /// deterministically. Mirrors the `FailOnceMarkerRemote` pattern from
+    /// tests/integration.rs: the fault fires on the first `write` whose path
+    /// starts with `incoming/` and disarms itself, while every other call —
+    /// including the `create_dir_all` that creates the incoming directory and
+    /// the `control/`/`state/` writes of the handshake — passes through
+    /// untouched. Failing the file WRITE (rather than the directory create)
+    /// leaves a real partial upload behind, so a test can assert the
+    /// best-effort incoming cleanup removed it.
+    pub(crate) struct FailOnceStagingRemote {
+        inner: LocalTransport,
+        armed: Arc<AtomicBool>,
+    }
+
+    impl FailOnceStagingRemote {
+        pub(crate) fn build(base: PathBuf, armed: Arc<AtomicBool>) -> Result<Box<dyn Remote>> {
+            Ok(Box::new(FailOnceStagingRemote {
+                inner: LocalTransport::new(base)?,
+                armed,
+            }))
+        }
+        fn fail_staging_write(&self, rel: &std::path::Path) -> bool {
+            self.armed.load(Ordering::SeqCst) && rel.to_string_lossy().starts_with("incoming/")
+        }
+    }
+
+    impl Remote for FailOnceStagingRemote {
+        fn root(&self) -> &std::path::Path {
+            self.inner.root()
+        }
+        fn provision_layout(&self) -> Result<()> {
+            self.inner.provision_layout()
+        }
+        fn read(&self, rel: &std::path::Path) -> Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
+            if self.fail_staging_write(rel) {
+                self.armed.store(false, Ordering::SeqCst);
+                return Err(Error::remote(
+                    "FailOnceStagingRemote: incoming staging write forced to fail (once)",
+                ));
+            }
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<bool> {
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &std::path::Path, mode: u32) -> Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(
+            &self,
+            rel: &std::path::Path,
+        ) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &std::path::Path) -> Result<std::path::PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &std::path::Path) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &std::path::Path) -> Result<crate::remote::transport::RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn exec(
+            &self,
+            argv: &[String],
+            timeout: std::time::Duration,
+        ) -> Result<crate::remote::transport::ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+        fn filesystem_bytes(&self) -> Result<crate::remote::transport::FsBytes> {
+            self.inner.filesystem_bytes()
+        }
+    }
+    /// A remote that counts EVERY trait-method call (delegating the
+    /// operation to the wrapped `LocalTransport`), so a test can assert the
+    /// push engine never touched a remote at all: with an INVALID ref and
+    /// `--dry-run`, the counter must stay at zero.
+    pub(crate) struct CountingRemote {
+        inner: LocalTransport,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingRemote {
+        fn new(base: PathBuf, calls: Arc<AtomicUsize>) -> Result<Self> {
+            Ok(CountingRemote {
+                inner: LocalTransport::new(base)?,
+                calls,
+            })
+        }
+        fn tick(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Remote for CountingRemote {
+        fn root(&self) -> &std::path::Path {
+            self.inner.root()
+        }
+        fn read(&self, rel: &std::path::Path) -> Result<Vec<u8>> {
+            self.tick();
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
+            self.tick();
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<bool> {
+            self.tick();
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &std::path::Path) -> Result<()> {
+            self.tick();
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.tick();
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &std::path::Path, mode: u32) -> Result<()> {
+            self.tick();
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(
+            &self,
+            rel: &std::path::Path,
+        ) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
+            self.tick();
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+            self.tick();
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+            self.tick();
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &std::path::Path) -> Result<std::path::PathBuf> {
+            self.tick();
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &std::path::Path) -> Result<()> {
+            self.tick();
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.tick();
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &std::path::Path) -> bool {
+            self.tick();
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &std::path::Path) -> Result<crate::remote::transport::RemoteMeta> {
+            self.tick();
+            self.inner.metadata(rel)
+        }
+        fn exec(
+            &self,
+            argv: &[String],
+            timeout: std::time::Duration,
+        ) -> Result<crate::remote::transport::ExecOutcome> {
+            self.tick();
+            self.inner.exec(argv, timeout)
+        }
+        fn filesystem_bytes(&self) -> Result<crate::remote::transport::FsBytes> {
+            self.tick();
+            self.inner.filesystem_bytes()
+        }
+    }
+    /// A RECORDING factory: every factory invocation (each remote
+    /// construction) AND every call on the produced remotes increments a
+    /// shared counter. The remotes delegate to `LocalTransport` rooted at
+    /// `base/<server-id>` (mirroring the harness factory), so a push through
+    /// this factory behaves exactly like a real one — the counters just tell
+    /// us whether ANY remote was touched.
+    pub(crate) fn recording_factory(
+        base: PathBuf,
+        calls: Arc<AtomicUsize>,
+    ) -> impl Fn(&crate::config::ServerDef, &crate::config::SlotDef) -> Result<Box<dyn Remote>>
+    {
+        move |s, _slot| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(CountingRemote::new(
+                base.join(&s.id),
+                calls.clone(),
+            )?))
+        }
+    }
+}
+
 #[cfg(test)]
 mod registry_property_tests {
     // Property tests for the per-fixture fault registry: two DISTINCT fault
