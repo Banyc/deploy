@@ -11,7 +11,11 @@
 //! push. The kill-then-reap ordering is deterministic: the wait thread owns
 //! the child, and the deadline path kills and then JOINS that thread, so the
 //! child is always collected before the runner returns (no kill-vs-wait race,
-//! no zombies, no return-before-reap).
+//! no zombies, no return-before-reap). A stdin-write failure is held to the
+//! same rule: the wait closure saves the write error, ALWAYS runs
+//! `wait_with_output` (drains and collects the child — after the deadline kill
+//! this returns the killed status promptly), and only then returns the saved
+//! error, so a write error can never leave an uncollected child either.
 //!
 //! This is the production transport. It authenticates the server against a
 //! *configured* identity: either a pre-provisioned `known_hosts` file used with
@@ -99,6 +103,11 @@ enum OpKind {
 enum RunError {
     /// The child could not be spawned.
     Spawn(String),
+    /// The stdin payload write failed (e.g. EPIPE after the deadline kill
+    /// closed the pipe). Returned only AFTER the child was reaped: the wait
+    /// closure always runs `wait_with_output` before surfacing a saved write
+    /// error.
+    StdinWrite(String),
     /// Waiting on the child failed (wait error, read error, …).
     Wait(String),
     /// The hard deadline fired; the child was killed and reaped.
@@ -112,8 +121,11 @@ enum RunError {
 struct SpawnedChild {
     pid: u32,
     /// Drain stdout/stderr and wait for the child; must return promptly once
-    /// the child exits (or is killed).
-    wait: Box<dyn FnOnce() -> std::io::Result<std::process::Output> + Send>,
+    /// the child exits (or is killed). ALWAYS reaps the child before returning
+    /// an error: a saved stdin-write error is surfaced only AFTER
+    /// `wait_with_output` has run, so an error can never leave the child
+    /// uncollected (no return-before-reap).
+    wait: Box<dyn FnOnce() -> std::result::Result<std::process::Output, RunError> + Send>,
 }
 
 /// The subprocess seam behind [`SshRunner`]. The production implementation
@@ -158,19 +170,32 @@ impl SshRunnerSeam for RealRunner {
         // The stdin payload is written from INSIDE the wait closure (which the
         // runner's deadline bounds): a remote that stops reading stdin mid-
         // upload blocks this write, the deadline fires, the kill closes the
-        // pipe, the write fails with EPIPE (SIGPIPE is ignored by the Rust
-        // runtime), and the closure returns so the child is reaped. Without
-        // this, a >pipe-buffer upload to a hung remote would hang the write
-        // indefinitely.
-        let wait: Box<dyn FnOnce() -> std::io::Result<std::process::Output> + Send> =
+        // pipe, and the write fails with EPIPE (SIGPIPE is ignored by the Rust
+        // runtime). Without this, a >pipe-buffer upload to a hung remote would
+        // hang the write indefinitely.
+        let wait: Box<dyn FnOnce() -> std::result::Result<std::process::Output, RunError> + Send> =
             Box::new(move || {
-                if let Some(data) = stdin
+                // Write the payload FIRST, saving any error: `?` here would
+                // return BEFORE the child is collected — a write error (EPIPE
+                // after the deadline kill, or a hung-remote pipe) would leave
+                // an un-reaped child. The error is therefore saved, and
+                // `wait_with_output` ALWAYS runs (it drains the child's pipes
+                // and collects it; after the deadline kill this returns the
+                // killed status promptly). The saved write error is returned
+                // only AFTER the child has been reaped.
+                use std::io::Write;
+                let write_res = if let Some(data) = stdin
                     && let Some(mut sin) = child.stdin.take()
                 {
-                    use std::io::Write;
-                    sin.write_all(&data)?;
+                    sin.write_all(&data)
+                } else {
+                    Ok(())
+                };
+                let wait_res = child.wait_with_output();
+                match write_res {
+                    Err(e) => Err(RunError::StdinWrite(format!("stdin write: {e}"))),
+                    Ok(()) => wait_res.map_err(|e| RunError::Wait(format!("wait: {e}"))),
                 }
-                child.wait_with_output()
             });
         Ok(SpawnedChild { pid, wait })
     }
@@ -266,8 +291,12 @@ impl SshRunner {
                 Ok(out)
             }
             Ok(Err(e)) => {
+                // The wait closure already reaped the child before returning
+                // the error (a saved stdin-write error is surfaced only after
+                // `wait_with_output` ran), and the join collects the thread —
+                // so an error path never leaves an uncollected child either.
                 let _ = handle.join();
-                Err(RunError::Wait(format!("wait {:?}: {e}", argv)))
+                Err(e)
             }
             Err(_) => {
                 // HARD DEADLINE: kill, then reap. The SIGKILL makes the child
@@ -527,6 +556,9 @@ impl SshTransport {
                 RunError::Spawn(m) => {
                     Error::transport(format!("ssh-keyscan {} spawn: {m}", self.address))
                 }
+                RunError::StdinWrite(m) => {
+                    Error::transport(format!("ssh-keyscan {} stdin write: {m}", self.address))
+                }
                 RunError::Wait(m) => {
                     Error::transport(format!("ssh-keyscan {} wait: {m}", self.address))
                 }
@@ -665,6 +697,7 @@ impl SshTransport {
         argv.push(command.to_string());
         self.runner.run(op, &argv, None, None).map_err(|e| match e {
             RunError::Spawn(m) => Error::transport(format!("ssh {command}: {m}")),
+            RunError::StdinWrite(m) => Error::transport(format!("ssh {command}: {m}")),
             RunError::Wait(m) => Error::transport(format!("ssh {command}: {m}")),
             RunError::Timeout { after } => {
                 Error::transport(format!("ssh command timed out after {after:?}: {command}"))
@@ -725,6 +758,7 @@ impl SshTransport {
             .run(OpKind::Upload, &argv, Some(data), None)
             .map_err(|e| match e {
                 RunError::Spawn(m) => Error::transport(format!("ssh upload spawn: {m}")),
+                RunError::StdinWrite(m) => Error::transport(format!("ssh upload stdin write: {m}")),
                 RunError::Wait(m) => Error::transport(format!("ssh upload wait: {m}")),
                 RunError::Timeout { after } => {
                     Error::transport(format!("ssh upload timed out after {after:?}"))
@@ -1078,6 +1112,7 @@ impl Remote for SshTransport {
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             }),
             Err(RunError::Spawn(m)) => Err(Error::transport(m)),
+            Err(RunError::StdinWrite(m)) => Err(Error::transport(m)),
             Err(RunError::Wait(m)) => Err(Error::transport(m)),
             Err(RunError::Timeout { after }) => Ok(crate::remote::transport::ExecOutcome {
                 exit_code: -1,
@@ -1890,6 +1925,13 @@ mod runner_property_tests {
         SpawnError,
         /// The child exits non-zero promptly.
         NonZero,
+        /// The stdin payload write fails (EPIPE) — but the wait closure STILL
+        /// reaps the child (runs `wait_with_output`) before returning the saved
+        /// write error: no return-before-reap on the write-error path. Vacuous
+        /// (completes normally) for ops that pipe no stdin.
+        StdinWriteError,
+        /// The wait itself (`wait_with_output`) fails, after the reap attempt.
+        WaitError,
     }
 
     /// Every operation the fake seam records, in order.
@@ -1970,6 +2012,9 @@ mod runner_property_tests {
         pid: u32,
         killed: AtomicBool,
         stall: Stall,
+        /// Whether the op pipes a stdin payload: the write-error stall is
+        /// meaningful only when there is something to write (the upload op).
+        has_stdin: bool,
         /// Real host-key line the fake keyscan emits on Complete, so the pin
         /// path succeeds end-to-end (fingerprint verified with real ssh-keygen).
         keyscan_line: Option<String>,
@@ -1977,20 +2022,21 @@ mod runner_property_tests {
     }
 
     impl ChildCtl {
-        /// The wait closure body: finish immediately (Complete / NonZero) or
-        /// block until killed (Hang), record the reap, return the stubbed
-        /// output.
-        fn wait(&self) -> std::io::Result<std::process::Output> {
+        /// The wait closure body: finish immediately (Complete / NonZero /
+        /// vacuous StdinWriteError), block until killed (Hang), or fail AFTER
+        /// recording the reap (StdinWriteError with a payload / WaitError);
+        /// record the reap, return the stubbed output or error.
+        fn wait(&self) -> std::result::Result<std::process::Output, RunError> {
             self.state.live_waiters.fetch_add(1, Ordering::SeqCst);
             let res = self.wait_inner();
             self.state.live_waiters.fetch_sub(1, Ordering::SeqCst);
             res
         }
 
-        fn wait_inner(&self) -> std::io::Result<std::process::Output> {
+        fn wait_inner(&self) -> std::result::Result<std::process::Output, RunError> {
             // Raw Unix wait status for an exit code: `code << 8` (WEXITSTATUS).
             let exit = |code: i32| std::process::ExitStatus::from_raw(code << 8);
-            let output = |code: i32| -> std::io::Result<std::process::Output> {
+            let output = |code: i32| -> std::process::Output {
                 let mut out = std::process::Output {
                     status: exit(code),
                     stdout: Vec::new(),
@@ -1999,18 +2045,18 @@ mod runner_property_tests {
                 if let Some(line) = &self.keyscan_line {
                     out.stdout = line.as_bytes().to_vec();
                 }
-                Ok(out)
+                out
             };
             match self.stall {
                 Stall::Complete => {
                     let res = output(0);
                     self.state.push(LogEntry::Reap { pid: self.pid });
-                    res
+                    Ok(res)
                 }
                 Stall::NonZero => {
                     let res = output(1);
                     self.state.push(LogEntry::Reap { pid: self.pid });
-                    res
+                    Ok(res)
                 }
                 Stall::Hang => {
                     // Block until the runner kills us at the deadline. A bounded
@@ -2026,7 +2072,33 @@ mod runner_property_tests {
                         self.pid
                     );
                     self.state.push(LogEntry::Reap { pid: self.pid });
-                    output(0)
+                    Ok(output(0))
+                }
+                Stall::StdinWriteError => {
+                    if self.has_stdin {
+                        // The stdin write fails — but the closure STILL reaps
+                        // (wait_with_output runs; recorded as Reap) and only
+                        // THEN returns the saved write error: a
+                        // return-before-reap on this path would show up as a
+                        // missing Reap.
+                        self.state.push(LogEntry::Reap { pid: self.pid });
+                        Err(RunError::StdinWrite(
+                            "simulated stdin write failure".to_string(),
+                        ))
+                    } else {
+                        // No stdin payload: there is nothing to write, so the
+                        // stall is vacuous and the child completes normally.
+                        let res = output(0);
+                        self.state.push(LogEntry::Reap { pid: self.pid });
+                        Ok(res)
+                    }
+                }
+                Stall::WaitError => {
+                    // The reap is ATTEMPTED (wait_with_output runs; recorded as
+                    // Reap) but the wait itself fails: surfaces as a wait error
+                    // after the reap attempt.
+                    self.state.push(LogEntry::Reap { pid: self.pid });
+                    Err(RunError::Wait("simulated wait failure".to_string()))
                 }
                 Stall::SpawnError => unreachable!("spawn errors never yield a child"),
             }
@@ -2062,7 +2134,7 @@ mod runner_property_tests {
             &self,
             op: OpKind,
             argv: &[String],
-            _stdin: Option<Vec<u8>>,
+            stdin: Option<Vec<u8>>,
         ) -> std::io::Result<SpawnedChild> {
             let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
             self.state.push(LogEntry::Spawn {
@@ -2077,12 +2149,14 @@ mod runner_property_tests {
                 pid,
                 killed: AtomicBool::new(false),
                 stall: self.stall,
+                has_stdin: stdin.is_some(),
                 keyscan_line: self.keyscan_line.clone(),
                 state: self.state.clone(),
             });
             self.children.lock().unwrap().push(ctl.clone());
-            let wait: Box<dyn FnOnce() -> std::io::Result<std::process::Output> + Send> =
-                Box::new(move || ctl.wait());
+            let wait: Box<
+                dyn FnOnce() -> std::result::Result<std::process::Output, RunError> + Send,
+            > = Box::new(move || ctl.wait());
             Ok(SpawnedChild { pid, wait })
         }
 
@@ -2395,6 +2469,98 @@ mod runner_property_tests {
                     "a non-zero child is reaped by the normal wait"
                 );
             }
+            Stall::StdinWriteError => {
+                if kind == OpKind::Upload {
+                    // The stdin write fails, but the closure ALWAYS reaps first
+                    // (wait_with_output runs; the fake records the Reap) and
+                    // only then returns the saved write error — no
+                    // return-before-reap — and the error surfaces (not a
+                    // Timeout) after the reap.
+                    let msg = match &outcome {
+                        PairOutcome::Err(m) => m,
+                        _ => {
+                            panic!(
+                                "a stdin-write failure must surface as an error, got {outcome:?}"
+                            )
+                        }
+                    };
+                    assert!(
+                        msg.contains("stdin write"),
+                        "a stdin-write failure must surface the write error, got: {msg}"
+                    );
+                    assert_eq!(
+                        state.kill_pids(),
+                        Vec::<u32>::new(),
+                        "a stdin-write error surfaces before the deadline: nothing to kill"
+                    );
+                    assert_eq!(
+                        state.reap_pids(),
+                        vec![spawn_pid],
+                        "the child must be reaped even on a stdin-write error"
+                    );
+                } else {
+                    // No stdin payload: nothing is written, so the stall is
+                    // vacuous and the child completes normally.
+                    match kind {
+                        OpKind::Exec => {
+                            let o = match outcome {
+                                PairOutcome::Exec(Ok(o)) => o,
+                                _ => panic!(
+                                    "exec with a vacuous write-error stall must succeed, got {outcome:?}"
+                                ),
+                            };
+                            assert_eq!(o.exit_code, 0);
+                        }
+                        OpKind::Remote => {
+                            let o = match outcome {
+                                PairOutcome::Remote(o) => o,
+                                _ => panic!(
+                                    "run_remote with a vacuous write-error stall must succeed, got {outcome:?}"
+                                ),
+                            };
+                            assert!(o.status.success());
+                        }
+                        _ => assert!(
+                            matches!(outcome, PairOutcome::Ok),
+                            "a vacuous write-error stall must succeed, got {outcome:?}"
+                        ),
+                    }
+                    assert_eq!(
+                        state.kill_pids(),
+                        Vec::<u32>::new(),
+                        "a vacuous write-error stall is a normal wait, not a kill"
+                    );
+                    assert_eq!(
+                        state.reap_pids(),
+                        vec![spawn_pid],
+                        "a vacuous write-error child is reaped by the normal wait"
+                    );
+                }
+            }
+            Stall::WaitError => {
+                // The wait fails AFTER the reap attempt, and the wait error
+                // surfaces (not a Timeout); the child is still recorded as
+                // reaped — never a return-before-reap.
+                let msg = match &outcome {
+                    PairOutcome::Err(m) => m.clone(),
+                    PairOutcome::Exec(Err(e)) => e.to_string(),
+                    _ => panic!("a wait failure must surface as an error, got {outcome:?}"),
+                };
+                assert!(
+                    msg.contains("wait"),
+                    "a wait failure must surface as a wait error, got: {msg}"
+                );
+                assert_eq!(
+                    state.kill_pids(),
+                    Vec::<u32>::new(),
+                    "a wait error is a normal wait, not a kill"
+                );
+                assert_eq!(
+                    state.reap_pids(),
+                    vec![spawn_pid],
+                    "the child must be reaped even on a wait error (the reap attempt is recorded)"
+                );
+            }
         }
 
         assert_eq!(
@@ -2450,6 +2616,52 @@ mod runner_property_tests {
         );
     }
 
+    /// THE timed-out-upload guarantee: a real child that RECORDS ITS PID but
+    /// NEVER reads stdin, with a payload larger than the pipe buffer (1 MiB » a
+    /// 16–64 KiB pipe), blocks the wait closure's stdin write until the tiny
+    /// deadline fires; the child is then KILLED — and the recorded PID must be
+    /// GONE afterwards, proving the timed-out upload was not only killed but
+    /// also REAPED (an uncollected zombie would still answer `kill(pid, 0)`).
+    #[test]
+    fn real_runner_kills_and_reaps_a_timed_out_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("child.pid");
+        // The child records its own pid, then execs `sleep` WITHOUT ever
+        // reading stdin: the piped payload fills the pipe buffer and the write
+        // blocks until the deadline kill closes the pipe.
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("echo $$ > {}; exec sleep 30", pidfile.display()),
+        ];
+        let runner = SshRunner::with_seam(
+            Arc::new(RealRunner),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+        );
+        let payload: Vec<u8> = vec![0x5A; 1024 * 1024]; // 1 MiB » pipe buffer
+        let start = Instant::now();
+        let res = runner.run(OpKind::Upload, &argv, Some(&payload), None);
+        assert!(
+            matches!(res, Err(RunError::Timeout { after }) if after == Duration::from_millis(50))
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a timed-out upload must be killed at the deadline, not after it"
+        );
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("child must have recorded its pid before stalling")
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: `kill(pid, 0)` only probes existence; it sends no signal.
+        let still_exists = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(
+            !still_exists,
+            "timed-out upload child {pid} must be reaped (a zombie would still exist)"
+        );
+    }
+
     /// Real-runner sanity check: a promptly-completing child returns its output
     /// (no kill, no timeout), and a spawn failure surfaces as a spawn error.
     #[test]
@@ -2481,7 +2693,24 @@ mod runner_property_tests {
             Just(Stall::Complete),
             Just(Stall::SpawnError),
             Just(Stall::NonZero),
+            Just(Stall::StdinWriteError),
+            Just(Stall::WaitError),
         ]
+    }
+
+    /// The extended seam's new outcomes, driven deterministically: the property
+    /// also draws them (6 stalls × 5 ops), but the fixed seed may not pair them
+    /// with the upload op in every run. A stdin-write error is returned only
+    /// AFTER the child was reaped, and a wait error surfaces after the reap
+    /// attempt — never a return-before-reap.
+    #[test]
+    fn stdin_write_error_is_returned_after_the_reap() {
+        run_one_pair(OpKind::Upload, Stall::StdinWriteError);
+    }
+
+    #[test]
+    fn wait_error_is_returned_after_the_reap() {
+        run_one_pair(OpKind::Upload, Stall::WaitError);
     }
 
     proptest! {
@@ -2489,11 +2718,13 @@ mod runner_property_tests {
         // point) pair must honor the ONE-runner deadline/kill/reap semantics —
         // stalled children terminate as Timeout AND are reaped (exactly one
         // kill, then exactly one reap, kill before reap), completed/non-zero
-        // children are never killed, and spawn failures surface as transport
-        // errors with nothing to kill or reap. FIXED SEED 0x5EED_5EED (repo
-        // style) + bounded cases keep the suite deterministic and fast: the fake
-        // blocks only until the tiny injected deadline, so no case ever sleeps
-        // more than ~25ms.
+        // children are never killed, spawn failures surface as transport errors
+        // with nothing to kill or reap, and stdin-write/wait failures surface
+        // their error (not a Timeout) only AFTER the child was reaped — the
+        // reap count per pid is 1 for EVERY outcome, so no path ever returns
+        // before reaping. FIXED SEED 0x5EED_5EED (repo style) + bounded cases
+        // keep the suite deterministic and fast: the fake blocks only until the
+        // tiny injected deadline, so no case ever sleeps more than ~25ms.
         #![proptest_config(ProptestConfig {
             cases: 16,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
