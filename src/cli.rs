@@ -359,7 +359,7 @@ fn effective_status(
 /// accepts (`deploy push <target> sN`) — or `-` for attempts that produced
 /// no snapshot (failed/degraded attempts are visible here but are NOT valid
 /// rollback refs). The snapshot id is the snapshot record's canonical
-/// `index` (the 0-based reflog position `s0`, `s1`, ...), never a recomputed
+/// `index` (the 0-based op log position `s0`, `s1`, ...), never a recomputed
 /// Vec position. The CLI prints exactly these lines; the unit test asserts
 /// on them directly because lib unit tests cannot capture the harness-owned
 /// stdout sink.
@@ -507,7 +507,7 @@ mod tests {
     /// of the snapshot that attempt produced — the same `sN` notation the
     /// push reference grammar accepts (`deploy push <target> sN`) — or `-`
     /// when the attempt produced no snapshot. The snapshot id is the snapshot
-    /// record's canonical `index` (the 0-based reflog position `s0`, `s1`,
+    /// record's canonical `index` (the 0-based op log position `s0`, `s1`,
     /// ...), never a recomputed Vec position. The CLI prints exactly what
     /// [`render_log`] returns, so the test drives the real `run_with` path
     /// and asserts the rendered lines through the helper — lib unit tests

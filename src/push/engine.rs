@@ -3987,7 +3987,7 @@ interval_seconds = 0
     }
 
     /// Multiple pending attempts are reconciled OLDEST FIRST (attempts.jsonl
-    /// order) so snapshot/reflog indices stay monotonic: two crafted
+    /// order) so snapshot/op-log indices stay monotonic: two crafted
     /// `InProgress` intents appended A-then-B finalize in that order with
     /// indices 1 and 2 after the baseline.
     #[test]
@@ -4039,7 +4039,7 @@ interval_seconds = 0
         assert_eq!(snapshots.len(), 3);
         assert_eq!(snapshots[1].deployment_id, a.deployment_id);
         assert_eq!(snapshots[2].deployment_id, b.deployment_id);
-        assert_eq!(snapshots[1].index, 1, "reflog indices stay monotonic");
+        assert_eq!(snapshots[1].index, 1, "op-log indices stay monotonic");
         assert_eq!(snapshots[2].index, 2);
         assert_eq!(
             latest_status(&h, a.deployment_id.as_str()),
@@ -5566,7 +5566,7 @@ interval_seconds = 0
             "the attempt must evolve InProgress -> FailedPreflight"
         );
 
-        // No reflog/snapshot, and NO remote deployment mutation: no `current`,
+        // No op log/snapshot, and NO remote deployment mutation: no `current`,
         // no generation record, no tree object.
         assert!(h.store.read_snapshots("t1").unwrap().is_empty());
         assert!(h.store.read_last_successful("t1").is_none());
@@ -5662,7 +5662,7 @@ interval_seconds = 0
             "the attempt must evolve InProgress -> FailedPreflight"
         );
 
-        // No reflog/snapshot, and NO remote deployment mutation: no `current`,
+        // No op log/snapshot, and NO remote deployment mutation: no `current`,
         // no generation record, no published object.
         assert!(h.store.read_snapshots("t1").unwrap().is_empty());
         assert!(h.store.read_last_successful("t1").is_none());
@@ -5870,7 +5870,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     /// A HISTORICAL push whose release's behavior snapshot is missing (or
     /// corrupt) must fail in PREFLIGHT before any attempt record, snapshot
-    /// append, reflog advance, or remote byte — never silently substitute the
+    /// append, op-log advance, or remote byte — never silently substitute the
     /// caller's current configuration (requirement.md: "a missing or corrupt
     /// historical behavior snapshot aborts the attempt during preflight").
     ///
