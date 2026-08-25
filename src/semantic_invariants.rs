@@ -4671,19 +4671,22 @@ enum ContentionDebtFault {
     Write,
 }
 
-/// One case of the step-17-contention × debt-I/O matrix for the generated
-/// `(preexisting_debt, fault)` combination. Each case is a FRESH fixture and
-/// a SINGLE push to `t1` (the shared slot `p1`) — the fixture's first push
-/// is GUARANTEED non-no-op (it mints generation 1; asserted via the recorded
-/// attempt + `Successful` status, never an up-to-date no-op). The push runs
-/// under the test-only step-17 phase hook with the fixture holding the
-/// slot's mutation guard at EVERY park; the debt fault is armed ONLY at the
-/// FreshStep17 park ([`step17_hook::HookPhase::FreshStep17`] — the fixture's
-/// own per-slot rotation, whose contended else-branch runs the debt
-/// read-modify-write that must fault), so the deferred-maintenance retry
-/// (which, with a preexisting marker, reads the debt FIRST — before its
-/// park — and must pass unarmed at the [`step17_hook::HookPhase::DeferredRetry`]
-/// phase) can never consume the one-shot at the wrong phase.
+/// One case of the step-17-contention × debt-I/O matrix for a generated
+/// `(preexisting_reason: Option<String>, fault: Read | Write)` pair — the
+/// preexisting debt marker's reason is an ARBITRARY string (or absent), the
+/// fault one of the two debt-I/O operations. Each case is a FRESH fixture
+/// and a SINGLE push to `t1` (the shared slot `p1`) — the fixture's first
+/// push is GUARANTEED non-no-op (it mints generation 1; asserted via the
+/// recorded attempt + `Successful` status, never an up-to-date no-op). The
+/// push runs under the test-only step-17 phase hook with the fixture holding
+/// the slot's mutation guard at EVERY park; the debt fault is armed ONLY at
+/// the FreshStep17 park ([`step17_hook::HookPhase::FreshStep17`] — the
+/// fixture's own per-slot rotation, whose contended else-branch runs the
+/// debt read-modify-write that must fault), so the deferred-maintenance
+/// retry (which, with a preexisting marker, reads the debt FIRST — before
+/// its park — and must pass unarmed at the
+/// [`step17_hook::HookPhase::DeferredRetry`] phase) can never consume the
+/// one-shot at the wrong phase.
 ///
 /// Per combination asserts the post-commit contract:
 /// (a) the push returns `Ok` with `Successful` — NEVER `Err`;
@@ -4691,130 +4694,176 @@ enum ContentionDebtFault {
 ///     (`rotation deferred for slot 'p1'`) AND the debt-I/O notice
 ///     (`failed to read` / `failed to write rotation debt`, per fault);
 /// (c) FAILED PERSISTENCE creates NO new debt marker while PRESERVING any
-///     preexisting one: `preexisting_debt=true` leaves the marker file
-///     BYTE-IDENTICAL (the faulted read/write leaves the file untouched),
-///     `preexisting_debt=false` leaves no marker file at all.
-fn run_step17_contention_debt_matrix(combos: &[(bool, ContentionDebtFault)]) {
+///     preexisting one: `Some(reason)` leaves the marker file BYTE-IDENTICAL
+///     (the faulted read/write leaves the file untouched) and the reason
+///     round-trips exactly through [`crate::store::local::LocalStore::read_rotation_debt`];
+///     `None` leaves no marker file at all.
+fn run_step17_contention_debt_case(preexisting_reason: Option<&str>, fault: ContentionDebtFault) {
+    let ctx = format!("preexisting_reason={preexisting_reason:?}, fault={fault:?}");
+    let f = Fixture::new();
+    let id = f.next_prop_id();
+    const TARGET: &str = "t1";
+    const SLOT: &str = "p1";
+    // Seed the preexisting debt marker with the ARBITRARY reason and
+    // snapshot it BEFORE the push: a failed persistence must leave it
+    // byte-identical.
+    let marker_path = f.store.rotation_debt_path(TARGET);
+    let before = if let Some(reason) = preexisting_reason {
+        f.store
+            .write_rotation_debt(
+                TARGET,
+                &BTreeMap::from([(SLOT.to_string(), reason.to_string())]),
+            )
+            .expect("seeding the preexisting debt marker");
+        std::fs::read(&marker_path).expect("the seeded marker file must exist")
+    } else {
+        Vec::new()
+    };
+    let class = match fault {
+        ContentionDebtFault::Read => FailureClass::Step17ContentionDebtRead,
+        ContentionDebtFault::Write => FailureClass::Step17ContentionDebtWrite,
+    };
+    // The phase-distinguished hook driver arms the debt fault ONLY at
+    // the FreshStep17 park; the retry (DeferredRetry) park passes
+    // unarmed.
+    let res = f.push_prop_step17_contended(TARGET, None, &id, class);
+    f.disarm_prop_faults();
+    let report = res.expect("{ctx}: the push must never fail (post-commit maintenance)");
+    // (a) Ok + Successful, and a REAL push (attempt recorded — a new
+    // generation was minted, never an up-to-date no-op).
     assert_eq!(
-        combos.len(),
-        4,
-        "the matrix case must cover all four (preexisting_debt, fault) combinations"
+        report.status,
+        Some(DeploymentStatus::Successful),
+        "{ctx}: the contended push must report the committed Successful status"
     );
-    for &(preexisting_debt, fault) in combos {
-        let ctx = format!("preexisting_debt={preexisting_debt}, fault={fault:?}");
-        let f = Fixture::new();
-        let id = f.next_prop_id();
-        const TARGET: &str = "t1";
-        const SLOT: &str = "p1";
-        // Seed the preexisting debt marker with a KNOWN byte image and
-        // snapshot it BEFORE the push: a failed persistence must leave it
-        // byte-identical.
-        let marker_path = f.store.rotation_debt_path(TARGET);
-        let before = if preexisting_debt {
-            f.store
-                .write_rotation_debt(
-                    TARGET,
-                    &BTreeMap::from([(SLOT.to_string(), "seeded".to_string())]),
-                )
-                .expect("seeding the preexisting debt marker");
-            std::fs::read(&marker_path).expect("the seeded marker file must exist")
-        } else {
-            Vec::new()
-        };
-        let class = match fault {
-            ContentionDebtFault::Read => FailureClass::Step17ContentionDebtRead,
-            ContentionDebtFault::Write => FailureClass::Step17ContentionDebtWrite,
-        };
-        // The phase-distinguished hook driver arms the debt fault ONLY at
-        // the FreshStep17 park; the retry (DeferredRetry) park passes
-        // unarmed.
-        let res = f.push_prop_step17_contended(TARGET, None, &id, class);
-        f.disarm_prop_faults();
-        let report = res.expect("{ctx}: the push must never fail (post-commit maintenance)");
-        // (a) Ok + Successful, and a REAL push (attempt recorded — a new
-        // generation was minted, never an up-to-date no-op).
+    assert!(
+        report.attempt.is_some(),
+        "{ctx}: the push must be the REAL push (attempt recorded), never an up-to-date no-op"
+    );
+    // (b) BOTH required warnings: the contention warning naming the slot
+    // AND the debt-I/O notice for the faulted operation.
+    let warning = report.warning.as_deref().unwrap_or("");
+    assert!(
+        warning.contains(STEP17_CONTENTION_WARNING),
+        "{ctx}: the report must carry the contention warning 'rotation deferred for slot \
+         'p1''; got: {warning:?}"
+    );
+    let debt_notice = match fault {
+        ContentionDebtFault::Read => DEBT_READ_WARNING,
+        ContentionDebtFault::Write => DEBT_WRITE_WARNING,
+    };
+    assert!(
+        warning.contains(debt_notice),
+        "{ctx}: the report must carry the debt-I/O notice {debt_notice:?}; got: {warning:?}"
+    );
+    // (c) FAILED PERSISTENCE: no NEW marker is created, and any
+    // PREEXISTING marker is preserved byte-identical — the faulted
+    // fresh-phase read/write leaves the file untouched, and the retry's
+    // earlier unarmed write re-persisted the SAME content (so the
+    // arbitrary reason round-trips exactly).
+    let after = std::fs::read(&marker_path).unwrap_or_default();
+    if let Some(reason) = preexisting_reason {
         assert_eq!(
-            report.status,
-            Some(DeploymentStatus::Successful),
-            "{ctx}: the contended push must report the committed Successful status"
+            after, before,
+            "{ctx}: the preexisting debt marker must be preserved byte-identical"
         );
+        let debt = f.store.read_rotation_debt(TARGET).unwrap();
+        assert_eq!(
+            debt.get(SLOT).map(String::as_str),
+            Some(reason),
+            "{ctx}: the preexisting marker must still name the slot with its reason INTACT"
+        );
+    } else {
         assert!(
-            report.attempt.is_some(),
-            "{ctx}: the push must be the REAL push (attempt recorded), never an up-to-date no-op"
+            after.is_empty() && !marker_path.exists(),
+            "{ctx}: no debt marker file may appear when the fresh deferral's persistence \
+             failed"
         );
-        // (b) BOTH required warnings: the contention warning naming the slot
-        // AND the debt-I/O notice for the faulted operation.
-        let warning = report.warning.as_deref().unwrap_or("");
-        assert!(
-            warning.contains(STEP17_CONTENTION_WARNING),
-            "{ctx}: the report must carry the contention warning 'rotation deferred for slot \
-             'p1''; got: {warning:?}"
-        );
-        let debt_notice = match fault {
-            ContentionDebtFault::Read => DEBT_READ_WARNING,
-            ContentionDebtFault::Write => DEBT_WRITE_WARNING,
-        };
-        assert!(
-            warning.contains(debt_notice),
-            "{ctx}: the report must carry the debt-I/O notice {debt_notice:?}; got: {warning:?}"
-        );
-        // (c) FAILED PERSISTENCE: no NEW marker is created, and any
-        // PREEXISTING marker is preserved byte-identical — the faulted
-        // fresh-phase read/write leaves the file untouched, and the retry's
-        // earlier unarmed write re-persisted the SAME content.
-        let after = std::fs::read(&marker_path).unwrap_or_default();
-        if preexisting_debt {
-            assert_eq!(
-                after, before,
-                "{ctx}: the preexisting debt marker must be preserved byte-identical"
-            );
-            let debt = f.store.read_rotation_debt(TARGET).unwrap();
-            assert_eq!(
-                debt.get(SLOT).map(String::as_str),
-                Some("seeded"),
-                "{ctx}: the preexisting marker must still name the seeded slot + reason"
-            );
-        } else {
-            assert!(
-                after.is_empty() && !marker_path.exists(),
-                "{ctx}: no debt marker file may appear when the fresh deferral's persistence \
-                 failed"
-            );
-        }
     }
 }
 
+/// The deterministic exhaustive driver: run the full four-combination
+/// `{preexisting_debt} × {Read | Write}` matrix in a FIXED order. This is
+/// the plain, deterministic floor (no generation, no shrinking) — the
+/// genuine randomized `(preexisting_reason, fault)` coverage lives in
+/// `step17_contention_debt_property` below.
+fn run_step17_contention_debt_matrix(combos: &[(Option<String>, ContentionDebtFault)]) {
+    assert_eq!(
+        combos.len(),
+        4,
+        "the matrix case must cover all four (preexisting_reason, fault) combinations"
+    );
+    for (preexisting_reason, fault) in combos {
+        run_step17_contention_debt_case(preexisting_reason.as_deref(), *fault);
+    }
+}
+
+/// DETERMINISTIC EXHAUSTIVE unit test: the full four-combination matrix —
+/// every `(preexisting_debt, fault)` pair from {no marker, seeded marker} ×
+/// {Read, Write}, run in a FIXED order through
+/// [`run_step17_contention_debt_matrix`]. This is the plain, deterministic
+/// floor (no generation, no shrinking): it pins the four post-commit
+/// contracts — `Ok`+`Successful`, both required warnings, marker
+/// preservation / no-marker-on-failed-persistence — for the whole matrix in
+/// one pass.
+#[test]
+fn step17_contention_debt_matrix_exhaustive() {
+    run_step17_contention_debt_matrix(&[
+        (None, ContentionDebtFault::Read),
+        (None, ContentionDebtFault::Write),
+        (Some("seeded".to_string()), ContentionDebtFault::Read),
+        (Some("seeded".to_string()), ContentionDebtFault::Write),
+    ]);
+}
+
 proptest! {
-    // The REQUIRED matrix property: generate `(preexisting_debt: bool, fault:
-    // Read | Write)` for a GUARANTEED NON-NO-OP push (each case is a fresh
-    // fixture whose FIRST push mints a generation — the runner asserts the
-    // attempt/status). Every case is a random PERMUTATION of all four
-    // combinations (a `subsequence` of size 4 over the 4-element matrix), so
-    // the full matrix is exercised by construction. The phase-distinguished
-    // hook is the deterministic mechanism: no sleeps beyond the 5ms
-    // `recv_timeout` polling, no races — the debt fault is armed while the
-    // engine is PARKED at the FreshStep17 barrier and released only after.
-    // Bounded cases (4) keep the suite fast; a fixed seed keeps CI
-    // deterministic (no persistence file).
+    // The GENUINE property test. The OLD matrix proptest's input was
+    // CONSTANT: `prop::sample::subsequence(vec![...4 elements], 4)` always
+    // yields the same full 4-vector — no random generation, no shrinking
+    // value. This test generates the REQUIRED
+    // `(preexisting_reason: Option<String>, fault: Read | Write)` pair for a
+    // GUARANTEED NON-NO-OP push: the preexisting debt marker's reason is an
+    // ARBITRARY string (or absent) and the fault is one of the two debt-I/O
+    // operations. Each case is a fresh fixture whose FIRST push mints a
+    // generation (the runner asserts the attempt/status). The
+    // phase-distinguished hook is the deterministic mechanism: no sleeps
+    // beyond the 5ms `recv_timeout` polling, no races — the fault is armed
+    // while the engine is PARKED at the FreshStep17 barrier and released
+    // only after.
+    //
+    // The shrinker now has a REAL dimension to minimize: a failing reason
+    // string (a preservation / round-trip break shrinks toward the minimal
+    // offending string — or to None), and the fault half shrinks toward
+    // `Read`. Every generated case asserts the same post-commit contract as
+    // the exhaustive unit test: (a) the disposition is `Ok` + `Successful` —
+    // never `Err`; (b) the EXACT warnings — the contention warning naming the
+    // slot AND the debt-I/O notice for the chosen fault; (c) SEMANTIC
+    // PRESERVATION of the arbitrary preexisting debt — the marker file
+    // survives byte-identical with its ARBITRARY reason round-tripped exactly
+    // when preexisting debt exists, and no marker appears when it does not
+    // exist and persistence failed.
+    //
+    // Bounded cases (16) keep the suite fast (~35s total); a fixed seed
+    // keeps CI deterministic (no persistence file) — the project's fixed-seed
+    // leg, mirroring `semantic_state_machine_fixed_seed_regression` (the
+    // randomized-with-persistence leg lives in the main
+    // `semantic_state_machine`).
     #![proptest_config(ProptestConfig {
-        cases: 4,
+        cases: 16,
         rng_seed: RngSeed::Fixed(0x5EED_17DE),
         failure_persistence: None,
         ..ProptestConfig::default()
     })]
 
     #[test]
-    fn step17_contention_debt_matrix(
-        combos in prop::sample::subsequence(
-            vec![
-                (false, ContentionDebtFault::Read),
-                (false, ContentionDebtFault::Write),
-                (true, ContentionDebtFault::Read),
-                (true, ContentionDebtFault::Write),
-            ],
-            4,
+    fn step17_contention_debt_property(
+        (preexisting_reason, fault) in (
+            prop::option::of(prop::string::string_regex(".{0,64}").unwrap()),
+            prop::sample::select(
+                [ContentionDebtFault::Read, ContentionDebtFault::Write].as_slice(),
+            ),
         )
     ) {
-        run_step17_contention_debt_matrix(&combos);
+        run_step17_contention_debt_case(preexisting_reason.as_deref(), fault);
     }
 }
