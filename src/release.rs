@@ -139,6 +139,16 @@ pub fn normalize_deploy_dir(path: &Path) -> String {
 /// canonicalize to the same identity as the deduplicated list — duplicate
 /// noise never shifts the digest. Server-level policy (user, address, port,
 /// capacity) is deliberately absent — it is not release identity.
+///
+/// The sort is a TOTAL ORDER over the four identity fields (id, then server,
+/// then deploy_dir, then targets), not a stable id-only sort: a STABLE sort
+/// over the id alone would let the DECLARATION ORDER of duplicate-id slots
+/// leak into the canonical form, making the digest asymmetric for two
+/// logically-identical declaration orders (the identity-gap class of bug). A
+/// total order makes the canonical form a pure function of the declared slot
+/// set — the same slots written in any order canonicalize identically, even
+/// for the degenerate duplicate-id declarations a record that slipped past
+/// validation can carry.
 pub fn canonicalize_slots(slots: &[SlotDef]) -> CanonicalSlots {
     let mut out: Vec<CanonicalSlot> = slots
         .iter()
@@ -154,14 +164,22 @@ pub fn canonicalize_slots(slots: &[SlotDef]) -> CanonicalSlots {
             },
         })
         .collect();
-    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out.sort_by(|a, b| {
+        a.id.cmp(&b.id)
+            .then_with(|| a.server.cmp(&b.server))
+            .then_with(|| a.deploy_dir.cmp(&b.deploy_dir))
+            .then_with(|| a.targets.cmp(&b.targets))
+    });
     CanonicalSlots { slots: out }
 }
 
 /// Canonical digest over name-sorted per-variant slot declarations. Each
 /// variant's slots are canonicalized (the four identity fields, `deploy_dir`
 /// lexically normalized, `targets` sorted and deduplicated) and sorted by
-/// slot id; the variants are name-sorted by the `BTreeMap`. Two releases
+/// the total order over those four fields (id, server, deploy_dir, targets —
+/// the content tie-break keeps the canonical form order-independent even for
+/// duplicate-id declarations); the variants are name-sorted by the
+/// `BTreeMap`. Two releases
 /// share this digest only when every declared variant declares the same
 /// slots — a rebind, `deploy_dir` move, or target-membership change alters
 /// it, while a reordering of slot declarations (or of variants, or of a
@@ -1013,6 +1031,526 @@ mod tests {
                 d, canonical,
                 "payload version {v} must produce a different digest than the canonical version"
             );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Release-identity digest contract (property tests)
+    // -------------------------------------------------------------------
+    //
+    // The property covers the FULL identity contract of
+    // `build_release` + `recompute_release_digest` + `verify_release_identity`
+    // over generated release components:
+    //
+    // 1. ROUND-TRIP: a built release's stored `release_sha256` / `release_id`
+    //    are exactly what the recompute path (which `verify` uses) re-derives
+    //    from the record's own content, and verification passes.
+    // 2. MUTATION SENSITIVITY: every identity field — mapping digest, behavior
+    //    digest, every variant's tree digest, the variant→tree binding, every
+    //    slot's id/server/deploy_dir/targets, the self-referential output
+    //    fields (`release_sha256`, `release_id`), and the schema versions —
+    //    is tamper-evident: mutating it makes the recompute disagree (for
+    //    content fields) and ALWAYS fails verification with an integrity
+    //    error. The intentionally non-identity fields (`created_at`, the
+    //    `git_revision` provenance) are whitelisted: mutating them must NOT
+    //    change the digest and must NOT break verification. (There is no
+    //    display-name field on `ReleaseRecord`; the docs' exclusion is
+    //    realized by `created_at` + provenance.)
+    // 3. CANONICAL ORDER-INDEPENDENCE: the same logical release written with
+    //    differently-ordered slot declarations, differently-ordered target
+    //    lists, duplicate targets, or textually-different-but-lexically-
+    //    equivalent `deploy_dir` spellings canonicalizes to the SAME digest.
+
+    use proptest::prelude::*;
+    use proptest::test_runner::{FileFailurePersistence, RngSeed};
+
+    /// One generated release component set: the frozen mapping digest, the
+    /// behavior digest, the `variant -> tree digest` bindings, and the raw
+    /// per-variant slot declarations. The shapes are adversarial: slot ids
+    /// come from a small pool (slots SHARE ids across variants, and may
+    /// collide within a variant), `targets` lists are generated unsorted with
+    /// duplicates, `deploy_dir`s include `..`/`//`/trailing-slash/relative
+    /// spellings, and variant names include empty and odd strings.
+    #[derive(Clone, Debug)]
+    struct ReleaseComponents {
+        mapping_sha256: String,
+        behavior_sha256: String,
+        /// `variant -> tree digest` bindings (name-sorted map).
+        variants: BTreeMap<String, String>,
+        /// Raw per-variant slot declarations, pre-canonicalization.
+        variant_slots: BTreeMap<String, Vec<SlotDef>>,
+    }
+
+    fn variant_name_strategy() -> impl Strategy<Value = String> {
+        prop::sample::select(vec![
+            "standard".to_string(),
+            "canary".to_string(),
+            "".to_string(),
+            "v".to_string(),
+            "Variant-2".to_string(),
+            "edge/blue-green".to_string(),
+        ])
+    }
+
+    fn slot_id_strategy() -> impl Strategy<Value = String> {
+        prop::sample::select(vec!["p1".to_string(), "p2".to_string(), "s1".to_string()])
+    }
+
+    fn server_strategy() -> impl Strategy<Value = String> {
+        prop::sample::select(vec![
+            "server-01".to_string(),
+            "server-02".to_string(),
+            "edge-1".to_string(),
+        ])
+    }
+
+    fn deploy_dir_strategy() -> impl Strategy<Value = String> {
+        prop::sample::select(vec![
+            "/srv/deploy/example".to_string(),
+            "//srv//deploy/example/".to_string(),
+            "/srv/deploy/../deploy/example".to_string(),
+            "/srv/deploy/example/..".to_string(),
+            "/srv/./deploy/example".to_string(),
+            "/".to_string(),
+            "..".to_string(),
+            "./srv/deploy/example".to_string(),
+            "/srv/deploy/example//".to_string(),
+            "/srv/../srv/deploy/example".to_string(),
+        ])
+    }
+
+    fn target_strategy() -> impl Strategy<Value = String> {
+        prop::sample::select(vec![
+            "production".to_string(),
+            "staging".to_string(),
+            "edge".to_string(),
+        ])
+    }
+
+    fn slot_strategy() -> impl Strategy<Value = SlotDef> {
+        (
+            slot_id_strategy(),
+            server_strategy(),
+            deploy_dir_strategy(),
+            prop::collection::vec(target_strategy(), 1..4),
+        )
+            .prop_map(|(id, server, deploy_dir, targets)| SlotDef {
+                id,
+                server,
+                deploy_dir: PathBuf::from(deploy_dir),
+                targets,
+            })
+    }
+
+    /// The component grammar: 1..4 `(variant name, tree seed, slots)` groups.
+    /// Variant names are deduplicated keeping the FIRST occurrence (so the
+    /// bindings and the slot declarations share exactly the same key set), the
+    /// tree digest is the hex of a random 16-byte seed, and each variant
+    /// carries 1..2 slots drawn from the adversarial slot grammar.
+    fn release_components_strategy() -> impl Strategy<Value = ReleaseComponents> {
+        (
+            any::<[u8; 16]>(),
+            any::<[u8; 16]>(),
+            prop::collection::vec(
+                (
+                    variant_name_strategy(),
+                    any::<[u8; 16]>(),
+                    prop::collection::vec(slot_strategy(), 1..3),
+                ),
+                1..4,
+            ),
+        )
+            .prop_map(|(mapping_seed, behavior_seed, groups)| {
+                let mut components = ReleaseComponents {
+                    mapping_sha256: hex::encode(mapping_seed),
+                    behavior_sha256: hex::encode(behavior_seed),
+                    variants: BTreeMap::new(),
+                    variant_slots: BTreeMap::new(),
+                };
+                for (name, tree_seed, slots) in groups {
+                    if components.variants.contains_key(&name) {
+                        continue;
+                    }
+                    components
+                        .variants
+                        .insert(name.clone(), hex::encode(tree_seed));
+                    components.variant_slots.insert(name, slots);
+                }
+                components
+            })
+    }
+
+    /// Three textual spellings of the same canonical directory `n`: the form
+    /// itself, a doubled-slash + trailing-slash form, and a `<last>/../<last>`
+    /// round-trip form. All three lexically normalize back to `n`. The
+    /// degenerate forms (`""`, `"/"`, and relative paths) have no
+    /// textually-different equivalent spelling, so all three spellings are
+    /// `n` itself.
+    fn equivalent_dir_spellings(n: &str) -> [String; 3] {
+        if n.is_empty() || n == "/" || !n.starts_with('/') {
+            return [n.to_string(), n.to_string(), n.to_string()];
+        }
+        let (prefix, last) = n.rsplit_once('/').expect("absolute path has a slash");
+        [
+            n.to_string(),
+            format!("{prefix}//{last}/"),
+            format!("{n}/../{last}"),
+        ]
+    }
+
+    /// A record whose CONTENT was mutated (a field that feeds the recompute)
+    /// must re-digest differently AND fail verification with an integrity
+    /// error. The recompute is allowed to refuse an emptied slot snapshot
+    /// (`None` — which is itself a recompute != original, since the original
+    /// recomputes to `Some`); in every other case the recomputed digest must
+    /// differ from the stored one.
+    fn assert_content_mutation(original: &ReleaseRecord, mutated: &ReleaseRecord, label: &str) {
+        if let Some(recomputed) = recompute_release_digest(mutated) {
+            assert_ne!(
+                recomputed.as_str(),
+                original.release_sha256,
+                "{label}: mutating an identity content field must change the recomputed digest"
+            );
+        }
+        let err = verify_release_identity(mutated).unwrap_err();
+        assert!(
+            err.to_string().contains("integrity"),
+            "{label}: tampering must fail with an integrity error, got: {err}"
+        );
+    }
+
+    /// A record whose self-referential OUTPUT field was mutated
+    /// (`release_sha256`, `release_id`, or a schema version) is detected by
+    /// verification — the stored field is checked against the recompute —
+    /// even though the recompute itself is unaffected (those fields are not
+    /// digest inputs).
+    fn assert_output_mutation(original: &ReleaseRecord, mutated: &ReleaseRecord, label: &str) {
+        let recomputed = recompute_release_digest(mutated)
+            .expect("output-field mutations never touch the slot snapshot");
+        assert_eq!(
+            recomputed.as_str(),
+            original.release_sha256,
+            "{label}: output fields are not digest inputs"
+        );
+        let err = verify_release_identity(mutated).unwrap_err();
+        assert!(
+            err.to_string().contains("integrity"),
+            "{label}: a tampered output field must fail with an integrity error, got: {err}"
+        );
+    }
+
+    /// A record whose WHITELISTED (intentionally non-identity) field was
+    /// mutated — `created_at`, the `git_revision` provenance — must digest
+    /// IDENTICALLY and still verify: the field is excluded from the identity
+    /// contract, so changing it is not tampering.
+    fn assert_whitelist_mutation(original: &ReleaseRecord, mutated: &ReleaseRecord, label: &str) {
+        let recomputed = recompute_release_digest(mutated)
+            .expect("whitelist mutations never touch the slot snapshot");
+        assert_eq!(
+            recomputed.as_str(),
+            original.release_sha256,
+            "{label}: whitelisted fields must not enter the digest"
+        );
+        verify_release_identity(mutated)
+            .expect("{label}: a whitelisted-field change must not break verification");
+    }
+
+    /// The three-part contract for one generated component set.
+    fn run_release_identity_contract(c: &ReleaseComponents) {
+        let variants: BTreeMap<VariantName, TreeDigest> = c
+            .variants
+            .iter()
+            .map(|(name, digest)| {
+                (
+                    VariantName::new(name.clone()),
+                    TreeDigest::new(digest.clone()),
+                )
+            })
+            .collect();
+        let rec = build_release(
+            &c.mapping_sha256,
+            &c.behavior_sha256,
+            &variants,
+            &c.variant_slots,
+            Path::new("."),
+        );
+
+        // (1) ROUND-TRIP: build and the recompute path `verify` uses agree on
+        // the exact field partition — the stored digest/id are exactly what
+        // the record's own content re-derives, and verification passes.
+        let recomputed = recompute_release_digest(&rec)
+            .expect("a built release always carries its canonical slot snapshot");
+        assert_eq!(
+            recomputed.as_str(),
+            rec.release_sha256,
+            "recompute must reproduce the digest build derived"
+        );
+        assert_eq!(
+            ReleaseId::from_digest(&recomputed).as_str(),
+            rec.release_id,
+            "recompute must reproduce the release id build derived"
+        );
+        verify_release_identity(&rec).expect("a freshly built release verifies");
+
+        // (2) MUTATION SENSITIVITY — content fields that feed the recompute.
+        // Mapping digest.
+        let mut r = rec.clone();
+        r.provenance.mapping_sha256 = format!("{}!tampered", r.provenance.mapping_sha256);
+        assert_content_mutation(&rec, &r, "mapping_sha256");
+        // Behavior digest.
+        let mut r = rec.clone();
+        r.provenance.behavior_sha256 = format!("{}!tampered", r.provenance.behavior_sha256);
+        assert_content_mutation(&rec, &r, "behavior_sha256");
+        // The first variant's tree digest (the variant->tree binding value).
+        let first_variant = rec
+            .variants
+            .keys()
+            .next()
+            .cloned()
+            .expect("the grammar always yields at least one variant");
+        let mut r = rec.clone();
+        r.variants.insert(
+            first_variant.clone(),
+            format!("{}!tampered", rec.variants[&first_variant]),
+        );
+        assert_content_mutation(&rec, &r, "variant tree digest");
+        // The variant->tree BINDING: adding a variant key changes the map.
+        let mut r = rec.clone();
+        let mut extra_name = "zzz-extra-variant".to_string();
+        while rec.variants.contains_key(&extra_name) {
+            extra_name.push('x');
+        }
+        r.variants.insert(extra_name, "tree-extra".to_string());
+        assert_content_mutation(&rec, &r, "variant binding addition");
+        // ... and removing a variant key changes the map.
+        let mut r = rec.clone();
+        r.variants.remove(&first_variant);
+        assert_content_mutation(&rec, &r, "variant binding removal");
+        // EVERY slot field of EVERY slot of EVERY variant is identity.
+        for (variant, cs) in &rec.slots {
+            for (i, slot) in cs.slots.iter().enumerate() {
+                let mut r = rec.clone();
+                r.slots.get_mut(variant).unwrap().slots[i].id = format!("{}!tampered", slot.id);
+                assert_content_mutation(&rec, &r, "slot id");
+
+                let mut r = rec.clone();
+                r.slots.get_mut(variant).unwrap().slots[i].server =
+                    format!("{}!tampered", slot.server);
+                assert_content_mutation(&rec, &r, "slot server");
+
+                let mut r = rec.clone();
+                r.slots.get_mut(variant).unwrap().slots[i].deploy_dir =
+                    format!("{}!tampered", slot.deploy_dir);
+                assert_content_mutation(&rec, &r, "slot deploy_dir");
+
+                let mut r = rec.clone();
+                let mut targets = slot.targets.clone();
+                targets.push("tampered".to_string());
+                r.slots.get_mut(variant).unwrap().slots[i].targets = targets;
+                assert_content_mutation(&rec, &r, "slot targets");
+            }
+        }
+        // Removing a slot changes the digest; clearing a variant's slots does
+        // too (the snapshot keeps the variant key).
+        let mut r = rec.clone();
+        let (any_variant, any_cs) = rec.slots.iter().next().expect("at least one variant");
+        if any_cs.slots.len() > 1 {
+            r.slots.get_mut(any_variant).unwrap().slots.remove(0);
+        } else {
+            r.slots.get_mut(any_variant).unwrap().slots.clear();
+        }
+        assert_content_mutation(&rec, &r, "slot removal");
+        // Emptying the ENTIRE slot snapshot: recompute refuses (None) and
+        // verification fails closed (no legacy escape hatch).
+        let mut r = rec.clone();
+        r.slots.clear();
+        assert!(
+            recompute_release_digest(&r).is_none(),
+            "an emptied slot snapshot must be refused by recompute"
+        );
+        let err = verify_release_identity(&r).unwrap_err();
+        assert!(
+            err.to_string().contains("integrity"),
+            "an emptied slot snapshot must fail with an integrity error, got: {err}"
+        );
+
+        // (2) MUTATION SENSITIVITY — self-referential OUTPUT fields. The
+        // stored digest, stored id, and record schema version are checked by
+        // verification against the recompute, not trusted as inputs.
+        let mut r = rec.clone();
+        r.release_sha256 = "tampered-digest".to_string();
+        assert_output_mutation(&rec, &r, "release_sha256");
+        let mut r = rec.clone();
+        r.release_id = "rel-sha256-tampered".to_string();
+        assert_output_mutation(&rec, &r, "release_id");
+        let mut r = rec.clone();
+        r.release_schema_version = RELEASE_RECORD_SCHEMA_VERSION.wrapping_add(1);
+        assert_output_mutation(&rec, &r, "release_schema_version");
+        // The PAYLOAD schema version is frozen into the digest: a release
+        // whose identity was derived from any other payload version fails the
+        // recompute-and-verify check (the recompute always uses the canonical
+        // payload version).
+        let raw_slots: BTreeMap<String, Vec<SlotDef>> = rec
+            .slots
+            .iter()
+            .map(|(v, cs)| {
+                (
+                    v.clone(),
+                    cs.slots
+                        .iter()
+                        .map(|s| SlotDef {
+                            id: s.id.clone(),
+                            server: s.server.clone(),
+                            deploy_dir: PathBuf::from(&s.deploy_dir),
+                            targets: s.targets.clone(),
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let slots_digest = variant_slots_digest(&raw_slots);
+        for v in [
+            0u32,
+            RELEASE_PAYLOAD_SCHEMA_VERSION.wrapping_add(1),
+            u32::MAX,
+        ] {
+            let mut r = rec.clone();
+            let payload = CanonicalReleasePayload {
+                schema_version: v,
+                mapping_sha256: rec.provenance.mapping_sha256.clone(),
+                behavior_sha256: rec.provenance.behavior_sha256.clone(),
+                slots_digest: slots_digest.clone(),
+                variants: rec.variants.clone(),
+            };
+            let digest = sha256_bytes(&serde_json::to_vec(&payload).expect("payload serializes"));
+            r.release_sha256 = digest.clone();
+            r.release_id = format!("rel-sha256-{digest}");
+            assert_output_mutation(&rec, &r, &format!("payload schema version {v}"));
+        }
+
+        // (2) WHITELIST — the intentionally non-identity fields. Mutating
+        // `created_at` or the `git_revision` provenance must NOT change the
+        // digest and must NOT break verification.
+        let mut r = rec.clone();
+        r.created_at = "2099-12-31T23:59:59Z".to_string();
+        assert_whitelist_mutation(&rec, &r, "created_at");
+        let mut r = rec.clone();
+        r.provenance.git_revision = Some("deadbeef".to_string());
+        assert_whitelist_mutation(&rec, &r, "git_revision set");
+        let mut r = rec.clone();
+        r.provenance.git_revision = None;
+        assert_whitelist_mutation(&rec, &r, "git_revision removed");
+
+        // (3) CANONICAL ORDER-INDEPENDENCE: the same LOGICAL release written
+        // differently canonicalizes to the SAME digest.
+        //
+        // B: each variant's slot declarations reversed, each slot's `targets`
+        // reversed, and each `deploy_dir` respelled textually-differently but
+        // lexically-equivalently. C: each slot's `targets` list gets its first
+        // name appended again (a duplicate — deduplicated away by the
+        // canonical form).
+        let b_slots: BTreeMap<String, Vec<SlotDef>> = c
+            .variant_slots
+            .iter()
+            .map(|(v, defs)| {
+                let mut out: Vec<SlotDef> = defs.iter().rev().cloned().collect();
+                for (i, s) in out.iter_mut().enumerate() {
+                    s.targets.reverse();
+                    let n = normalize_deploy_dir(&s.deploy_dir);
+                    s.deploy_dir = PathBuf::from(equivalent_dir_spellings(&n)[i % 3].clone());
+                }
+                (v.clone(), out)
+            })
+            .collect();
+        let c_slots: BTreeMap<String, Vec<SlotDef>> = c
+            .variant_slots
+            .iter()
+            .map(|(v, defs)| {
+                let out: Vec<SlotDef> = defs
+                    .iter()
+                    .map(|s| {
+                        let mut dup = s.clone();
+                        if let Some(first) = dup.targets.first().cloned() {
+                            dup.targets.push(first);
+                        }
+                        dup
+                    })
+                    .collect();
+                (v.clone(), out)
+            })
+            .collect();
+        let rec_b = build_release(
+            &c.mapping_sha256,
+            &c.behavior_sha256,
+            &variants,
+            &b_slots,
+            Path::new("."),
+        );
+        let rec_c = build_release(
+            &c.mapping_sha256,
+            &c.behavior_sha256,
+            &variants,
+            &c_slots,
+            Path::new("."),
+        );
+        assert_eq!(
+            rec_b.release_sha256, rec.release_sha256,
+            "reordered/reshuffled slot declarations must canonicalize to the same digest"
+        );
+        assert_eq!(
+            rec_c.release_sha256, rec.release_sha256,
+            "duplicated target names must dedup to the same digest"
+        );
+        assert_eq!(rec_b.release_id, rec.release_id, "reshuffled release id");
+        assert_eq!(rec_c.release_id, rec.release_id, "deduplicated release id");
+        assert_eq!(
+            rec_b.slots, rec.slots,
+            "the frozen canonical slot snapshot must be identical across spellings"
+        );
+        assert_eq!(
+            rec_c.slots, rec.slots,
+            "the frozen canonical slot snapshot must be identical after dedup"
+        );
+        verify_release_identity(&rec_b).expect("the reshuffled release verifies");
+        verify_release_identity(&rec_c).expect("the deduplicated release verifies");
+    }
+
+    proptest! {
+        // Main property: ORDINARY RANDOMIZED SEEDS with FAILURE PERSISTENCE
+        // (proptest's defaults) — a failing vector writes to
+        // `proptest-regressions/release.txt` and is replayed on the next run
+        // (commit it so CI keeps reproducing the regression until fixed). The
+        // case count is bounded so the suite stays fast.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            failure_persistence: Some(Box::new(FileFailurePersistence::default())),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn release_identity_digest_contract(components in release_components_strategy()) {
+            run_release_identity_contract(&components);
+        }
+    }
+
+    proptest! {
+        // FIXED-SEED REGRESSION: the deterministic floor for CI. The same
+        // generator under the pinned 0x5EED_5EED seed with no persistence runs
+        // the IDENTICAL vectors on every invocation, so the suite stays
+        // reproducible even when no failure has ever been persisted by the
+        // main test. The case count is bounded so the suite stays fast.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn release_identity_digest_contract_fixed_seed_regression(
+            components in release_components_strategy(),
+        ) {
+            run_release_identity_contract(&components);
         }
     }
 }

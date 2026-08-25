@@ -266,7 +266,11 @@ pub struct CanonicalSlot {
 }
 
 /// The canonicalized slot declaration set of one variant: its slots sorted by
-/// slot id. A variant's slot declarations ARE release identity — rebinding a
+/// slot id, with ties broken deterministically by the remaining identity
+/// fields (server, deploy_dir, targets) so the canonical form is a pure
+/// function of the declared slot set — order-independent even for the
+/// degenerate duplicate-id declarations a record that slipped past validation
+/// can carry. A variant's slot declarations ARE release identity — rebinding a
 /// slot to another server, moving its `deploy_dir`, or changing its target
 /// membership changes the release — so this snapshot is frozen into the
 /// release record and digest. It carries exactly the four [`CanonicalSlot`]
