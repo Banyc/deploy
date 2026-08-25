@@ -553,9 +553,9 @@ impl<'a> RemoteHelper<'a> {
         }
     }
 
-    /// Write a fleet-commit marker for a deployment under this server. The marker
+    /// Write a commit marker for a deployment under this server. The marker
     /// records the generation this slot committed, the full set of placement
-    /// slot IDs that participate in the fleet commit (so a partial marker can
+    /// slot IDs that participate in the commit (so a partial marker can
     /// never masquerade as a complete commit), and the originating target of
     /// the push. `target` is optional for legacy markers written before
     /// originating-target attribution existed; new commits always record it.
@@ -1415,7 +1415,7 @@ mod durability_tests {
         );
     }
 
-    /// Same recovery rule for fleet-commit markers: an interrupted write never
+    /// Same recovery rule for commit markers: an interrupted write never
     /// surfaces as a partial marker, and a later commit succeeds cleanly.
     #[test]
     fn interrupted_commit_marker_write_is_recovered() {

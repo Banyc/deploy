@@ -526,7 +526,7 @@ keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[targets.t1.rotation.fleet]
+[targets.t1.rotation.deployment]
 protect_deployments = 1
 
 [[servers]]
@@ -589,7 +589,7 @@ keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[targets.t1.rotation.fleet]
+[targets.t1.rotation.deployment]
 protect_deployments = 1
 
 [[servers]]

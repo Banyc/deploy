@@ -114,12 +114,12 @@ pub fn operation_lock() -> PathBuf {
     state_file(OPERATION_LOCK)
 }
 
-/// Directory holding fleet-commit markers.
+/// Directory holding commit markers.
 pub fn commits_dir() -> PathBuf {
     state_dir().join("commits")
 }
 
-/// Fleet-commit markers, one per deployment.
+/// Commit markers, one per deployment.
 pub fn commit_marker(deployment_id: &str) -> PathBuf {
     commits_dir().join(format!("{deployment_id}.json"))
 }

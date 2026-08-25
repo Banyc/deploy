@@ -690,9 +690,9 @@ impl LocalStore {
             .filter(|s| !s.trim().is_empty())
     }
 
-    /// Append a terminal successful fleet snapshot (`refs/snapshots.jsonl`),
+    /// Append a terminal successful snapshot (`refs/snapshots.jsonl`),
     /// one JSON line per entry. Snapshots are the immutable rollback source
-    /// (`<target>@fN`); only successful deployments produce them.
+    /// (`<target>@sN`); only successful deployments produce them.
     pub fn append_snapshot(&self, target: &str, entry: &DeploymentSnapshot) -> Result<()> {
         #[cfg(test)]
         if self

@@ -42,5 +42,5 @@ keep_distinct_artifacts = 5   # keep the newest 5 distinct artifacts per server
 keep_days = 14                # ...and everything activated in the last 14 days
 protect_previous = true       # never delete the artifact `current` can roll back to
 
-[targets.production.rotation.fleet]
+[targets.production.rotation.deployment]
 protect_deployments = 2       # keep each server's artifacts of the newest 2 successful deployments

@@ -137,13 +137,18 @@ Then, from inside the project:\n\
 variants (or restore a historical deployment) to every server in the target,\n\
 in rollout batches.\n\
 \n\
-REFERENCE (optional second argument):\n\
-  HEAD                          the current local files (default)\n\
-  <target>@fN                   roll back to the Nth successful fleet deployment\n\
-                                (e.g. production@f1); failed attempts never count\n\
-  release/<id>:current          deploy a retained release, keeping each server's\n\
-                                configured variant (omit :current to restore the\n\
-                                release's original variant per server)\n\
+REFERENCE (optional second argument, jj-style — the target is NEVER repeated\n\
+in the reference; every relative form resolves against the target argument):\n\n\
+  (none), HEAD, @      the current local files (default)\n\
+  @-                   the snapshot BEFORE the latest successful deployment\n\
+  @--                  two steps back (the grandparent)\n\
+  parent(@, N)         N steps back from the latest (e.g. parent(@, 2))\n\
+  sN                   the exact Nth successful snapshot (e.g. s3); failed\n\
+                       attempts never count and never produce a snapshot\n\
+  sN- / sN--            N steps back from snapshot sN\n\
+  parent(sN, M)         M steps back from snapshot sN\n\
+  <id>-- / parent(<id>, N)   N steps back from the most recent snapshot that\n\
+                       deployed deployment <id> or referenced release <id>\n\
 \n\
 --dry-run prints the plan and touches nothing (no store writes, no remote\n\
 state, no locks). Pushing identical content prints 'Everything up to date'.\n\
@@ -153,13 +158,15 @@ reported explicitly, including partial states like `degraded`.",
         after_help = "Examples:\n\
   deploy push production               # deploy local files\n\
   deploy push production --dry-run     # preview the plan, touch nothing\n\
-  deploy push production production@f1 # roll back to the 2nd successful deployment\n\
-  deploy push production release/rel-41da2f63   # deploy a specific release"
+  deploy push production @-            # roll back to the previous deployment\n\
+  deploy push production parent(@, 3)  # roll back 3 deployments\n\
+  deploy push production s3--          # 2 deployments before snapshot s3"
     )]
     Push {
         target: String,
-        /// Optional source reference: HEAD (default), <target>@fN, or
-        /// release/<id>:current.
+        /// Optional jj-style source reference: blank/HEAD/@ (default),
+        /// @- / @-- / parent(@, N), or a refid relative (sN, <refid>--,
+        /// parent(<refid>, N)) — never repeats the target.
         reference: Option<String>,
         #[arg(long)]
         dry_run: bool,
@@ -168,8 +175,8 @@ reported explicitly, including partial states like `degraded`.",
     #[command(
         long_about = "Show every recorded deployment attempt for the target, newest last:\n\
 deployment ID, status, and timestamp. Failed and degraded attempts remain\n\
-visible here but are NOT valid rollback refs — only successful fleet\n\
-snapshots advance <target>@fN (see `deploy help push`)."
+visible here but are NOT valid rollback refs — only successful deployments\n\
+produce snapshots (see `deploy help push` for the reference syntax)."
     )]
     Log { target: String },
     /// Show what is actually running on every server.
@@ -506,7 +513,7 @@ keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[targets.production.rotation.fleet]
+[targets.production.rotation.deployment]
 protect_deployments = 1
 
 [[servers]]

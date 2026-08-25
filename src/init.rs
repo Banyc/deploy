@@ -22,8 +22,8 @@
 
 use crate::config::{
     ActivationConfig, ActivationScope, ArtifactConfig, CapacityConfig, ConflictPolicy,
-    FleetRotation, Mapping, PerServerRotation, RolloutConfig, RotationConfig, ServerDef, SlotDef,
-    TargetDef, UnitDef, VariantConfig, VerificationConfig,
+    DeploymentRotation, Mapping, PerServerRotation, RolloutConfig, RotationConfig, ServerDef,
+    SlotDef, TargetDef, UnitDef, VariantConfig, VerificationConfig,
 };
 use crate::error::{Error, Result};
 use serde::Serialize;
@@ -300,7 +300,7 @@ fn build_docs(
                         keep_days: 14,
                         protect_previous: true,
                     },
-                    fleet: FleetRotation {
+                    deployment: DeploymentRotation {
                         protect_deployments: 2,
                     },
                 },

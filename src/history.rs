@@ -1,9 +1,34 @@
-//! Fleet history, rollback snapshots, and rollback reference handling.
+//! Deployment snapshot history, rollback snapshots, and rollback reference
+//! handling.
 //!
-//! Only fully successful deployments produce a fleet snapshot
-//! (`refs/snapshots.jsonl`), exposed as `<target>@f0`, `<target>@f1`, and so
-//! on. Failed and degraded attempts remain visible through `deploy log` and
-//! `attempts.jsonl` but are not valid rollback sources.
+//! Only fully successful deployments produce a snapshot
+//! (`refs/snapshots.jsonl`), exposed as the indices `s0`, `s1`, and so on
+//! (`ref_name` renders them `production@s0` for display). Failed and degraded
+//! attempts remain visible through `deploy log` and `attempts.jsonl` but are
+//! not valid rollback sources.
+//!
+//! # Reference syntax (jj-style)
+//!
+//! The push reference is jj-style: the TARGET IS NEVER REPEATED in the
+//! reference, and the `@`-relative forms resolve against the separately-given
+//! target argument (see [`resolve_push_ref`]). The accepted forms are:
+//!
+//! * `` (empty), `HEAD`, `@` — the current local files (the default).
+//! * `@-`, `@--` — the snapshot BEFORE the latest, the grandparent.
+//! * `parent(@, N)` — the Nth ancestor of the latest snapshot.
+//! * `<refid>-`, `<refid>--` — N ancestors of the refid (1 or 2 dashes).
+//! * `parent(<refid>, N)` — N ancestors of the refid (N = 0 is the refid
+//!   itself).
+//! * the bare refid itself — `s3` (snapshot index 3), `deploy-...` (the
+//!   most recent snapshot of that deployment).
+//!
+//! `<refid>` is a snapshot index (`s3`), a deployment id (`deploy-...`), or a
+//! release id (`rel-sha256-...` or a bare digest). A snapshot index resolves
+//! to the snapshot with that index; a deployment or release id resolves to
+//! the MOST RECENT snapshot that deployed that deployment / references that
+//! release. The ancestor steps then walk `s(index - N)`; stepping past the
+//! start of the chain, an unresolvable refid, or an empty chain fail closed
+//! with a ref error — never underflow, never guess.
 
 use crate::error::{Error, Result};
 use crate::model::{
@@ -15,74 +40,322 @@ use crate::records::{
 use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
 
-/// A parsed push source reference.
+/// A concrete push source reference (store + target already resolved).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PushRef {
     /// Materialize the currently mapped local files; assign configured variants.
     Head,
-    /// Restore a historical successful fleet snapshot by index.
-    Fleet {
-        target: TargetName,
-        index: u64,
-        current_variant: bool,
-    },
+    /// Restore a historical successful snapshot by index.
+    Snapshot { target: TargetName, index: u64 },
     /// Assign each current server its configured variant from a named release.
-    Release {
-        release: ReleaseId,
-        current_variant: bool,
-    },
+    Release { release: ReleaseId },
 }
 
-/// Parse a push source reference token (the part after the target name).
-pub fn parse_push_ref(token: &str) -> Result<PushRef> {
-    let t = token.trim();
-    let current_variant = t.ends_with(":current");
-    let base = if current_variant {
-        &t[..t.len() - ":current".len()]
-    } else {
-        t
-    };
+/// A parsed push reference BEFORE store/target resolution.
+///
+/// The relative forms cannot be turned into a concrete [`PushRef`] without the
+/// target's snapshot chain, so [`parse_push_ref`] stops at this parsed form
+/// and [`resolve_push_ref`] finishes the job against the store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefExpr {
+    /// `""`, `HEAD`, `@`: materialize the currently mapped local files.
+    Head,
+    /// A jj-style relative reference needing the store + target.
+    Relative(RelativeRef),
+}
 
-    if base == "HEAD" || base.is_empty() {
-        return Ok(PushRef::Head);
+/// A jj-style relative push reference: `@-`, `@--`, `parent(@, N)`,
+/// `<refid>-`, `<refid>--`, `parent(<refid>, N)`, or the bare refid itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelativeRef {
+    /// The chain position the ancestor steps walk back from.
+    pub base: RelBase,
+    /// How many ancestors to walk (1 for `@-`, 2 for `@--`; 0 = the base
+    /// itself, e.g. the bare `s3` refid form).
+    pub steps: u64,
+}
+
+/// The chain position a relative reference walks back from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RelBase {
+    /// `@`: the target's LATEST successful snapshot.
+    At,
+    /// `<refid>`: an explicit snapshot index, deployment id, or release id.
+    Refid(RefId),
+}
+
+/// A refid primitive: a snapshot index, a deployment id, or a release id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefId {
+    /// `s<K>`: a snapshot index.
+    SnapshotIndex(u64),
+    /// A deployment id (`deploy-...`): the most recent snapshot that deployed it.
+    Deployment(String),
+    /// A release id (`rel-sha256-...` or a bare digest): the most recent
+    /// snapshot that references it.
+    Release(String),
+}
+
+/// Parse a push source reference token (the part after the target name),
+/// WITHOUT touching the store.
+///
+/// The target is never part of the token: every relative form resolves
+/// against the separately-given target argument at [`resolve_push_ref`] time.
+/// The old `<target>@sN` / `release/<id>` / bare release-id / `fN` index
+/// forms are NOT accepted (they repeat the target and predate the jj-style
+/// grammar); they fail with an explicit migration hint.
+pub fn parse_push_ref(token: &str) -> Result<RefExpr> {
+    let t = token.trim();
+    // HEAD / the default / `@` all mean the current state.
+    if t.is_empty() || t == "HEAD" || t == "@" {
+        return Ok(RefExpr::Head);
     }
-    if let Some(idx) = base.find("@f") {
-        let target = &base[..idx];
-        let num = &base[idx + 2..];
-        let n: u64 = num
+
+    // `@-` / `@--`: the latest snapshot's parent / grandparent.
+    if let Some(rest) = t.strip_prefix('@') {
+        let steps = match rest {
+            "-" => 1,
+            "--" => 2,
+            _ => {
+                return Err(Error::r#ref(format!(
+                    "unrecognized reference '{token}' (the only '@' forms are '@', '@-' and '@--')"
+                )));
+            }
+        };
+        return Ok(RefExpr::Relative(RelativeRef {
+            base: RelBase::At,
+            steps,
+        }));
+    }
+
+    // `parent(<base>, <N>)`.
+    if let Some(inner) = t.strip_prefix("parent(").and_then(|s| s.strip_suffix(')')) {
+        let (base, n) = inner.split_once(',').ok_or_else(|| {
+            Error::r#ref(format!(
+                "malformed parent() reference '{token}' (expected 'parent(<ref>, N)')"
+            ))
+        })?;
+        let steps: u64 = n
+            .trim()
             .parse()
-            .map_err(|_| Error::r#ref(format!("invalid fleet index in '{token}'")))?;
-        // An empty target (e.g. ref token `@f0`) is filled in by the caller
-        // from the separate target argument.
-        let target = TargetName::new(target.to_string());
-        return Ok(PushRef::Fleet {
-            target: TargetName::new(target.to_string()),
-            index: n,
-            current_variant,
-        });
+            .map_err(|_| Error::r#ref(format!("invalid ancestor step count in '{token}'")))?;
+        let base_tok = base.trim();
+        let base = if base_tok == "@" {
+            RelBase::At
+        } else if let Some(digits) = f_index_digits(base_tok) {
+            return Err(Error::r#ref(format!(
+                "legacy 'f{digits}' snapshot-index form is no longer accepted; use 's{digits}'"
+            )));
+        } else {
+            RelBase::Refid(parse_ref_id(base_tok).ok_or_else(|| {
+                Error::r#ref(format!(
+                    "unrecognized reference id '{base_tok}' in '{token}'"
+                ))
+            })?)
+        };
+        return Ok(RefExpr::Relative(RelativeRef { base, steps }));
     }
-    if base.starts_with("release/") {
-        let id = base.strip_prefix("release/").unwrap().to_string();
-        return Ok(PushRef::Release {
-            release: ReleaseId::parse(&id),
-            current_variant,
-        });
+
+    // The legacy `<target>@sN` form repeats the target and is not accepted.
+    if t.contains('@') {
+        return Err(Error::r#ref(format!(
+            "unrecognized reference '{token}' (the target is passed once, on the command line: \
+            the '@' forms are '@', '@-', '@--', and 'parent(@, N)')"
+        )));
     }
-    if base.starts_with("rel-sha256-") || base.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Ok(PushRef::Release {
-            release: ReleaseId::parse(base),
-            current_variant,
-        });
+    // The legacy `release/<id>` form is not accepted either.
+    if let Some(_id) = t.strip_prefix("release/") {
+        return Err(Error::r#ref(format!(
+            "legacy 'release/<id>' reference '{token}' is no longer accepted; \
+            reference the release by its id as a refid, e.g. 'parent(<id>, N)' or '<id>--'"
+        )));
+    }
+    // The legacy `fN` snapshot-index form is not accepted (snapshot indices
+    // are `sN` now).
+    if let Some(digits) = f_index_digits(t) {
+        return Err(Error::r#ref(format!(
+            "legacy 'f{digits}' snapshot-index form is no longer accepted; use 's{digits}'"
+        )));
+    }
+
+    // A `<refid>` with an optional trailing `-` / `--` ancestor suffix (1 or
+    // 2 dashes), or the bare refid itself (0 steps, only meaningful for a
+    // snapshot index or a deployment id — a bare release id is a legacy form).
+    let dashes = t.len() - t.trim_end_matches('-').len();
+    if dashes > 2 {
+        return Err(Error::r#ref(format!(
+            "unrecognized reference '{token}' (only '-' and '--' ancestor steps are accepted)"
+        )));
+    }
+    let id = &t[..t.len() - dashes];
+    if id.is_empty() {
+        return Err(Error::r#ref(format!("unrecognized reference '{token}'")));
+    }
+    // The refid itself may be an `f<digits>` (legacy prefix) even when the
+    // steps made the whole token something else (e.g. `f3--`).
+    if let Some(digits) = f_index_digits(id) {
+        return Err(Error::r#ref(format!(
+            "legacy 'f{digits}' snapshot-index form is no longer accepted; use 's{digits}'"
+        )));
+    }
+    if let Some(rid) = parse_ref_id(id) {
+        if dashes > 0 || matches!(rid, RefId::SnapshotIndex(_) | RefId::Deployment(_)) {
+            return Ok(RefExpr::Relative(RelativeRef {
+                base: RelBase::Refid(rid),
+                steps: dashes as u64,
+            }));
+        }
+        return Err(Error::r#ref(format!(
+            "legacy bare release id '{token}' is no longer accepted; \
+            reference the release as 'parent(<id>, N)' or '<id>--'"
+        )));
+    }
+    if t.starts_with("rel-sha256-") || (!t.is_empty() && t.chars().all(|c| c.is_ascii_hexdigit())) {
+        return Err(Error::r#ref(format!(
+            "legacy bare release id '{token}' is no longer accepted; \
+            reference the release as 'parent(<id>, N)' or '<id>--'"
+        )));
     }
     Err(Error::r#ref(format!("unrecognized reference '{token}'")))
 }
 
-/// Human-readable ref name for a fleet index, e.g. `production@f1`.
-pub fn ref_name(target: &TargetName, index: u64) -> String {
-    format!("{}@f{index}", target.as_str())
+/// The `f<digits>` legacy snapshot-index prefix, if the string has it.
+fn f_index_digits(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix('f')?;
+    (!rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())).then_some(rest)
 }
 
-/// Ensure the snapshot log contains exactly one successful fleet snapshot for
+/// Parse a refid primitive. Ordering is by shape: a `s<digits>` token is a
+/// snapshot index; a `deploy-...` token a deployment id; a `rel-sha256-...`
+/// token or a bare hex digest a release id. The `f<digits>` legacy
+/// snapshot-index prefix is REJECTED (never misread as a bare-hex release
+/// digest — `f3` is hex); callers surface the specific "use sN" hint before
+/// reaching here.
+fn parse_ref_id(s: &str) -> Option<RefId> {
+    // Legacy `f<digits>` snapshot-index prefix: never a release digest.
+    if f_index_digits(s).is_some() {
+        return None;
+    }
+    if let Some(digits) = s.strip_prefix('s')
+        && !digits.is_empty()
+        && digits.chars().all(|c| c.is_ascii_digit())
+    {
+        return Some(RefId::SnapshotIndex(digits.parse().unwrap()));
+    }
+    if let Some(rest) = s.strip_prefix("deploy-")
+        && !rest.is_empty()
+    {
+        return Some(RefId::Deployment(s.to_string()));
+    }
+    if let Some(rest) = s.strip_prefix("rel-sha256-")
+        && !rest.is_empty()
+    {
+        return Some(RefId::Release(s.to_string()));
+    }
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(RefId::Release(s.to_string()));
+    }
+    None
+}
+
+/// Parse AND resolve a push source reference token against the separately-
+/// given `target` and the target's snapshot chain in `store`.
+///
+/// The target is passed ONCE (the push argument); the relative forms never
+/// repeat it. Failures are ref errors: an empty chain, an unresolvable
+/// refid, and walking past the start of the chain all fail closed rather
+/// than guessing.
+pub fn resolve_push_ref(token: &str, target: &str, store: &LocalStore) -> Result<PushRef> {
+    let expr = parse_push_ref(token)?;
+    match expr {
+        RefExpr::Head => Ok(PushRef::Head),
+        RefExpr::Relative(rel) => {
+            // `parent(@, 0)` is the same as `@` itself: the current state.
+            if rel.base == RelBase::At && rel.steps == 0 {
+                return Ok(PushRef::Head);
+            }
+            let entries = store.read_snapshots(target)?;
+            let base_index = resolve_base_index(&rel.base, target, &entries, token)?;
+            let index = base_index.checked_sub(rel.steps).ok_or_else(|| {
+                Error::r#ref(format!(
+                    "'{token}' walks {} step(s) back from @s{base_index} on target '{target}', \
+                    before the start of the snapshot chain",
+                    rel.steps
+                ))
+            })?;
+            Ok(PushRef::Snapshot {
+                target: TargetName::new(target.to_string()),
+                index,
+            })
+        }
+    }
+}
+
+/// Resolve a relative reference's base to a snapshot index in the chain.
+fn resolve_base_index(
+    base: &RelBase,
+    target: &str,
+    entries: &[DeploymentSnapshot],
+    token: &str,
+) -> Result<u64> {
+    let latest = entries.iter().map(|e| e.index).max();
+    match base {
+        RelBase::At => latest.ok_or_else(|| {
+            Error::r#ref(format!(
+                "no successful snapshots for target '{target}'; cannot resolve '{token}'"
+            ))
+        }),
+        RelBase::Refid(RefId::SnapshotIndex(k)) => {
+            if entries.iter().any(|e| e.index == *k) {
+                Ok(*k)
+            } else {
+                Err(Error::r#ref(format!(
+                    "no snapshot ref @s{k} for target '{target}'"
+                )))
+            }
+        }
+        RelBase::Refid(RefId::Deployment(id)) => entries
+            .iter()
+            .filter(|e| e.deployment_id.as_str() == id)
+            .map(|e| e.index)
+            .max()
+            .ok_or_else(|| {
+                Error::r#ref(format!(
+                    "no successful snapshot for deployment '{id}' on target '{target}'"
+                ))
+            }),
+        RelBase::Refid(RefId::Release(rid)) => {
+            let want = ReleaseId::parse(rid);
+            entries
+                .iter()
+                .filter(|e| snapshot_release(e) == want)
+                .map(|e| e.index)
+                .max()
+                .ok_or_else(|| {
+                    Error::r#ref(format!(
+                        "no successful snapshot references release '{rid}' on target '{target}'"
+                    ))
+                })
+        }
+    }
+}
+
+/// The release a snapshot's generations came from (a coherent snapshot
+/// carries one release across its slots).
+fn snapshot_release(e: &DeploymentSnapshot) -> ReleaseId {
+    e.slots
+        .values()
+        .next()
+        .map(|g| g.assignment.artifact.release.clone())
+        .unwrap_or_default()
+}
+
+/// Human-readable ref name for a snapshot index, e.g. `production@s1`.
+pub fn ref_name(target: &TargetName, index: u64) -> String {
+    format!("{}@s{index}", target.as_str())
+}
+
+/// Ensure the snapshot log contains exactly one successful snapshot for
 /// the attempt's deployment ID, and that `refs/last-successful` points at it.
 /// Returns the snapshot's index.
 ///
@@ -127,7 +400,7 @@ pub fn ensure_snapshot(
     Ok(next)
 }
 
-/// Append a successful fleet snapshot to the snapshot log and return its
+/// Append a successful snapshot to the snapshot log and return its
 /// index.
 ///
 /// Idempotent by deployment ID: delegates to
@@ -148,7 +421,7 @@ pub fn append_snapshot(
     ensure_snapshot(store, target, attempt, outcomes, bindings)
 }
 
-/// Finalize a successful fleet attempt replay-safely: the single shared
+/// Finalize a successful deployment attempt replay-safely: the single shared
 /// terminal path used by BOTH the normal push success path and recovery
 /// ([`crate::push::reconcile::reconcile_pending_commits`]).
 ///
@@ -173,7 +446,7 @@ pub fn append_snapshot(
 ///    the snapshot append and the ref update.
 /// 3. STATUS LAST: append the terminal `Successful` transition with `reason`
 ///    only after every durable step, so the attempt is never recorded
-///    `Successful` while its fleet snapshot is missing.
+///    `Successful` while its snapshot is missing.
 ///
 /// Replay idempotency: step 1 is skipped when the latest transition is
 /// already `PendingCommit`; step 2 is a no-op (or ref repair) when the
@@ -213,7 +486,7 @@ pub fn finalize_successful_attempt(
     Ok(idx)
 }
 
-/// Resolve the per-slot outcomes used to build a successful fleet snapshot
+/// Resolve the per-slot outcomes used to build a successful snapshot
 /// when the engine no longer has the live outcomes at hand (recovery): the
 /// persisted results (`deployments/<id>/results.json`) when present — a
 /// crash after the mutation loop but before/within finalization — otherwise
@@ -258,7 +531,7 @@ pub fn resolve_attempt_outcomes(
 /// immutable intent (its `slots` map is empty), so the snapshot must be
 /// built from the outcomes the engine observed — live per-slot actuals on
 /// the main path, or results.json / the verified desired state during
-/// recovery ([`resolve_attempt_outcomes`]). A successful fleet snapshot
+/// recovery ([`resolve_attempt_outcomes`]). A successful snapshot
 /// carries one complete [`GenerationRef`] per slot; slots without a
 /// recorded generation are not part of a coherent successful snapshot and
 /// are dropped.
@@ -301,7 +574,7 @@ pub fn build_snapshot(
     }
 }
 
-/// Resolve a fleet snapshot index to its entry.
+/// Resolve a snapshot index to its entry.
 pub fn resolve_snapshot(
     store: &LocalStore,
     target: &TargetName,
@@ -312,13 +585,13 @@ pub fn resolve_snapshot(
     entries
         .into_iter()
         .find(|e| e.index == index)
-        .ok_or_else(|| Error::r#ref(format!("no fleet ref @f{index} for target '{target}'")))
+        .ok_or_else(|| Error::r#ref(format!("no snapshot ref @s{index} for target '{target}'")))
 }
 
-/// Reconstruct the set of successful fleet deployments for a target from the
+/// Reconstruct the set of successful deployments for a target from the
 /// snapshot log (used to rebuild history from servers when the local ref is
 /// stale).
-pub fn successful_fleet_snapshots(
+pub fn successful_snapshots(
     store: &LocalStore,
     target: &TargetName,
 ) -> Result<Vec<DeploymentSnapshot>> {
@@ -330,7 +603,7 @@ pub fn attempt_slot_ids(attempt: &DeploymentAttempt) -> Vec<PlacementSlotId> {
     attempt.slot_ids.clone()
 }
 
-/// Build a map of `<target>@fN` -> snapshot for display.
+/// Build a map of `<target>@sN` -> snapshot for display.
 pub fn snapshot_index(
     store: &LocalStore,
     target: &TargetName,
@@ -347,100 +620,319 @@ mod tests {
     use super::*;
     use crate::model::{
         ArtifactRef, DeploymentId, GenerationId, PlacementSlotId, ReleaseId, SCHEMA_VERSION,
-        ServerId,
+        ServerId, TreeDigest, VariantName,
     };
     use std::collections::BTreeMap;
 
     #[test]
-    fn parse_ref_forms() {
-        assert_eq!(parse_push_ref("HEAD").unwrap(), PushRef::Head);
+    fn parse_ref_head_forms() {
+        // The empty form, `HEAD`, and `@` all mean the current local files
+        // (the default push).
+        for token in ["", "HEAD", "@"] {
+            assert_eq!(
+                parse_push_ref(token).unwrap(),
+                RefExpr::Head,
+                "{token:?} must parse to Head"
+            );
+        }
+    }
+
+    /// Every jj-style relative form parses WITHOUT touching the store:
+    /// `@-` / `@--` / `parent(@, N)` walk back from the latest snapshot;
+    /// `<refid>-`, `<refid>--`, `parent(<refid>, N)`, and the bare refid
+    /// itself walk back from a snapshot index, deployment id, or release id.
+    #[test]
+    fn parse_ref_relative_forms() {
+        let rel = |token: &str| parse_push_ref(token).unwrap();
         assert_eq!(
-            parse_push_ref("production@f0").unwrap(),
-            PushRef::Fleet {
-                target: TargetName::new("production".to_string()),
-                index: 0,
-                current_variant: false
-            }
+            rel("@-"),
+            RefExpr::Relative(RelativeRef {
+                base: RelBase::At,
+                steps: 1
+            })
         );
         assert_eq!(
-            parse_push_ref("@f0").unwrap(),
-            PushRef::Fleet {
-                target: TargetName::new("".to_string()),
-                index: 0,
-                current_variant: false
-            }
+            rel("@--"),
+            RefExpr::Relative(RelativeRef {
+                base: RelBase::At,
+                steps: 2
+            })
         );
         assert_eq!(
-            parse_push_ref("rel-sha256-deadbeef").unwrap(),
-            PushRef::Release {
-                release: ReleaseId::parse("rel-sha256-deadbeef"),
-                current_variant: false
-            }
+            rel("parent(@, 3)"),
+            RefExpr::Relative(RelativeRef {
+                base: RelBase::At,
+                steps: 3
+            })
+        );
+        assert_eq!(
+            rel("s3--"),
+            RefExpr::Relative(RelativeRef {
+                base: RelBase::Refid(RefId::SnapshotIndex(3)),
+                steps: 2
+            })
+        );
+        assert_eq!(
+            rel("parent(s5, 2)"),
+            RefExpr::Relative(RelativeRef {
+                base: RelBase::Refid(RefId::SnapshotIndex(5)),
+                steps: 2
+            })
+        );
+        assert_eq!(
+            rel("s1"),
+            RefExpr::Relative(RelativeRef {
+                base: RelBase::Refid(RefId::SnapshotIndex(1)),
+                steps: 0
+            })
+        );
+        assert_eq!(
+            rel("deploy-abc123--"),
+            RefExpr::Relative(RelativeRef {
+                base: RelBase::Refid(RefId::Deployment("deploy-abc123".to_string())),
+                steps: 2
+            })
+        );
+        assert_eq!(
+            rel("parent(rel-sha256-deadbeef, 1)"),
+            RefExpr::Relative(RelativeRef {
+                base: RelBase::Refid(RefId::Release("rel-sha256-deadbeef".to_string())),
+                steps: 1
+            })
+        );
+        // An abbreviated digest is a release refid too.
+        assert_eq!(
+            rel("parent(deadbeef, 2)"),
+            RefExpr::Relative(RelativeRef {
+                base: RelBase::Refid(RefId::Release("deadbeef".to_string())),
+                steps: 2
+            })
+        );
+        // N = 0 means the base itself.
+        assert_eq!(
+            rel("parent(@, 0)"),
+            RefExpr::Relative(RelativeRef {
+                base: RelBase::At,
+                steps: 0
+            })
         );
     }
 
-    /// The `:current` suffix forms parse with `current_variant` set: a
-    /// `release/<id>:current` token keeps each server's CONFIGURED variant
-    /// (as opposed to the release's own stored slot snapshot), and
-    /// `<target>@fN:current` / `@fN:current` carry the flag through the fleet
-    /// form. The same tokens WITHOUT the suffix parse with
-    /// `current_variant: false`; `HEAD:current` still resolves to `Head` (the
-    /// flag is meaningless for the materialize-HEAD form and is dropped).
+    /// The legacy grammar is REJECTED with a ref error, never silently
+    /// re-mapped: `<target>@sN` (target repeated), `release/<id>`, bare
+    /// release ids, the old `fN` snapshot-index prefix, `:current`, and
+    /// malformed relatives.
     #[test]
-    fn parse_ref_current_suffix_forms() {
-        // `release/<id>:current` — the variant is the server's CURRENT
-        // configured variant, not the release's stored slot snapshot.
+    fn parse_ref_rejects_legacy_forms() {
+        for token in [
+            "production@s0",
+            "@s0",
+            "release/rel-sha256-x",
+            "rel-sha256-x",
+            "deadbeef",
+            "f3",
+            "f3--",
+            "parent(f5, 2)",
+            "HEAD:current",
+            "@-:current",
+            "@@",
+            "@---",
+            "parent(@, x)",
+            "parent(@, -1)",
+            "parent(@",
+            "s3---",
+            "--",
+        ] {
+            let err = parse_push_ref(token).expect_err(&format!("{token:?} must be rejected"));
+            assert!(
+                err.to_string().contains("reference"),
+                "error for {token:?} must be a ref error, got: {err}"
+            );
+        }
+    }
+
+    /// Build a store whose target `production` has the chain s0..s5
+    /// (deployments deploy-a..deploy-f; the s2 and s3 snapshots BOTH carry
+    /// release rel-sha256-cccc, so the "most recent" release resolution is
+    /// exercised).
+    fn chain() -> (tempfile::TempDir, LocalStore) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        for (i, (dep, rel)) in [
+            ("deploy-a", "aaaa"),
+            ("deploy-b", "bbbb"),
+            ("deploy-c", "cccc"),
+            ("deploy-d", "cccc"),
+            ("deploy-e", "eeee"),
+            ("deploy-f", "ffff"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            store
+                .append_snapshot("production", &snapshot_entry(i as u64, dep, rel))
+                .unwrap();
+        }
+        (tmp, store)
+    }
+
+    fn snapshot_entry(index: u64, deployment: &str, release: &str) -> DeploymentSnapshot {
+        DeploymentSnapshot {
+            index,
+            deployment_id: DeploymentId::new(deployment.to_string()),
+            target: TargetName::new("production".to_string()),
+            behavior_sha256: "sha256-aa".to_string(),
+            slots: BTreeMap::from([(
+                PlacementSlotId::new("p1".to_string()),
+                GenerationRef {
+                    generation: GenerationId::new(format!("gen-{index}")),
+                    assignment: PlacementSlotAssignment {
+                        placement_slot: PlacementSlotId::new("p1".to_string()),
+                        artifact: ArtifactRef {
+                            release: ReleaseId::new(format!("rel-sha256-{release}")),
+                            variant: VariantName::new("standard".to_string()),
+                            tree: TreeDigest::new(format!("tree-{index}")),
+                        },
+                    },
+                },
+            )]),
+            bindings: BTreeMap::new(),
+        }
+    }
+
+    fn snap(target: &TargetName, index: u64) -> PushRef {
+        PushRef::Snapshot {
+            target: target.clone(),
+            index,
+        }
+    }
+
+    /// `@` / `HEAD` / `` / `parent(@, 0)` resolve to the default HEAD push.
+    #[test]
+    fn resolve_ref_head_forms() {
+        let (_tmp, store) = chain();
+        for token in ["", "HEAD", "@", "parent(@, 0)"] {
+            assert_eq!(
+                resolve_push_ref(token, "production", &store).unwrap(),
+                PushRef::Head,
+                "{token:?} must resolve to Head"
+            );
+        }
+    }
+
+    /// The ancestor steps on the s0..s5 chain (latest = s5): `@-` = s4,
+    /// `@--` = s3, `parent(@, 3)` = s2, `s3--` = s1, `parent(s5, 2)` = s3,
+    /// `s1-` = s0, and the bare `s1` / `parent(s1, 0)` forms name s1 itself.
+    #[test]
+    fn resolve_ref_ancestor_steps() {
+        let (_tmp, store) = chain();
+        let target = TargetName::new("production".to_string());
+        for (token, want) in [
+            ("@-", 4u64),
+            ("@--", 3),
+            ("parent(@, 3)", 2),
+            ("parent(@, 2)", 3),
+            ("s3--", 1),
+            ("parent(s5, 2)", 3),
+            ("s1-", 0),
+            ("s1", 1),
+            ("parent(s1, 0)", 1),
+            ("parent(s2, 1)", 1),
+        ] {
+            assert_eq!(
+                resolve_push_ref(token, "production", &store).unwrap(),
+                snap(&target, want),
+                "{token} must resolve to index {want}"
+            );
+        }
+    }
+
+    /// A deployment refid resolves to the snapshot that deployed it (most
+    /// recent); a release refid to the most recent snapshot referencing the
+    /// release — then the ancestor steps walk from there.
+    #[test]
+    fn resolve_ref_deployment_and_release_refids() {
+        let (_tmp, store) = chain();
+        let target = TargetName::new("production".to_string());
+        // deploy-b deployed s1.
         assert_eq!(
-            parse_push_ref("release/rel-sha256-deadbeef:current").unwrap(),
-            PushRef::Release {
-                release: ReleaseId::parse("rel-sha256-deadbeef"),
-                current_variant: true
-            }
+            resolve_push_ref("deploy-b-", "production", &store).unwrap(),
+            snap(&target, 0)
         );
-        // Same token without the suffix keeps the flag false.
         assert_eq!(
-            parse_push_ref("release/rel-sha256-deadbeef").unwrap(),
-            PushRef::Release {
-                release: ReleaseId::parse("rel-sha256-deadbeef"),
-                current_variant: false
-            }
+            resolve_push_ref("parent(deploy-b, 1)", "production", &store).unwrap(),
+            snap(&target, 0)
         );
-        // Hex-shorthand release form also accepts the suffix.
         assert_eq!(
-            parse_push_ref("rel-sha256-deadbeef:current").unwrap(),
-            PushRef::Release {
-                release: ReleaseId::parse("rel-sha256-deadbeef"),
-                current_variant: true
-            }
+            resolve_push_ref("parent(deploy-c, 0)", "production", &store).unwrap(),
+            snap(&target, 2)
         );
-        // `<target>@fN:current` — fleet form with the flag set.
+        // rel-sha256-cccc is referenced by BOTH s2 and s3; the most recent
+        // (s3) wins, then the ancestor steps apply.
         assert_eq!(
-            parse_push_ref("production@f3:current").unwrap(),
-            PushRef::Fleet {
-                target: TargetName::new("production".to_string()),
-                index: 3,
-                current_variant: true
-            }
+            resolve_push_ref("parent(rel-sha256-cccc, 0)", "production", &store).unwrap(),
+            snap(&target, 3)
         );
-        // The bare `@fN:current` form (target filled in by the caller from
-        // the separate target argument) also carries the flag.
         assert_eq!(
-            parse_push_ref("@f0:current").unwrap(),
-            PushRef::Fleet {
-                target: TargetName::new("".to_string()),
-                index: 0,
-                current_variant: true
-            }
+            resolve_push_ref("rel-sha256-cccc-", "production", &store).unwrap(),
+            snap(&target, 2)
         );
-        // `HEAD:current` is still the Head form; the flag is dropped.
-        assert_eq!(parse_push_ref("HEAD:current").unwrap(), PushRef::Head);
+        assert_eq!(
+            resolve_push_ref("parent(rel-sha256-cccc, 2)", "production", &store).unwrap(),
+            snap(&target, 1)
+        );
+        // Abbreviated digest form resolves the same release.
+        assert_eq!(
+            resolve_push_ref("parent(cccc, 0)", "production", &store).unwrap(),
+            snap(&target, 3)
+        );
+    }
+
+    /// Out-of-range and unresolvable references fail closed with a ref
+    /// error: stepping before the chain start, a missing snapshot index, an
+    /// unknown deployment/release, and an EMPTY chain. Never underflow,
+    /// never guess.
+    #[test]
+    fn resolve_ref_failures_fail_closed() {
+        let (_tmp, store) = chain();
+        for token in [
+            "parent(@, 6)", // s5 - 6 underflows
+            "s0-",
+            "s0--",
+            "parent(s1, 2)",
+            "s9",
+            "parent(s9, 0)",
+            "deploy-missing-",
+            "parent(deploy-missing, 1)",
+            "parent(rel-sha256-zzzz, 0)",
+        ] {
+            let err = resolve_push_ref(token, "production", &store)
+                .expect_err(&format!("{token} must fail closed"));
+            assert!(
+                err.to_string().contains("reference") || err.to_string().contains("step(s) back"),
+                "{token} error must be a ref error, got: {err}"
+            );
+        }
+
+        // An EMPTY target chain: `@` is still fine (HEAD), every relative
+        // form fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        assert_eq!(
+            resolve_push_ref("@", "production", &empty).unwrap(),
+            PushRef::Head
+        );
+        for token in ["@-", "parent(@, 2)", "s0", "deploy-x-"] {
+            resolve_push_ref(token, "production", &empty)
+                .expect_err(&format!("{token} on an empty chain must fail"));
+        }
     }
 
     #[test]
     fn ref_name_index() {
         assert_eq!(
             ref_name(&TargetName::new("production".to_string()), 3),
-            "production@f3"
+            "production@s3"
         );
     }
 

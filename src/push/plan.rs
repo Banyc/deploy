@@ -60,11 +60,7 @@ pub fn plan_assignments(
             }
             Ok((out, local_release_id.clone(), PlanSource::Head))
         }
-        PushRef::Fleet {
-            target: ft,
-            index,
-            current_variant,
-        } => {
+        PushRef::Snapshot { target: ft, index } => {
             let entry = resolve_snapshot(store, ft, *index)?;
             let recorded: BTreeSet<String> =
                 entry.slots.keys().map(|s| s.as_str().to_string()).collect();
@@ -72,7 +68,7 @@ pub fn plan_assignments(
                 slot_ids.iter().map(|s| s.as_str().to_string()).collect();
             if recorded != current {
                 return Err(Error::rollback(
-                    "target membership changed; exact fleet rollback requires identical stable placement-slot set",
+                    "target membership changed; exact rollback requires identical stable placement-slot set",
                 ));
             }
             // Every member's COMPLETE physical binding — the server AND the
@@ -91,106 +87,64 @@ pub fn plan_assignments(
                 };
                 let recorded = entry.bindings.get(&slot_id).ok_or_else(|| {
                     Error::rollback(format!(
-                        "slot '{slot_id}' has no recorded physical binding in {ft}@f{index}; exact rollback cannot verify the deployment location"
+                        "slot '{slot_id}' has no recorded physical binding in {ft}@s{index}; exact rollback cannot verify the deployment location"
                     ))
                 })?;
                 if recorded != &current {
                     return Err(Error::rollback(format!(
-                        "slot '{slot_id}' was bound to server '{}' at '{}' in {ft}@f{index}, now bound to '{}' at '{}'; exact rollback would deploy to the wrong host",
+                        "slot '{slot_id}' was bound to server '{}' at '{}' in {ft}@s{index}, now bound to '{}' at '{}'; exact rollback would deploy to the wrong host",
                         recorded.server, recorded.deploy_dir, current.server, current.deploy_dir
                     )));
                 }
             }
             // The release the snapshot's generations came from (a coherent
-            // fleet snapshot carries one release across its slots).
+            // snapshot carries one release across its slots).
             let release = entry
                 .slots
                 .values()
                 .next()
                 .map(|g| g.assignment.artifact.release.clone())
                 .unwrap_or_else(|| local_release_id.clone());
-            // With the `:current` suffix each slot keeps its CURRENT
-            // configured variant, so the per-slot TREE resolves from the
-            // release's own variant→tree bindings (the release record must be
-            // locally available), not from the snapshot's historical
-            // artifact. Without it, the exact historical artifact
-            // (variant + tree together) is restored.
-            let rec = if *current_variant {
-                Some(store.read_release(&release).map_err(|_| {
-                    Error::rollback(format!(
-                        "release {release} not available locally; `:current` needs its variant→tree bindings"
-                    ))
-                })?)
-            } else {
-                None
-            };
+            // EXACT rollback always restores the snapshot's OWN historical
+            // artifact (variant + tree together), never the caller's current
+            // configuration: a variant renamed or re-declared after the
+            // snapshot was taken must not change what the rollback deploys.
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
                 let slot_id = PlacementSlotId::new(slot.id.clone());
-                let (variant, tree) = if *current_variant {
-                    // `:current`: the variant is the slot's CURRENT declared
-                    // variant (the current config's declaring file), never the
-                    // snapshot's historical one; the tree still comes from the
-                    // referenced release's own bindings.
-                    let rec = rec.as_ref().expect("release record resolved above");
-                    let variant = config.slot_variant(&slot.id)?;
-                    let tree = rec.variants.get(variant).cloned().ok_or_else(|| {
-                        Error::rollback(format!(
-                            "release {release} lacks variant '{variant}' required by `:current` (current config assigns slot '{slot_id}' to it)"
-                        ))
-                    })?;
-                    (VariantName::new(variant.to_string()), TreeDigest::new(tree))
-                } else {
-                    // Exact rollback: the variant AND tree come together from
-                    // the historical snapshot, not the current slot binding.
-                    let g = entry.slots.get(&slot_id).ok_or_else(|| {
-                        Error::rollback(format!("slot {slot_id} missing in fleet snapshot"))
-                    })?;
-                    (
-                        g.assignment.artifact.variant.clone(),
-                        g.assignment.artifact.tree.clone(),
-                    )
-                };
+                let g = entry.slots.get(&slot_id).ok_or_else(|| {
+                    Error::rollback(format!("slot {slot_id} missing in snapshot"))
+                })?;
                 out.push(PlannedAssignment {
                     placement_slot: slot_id,
-                    artifact: ArtifactRef {
-                        release: release.clone(),
-                        variant,
-                        tree,
-                    },
+                    artifact: g.assignment.artifact.clone(),
                 });
             }
-            Ok((out, release, PlanSource::FleetRef(*index)))
+            Ok((out, release, PlanSource::SnapshotRef(*index)))
         }
-        PushRef::Release {
-            release,
-            current_variant,
-        } => {
+        PushRef::Release { release } => {
             let rec = store
                 .read_release(release)
                 .map_err(|_| Error::rollback(format!("release {release} not available locally")))?;
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
                 let slot_id = PlacementSlotId::new(slot.id.clone());
-                // WITHOUT `:current`, the variant comes from the release's OWN
-                // stored slot snapshot: a historical release resolves each
-                // slot's slot→variant binding against the slots it was
-                // materialized from, never the caller's current variant files.
-                // A record written before the canonical slot snapshot existed
-                // (empty `rec.slots`) falls back to the current configuration's
-                // declaring file. WITH `:current`, the variant ALWAYS comes
-                // from the caller's current configuration — "assign each
-                // current server its configured variant" — while the tree
-                // still comes from the release's own per-variant bindings.
-                // Note this slot declaration snapshot is distinct from a fleet
+                // The variant ALWAYS comes from the release's OWN stored slot
+                // snapshot: a historical release resolves each slot's
+                // slot→variant binding against the slots it was materialized
+                // from, never the caller's current variant files. Note this
+                // slot declaration snapshot is distinct from a deployment
                 // snapshot's slot→SERVER bindings (the exact-rollback
                 // physical-host check): those remain a per-target deployment
                 // concern.
-                let variant_name = if *current_variant {
-                    config.slot_variant(&slot.id)?.to_string()
-                } else if rec.slots.is_empty() {
-                    // Legacy record: fall back to the current declaring file.
-                    config.slot_variant(&slot.id)?.to_string()
+                let variant_name = if rec.slots.is_empty() {
+                    // A record without a canonical slot snapshot is
+                    // unverifiable; the store rejects such records at read,
+                    // so this is a belt-and-braces refusal rather than a
+                    // reachable fallback to the current configuration.
+                    return Err(Error::rollback(format!(
+                        "release {release} carries no stored slot snapshot; cannot resolve slot '{slot_id}'"
+                    )));
                 } else {
                     rec.slots
                         .iter()
@@ -208,13 +162,7 @@ pub fn plan_assignments(
                 };
                 let variant = VariantName::new(variant_name.clone());
                 let tree = rec.variants.get(&variant_name).cloned().ok_or_else(|| {
-                    let mut msg = format!("release {release} lacks variant '{variant_name}'");
-                    if *current_variant {
-                        msg.push_str(" required by `:current` (current config assigns slot '");
-                        msg.push_str(slot_id.as_str());
-                        msg.push_str("' to it)");
-                    }
-                    Error::rollback(msg)
+                    Error::rollback(format!("release {release} lacks variant '{variant_name}'"))
                 })?;
                 out.push(PlannedAssignment {
                     placement_slot: slot_id,
@@ -254,7 +202,7 @@ keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[targets.t1.rotation.fleet]
+[targets.t1.rotation.deployment]
 protect_deployments = 1
 
 [[servers]]
@@ -380,7 +328,6 @@ interval_seconds = 0
             "t1",
             &PushRef::Release {
                 release: release.clone(),
-                current_variant: false,
             },
             &ReleaseId::new("unused-local".to_string()),
             &BTreeMap::new(),
@@ -434,7 +381,6 @@ interval_seconds = 0
             "t1",
             &PushRef::Release {
                 release: release.clone(),
-                current_variant: false,
             },
             &ReleaseId::new("unused-local".to_string()),
             &BTreeMap::new(),
@@ -477,7 +423,6 @@ interval_seconds = 0
             "t1",
             &PushRef::Release {
                 release: release.clone(),
-                current_variant: false,
             },
             &ReleaseId::new("unused".to_string()),
             &BTreeMap::new(),
@@ -520,7 +465,6 @@ interval_seconds = 0
             "t1",
             &PushRef::Release {
                 release: release.clone(),
-                current_variant: false,
             },
             &ReleaseId::new("unused".to_string()),
             &BTreeMap::new(),
@@ -567,7 +511,6 @@ interval_seconds = 0
             "t1",
             &PushRef::Release {
                 release: release.clone(),
-                current_variant: false,
             },
             &ReleaseId::new("unused".to_string()),
             &BTreeMap::new(),
@@ -587,156 +530,14 @@ interval_seconds = 0
         );
     }
 
-    /// The `:current` suffix on a RELEASE ref keeps each slot's CURRENT
-    /// configured variant (the declaring file in the caller's current config)
-    /// while the TREE still comes from the referenced release's own per-variant
-    /// bindings — "assign each current server its configured variant from that
-    /// release". The bare `release/<id>` form uses the release's OWN stored
-    /// slot snapshot instead. A release that ships BOTH variants proves the
-    /// difference: the stored snapshot binds p1 to `other`, while the current
-    /// config declares p1 in `standard`.
+    /// EXACT SNAPSHOT ROLLBACK ALWAYS RESTORES THE SNAPSHOT'S OWN HISTORICAL
+    /// VARIANT — never the caller's current config. Variant-renamed scenario:
+    /// the snapshot's release ships BOTH the historical variant `old` (which
+    /// declares p1 at snapshot time) and the current `new` variant, and the
+    /// CURRENT config declares p1 inside `new.toml`. A `PushRef::Snapshot`
+    /// ref must still plan `old` + its tree, not the current declaring file.
     #[test]
-    fn release_ref_current_suffix_uses_current_config_variant() {
-        let (_dir, config) = project_with_config();
-        let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
-        // Stored slot snapshot: p1 was bound to `other` at materialization.
-        // Current config: p1 is declared by `standard` (slot_variant = standard).
-        let mut rec = legacy_record("unused", "tree-x");
-        rec.slots = BTreeMap::from([(
-            "other".to_string(),
-            CanonicalSlots {
-                slots: vec![CanonicalSlot {
-                    id: "p1".to_string(),
-                    server: "s1".to_string(),
-                    deploy_dir: "/srv/plan".to_string(),
-                    targets: vec!["t1".to_string()],
-                }],
-            },
-        )]);
-        rec.variants = BTreeMap::from([
-            ("standard".to_string(), "tree-standard".to_string()),
-            ("other".to_string(), "tree-other".to_string()),
-        ]);
-        let release = consistent(&mut rec);
-        store.write_release(&rec).unwrap();
-        assert_eq!(config.slot_variant("p1").unwrap(), "standard");
-
-        // Bare ref: the release's OWN stored snapshot wins (p1 -> `other`).
-        let (bare, desired, source) = plan_assignments(
-            "t1",
-            &PushRef::Release {
-                release: release.clone(),
-                current_variant: false,
-            },
-            &ReleaseId::new("unused".to_string()),
-            &BTreeMap::new(),
-            &store,
-            &config,
-        )
-        .expect("bare release ref resolves");
-        assert_eq!(bare[0].artifact.variant.as_str(), "other");
-        assert_eq!(bare[0].artifact.tree.as_str(), "tree-other");
-        assert_eq!(bare[0].artifact.release, release);
-        assert_eq!(desired, release);
-        assert_eq!(source, PlanSource::ReleaseRef(release.clone()));
-
-        // `:current` ref: the CURRENT config's declaring file wins (p1 ->
-        // `standard`), the tree comes from the release's OWN bindings.
-        let (cur, desired, source) = plan_assignments(
-            "t1",
-            &PushRef::Release {
-                release: release.clone(),
-                current_variant: true,
-            },
-            &ReleaseId::new("unused".to_string()),
-            &BTreeMap::new(),
-            &store,
-            &config,
-        )
-        .expect("current-variant release ref resolves");
-        assert_eq!(
-            cur[0].artifact.variant.as_str(),
-            "standard",
-            "`:current` must assign the slot's CURRENT configured variant"
-        );
-        assert_eq!(
-            cur[0].artifact.tree.as_str(),
-            "tree-standard",
-            "the tree must come from the release's own binding for the current variant"
-        );
-        assert_eq!(cur[0].artifact.release, release);
-        assert_eq!(desired, release);
-        assert_eq!(source, PlanSource::ReleaseRef(release));
-    }
-
-    /// `release/<id>:current` fails closed when the release does NOT ship the
-    /// slot's current configured variant — a variant renamed AFTER the release
-    /// was materialized (the current config declares `new`, the release only
-    /// ships `old`). The bare form still resolves the stored snapshot binding.
-    #[test]
-    fn release_ref_current_suffix_missing_current_variant_fails_closed() {
-        let (_dir, config) = project_with_config();
-        let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
-        // The release ships ONLY `other`; the current config declares p1 in
-        // `standard` (which the release never shipped).
-        let mut rec = legacy_record("unused", "tree-x");
-        rec.slots = BTreeMap::from([(
-            "other".to_string(),
-            CanonicalSlots {
-                slots: vec![CanonicalSlot {
-                    id: "p1".to_string(),
-                    server: "s1".to_string(),
-                    deploy_dir: "/srv/plan".to_string(),
-                    targets: vec!["t1".to_string()],
-                }],
-            },
-        )]);
-        rec.variants = BTreeMap::from([("other".to_string(), "tree-other".to_string())]);
-        let release = consistent(&mut rec);
-        store.write_release(&rec).unwrap();
-
-        let err = plan_assignments(
-            "t1",
-            &PushRef::Release {
-                release: release.clone(),
-                current_variant: true,
-            },
-            &ReleaseId::new("unused".to_string()),
-            &BTreeMap::new(),
-            &store,
-            &config,
-        )
-        .expect_err("a release lacking the current variant must refuse the `:current` ref");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("lacks variant 'standard'") && msg.contains(":current"),
-            "error must name the missing current variant and the `:current` ref, got: {msg}"
-        );
-
-        // The bare ref still resolves against the stored snapshot.
-        let (bare, _, _) = plan_assignments(
-            "t1",
-            &PushRef::Release {
-                release: release.clone(),
-                current_variant: false,
-            },
-            &ReleaseId::new("unused".to_string()),
-            &BTreeMap::new(),
-            &store,
-            &config,
-        )
-        .expect("bare release ref still resolves");
-        assert_eq!(bare[0].artifact.variant.as_str(), "other");
-        assert_eq!(bare[0].artifact.tree.as_str(), "tree-other");
-    }
-
-    /// The `:current` suffix on a FLEET ref keeps each slot's CURRENT
-    /// configured variant too (sourcing the tree from the snapshot release's
-    /// own per-variant bindings), while the bare `@fN` form restores the exact
-    /// historical artifact (variant + tree together). A variant rename with
-    /// both variants shipped proves the difference.
-    #[test]
-    fn fleet_ref_current_suffix_uses_current_config_variant() {
+    fn snapshot_ref_restores_historical_variant_after_rename() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
@@ -772,7 +573,7 @@ interval_seconds = 0
         store.write_release(&rec).unwrap();
         let snapshot = DeploymentSnapshot {
             index: 0,
-            deployment_id: DeploymentId::new("deploy-fleet-curvar".to_string()),
+            deployment_id: DeploymentId::new("deploy-snapshot-histvar".to_string()),
             target: TargetName::new("t1".to_string()),
             behavior_sha256: "sha256-aa".to_string(),
             slots: BTreeMap::from([(
@@ -799,62 +600,37 @@ interval_seconds = 0
         };
         store.append_snapshot("t1", &snapshot).unwrap();
 
-        // Bare fleet ref: exact rollback restores the historical artifact
-        // (variant `old` + tree tree-old together).
-        let (bare, desired, source) = plan_assignments(
+        // Exact rollback restores the historical artifact (variant `old` +
+        // tree-old together) even though the current config declares p1 in
+        // `new` and the release also ships it.
+        let (assignments, desired, source) = plan_assignments(
             "t1",
-            &PushRef::Fleet {
+            &PushRef::Snapshot {
                 target: TargetName::new("t1".to_string()),
                 index: 0,
-                current_variant: false,
             },
             &ReleaseId::new("unused".to_string()),
             &BTreeMap::new(),
             &store,
             &config,
         )
-        .expect("bare fleet ref resolves");
-        assert_eq!(bare[0].artifact.variant.as_str(), "old");
-        assert_eq!(bare[0].artifact.tree.as_str(), "tree-old");
-        assert_eq!(bare[0].artifact.release, release);
+        .expect("snapshot ref resolves");
+        assert_eq!(assignments[0].artifact.variant.as_str(), "old");
+        assert_eq!(assignments[0].artifact.tree.as_str(), "tree-old");
+        assert_eq!(assignments[0].artifact.release, release);
         assert_eq!(desired, release);
-        assert_eq!(source, PlanSource::FleetRef(0));
-
-        // `:current` fleet ref: the CURRENT config's declaring file wins
-        // (p1 -> `new`), the tree comes from the release's own bindings.
-        let (cur, desired, source) = plan_assignments(
-            "t1",
-            &PushRef::Fleet {
-                target: TargetName::new("t1".to_string()),
-                index: 0,
-                current_variant: true,
-            },
-            &ReleaseId::new("unused".to_string()),
-            &BTreeMap::new(),
-            &store,
-            &config,
-        )
-        .expect("current-variant fleet ref resolves");
-        assert_eq!(
-            cur[0].artifact.variant.as_str(),
-            "new",
-            "`:current` must assign the slot's CURRENT configured variant"
-        );
-        assert_eq!(cur[0].artifact.tree.as_str(), "tree-new");
-        assert_eq!(cur[0].artifact.release, release);
-        assert_eq!(desired, release);
-        assert_eq!(source, PlanSource::FleetRef(0));
+        assert_eq!(source, PlanSource::SnapshotRef(0));
     }
 
-    /// A LEGACY fleet snapshot (no `bindings` map — the pre-feature shape)
+    /// A LEGACY snapshot (no `bindings` map — the pre-feature shape)
     /// makes exact rollback unverifiable: `plan_assignments` must REFUSE the
-    /// `@fN` ref with a rollback error naming the slot, rather than guessing
+    /// `@sN` ref with a rollback error naming the slot, rather than guessing
     /// the host/location. The integration tests cover binding MISMATCH
     /// (`rollback_refuses_rebound_slot` / `rollback_refuses_moved_deploy_dir`);
     /// this pins the MISSING-binding refusal (the `#[serde(default)]` empty
     /// map path).
     #[test]
-    fn fleet_ref_without_recorded_bindings_refuses_rollback() {
+    fn snapshot_ref_without_recorded_bindings_refuses_rollback() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
@@ -870,7 +646,7 @@ interval_seconds = 0
         // map is EMPTY (legacy pre-feature line).
         let snapshot = DeploymentSnapshot {
             index: 0,
-            deployment_id: DeploymentId::new("deploy-legacy-fleet".to_string()),
+            deployment_id: DeploymentId::new("deploy-legacy-snapshot".to_string()),
             target: TargetName::new("t1".to_string()),
             behavior_sha256: "sha256-aa".to_string(),
             slots: BTreeMap::from([(
@@ -893,24 +669,23 @@ interval_seconds = 0
 
         let err = plan_assignments(
             "t1",
-            &PushRef::Fleet {
+            &PushRef::Snapshot {
                 target: TargetName::new("t1".to_string()),
                 index: 0,
-                current_variant: false,
             },
             &ReleaseId::new("unused".to_string()),
             &BTreeMap::new(),
             &store,
             &config,
         )
-        .expect_err("a fleet ref whose snapshot recorded no physical binding must refuse");
+        .expect_err("a snapshot ref whose snapshot recorded no physical binding must refuse");
         let msg = err.to_string();
         assert!(
             msg.contains("no recorded physical binding") && msg.contains("p1"),
             "error must name the unverifiable slot and the missing binding, got: {msg}"
         );
         assert!(
-            msg.contains("f0") || msg.contains("exact rollback"),
+            msg.contains("s0") || msg.contains("exact rollback"),
             "error must explain the exact-rollback verification failure, got: {msg}"
         );
     }

@@ -189,12 +189,12 @@ fn default_keep_days() -> u64 {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
-pub struct FleetRotation {
+pub struct DeploymentRotation {
     #[serde(default)]
     pub protect_deployments: u32,
 }
 
-/// Fleet-wide retention policy, declared once at the top level of
+/// Deployment-snapshot retention policy (the `protect_deployments` window),, declared once at the top level of
 /// `deploy.toml` (not per variant). Applied on every rotation.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
@@ -202,7 +202,7 @@ pub struct RotationConfig {
     #[serde(default)]
     pub per_server: PerServerRotation,
     #[serde(default)]
-    pub fleet: FleetRotation,
+    pub deployment: DeploymentRotation,
 }
 
 /// A per-release variant's own artifact, deployment, and slot policy. Each
@@ -752,7 +752,7 @@ impl Config {
     /// ID: the complete `{server, deploy_dir}` binding ([`PhysicalBinding`])
     /// each slot currently has in the configuration — the physical server
     /// AND the absolute on-server directory its deployment state lives in.
-    /// Used to record (and later verify) the exact physical location a fleet
+    /// Used to record (and later verify) the exact physical location a deployment
     /// snapshot's slots were deployed onto: exact rollback must see BOTH
     /// halves unchanged, because a slot that keeps its server but moves its
     /// `deploy_dir` would otherwise roll back onto the new location.
@@ -935,7 +935,7 @@ keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[targets.t1.rotation.fleet]
+[targets.t1.rotation.deployment]
 protect_deployments = 1
 
 [[servers]]
@@ -1020,7 +1020,7 @@ keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[targets.t1.rotation.fleet]
+[targets.t1.rotation.deployment]
 protect_deployments = 2
 
 [[servers]]
@@ -1044,7 +1044,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 .keep_distinct_artifacts,
             5
         );
-        assert_eq!(cfg.targets["t1"].rotation.fleet.protect_deployments, 2);
+        assert_eq!(cfg.targets["t1"].rotation.deployment.protect_deployments, 2);
         let names = cfg.variant_names();
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"standard".to_string()));
@@ -1112,7 +1112,7 @@ keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[targets.t1.rotation.fleet]
+[targets.t1.rotation.deployment]
 protect_deployments = 1
 
 [[servers]]

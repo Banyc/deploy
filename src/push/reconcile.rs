@@ -2,7 +2,7 @@
 //!
 //! `reconcile_pending_commits` completes incomplete attempts left by earlier
 //! pushes: eligibility gating on the latest transition, membership and
-//! generation verification, missing fleet-commit markers under each slot's
+//! generation verification, missing commit markers under each slot's
 //! mutation lock, and replay-safe finalization through the same shared
 //! finalizer as the main success path
 //! ([`crate::history::finalize_successful_attempt`]). Extracted from
@@ -18,7 +18,7 @@ use crate::store::local::LocalStore;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Reconcile incomplete attempts recorded by earlier pushes (steps 15 of
-/// `requirement.md`). An attempt is eligible when its fleet-commit markers
+/// `requirement.md`). An attempt is eligible when its commit markers
 /// were not all durable and/or its finalization never completed — the latest
 /// transition is `PendingCommit` (markers missing: the earlier push gave up
 /// during the metadata phase) OR `InProgress` (the intent was persisted before
@@ -114,7 +114,7 @@ pub(crate) fn reconcile_pending_commits(
     }
 
     // Current target membership: a pending attempt whose participants were
-    // removed from the target can no longer be completed as a fleet commit.
+    // removed from the target can no longer be completed as a commit.
     let members: HashSet<String> = config
         .target_slots(target_name)?
         .iter()
@@ -156,7 +156,7 @@ pub(crate) fn reconcile_pending_commits(
                 .or_else(|| attempt.slots.get(sid).and_then(|s| s.generation.clone()))
             else {
                 // No recorded generation for a participant: the attempt is not
-                // a coherent fleet commit; finalize as degraded.
+                // a coherent commit; finalize as degraded.
                 all_match = false;
                 break;
             };

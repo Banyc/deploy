@@ -40,7 +40,7 @@
 //! action stream as the [`Fixture`] (proptest, fixed seed + bounded cases so
 //! every run is reproducible). The model tracks, purely from the actions, the
 //! invariants' ground truth — the remote current generation, every member
-//! target's observed projection, the per-target fleet-snapshot and
+//! target's observed projection, the per-target snapshot and
 //! deployment-attempt logs, pending-commit and rotation-debt state — and
 //! [`assert_semantic_invariants`] cross-checks it against the system's
 //! observable state after every action while re-evaluating all five
@@ -142,9 +142,9 @@ deploy_dir = "/srv/si-debt"
 "#;
 
 /// Two CONTRASTING rotation policies over the shared slot: `t1` is AGGRESSIVE
-/// (newest 1 distinct binding, no age window, no previous protection, 1 fleet
+/// (newest 1 distinct binding, no age window, no previous protection, 1 snapshot
 /// deployment) while `t2` is CONSERVATIVE (newest 5 distinct bindings, 30
-/// days of age, the protected previous, 2 fleet deployments). The union is
+/// days of age, the protected previous, 2 deployments). The union is
 /// strictly larger than either policy alone, so a rotation that consults only
 /// the pushing target's policy sweeps content the other member retains.
 const DEPLOY_TOML: &str = r#"
@@ -157,7 +157,7 @@ keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = false
 
-[targets.t1.rotation.fleet]
+[targets.t1.rotation.deployment]
 protect_deployments = 1
 
 [targets.t2.rotation.per_server]
@@ -165,7 +165,7 @@ keep_distinct_artifacts = 5
 keep_days = 30
 protect_previous = true
 
-[targets.t2.rotation.fleet]
+[targets.t2.rotation.deployment]
 protect_deployments = 2
 
 [[servers]]
@@ -185,7 +185,7 @@ keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = false
 
-[targets.debtfx.rotation.fleet]
+[targets.debtfx.rotation.deployment]
 protect_deployments = 1
 
 [targets.debtfx]
@@ -199,7 +199,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 /// The I/O boundaries the Lifecycle class injects failures at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FailureStep {
-    /// Fleet-commit marker write on the remote (`state/commits/<id>.json`).
+    /// commit marker write on the remote (`state/commits/<id>.json`).
     CommitMarkerWrite,
     /// Post-commit rotation's inventory write (`state/inventory.json`).
     RotationInventoryWrite,
@@ -360,7 +360,7 @@ pub(crate) enum Action {
     Push(&'static str),
     /// An up-to-date retry push on the target (no-op or reconcile).
     Retry(&'static str),
-    /// Roll the target back to fleet snapshot index `n`.
+    /// Roll the target back to snapshot index `n`.
     Rollback(&'static str, u64),
     /// Run a standalone rotation pass under the FULL member policy union.
     Rotate,
@@ -429,7 +429,7 @@ pub(crate) enum Disposition {
     /// refresh, debt I/O) ride on the SAME report and never change the class.
     Successful,
     /// Recorded but NOT durably committed: report status `PendingCommit`
-    /// (the fleet-commit marker write failed — a deferred/recoverable
+    /// (the commit marker write failed — a deferred/recoverable
     /// completion a later push reconciles), or a crash-window `Err` that left
     /// the recorded attempt recoverable-pending (`PendingCommit` /
     /// `InProgress`).
@@ -462,7 +462,7 @@ pub(crate) enum OutcomeClass {
     /// (boundary, disposition) pair. `Ok` + `NoAttempt` is the no-op report
     /// (and any non-push action); `Ok` + `Successful` is the durably
     /// committed deployment; `Ok` + `Pending` is the recoverable
-    /// fleet-commit failure; `Err` + `NoAttempt` is a pre-intent failure;
+    /// commit failure; `Err` + `NoAttempt` is a pre-intent failure;
     /// `Err` + `Pending` is a crash-window failure whose intent WAS recorded.
     Push {
         boundary: ReturnBoundary,
@@ -485,7 +485,7 @@ pub(crate) enum OutcomeClass {
 pub(crate) enum FailureClass {
     /// No fault: a clean action.
     None,
-    /// Remote fleet-commit marker write fails: the attempt reports
+    /// Remote commit marker write fails: the attempt reports
     /// `PendingCommit` (recoverable; a later push reconciles it).
     CommitMarker,
     /// Remote post-commit rotation inventory write fails: the rotation is
@@ -549,7 +549,7 @@ pub(crate) enum FailureClass {
     /// push still reports `Successful` (it already committed — the outcome
     /// class is `Ok` + `Successful`, NEVER `Err`), and a later clean no-op
     /// services the marker once the lock is free. The pre-commit lock checks
-    /// (preflight, reconcile, fleet-commit) run while the lock is FREE: the
+    /// (preflight, reconcile, commit) run while the lock is FREE: the
     /// fixture only grabs the guard the moment the engine parks at a
     /// step-17-equivalent lock acquisition — the push's own step-17 rotation
     /// AND, when prior debt exists, the deferred-maintenance retry that runs
@@ -978,7 +978,7 @@ impl Fixture {
     fn apply_prop(&self, action: &Action, class: FailureClass) -> Outcome {
         match action {
             Action::Push(t) | Action::Retry(t) => self.push_prop(t, None, class),
-            Action::Rollback(t, i) => self.push_prop(t, Some(&format!("{t}@f{i}")), class),
+            Action::Rollback(t, i) => self.push_prop(t, Some(&format!("s{i}")), class),
             other => {
                 // Build / Rotate / Tamper: nothing consumes a fault, so the
                 // class is dropped without arming.
@@ -1281,9 +1281,7 @@ impl Fixture {
                 Outcome::Ok
             }
             Action::Push(t) | Action::Retry(t) => Outcome::Push(Box::new(self.push(t))),
-            Action::Rollback(t, i) => {
-                Outcome::Push(Box::new(self.push_ref(t, &format!("{t}@f{i}"))))
-            }
+            Action::Rollback(t, i) => Outcome::Push(Box::new(self.push_ref(t, &format!("s{i}")))),
             Action::Rotate => {
                 self.rotate_union().expect("standalone rotation succeeds");
                 Outcome::Ok
@@ -2015,7 +2013,7 @@ fn state_machine_lifecycle_intent_persist_leaves_remote_untouched() {
     f.check_invariants();
 }
 
-/// Lifecycle: a failure at the fleet-commit marker write (after activation,
+/// Lifecycle: a failure at the commit marker write (after activation,
 /// before durable commit) leaves the attempt PendingCommit — never reported
 /// fully successful anywhere — and a retry converges to exactly one snapshot
 /// with no duplicated history.
@@ -2030,7 +2028,7 @@ fn state_machine_lifecycle_pending_commit_recovery_no_duplicate_history() {
     assert_eq!(
         r1.status,
         Some(DeploymentStatus::PendingCommit),
-        "the failed fleet commit must be reported PendingCommit"
+        "the failed commit must be reported PendingCommit"
     );
     let attempt = r1.attempt.expect("the attempt is recorded");
     let id = attempt.deployment_id.clone();
@@ -2097,7 +2095,7 @@ fn state_machine_mixed_sequence_invariants() {
     };
     res.expect("push t2 succeeds");
 
-    // Rollback t1 to its own f0 (tree v1) and t2 to f0 (tree v2).
+    // Rollback t1 to its own s0 (tree v1) and t2 to s0 (tree v2).
     let r = f.apply(Action::Rollback("t1", 0));
     let Outcome::Push(res) = r else {
         panic!("expected push")
@@ -2168,9 +2166,9 @@ fn observed_scope_crash_before_refresh_recovered_by_noop_retry() {
     f.check_invariants();
 }
 
-/// (b) Rollback on ONE target: a fleet rollback is a REAL push; its observed
+/// (b) Rollback on ONE target: a snapshot rollback is a REAL push; its observed
 /// refresh must land the rolled-back assignment in EVERY member target's
-/// projection, so after rolling t1 back to its own `@f0` both t1 and t2
+/// projection, so after rolling t1 back to its own `@s0` both t1 and t2
 /// observe the restored assignment (generation + artifact).
 #[test]
 fn observed_scope_rollback_refreshes_every_member_projection() {
@@ -2285,7 +2283,7 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     assert!(err.to_string().contains("append_attempt"), "{err}");
     f.assert_observed_scope_property();
 
-    // (b) Rollback t1 to its own `@f0` (tree v1): a real push whose refresh
+    // (b) Rollback t1 to its own `@s0` (tree v1): a real push whose refresh
     // propagates the restored assignment to BOTH member targets.
     let r = f.apply(Action::Rollback("t1", 0));
     let Outcome::Push(res) = r else {
@@ -2344,7 +2342,7 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     );
     f.assert_observed_scope_property();
 
-    // A mid-flight failure that STILL returns Ok: the fleet-commit marker
+    // A mid-flight failure that STILL returns Ok: the commit marker
     // write fails on a fresh t2 push (v4) -> PendingCommit. The observed
     // refresh has already run on that push, so the next retry finalizes and
     // keeps the projections current.
@@ -2578,12 +2576,12 @@ fn scope_strengthening_policy_never_reduces_retained() {
     let weak = baseline(&f.config);
 
     // Strengthen t1's policy: keep 5 distinct (was 1), protect the previous,
-    // protect 2 fleet deployments.
+    // protect 2 deployments.
     let mut strong_config = f.config.clone();
     let r = strong_config.targets.get_mut("t1").unwrap();
     r.rotation.per_server.keep_distinct_artifacts = 5;
     r.rotation.per_server.protect_previous = true;
-    r.rotation.fleet.protect_deployments = 2;
+    r.rotation.deployment.protect_deployments = 2;
     let strong = baseline(&mut strong_config);
     assert!(
         strong.is_superset(&weak),
@@ -3289,7 +3287,7 @@ fn integrity_tampered_stored_release_blocks_historical_push() {
     std::fs::write(&p, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
 
     let err = f
-        .push_ref_impl("t1", id.as_str())
+        .push_ref_impl("t1", &format!("parent({}, 0)", id.as_str()))
         .expect_err("a historical push against a tampered stored release must fail closed");
     assert!(
         err.to_string().contains("identity mismatch"),
@@ -3319,7 +3317,7 @@ fn integrity_tampered_stored_behavior_json_blocks_historical_push() {
         .unwrap();
     let id = ReleaseId::new(dir.file_name().to_string_lossy().into_owned());
     let err = f
-        .push_ref_impl("t1", id.as_str())
+        .push_ref_impl("t1", &format!("parent({}, 0)", id.as_str()))
         .expect_err("a historical push against a tampered behavior snapshot must fail closed");
     let msg = err.to_string();
     assert!(
@@ -3400,7 +3398,7 @@ fn integrity_stored_release_schema_version_tamper_fails_closed() {
             "error must name the accepted version, got: {msg}"
         );
         let push_err = f
-            .push_ref_impl("t1", id.as_str())
+            .push_ref_impl("t1", &format!("parent({}, 0)", id.as_str()))
             .expect_err("a push against a tampered record version must fail closed");
         assert!(
             push_err.to_string().contains("release_schema_version"),
@@ -3414,21 +3412,21 @@ fn integrity_stored_release_schema_version_tamper_fails_closed() {
     f.store
         .read_release(&id)
         .expect("the canonical version reads");
-    f.push_ref_impl("t1", id.as_str())
+    f.push_ref_impl("t1", &format!("parent({}, 0)", id.as_str()))
         .expect("a push against the restored record succeeds");
 
     // And the dedicated Tamper action rewrites the field the same way.
-    let f2 = Fixture::new();
-    f2.apply(Action::Push("t1"));
-    f2.apply(Action::Tamper(TamperKind::ReleaseSchemaVersion));
-    let releases_root = f2.store.base().join(layout::RELEASES);
+    let s2 = Fixture::new();
+    s2.apply(Action::Push("t1"));
+    s2.apply(Action::Tamper(TamperKind::ReleaseSchemaVersion));
+    let releases_root = s2.store.base().join(layout::RELEASES);
     let dir = std::fs::read_dir(&releases_root)
         .unwrap()
         .flatten()
         .next()
         .unwrap();
     let id = ReleaseId::new(dir.file_name().to_string_lossy().into_owned());
-    let err = f2
+    let err = s2
         .store
         .read_release(&id)
         .expect_err("the Tamper action's rewritten version must fail closed on read");
@@ -3550,7 +3548,7 @@ fn bounds_capacity_edge_corners_fail_safely() {
 /// * the remote `current` generation's expected content version;
 /// * each member target's expected observed projection (a completed
 ///   push/rollback propagates the shared slot to BOTH members);
-/// * the per-target fleet-snapshot log (`t@f{i}` rollback refs) and the
+/// * the per-target snapshot log (`t@s{i}` rollback refs) and the
 ///   deployment-attempt log (one entry per real deployment);
 /// * pending-commit state — a CommitMarker-write fault leaves the attempt
 ///   un-finalized until the next push of that target reconciles it (or
@@ -3588,7 +3586,7 @@ struct Model {
     /// Expected per-target observed projection (content version), or `None`
     /// before the first completed mutation.
     observed: BTreeMap<&'static str, Option<u32>>,
-    /// Per-target fleet snapshot log: content version per snapshot index.
+    /// Per-target snapshot log: content version per snapshot index.
     snapshots: BTreeMap<&'static str, Vec<u32>>,
     /// Per-target deployment-attempt log: content version per attempt.
     attempts: BTreeMap<&'static str, Vec<u32>>,
@@ -3719,7 +3717,7 @@ impl Model {
     /// Reconcile a pending attempt of `t` at the START of a push/rollback,
     /// mirroring `reconcile_pending_commits` (which runs before the early
     /// no-op check): verify the attempt's generation, then write its missing
-    /// fleet-commit marker. The marker write is a commit-path write, so an
+    /// commit marker. The marker write is a commit-path write, so an
     /// armed [`FailureClass::CommitMarker`] is consumed there and the attempt
     /// stays pending; under [`FailureClass::LockContention`] the reconcile's
     /// lock acquisition fails BEFORE any write, so the attempt stays pending
@@ -3769,7 +3767,7 @@ impl Model {
         }
     }
 
-    /// A fleet-rollback to snapshot `i`. Out-of-range refs are rejected by
+    /// A snapshot rollback to snapshot `i`. Out-of-range refs are rejected by
     /// the engine's plan BEFORE reconcile or any mutation: the push returns
     /// `Err` (nothing recorded — `NoAttempt`) and the crash-window state
     /// stands.
@@ -3792,7 +3790,7 @@ impl Model {
     }
 
     /// A HEAD push / no-op retry (`Push` and `Retry` are the same operation
-    /// in the fixture) or a valid fleet-rollback (deploying `rollback_version`),
+    /// in the fixture) or a valid snapshot rollback (deploying `rollback_version`),
     /// under the step's failure class. Returns the expected outcome class and
     /// the NEW crash-window state.
     fn deploy(&mut self, t: &'static str, rollback_version: Option<u32>) -> (OutcomeClass, bool) {
@@ -3803,7 +3801,7 @@ impl Model {
         // class is `Err` + `NoAttempt` (CONFIRMED against the engine: the
         // per-slot preflight lock check at `push_inner` runs before
         // `reconcile_pending_commits`, `write_plan`, and `append_attempt`;
-        // the step-15 fleet-commit contention, by contrast, happens AFTER the
+        // the step-15 commit contention, by contrast, happens AFTER the
         // intent and yields `Ok` + `Pending`). The crash-window state and the
         // step's fault stand exactly as before (a pending attempt is left for
         // a later push to reconcile).
@@ -3889,7 +3887,7 @@ impl Model {
                 self.debt.insert(t, false);
             }
             Some(FailureClass::CommitMarker) => {
-                // Fleet-commit marker write fails: the deployment is recorded
+                // commit marker write fails: the deployment is recorded
                 // PendingCommit; current advanced and observed refreshed, but
                 // the snapshot/ref finalization defers to the next push of
                 // this target. Step-17 rotation still succeeds (the fault is
@@ -3971,7 +3969,7 @@ impl Model {
             Some(FailureClass::Step17ContentionDebtRead)
             | Some(FailureClass::Step17ContentionDebtWrite) => {
                 // STEP-17 LOCK CONTENTION (post-commit, via the phase hook)
-                // combined with a rotation-debt I/O fault: the fleet commit
+                // combined with a rotation-debt I/O fault: the commit
                 // succeeded and the slot's rotation lock is contended, so the
                 // step-17 loop defers the rotation as a debt marker. The
                 // deferral I/O is NON-FALLIBLE — a debt read/write failure
@@ -4029,7 +4027,7 @@ impl Model {
         // The TWO-DIMENSION class: the boundary is `Ok` unless the step crashed
         // inside the commit path (an `Err` whose intent WAS persisted —
         // disposition `Pending`); the disposition is `Pending` for the
-        // fleet-commit marker failure and for the crash-window `Err`s, and
+        // commit marker failure and for the crash-window `Err`s, and
         // `Successful` for a durable commit. Terminal failure dispositions
         // (`FailedPreflight` / `Degraded` / `FailedRolledBack`) are not
         // reachable from the property's injected fault classes (no server
@@ -4148,7 +4146,7 @@ impl Model {
     /// Whether `action` would replace the tampered current record with a new
     /// pristine generation. Only a REAL deployment does: a HEAD push/retry
     /// always deploys after a tamper (the tampered artifact never equals the
-    /// materialized head), while a fleet-rollback repairs only when its ref
+    /// materialized head), while a snapshot rollback repairs only when its ref
     /// resolves — an out-of-range index errors at plan time, before any
     /// mutation, leaving the tampered record in place.
     fn repairs_tamper(&self, action: &Action) -> bool {
@@ -4178,7 +4176,7 @@ fn action_strategy() -> impl Strategy<Value = Action> {
         4 => prop::sample::select(["t1", "t2"].as_slice()).prop_map(Action::Push),
         // Up-to-date retry (no-op or reconcile) — the same engine call.
         2 => prop::sample::select(["t1", "t2"].as_slice()).prop_map(Action::Retry),
-        // Fleet rollback to snapshot index 0 or 1 of the target.
+        // Rollback to snapshot index 0 or 1 of the target.
         2 => (prop::sample::select(["t1", "t2"].as_slice()), 0u64..2)
             .prop_map(|(t, i)| Action::Rollback(t, i)),
         // Standalone rotation under the full member-policy union.
@@ -4200,7 +4198,7 @@ fn action_strategy() -> impl Strategy<Value = Action> {
 /// (IntentPersist, early lock contention, a rejected plan) yields `Err` +
 /// `NoAttempt`; a crash-window arm (results/finalizer I/O) yields `Err` +
 /// `Pending`; a post-commit arm yields the committed class with the model's
-/// tracked debt/warning state; and the fleet-commit marker failure yields
+/// tracked debt/warning state; and the commit marker failure yields
 /// `Ok` + `Pending`. Lock contention demotes the whole attempt
 /// (`LockContention`, pre-intent: `Err` + `NoAttempt`) or only the step-17
 /// rotation (`Step17Contended`, deferred via the phase hook: debt + warning,
@@ -4266,7 +4264,7 @@ fn system_has_pending(system: &Fixture, t: &str) -> bool {
 }
 
 /// Record `art` as the artifact for content version `v`. Every source (a
-/// fleet snapshot, an attempt's desired assignment, the remote current, an
+/// snapshot, an attempt's desired assignment, the remote current, an
 /// observed projection) must agree: the same version materializing into two
 /// different artifacts is exactly the interleaving/state bug the oracle
 /// exists to catch.
@@ -4335,7 +4333,7 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
     let pid = PlacementSlotId::new("p1");
     let mut learned: BTreeMap<u32, ArtifactRef> = BTreeMap::new();
 
-    // Fleet-snapshot logs: count + per-index artifact/version join.
+    // Snapshot logs: count + per-index artifact/version join.
     for t in ["t1", "t2"] {
         let sys_snaps = system.store.read_snapshots(t).unwrap_or_default();
         let want = model.snapshots.get(t).cloned().unwrap_or_default();
@@ -4349,7 +4347,7 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
         for (i, (ss, mv)) in sys_snaps.iter().zip(&want).enumerate() {
             assert_eq!(ss.index, i as u64, "{ctx}: snapshot index order for {t}");
             let art = ss.slots[&pid].assignment.artifact.clone();
-            learn_artifact(&mut learned, &ctx, *mv, art, &format!("snapshot {t}@f{i}"));
+            learn_artifact(&mut learned, &ctx, *mv, art, &format!("snapshot {t}@s{i}"));
         }
     }
     // Deployment-attempt logs: exactly one record per real deployment.

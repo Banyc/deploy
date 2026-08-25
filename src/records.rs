@@ -1,17 +1,17 @@
 //! Shared record structures persisted by the local store, the push engine, and
-//! the fleet history / rollback subsystem.
+//! the snapshot history / rollback subsystem.
 //!
 //! Assignment relationships are expressed exclusively through the canonical
 //! model types ([`crate::model::ArtifactRef`],
 //! [`crate::model::PlacementSlotAssignment`], [`crate::model::GenerationRef`])
 //! rather than re-declared per record. Every slot→assignment map (attempt
-//! `desired` / `pre_push` / `slots`, observed state, fleet snapshots) is
+//! `desired` / `pre_push` / `slots`, observed state, snapshots) is
 //! keyed by [`crate::model::PlacementSlotId`] — the deployment-location
 //! identity — while [`crate::model::ServerId`] remains the actual-server
 //! identity used for transport addressing (`ServerState`, config `ServerDef`).
 //!
 //! The records model separates the IMMUTABLE attempt INTENT from MUTABLE
-//! status and per-slot OUTCOMES, and freezes the terminal successful fleet
+//! status and per-slot OUTCOMES, and freezes the terminal successful snapshot
 //! state for rollback:
 //!
 //! * [`DeploymentAttempt`] — the immutable INTENT of one deployment
@@ -33,7 +33,7 @@
 //!   is the deployment's mutable status lifecycle: the current status of an
 //!   attempt is the LATEST transition.
 //! * [`DeploymentSnapshot`] — a terminal successful FLEET state used for
-//!   rollback, exposed as `<target>@fN`. Only successful deployments produce
+//!   rollback, exposed as `<target>@sN`. Only successful deployments produce
 //!   a snapshot (`refs/snapshots.jsonl` + `refs/last-successful`). It records
 //!   each slot's advanced [`GenerationRef`] keyed by the DEPLOYMENT-LOCATION
 //!   identity AND the complete physical binding ([`PhysicalBinding`]
@@ -55,7 +55,7 @@ pub enum DeploymentStatus {
     /// transition of every attempt is `InProgress`.
     InProgress,
     Successful,
-    /// The fleet-commit markers are not all durable yet; a later push
+    /// The commit markers are not all durable yet; a later push
     /// reconciles this attempt before its own no-op check.
     PendingCommit,
     FailedPreflight,
@@ -114,7 +114,7 @@ pub struct AttemptServer {
 /// this record — the persisted `slots` map is empty.
 ///
 /// Every slot→assignment map is keyed by [`PlacementSlotId`]; `slot_ids` is
-/// the deployment's membership (mirroring the fleet-commit marker `slots`
+/// the deployment's membership (mirroring the commit marker `slots`
 /// payload). The record carries `deployment_schema_version`, which must be
 /// exactly [`crate::model::SCHEMA_VERSION`]: writers emit the constant and
 /// readers (e.g. [`crate::store::local::LocalStore::read_attempts`]) refuse
@@ -129,7 +129,7 @@ pub struct DeploymentAttempt {
     pub deployment_id: DeploymentId,
     pub target: TargetName,
     /// The placement slots participating in this deployment, in deployment
-    /// order (the same set the fleet-commit marker `slots` payload records).
+    /// order (the same set the commit marker `slots` payload records).
     pub slot_ids: Vec<PlacementSlotId>,
     pub behavior_sha256: String,
     pub attempted_at: String,
@@ -163,12 +163,12 @@ pub struct DeploymentTransition {
     pub reason: Option<String>,
 }
 
-/// A terminal successful fleet state used for rollback, exposed as
+/// A terminal successful snapshot state used for rollback, exposed as
 /// The complete PHYSICAL binding of one placement slot at snapshot time: the
 /// actual server ([`ServerId`]) AND the absolute `deploy_dir` on that server
 /// where the slot's deployment state (objects, releases, generations,
 /// `current`) lives. Together `{server, deploy_dir}` name the exact on-host
-/// deployment location a fleet snapshot's generations were advanced on.
+/// deployment location a snapshot's generations were advanced on.
 /// Exact rollback must verify BOTH halves: a slot that keeps its server but
 /// moves its `deploy_dir` would otherwise receive the historical generations
 /// at the new location, silently deploying to the wrong place on the same
@@ -182,8 +182,8 @@ pub struct PhysicalBinding {
     pub deploy_dir: String,
 }
 
-/// A terminal successful fleet state used for rollback, exposed as
-/// `<target>@fN`. Only successful deployments produce a snapshot
+/// A terminal successful snapshot state used for rollback, exposed as
+/// `<target>@sN`. Only successful deployments produce a snapshot
 /// (`refs/snapshots.jsonl` + `refs/last-successful`). Each slot's entry is
 /// the complete [`GenerationRef`] it advanced to (a successful snapshot always
 /// has a generation per slot).
@@ -255,8 +255,8 @@ pub enum PlanSource {
     /// Materialize the currently mapped local files and assign each slot its
     /// target-configured (current) variant.
     Head,
-    /// Restore a historical successful fleet snapshot by index (`@fN`).
-    FleetRef(u64),
+    /// Restore a historical successful snapshot by index (`@sN`).
+    SnapshotRef(u64),
     /// Assign each current slot its configured variant from a named release.
     ReleaseRef(ReleaseId),
 }

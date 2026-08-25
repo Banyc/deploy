@@ -283,7 +283,7 @@ keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[targets.production.rotation.fleet]
+[targets.production.rotation.deployment]
 protect_deployments = 2
 
 [[servers]]

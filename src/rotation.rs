@@ -8,10 +8,10 @@
 //! * artifacts or releases selected by durable pins
 //! * the newest `keep_distinct_artifacts` distinct successful artifact bindings
 //! * artifacts successfully activated less than `keep_days` ago
-//! * that server's artifacts in the newest `protect_deployments` fleet window
+//! * that server's artifacts in the newest `protect_deployments` deployment window
 //!
 //! A slot may belong to SEVERAL targets with DIFFERENT retention policies (the
-//! multi-target feature). Every generation record (and fleet-commit marker)
+//! multi-target feature). Every generation record (and commit marker)
 //! carries the target that created it (`GenerationAssignment.target`); on
 //! rotation, each member target's policy is applied to the generations that
 //! target created, and the retained set is the UNION of every member's
@@ -44,7 +44,7 @@ struct GenRecord {
 }
 
 /// Compute the set of retained tree digests for one server, using the
-/// fleet-wide rotation policies of EVERY target the slot belongs to and the
+/// target-wide rotation policies of EVERY target the slot belongs to and the
 /// durable pins declared in `deploy.toml`. `target_names` (the slot's FULL
 /// member list) resolves each member's `RotationConfig` from the caller's
 /// current configuration; each policy is applied to the generations that
@@ -229,9 +229,9 @@ fn retained_for_policy(
         }
     }
 
-    // Fleet window: newest `protect_deployments` distinct deployment IDs
+    // Deployment window: newest `protect_deployments` distinct deployment IDs
     // among this target's owned records.
-    let protect_deployments = rotation.fleet.protect_deployments as usize;
+    let protect_deployments = rotation.deployment.protect_deployments as usize;
     if protect_deployments > 0 {
         let mut depl: BTreeMap<String, DateTime<Utc>> = BTreeMap::new();
         for g in gens.iter().filter(|g| owns(g)) {
@@ -312,7 +312,7 @@ keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[targets.t1.rotation.fleet]
+[targets.t1.rotation.deployment]
 protect_deployments = 1
 
 [[servers]]
@@ -331,9 +331,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     /// A slot shared between `production` (CONSERVATIVE retention) and
     /// `staging` (AGGRESSIVE retention): production keeps 5 distinct
-    /// artifacts, 14 days of age, the protected previous, and 2 fleet
+    /// artifacts, 14 days of age, the protected previous, and 2 snapshot
     /// deployments; staging keeps only the newest 1, no age, no previous
-    /// protection, and 1 fleet deployment.
+    /// protection, and 1 deployment.
     fn cfg_shared() -> Config {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
@@ -371,7 +371,7 @@ keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[targets.production.rotation.fleet]
+[targets.production.rotation.deployment]
 protect_deployments = 2
 
 [targets.staging.rotation.per_server]
@@ -379,7 +379,7 @@ keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = false
 
-[targets.staging.rotation.fleet]
+[targets.staging.rotation.deployment]
 protect_deployments = 1
 
 [[servers]]
@@ -618,7 +618,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .get_mut("t1")
             .unwrap()
             .rotation
-            .fleet
+            .deployment
             .protect_deployments = 0;
         // No prior chain, so protect_previous has nothing to add.
         c.targets
@@ -674,7 +674,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .get_mut("t1")
             .unwrap()
             .rotation
-            .fleet
+            .deployment
             .protect_deployments = 0;
 
         let retained = compute_retained(&helper, &c.pins, &store, &c, &["t1".to_string()]).unwrap();
@@ -699,11 +699,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert!(retained.contains("t-recent"));
     }
 
-    /// The fleet `protect_deployments` window retains the artifacts of the
+    /// The deployment `protect_deployments` window retains the artifacts of the
     /// newest N distinct deployment IDs, even when the distinct-artifact
     /// window alone would sweep them.
     #[test]
-    fn fleet_protect_deployments_retains_newest_deployments() {
+    fn snapshot_protect_deployments_retains_newest_deployments() {
         let dir = tempfile::tempdir().unwrap();
         let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
         let helper = RemoteHelper::new(&remote);
@@ -759,23 +759,23 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .get_mut("t1")
             .unwrap()
             .rotation
-            .fleet
+            .deployment
             .protect_deployments = 2;
 
         let retained = compute_retained(&helper, &c.pins, &store, &c, &["t1".to_string()]).unwrap();
         assert!(retained.contains("t3"), "current deployment retained");
         assert!(
             retained.contains("t2"),
-            "second-newest deployment protected by the fleet window"
+            "second-newest deployment protected by the deployment window"
         );
         assert!(
             !retained.contains("t1"),
-            "oldest deployment outside the fleet window must be swept"
+            "oldest deployment outside the deployment window must be swept"
         );
     }
 
     /// Rotation never deletes what rollback needs: with EVERY retention
-    /// window zeroed (keep_distinct = 0, keep_days = 0, fleet = 0) and no
+    /// window zeroed (keep_distinct = 0, keep_days = 0, deployment = 0) and no
     /// pins, the current artifact and the protected previous artifact survive.
     #[test]
     fn current_and_protected_previous_survive_zero_windows() {
@@ -826,7 +826,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .get_mut("t1")
             .unwrap()
             .rotation
-            .fleet
+            .deployment
             .protect_deployments = 0;
 
         let retained = compute_retained(&helper, &c.pins, &store, &c, &["t1".to_string()]).unwrap();
@@ -898,7 +898,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .get_mut("t1")
             .unwrap()
             .rotation
-            .fleet
+            .deployment
             .protect_deployments = 0;
 
         let retained = compute_retained(&helper, &c.pins, &store, &c, &["t1".to_string()]).unwrap();
@@ -923,7 +923,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// production's policy retains — its newest 5 distinct bindings AND the
     /// previous generation of `current` (a STAGING push, whose own
     /// `protect_previous=false` would sweep it) — and sweeps only objects NO
-    /// target retains. The generation and fleet-commit records are asserted to
+    /// target retains. The generation and commit records are asserted to
     /// carry their originating target.
     #[test]
     fn shared_slot_rotates_under_the_union_of_every_targets_policy() {
@@ -1076,7 +1076,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             );
         }
 
-        // The generation and fleet-commit records carry their originating
+        // The generation and commit records carry their originating
         // target: read assignment.json (a production generation and a staging
         // generation) and a commit marker payload.
         assert_eq!(
@@ -1166,7 +1166,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let mut c = cfg_shared();
         // Isolate the distinct window: no keep_days, no protect_previous, no
-        // fleet window on either member.
+        // deployment window on either member.
         c.targets
             .get_mut("production")
             .unwrap()
@@ -1189,7 +1189,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .get_mut("production")
             .unwrap()
             .rotation
-            .fleet
+            .deployment
             .protect_deployments = 0;
         c.targets
             .get_mut("staging")
@@ -1201,7 +1201,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .get_mut("staging")
             .unwrap()
             .rotation
-            .fleet
+            .deployment
             .protect_deployments = 0;
 
         let slot_targets = ["production".to_string(), "staging".to_string()];

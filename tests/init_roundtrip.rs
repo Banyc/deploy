@@ -199,7 +199,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     assert_eq!(
         snapshots.len(),
         1,
-        "one successful fleet snapshot (production@f0)"
+        "one successful snapshot (production@s0)"
     );
     assert_eq!(snapshots[0].index, 0);
 

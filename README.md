@@ -67,7 +67,7 @@ Then deploy:
 
 ```sh
 deploy push production --dry-run   # preview the plan; touches nothing
-deploy push production             # deploy (status: Successful, ref production@f0)
+deploy push production             # deploy (status: Successful, ref production@s0)
 deploy status production           # what is actually running on each server
 deploy log production              # deployment history
 ```
@@ -104,29 +104,32 @@ Global flag: `--config <path>` selects a different `deploy.toml` than
 
 ```sh
 deploy push production --dry-run                 # preview; touches nothing
-# HEAD: the local files
+# HEAD: the local files (default — `@` and `HEAD` mean the same)
 deploy push production
-# roll back to the 2nd successful deployment (restores the exact historical
-# per-slot artifacts — variant and tree together)
-deploy push production production@f1
-deploy push production production@f1:current    # same release, but keep each server's configured variant
-deploy push production release/rel-41da2f63      # deploy a specific retained release
-# same release, but assign each current server its CONFIGURED variant
-# (the tree still comes from the release's own per-variant bindings)
-deploy push production release/rel-41da2f63:current
+# jj-style references: the target is passed ONCE, never repeated in the
+# reference; every relative form resolves against the target argument.
+deploy push production @-              # roll back to the PREVIOUS successful snapshot
+deploy push production @--             # two snapshots back (the grandparent)
+deploy push production parent(@, 3)    # three snapshots back from the latest
+# refids resolve to exact snapshots, then step N ancestors (N = 0 is the
+# snapshot itself):
+deploy push production s2              # the exact 2nd successful snapshot
+deploy push production s2--            # two snapshots before snapshot s2
+deploy push production parent(s2, 1)   # one snapshot before s2
+deploy push production deploy-20260821T102000Z--   # 2 before the snapshot that deployed that deployment
+deploy push production rel-sha256-41da2f63--        # 2 before the most recent snapshot referencing that release
 ```
 
-- `<target>@fN` refers to the Nth *successful* fleet snapshot; failed and
-  degraded attempts never advance the rollback ref and cannot be rolled back
-  to (`deploy log` still shows them).
-- The `:current` suffix — on `release/<id>:current` or `<target>@fN:current` —
-  keeps each slot's CURRENT configured variant (the variant file that declares
-  the slot in today's config) while the tree still comes from the referenced
-  release's own per-variant bindings. The bare form (`release/<id>`,
-  `<target>@fN`) instead restores the release/snapshot's OWN stored
-  slot→variant mapping. A `:current` push fails closed if the referenced
-  release does not ship the current variant (e.g. the variant was renamed
-  after the release was materialized).
+- Every *successful* deployment appends a snapshot (`s0`, `s1`, …; `deploy
+  log` shows them as `production@sN`); failed and degraded attempts never
+  advance the rollback ref and cannot be rolled back to.
+- A refid is a snapshot index (`sN`), a deployment id (`deploy-...`), or a
+  release id (`rel-sha256-...` or a bare digest). Deployment/release refids
+  resolve to the MOST RECENT snapshot that deployed the deployment /
+  references the release, then walk the ancestor steps (`s(index - N)`).
+- Out-of-range refs fail closed before anything runs: an empty chain, a
+  missing refid, or walking past the start of the chain is a ref error — never
+  an underflow or a guess.
 - Pushing identical content prints `Everything up to date`.
 - Rollout is batched per `rollout.batch_size`; on a failed server, earlier
   batches roll back by default (`failure_policy: rollback_changed`). The final
@@ -269,12 +272,12 @@ before anything is touched.
   do not list slots.
 - **Cut a release**: copy the release directory (e.g. `releases/v1` →
   `releases/v2`), edit the variant files (new mappings, verification, etc.),
-  and set `release = "v2"` in `deploy.toml`. Old releases stay deployable via
-  their `release/<id>` refs.
-- **Roll back**: `deploy push production production@fN` restores a historical
-  successful fleet snapshot; `deploy push production release/<id>` deploys a
-  retained release. Historical deployments restore their original behavior —
-  they never re-run today's verification or activation settings.
+  and set `release = "v2"` in `deploy.toml`. Old releases stay deployable
+  via the release-refid form (`parent(<release-id>, 0)`).
+- **Roll back**: `deploy push production @-` restores the previous
+  successful snapshot; `deploy push production parent(@, 3)` the 3rd
+  previous. Historical deployments restore their original behavior — they
+  never re-run today's verification or activation settings.
 - **Change rollout policy**: edit `[targets.<name>]` in `deploy.toml`; push.
 
 ## Requirements on servers (SSH)

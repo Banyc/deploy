@@ -18,7 +18,7 @@
 //!
 //! Identity model: [`PlacementSlotId`] is the DEPLOYMENT-LOCATION identity —
 //! the key of every slot→assignment relationship (plans, attempts, observed
-//! state, fleet snapshots, commit markers). [`ServerId`] is the ACTUAL SERVER
+//! state, snapshots, commit markers). [`ServerId`] is the ACTUAL SERVER
 //! identity used for transport addressing (user@host lives on `ServerDef`).
 //! They are distinct concepts: a server can host slots in multiple targets,
 //! and a slot may be a member of several targets (each carrying its own
@@ -336,7 +336,7 @@ pub struct ResolvedVariant {
 /// The canonical artifact reference: the (release, variant, tree) triple that
 /// fully names one deployable artifact. This is the single reusable type for
 /// the artifact relationship — plans, attempts, observed state, generation
-/// records, and fleet snapshots all express it through [`ArtifactRef`] instead
+/// records, and snapshots all express it through [`ArtifactRef`] instead
 /// of re-declaring the three fields.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct ArtifactRef {
@@ -356,7 +356,7 @@ pub struct PlacementSlotAssignment {
 
 /// One slot's durable generation for one artifact assignment: the complete,
 /// non-optional record of what a slot advanced to (minted generations in an
-/// attempt, and the per-slot state of a successful fleet snapshot).
+/// attempt, and the per-slot state of a successful snapshot).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationRef {
     pub generation: GenerationId,
