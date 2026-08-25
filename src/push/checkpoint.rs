@@ -34,8 +34,9 @@
 //!    current/incomplete state (observed artifacts, pending intent-only
 //!    entries, in-flight deployment dirs), or a PIN. A failed sweep is
 //!    retried by RECOMPUTING reachability — no persisted deletion worklist,
-//!    no cleanup-pending debt marker, no backup. Sweeps are best-effort and
-//!    NOT secure erasure.
+//!    no backup — and an incomplete sweep records a DURABLE SWEEP-DEBT
+//!    marker (`<base>/sweep-debt.json`) so the NEXT PUSH (not just the next
+//!    checkpoint) retries it. Sweeps are best-effort and NOT secure erasure.
 //!
 //! The old multi-file checkpoint machinery — the `history-floor.json` marker,
 //! the transactional floor ADVANCE with its tagged `.prev.<tag>` backups,
@@ -43,7 +44,8 @@
 //! the `cleanup-pending.json` debt flag with its three report flags — is
 //! GONE: the atomic ledger replacement is the only logical commit, and the
 //! report carries at most the commit status + sweep completed /
-//! retry-required.
+//! retry-required (plus the sweep-debt warning when the marker could not be
+//! persisted).
 //!
 //! # Concurrency
 //!
@@ -77,9 +79,16 @@ pub struct CheckpointReport {
     /// replacement); false for dry-run previews.
     pub established: bool,
     /// True when the best-effort sweep ran all three stages clean; false
-    /// means the sweep is RETRY-REQUIRED — re-running the same checkpoint
+    /// means the sweep is RETRY-REQUIRED — a durable sweep-debt marker was
+    /// recorded and the next push (or a re-run of the same checkpoint)
     /// recomputes reachability fresh and finishes it.
     pub sweep_completed: bool,
+    /// Warning about the sweep-debt marker I/O when the sweep did not
+    /// complete (the marker could not be persisted). Post-commit
+    /// maintenance: a debt write failure is a warning, never an `Err` — the
+    /// checkpoint's logical commit stands either way. `None` when the sweep
+    /// completed or the marker was recorded cleanly.
+    pub sweep_debt_warning: Option<String>,
     /// True when the operation ran read-only (`--dry-run`): no locks, no
     /// writes, no replacement, no sweep.
     pub dry_run: bool,
@@ -150,9 +159,26 @@ fn checkpoint_inner(
     //    If this fails, NO DELETION HAPPENS — the previous ledger stands.
     store.write_ledger_suffix(target, &suffix)?;
     // 3. Best-effort global sweep of unreachable deployments / releases /
-    //    objects (retry-required on a failed stage: the next same-deployment
-    //    checkpoint recomputes reachability fresh and finishes it).
+    //    objects. The sweep is POST-COMMIT MAINTENANCE: an incomplete sweep
+    //    must NEVER fail the checkpoint (the ledger commit stands) — it
+    //    records a DURABLE sweep-debt marker so the NEXT PUSH (not just the
+    //    next checkpoint) retries the sweep, recomputing reachability fresh
+    //    (no persisted deletion worklist), and clears the marker once it
+    //    completes. The debt write is itself non-fallible maintenance: a
+    //    failure is a warning on the report, never an `Err`.
     let (sweep, complete) = store.run_sweep(config, deployment_id.as_str())?;
+    let sweep_debt_warning = if complete {
+        None
+    } else {
+        match store.write_sweep_debt(Some(
+            "checkpoint sweep did not complete; the next push retries it",
+        )) {
+            Ok(()) => None,
+            Err(e) => Some(format!(
+                "sweep debt maintenance deferred: failed to write sweep debt: {e}"
+            )),
+        }
+    };
     Ok(CheckpointReport {
         target: target.to_string(),
         deployment_id: deployment_id.clone(),
@@ -162,6 +188,7 @@ fn checkpoint_inner(
         },
         established: true,
         sweep_completed: complete,
+        sweep_debt_warning,
         dry_run: false,
     })
 }
@@ -187,6 +214,7 @@ fn preview_checkpoint(
         },
         established: false,
         sweep_completed: false,
+        sweep_debt_warning: None,
         dry_run: true,
     })
 }
@@ -235,9 +263,12 @@ pub fn render_checkpoint_report(report: &CheckpointReport) -> Vec<String> {
     ));
     if !report.dry_run && !report.sweep_completed {
         lines.push(format!(
-            "warning: sweep did not complete — re-run `deploy checkpoint {} {}` to recompute reachability and finish it",
+            "warning: sweep did not complete — the next push retries it; re-run `deploy checkpoint {} {}` to finish it now",
             report.target, report.deployment_id
         ));
+    }
+    if let Some(w) = &report.sweep_debt_warning {
+        lines.push(format!("warning: {w}"));
     }
     lines
 }
@@ -596,9 +627,9 @@ interval_seconds = 0
         match fault {
             CheckpointFault::LedgerReplaceBefore => reg.arm_ledger_replace_before(TARGET),
             CheckpointFault::LedgerReplaceAfter => reg.arm_ledger_replace_after(TARGET),
-            CheckpointFault::SweepDeployments => reg.arm_sweep_deployments(TARGET),
-            CheckpointFault::SweepReleases => reg.arm_sweep_releases(TARGET),
-            CheckpointFault::SweepObjects => reg.arm_sweep_objects(TARGET),
+            CheckpointFault::SweepDeployments => reg.arm_sweep_deployments(),
+            CheckpointFault::SweepReleases => reg.arm_sweep_releases(),
+            CheckpointFault::SweepObjects => reg.arm_sweep_objects(),
         }
     }
 

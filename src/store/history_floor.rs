@@ -9,7 +9,13 @@
 //! results/transition stream, and NO cleanup-pending debt flag: the old
 //! multi-file model (and with it the transactional floor-advance backup
 //! machinery — `history-floor.json.prev.*` backups, restore/recovery, the
-//! torn-advance guard and the tri-state marker discovery) is GONE.
+//! torn-advance guard and the tri-state marker discovery) is GONE. The ONE
+//! maintenance debt that remains is the SWEEP-DEBT marker
+//! (`<base>/sweep-debt.json`, see [`LocalStore::read_sweep_debt`]): the
+//! checkpoint's best-effort global sweep is POST-COMMIT MAINTENANCE, so an
+//! incomplete sweep records a durable marker and the NEXT PUSH (not just the
+//! next checkpoint) retries the sweep and clears it — see
+//! [`crate::push::engine::retry_pending_sweep`].
 //!
 //! A checkpoint (`deploy checkpoint <target> <deployment-id>`) is exactly
 //! three steps:

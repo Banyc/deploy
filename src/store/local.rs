@@ -667,6 +667,71 @@ impl LocalStore {
         write_json(&p, debt)
     }
 
+    // ---- the store-global sweep debt (checkpoint sweep maintenance) ------
+
+    /// Path of the store-global sweep-debt marker (`<base>/sweep-debt.json`).
+    /// The checkpoint's best-effort GLOBAL sweep is POST-COMMIT maintenance:
+    /// an incomplete sweep records a durable marker here (the reason the
+    /// sweep did not complete) so the NEXT PUSH — not just the next
+    /// checkpoint — retries the sweep (recomputing reachability fresh, no
+    /// persisted deletion worklist) and clears the marker once it completes.
+    /// The marker is store-global because the sweep is global: release
+    /// records and tree objects are content-addressed and shared across
+    /// targets, so a pending sweep is a property of the whole store, not of
+    /// one target's ledger.
+    pub fn sweep_debt_path(&self) -> PathBuf {
+        self.base.join("sweep-debt.json")
+    }
+
+    /// Read the store-global sweep-debt marker: `Some(reason)` when a sweep
+    /// is pending, `None` when no maintenance is outstanding. Tri-state:
+    /// only a genuine NotFound is "no debt"; a stat failure propagates (an
+    /// unreadable marker must not read as "no debt").
+    pub fn read_sweep_debt(&self) -> Result<Option<String>> {
+        // Post-commit maintenance fault injection, keyed by the empty global
+        // key (the sweep debt is store-global, not target-keyed).
+        #[cfg(test)]
+        if self.fault_registry.consume(FaultKind::ReadSweepDebt, "") {
+            return Err(Error::store(
+                "test fault: read_sweep_debt forced to fail once",
+            ));
+        }
+        let p = self.sweep_debt_path();
+        if path_state(&p)? {
+            let v: serde_json::Value = read_json(&p)?;
+            Ok(v.get("reason").and_then(|r| r.as_str()).map(str::to_string))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Persist (or clear) the store-global sweep-debt marker. `None` removes
+    /// the marker file, so a fully-serviced store leaves no trace.
+    pub fn write_sweep_debt(&self, reason: Option<&str>) -> Result<()> {
+        // Post-commit maintenance write fault, keyed by the empty global key.
+        #[cfg(test)]
+        if self.fault_registry.consume(FaultKind::WriteSweepDebt, "") {
+            return Err(Error::store(
+                "test fault: write_sweep_debt forced to fail once",
+            ));
+        }
+        let p = self.sweep_debt_path();
+        match reason {
+            None => {
+                // Tri-state removal decision: a genuine NotFound is nothing
+                // to remove; any other stat error propagates (an unreadable
+                // marker must not silently survive as a stale "debt" record).
+                if path_state(&p)? {
+                    std::fs::remove_file(&p).map_err(|e| {
+                        Error::store(format!("remove sweep debt {}: {e}", p.display()))
+                    })?;
+                }
+                Ok(())
+            }
+            Some(r) => write_json(&p, &serde_json::json!({ "reason": r })),
+        }
+    }
+
     // ---- the per-target deployment LEDGER --------------------------------
 
     /// Path of the target's ONE ordered deployment ledger

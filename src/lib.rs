@@ -19,6 +19,8 @@ pub mod remote;
 pub(crate) mod revset;
 pub mod rotation;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod sweep;
 pub mod template;
 pub mod tree;
 

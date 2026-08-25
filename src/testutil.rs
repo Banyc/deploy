@@ -112,6 +112,14 @@ pub(crate) mod test_faults {
         /// `write_rotation_debt` (rotation maintenance debt write), keyed by
         /// target.
         WriteRotationDebt,
+        /// `read_sweep_debt` (the store-global sweep-debt read), keyed by the
+        /// empty global key (the sweep debt is store-global, not
+        /// target-keyed). Post-commit maintenance: a failure is a warning,
+        /// never an `Err`.
+        ReadSweepDebt,
+        /// `write_sweep_debt` (the store-global sweep-debt write/remove),
+        /// keyed by the empty global key.
+        WriteSweepDebt,
         /// The artifact garbage collection SCAN (the retained-set
         /// computation of [`crate::store::gc`]), keyed by the checkpoint
         /// deployment id. Post-commit maintenance: a failure aborts the
@@ -313,25 +321,43 @@ pub(crate) mod test_faults {
             self.arm(FaultKind::LedgerReplaceAfter, target);
         }
 
-        /// Arm the checkpoint sweep's DEPLOYMENT-DIR stage for `target` to
-        /// fail once (at the stage's entry: no deployment dir is deleted and
-        /// the report says sweep retry-required).
-        pub(crate) fn arm_sweep_deployments(&self, target: &str) {
-            self.arm(FaultKind::SweepDeployments, target);
+        /// Arm the checkpoint sweep's DEPLOYMENT-DIR stage to fail once (at
+        /// the stage's entry: no deployment dir is deleted and the report
+        /// says sweep retry-required). The sweep is GLOBAL (not
+        /// target-keyed): the arm lands on the empty key the sweep consumes,
+        /// so it fires on the next `run_sweep` regardless of which target
+        /// triggered it.
+        pub(crate) fn arm_sweep_deployments(&self) {
+            self.arm(FaultKind::SweepDeployments, "");
         }
 
-        /// Arm the checkpoint sweep's RELEASE-RECORD stage for `target` to
-        /// fail once (at the stage's entry: no release record is deleted and
-        /// the report says sweep retry-required).
-        pub(crate) fn arm_sweep_releases(&self, target: &str) {
-            self.arm(FaultKind::SweepReleases, target);
+        /// Arm the checkpoint sweep's RELEASE-RECORD stage to fail once (at
+        /// the stage's entry: no release record is deleted and the report
+        /// says sweep retry-required). Global, like
+        /// [`FaultRegistry::arm_sweep_deployments`].
+        pub(crate) fn arm_sweep_releases(&self) {
+            self.arm(FaultKind::SweepReleases, "");
         }
 
-        /// Arm the checkpoint sweep's TREE-OBJECT stage for `target` to fail
-        /// once (at the stage's entry: no object is deleted and the report
-        /// says sweep retry-required).
-        pub(crate) fn arm_sweep_objects(&self, target: &str) {
-            self.arm(FaultKind::SweepObjects, target);
+        /// Arm the checkpoint sweep's TREE-OBJECT stage to fail once (at the
+        /// stage's entry: no object is deleted and the report says sweep
+        /// retry-required). Global, like
+        /// [`FaultRegistry::arm_sweep_deployments`].
+        pub(crate) fn arm_sweep_objects(&self) {
+            self.arm(FaultKind::SweepObjects, "");
+        }
+
+        /// Arm the next store-global `read_sweep_debt` call to fail once
+        /// (sweep-debt maintenance read, keyed by the empty global key).
+        pub(crate) fn arm_read_sweep_debt(&self) {
+            self.arm(FaultKind::ReadSweepDebt, "");
+        }
+
+        /// Arm the next store-global `write_sweep_debt` call to fail once
+        /// (sweep-debt maintenance write/remove, keyed by the empty global
+        /// key).
+        pub(crate) fn arm_write_sweep_debt(&self) {
+            self.arm(FaultKind::WriteSweepDebt, "");
         }
     }
 }
@@ -754,6 +780,101 @@ pub(crate) mod test_remotes {
                 self.armed.store(false, Ordering::SeqCst);
                 return Err(Error::remote(
                     "FailOnceStagingRemote: incoming staging write forced to fail (once)",
+                ));
+            }
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> Result<bool> {
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &std::path::Path, mode: u32) -> Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(
+            &self,
+            rel: &std::path::Path,
+        ) -> Result<Vec<crate::remote::transport::RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(&self, target: &std::path::Path, link: &std::path::Path) -> Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn read_link(&self, rel: &std::path::Path) -> Result<std::path::PathBuf> {
+            self.inner.read_link(rel)
+        }
+        fn remove_file(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &std::path::Path) -> Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exists(&self, rel: &std::path::Path) -> bool {
+            self.inner.exists(rel)
+        }
+        fn metadata(&self, rel: &std::path::Path) -> Result<crate::remote::transport::RemoteMeta> {
+            self.inner.metadata(rel)
+        }
+        fn exec(
+            &self,
+            argv: &[String],
+            timeout: std::time::Duration,
+        ) -> Result<crate::remote::transport::ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+        fn filesystem_bytes(&self) -> Result<crate::remote::transport::FsBytes> {
+            self.inner.filesystem_bytes()
+        }
+    }
+    /// A transport wrapper that fails the FIRST `state/inventory.json`
+    /// write once (the last step of `RemoteHelper::rotate`), letting a test
+    /// inject a post-commit ROTATION failure deterministically: the
+    /// mark-and-sweep deletions have already happened, then the inventory
+    /// write errors — exactly the "rotation failed after commit" window the
+    /// engine defers as durable rotation debt. Mirrors the
+    /// `FailOnceMarkerRemote` pattern: the fault fires on the first `write`
+    /// whose path is exactly `state/inventory.json` and disarms itself,
+    /// while every other call passes through untouched.
+    pub(crate) struct FailOnceInventoryRemote {
+        inner: LocalTransport,
+        armed: Arc<AtomicBool>,
+    }
+
+    impl FailOnceInventoryRemote {
+        pub(crate) fn build(base: PathBuf, armed: Arc<AtomicBool>) -> Result<Box<dyn Remote>> {
+            Ok(Box::new(FailOnceInventoryRemote {
+                inner: LocalTransport::new(base)?,
+                armed,
+            }))
+        }
+        fn fail_inventory(&self, rel: &std::path::Path) -> bool {
+            self.armed.load(Ordering::SeqCst) && rel.to_string_lossy() == "state/inventory.json"
+        }
+    }
+
+    impl Remote for FailOnceInventoryRemote {
+        fn root(&self) -> &std::path::Path {
+            self.inner.root()
+        }
+        fn provision_layout(&self) -> Result<()> {
+            self.inner.provision_layout()
+        }
+        fn read(&self, rel: &std::path::Path) -> Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
+            if self.fail_inventory(rel) {
+                self.armed.store(false, Ordering::SeqCst);
+                return Err(Error::remote(
+                    "FailOnceInventoryRemote: rotation inventory write forced to fail (once)",
                 ));
             }
             self.inner.write(rel, data, mode)

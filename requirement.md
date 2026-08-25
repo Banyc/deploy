@@ -4,7 +4,7 @@ This is what the operator actually needs:
 - Push this release.
 - Return to that deployment.
 - Keep these artifacts.
-- Forget everything before this checkpoint.
+- No disk usage leak — clean up what you create once it stales.
 - Show what is currently running.
 
 everything else derives from and serves these rules.
@@ -893,6 +893,54 @@ projections of already-durable facts, so no debt marker is needed: the next real
 rebuilds the projections from current state, and retries converge without duplicate history.
 
 Rotation may later be exposed as an explicit maintenance command without changing these safety rules.
+
+## Sweep: the two-sided no-leak contract
+
+The Constitution's "No disk usage leak" rule is served by TWO sweep
+mechanisms, one per side of the push:
+
+- RECEIVER side (every server's deployment root): swept by ROTATION. The
+  slot's single owning-variant retention policy computes the retained digest
+  set (`rotation::compute_retained`); the mark-and-sweep pass
+  (`RemoteHelper::rotate`) deletes every tree object NOT in the retained set
+  and every abandoned incoming directory. Generation/release/commit
+  metadata is small and kept by design (it continues to explain unavailable
+  historical states); the disk usage — the tree content — is reclaimed.
+  Pins and retained content survive.
+- PUSHER side (the local store): swept by CHECKPOINT. The checkpoint
+  atomically replaces the target's ONE ledger with the retained suffix (the
+  only logical commit) and then runs the GLOBAL reachability sweep
+  (`LocalStore::run_sweep`): unreachable deployment directories, release
+  records, and tree objects are unlinked; everything reachable from a
+  retained ledger, the current/incomplete state, or a pin survives. The
+  checkpoint is a MEANS — the pusher-side sweep — not a Constitution rule.
+
+BOTH sweeps are POST-COMMIT MAINTENANCE, never corrections. A sweep failure
+(or a sweep that has not run) never blocks or rolls back the operation that
+triggered it and never reports an ordinary failure:
+
+- The receiver's rotation runs after the deployment already committed; a
+  failure records a durable rotation-debt marker
+  (`targets/<target>/rotation-debt.json`) plus a warning, and the NEXT PUSH
+  (real or no-op) retries the rotation under the slot's mutation lock and
+  clears the marker once it succeeds.
+- The pusher's checkpoint sweep is best-effort; an incomplete sweep records
+  a durable sweep-debt marker (`<store>/sweep-debt.json`) and the report
+  says sweep retry-required, and the NEXT PUSH (not just the next
+  checkpoint) retries the sweep — recomputing reachability FRESH, no
+  persisted deletion worklist — and clears the marker once it completes.
+
+Both reports surface a pending sweep as a WARNING, never an error: the
+checkpoint report's "sweep did not complete" line and the push report's
+"post-commit maintenance deferred" warning. The no-leak property
+(`sweep::two_sided_sweep_no_leak`, fixed seed 0x5EED_5EED) asserts: after a
+rotation pass the receiver retains exactly the policy-retained trees (stale
+ones gone, pins/retained content survive); after a checkpoint the pusher
+retains exactly the reachable artifacts (unreachable releases/objects/
+deployment dirs gone, pins survive); the two sides are independent (rotation
+never touches the pusher's ledger; checkpoint never touches the receiver's
+generations); and with sweep faults injected the operation still succeeds,
+debt is recorded, and the next push converges the sweep.
 
 ## systemd adapter
 Systemd support is an optional adapter outside the generic artifact engine. The mapped unit remains an ordinary artifact file whose CONTENT is rendered through the template module (see “Mapping semantics” and “Activation”) with the slot's template context at activation time — `ExecStart={{ deploy_dir }}/current/app/server` resolves per slot, and the tree itself stays slot-independent (content-addressed and shared across slots). The adapter alone knows how to register and activate it. The activation and verification definitions are canonicalized, hashed into the release identity, and copied into each deployment and generation record. A historical push therefore uses its historical behavior contract rather than the caller's current configuration.

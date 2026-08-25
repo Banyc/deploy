@@ -904,6 +904,17 @@ fn push_inner(
                     &mut observed_warnings,
                 );
                 let mut maintenance = deferred;
+                // The store-global PENDING SWEEP (deferred by an earlier
+                // checkpoint whose sweep did not complete) is also
+                // POST-COMMIT MAINTENANCE: a no-op push creates no records
+                // and skips step 17, so the sweep debt would never be
+                // serviced here — retry it explicitly before reporting
+                // "Everything up to date". Best-effort: a failure stays as
+                // the marker and surfaces as a warning; the no-op report
+                // itself is unchanged. NON-FALLIBLE (post-commit
+                // maintenance): every debt read/write failure is collected
+                // into the returned warnings, never an `Err`.
+                maintenance.extend(retry_pending_sweep(store, config, deployment_id.as_str()));
                 maintenance.extend(observed_warnings);
                 let warning = maintenance_warning(&maintenance);
                 return Ok(PushReport {
@@ -1584,6 +1595,14 @@ fn push_inner(
         op_id,
         deployment_id,
     ));
+    // The store-global PENDING SWEEP (deferred by an earlier checkpoint
+    // whose sweep did not complete) is likewise POST-COMMIT MAINTENANCE:
+    // retry it on this push — recomputing reachability fresh, no persisted
+    // worklist — and clear the marker once it completes. NON-FALLIBLE: every
+    // debt read/write failure is a warning entry in the returned vec, never
+    // an `Err` — a debt-file fault must not change the outcome of a
+    // deployment that already committed.
+    maintenance.extend(retry_pending_sweep(store, config, deployment_id.as_str()));
     for sid in &servers_order {
         let helper = &helpers[sid];
         // The slot's ONE retention policy, from its OWNING VARIANT (the
@@ -1712,7 +1731,7 @@ fn rotate_slot_locked(
 /// the OTHER slots' existing markers — and the returned warning names the
 /// deferral, so the maintenance is explicitly warned even though this slot's
 /// marker was not persisted.
-fn set_rotation_deferred(
+pub(crate) fn set_rotation_deferred(
     store: &LocalStore,
     target: &str,
     slot: &PlacementSlotId,
@@ -1858,7 +1877,7 @@ fn refresh_observed(
 /// can never turn a push (real or no-op) into an error after the deployment
 /// durably committed. Returns the slots still deferred, for the push report's
 /// warning.
-fn retry_deferred_rotations(
+pub(crate) fn retry_deferred_rotations(
     store: &LocalStore,
     config: &Config,
     target_name: &str,
@@ -1952,6 +1971,74 @@ fn retry_deferred_rotations(
         ));
     }
     still_deferred
+}
+
+/// Retry the store-global PENDING SWEEP (the checkpoint's best-effort global
+/// sweep, deferred as durable sweep debt — `<base>/sweep-debt.json`). Runs on
+/// later pushes — real and no-op — because the sweep is POST-COMMIT
+/// MAINTENANCE that must never change a deployment's reported outcome: a
+/// sweep that has not run (or failed) is retried here, recomputing
+/// reachability FRESH (no persisted deletion worklist), and the marker is
+/// cleared once the sweep completes. NON-FALLIBLE by contract: this function
+/// never returns `Err` — a debt read/write failure (a read treated as no
+/// debt, or a write/remove of the marker) becomes a WARNING entry in the
+/// returned vec, so a debt-file fault can never turn a push (real or no-op)
+/// into an error after the deployment durably committed. Returns the
+/// pending-sweep warnings for the push report's maintenance channel.
+pub(crate) fn retry_pending_sweep(
+    store: &LocalStore,
+    config: &Config,
+    anchor: &str,
+) -> Vec<String> {
+    // A debt READ failure is treated as no debt: nothing can be serviced
+    // this push, and the marker file (if any) is left untouched for a later
+    // push to retry — the warning keeps the deferral explicit.
+    let pending = match store.read_sweep_debt() {
+        Ok(p) => p,
+        Err(e) => {
+            return vec![format!(
+                "sweep debt maintenance deferred: failed to read sweep debt: {e}"
+            )];
+        }
+    };
+    let Some(reason) = pending else {
+        return Vec::new();
+    };
+    match store.run_sweep(config, anchor) {
+        Ok((_, true)) => {
+            // The sweep completed: clear the marker. A write/remove failure
+            // is post-commit maintenance: warn and leave the marker as it
+            // is — a later push retries and converges. Never an `Err`.
+            if let Err(e) = store.write_sweep_debt(None) {
+                return vec![format!(
+                    "sweep debt maintenance deferred: failed to clear sweep debt: {e}"
+                )];
+            }
+            Vec::new()
+        }
+        Ok((_, false)) => {
+            // Still incomplete: keep the marker with the fresh reason.
+            if let Err(e) = store.write_sweep_debt(Some(
+                "sweep still incomplete on retry; a later push retries it",
+            )) {
+                return vec![format!(
+                    "sweep debt maintenance deferred: failed to write sweep debt: {e}"
+                )];
+            }
+            vec![format!(
+                "sweep still deferred: the global sweep did not complete ({reason}); a later push retries it"
+            )]
+        }
+        Err(e) => {
+            // The sweep failed: keep the marker with the fresh reason.
+            if let Err(e2) = store.write_sweep_debt(Some(&e.to_string())) {
+                return vec![format!(
+                    "sweep debt maintenance deferred: failed to write sweep debt: {e2}"
+                )];
+            }
+            vec![format!("sweep still deferred: {e}")]
+        }
+    }
 }
 
 /// Build the report's `warning` from deferred-maintenance entries: `None`
