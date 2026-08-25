@@ -1,5 +1,10 @@
 //! SSH transport over `ssh`/`scp` with configured host-identity verification.
 //!
+//! Every connection is bounded: the fixed `ssh` arguments carry
+//! `-o ConnectTimeout=N`, and the `ssh-keyscan` pin step carries the same
+//! bound (native `-T` plus process-level enforcement), so an unreachable or
+//! dead host fails fast instead of hanging the transport indefinitely.
+//!
 //! This is the production transport. It authenticates the server against a
 //! *configured* identity: either a pre-provisioned `known_hosts` file used with
 //! `StrictHostKeyChecking=yes`, or a pinned `host_key_fingerprint` that is
@@ -31,6 +36,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+/// Connect timeout in seconds applied to every `ssh` connection (`-o
+/// ConnectTimeout=N`) and to the `ssh-keyscan` key-pin step (native `-T N`
+/// plus a process-level bound, see [`SshTransport::pin_known_hosts`]). A dead
+/// or unreachable host must fail fast instead of hanging the transport
+/// indefinitely; 10s bounds the connection phase while leaving slow but
+/// reachable hosts (cold VPN routes, slow DNS) enough headroom.
+const SSH_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 /// A transport that drives a real remote host over SSH.
 pub struct SshTransport {
@@ -121,6 +134,8 @@ impl SshTransport {
             "BatchMode=yes".into(),
             "-o".into(),
             "PreferredAuthentications=publickey".into(),
+            "-o".into(),
+            format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"),
             "-p".into(),
             self.port.to_string(),
         ];
@@ -151,13 +166,21 @@ impl SshTransport {
         Ok(args)
     }
 
-    /// Build the `ssh-keyscan` argument vector (port, key types, bare host).
-    /// The bare address is used (not `user@address`) because `ssh-keyscan`
-    /// expects a hostname/address, and the configured port is passed via `-p`.
+    /// Build the `ssh-keyscan` argument vector (port, connect timeout, key
+    /// types, bare host). The bare address is used (not `user@address`) because
+    /// `ssh-keyscan` expects a hostname/address, and the configured port is
+    /// passed via `-p`. `-T N` is the canonical ssh-keyscan connection timeout:
+    /// it is supported by both OpenSSH (Linux) and the LibreSSL/macOS build
+    /// (which REJECTS the nonexistent `-O timeout=` variant — `-O` only
+    /// carries `hashalg=`). [`SshTransport::pin_known_hosts`] additionally
+    /// enforces the same N-second bound at the process level, so a keyscan
+    /// implementation that ignores `-T` still cannot hang the pin step.
     fn keyscan_args(&self) -> Vec<String> {
         vec![
             "-p".into(),
             self.port.to_string(),
+            "-T".into(),
+            SSH_CONNECT_TIMEOUT_SECS.to_string(),
             "-t".into(),
             "ed25519,ecdsa,rsa".into(),
             self.address.clone(),
@@ -217,11 +240,42 @@ impl SshTransport {
             let _ = std::fs::remove_file(&path);
         }
 
-        // Fetch the host keys using the bare address and configured port.
-        let scan = Command::new("ssh-keyscan")
+        // Fetch the host keys using the bare address and configured port. The
+        // spawn is bounded at the process level (mirroring `exec`'s
+        // recv_timeout pattern): a dead or unresponsive host fails the pin
+        // step within `SSH_CONNECT_TIMEOUT_SECS` even if the local
+        // `ssh-keyscan` ignores its native `-T` option.
+        let child = Command::new("ssh-keyscan")
             .args(self.keyscan_args())
-            .output()
-            .map_err(|e| Error::transport(format!("ssh-keyscan {} failed: {e}", self.address)))?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| Error::transport(format!("ssh-keyscan {} spawn: {e}", self.address)))?;
+        let pid = child.id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let res = child.wait_with_output();
+            let _ = tx.send(res);
+        });
+        let scan = match rx.recv_timeout(Duration::from_secs(SSH_CONNECT_TIMEOUT_SECS)) {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                return Err(Error::transport(format!(
+                    "ssh-keyscan {} wait: {e}",
+                    self.address
+                )));
+            }
+            Err(_) => {
+                let _ = std::process::Command::new("kill")
+                    .arg("-9")
+                    .arg(pid.to_string())
+                    .status();
+                return Err(Error::transport(format!(
+                    "ssh-keyscan {} timed out after {SSH_CONNECT_TIMEOUT_SECS}s (host unreachable?)",
+                    self.address
+                )));
+            }
+        };
         if !scan.status.success() {
             return Err(Error::transport(format!(
                 "ssh-keyscan {} failed: {}",
@@ -899,6 +953,14 @@ mod tests {
         assert!(args.contains(&"db.example.com".to_string()));
         // The connection target (`user@host`) must NOT be passed to ssh-keyscan.
         assert!(!args.iter().any(|a| a.contains('@')));
+        // The keyscan carries the same connect timeout as ssh. `-T N` is the
+        // canonical ssh-keyscan connection timeout (OpenSSH and the
+        // LibreSSL/macOS build both support it; `-O timeout=` does not exist).
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-T" && w[1] == SSH_CONNECT_TIMEOUT_SECS.to_string()),
+            "keyscan args must carry -T {SSH_CONNECT_TIMEOUT_SECS}, got: {args:?}"
+        );
     }
 
     #[test]
@@ -909,6 +971,22 @@ mod tests {
         assert_eq!(args[p + 1], "2222");
         // The ssh connection target keeps the user@host form.
         assert!(args.iter().any(|a| a == "deploy@db.example.com"));
+    }
+
+    // The fixed ssh arguments must bound the connection phase: a dead or
+    // unreachable host aborts after `SSH_CONNECT_TIMEOUT_SECS` instead of
+    // hanging the transport indefinitely.
+    #[test]
+    fn ssh_args_carries_connect_timeout() {
+        let t = transport();
+        let args = t.ssh_args().unwrap();
+        assert!(
+            args.windows(2).any(|w| {
+                w[0] == "-o" && w[1] == format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}")
+            }),
+            "ssh args must carry -o ConnectTimeout={}, got: {args:?}",
+            SSH_CONNECT_TIMEOUT_SECS
+        );
     }
 
     // Finding 3: `.` and `..` are excluded, and real modes are preserved.
@@ -1314,10 +1392,11 @@ host=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -p) shift 2 ;;
+    -T) shift 2 ;;
     -t) shift 2 ;;
-    *) host="$1" ;;
+    -*) shift ;;
+    *) host="$1"; shift ;;
   esac
-  shift
 done
 [ -n "$host" ] || host='{address}'
 printf '%s %s\n' "$host" '{pubkey}'

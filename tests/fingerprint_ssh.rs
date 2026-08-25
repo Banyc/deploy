@@ -105,10 +105,11 @@ host=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -p) shift 2 ;;
+    -T) shift 2 ;;
     -t) shift 2 ;;
-    *) host="$1" ;;
+    -*) shift ;;
+    *) host="$1"; shift ;;
   esac
-  shift
 done
 [ -n "$host" ] || host='{address}'
 printf '%s %s\n' "$host" '{pubkey}'
