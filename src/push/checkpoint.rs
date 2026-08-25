@@ -1726,4 +1726,288 @@ mod tests {
             );
         }
     }
+
+    // ---------------------------------------------------------------------
+    // Floor-marker INTEGRITY BINDING (the property test)
+    // ---------------------------------------------------------------------
+
+    /// One corruption/tampering of the floor marker. Every variant breaks at
+    /// least one binding the loader verifies
+    /// ([`crate::store::local::LocalStore::read_history_floor`]): the
+    /// target-name binding, the exact snapshot-pair binding, or the attempt
+    /// binding — so a mutated marker must NEVER be silently treated as
+    /// "no floor" (which would expose the below-floor prefix).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FloorMutation {
+        /// (1) Retarget the marker to a different target name.
+        Retarget,
+        /// (2a) `snapshot_index` BELOW the real one.
+        IndexBelow,
+        /// (2b) `snapshot_index` ABOVE the real one.
+        IndexAbove,
+        /// (3a) `deployment_id` → a deployment that never existed.
+        ForeignDeployment,
+        /// (3b) `deployment_id` → another EXISTING deployment (its snapshot
+        /// lives at a different index, so the exact snapshot pair still
+        /// fails — the id alone is never enough).
+        ExistingDeployment,
+        /// (4) Delete the anchor snapshot (the exact entry the marker
+        /// names).
+        DeleteAnchorSnapshot,
+        /// (5) Delete the matching attempt (the marker's own deployment).
+        DeleteAnchorAttempt,
+    }
+
+    fn floor_mutation_strategy() -> impl Strategy<Value = FloorMutation> {
+        prop_oneof![
+            1 => Just(FloorMutation::Retarget),
+            1 => Just(FloorMutation::IndexBelow),
+            1 => Just(FloorMutation::IndexAbove),
+            1 => Just(FloorMutation::ForeignDeployment),
+            1 => Just(FloorMutation::ExistingDeployment),
+            1 => Just(FloorMutation::DeleteAnchorSnapshot),
+            1 => Just(FloorMutation::DeleteAnchorAttempt),
+        ]
+    }
+
+    /// Rewrite the marker file to a mutated form of the INTACT floor (each
+    /// mutation is a fresh corruption derived from the intact marker, never
+    /// from an already-corrupt file — a sequence of mutations stays a
+    /// sequence of independent corruptions), or physically delete the named
+    /// anchor record for the anchor-deletion mutations.
+    fn apply_floor_mutation(store: &LocalStore, intact: &HistoryFloor, mutation: FloorMutation) {
+        match mutation {
+            FloorMutation::DeleteAnchorSnapshot => {
+                // Physically remove the snapshot entry the marker names
+                // (index AND deployment id — the exact pair).
+                let keep: Vec<DeploymentSnapshot> = store
+                    .read_snapshots_raw(TARGET)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|s| {
+                        !(s.index == intact.snapshot_index
+                            && s.deployment_id == intact.deployment_id)
+                    })
+                    .collect();
+                let body = keep
+                    .iter()
+                    .map(|s| serde_json::to_string(s).unwrap())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                std::fs::write(
+                    store.refs_dir(TARGET).join("snapshots.jsonl"),
+                    if body.is_empty() {
+                        String::new()
+                    } else {
+                        body + "\n"
+                    },
+                )
+                .unwrap();
+            }
+            FloorMutation::DeleteAnchorAttempt => {
+                // Physically remove the attempt of the marker's deployment.
+                let keep: Vec<DeploymentAttempt> = store
+                    .read_attempts_raw(TARGET)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|a| a.deployment_id != intact.deployment_id)
+                    .collect();
+                let body = keep
+                    .iter()
+                    .map(|a| serde_json::to_string(a).unwrap())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                std::fs::write(
+                    store.target_dir(TARGET).join("attempts.jsonl"),
+                    if body.is_empty() {
+                        String::new()
+                    } else {
+                        body + "\n"
+                    },
+                )
+                .unwrap();
+            }
+            _ => {
+                let mut m = intact.clone();
+                match mutation {
+                    FloorMutation::Retarget => {
+                        m.target = TargetName::new("staging".to_string());
+                    }
+                    FloorMutation::IndexBelow => {
+                        m.snapshot_index = intact.snapshot_index.saturating_sub(1);
+                    }
+                    FloorMutation::IndexAbove => {
+                        m.snapshot_index = intact.snapshot_index + 1;
+                    }
+                    FloorMutation::ForeignDeployment => {
+                        m.deployment_id = DeploymentId::new("deploy-foreign".to_string());
+                    }
+                    FloorMutation::ExistingDeployment => {
+                        m.deployment_id = DeploymentId::new("deploy-0000".to_string());
+                    }
+                    _ => unreachable!("the anchor-deletion variants are handled above"),
+                }
+                std::fs::write(
+                    store.history_floor_path(TARGET),
+                    serde_json::to_vec_pretty(&m).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// Assert that NO PUBLIC reader exposes a below-floor prefix after a
+    /// mutation: the loader fails closed with an integrity error, and every
+    /// gated public reader propagates it (`read_attempts`, `read_snapshots`,
+    /// ref resolution, the log render). A corrupted marker is NEVER silently
+    /// downgraded to "no floor" (full exposure) and never yields a partial
+    /// suffix.
+    fn assert_mutated_floor_fails_closed(store: &LocalStore, mutation: FloorMutation) {
+        // The loader itself: integrity error, never `None` (a `None` would
+        // make the gated readers expose the FULL history — the danger).
+        let err = store.read_history_floor(TARGET).unwrap_err();
+        assert!(
+            err.to_string().contains("integrity"),
+            "{mutation:?} must fail closed with an integrity error from the loader, got: {err}"
+        );
+        // `read_attempts` (the `deploy log` source): propagates the error.
+        let err = store.read_attempts(TARGET).unwrap_err();
+        assert!(
+            err.to_string().contains("integrity"),
+            "read_attempts must propagate the integrity error after {mutation:?}, got: {err}"
+        );
+        // `read_snapshots` (the rollback-refs source): propagates the error.
+        let err = store.read_snapshots(TARGET).unwrap_err();
+        assert!(
+            err.to_string().contains("integrity"),
+            "read_snapshots must propagate the integrity error after {mutation:?}, got: {err}"
+        );
+        // Ref resolution reads the gated snapshot chain: the below-floor ref
+        // AND the checkpoint ref both fail (never a resolved below-floor
+        // snapshot).
+        for token in ["s0", "s1", "s2"] {
+            let expr = history::parse_ref_expr(token).unwrap();
+            let err = history::resolve_ref_expr(&expr, TARGET, store).unwrap_err();
+            assert!(
+                err.to_string().contains("integrity"),
+                "resolve '{token}' must fail with the integrity error after {mutation:?}, got: {err}"
+            );
+        }
+        // The log render (`deploy log`) is read_attempts-gated.
+        let err = crate::cli::render_log(store, TARGET, &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("integrity"),
+            "the log render must fail with the integrity error after {mutation:?}, got: {err}"
+        );
+    }
+
+    fn run_floor_mutation_case(mutations: &[FloorMutation]) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        // History: s0 (deploy-0000), s1 (deploy-0001), a FAILED attempt
+        // (deploy-0002 — below-floor prefix material), the checkpoint
+        // deploy-0003 at s2, then a failed deploy-0004 ABOVE the floor (the
+        // retained suffix must never shrink). Floor at s2 / deploy-0003:
+        // below-floor prefix = [s0, s1] + attempts [deploy-0000..deploy-0002];
+        // the suffix = [s2] + attempts [deploy-0003, deploy-0004].
+        seed_history(&store, TARGET, "deploy", &[true, true, false, true, false]);
+        let anchor_id = "deploy-0003";
+        run_checkpoint(
+            &store,
+            TARGET,
+            &DeploymentId::new(anchor_id.to_string()),
+            false,
+        )
+        .expect("the control checkpoint establishes a valid, integrity-bound floor");
+
+        // ---- CONTROL: the INTACT marker reads fine and the public readers
+        // expose exactly the at/above-floor suffix (the property's baseline).
+        let intact = store.read_history_floor(TARGET).unwrap().unwrap();
+        assert_eq!(intact.deployment_id.as_str(), anchor_id);
+        assert_eq!(intact.snapshot_index, 2);
+        let snaps = store.read_snapshots(TARGET).unwrap();
+        assert_eq!(
+            snaps.iter().map(|s| s.index).collect::<Vec<_>>(),
+            vec![2],
+            "intact floor exposes exactly the at/above suffix"
+        );
+        let attempts = store.read_attempts(TARGET).unwrap();
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|a| a.deployment_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["deploy-0003", "deploy-0004"],
+            "intact floor exposes the suffix from the checkpoint's own attempt"
+        );
+        history::resolve_ref_expr(&history::parse_ref_expr("s2").unwrap(), TARGET, &store)
+            .expect("the checkpoint snapshot resolves on the intact floor");
+        let err =
+            history::resolve_ref_expr(&history::parse_ref_expr("s0").unwrap(), TARGET, &store)
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("history floor") || err.to_string().contains("no snapshot"),
+            "a below-floor ref stays refused on the intact floor, got: {err}"
+        );
+        let lines = crate::cli::render_log(&store, TARGET, &attempts).unwrap();
+        assert_eq!(
+            lines.len(),
+            2,
+            "the intact log render shows exactly the suffix"
+        );
+        assert!(
+            lines[0].starts_with("s2  "),
+            "first rendered line carries the checkpoint's snapshot prefix, got: {}",
+            lines[0]
+        );
+
+        // ---- MUTATIONS: every corruption of the marker must fail closed —
+        // no public reader ever exposes a below-floor prefix.
+        for &mutation in mutations {
+            apply_floor_mutation(&store, &intact, mutation);
+            assert_mutated_floor_fails_closed(&store, mutation);
+        }
+    }
+
+    /// EXHAUSTIVE coverage: every mutation is exercised against a FRESH
+    /// fixture (deterministic, independent of the proptest seed), so a
+    /// single broken binding is always caught even if the randomized
+    /// sequence never sampled that variant.
+    #[test]
+    fn every_floor_mutation_fails_closed_exhaustively() {
+        for mutation in [
+            FloorMutation::Retarget,
+            FloorMutation::IndexBelow,
+            FloorMutation::IndexAbove,
+            FloorMutation::ForeignDeployment,
+            FloorMutation::ExistingDeployment,
+            FloorMutation::DeleteAnchorSnapshot,
+            FloorMutation::DeleteAnchorAttempt,
+        ] {
+            run_floor_mutation_case(&[mutation]);
+        }
+    }
+
+    proptest! {
+        // Floor-marker integrity: each case runs a deterministic sequence of
+        // mutations over a FRESH fixture (fixed seed 0x5EED_5EED + bounded
+        // cases — the same vectors run on every invocation). Every mutated
+        // marker fails closed with an integrity error from the loader and
+        // every PUBLIC reader propagates it: a corrupted marker is never
+        // silently downgraded to "no floor" (full exposure) and never
+        // exposes a below-floor prefix.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn floor_marker_integrity_binding(
+            mutations in prop::collection::vec(floor_mutation_strategy(), 0..7),
+        ) {
+            run_floor_mutation_case(&mutations);
+        }
+    }
 }

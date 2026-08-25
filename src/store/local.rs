@@ -45,6 +45,10 @@
 //! with a warning instead of an `Err`; the next same-deployment checkpoint
 //! retries the cleanup until it completes (then clears the marker).
 //!
+//! The marker is INTEGRITY-BOUND at read time ([`LocalStore::read_history_floor`]):
+//! it must name the target it was read from AND an exact snapshot-pair
+//! target's logs — any violation fails closed with an integrity error, so a
+//! (which would expose the below-floor prefix).
 //! # Test-only fault injection (per-fixture registry)
 //!
 //! Under `#[cfg(test)]` each [`LocalStore`] owns a per-fixture
@@ -752,14 +756,15 @@ impl LocalStore {
         set_private(&p)
     }
 
-    /// Read the FULL attempts log UNFILTERED by any history floor. This is
+    /// Read the FULL attempt history UNFILTERED by any history floor. This is
     /// the physical view of `attempts.jsonl` (never a below-floor escape
     /// hatch for consumers: every public read goes through
     /// [`LocalStore::read_attempts`]); the checkpoint compaction and the
     /// discard preview use it to compute the exact suffix at/after a floor,
     /// and index allocation must see the full log so compaction can never
-    /// reuse an index.
-    pub fn read_attempts_raw(&self, target: &str) -> Result<Vec<DeploymentAttempt>> {
+    /// reuse an index. Crate-private: non-crate consumers must use the
+    /// floor-gated [`LocalStore::read_attempts`].
+    pub(crate) fn read_attempts_raw(&self, target: &str) -> Result<Vec<DeploymentAttempt>> {
         let p = self.target_dir(target).join("attempts.jsonl");
         if !p.exists() {
             return Ok(vec![]);
@@ -794,7 +799,11 @@ impl LocalStore {
     /// established). No floor marker: the full log. The checkpoint's own
     /// deployment is always retained, so its attempt is the first line the
     /// readers expose; attempts AFTER it (including later failed attempts)
-    /// remain visible.
+    /// remain visible. The floor marker is integrity-bound
+    /// ([`LocalStore::read_history_floor`]): a corrupted/tampered marker
+    /// makes this read FAIL CLOSED with an integrity error — it is never
+    /// silently treated as "no floor" (which would expose the below-floor
+    /// prefix).
     pub fn read_attempts(&self, target: &str) -> Result<Vec<DeploymentAttempt>> {
         let mut out = self.read_attempts_raw(target)?;
         if let Some(floor) = self.read_history_floor(target)?
@@ -844,8 +853,9 @@ impl LocalStore {
     /// (`refs/history-floor.json`). The marker is written FIRST (durable)
     /// before the physical compaction, and every read path in this module is
     /// gated by it — see [`LocalStore::read_attempts`] /
-    /// [`LocalStore::read_snapshots`].
-    pub fn history_floor_path(&self, target: &str) -> PathBuf {
+    /// [`LocalStore::read_snapshots`]. Crate-private: the marker is an
+    /// internal enforcement point, never a public API.
+    pub(crate) fn history_floor_path(&self, target: &str) -> PathBuf {
         self.refs_dir(target).join("history-floor.json")
     }
 
@@ -871,7 +881,7 @@ impl LocalStore {
     /// mirroring the torn-record cleanup in [`write_atomic_cas`]. The
     /// checkpoint flow writes this FIRST — before any compaction — so the
     /// floor is durable before anything is discarded.
-    pub fn write_history_floor(&self, target: &str, floor: &HistoryFloor) -> Result<()> {
+    pub(crate) fn write_history_floor(&self, target: &str, floor: &HistoryFloor) -> Result<()> {
         // Entry-point fault (existing): fired BEFORE any durability I/O, so
         // a failure here leaves no marker, no temp, no compaction.
         #[cfg(test)]
@@ -969,11 +979,30 @@ impl LocalStore {
     }
 
     /// Read the target's history-floor marker, or `None` when no checkpoint
-    /// has been established. `schema_version` must be exactly
-    /// [`SCHEMA_VERSION`]; any other version fails closed with an error
-    /// naming the version (a floor written by a different schema is never
-    /// silently interpreted).
-    pub fn read_history_floor(&self, target: &str) -> Result<Option<HistoryFloor>> {
+    /// has been established. FAILS CLOSED on every integrity violation:
+    ///
+    /// * `schema_version` must be exactly [`SCHEMA_VERSION`]; any other
+    ///   version fails with an error naming the version (a floor written by
+    ///   a different schema is never silently interpreted).
+    /// * (a) the marker's `target` must match the path it was read from
+    ///   (`marker.target == target`): a marker is bound to the target
+    ///   directory it lives in, so a marker smuggled into another target's
+    ///   `refs/` can never gate (or leak into) that target's history.
+    /// * (b) a snapshot must exist with EXACTLY `index == snapshot_index`
+    ///   AND `deployment_id == marker.deployment_id` — the exact snapshot
+    ///   pair, never the index alone (a floor must name a real rollback
+    ///   state that still exists).
+    /// * (c) an attempt must exist with `deployment_id ==
+    ///   marker.deployment_id` (the floor's own deployment must be in the
+    ///   target's attempts log).
+    ///
+    /// Each violation is an [`Error::integrity`] error, so a corrupted or
+    /// tampered marker is NEVER silently treated as "no floor" (which would
+    /// expose the below-floor prefix): the gated readers
+    /// ([`LocalStore::read_attempts`] / [`LocalStore::read_snapshots`])
+    /// propagate the error. Crate-private: non-crate consumers use the
+    /// gated readers, never the marker directly.
+    pub(crate) fn read_history_floor(&self, target: &str) -> Result<Option<HistoryFloor>> {
         let p = self.history_floor_path(target);
         if !p.exists() {
             return Ok(None);
@@ -983,6 +1012,46 @@ impl LocalStore {
             return Err(Error::store(format!(
                 "history floor for target '{target}' carries unsupported schema_version {} (expected {SCHEMA_VERSION}): only SCHEMA_VERSION is accepted",
                 floor.schema_version
+            )));
+        }
+
+        // from. A marker with a foreign `target` is a tampered/corrupted
+        // marker — it is refused, not interpreted as a floor for either the
+        // path target or the named target.
+        if floor.target.as_str() != target {
+            return Err(Error::integrity(format!(
+                "history floor marker at {} is not bound to its path: marker.target = '{}' but the marker was read for target '{target}' (a floor marker must name the target directory it lives in)",
+                p.display(),
+                floor.target
+            )));
+        }
+        // (b) SNAPSHOT-PAIR BINDING: a snapshot must exist with EXACTLY
+        // `index == floor.snapshot_index` AND `deployment_id ==
+        // floor.deployment_id` — the exact pair, never the index alone (the
+        // checkpoint snapshot is the oldest rollback state; if it no longer
+        // exists the floor points at nothing).
+        let snapshots = self.read_snapshots_raw(target)?;
+        let bound_snapshot = snapshots
+            .iter()
+            .any(|s| s.index == floor.snapshot_index && s.deployment_id == floor.deployment_id);
+        if !bound_snapshot {
+            return Err(Error::integrity(format!(
+                "history floor for target '{target}' is not bound to a snapshot: no snapshot has EXACTLY index s{} AND deployment '{}' (the exact snapshot pair the marker names does not exist in refs/snapshots.jsonl)",
+                floor.snapshot_index, floor.deployment_id
+            )));
+        }
+        // (c) ATTEMPT BINDING: the floor's own deployment must exist in the
+        // target's attempts log (a floor whose attempt was deleted is
+        // refused, so the checkpoint's own attempt can never be discarded
+        // behind the readers' backs).
+        let attempts = self.read_attempts_raw(target)?;
+        let bound_attempt = attempts
+            .iter()
+            .any(|a| a.deployment_id == floor.deployment_id);
+        if !bound_attempt {
+            return Err(Error::integrity(format!(
+                "history floor for target '{target}' is not bound to an attempt: no attempt with deployment '{}' exists in targets/{target}/attempts.jsonl (the floor's own deployment must be in the target's attempts log)",
+                floor.deployment_id
             )));
         }
         Ok(Some(floor))
@@ -1045,14 +1114,30 @@ impl LocalStore {
     /// (the `deployments/<id>/` directories the compaction deletes). Pure
     /// read over the physical logs; the dry-run preview and the compaction
     /// itself share it, so the preview enumerates EXACTLY what the
-    /// compaction removes.
-    pub fn checkpoint_discards(&self, target: &str, floor: &HistoryFloor) -> Result<FloorDiscards> {
+    /// compaction removes. Crate-private: only the checkpoint flow (and the
+    /// in-crate integrity tests) computes discards.
+    pub(crate) fn checkpoint_discards(
+        &self,
+        target: &str,
+        floor: &HistoryFloor,
+    ) -> Result<FloorDiscards> {
         let attempts = self.read_attempts_raw(target)?;
         let snapshots = self.read_snapshots_raw(target)?;
+        // FAIL CLOSED: the floor's deployment MUST be in the target's
+        // attempts log. The old `unwrap_or(0)` fallback silently discarded
+        // EVERYTHING before the checkpoint (including the checkpoint's own
+        // attempt) when the id was missing; with the read-time binding this
+        // is unreachable via the public flow, but the raw path must still
+        // refuse rather than guess.
         let keep_from = attempts
             .iter()
             .position(|a| a.deployment_id == floor.deployment_id)
-            .unwrap_or(0);
+            .ok_or_else(|| {
+                Error::integrity(format!(
+                    "checkpoint discard computation for target '{target}': the floor's deployment '{}' does not exist in the target's attempts log — refusing to enumerate discards for an unbound floor",
+                    floor.deployment_id
+                ))
+            })?;
         let discarded_attempts: Vec<String> = attempts
             .iter()
             .take(keep_from)
@@ -1127,7 +1212,7 @@ impl LocalStore {
     /// though the compacted logs no longer name them (a retry converges to
     /// no below-floor dirs/files; the marker clears once the compaction
     /// completes).
-    pub fn checkpoint_compact(&self, target: &str, floor: &HistoryFloor) -> Result<()> {
+    pub(crate) fn checkpoint_compact(&self, target: &str, floor: &HistoryFloor) -> Result<()> {
         // Recomputed from the CURRENT (still-intact or already-rewritten)
         // logs on every call — this is what makes an interrupted compaction
         // converge on retry, so it must run BEFORE any log rewrite below.
@@ -1185,10 +1270,21 @@ impl LocalStore {
             ));
         }
         let attempts = self.read_attempts_raw(target)?;
+        // FAIL CLOSED: the floor's deployment id must be in the target's
+        // attempts log. The old `unwrap_or(&attempts[..])` silently KEPT ALL
+        // attempts when the id was absent (the opposite of the discard
+        // fallback's silent discard-everything); both must be errors, and
+        // with the raw-time binding this is unreachable via the public flow.
         let pos = attempts
             .iter()
-            .position(|a| a.deployment_id == floor.deployment_id);
-        let keep = pos.map(|p| &attempts[p..]).unwrap_or(&attempts[..]);
+            .position(|a| a.deployment_id == floor.deployment_id)
+            .ok_or_else(|| {
+                Error::integrity(format!(
+                    "checkpoint compaction for target '{target}': the floor's deployment '{}' does not exist in the target's attempts log — refusing to compact against an unbound floor",
+                    floor.deployment_id
+                ))
+            })?;
+        let keep = &attempts[pos..];
         write_jsonl_atomic(&self.target_dir(target).join("attempts.jsonl"), keep)?;
 
         // 3. snapshots.jsonl → the suffix at/after the floor.
@@ -1246,8 +1342,9 @@ impl LocalStore {
     /// is the physical view of `refs/snapshots.jsonl` (never a below-floor
     /// escape hatch for consumers: [`LocalStore::read_snapshots`] is the
     /// gated read). Index allocation and the compaction suffix use it, so
-    /// compacted logs never reuse an index.
-    pub fn read_snapshots_raw(&self, target: &str) -> Result<Vec<DeploymentSnapshot>> {
+    /// compacted logs never reuse an index. Crate-private: non-crate
+    /// consumers must use the floor-gated [`LocalStore::read_snapshots`].
+    pub(crate) fn read_snapshots_raw(&self, target: &str) -> Result<Vec<DeploymentSnapshot>> {
         let p = self.refs_dir(target).join("snapshots.jsonl");
         if !p.exists() {
             return Ok(vec![]);
@@ -1272,7 +1369,10 @@ impl LocalStore {
     /// checkpoint snapshot itself stays resolvable; everything below it was
     /// discarded. The floor marker gates this read even when the physical
     /// log has not been compacted yet (an interrupted compaction), so history
-    /// below the durable floor is never exposed.
+    /// below the durable floor is never exposed. The marker is verified
+    /// ([`LocalStore::read_history_floor`]): a corrupted/tampered marker
+    /// makes this read fail closed with an integrity error — never a silent
+    /// downgrade to "no floor" (which would expose the below-floor prefix).
     pub fn read_snapshots(&self, target: &str) -> Result<Vec<DeploymentSnapshot>> {
         let mut out = self.read_snapshots_raw(target)?;
         if let Some(floor) = self.read_history_floor(target)? {
