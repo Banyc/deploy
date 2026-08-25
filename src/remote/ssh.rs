@@ -1,9 +1,17 @@
 //! SSH transport over `ssh`/`scp` with configured host-identity verification.
 //!
-//! Every connection is bounded: the fixed `ssh` arguments carry
-//! `-o ConnectTimeout=N`, and the `ssh-keyscan` pin step carries the same
-//! bound (native `-T` plus process-level enforcement), so an unreachable or
-//! dead host fails fast instead of hanging the transport indefinitely.
+//! EVERY ssh operation runs through ONE bounded subprocess runner
+//! ([`SshRunner`]): the runner spawns the child, waits with a HARD deadline,
+//! on deadline KILLS the child (SIGKILL) and then REAPS it (joins the wait
+//! thread that owns the child) before returning a Timeout. Nothing is
+//! unbounded: `-o ConnectTimeout=N` in the fixed `ssh` arguments bounds only
+//! the CONNECTION phase, so the runner's deadline bounds every operation
+//! AFTER connection establishment — a remote that hangs mid-command, mid-
+//! upload, mid-keyscan, or mid-`exec` fails fast instead of hanging the whole
+//! push. The kill-then-reap ordering is deterministic: the wait thread owns
+//! the child, and the deadline path kills and then JOINS that thread, so the
+//! child is always collected before the runner returns (no kill-vs-wait race,
+//! no zombies, no return-before-reap).
 //!
 //! This is the production transport. It authenticates the server against a
 //! *configured* identity: either a pre-provisioned `known_hosts` file used with
@@ -13,6 +21,11 @@
 //! pinned in a managed known-hosts file). It never falls back to
 //! trust-on-first-use: if no host identity is configured the transport refuses
 //! to connect.
+//!
+//! The `ssh-keygen -lf` fingerprint check ([`SshTransport::key_matches_fingerprint`])
+//! spawns a LOCAL one-shot utility that reads a single key line from stdin and
+//! prints its fingerprint — it performs no ssh/remote operation and cannot
+//! hang the transport, so it deliberately stays OUTSIDE the runner's scope.
 //!
 //! Host-identity setup is split from layout setup: [`SshTransport::prepare_identity`]
 //! verifies and pins the host key BEFORE any remote request (a dry run still
@@ -35,15 +48,242 @@ use crate::remote::transport::{FsBytes, Remote, RemoteEntry, RemoteMeta};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
-/// Connect timeout in seconds applied to every `ssh` connection (`-o
-/// ConnectTimeout=N`) and to the `ssh-keyscan` key-pin step (native `-T N`
-/// plus a process-level bound, see [`SshTransport::pin_known_hosts`]). A dead
-/// or unreachable host must fail fast instead of hanging the transport
-/// indefinitely; 10s bounds the connection phase while leaving slow but
-/// reachable hosts (cold VPN routes, slow DNS) enough headroom.
+// Connect timeout in seconds applied to every `ssh` connection (`-o
+// ConnectTimeout=N`) and to the `ssh-keyscan` key-pin step (native `-T N`
+// plus the runner's process-level deadline, see [`SshRunner`] and
+// [`SshTransport::pin_known_hosts`]). A dead or unreachable host must fail
+// fast instead of hanging the transport indefinitely; 10s bounds the
+// connection phase while leaving slow but reachable hosts (cold VPN routes,
+// slow DNS) enough headroom.
 const SSH_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+// Deadline in seconds applied by [`SshRunner`] to every ssh operation AFTER
+// connection establishment: remote commands ([`SshTransport::run_remote`] /
+// [`SshTransport::run_remote_ok`]) and uploads. `-o ConnectTimeout=N` bounds
+// ONLY the connection phase, so without this bound a remote command on a hung
+// host (stuck filesystem, wedged service) would run indefinitely and hang the
+// whole push. 60s is deliberately DISTINCT from the 10s connection bound: a
+// slow-but-healthy remote (large upload over a slow link, cold NFS) legitimately
+// needs longer than connection establishment once connected. The `ssh-keyscan`
+// pin keeps `SSH_CONNECT_TIMEOUT_SECS` (it IS a connection-establishment
+// probe), and `Remote::exec` keeps its caller-supplied timeout.
+const SSH_COMMAND_TIMEOUT_SECS: u64 = 60;
+
+/// The kind of ssh operation the runner is executing. The property test
+/// generates these × stall points through an injected fake seam (see the
+/// `runner_property_tests` module) and asserts the deadline/kill/reap contract
+/// for every one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpKind {
+    /// `run_remote`: a plain remote shell command (output returned, status not
+    /// checked by the caller).
+    Remote,
+    /// `run_remote_ok`: a remote shell command that must exit 0.
+    RemoteOk,
+    /// The upload path (`ssh` with a stdin payload piped to the remote `cat`).
+    Upload,
+    /// The `ssh-keyscan` key-pin step.
+    KeyscanPin,
+    /// `Remote::exec` (caller-supplied timeout).
+    Exec,
+}
+
+/// How a runner invocation failed. Timeout is distinct so each caller can map
+/// it to its own outcome shape: `exec` returns an `ExecOutcome` with
+/// `exit_code = -1` and `stderr = "timed out after …"` (existing callers
+/// depend on it), every other operation returns a `Result` error.
+#[derive(Debug)]
+enum RunError {
+    /// The child could not be spawned.
+    Spawn(String),
+    /// Waiting on the child failed (wait error, read error, …).
+    Wait(String),
+    /// The hard deadline fired; the child was killed and reaped.
+    Timeout { after: Duration },
+}
+
+/// A spawned child owned by the runner: the runner keeps the pid (for the
+/// deadline kill) and a reaping closure that the wait thread runs. The closure
+/// returns once the child exits — including after [`SshRunnerSeam::kill`] — so
+/// the runner's join is a deterministic reap.
+struct SpawnedChild {
+    pid: u32,
+    /// Drain stdout/stderr and wait for the child; must return promptly once
+    /// the child exits (or is killed).
+    wait: Box<dyn FnOnce() -> std::io::Result<std::process::Output> + Send>,
+}
+
+/// The subprocess seam behind [`SshRunner`]. The production implementation
+/// spawns real `ssh` / `ssh-keyscan` processes; tests inject a fake that
+/// RECORDS every operation (`spawn(kind, argv)`, `kill`, `reap`) and simulates
+/// the stall points, so the runner's deadline logic is driven without any real
+/// subprocess or sleep.
+trait SshRunnerSeam: Send + Sync {
+    /// Spawn `argv[0]` with the remaining arguments. When `stdin` is `Some`,
+    /// those bytes are piped to the child's stdin as part of the wait, so a
+    /// child that stops reading is covered by the same deadline. Returns a
+    /// handle whose `wait` drains the child and returns once it exits.
+    fn spawn(
+        &self,
+        op: OpKind,
+        argv: &[String],
+        stdin: Option<Vec<u8>>,
+    ) -> std::io::Result<SpawnedChild>;
+    /// Force-kill `pid` (SIGKILL).
+    fn kill(&self, pid: u32) -> std::io::Result<()>;
+}
+
+/// Production seam: real `ssh` / `ssh-keyscan` subprocesses.
+struct RealRunner;
+
+impl SshRunnerSeam for RealRunner {
+    fn spawn(
+        &self,
+        _op: OpKind,
+        argv: &[String],
+        stdin: Option<Vec<u8>>,
+    ) -> std::io::Result<SpawnedChild> {
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        if stdin.is_some() {
+            cmd.stdin(Stdio::piped());
+        }
+        let mut child = cmd.spawn()?;
+        let pid = child.id();
+        // The stdin payload is written from INSIDE the wait closure (which the
+        // runner's deadline bounds): a remote that stops reading stdin mid-
+        // upload blocks this write, the deadline fires, the kill closes the
+        // pipe, the write fails with EPIPE (SIGPIPE is ignored by the Rust
+        // runtime), and the closure returns so the child is reaped. Without
+        // this, a >pipe-buffer upload to a hung remote would hang the write
+        // indefinitely.
+        let wait: Box<dyn FnOnce() -> std::io::Result<std::process::Output> + Send> =
+            Box::new(move || {
+                if let Some(data) = stdin
+                    && let Some(mut sin) = child.stdin.take()
+                {
+                    use std::io::Write;
+                    sin.write_all(&data)?;
+                }
+                child.wait_with_output()
+            });
+        Ok(SpawnedChild { pid, wait })
+    }
+
+    fn kill(&self, pid: u32) -> std::io::Result<()> {
+        // SAFETY: `pid` is a pid the runner spawned (and holds a child for), so
+        // the target is a child process of ours; SIGKILL cannot be blocked.
+        let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        Ok(())
+    }
+}
+
+/// THE single subprocess runner for every ssh operation: spawn the child, wait
+/// with a hard deadline, on deadline KILL (-9) then REAP — join the wait
+/// thread that owns the child, so the child is deterministically collected
+/// before the runner returns (no kill-vs-wait race, no zombie, no
+/// return-before-reap). On success the `Output` is returned; spawn/wait
+/// failures and the deadline map to [`RunError`].
+///
+/// The deadline policy: `exec` uses its caller-supplied timeout; the
+/// `ssh-keyscan` pin uses the connect deadline; every other operation uses the
+/// command deadline. Both deadlines are owned here so the property test can
+/// inject tiny ones through [`SshRunner::with_seam`].
+struct SshRunner {
+    seam: Arc<dyn SshRunnerSeam>,
+    /// Deadline for the connect-bound `ssh-keyscan` pin.
+    connect_deadline: Duration,
+    /// Deadline for post-connect remote command/upload operations.
+    command_deadline: Duration,
+}
+
+impl SshRunner {
+    fn new() -> Self {
+        SshRunner {
+            seam: Arc::new(RealRunner),
+            connect_deadline: Duration::from_secs(SSH_CONNECT_TIMEOUT_SECS),
+            command_deadline: Duration::from_secs(SSH_COMMAND_TIMEOUT_SECS),
+        }
+    }
+
+    /// Test-only constructor with an injected seam and (tiny) deadlines, so the
+    /// property test can drive the deadline/kill/reap logic against a fake
+    /// without any real subprocess or wall-clock waits.
+    #[cfg(test)]
+    fn with_seam(
+        seam: Arc<dyn SshRunnerSeam>,
+        connect_deadline: Duration,
+        command_deadline: Duration,
+    ) -> Self {
+        SshRunner {
+            seam,
+            connect_deadline,
+            command_deadline,
+        }
+    }
+
+    /// Run `op` with `argv`, bounding the whole wait by a hard deadline: the
+    /// runner's policy for the op kind, unless `timeout` is `Some` (`exec`'s
+    /// caller-supplied bound). On deadline the child is killed and the wait
+    /// thread joined (deterministic reap) BEFORE the Timeout is returned.
+    fn run(
+        &self,
+        op: OpKind,
+        argv: &[String],
+        stdin: Option<&[u8]>,
+        timeout: Option<Duration>,
+    ) -> std::result::Result<std::process::Output, RunError> {
+        let deadline = match timeout {
+            Some(t) => t,
+            None => match op {
+                OpKind::KeyscanPin => self.connect_deadline,
+                _ => self.command_deadline,
+            },
+        };
+        let child = self
+            .seam
+            .spawn(op, argv, stdin.map(<[u8]>::to_vec))
+            .map_err(|e| RunError::Spawn(format!("spawn {:?}: {e}", argv)))?;
+        let pid = child.pid;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wait = child.wait;
+        let handle = std::thread::spawn(move || {
+            let res = wait();
+            let _ = tx.send(res);
+        });
+        match rx.recv_timeout(deadline) {
+            Ok(Ok(out)) => {
+                // Success: the wait thread reaped the child (wait_with_output
+                // collects it) and sent the output. Join so the thread — and
+                // therefore the child's collection — is complete before we
+                // return.
+                let _ = handle.join();
+                Ok(out)
+            }
+            Ok(Err(e)) => {
+                let _ = handle.join();
+                Err(RunError::Wait(format!("wait {:?}: {e}", argv)))
+            }
+            Err(_) => {
+                // HARD DEADLINE: kill, then reap. The SIGKILL makes the child
+                // exit; the join collects the wait thread that owns the child
+                // (its `wait` returns promptly after the kill). Both complete
+                // before this function returns, so the child is determinis-
+                // tically collected — no zombie, no kill-vs-wait race, and the
+                // caller can never observe a returned Timeout with the child
+                // still un-reaped.
+                let _ = self.seam.kill(pid);
+                let _ = handle.join();
+                Err(RunError::Timeout { after: deadline })
+            }
+        }
+    }
+}
 
 /// A transport that drives a real remote host over SSH.
 pub struct SshTransport {
@@ -64,6 +304,10 @@ pub struct SshTransport {
     /// fingerprint was configured). Set only by [`SshTransport::prepare_identity`],
     /// never at construction, so building the transport has no side effects.
     pinned_known_hosts: std::sync::Mutex<Option<PathBuf>>,
+    /// THE bounded subprocess runner every ssh operation goes through
+    /// ([`SshRunner`]): hard deadline, kill, and deterministic reap, so no
+    /// operation can run unbounded after connection establishment.
+    runner: SshRunner,
 }
 
 impl SshTransport {
@@ -117,11 +361,38 @@ impl SshTransport {
             known_hosts: known_hosts.map(|p| p.to_path_buf()),
             host_key_fingerprint: host_key_fingerprint.map(|s| s.to_string()),
             pinned_known_hosts: std::sync::Mutex::new(None),
+            runner: SshRunner::new(),
         };
         // NOTE: construction is side-effect-free. When a fingerprint was
         // supplied without an explicit known-hosts file, the host key is
         // verified and pinned by `prepare_identity` (before the first remote
         // request), not here — a dry run must never touch the network or disk.
+        Ok(t)
+    }
+
+    /// Test-only constructor: same validation as [`SshTransport::new`], but with
+    /// an injected runner (fake seam + tiny deadlines), so the property test can
+    /// drive the deadline/kill/reap contract through the real entry points
+    /// without any real subprocess.
+    #[cfg(test)]
+    fn with_runner(
+        user: &str,
+        address: &str,
+        port: u16,
+        deploy_dir: &Path,
+        known_hosts: Option<&Path>,
+        host_key_fingerprint: Option<&str>,
+        runner: SshRunner,
+    ) -> Result<Self> {
+        let mut t = Self::new(
+            user,
+            address,
+            port,
+            deploy_dir,
+            known_hosts,
+            host_key_fingerprint,
+        )?;
+        t.runner = runner;
         Ok(t)
     }
 
@@ -241,41 +512,29 @@ impl SshTransport {
         }
 
         // Fetch the host keys using the bare address and configured port. The
-        // spawn is bounded at the process level (mirroring `exec`'s
-        // recv_timeout pattern): a dead or unresponsive host fails the pin
-        // step within `SSH_CONNECT_TIMEOUT_SECS` even if the local
-        // `ssh-keyscan` ignores its native `-T` option.
-        let child = Command::new("ssh-keyscan")
-            .args(self.keyscan_args())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| Error::transport(format!("ssh-keyscan {} spawn: {e}", self.address)))?;
-        let pid = child.id();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let res = child.wait_with_output();
-            let _ = tx.send(res);
-        });
-        let scan = match rx.recv_timeout(Duration::from_secs(SSH_CONNECT_TIMEOUT_SECS)) {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                return Err(Error::transport(format!(
-                    "ssh-keyscan {} wait: {e}",
+        // spawn runs through THE shared runner ([`SshRunner`]): the keyscan is
+        // bounded at the process level by the runner's connect deadline (the
+        // same `SSH_CONNECT_TIMEOUT_SECS` as the native `-T` option), and on
+        // deadline the child is killed and reaped — a dead or unresponsive host
+        // fails the pin step fast even if the local `ssh-keyscan` ignores its
+        // native `-T` option.
+        let mut argv = vec!["ssh-keyscan".to_string()];
+        argv.extend(self.keyscan_args());
+        let scan = self
+            .runner
+            .run(OpKind::KeyscanPin, &argv, None, None)
+            .map_err(|e| match e {
+                RunError::Spawn(m) => {
+                    Error::transport(format!("ssh-keyscan {} spawn: {m}", self.address))
+                }
+                RunError::Wait(m) => {
+                    Error::transport(format!("ssh-keyscan {} wait: {m}", self.address))
+                }
+                RunError::Timeout { after } => Error::transport(format!(
+                    "ssh-keyscan {} timed out after {after:?} (host unreachable?)",
                     self.address
-                )));
-            }
-            Err(_) => {
-                let _ = std::process::Command::new("kill")
-                    .arg("-9")
-                    .arg(pid.to_string())
-                    .status();
-                return Err(Error::transport(format!(
-                    "ssh-keyscan {} timed out after {SSH_CONNECT_TIMEOUT_SECS}s (host unreachable?)",
-                    self.address
-                )));
-            }
-        };
+                )),
+            })?;
         if !scan.status.success() {
             return Err(Error::transport(format!(
                 "ssh-keyscan {} failed: {}",
@@ -376,19 +635,16 @@ impl SshTransport {
     /// Run a single remote shell command (already fully quoted) and return its
     /// stdout/stderr/status. The command is passed as one `ssh` argument after
     /// `--`, so OpenSSH cannot interpret any part of our data as options or as
-    /// the connection target.
+    /// the connection target. Runs through the shared bounded runner: once
+    /// connected, a remote command that hangs is killed after
+    /// `SSH_COMMAND_TIMEOUT_SECS` (nothing is unbounded after connection
+    /// establishment).
     fn run_remote(&self, command: &str) -> Result<std::process::Output> {
-        let args = self.ssh_args()?;
-        let mut cmd = Command::new("ssh");
-        cmd.args(&args);
-        cmd.arg("--");
-        cmd.arg(command);
-        cmd.output()
-            .map_err(|e| Error::transport(format!("ssh {}: {e}", command)))
+        self.run_remote_op(OpKind::Remote, command)
     }
 
     fn run_remote_ok(&self, command: &str) -> Result<()> {
-        let out = self.run_remote(command)?;
+        let out = self.run_remote_op(OpKind::RemoteOk, command)?;
         if !out.status.success() {
             return Err(Error::transport(format!(
                 "ssh command failed: {}",
@@ -396,6 +652,24 @@ impl SshTransport {
             )));
         }
         Ok(())
+    }
+
+    /// Shared implementation of the single-command ssh operations: build the
+    /// `ssh <args> -- <command>` vector and run it through the runner under the
+    /// command deadline. `run_remote` and `run_remote_ok` differ only in the
+    /// recorded operation kind and in whether they check the exit status.
+    fn run_remote_op(&self, op: OpKind, command: &str) -> Result<std::process::Output> {
+        let mut argv = vec!["ssh".to_string()];
+        argv.extend(self.ssh_args()?);
+        argv.push("--".into());
+        argv.push(command.to_string());
+        self.runner.run(op, &argv, None, None).map_err(|e| match e {
+            RunError::Spawn(m) => Error::transport(format!("ssh {command}: {m}")),
+            RunError::Wait(m) => Error::transport(format!("ssh {command}: {m}")),
+            RunError::Timeout { after } => {
+                Error::transport(format!("ssh command timed out after {after:?}: {command}"))
+            }
+        })
     }
 
     /// Build a remote shell command string from an `argv`, quoting every
@@ -430,7 +704,11 @@ impl SshTransport {
             .join(" ")
     }
 
-    /// Upload raw bytes to a remote path (creating parent dirs).
+    /// Upload raw bytes to a remote path (creating parent dirs). Runs through
+    /// the shared bounded runner: the stdin payload is written as part of the
+    /// bounded wait, so an upload to a remote that stops reading (hung remote
+    /// mid-`cat`) times out after `SSH_COMMAND_TIMEOUT_SECS` instead of
+    /// blocking the push indefinitely.
     fn upload_bytes(&self, rel: &Path, data: &[u8], mode: u32) -> Result<()> {
         let remote_path = self.root.join(rel);
         let remote_path_str = remote_path.to_string_lossy().into_owned();
@@ -438,24 +716,20 @@ impl SshTransport {
             "mkdir -p $(dirname {p}) && cat > {p}",
             p = shell_quote(&remote_path_str)
         );
-        let mut cmd = Command::new("ssh");
-        cmd.args(self.ssh_args()?);
-        cmd.arg("--");
-        cmd.arg(&script);
-        cmd.stdin(Stdio::piped());
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| Error::transport(format!("ssh upload spawn: {e}")))?;
-        use std::io::Write;
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(data)
-            .map_err(|e| Error::transport(format!("ssh upload write: {e}")))?;
-        let out = child
-            .wait_with_output()
-            .map_err(|e| Error::transport(format!("ssh upload wait: {e}")))?;
+        let mut argv = vec!["ssh".to_string()];
+        argv.extend(self.ssh_args()?);
+        argv.push("--".into());
+        argv.push(script);
+        let out = self
+            .runner
+            .run(OpKind::Upload, &argv, Some(data), None)
+            .map_err(|e| match e {
+                RunError::Spawn(m) => Error::transport(format!("ssh upload spawn: {m}")),
+                RunError::Wait(m) => Error::transport(format!("ssh upload wait: {m}")),
+                RunError::Timeout { after } => {
+                    Error::transport(format!("ssh upload timed out after {after:?}"))
+                }
+            })?;
         if !out.status.success() {
             return Err(Error::transport(format!(
                 "ssh upload failed: {}",
@@ -790,44 +1064,27 @@ impl Remote for SshTransport {
         // so the program receives exactly `argv` and the remote shell cannot
         // reinterpret spaces/metacharacters inside an argument.
         let command = format!("exec {}", Self::argv_cmd(argv));
-        let args = self.ssh_args()?;
-        let mut cmd = Command::new("ssh");
-        cmd.args(&args);
-        cmd.arg("--");
-        cmd.arg(&command);
-        let child = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| Error::transport(format!("ssh spawn {:?}: {e}", argv)))?;
-        let pid = child.id();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let res = child.wait_with_output();
-            let _ = tx.send(res);
-        });
-        let out = match rx.recv_timeout(timeout) {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                return Err(Error::transport(format!("ssh wait {:?}: {e}", argv)));
-            }
-            Err(_) => {
-                let _ = std::process::Command::new("kill")
-                    .arg("-9")
-                    .arg(pid.to_string())
-                    .status();
-                return Ok(crate::remote::transport::ExecOutcome {
-                    exit_code: -1,
-                    stdout: String::new(),
-                    stderr: format!("timed out after {timeout:?}"),
-                });
-            }
-        };
-        Ok(crate::remote::transport::ExecOutcome {
-            exit_code: out.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        })
+        let mut full = vec!["ssh".to_string()];
+        full.extend(self.ssh_args()?);
+        full.push("--".into());
+        full.push(command);
+        // Runs through THE shared runner with the caller-supplied timeout: on
+        // deadline the child is killed and reaped (deterministically) before the
+        // Timeout outcome is returned, so `exec` can never hang the push either.
+        match self.runner.run(OpKind::Exec, &full, None, Some(timeout)) {
+            Ok(out) => Ok(crate::remote::transport::ExecOutcome {
+                exit_code: out.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            }),
+            Err(RunError::Spawn(m)) => Err(Error::transport(m)),
+            Err(RunError::Wait(m)) => Err(Error::transport(m)),
+            Err(RunError::Timeout { after }) => Ok(crate::remote::transport::ExecOutcome {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: format!("timed out after {after:?}"),
+            }),
+        }
     }
 
     fn filesystem_bytes(&self) -> Result<FsBytes> {
@@ -1601,5 +1858,656 @@ esac
                 );
             });
         });
+    }
+}
+
+/// Property test for the runner contract: EVERY ssh operation (run_remote,
+/// run_remote_ok, upload, keyscan-pin, exec) must go through the ONE bounded
+/// runner, and the runner must kill + deterministically reap every stalled
+/// child. The generated operations are driven through the REAL transport entry
+/// points with an INJECTED fake seam (via `SshTransport::with_runner`), so the
+/// runner's deadline logic is exercised end to end while the fake simulates
+/// the stall points at the spawn boundary and RECORDS the full
+/// spawn/kill/reap call log.
+#[cfg(test)]
+mod runner_property_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    /// The stall point each generated operation must exhibit.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Stall {
+        /// The child hangs forever (until the runner kills it at the deadline).
+        Hang,
+        /// The child exits 0 promptly.
+        Complete,
+        /// The child cannot be spawned at all.
+        SpawnError,
+        /// The child exits non-zero promptly.
+        NonZero,
+    }
+
+    /// Every operation the fake seam records, in order.
+    #[derive(Clone, Debug)]
+    enum LogEntry {
+        Spawn {
+            op: OpKind,
+            argv: Vec<String>,
+            pid: u32,
+        },
+        Kill {
+            pid: u32,
+        },
+        Reap {
+            pid: u32,
+        },
+    }
+
+    #[derive(Default)]
+    struct FakeState {
+        log: Mutex<Vec<LogEntry>>,
+        /// Number of fake wait closures still running (children not yet
+        /// reaped). Zero after an operation returns proves the runner joined
+        /// every wait thread — the thread-level half of "no zombie".
+        live_waiters: AtomicUsize,
+    }
+
+    impl FakeState {
+        fn push(&self, entry: LogEntry) {
+            self.log.lock().unwrap().push(entry);
+        }
+        fn spawn(&self) -> (OpKind, Vec<String>, u32) {
+            let log = self.log.lock().unwrap();
+            match log.iter().find_map(|e| match e {
+                LogEntry::Spawn { op, argv, pid } => Some((*op, argv.clone(), *pid)),
+                _ => None,
+            }) {
+                Some(s) => s,
+                None => panic!("no spawn recorded"),
+            }
+        }
+        fn kill_pids(&self) -> Vec<u32> {
+            self.pids(|e| matches!(e, LogEntry::Kill { .. }))
+        }
+        fn reap_pids(&self) -> Vec<u32> {
+            self.pids(|e| matches!(e, LogEntry::Reap { .. }))
+        }
+        fn pids(&self, kind: fn(&LogEntry) -> bool) -> Vec<u32> {
+            let log = self.log.lock().unwrap();
+            log.iter()
+                .filter(|e| kind(e))
+                .filter_map(|e| match e {
+                    LogEntry::Kill { pid } | LogEntry::Reap { pid } => Some(*pid),
+                    _ => None,
+                })
+                .collect()
+        }
+        /// True when the first Kill precedes the first Reap (kill-then-reap).
+        fn kill_precedes_reap(&self) -> bool {
+            let log = self.log.lock().unwrap();
+            let kpos = log.iter().position(|e| matches!(e, LogEntry::Kill { .. }));
+            let rpos = log.iter().position(|e| matches!(e, LogEntry::Reap { .. }));
+            match (kpos, rpos) {
+                (Some(k), Some(r)) => k < r,
+                _ => false,
+            }
+        }
+        fn live_waiters(&self) -> usize {
+            self.live_waiters.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Per-child control block: the fake wait polls `killed`; the runner's
+    /// deadline path calls [`FakeSeam::kill`], which sets it, so the blocked
+    /// wait unblocks and records the reap — reproducing exactly the real
+    /// child's kill-then-reap lifecycle without any subprocess.
+    struct ChildCtl {
+        pid: u32,
+        killed: AtomicBool,
+        stall: Stall,
+        /// Real host-key line the fake keyscan emits on Complete, so the pin
+        /// path succeeds end-to-end (fingerprint verified with real ssh-keygen).
+        keyscan_line: Option<String>,
+        state: Arc<FakeState>,
+    }
+
+    impl ChildCtl {
+        /// The wait closure body: finish immediately (Complete / NonZero) or
+        /// block until killed (Hang), record the reap, return the stubbed
+        /// output.
+        fn wait(&self) -> std::io::Result<std::process::Output> {
+            self.state.live_waiters.fetch_add(1, Ordering::SeqCst);
+            let res = self.wait_inner();
+            self.state.live_waiters.fetch_sub(1, Ordering::SeqCst);
+            res
+        }
+
+        fn wait_inner(&self) -> std::io::Result<std::process::Output> {
+            // Raw Unix wait status for an exit code: `code << 8` (WEXITSTATUS).
+            let exit = |code: i32| std::process::ExitStatus::from_raw(code << 8);
+            let output = |code: i32| -> std::io::Result<std::process::Output> {
+                let mut out = std::process::Output {
+                    status: exit(code),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                };
+                if let Some(line) = &self.keyscan_line {
+                    out.stdout = line.as_bytes().to_vec();
+                }
+                Ok(out)
+            };
+            match self.stall {
+                Stall::Complete => {
+                    let res = output(0);
+                    self.state.push(LogEntry::Reap { pid: self.pid });
+                    res
+                }
+                Stall::NonZero => {
+                    let res = output(1);
+                    self.state.push(LogEntry::Reap { pid: self.pid });
+                    res
+                }
+                Stall::Hang => {
+                    // Block until the runner kills us at the deadline. A bounded
+                    // backstop turns a broken runner (one that never kills) into
+                    // a loud assertion failure instead of a suite-wide hang.
+                    let budget = Instant::now() + Duration::from_secs(5);
+                    while !self.killed.load(Ordering::SeqCst) && Instant::now() < budget {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    assert!(
+                        self.killed.load(Ordering::SeqCst),
+                        "stalled child {} was never killed: the runner must kill then reap on deadline",
+                        self.pid
+                    );
+                    self.state.push(LogEntry::Reap { pid: self.pid });
+                    output(0)
+                }
+                Stall::SpawnError => unreachable!("spawn errors never yield a child"),
+            }
+        }
+    }
+
+    /// The injected fake seam: records every spawn (kind + argv), kill, and
+    /// reap, and simulates the generated stall point.
+    struct FakeSeam {
+        state: Arc<FakeState>,
+        stall: Stall,
+        next_pid: AtomicU32,
+        children: Mutex<Vec<Arc<ChildCtl>>>,
+        keyscan_line: Option<String>,
+    }
+
+    impl FakeSeam {
+        fn new(stall: Stall, keyscan_line: Option<String>) -> (Arc<Self>, Arc<FakeState>) {
+            let state = Arc::new(FakeState::default());
+            let seam = FakeSeam {
+                state: state.clone(),
+                stall,
+                next_pid: AtomicU32::new(1),
+                children: Mutex::new(Vec::new()),
+                keyscan_line,
+            };
+            (Arc::new(seam), state)
+        }
+    }
+
+    impl SshRunnerSeam for FakeSeam {
+        fn spawn(
+            &self,
+            op: OpKind,
+            argv: &[String],
+            _stdin: Option<Vec<u8>>,
+        ) -> std::io::Result<SpawnedChild> {
+            let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
+            self.state.push(LogEntry::Spawn {
+                op,
+                argv: argv.to_vec(),
+                pid,
+            });
+            if self.stall == Stall::SpawnError {
+                return Err(std::io::Error::other("simulated spawn failure"));
+            }
+            let ctl = Arc::new(ChildCtl {
+                pid,
+                killed: AtomicBool::new(false),
+                stall: self.stall,
+                keyscan_line: self.keyscan_line.clone(),
+                state: self.state.clone(),
+            });
+            self.children.lock().unwrap().push(ctl.clone());
+            let wait: Box<dyn FnOnce() -> std::io::Result<std::process::Output> + Send> =
+                Box::new(move || ctl.wait());
+            Ok(SpawnedChild { pid, wait })
+        }
+
+        fn kill(&self, pid: u32) -> std::io::Result<()> {
+            let children = self.children.lock().unwrap();
+            let ctl = children
+                .iter()
+                .find(|c| c.pid == pid)
+                .expect("kill of an unknown pid: the runner must only kill children it spawned");
+            self.state.push(LogEntry::Kill { pid });
+            ctl.killed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// The per-operation outcome, normalised so one assertion function can
+    /// check every generated kind.
+    #[derive(Debug)]
+    enum PairOutcome {
+        Ok,
+        Remote(std::process::Output),
+        Err(String),
+        Exec(std::result::Result<crate::remote::transport::ExecOutcome, Error>),
+    }
+
+    /// A real ed25519 host key (never a hardcoded fake), generated once per
+    /// test binary: the keyscan "completes" with this key line, so the pin path
+    /// verifies it with real `ssh-keygen` and succeeds end-to-end.
+    fn host_key() -> (String, String) {
+        static KEY: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+        KEY.get_or_init(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let keyfile = dir.path().join("hostkey");
+            let out = std::process::Command::new("ssh-keygen")
+                .args(["-t", "ed25519", "-N", "", "-f"])
+                .arg(&keyfile)
+                .output()
+                .expect("ssh-keygen must be available");
+            assert!(
+                out.status.success(),
+                "ssh-keygen failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let pubkey = std::fs::read_to_string(keyfile.with_extension("pub"))
+                .expect("read generated pubkey")
+                .trim()
+                .to_string();
+            let fp = std::process::Command::new("ssh-keygen")
+                .args([
+                    "-lf",
+                    keyfile.with_extension("pub").to_str().unwrap(),
+                    "-E",
+                    "sha256",
+                ])
+                .output()
+                .expect("ssh-keygen -lf must run");
+            let fingerprint = String::from_utf8_lossy(&fp.stdout)
+                .split_whitespace()
+                .nth(1)
+                .expect("fingerprint field")
+                .to_string();
+            (pubkey, fingerprint)
+        })
+        .clone()
+    }
+
+    fn transport_for(kind: OpKind, fingerprint: &str, runner: SshRunner) -> SshTransport {
+        match kind {
+            // The pin path requires a configured fingerprint (it reads
+            // `self.host_key_fingerprint`), and must never have a known_hosts
+            // file or it skips the keyscan entirely.
+            OpKind::KeyscanPin => SshTransport::with_runner(
+                "deploy",
+                "runner-prop.test",
+                2222,
+                Path::new("/srv/app"),
+                None,
+                Some(fingerprint),
+                runner,
+            )
+            .unwrap(),
+            // Every other op needs a resolvable identity to build `ssh_args`.
+            _ => SshTransport::with_runner(
+                "deploy",
+                "runner-prop.test",
+                2222,
+                Path::new("/srv/app"),
+                Some(Path::new("/dev/null")),
+                None,
+                runner,
+            )
+            .unwrap(),
+        }
+    }
+
+    /// Drive ONE generated (kind × stall) pair through the real transport entry
+    /// point with the fake runner injected, then assert the contract.
+    fn run_one_pair(kind: OpKind, stall: Stall) {
+        let deadline = Duration::from_millis(25);
+        let (pubkey, fingerprint) = host_key();
+        let (seam, state) = FakeSeam::new(stall, Some(pubkey));
+        let runner = SshRunner::with_seam(seam, deadline, deadline);
+        let t = transport_for(kind, &fingerprint, runner);
+
+        // The env-lock invariant (crate::testutil): every env-mutating test in
+        // this binary serializes on ENV_LOCK. The keyscan pin writes its cache
+        // under DEPLOY_SSH_KNOWNHOSTS_DIR; pointing it at a fresh per-pair temp
+        // dir guarantees the pin always performs the keyscan SPAWN (a reused
+        // cache file would skip the runner call entirely).
+        let _guard = crate::testutil::ENV_LOCK.lock().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let old_cache = std::env::var_os("DEPLOY_SSH_KNOWNHOSTS_DIR");
+        unsafe {
+            std::env::set_var("DEPLOY_SSH_KNOWNHOSTS_DIR", cache.path());
+        }
+        let outcome = match kind {
+            OpKind::Remote => match t.run_remote("printf ok") {
+                Ok(out) => PairOutcome::Remote(out),
+                Err(e) => PairOutcome::Err(e.to_string()),
+            },
+            OpKind::RemoteOk => match t.run_remote_ok("true") {
+                Ok(()) => PairOutcome::Ok,
+                Err(e) => PairOutcome::Err(e.to_string()),
+            },
+            OpKind::Upload => match t.upload_bytes(Path::new("files/app"), b"payload", 0) {
+                Ok(()) => PairOutcome::Ok,
+                Err(e) => PairOutcome::Err(e.to_string()),
+            },
+            OpKind::KeyscanPin => match t.pin_known_hosts() {
+                Ok(()) => PairOutcome::Ok,
+                Err(e) => PairOutcome::Err(e.to_string()),
+            },
+            OpKind::Exec => PairOutcome::Exec(t.exec(&["true".into()], deadline)),
+        };
+        match old_cache {
+            Some(v) => unsafe {
+                std::env::set_var("DEPLOY_SSH_KNOWNHOSTS_DIR", v);
+            },
+            None => unsafe {
+                std::env::remove_var("DEPLOY_SSH_KNOWNHOSTS_DIR");
+            },
+        }
+        drop(_guard);
+
+        assert_pair(kind, stall, deadline, &state, outcome);
+    }
+
+    /// The property's assertions for one pair. `state` is the fake's full call
+    /// log + live-waiter count.
+    fn assert_pair(
+        kind: OpKind,
+        stall: Stall,
+        deadline: Duration,
+        state: &FakeState,
+        outcome: PairOutcome,
+    ) {
+        let (spawn_op, spawn_argv, spawn_pid) = state.spawn();
+        assert_eq!(
+            spawn_op, kind,
+            "the recorded spawn kind must match the operation"
+        );
+        // argv[0] is the binary: `ssh-keyscan` for the pin, `ssh` for every
+        // other operation.
+        let expect_bin = if kind == OpKind::KeyscanPin {
+            "ssh-keyscan"
+        } else {
+            "ssh"
+        };
+        assert_eq!(
+            spawn_argv.first().map(String::as_str),
+            Some(expect_bin),
+            "spawn argv must start with the right binary"
+        );
+
+        match stall {
+            Stall::Hang => {
+                // Every stalled child terminates as Timeout: `exec` keeps its
+                // ExecOutcome shape (exit_code -1, stderr "timed out after …"),
+                // every other op returns a transport error.
+                match &outcome {
+                    PairOutcome::Exec(res) => {
+                        let o = res
+                            .as_ref()
+                            .expect("exec on a stalled child must return a Timeout ExecOutcome");
+                        assert_eq!(o.exit_code, -1, "timeout exec exit_code must be -1");
+                        assert_eq!(
+                            o.stderr,
+                            format!("timed out after {deadline:?}"),
+                            "timeout exec stderr must keep the existing shape"
+                        );
+                    }
+                    _ => {
+                        let msg = match &outcome {
+                            PairOutcome::Err(m) => m,
+                            _ => {
+                                panic!("stalled op must fail with a timeout error, got {outcome:?}")
+                            }
+                        };
+                        assert!(
+                            msg.contains("timed out after"),
+                            "stalled op must report the timeout, got: {msg}"
+                        );
+                    }
+                }
+                // … and is REAPED: exactly one kill, then exactly one reap, of
+                // THE SAME pid, in that order, after the spawn — no kill-vs-
+                // wait race, no zombie, no return-before-reap.
+                assert_eq!(
+                    state.kill_pids(),
+                    vec![spawn_pid],
+                    "stalled child must be killed exactly once"
+                );
+                assert_eq!(
+                    state.reap_pids(),
+                    vec![spawn_pid],
+                    "stalled child must be reaped exactly once"
+                );
+                assert!(
+                    state.kill_precedes_reap(),
+                    "kill must precede reap for a stalled child"
+                );
+            }
+            Stall::Complete => {
+                match kind {
+                    OpKind::Exec => {
+                        let o = match outcome {
+                            PairOutcome::Exec(Ok(o)) => o,
+                            _ => panic!("exec on a completed child must succeed, got {outcome:?}"),
+                        };
+                        assert_eq!(o.exit_code, 0);
+                    }
+                    OpKind::Remote => {
+                        let o = match outcome {
+                            PairOutcome::Remote(o) => o,
+                            _ => panic!(
+                                "run_remote on a completed child must succeed, got {outcome:?}"
+                            ),
+                        };
+                        assert!(o.status.success());
+                    }
+                    _ => assert!(
+                        matches!(outcome, PairOutcome::Ok),
+                        "completed child must succeed, got {outcome:?}"
+                    ),
+                }
+                assert_eq!(
+                    state.kill_pids(),
+                    Vec::<u32>::new(),
+                    "a completed child must never be killed"
+                );
+                assert_eq!(
+                    state.reap_pids(),
+                    vec![spawn_pid],
+                    "a completed child is reaped by the normal wait"
+                );
+            }
+            Stall::SpawnError => {
+                let msg = match &outcome {
+                    PairOutcome::Err(m) => m.clone(),
+                    PairOutcome::Exec(Err(e)) => e.to_string(),
+                    _ => panic!("spawn failure must surface as a transport error, got {outcome:?}"),
+                };
+                assert!(
+                    msg.contains("spawn"),
+                    "spawn failure must surface as a spawn error, got: {msg}"
+                );
+                assert_eq!(
+                    state.kill_pids(),
+                    Vec::<u32>::new(),
+                    "a failed spawn has nothing to kill"
+                );
+                assert_eq!(
+                    state.reap_pids(),
+                    Vec::<u32>::new(),
+                    "a failed spawn has nothing to reap"
+                );
+            }
+            Stall::NonZero => {
+                match kind {
+                    OpKind::Remote => {
+                        let o = match outcome {
+                            PairOutcome::Remote(o) => o,
+                            _ => panic!("run_remote returns the raw output, got {outcome:?}"),
+                        };
+                        assert!(!o.status.success(), "non-zero exit must be reported");
+                    }
+                    OpKind::Exec => {
+                        let o = match outcome {
+                            PairOutcome::Exec(Ok(o)) => o,
+                            _ => panic!("exec returns the raw outcome, got {outcome:?}"),
+                        };
+                        assert_eq!(o.exit_code, 1);
+                    }
+                    _ => {
+                        let msg = match &outcome {
+                            PairOutcome::Err(m) => m,
+                            _ => panic!("non-zero exit must surface as an error, got {outcome:?}"),
+                        };
+                        assert!(msg.contains("failed"), "got: {msg}");
+                    }
+                }
+                assert_eq!(
+                    state.kill_pids(),
+                    Vec::<u32>::new(),
+                    "a non-zero exit is a normal wait, not a kill"
+                );
+                assert_eq!(
+                    state.reap_pids(),
+                    vec![spawn_pid],
+                    "a non-zero child is reaped by the normal wait"
+                );
+            }
+        }
+
+        assert_eq!(
+            state.live_waiters(),
+            0,
+            "every wait thread must be joined (reaped) before the operation returns"
+        );
+    }
+
+    fn op_strategy() -> impl Strategy<Value = OpKind> {
+        prop_oneof![
+            Just(OpKind::Remote),
+            Just(OpKind::RemoteOk),
+            Just(OpKind::Upload),
+            Just(OpKind::KeyscanPin),
+            Just(OpKind::Exec),
+        ]
+    }
+
+    /// Real-runner sanity check: a REAL subprocess that stalls must be killed
+    /// at the deadline AND reaped — the pid must be gone afterwards, because an
+    /// un-reaped zombie would still answer `kill(pid, 0)` with success.
+    #[test]
+    fn real_runner_kills_and_reaps_a_stalled_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("child.pid");
+        // The child records its own pid to a file, then execs `sleep` (so the
+        // recorded pid IS the process the runner must kill and reap).
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("echo $$ > {}; exec sleep 30", pidfile.display()),
+        ];
+        let runner = SshRunner::new();
+        let deadline = Duration::from_millis(100);
+        let start = Instant::now();
+        let res = runner.run(OpKind::Exec, &argv, None, Some(deadline));
+        assert!(matches!(res, Err(RunError::Timeout { after }) if after == deadline));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a stalled child must be killed at the deadline, not after it"
+        );
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("child must have recorded its pid before stalling")
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: `kill(pid, 0)` only probes existence; it sends no signal.
+        let still_exists = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(
+            !still_exists,
+            "child {pid} must be reaped (a zombie would still exist)"
+        );
+    }
+
+    /// Real-runner sanity check: a promptly-completing child returns its output
+    /// (no kill, no timeout), and a spawn failure surfaces as a spawn error.
+    #[test]
+    fn real_runner_completes_and_surfaces_spawn_errors() {
+        let runner = SshRunner::new();
+        let out = runner
+            .run(
+                OpKind::Exec,
+                &["true".to_string()],
+                None,
+                Some(Duration::from_secs(5)),
+            )
+            .expect("a completing child must succeed");
+        assert!(out.status.success());
+        let err = runner
+            .run(
+                OpKind::Exec,
+                &["/definitely/not/a/real/binary".to_string()],
+                None,
+                Some(Duration::from_secs(5)),
+            )
+            .expect_err("a missing binary must fail at spawn");
+        assert!(matches!(err, RunError::Spawn(_)));
+    }
+
+    fn stall_strategy() -> impl Strategy<Value = Stall> {
+        prop_oneof![
+            Just(Stall::Hang),
+            Just(Stall::Complete),
+            Just(Stall::SpawnError),
+            Just(Stall::NonZero),
+        ]
+    }
+
+    proptest! {
+        // The runner contract property: every generated (operation kind × stall
+        // point) pair must honor the ONE-runner deadline/kill/reap semantics —
+        // stalled children terminate as Timeout AND are reaped (exactly one
+        // kill, then exactly one reap, kill before reap), completed/non-zero
+        // children are never killed, and spawn failures surface as transport
+        // errors with nothing to kill or reap. FIXED SEED 0x5EED_5EED (repo
+        // style) + bounded cases keep the suite deterministic and fast: the fake
+        // blocks only until the tiny injected deadline, so no case ever sleeps
+        // more than ~25ms.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn every_ssh_operation_is_deadline_killed_and_reaped(
+            pairs in prop::collection::vec((op_strategy(), stall_strategy()), 2..=6)
+        ) {
+            for (kind, stall) in pairs {
+                run_one_pair(kind, stall);
+            }
+        }
     }
 }
