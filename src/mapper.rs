@@ -10,12 +10,19 @@
 //! * Mappings are applied in declaration order.
 //! * Recursive directory mappings merge; their conflict policy applies to
 //!   colliding descendant entries rather than deleting unrelated entries.
+//! * Symlinks are fail-closed. A relative target means what it means where the
+//!   link LIVES, so the target is validated from the DESTINATION parent
+//!   (`dst.parent().join(target)`) and must resolve beneath the staging root.
+//!   And no destination operation may pass through a symlink: every component
+//!   of a destination is walked with no-follow `symlink_metadata` semantics
+//!   before any write, so a symlink ancestor refuses the whole mapping instead
+//!   of redirecting writes to its target.
 
 use crate::config::{ConflictPolicy, Mapping, resolved_mode};
 use crate::error::{Error, Result};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
 
@@ -118,47 +125,71 @@ fn create_parent_dirs(src: &Path, dst: &Path, src_root: Option<&Path>) -> Result
     Ok(())
 }
 
+/// Settings for a single [`copy_entry`]: the mapping mode override, the source
+/// root whose modes the mirrored intermediate directories inherit, and the
+/// destination root the copy must stay inside.
+struct CopyEntryOptions<'a> {
+    mode_override: Option<u32>,
+    src_root: Option<&'a Path>,
+    dest_root: &'a Path,
+}
+
 /// Copy a single source entry (file or symlink) to a destination, applying the
 /// mapping mode override. When the override is `None` the source's own mode is
 /// preserved (instead of defaulting to 0755). Intermediate directories created
 /// along the way get canonical, umask-independent modes (see
 /// [`create_parent_dirs`]); the final entry itself is always set explicitly.
-fn copy_entry(
-    src: &Path,
-    dst: &Path,
-    mode_override: Option<u32>,
-    src_root: Option<&Path>,
-) -> Result<()> {
+///
+/// The destination is fail-closed against symlinks: any symlink component of
+/// the destination path refuses the copy before any write (a write would
+/// resolve to the link's target instead of the intended staging location), and
+/// a relative symlink target must resolve beneath `opts.dest_root` from `dst`'s
+/// own parent directory.
+fn copy_entry(src: &Path, dst: &Path, opts: &CopyEntryOptions<'_>) -> Result<()> {
     let ft = std::fs::symlink_metadata(src)
         .map_err(|e| Error::materialization(format!("stat {}: {e}", src.display())))?;
+    // Refuse BEFORE any write: a symlink component would redirect every
+    // subsequent mkdir/remove_file/copy/symlink/set_mode to its target.
+    ensure_no_symlink_ancestor(opts.dest_root, dst)?;
     if ft.is_dir() {
-        create_parent_dirs(src, dst, src_root)?;
-        if dst.exists() {
-            if !dst.is_dir() {
+        create_parent_dirs(src, dst, opts.src_root)?;
+        match std::fs::symlink_metadata(dst) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => {
                 return Err(Error::materialization(format!(
                     "mkdir {}: destination exists and is not a directory",
                     dst.display()
                 )));
             }
-        } else {
-            std::fs::create_dir(dst)
-                .map_err(|e| Error::materialization(format!("mkdir {}: {e}", dst.display())))?;
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(dst)
+                    .map_err(|e| Error::materialization(format!("mkdir {}: {e}", dst.display())))?;
+            }
+            Err(e) => {
+                return Err(Error::materialization(format!(
+                    "lstat {}: {e}",
+                    dst.display()
+                )));
+            }
         }
-        let final_mode = mode_override.unwrap_or_else(|| ft.mode() & 0o7777);
+        let final_mode = opts.mode_override.unwrap_or_else(|| ft.mode() & 0o7777);
         set_mode(dst, Some(final_mode))?;
         return Ok(());
     }
     if ft.is_symlink() {
         let target = std::fs::read_link(src)
             .map_err(|e| Error::materialization(format!("readlink {}: {e}", src.display())))?;
-        // Reject escaping symlinks relative to the project root at copy time.
         if target.is_absolute() {
             return Err(Error::mapping(format!(
                 "absolute symlink {} is not allowed",
                 src.display()
             )));
         }
-        create_parent_dirs(src, dst, src_root)?;
+        // A relative target resolves against the DESTINATION parent — the
+        // relocation into staging changes what it means — so reject any target
+        // whose resolved destination location escapes the staging root.
+        ensure_symlink_target_within(opts.dest_root, dst, &target)?;
+        create_parent_dirs(src, dst, opts.src_root)?;
         // remove existing dst if present (replace policy handled by caller)
         let _ = std::fs::remove_file(dst);
         std::os::unix::fs::symlink(&target, dst).map_err(|e| {
@@ -172,8 +203,8 @@ fn copy_entry(
     }
     // Regular file: preserve the source mode unless an override is given.
     let source_mode = ft.mode() & 0o7777;
-    let final_mode = mode_override.unwrap_or(source_mode);
-    create_parent_dirs(src, dst, src_root)?;
+    let final_mode = opts.mode_override.unwrap_or(source_mode);
+    create_parent_dirs(src, dst, opts.src_root)?;
     let _ = std::fs::remove_file(dst);
     std::fs::copy(src, dst).map_err(|e| {
         Error::materialization(format!("copy {} -> {}: {e}", src.display(), dst.display()))
@@ -182,17 +213,134 @@ fn copy_entry(
     Ok(())
 }
 
+/// Lexically resolve `rel` against `base`, collapsing `.` and `..` without
+/// touching the filesystem (no symlink following). Returns `None` when `rel` is
+/// absolute or its `..` climbs above `base` entirely.
+fn resolve_lexically(base: &Path, rel: &Path) -> Option<PathBuf> {
+    let mut out = base.to_path_buf();
+    for comp in rel.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => return None,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(c) => out.push(c),
+        }
+    }
+    Some(out)
+}
+
+/// Refuse to touch `dst` when ANY component of it (walked from the destination
+/// root with no-follow `symlink_metadata`) is a symlink. A destination whose
+/// path passes through a symlink would redirect the write to the link's target
+/// instead of the intended staging location, so a symlink component — the
+/// final one included, which a replace would otherwise write through — refuses
+/// the operation. Real directories are unaffected, so recursive merges keep
+/// their semantics.
+fn ensure_no_symlink_ancestor(dest_root: &Path, dst: &Path) -> Result<()> {
+    let rel = dst.strip_prefix(dest_root).map_err(|_| {
+        Error::mapping(format!(
+            "destination '{}' escapes staging root '{}'",
+            dst.display(),
+            dest_root.display()
+        ))
+    })?;
+    let mut cur = dest_root.to_path_buf();
+    for comp in rel.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(Error::mapping(format!(
+                    "destination '{}' is not beneath staging root '{}'",
+                    dst.display(),
+                    dest_root.display()
+                )));
+            }
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                cur.pop();
+                continue;
+            }
+            Component::Normal(name) => cur.push(name),
+        }
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(Error::mapping(format!(
+                    "destination '{}' descends through symlink '{}'",
+                    dst.display(),
+                    cur.display()
+                )));
+            }
+            Ok(_) => {}
+            // A missing component cannot have anything below it, so the rest
+            // of the destination is safe by construction.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => {
+                return Err(Error::materialization(format!(
+                    "lstat {}: {e}",
+                    cur.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject a symlink whose relative `target` resolves OUTSIDE the destination
+/// root when copied to `dst`: resolve the target against the DESTINATION
+/// parent (`dst.parent().join(target)`) — relocation into staging changes what
+/// a relative target means, so the source-side absolute check alone does not
+/// protect destination operations.
+fn ensure_symlink_target_within(dest_root: &Path, dst: &Path, target: &Path) -> Result<()> {
+    let base = dst.parent().unwrap_or(dest_root);
+    let resolved = resolve_lexically(base, target).ok_or_else(|| {
+        Error::mapping(format!(
+            "symlink '{}' target '{}' resolves above its destination parent '{}'",
+            dst.display(),
+            target.display(),
+            base.display()
+        ))
+    })?;
+    if !resolved.starts_with(dest_root) {
+        return Err(Error::mapping(format!(
+            "symlink '{}' target '{}' escapes staging root: {}",
+            dst.display(),
+            target.display(),
+            resolved.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Defensively verify that a computed destination stays beneath the staging
-/// root, rejecting any path that escapes it.
-fn ensure_within_dest(dest_root: &Path, dst: &Path) -> Result<()> {
-    dst.strip_prefix(dest_root).map_err(|_| {
+/// root. `..` is resolved LEXICALLY (no filesystem access, no canonicalize,
+/// which would FOLLOW symlinks), so the destination cannot climb above the
+/// staging root; the resolved path is returned for the caller to write into.
+fn ensure_within_dest(dest_root: &Path, dst: &Path) -> Result<PathBuf> {
+    let rel = dst.strip_prefix(dest_root).map_err(|_| {
         Error::mapping(format!(
             "computed destination '{}' escapes staging root '{}'",
             dst.display(),
             dest_root.display()
         ))
     })?;
-    Ok(())
+    let resolved = resolve_lexically(dest_root, rel).ok_or_else(|| {
+        Error::mapping(format!(
+            "computed destination '{}' climbs above staging root '{}'",
+            dst.display(),
+            dest_root.display()
+        ))
+    })?;
+    if !resolved.starts_with(dest_root) {
+        return Err(Error::mapping(format!(
+            "computed destination '{}' escapes staging root '{}'",
+            dst.display(),
+            dest_root.display()
+        )));
+    }
+    Ok(resolved)
 }
 
 /// Apply all mappings for `variant` to assemble a complete staging tree at
@@ -237,8 +385,10 @@ pub fn materialize_variant(
         if src_meta.is_dir() && m.recursive {
             // Merge directory contents into `to`.
             let to_rel = Path::new(&m.to);
-            let base = dest.join(to_rel);
-            ensure_within_dest(dest, &base)?;
+            let base = ensure_within_dest(dest, &dest.join(to_rel))?;
+            // The merge writes INTO `base`, so its own component chain must be
+            // symlink-free; every nested entry re-checks through `copy_entry`.
+            ensure_no_symlink_ancestor(dest, &base)?;
             // Preserve the source directory's mode on the merge base.
             let base_mode = src_meta.mode() & 0o7777;
             for entry in WalkDir::new(&src).min_depth(1).into_iter() {
@@ -247,8 +397,7 @@ pub fn materialize_variant(
                     .path()
                     .strip_prefix(&src)
                     .map_err(|e| Error::mapping(format!("{e}")))?;
-                let dst = base.join(rel);
-                ensure_within_dest(dest, &dst)?;
+                let dst = ensure_within_dest(dest, &base.join(rel))?;
                 if dst.exists() {
                     match m.conflict {
                         ConflictPolicy::Error => {
@@ -261,7 +410,15 @@ pub fn materialize_variant(
                         ConflictPolicy::Replace => {}
                     }
                 }
-                copy_entry(entry.path(), &dst, mode_override, Some(&src))?;
+                copy_entry(
+                    entry.path(),
+                    &dst,
+                    &CopyEntryOptions {
+                        mode_override,
+                        src_root: Some(&src),
+                        dest_root: dest,
+                    },
+                )?;
             }
             set_mode(&base, Some(base_mode)).ok();
         } else {
@@ -272,7 +429,7 @@ pub fn materialize_variant(
                 src_meta.is_dir() && !m.recursive,
                 Path::new(&from),
             );
-            ensure_within_dest(dest, &dst)?;
+            let dst = ensure_within_dest(dest, &dst)?;
             if dst.exists() {
                 match m.conflict {
                     ConflictPolicy::Error => {
@@ -285,11 +442,20 @@ pub fn materialize_variant(
                     ConflictPolicy::Replace => {}
                 }
             }
-            // A copied directory mirrors its own source path below `to`, so its
-            // intermediate parents inherit the source directories' modes; a
-            // single file's parents are fresh staging scaffolding (None).
+            // A copied directory's intermediate parents inherit the source
+            // directories' modes; a single file's parents are fresh staging
+            // scaffolding (None). `copy_entry` itself refuses any destination
+            // whose path passes through a symlink.
             let src_root = src_meta.is_dir().then_some(root);
-            copy_entry(&src, &dst, mode_override, src_root)?;
+            copy_entry(
+                &src,
+                &dst,
+                &CopyEntryOptions {
+                    mode_override,
+                    src_root,
+                    dest_root: dest,
+                },
+            )?;
         }
     }
     Ok(())
@@ -829,6 +995,222 @@ mod tests {
         #[test]
         fn mapping_shapes_deterministic_fixed_seed_regression(case in mapper_case_strategy()) {
             run_mapper_case_property(&case);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Property: relocated symlinks never write outside staging (fail-closed)
+    // -----------------------------------------------------------------------
+
+    /// A generated symlink-escape scenario: the symlinked tree is copied into
+    /// a RELOCATED destination (so its relative targets resolve differently),
+    /// and a LATER mapping descends through the relocated symlink. The mapper
+    /// must either refuse (destination-parent validation of the target, or the
+    /// no-follow ancestor walk) or complete WITHOUT writing through a symlink
+    /// — the outside-staging canary is the oracle either way.
+    #[derive(Clone, Debug)]
+    struct SymlinkEscapeCase {
+        /// Nested real-directory depth between the relocated tree's root and
+        /// the final symlink `ln`, so its relative target sits at a depth.
+        depth: usize,
+        /// Destination the symlinked tree is relocated to.
+        reloc: String,
+        /// Number of `..` hops in an in-staging target (0 = no hops).
+        hops: usize,
+        /// Whether the target must escape to the canary (outside staging).
+        escape: bool,
+        /// File name the nested mapping writes through the relocated link.
+        nested_name: String,
+        nested_policy: ConflictPolicy,
+    }
+
+    fn symlink_escape_case_strategy() -> impl Strategy<Value = SymlinkEscapeCase> {
+        let depth = 0usize..=2;
+        let reloc = prop_oneof![
+            2 => Just("reloc/".to_string()),
+            1 => Just("deep/nested/".to_string()),
+        ];
+        let hops = 0usize..=2;
+        let escape = prop::bool::ANY;
+        let nested_name = prop_oneof![
+            1 => Just("can.txt".to_string()),
+            1 => Just("esc.txt".to_string()),
+            1 => Just("canary.txt".to_string()),
+        ];
+        let nested_policy = conflict_strategy();
+        (depth, reloc, hops, escape, nested_name, nested_policy).prop_map(
+            |(depth, reloc, hops, escape, nested_name, nested_policy)| SymlinkEscapeCase {
+                depth,
+                reloc,
+                hops,
+                escape,
+                nested_name,
+                nested_policy,
+            },
+        )
+    }
+
+    /// Build the source tree: under `sym/`, `depth` nested real directories
+    /// each carrying a relative symlink `s{i} -> d{i}` (relative targets at
+    /// various depths), a final symlink `ln` with the generated target at the
+    /// deepest level, plus `payload/p.txt` for the nested mapping to write.
+    fn build_symlink_source(root: &Path, depth: usize, target: &str) {
+        let mut cur = root.join("sym");
+        std::fs::create_dir_all(&cur).unwrap();
+        for i in 0..depth {
+            std::os::unix::fs::symlink(format!("d{i}"), cur.join(format!("s{i}"))).unwrap();
+            cur = cur.join(format!("d{i}"));
+            std::fs::create_dir_all(&cur).unwrap();
+        }
+        std::os::unix::fs::symlink(target, cur.join("ln")).unwrap();
+        let payload = root.join("payload");
+        std::fs::create_dir_all(&payload).unwrap();
+        std::fs::write(payload.join("payload.txt"), b"payload").unwrap();
+    }
+
+    fn run_symlink_escape_property(case: &SymlinkEscapeCase) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+
+        // The number of components between the staging root and the symlink's
+        // destination parent decides how many `..` hops the relative target
+        // needs to escape: the very same target resolves DIFFERENTLY per
+        // relocation/depth combination.
+        let reloc_comps = Path::new(&case.reloc).components().count();
+        let below = reloc_comps + case.depth;
+        let target = if case.escape {
+            // Resolves EXACTLY onto the canary directory (the staging root's
+            // parent), so an escaping copy or write-through hits it.
+            format!("{}{}", "../".repeat(below + 1), "canary/")
+        } else {
+            // Stays inside staging: capped hops keep the resolution at or
+            // below the staging root for every relocation/depth combination.
+            format!("{}{}", "../".repeat(case.hops.min(below)), "payload/")
+        };
+        build_symlink_source(&root, case.depth, &target);
+
+        // Outside-staging canary, unique per case via the fresh tempdir so
+        // parallel cases can never collide.
+        let staging = dir.path().join("staging");
+        let canary_dir = dir.path().join("canary");
+        std::fs::create_dir_all(&canary_dir).unwrap();
+        let canary = canary_dir.join("canary.txt");
+        std::fs::write(&canary, b"SENTINEL-CANARY").unwrap();
+
+        // The relocated link lives at `reloc/d0/.../d{depth-1}/ln`; the nested
+        // mapping descends through it.
+        let mut link_rel = PathBuf::new();
+        for i in 0..case.depth {
+            link_rel.push(format!("d{i}"));
+        }
+        link_rel.push("ln");
+        let nested_to = format!("{}{}/{}", case.reloc, link_rel.display(), case.nested_name);
+        let mappings = vec![
+            Mapping {
+                from: "sym/".into(),
+                to: case.reloc.clone(),
+                recursive: true,
+                conflict: ConflictPolicy::Replace,
+                mode: None,
+                optional: false,
+            },
+            Mapping {
+                from: "payload/payload.txt".into(),
+                to: nested_to,
+                recursive: false,
+                conflict: case.nested_policy.clone(),
+                mode: None,
+                optional: false,
+            },
+        ];
+        let res = materialize_variant(
+            &root,
+            &mappings,
+            &crate::template::TemplateVars::mapping("app", "v1", "standard"),
+            &staging,
+        );
+
+        // Oracle: the canary must be byte-identical after EVERY materialization
+        // (a write through the relocated symlink would land here), and nothing
+        // else may appear in the canary directory.
+        assert_eq!(
+            std::fs::read(&canary).unwrap(),
+            b"SENTINEL-CANARY",
+            "outside-staging canary was written: depth {} reloc {} target {}",
+            case.depth,
+            case.reloc,
+            target
+        );
+        let leaked: Vec<String> = std::fs::read_dir(&canary_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "canary.txt")
+            .collect();
+        assert!(leaked.is_empty(), "canary dir leaked entries: {leaked:?}");
+
+        match res {
+            Ok(()) => {
+                // Accepted staging must be canonical: no escaping or absolute
+                // symlink survives and every entry sits inside the staging root
+                // (no writes outside the intended destinations).
+                crate::tree::canonicalize_tree(&staging)
+                    .expect("an accepted mapping must canonicalize");
+                // The nested mapping may not have been resolved through the
+                // link: the write would have landed at the target's RESOLVED
+                // location instead of the lexical destination.
+                let link_dir = staging
+                    .join(&case.reloc)
+                    .join(link_rel.parent().unwrap_or(Path::new("")));
+                let resolved = resolve_lexically(&link_dir, Path::new(&target))
+                    .expect("in-staging target resolves");
+                if resolved.starts_with(&staging) {
+                    let through = resolved.join(&case.nested_name);
+                    assert!(
+                        !through.exists(),
+                        "nested mapping leaked through the relocated symlink to {}",
+                        through.display()
+                    );
+                }
+            }
+            Err(_) => {
+                // Fail-closed refusal is the expected outcome for an escaping
+                // target (destination-parent validation) or for a write through
+                // the relocated symlink (no-follow ancestor walk).
+            }
+        }
+    }
+
+    proptest! {
+        // Property: MAIN RANDOMIZED RUN with FAILURE PERSISTENCE (house
+        // style) — a failing vector is written to `proptest-regressions/
+        // mapper.txt` and replayed until fixed. Bounded count keeps it fast.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            failure_persistence: Some(Box::new(FileFailurePersistence::default())),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn symlink_relocation_never_escapes_staging(case in symlink_escape_case_strategy()) {
+            run_symlink_escape_property(&case);
+        }
+    }
+
+    proptest! {
+        // FIXED-SEED REGRESSION for the symlink property: identical vectors on
+        // every run, so CI always exercises the fail-closed symlink paths even
+        // with no persisted failure.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn symlink_relocation_fixed_seed_regression(case in symlink_escape_case_strategy()) {
+            run_symlink_escape_property(&case);
         }
     }
 }

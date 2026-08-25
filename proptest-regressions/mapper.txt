@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 63f6c3c5c2b23078ac81743cf483954b3acb1d4e799e4844965568b06b90cb04 # shrinks to case = SymlinkEscapeCase { depth: 0, reloc: "reloc/", hops: 0, escape: true, nested_name: "can.txt", nested_policy: Error }
