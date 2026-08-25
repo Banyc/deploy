@@ -200,6 +200,17 @@ deploy push production s3   # the checkpoint snapshot stays the oldest rollback
 - Repeating the same checkpoint is idempotent (a no-op); advancing it to a
   LATER deployment updates the floor; a checkpoint can NEVER move backward —
   an earlier deployment than the current floor is refused.
+- Advancing the floor is TRANSACTIONAL: the current floor is moved aside to
+  a durable, transaction-tagged backup
+  (`targets/<target>/refs/history-floor.json.prev.<target-id>`), and any
+  failure before the replacement's commit point restores the previous floor
+  (rename back + parent fsync) — a failed advance can never erase the
+  previously durable floor. If the restore itself ALSO fails (a torn
+  advance: the marker absent, the validated backup still holding the
+  previous floor), every read returns the backup's floor — never "no
+  floor" — and the NEXT checkpoint repairs the torn state AUTOMATICALLY by
+  restoring the validated backup (rename + parent fsync): recovery
+  restores, never deletes, the only valid floor.
 - Only `deployments/<id>/` directories strictly before the floor are
   deleted: release records, tree objects, remote generations, and pinned
   artifacts are never touched, and checkpointing one target never changes

@@ -70,8 +70,17 @@
 //! tagged backup back over the marker name + parent-dir fsync
 //! ([`LocalStore::recover_history_floor_backup`]): the backup is the ONLY
 //! valid floor in a torn state and is NEVER deleted (deleting it would
-//! erase the floor and re-expose discarded history). Every subsequent
-//! ADVANCE reconciles leftover backups automatically before it starts.
+//! erase the floor and re-expose discarded history). The NEXT CHECKPOINT
+//! repairs the torn state AUTOMATICALLY: `checkpoint_inner` restores the
+//! validated backup (rename + parent-dir fsync) at its entry, before it
+//! plans or writes anything, so a torn advance self-heals through the
+//! PRODUCTION path (a re-checkpoint of A first restores the marker, then
+//! proceeds through the idempotency branch; an advance to B first restores
+//! the marker, then advances normally). Every advance's pre-start
+//! reconciliation composes with that: it removes leftover backups ONLY
+//! when the floor marker EXISTS — a marker ABSENT alongside a VALIDATED
+//! backup is the torn state (the backup is the ONLY valid floor) and is
+//! RESTORED, never deleted.
 //!
 //! EVERY failure AFTER the marker write — enumerating the discards or any
 //! compaction phase, on the fresh path or the idempotency-repair path — is
@@ -282,6 +291,24 @@ fn checkpoint_inner(
     target: &str,
     deployment_id: &DeploymentId,
 ) -> Result<CheckpointReport> {
+    // PRODUCTION AUTO-REPAIR of a torn floor advance: when a previous
+    // advance A→B failed AND its restore of A also failed, the marker may
+    // be ABSENT while the durable, TRANSACTION-TAGGED backup
+    // (`history-floor.json.prev.<B-id>`) still holds A — the ONLY valid
+    // floor. The readers already return A via the validated-backup
+    // fallback (never "no floor"); THIS call repairs the torn state
+    // BEFORE anything else runs: the validated backup is RESTORED as the
+    // marker (rename + parent-dir fsync — the SAME atomic restore a failed
+    // advance performs; never a delete). A no-op when the marker exists or
+    // nothing is left over; FAILS CLOSED (Err) when the marker is absent
+    // but leftovers exist and none validates — an unvalidatable backup is
+    // never restored, never deleted, and never silently ignored. After the
+    // repair the checkpoint proceeds normally: a re-checkpoint of the
+    // original floor A hits the idempotency branch (and may finish a
+    // pending cleanup); an advance to B is a clean transactional advance
+    // from the durable marker A.
+    store.recover_history_floor_backup(target)?;
+
     let floor = plan_floor(store, target, deployment_id)?;
 
     // Idempotency: re-checkpointing the SAME deployment id is a no-op when
@@ -3563,6 +3590,212 @@ mod tests {
             a_cleanup_interrupted in any::<bool>(),
         ) {
             run_recovery_case(&history, a_at, a_cleanup_interrupted);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // PRODUCTION AUTO-REPAIR OF A TORN ADVANCE (the property test)
+    // ---------------------------------------------------------------------
+
+    /// One production-repair case (the property's body): establish floor A
+    /// (clean OR with an INTERRUPTED cleanup — the debt marker + leftover
+    /// below-A dirs, replaying the commit-point test's seeding), DOUBLE-
+    /// FAULT the advance A→B (B's parent-sync commit-point fault AND the
+    /// restore fault — the same arming the transactional-advance property
+    /// uses), assert EVERY torn read sees floor A — `read_history_floor`
+    /// (never None, never B), the visible suffix EXACTLY unchanged, and
+    /// every below-A ref rejected via `resolve_ref_expr` — then run THE
+    /// PRODUCTION REPAIR: the NEXT CHECKPOINT invocation (a re-checkpoint
+    /// of A through the checkpoint flow itself, `run_checkpoint` — never
+    /// the test-only recovery call) restores the validated backup as the
+    /// marker (rename + parent fsync) at its entry, then proceeds through
+    /// the idempotency branch. After the repair every read STILL sees
+    /// floor A (never None, never B), the visible suffix is EXACTLY
+    /// unchanged, every below-A ref stays refused, and the tagged backup
+    /// is consumed. The control: a fault-free advance to B SUCCEEDS from
+    /// the repaired fixture — the advance moves on cleanly.
+    fn run_production_repair_case(history_in: &[bool], a_at: usize, a_cleanup_interrupted: bool) {
+        let fx = seed_floor_a(history_in, a_at, a_cleanup_interrupted);
+        let store = &fx.store;
+        let a_id = fx.a_id.as_str();
+        let a_index = fx.a_index;
+        let b_id = fx.b_id.as_str();
+        let pre = &fx.pre;
+
+        // ---- DOUBLE FAULT: A → B fails at B's durability commit point
+        // AND the restore of A also fails (arm B's parent-sync fault AND
+        // the RestoreFloor fault, keyed by B's deployment id — the
+        // transactional-advance fixtures' arming): the marker is left
+        // ABSENT while the durable tagged backup `.prev.<b_id>` holds A.
+        store.fault_registry().arm_sync_floor_parent(b_id);
+        store.fault_registry().arm_restore_floor(b_id);
+        let err = run_checkpoint(store, TARGET, &DeploymentId::new(b_id.to_string()), false)
+            .expect_err("the double fault must fail the advance before B commits");
+        assert!(
+            err.to_string().contains("test fault"),
+            "the fault is the failure cause, got: {err}"
+        );
+
+        // ---- TORN STATE, BEFORE the repair: every read sees floor A ----
+        assert!(
+            !store.history_floor_path(TARGET).exists(),
+            "the double fault leaves the marker absent"
+        );
+        assert!(
+            store
+                .refs_dir(TARGET)
+                .join(format!("history-floor.json.prev.{b_id}"))
+                .exists(),
+            "the double fault leaves the durable backup holding A"
+        );
+        let torn = store.read_history_floor(TARGET).unwrap();
+        let f = torn
+            .as_ref()
+            .expect("the torn state reads floor A through the validated backup — never None");
+        assert_eq!(
+            f.deployment_id.as_str(),
+            a_id,
+            "the torn read returns the ORIGINAL floor A (same deployment_id)"
+        );
+        assert_eq!(
+            f.snapshot_index, a_index,
+            "the torn read returns the ORIGINAL floor A (same snapshot_index)"
+        );
+        let torn_post = capture_visible(store, TARGET, &torn);
+        assert_eq!(
+            torn_post.snapshots, pre.snapshots,
+            "the torn read exposes exactly the pre-advance snapshot suffix"
+        );
+        assert_eq!(
+            torn_post.attempts, pre.attempts,
+            "the torn read exposes exactly the pre-advance attempts suffix"
+        );
+        assert_eq!(
+            torn_post.below_floor_ref_err, pre.below_floor_ref_err,
+            "the same below-A refs stay refused during the torn state"
+        );
+        for n in 0..a_index {
+            let expr = history::parse_ref_expr(&format!("s{n}")).unwrap();
+            let e = history::resolve_ref_expr(&expr, TARGET, store).unwrap_err();
+            assert!(
+                e.to_string().contains("floor"),
+                "the below-A ref s{n} stays rejected during the torn state, got: {e}"
+            );
+        }
+
+        // ---- THE PRODUCTION REPAIR: the next CHECKPOINT invocation ----
+        // Re-checkpointing A runs the FULL checkpoint flow (locks + the
+        // checkpoint entry — the PRODUCTION path, never the test-only
+        // recovery fn). The entry FIRST restores the validated backup as
+        // the marker (rename + parent-dir fsync), THEN the idempotency
+        // branch sees the restored floor A and finishes (a pending cleanup
+        // converges; a clean A is a pure no-op). No repair transition
+        // produced None: the torn read saw A, the post-repair read sees A.
+        let rep_a = run_checkpoint(store, TARGET, &DeploymentId::new(a_id.to_string()), false)
+            .expect("the next checkpoint repairs the torn state and succeeds");
+        assert!(
+            store.history_floor_path(TARGET).exists(),
+            "the checkpoint entry restored the validated backup as the marker"
+        );
+        assert!(
+            floor_backup_leftovers(store).is_empty(),
+            "the production repair consumed the tagged backup: no stale .prev.<b_id> remains"
+        );
+        let repaired = store.read_history_floor(TARGET).unwrap();
+        let f = repaired
+            .as_ref()
+            .expect("post-repair the floor is A — never None");
+        assert_eq!(
+            f.deployment_id.as_str(),
+            a_id,
+            "the production repair restored the ORIGINAL floor A (same deployment_id)"
+        );
+        assert_eq!(
+            f.snapshot_index, a_index,
+            "the production repair restored the ORIGINAL floor A (same snapshot_index)"
+        );
+        let repaired_post = capture_visible(store, TARGET, &repaired);
+        assert_eq!(
+            repaired_post.snapshots, pre.snapshots,
+            "visible history is EXACTLY unchanged after the production repair"
+        );
+        assert_eq!(
+            repaired_post.attempts, pre.attempts,
+            "the visible attempts suffix is EXACTLY unchanged after the production repair"
+        );
+        assert_eq!(
+            repaired_post.below_floor_ref_err, pre.below_floor_ref_err,
+            "every below-A ref stays rejected after the production repair"
+        );
+        for n in 0..a_index {
+            let expr = history::parse_ref_expr(&format!("s{n}")).unwrap();
+            let e = history::resolve_ref_expr(&expr, TARGET, store).unwrap_err();
+            assert!(
+                e.to_string().contains("floor"),
+                "the below-A ref s{n} stays rejected after the production repair, got: {e}"
+            );
+        }
+        // The repair may also converge A's interrupted cleanup (the
+        // idempotency branch runs the post-commit maintenance): the debt
+        // clears and the report carries no warning.
+        if a_cleanup_interrupted && fx.a_attempt_pos > 0 {
+            assert!(
+                !rep_a.cleanup_pending,
+                "the repair converges A's interrupted cleanup"
+            );
+            assert!(
+                store.read_cleanup_pending(TARGET, None).unwrap().is_none(),
+                "the debt marker clears once the repair converges A's cleanup"
+            );
+        }
+        assert!(
+            torn.is_some() && repaired.is_some(),
+            "no repair transition produced None: the torn read AND the post-repair read both see floor A"
+        );
+
+        // ---- THE ADVANCE MOVES ON CLEANLY: a fault-free checkpoint of B
+        // SUCCEEDS from the repaired fixture (floor A is the durable marker
+        // again; the advance commits B).
+        let rep_b = run_checkpoint(store, TARGET, &DeploymentId::new(b_id.to_string()), false)
+            .expect("a fault-free advancement to B succeeds after the production repair");
+        assert!(rep_b.established, "the advancement to B establishes B");
+        let floor_b = store.read_history_floor(TARGET).unwrap().unwrap();
+        assert_eq!(floor_b.deployment_id.as_str(), b_id);
+        assert_eq!(floor_b.snapshot_index, fx.b_index);
+        assert!(
+            floor_backup_leftovers(store).is_empty(),
+            "a committed advance leaves no backup behind"
+        );
+    }
+
+    proptest! {
+        // THE PROPERTY (the user's requirement): through the PRODUCTION
+        // path — the checkpoint flow itself, never the test-only recovery
+        // call — a DOUBLE-FAULTED advance A → B (B's commit-point
+        // parent-sync fault + the restore fault) leaves a TORN state whose
+        // every transition (reads of read_history_floor, the visible
+        // suffix, and ref resolution BEFORE repair, during, and after)
+        // retains floor A — never None, never B — with every below-A ref
+        // still rejected; the next CHECKPOINT invocation (re-checkpointing
+        // A) repairs the torn state automatically at its entry (restores
+        // the validated backup, rename + parent-dir fsync, before
+        // proceeding) and the subsequent fault-free advance to B moves on
+        // cleanly. Fixed seed 0x5EED_5EED + bounded cases — the same
+        // vectors run on every invocation.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn production_checkpoint_repairs_torn_advance(
+            history in prop::collection::vec(any::<bool>(), 3..7),
+            a_at in 0usize..8,
+            a_cleanup_interrupted in any::<bool>(),
+        ) {
+            run_production_repair_case(&history, a_at, a_cleanup_interrupted);
         }
     }
 

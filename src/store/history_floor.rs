@@ -100,8 +100,15 @@
 //! the tagged backup back over the marker name + parent-dir fsync
 //! ([`LocalStore::recover_history_floor_backup`]): the backup is the ONLY
 //! valid floor in a torn state and is NEVER deleted (deleting it would
-//! erase the floor and re-expose discarded history) — and every subsequent
-//! ADVANCE reconciles leftover backups automatically before it starts.
+//! erase the floor and re-expose discarded history). The NEXT CHECKPOINT
+//! repairs the torn state AUTOMATICALLY: the checkpoint entry restores the
+//! validated backup (rename + parent-dir fsync — the PRODUCTION repair
+//! path, [`LocalStore::recover_history_floor_backup`]) before it proceeds,
+//! so a torn advance is self-healing and the target never needs a manual
+//! intervention. Every advance's pre-start reconciliation composes with
+//! that: it removes leftover backups ONLY when the floor marker EXISTS — a
+//! marker ABSENT alongside a VALIDATED backup is the torn state (the
+//! backup is the ONLY valid floor) and is RESTORED, never deleted.
 //!
 //! EVERY failure AFTER the marker write — enumerating the discards or any
 //! compaction phase — is POST-COMMIT MAINTENANCE: the checkpoint already
@@ -454,9 +461,12 @@ impl LocalStore {
     /// readers survive via the validated-backup fallback
     /// ([`LocalStore::read_history_floor`]: a VALIDATED tagged backup with
     /// no marker IS the active floor A, never "no floor", which would
-    /// expose the below-floor prefix) and that recovery repairs by
-    /// atomically restoring the backup
-    /// ([`LocalStore::recover_history_floor_backup`]). Every stage error
+    /// expose the below-floor prefix) and that the NEXT CHECKPOINT repairs
+    /// by atomically restoring the backup
+    /// ([`LocalStore::recover_history_floor_backup`], invoked
+    /// automatically at the checkpoint entry — the PRODUCTION repair path;
+    /// the advance-start reconciliation composes with it and restores
+    /// rather than deletes whenever the marker is absent). Every stage error
     /// is returned from THIS method (PRE-commit): B is never reported
     /// established unless its parent-dir sync succeeded.
     pub(crate) fn write_history_floor(&self, target: &str, floor: &HistoryFloor) -> Result<()> {
@@ -533,18 +543,23 @@ impl LocalStore {
         if had_floor {
             // ---- TRANSACTIONAL ADVANCE, stage 0: RECONCILE ----------------
             // Durably remove every leftover `history-floor.json.prev*`
-            // sibling BEFORE this advance starts — the tagged backup of an
-            // EARLIER transaction (e.g. a `.prev.<B>` holding A left by a
-            // committed A→B whose success-path cleanup was faulted) plus any
-            // legacy untagged `.prev`. The backup slot starts CLEAN, so a
-            // stale backup from another transaction can never be confused
-            // with this transaction's backup (the fixed-name hazard: a
-            // failure in a later transaction consulting the shared `.prev`
-            // would find the STALE A and could restore it over a newer
-            // floor, rolling the floor BACKWARD). The removal is durable
-            // (parent fsync) BEFORE this transaction creates its own
-            // backup.
-            self.reconcile_floor_backups(&path)?;
+            // sibling BEFORE this advance starts — the tagged backup of an EARLIER
+            // transaction (e.g. a `.prev.<B>` holding A left by a committed
+            // A→B whose success-path cleanup was faulted) plus any legacy
+            // untagged `.prev`. The backup slot starts CLEAN, so a stale
+            // backup from another transaction can never be confused with
+            // this transaction's backup (the fixed-name hazard: a failure
+            // in a later transaction consulting the shared `.prev` would
+            // find the STALE A and could restore it over a newer floor,
+            // rolling the floor BACKWARD). The removal is durable (parent
+            // fsync) BEFORE this transaction creates its own backup. The
+            // marker EXISTS here (the checkpoint entry repaired any torn
+            // state before calling the advance, and the guard inside
+            // [`LocalStore::reconcile_floor_backups`] restores — never
+            // deletes — a validated backup when the marker is absent), so
+            // this reconcile only ever removes genuine leftovers, never the
+            // only valid floor.
+            self.reconcile_floor_backups(&path, target)?;
 
             // ---- TRANSACTIONAL ADVANCE, stage 1: BACKUP A ----------------
             // Move the current floor A aside to the durable, tagged backup
@@ -727,7 +742,39 @@ impl LocalStore {
     /// Removal errors PROPAGATE (fail-closed: an advance must not proceed
     /// while a leftover backup that a later failure could mistake for its
     /// own still sits in the directory).
-    fn reconcile_floor_backups(&self, path: &Path) -> Result<()> {
+    ///
+    /// TORN-ADVANCE GUARD (the composition with the checkpoint's automatic
+    /// repair): a leftover backup with the marker ABSENT is a TORN ADVANCE
+    /// — the backup may be the ONLY valid floor — NEVER a "leftover of
+    /// another transaction". Reconcile only REMOVES backups when the marker
+    /// EXISTS. When the marker is absent and a VALIDATED backup exists it
+    /// RESTORES the backup (rename + parent-dir fsync — the production
+    /// repair, [`LocalStore::recover_history_floor_backup`]) instead, then
+    /// removes any remaining siblings now that the marker exists again;
+    /// when the marker is absent and leftovers exist but NONE validates it
+    /// FAILS CLOSED (an unvalidatable backup is never deleted while the
+    /// marker is absent — it may be the only record of the floor — and
+    /// never restored). The checkpoint entry runs the same repair before
+    /// this advance ever starts, so this guard is defense-in-depth for any
+    /// caller that reaches an advance directly in the torn state.
+    fn reconcile_floor_backups(&self, path: &Path, target: &str) -> Result<()> {
+        // TORN-ADVANCE GUARD: when the marker is ABSENT, backup siblings
+        // are the torn state — the VALIDATED one is the ONLY valid floor
+        // and must be RESTORED, never deleted. (The checkpoint entry
+        // already repaired the torn state before calling the advance; this
+        // guard is defense-in-depth so a direct advance call can never
+        // delete the only valid floor.) The restore is a no-op when nothing
+        // is left over and FAILS CLOSED when leftovers exist but none
+        // validates — an unvalidatable backup is never deleted while the
+        // marker is absent.
+        if !path.exists() {
+            self.recover_history_floor_backup(target)?;
+        }
+        // Marker EXISTS (restored by the guard above, or never torn):
+        // durably remove every leftover backup sibling. Removal errors
+        // PROPAGATE (fail-closed: an advance must not proceed while a
+        // leftover backup that a later failure could mistake for its own
+        // still sits in the directory).
         for leftover in floor_backup_siblings(path) {
             std::fs::remove_file(&leftover).map_err(|e| {
                 Error::store(format!(
@@ -927,18 +974,24 @@ impl LocalStore {
     /// restores the previous floor. In a torn state (the marker ABSENT, the
     /// backup holding the pre-advance floor A) the backup is the ONLY valid
     /// floor — deleting it would erase the floor and re-expose the
-    /// below-floor history — so the documented recovery restores it and
-    /// NEVER deletes it. The recovery is a MANUAL REPAIR without a
-    /// transaction context, so it restores A VALIDATED backup — any
-    /// leftover `.prev*` sibling whose content passes the full integrity
-    /// binding, preferring the newest — and NEVER an unvalidated one. A
-    /// no-op when the marker already exists (a present marker is
-    /// authoritative: there is nothing to recover, and restoring the backup
-    /// over it could overwrite a NEWER committed floor) or when no backup
-    /// exists. Fails closed (`Err`) when leftover backups exist but none
-    /// validates (an unvalidatable backup is never restored over the
-    /// marker) or when the restore cannot be made durable.
-    #[cfg(test)]
+    /// below-floor history — so the recovery restores it and NEVER deletes
+    /// it. THIS IS THE PRODUCTION REPAIR: the checkpoint entry
+    /// ([`crate::push::checkpoint::run_checkpoint`] → `checkpoint_inner`)
+    /// invokes it automatically at the start of every checkpoint — the next
+    /// checkpoint after a torn advance restores the validated backup
+    /// (rename + parent fsync) before it proceeds — and the advance-start
+    /// backup reconciliation ([`LocalStore::reconcile_floor_backups`])
+    /// invokes it as its marker-absent branch, so no manual repair exists
+    /// anywhere in the flow. The recovery has no transaction context, so it
+    /// restores A VALIDATED backup — any leftover `.prev*` sibling whose
+    /// content passes the full integrity binding, preferring the newest —
+    /// and NEVER an unvalidated one. A no-op when the marker already exists
+    /// (a present marker is authoritative: there is nothing to recover, and
+    /// restoring the backup over it could overwrite a NEWER committed
+    /// floor) or when no backup exists. Fails closed (`Err`) when leftover
+    /// backups exist but none validates (an unvalidatable backup is never
+    /// restored over the marker — and never deleted behind the repair's
+    /// back) or when the restore cannot be made durable.
     pub(crate) fn recover_history_floor_backup(&self, target: &str) -> Result<()> {
         let p = self.history_floor_path(target);
         if p.exists() {

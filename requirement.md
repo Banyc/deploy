@@ -415,22 +415,39 @@ unique and increasing.
 
 Advancing the floor is TRANSACTIONAL — replacing the marker must never
 erase the previously durable floor. `write_history_floor` stages B's marker
-(private temp + fsync), moves the current floor A aside to a durable backup
-(`history-floor.json.prev`, renamed + parent-dir fsynced BEFORE B can
-overwrite the marker name), renames B into place, and fsyncs the parent
-directory — B's durability commit point. A failure at ANY stage before that
-commit point RESTORES A from the backup (rename back + parent fsync): a
-failed advancement leaves exactly the pre-advance state — floor A durable,
-the same visible suffix, no compaction side effects — so advancing a
-checkpoint can never erase the previously durable floor. If the restore of A
-itself ALSO fails, the marker may be left absent while `.prev` still holds
-A; every read then fails closed with an integrity error (a torn advance is
-never treated as "no floor", which would expose the below-floor prefix) —
-recovery is to remove the stale `.prev` and re-checkpoint (reads then
-report no floor, and the next checkpoint re-establishes one). After B
-commits, the backup is removed best-effort and the parent is re-synced; a
-stale `.prev` is harmless (reads are keyed on the marker, never the
-backup).
+(private temp + fsync), moves the current floor A aside to a durable,
+TRANSACTION-TAGGED backup (`history-floor.json.prev.<B-id>` — tagged by the
+advance target, so a stale backup from another transaction is a different
+file; renamed + parent-dir fsynced BEFORE B can overwrite the marker name),
+renames B into place, and fsyncs the parent directory — B's durability
+commit point. A failure at ANY stage before that
+commit point RESTORES the previous floor A from the backup (rename back +
+parent fsync — the restore is tag- and content-verified, so a stale backup
+from another transaction can never roll the floor backward): a failed
+advancement leaves the pre-advance state — floor A durable, the same
+visible suffix, no compaction side effects — so advancing a checkpoint can
+never erase the previously durable floor. If the restore of A itself ALSO
+fails, the marker may be left absent while the tagged backup still holds A
+— a TORN ADVANCE. The readers NEVER treat this as "no floor" (which would
+expose the below-floor prefix): they VALIDATE the durable backup against the
+SAME integrity binding as the marker (schema version, target binding, exact
+snapshot pair, matching attempt) and, when valid, treat it as the ACTIVE
+floor — reads return A (never None, never an error); they fail closed only
+when the backup itself fails validation. RECOVERY RESTORES — NEVER DELETES
+— the validated backup (rename the tagged backup back over the marker name
++ parent fsync): the backup is the ONLY valid floor in a torn state, and
+deleting it would erase the floor and re-expose the below-floor history. The
+next CHECKPOINT repairs the torn state AUTOMATICALLY: it restores the
+validated backup (rename + parent fsync) before proceeding, so the target
+self-heals through the production path — a re-checkpoint of the original
+floor A restores the marker and finishes; an advance to a later floor B
+restores the marker and advances normally. The advance's pre-start
+reconciliation composes with that: it removes leftover backups ONLY when
+the floor marker exists — a marker absent alongside a validated backup is
+the torn state (the backup is the ONLY valid floor) and is restored, never
+deleted. After B commits, the backup is removed best-effort and the parent
+is re-synced; a stale leftover backup is harmless (reads are keyed on the
+marker, never the backup).
 
 Tree metadata is identity-neutral. For example,
 
