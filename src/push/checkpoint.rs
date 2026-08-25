@@ -60,12 +60,18 @@
 //! pre-advance state (floor A durable, the same visible suffix, no
 //! compaction side effects) — advancing a checkpoint can never erase the
 //! previously durable floor. If the restore of A itself ALSO fails, the
-//! marker may be left absent while the tagged backup holds A: every read
-//! fails closed with an integrity error (a torn advance is never treated as
-//! "no floor", which would expose the below-floor prefix); recovery is to
-//! remove the leftover tagged backup (reads then report no floor, and the
-//! next checkpoint re-establishes one) — every subsequent ADVANCE
-//! reconciles leftover backups automatically before it starts.
+//! marker may be left absent while the tagged backup
+//! (`history-floor.json.prev.<B-id>`) holds A — a TORN ADVANCE. The reader
+//! NEVER treats this as "no floor" (which would expose the below-floor
+//! prefix): it VALIDATES the durable backup against the SAME integrity
+//! binding as the marker and treats a valid backup as the ACTIVE floor
+//! (reads see A), failing closed only when the backup itself fails
+//! validation. RECOVERY is the ATOMIC RESTORE of the backup — rename the
+//! tagged backup back over the marker name + parent-dir fsync
+//! ([`LocalStore::recover_history_floor_backup`]): the backup is the ONLY
+//! valid floor in a torn state and is NEVER deleted (deleting it would
+//! erase the floor and re-expose discarded history). Every subsequent
+//! ADVANCE reconciles leftover backups automatically before it starts.
 //!
 //! EVERY failure AFTER the marker write — enumerating the discards or any
 //! compaction phase, on the fresh path or the idempotency-repair path — is
@@ -2159,12 +2165,16 @@ mod tests {
     /// One durability stage of a floor ADVANCE (A → B). Faulting it while
     /// advancing must leave the PRE-ADVANCE state: floor A durable, the
     /// visible suffix EXACTLY unchanged, no compaction side effects. The
-    /// RESTORE stage is the fail-closed exception: the restore is only
+    /// RESTORE stage is the double-fault exception: the restore is only
     /// attempted when an EARLIER stage already failed, so the property
     /// double-faults it (the parent-sync stage + the restore — "if IT also
-    /// fails") and asserts the reads fail CLOSED: the marker may be left
-    /// absent while the tagged backup holds A — never "no floor", never a
-    /// below-floor exposure.
+    /// fails") and asserts the TORN STATE never exposes below-A history:
+    /// the marker is left absent while the tagged backup
+    /// (`history-floor.json.prev.<B-id>`) holds A, the VALIDATED backup
+    /// reads as the ACTIVE floor A (never None, never an error, never a
+    /// below-floor exposure), and the documented recovery — ATOMICALLY
+    /// RESTORING the backup (rename + parent-dir fsync, never deleting
+    /// it) — returns the target to EXACTLY the pre-advance state.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum AdvanceStage {
         Entry,
@@ -2267,23 +2277,54 @@ mod tests {
         }
     }
 
-    /// One transactional-advance case: establish floor A (clean OR with an
-    /// INTERRUPTED cleanup — leftover debt + below-floor dirs, replaying the
-    /// commit-point test's seeding), capture the exact pre-advance visible
-    /// state, then fault EVERY durability stage while advancing A → B. Each
-    /// faulted advancement must return `Err` and retain A — the ORIGINAL
-    /// floor (same deployment_id + snapshot_index), never None, never B —
-    /// with the visible suffix EXACTLY unchanged (the restore stage is the
-    /// fail-closed exception: the restore also fails, so the reads fail
-    /// closed instead). Then the controls: a fault-free advancement to B
-    /// succeeds (floor = B), and A's interrupted cleanup converges after
-    /// the failed advances.
-    fn run_transactional_advance_case(
+    /// Establish floor A on a seeded fixture (clean OR with an INTERRUPTED
+    /// cleanup — the debt marker + leftover below-A dirs, replaying the
+    /// commit-point test's seeding) and capture the EXACT pre-advance
+    /// visible and physical state: the baseline a failed ADVANCE and its
+    /// RECOVERY must leave untouched. B is the guaranteed FINAL success —
+    /// always a strictly-later deployment than A.
+    struct FloorAFixture {
+        _tmp: tempfile::TempDir,
+        store: LocalStore,
+        /// The full seeded history (the deployment-dir inventory derives
+        /// from it).
+        history: Vec<bool>,
+        /// A's deployment id (the ORIGINAL floor).
+        a_id: String,
+        /// A's snapshot index.
+        a_index: u64,
+        /// A's position in the FULL history (everything before it owns a
+        /// below-A `deployments/<id>/` directory — the material an
+        /// interrupted A cleanup leaves behind).
+        a_attempt_pos: usize,
+        /// The established floor A marker.
+        a_floor: HistoryFloor,
+        /// B's deployment id (the never-committed advance target).
+        b_id: String,
+        /// B's snapshot index.
+        b_index: u64,
+        /// The pre-advance visible suffix under floor A.
+        pre: VisibleState,
+        /// The pre-advance raw attempts-log line count.
+        pre_raw_attempts: usize,
+        /// The pre-advance raw snapshots-log entry count.
+        pre_raw_snaps: usize,
+        /// The pre-advance deployment-dir inventory (ids with a dir on
+        /// disk).
+        pre_dirs: Vec<String>,
+    }
+
+    /// Seed a fresh fixture and establish floor A, then capture the exact
+    /// pre-advance state — see [`FloorAFixture`]. Shared by the
+    /// transactional-advance cases and the recovery property, so both run
+    /// the same seeding (the commit-point test's fixtures: a guaranteed
+    /// early success, a guaranteed FAILED attempt, the randomized history,
+    /// and a guaranteed FINAL success).
+    fn seed_floor_a(
         history_in: &[bool],
         a_at: usize,
         a_cleanup_interrupted: bool,
-        stage: AdvanceStage,
-    ) {
+    ) -> FloorAFixture {
         // Seeding (replaying the commit-point test): a guaranteed early
         // success, a guaranteed FAILED attempt (a `deployments/<id>/` dir
         // with no snapshot — below-floor dir material for A's interrupted
@@ -2355,10 +2396,10 @@ mod tests {
         let pre = capture_visible(&store, TARGET, &Some(a_floor.clone()));
         // PRE-ADVANCE PHYSICAL state (the "no compaction side effects"
         // half): the raw logs and the deployment-dir set must be UNCHANGED
-        // by a failed advancement. (A's OWN establishment may already have
-        // compacted the raw logs and deleted below-A dirs — that is the
-        // pre-advance baseline, not a side effect of the failed B
-        // advance.)
+        // by a failed advancement AND by the recovery. (A's OWN
+        // establishment may already have compacted the raw logs and deleted
+        // below-A dirs — that is the pre-advance baseline, not a side
+        // effect of the failed B advance.)
         let pre_raw_attempts = store.read_attempts_raw(TARGET).unwrap().len();
         let pre_raw_snaps = store.read_snapshots_raw(TARGET).unwrap().len();
         let pre_dirs: Vec<String> = history
@@ -2367,16 +2408,60 @@ mod tests {
             .filter(|(n, _)| store.deployment_dir(&format!("deploy-{n:04}")).exists())
             .map(|(n, _)| format!("deploy-{n:04}"))
             .collect();
+        FloorAFixture {
+            _tmp: tmp,
+            store,
+            history,
+            a_id,
+            a_index,
+            a_attempt_pos,
+            a_floor,
+            b_id,
+            b_index,
+            pre,
+            pre_raw_attempts,
+            pre_raw_snaps,
+            pre_dirs,
+        }
+    }
+
+    /// One transactional-advance case: establish floor A (clean OR with an
+    /// INTERRUPTED cleanup — leftover debt + below-floor dirs, replaying the
+    /// commit-point test's seeding), capture the exact pre-advance visible
+    /// state, then fault EVERY durability stage while advancing A → B. Each
+    /// faulted advancement must return `Err` and retain A — the ORIGINAL
+    /// floor (same deployment_id + snapshot_index), never None, never B —
+    /// with the visible suffix EXACTLY unchanged (the restore stage is the
+    /// double-fault exception: the restore ALSO fails, so the marker is
+    /// left ABSENT while the durable backup holds A — the VALIDATED backup
+    /// then reads as the ACTIVE floor A and the documented recovery
+    /// atomically restores it, never deleting it). Then the controls: a
+    /// fault-free advancement to B succeeds (floor = B), and A's
+    /// interrupted cleanup converges after the failed advances.
+    fn run_transactional_advance_case(
+        history_in: &[bool],
+        a_at: usize,
+        a_cleanup_interrupted: bool,
+        stage: AdvanceStage,
+    ) {
+        let fx = seed_floor_a(history_in, a_at, a_cleanup_interrupted);
+        let store = &fx.store;
+        let a_id = fx.a_id.as_str();
+        let a_index = fx.a_index;
+        let b_id = fx.b_id.as_str();
+        let pre = &fx.pre;
 
         // ---- FAULTED ADVANCE: the durability stage under test ------------
         // Fault the stage while advancing A → B; the advancement MUST fail
         // before B's durability commit point, and the PRE-ADVANCE state
         // must survive EXACTLY (floor A, same visible suffix, same
         // below-floor ref refusals, no compaction side effects) — except
-        // the RESTORE stage, whose restore ALSO fails: reads then fail
-        // CLOSED (a torn advance is never "no floor").
-        arm_advance_stage(&store, stage, &b_id);
-        let err = run_checkpoint(&store, TARGET, &DeploymentId::new(b_id.clone()), false)
+        // the RESTORE stage, whose restore ALSO fails: the marker is left
+        // ABSENT while the durable backup holds A, and the VALIDATED backup
+        // reads as the ACTIVE floor A (the recovery below restores it
+        // atomically — never "no floor", never a below-A exposure).
+        arm_advance_stage(store, stage, b_id);
+        let err = run_checkpoint(store, TARGET, &DeploymentId::new(b_id.to_string()), false)
             .expect_err("a durability-stage fault must fail the advance before B commits");
         assert!(
             err.to_string().contains("test fault"),
@@ -2384,72 +2469,152 @@ mod tests {
         );
 
         if stage == AdvanceStage::Restore {
-            // The restore itself failed: the previous floor A stays in the
-            // durable backup and the marker was left ABSENT (B's marker was
-            // unlinked). Every read must fail CLOSED — never a downgrade to
-            // "no floor" (which would expose the below-floor prefix).
-            let e = store.read_history_floor(TARGET).unwrap_err();
+            // The DOUBLE FAULT (the restore of A ALSO failed): the previous
+            // floor A stays in the durable backup and the marker was left
+            // ABSENT (B's marker was unlinked). The torn state is NEVER "no
+            // floor" (which would expose the below-floor prefix): the
+            // VALIDATED backup IS the active floor — every read sees A (the
+            // ORIGINAL floor — same deployment_id + snapshot_index, never
+            // None, never an error), the visible suffix is EXACTLY
+            // unchanged, and every below-A ref stays refused.
             assert!(
-                e.to_string().contains("integrity"),
-                "restore-failure reads fail closed from the loader, got: {e}"
+                !store.history_floor_path(TARGET).exists(),
+                "the double fault leaves the marker absent"
             );
-            let e = store.read_snapshots(TARGET).unwrap_err();
             assert!(
-                e.to_string().contains("integrity"),
-                "read_snapshots propagates the torn-advance error, got: {e}"
+                store
+                    .refs_dir(TARGET)
+                    .join(format!("history-floor.json.prev.{b_id}"))
+                    .exists(),
+                "the double fault leaves the durable backup holding A"
             );
-            let e = store.read_attempts(TARGET).unwrap_err();
-            assert!(
-                e.to_string().contains("integrity"),
-                "read_attempts propagates the torn-advance error, got: {e}"
+            let torn = store.read_history_floor(TARGET).unwrap();
+            let f = torn
+                .as_ref()
+                .expect("a torn advance reads floor A through the validated backup — never None");
+            assert_eq!(
+                f.deployment_id.as_str(),
+                a_id,
+                "the torn read returns the ORIGINAL floor A"
             );
-            // Below-floor refs refuse through the gated chain — never a
-            // resolved below-A snapshot.
-            for tok in ["s0", "s1", "s2"] {
-                let expr = history::parse_ref_expr(tok).unwrap();
-                let e = history::resolve_ref_expr(&expr, TARGET, &store).unwrap_err();
-                assert!(
-                    e.to_string().contains("integrity"),
-                    "resolve '{tok}' fails closed after the torn advance, got: {e}"
-                );
-            }
+            assert_eq!(
+                f.snapshot_index, a_index,
+                "the torn read returns the ORIGINAL floor index"
+            );
+            let torn_post = capture_visible(store, TARGET, &torn);
+            assert_eq!(
+                torn_post.snapshots, pre.snapshots,
+                "the torn read exposes exactly the pre-advance snapshot suffix"
+            );
+            assert_eq!(
+                torn_post.attempts, pre.attempts,
+                "the torn read exposes exactly the pre-advance attempts suffix"
+            );
+            assert_eq!(
+                torn_post.below_floor_ref_err, pre.below_floor_ref_err,
+                "the same below-A refs stay refused during the torn state"
+            );
             // No compaction side effects from the failed advance: the raw
             // logs and the deployment-dir set are EXACTLY the pre-advance
             // physical state.
             assert_eq!(
                 store.read_snapshots_raw(TARGET).unwrap().len(),
-                pre_raw_snaps,
+                fx.pre_raw_snaps,
                 "the failed advance never touches the raw snapshot log"
             );
             assert_eq!(
                 store.read_attempts_raw(TARGET).unwrap().len(),
-                pre_raw_attempts,
+                fx.pre_raw_attempts,
                 "the failed advance never touches the raw attempts log"
             );
-            let dirs: Vec<String> = history
+            let dirs: Vec<String> = fx
+                .history
                 .iter()
                 .enumerate()
                 .filter(|(n, _)| store.deployment_dir(&format!("deploy-{n:04}")).exists())
                 .map(|(n, _)| format!("deploy-{n:04}"))
                 .collect();
             assert_eq!(
-                dirs, pre_dirs,
+                dirs, fx.pre_dirs,
                 "the failed advance never deletes or creates a deployment dir"
             );
-            // HEAL the torn state (the documented recovery): removing the
-            // leftover TAGGED backup (`.prev.<b_id>`, holding A) restores
-            // "no floor" — nothing was ever compacted, so the full history
-            // is intact and the fault-free advance control below
-            // re-establishes a floor.
-            std::fs::remove_file(
-                store
-                    .refs_dir(TARGET)
-                    .join(format!("history-floor.json.prev.{b_id}")),
-            )
-            .unwrap();
+            // RECOVERY (the documented recovery INVERTED): ATOMICALLY
+            // RESTORE the durable backup as the marker — rename the tagged
+            // backup `history-floor.json.prev.<b_id>` back + parent-dir
+            // fsync (the SAME operation a failed advance's restore
+            // performs; the backup is the ONLY valid floor in the torn
+            // state and is NEVER deleted — deleting it would erase the
+            // floor and re-expose the below-floor history). After recovery
+            // the floor is STILL A and the visible history is EXACTLY
+            // unchanged — no recovery transition produced None.
+            store
+                .recover_history_floor_backup(TARGET)
+                .expect("recovery atomically restores the durable backup");
             assert!(
-                store.read_history_floor(TARGET).unwrap().is_none(),
-                "after healing, the torn target has no floor (never a partial one)"
+                store.history_floor_path(TARGET).exists(),
+                "recovery restores the marker file"
+            );
+            assert!(
+                !store
+                    .refs_dir(TARGET)
+                    .join(format!("history-floor.json.prev.{b_id}"))
+                    .exists(),
+                "recovery consumes the tagged backup: no stale .prev.<b_id> remains"
+            );
+            let recovered = store.read_history_floor(TARGET).unwrap();
+            let f = recovered
+                .as_ref()
+                .expect("post-recovery the floor is A — never None");
+            assert_eq!(
+                f.deployment_id.as_str(),
+                a_id,
+                "recovery restores the ORIGINAL floor A (same deployment_id)"
+            );
+            assert_eq!(
+                f.snapshot_index, a_index,
+                "recovery restores the ORIGINAL floor A (same snapshot_index)"
+            );
+            let recovered_post = capture_visible(store, TARGET, &recovered);
+            assert_eq!(
+                recovered_post.snapshots, pre.snapshots,
+                "visible history is EXACTLY unchanged after recovery"
+            );
+            assert_eq!(
+                recovered_post.attempts, pre.attempts,
+                "the visible attempts suffix is EXACTLY unchanged after recovery"
+            );
+            assert_eq!(
+                recovered_post.below_floor_ref_err, pre.below_floor_ref_err,
+                "every below-A ref stays refused after recovery"
+            );
+            // Physical state still EXACTLY the pre-advance state after
+            // recovery: same raw logs, same deployment dirs (the recovery
+            // only renames the backup into the marker name — it compacts
+            // nothing).
+            assert_eq!(
+                store.read_snapshots_raw(TARGET).unwrap().len(),
+                fx.pre_raw_snaps,
+                "recovery never touches the raw snapshot log"
+            );
+            assert_eq!(
+                store.read_attempts_raw(TARGET).unwrap().len(),
+                fx.pre_raw_attempts,
+                "recovery never touches the raw attempts log"
+            );
+            let dirs_after: Vec<String> = fx
+                .history
+                .iter()
+                .enumerate()
+                .filter(|(n, _)| store.deployment_dir(&format!("deploy-{n:04}")).exists())
+                .map(|(n, _)| format!("deploy-{n:04}"))
+                .collect();
+            assert_eq!(
+                dirs_after, fx.pre_dirs,
+                "recovery never deletes or creates a deployment dir"
+            );
+            assert!(
+                torn.is_some() && recovered.is_some(),
+                "no recovery transition produced None: the torn read AND the post-recovery read both see floor A"
             );
         } else {
             // The failed advancement left EXACTLY the pre-advance state:
@@ -2469,7 +2634,7 @@ mod tests {
                 f.snapshot_index, a_index,
                 "the ORIGINAL floor index survives the failed {stage:?} advance"
             );
-            let post = capture_visible(&store, TARGET, &floor);
+            let post = capture_visible(store, TARGET, &floor);
             assert_eq!(
                 post.snapshots, pre.snapshots,
                 "{stage:?}: the visible snapshot suffix is exactly unchanged"
@@ -2486,9 +2651,16 @@ mod tests {
             // CONTROL: when A's cleanup was interrupted, re-checkpointing A
             // after the failed advances CONVERGES the pending cleanup (the
             // durable debt clears, the below-floor dirs are deleted).
-            if a_cleanup_interrupted && a_attempt_pos > 0 {
-                let retry = run_checkpoint(&store, TARGET, &DeploymentId::new(a_id.clone()), false)
-                    .expect("re-checkpointing A after the failed advances converges its pending cleanup");
+            if a_cleanup_interrupted && fx.a_attempt_pos > 0 {
+                let retry = run_checkpoint(
+                    store,
+                    TARGET,
+                    &DeploymentId::new(fx.a_id.clone()),
+                    false,
+                )
+                .expect(
+                    "re-checkpointing A after the failed advances converges its pending cleanup",
+                );
                 assert!(
                     !retry.cleanup_pending,
                     "{stage:?}: A's interrupted cleanup converges after the failed advances"
@@ -2497,7 +2669,7 @@ mod tests {
                     store.read_cleanup_pending(TARGET, None).unwrap().is_none(),
                     "{stage:?}: the debt marker clears once A's cleanup completes"
                 );
-                for (n, _) in history.iter().enumerate().take(a_attempt_pos) {
+                for (n, _) in fx.history.iter().enumerate().take(fx.a_attempt_pos) {
                     assert!(
                         !store.deployment_dir(&format!("deploy-{n:04}")).exists(),
                         "{stage:?}: below-A dir {n} is deleted by the converged cleanup"
@@ -2508,15 +2680,16 @@ mod tests {
 
         // CONTROL: a fault-free advancement to B SUCCEEDS (floor = B, the
         // advancement commits). For the restore stage this runs on the
-        // healed fixture (the first-ever-floor path).
-        let rep_b = run_checkpoint(&store, TARGET, &DeploymentId::new(b_id.clone()), false)
+        // RECOVERED fixture (the marker holds A again — the advancement is
+        // a normal transactional advance).
+        let rep_b = run_checkpoint(store, TARGET, &DeploymentId::new(b_id.to_string()), false)
             .expect("a fault-free advancement to B succeeds");
         assert!(rep_b.established, "the advancement to B establishes B");
         let floor_b = store.read_history_floor(TARGET).unwrap().unwrap();
         assert_eq!(floor_b.deployment_id.as_str(), b_id);
-        assert_eq!(floor_b.snapshot_index, b_index);
+        assert_eq!(floor_b.snapshot_index, fx.b_index);
         assert!(
-            floor_backup_leftovers(&store).is_empty(),
+            floor_backup_leftovers(store).is_empty(),
             "a committed advance leaves no backup behind"
         );
     }
@@ -2530,11 +2703,14 @@ mod tests {
         // (same deployment_id + snapshot_index), never None, never B — and
         // exposes EXACTLY the same visible suffix (identical gated lists,
         // the same below-floor refs refused); the RESTORE-stage double
-        // fault instead asserts the reads fail CLOSED (a torn advance is
-        // never "no floor"). Then the controls: a fault-free advancement to
-        // B succeeds (floor = B) and A's pending cleanup converges after
-        // the failed advances. Fixed seed 0x5EED_5EED + bounded cases — the
-        // same vectors run on every invocation.
+        // fault instead asserts the torn state reads the VALIDATED backup
+        // as the ACTIVE floor A (never None, never an error, never a
+        // below-A exposure) and that the documented recovery — ATOMICALLY
+        // restoring the backup, never deleting it — returns the target to
+        // EXACTLY the pre-advance state. Then the controls: a fault-free
+        // advancement to B succeeds (floor = B) and A's pending cleanup
+        // converges after the failed advances. Fixed seed 0x5EED_5EED +
+        // bounded cases — the same vectors run on every invocation.
         #![proptest_config(ProptestConfig {
             cases: 16,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
@@ -2565,9 +2741,10 @@ mod tests {
         for stage in ALL_ADVANCE_STAGES {
             // A with an INTERRUPTED cleanup (pending debt + leftover
             // below-floor dirs): every stage leaves floor A durable and the
-            // visible suffix exactly unchanged (the restore stage fails
-            // closed); the pending cleanup converges after the failed
-            // advances, then a fault-free advance to B succeeds.
+            // visible suffix exactly unchanged (the restore stage
+            // double-faults: the validated backup reads as A and the
+            // recovery restores it); the pending cleanup converges after
+            // the failed advances, then a fault-free advance to B succeeds.
             run_transactional_advance_case(&[true, false, true], 1, true, stage);
             // A at the very first attempt (clean, nothing below it): the
             // interrupted-control is moot; every stage still retains A.
@@ -2799,6 +2976,289 @@ mod tests {
             floor_backup_leftovers(&store).is_empty(),
             "a fault-free chain leaves no backup leftovers"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // RECOVERY OF A TORN ADVANCE (the property test)
+    // ---------------------------------------------------------------------
+
+    /// One recovery case (the property's body): establish floor A (clean
+    /// OR with an INTERRUPTED cleanup — the debt marker + leftover below-A
+    /// dirs, replaying the commit-point test's seeding), DOUBLE-FAULT the
+    /// advance A→B (B's parent-sync commit-point fault AND the restore
+    /// fault — the transactional-advance property's fixture shows the fault
+    /// arming), assert the TORN reads see floor A through the
+    /// validated-backup fallback — never None, never an error, never a
+    /// below-A exposure, with the visible suffix EXACTLY unchanged, the
+    /// raw logs/dirs unchanged, and every below-A ref refused — then
+    /// RECOVER by ATOMICALLY RESTORING the backup (rename + parent-dir
+    /// fsync, never deleting it) and assert the floor remains A (same
+    /// deployment_id + snapshot_index), the visible history is EXACTLY
+    /// unchanged, and every ref below A remains rejected — no recovery
+    /// transition produced None. The CONTROL: a backup that FAILS
+    /// validation (corrupted backup) still fails closed (no below-A
+    /// exposure) — the unvalidatable backup is never "no floor" — while
+    /// the restored intact backup reads as A again. Then the fault-free
+    /// advance control: advancing to B succeeds on the recovered fixture.
+    fn run_recovery_case(history_in: &[bool], a_at: usize, a_cleanup_interrupted: bool) {
+        let fx = seed_floor_a(history_in, a_at, a_cleanup_interrupted);
+        let store = &fx.store;
+        let a_id = fx.a_id.as_str();
+        let a_index = fx.a_index;
+        let b_id = fx.b_id.as_str();
+        let pre = &fx.pre;
+
+        // ---- DOUBLE FAULT: A → B fails at B's durability commit point
+        // AND the restore of A also fails (arm B's parent-sync fault AND
+        // the RestoreFloor fault, keyed by B's deployment id): the marker
+        // is left ABSENT while the durable backup holds A.
+        store.fault_registry().arm_sync_floor_parent(b_id);
+        store.fault_registry().arm_restore_floor(b_id);
+        let err = run_checkpoint(store, TARGET, &DeploymentId::new(b_id.to_string()), false)
+            .expect_err("the double fault must fail the advance before B commits");
+        assert!(
+            err.to_string().contains("test fault"),
+            "the fault is the failure cause, got: {err}"
+        );
+
+        // ---- TORN STATE: the validated backup IS the active floor -------
+        // The marker is absent but the tagged backup `.prev.<b_id>` holds A. Every
+        // read must see A
+        // (the ORIGINAL floor — same deployment_id + snapshot_index, never
+        // None, never an error) — a reader during the torn state sees
+        // EXACTLY the pre-advance state, never the below-A prefix.
+        assert!(
+            !store.history_floor_path(TARGET).exists(),
+            "the double fault leaves the marker absent"
+        );
+        assert!(
+            store
+                .refs_dir(TARGET)
+                .join(format!("history-floor.json.prev.{b_id}"))
+                .exists(),
+            "the double fault leaves the durable backup holding A"
+        );
+        let torn = store.read_history_floor(TARGET).unwrap();
+        let f = torn
+            .as_ref()
+            .expect("the torn state reads floor A through the validated backup — never None");
+        assert_eq!(
+            f.deployment_id.as_str(),
+            a_id,
+            "the torn read returns the ORIGINAL floor A (same deployment_id)"
+        );
+        assert_eq!(
+            f.snapshot_index, a_index,
+            "the torn read returns the ORIGINAL floor A (same snapshot_index)"
+        );
+        let torn_post = capture_visible(store, TARGET, &torn);
+        assert_eq!(
+            torn_post.snapshots, pre.snapshots,
+            "the torn read exposes exactly the pre-advance snapshot suffix"
+        );
+        assert_eq!(
+            torn_post.attempts, pre.attempts,
+            "the torn read exposes exactly the pre-advance attempts suffix"
+        );
+        assert_eq!(
+            torn_post.below_floor_ref_err, pre.below_floor_ref_err,
+            "the same below-A refs stay refused during the torn state"
+        );
+        // Physical state unchanged: same raw logs, same deployment dirs.
+        assert_eq!(
+            store.read_snapshots_raw(TARGET).unwrap().len(),
+            fx.pre_raw_snaps,
+            "the torn state never touches the raw snapshot log"
+        );
+        assert_eq!(
+            store.read_attempts_raw(TARGET).unwrap().len(),
+            fx.pre_raw_attempts,
+            "the torn state never touches the raw attempts log"
+        );
+        let dirs: Vec<String> = fx
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(n, _)| store.deployment_dir(&format!("deploy-{n:04}")).exists())
+            .map(|(n, _)| format!("deploy-{n:04}"))
+            .collect();
+        assert_eq!(
+            dirs, fx.pre_dirs,
+            "the torn state changes no deployment dir"
+        );
+
+        // ---- CONTROL: a backup that FAILS validation fails closed ------
+        // Corrupt the backup (a valid floor retargeted to a foreign target
+        // — breaks the target binding): the unvalidatable backup is NOT
+        // trusted — every read fails closed with an integrity error, never
+        // None (which would expose the full below-floor prefix). Restoring
+        // the INTACT A floor to the tagged backup makes the fallback read A again.
+        let backup_path = store
+            .refs_dir(TARGET)
+            .join(format!("history-floor.json.prev.{b_id}"));
+        let mut retargeted = fx.a_floor.clone();
+        retargeted.target = TargetName::new("staging".to_string());
+        std::fs::write(
+            &backup_path,
+            serde_json::to_vec_pretty(&retargeted).unwrap(),
+        )
+        .unwrap();
+        let e = store.read_history_floor(TARGET).unwrap_err();
+        assert!(
+            e.to_string().contains("integrity"),
+            "an unvalidatable backup fails closed from the loader, got: {e}"
+        );
+        let e = store.read_snapshots(TARGET).unwrap_err();
+        assert!(
+            e.to_string().contains("integrity"),
+            "read_snapshots propagates the unvalidatable-backup error, got: {e}"
+        );
+        let e = store.read_attempts(TARGET).unwrap_err();
+        assert!(
+            e.to_string().contains("integrity"),
+            "read_attempts propagates the unvalidatable-backup error, got: {e}"
+        );
+        for tok in ["s0", "s1", "s2"] {
+            let expr = history::parse_ref_expr(tok).unwrap();
+            let e = history::resolve_ref_expr(&expr, TARGET, store).unwrap_err();
+            assert!(
+                e.to_string().contains("integrity"),
+                "resolve '{tok}' fails closed after the backup corruption, got: {e}"
+            );
+        }
+        // Restore the INTACT A floor to the backup: the fallback reads A
+        // again — never None at ANY step of the torn state.
+        std::fs::write(
+            &backup_path,
+            serde_json::to_vec_pretty(&fx.a_floor).unwrap(),
+        )
+        .unwrap();
+        let intact_again = store.read_history_floor(TARGET).unwrap();
+        assert!(
+            intact_again.is_some(),
+            "the restored intact backup reads as the active floor again — never None"
+        );
+
+        // ---- RECOVERY: ATOMIC RESTORE of the durable backup -------------
+        // The documented recovery restores the tagged backup as the marker (rename +
+        // parent-dir fsync — the SAME operation a failed advance's restore
+        // performs via [`LocalStore::restore_floor_backup`]). The backup is
+        // the ONLY valid floor in the torn state and is NEVER deleted
+        // (deleting it would erase the floor and re-expose the below-floor
+        // history). No recovery transition produced None: torn reads A,
+        // the restored-backup read sees A, post-recovery reads A.
+        store
+            .recover_history_floor_backup(TARGET)
+            .expect("recovery atomically restores the durable backup");
+        assert!(
+            store.history_floor_path(TARGET).exists(),
+            "recovery restores the marker file"
+        );
+        assert!(
+            floor_backup_leftovers(store).is_empty(),
+            "recovery consumes the tagged backup: no stale .prev.<b_id> remains"
+        );
+        let recovered = store.read_history_floor(TARGET).unwrap();
+        let f = recovered
+            .as_ref()
+            .expect("post-recovery the floor is A — never None");
+        assert_eq!(
+            f.deployment_id.as_str(),
+            a_id,
+            "recovery restores the ORIGINAL floor A (same deployment_id)"
+        );
+        assert_eq!(
+            f.snapshot_index, a_index,
+            "recovery restores the ORIGINAL floor A (same snapshot_index)"
+        );
+        let recovered_post = capture_visible(store, TARGET, &recovered);
+        assert_eq!(
+            recovered_post.snapshots, pre.snapshots,
+            "visible history is EXACTLY unchanged after recovery"
+        );
+        assert_eq!(
+            recovered_post.attempts, pre.attempts,
+            "the visible attempts suffix is EXACTLY unchanged after recovery"
+        );
+        assert_eq!(
+            recovered_post.below_floor_ref_err, pre.below_floor_ref_err,
+            "every below-A ref stays refused after recovery"
+        );
+        // Physical state still EXACTLY the pre-advance state after
+        // recovery: same raw logs, same deployment dirs (the recovery only
+        // renames the backup into the marker name — it compacts nothing).
+        assert_eq!(
+            store.read_snapshots_raw(TARGET).unwrap().len(),
+            fx.pre_raw_snaps,
+            "recovery never touches the raw snapshot log"
+        );
+        assert_eq!(
+            store.read_attempts_raw(TARGET).unwrap().len(),
+            fx.pre_raw_attempts,
+            "recovery never touches the raw attempts log"
+        );
+        let dirs_after: Vec<String> = fx
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(n, _)| store.deployment_dir(&format!("deploy-{n:04}")).exists())
+            .map(|(n, _)| format!("deploy-{n:04}"))
+            .collect();
+        assert_eq!(
+            dirs_after, fx.pre_dirs,
+            "recovery never deletes or creates a deployment dir"
+        );
+        assert!(
+            torn.is_some() && intact_again.is_some() && recovered.is_some(),
+            "no recovery transition produced None: torn, restored-backup, and post-recovery reads all see floor A"
+        );
+
+        // CONTROL: a fault-free advancement to B SUCCEEDS from the recovered
+        // fixture (floor A is durable again; the advancement commits B).
+        let rep_b = run_checkpoint(store, TARGET, &DeploymentId::new(b_id.to_string()), false)
+            .expect("a fault-free advancement to B succeeds after recovery");
+        assert!(rep_b.established, "the advancement to B establishes B");
+        let floor_b = store.read_history_floor(TARGET).unwrap().unwrap();
+        assert_eq!(floor_b.deployment_id.as_str(), b_id);
+        assert_eq!(floor_b.snapshot_index, fx.b_index);
+        assert!(
+            floor_backup_leftovers(store).is_empty(),
+            "a committed advance leaves no backup behind"
+        );
+    }
+
+    proptest! {
+        // RECOVERY of a TORN floor ADVANCE: over (history shape, A's
+        // checkpoint position, whether A's cleanup was INTERRUPTED — clean
+        // OR pending), DOUBLE-FAULT the advance A → B (B's parent-sync
+        // commit-point fault + the restore fault, so the marker is left
+        // ABSENT while the durable backup holds A), then assert the TORN
+        // reads see floor A through the validated-backup fallback — never
+        // None, never an error, never a below-A exposure, with the visible
+        // suffix EXACTLY unchanged and every below-A ref refused — recover
+        // by ATOMICALLY RESTORING the backup (rename + parent-dir fsync,
+        // never deleting it), and assert the floor remains A (same
+        // deployment_id + snapshot_index), the visible history is EXACTLY
+        // unchanged, and every ref below A remains rejected — no recovery
+        // transition produced None (torn reads A, post-recovery reads A).
+        // The control: a backup that FAILS validation (corrupted backup)
+        // still fails closed (no below-A exposure). Fixed seed 0x5EED_5EED
+        // + bounded cases — the same vectors run on every invocation.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn recovery_restores_the_durable_backup(
+            history in prop::collection::vec(any::<bool>(), 3..7),
+            a_at in 0usize..8,
+            a_cleanup_interrupted in any::<bool>(),
+        ) {
+            run_recovery_case(&history, a_at, a_cleanup_interrupted);
+        }
     }
 
     // ---------------------------------------------------------------------

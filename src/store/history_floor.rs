@@ -86,12 +86,17 @@
 //! durable, the same visible suffix, no compaction side effects) —
 //! advancing a checkpoint can never erase the previously durable floor. If
 //! the restore of A itself ALSO fails, the marker may be left absent while
-//! the tagged backup holds A: every read fails closed with an integrity
-//! error (a torn advance is never treated as "no floor", which would
-//! expose the below-floor prefix); recovery is to remove the leftover
-//! tagged backup (reads then report no floor, and the next checkpoint
-//! re-establishes one) — every subsequent ADVANCE reconciles leftover
-//! backups automatically before it starts.
+//! the tagged backup (`history-floor.json.prev.<B-id>`) holds A — a TORN
+//! ADVANCE. The reader NEVER treats this as "no floor" (which would expose
+//! the below-floor prefix): it VALIDATES the durable backup against the
+//! SAME integrity binding as the marker and treats a valid backup as the
+//! ACTIVE floor (reads see A), failing closed only when the backup itself
+//! fails validation. RECOVERY is the ATOMIC RESTORE of the backup — rename
+//! the tagged backup back over the marker name + parent-dir fsync
+//! ([`LocalStore::recover_history_floor_backup`]): the backup is the ONLY
+//! valid floor in a torn state and is NEVER deleted (deleting it would
+//! erase the floor and re-expose discarded history) — and every subsequent
+//! ADVANCE reconciles leftover backups automatically before it starts.
 //!
 //! EVERY failure AFTER the marker write — enumerating the discards or any
 //! compaction phase — is POST-COMMIT MAINTENANCE: the checkpoint already
@@ -151,7 +156,14 @@ use crate::testutil::test_faults::FaultKind;
 /// file from the next transaction's `.prev.<C>`, so a failure in B→C can
 /// never consult, let alone restore, another transaction's backup. The
 /// restore ([`LocalStore::restore_floor_backup`]) verifies the tag AND the
-/// content before it ever renames a backup over the marker.
+/// content before it ever renames a backup over the marker; when the
+/// marker is ABSENT but this backup exists (a torn advance: A was moved
+/// aside, its restore failed), the reader
+/// ([`LocalStore::read_history_floor`]) VALIDATES the backup and treats it
+/// as the ACTIVE floor — never "no floor", which would expose the
+/// below-floor prefix — and recovery
+/// ([`LocalStore::recover_history_floor_backup`]) restores it atomically,
+/// never deleting it.
 fn floor_backup_path(path: &Path, tag: &str) -> PathBuf {
     path.with_file_name(format!(
         "{}.prev.{tag}",
@@ -272,12 +284,15 @@ impl LocalStore {
     /// content must parse and equal the pre-advance floor A (read at the
     /// start of the transaction) — a stale or foreign backup is REFUSED,
     /// never renamed over the marker. A restore failure leaves the marker
-    /// absent while the tagged backup still holds A — the readers
-    /// ([`LocalStore::read_history_floor`]) then fail closed (a leftover
-    /// backup with no marker is a torn advance, never "no floor", which
-    /// would expose the below-floor prefix). Every stage error is returned
-    /// from THIS method (PRE-commit): B is never reported established
-    /// unless its parent-dir sync succeeded.
+    /// absent while the tagged backup still holds A — a TORN ADVANCE the
+    /// readers survive via the validated-backup fallback
+    /// ([`LocalStore::read_history_floor`]: a VALIDATED tagged backup with
+    /// no marker IS the active floor A, never "no floor", which would
+    /// expose the below-floor prefix) and that recovery repairs by
+    /// atomically restoring the backup
+    /// ([`LocalStore::recover_history_floor_backup`]). Every stage error
+    /// is returned from THIS method (PRE-commit): B is never reported
+    /// established unless its parent-dir sync succeeded.
     pub(crate) fn write_history_floor(&self, target: &str, floor: &HistoryFloor) -> Result<()> {
         // Entry-point fault (existing): fired BEFORE any durability I/O, so
         // a failure here leaves no marker, no temp, no backup, no
@@ -559,7 +574,9 @@ impl LocalStore {
     /// POSIX — it overwrites any half-installed B marker) and fsync the
     /// parent so the restore is durable. A no-op when no backup exists (the
     /// advance failed before A was ever moved aside — A is still the
-    /// durable marker).
+    /// durable marker). THE DOCUMENTED RECOVERY of a torn advance IS THIS
+    /// OPERATION — the backup is the only valid floor and is restored,
+    /// never deleted (see [`LocalStore::recover_history_floor_backup`]).
     ///
     /// NEVER RESTORES A FOREIGN BACKUP: the restore verifies the backup
     /// name carries the CURRENT advance's tag (`deployment_id`) AND that
@@ -577,11 +594,11 @@ impl LocalStore {
     /// FAIL-CLOSED: the [`FaultKind::RestoreFloor`](crate::testutil::test_faults::FaultKind::RestoreFloor) fault (and any real
     /// rename/sync error) makes the restore itself fail: A stays in the
     /// backup and the marker keeps the failed stage's state — possibly
-    /// ABSENT. The readers ([`LocalStore::read_history_floor`]) then fail
-    /// closed with an integrity error (a leftover backup with no marker is
-    /// a torn advance, never "no floor" — which would expose the
-    /// below-floor prefix), so a double failure can never expose history
-    /// below A.
+    /// ABSENT. The readers ([`LocalStore::read_history_floor`]) then treat
+    /// a VALIDATED backup as the active floor A (a torn advance is never
+    /// "no floor" — which would expose the below-floor prefix) and fail
+    /// closed only when the backup itself fails validation, so a double
+    /// failure can never expose history below A.
     fn restore_floor_backup(
         &self,
         path: &Path,
@@ -647,6 +664,72 @@ impl LocalStore {
         sync_parent_dir(path)
     }
 
+    /// The newest leftover backup sibling of the floor marker whose content
+    /// VALIDATES as the floor — parses AND passes the full integrity
+    /// binding of [`LocalStore::validate_history_floor`] (schema version,
+    /// target binding, exact snapshot pair, matching attempt), the SAME
+    /// binding the marker path enforces — or `None` when no backup
+    /// validates. The reader's torn-advance fallback
+    /// ([`LocalStore::read_history_floor`]) and the recovery
+    /// ([`LocalStore::recover_history_floor_backup`]) share it: a leftover
+    /// backup is only ever trusted — as the ACTIVE floor or as the restore
+    /// source — when it validates; a backup that fails validation is NEVER
+    /// treated as the floor and NEVER restored (an unvalidatable backup is
+    /// not "no floor" either — the callers fail closed).
+    fn validated_backup(&self, target: &str, path: &Path) -> Option<(PathBuf, HistoryFloor)> {
+        floor_backup_siblings(path)
+            .into_iter()
+            .rev()
+            .find_map(|backup| {
+                let floor = read_json_marker(&backup).ok()?;
+                self.validate_history_floor(target, &backup, &floor).ok()?;
+                Some((backup, floor))
+            })
+    }
+
+    /// RECOVER a torn floor ADVANCE ([`LocalStore::read_history_floor`]'s
+    /// validated-backup fallback): atomically restore the durable,
+    /// VALIDATED tagged backup (`history-floor.json.prev.<tag>`) as the
+    /// marker (`history-floor.json`) — the SAME rename + parent-dir fsync
+    /// [`LocalStore::restore_floor_backup`] performs when a failed advance
+    /// restores the previous floor. In a torn state (the marker ABSENT, the
+    /// backup holding the pre-advance floor A) the backup is the ONLY valid
+    /// floor — deleting it would erase the floor and re-expose the
+    /// below-floor history — so the documented recovery restores it and
+    /// NEVER deletes it. The recovery is a MANUAL REPAIR without a
+    /// transaction context, so it restores A VALIDATED backup — any
+    /// leftover `.prev*` sibling whose content passes the full integrity
+    /// binding, preferring the newest — and NEVER an unvalidated one. A
+    /// no-op when the marker already exists (a present marker is
+    /// authoritative: there is nothing to recover, and restoring the backup
+    /// over it could overwrite a NEWER committed floor) or when no backup
+    /// exists. Fails closed (`Err`) when leftover backups exist but none
+    /// validates (an unvalidatable backup is never restored over the
+    /// marker) or when the restore cannot be made durable.
+    #[cfg(test)]
+    pub(crate) fn recover_history_floor_backup(&self, target: &str) -> Result<()> {
+        let p = self.history_floor_path(target);
+        if p.exists() {
+            return Ok(());
+        }
+        let Some((backup, _)) = self.validated_backup(target, &p) else {
+            // No VALIDATED backup to restore: no-op when nothing is left
+            // over; fail closed when leftovers exist but none validates.
+            let leftovers = floor_backup_siblings(&p);
+            return if leftovers.is_empty() {
+                Ok(())
+            } else {
+                Err(Error::integrity(format!(
+                    "recover history floor for target '{target}': the durable backup {} exists but does not pass the floor integrity binding — refusing to restore an unvalidated backup over the marker",
+                    leftovers[0].display()
+                )))
+            };
+        };
+        std::fs::rename(&backup, &p)
+            .map_err(|e| Error::store(format!("recover floor {}: {e}", backup.display())))?;
+        sync_parent_dir(&p)
+    }
+
     /// Read the target's history-floor marker, or `None` when no checkpoint
     /// has been established. FAILS CLOSED on every integrity violation:
     ///
@@ -670,18 +753,26 @@ impl LocalStore {
     /// * (c) an attempt must exist with `deployment_id ==
     ///   marker.deployment_id` (the floor's own deployment must be in the
     ///   target's attempts log).
-    /// * (d) TORN ADVANCE: when the marker is ABSENT but a leftover backup
-    ///   sibling (`history-floor.json.prev.<tag>` — the current,
-    ///   transaction-tagged scheme — or a legacy untagged
+    /// * (d) TORN ADVANCE (validated-backup fallback): when the marker is
+    ///   ABSENT but a leftover backup sibling (`history-floor.json.prev.<tag>`
+    ///   — the current, transaction-tagged scheme — or a legacy untagged
     ///   `history-floor.json.prev`) exists, an ADVANCE was interrupted
-    ///   mid-flight and its restore of the previous floor A failed — the
-    ///   marker cannot be trusted. This state is NEVER treated as "no
-    ///   floor" (which would expose the below-floor prefix): it fails
-    ///   closed with an integrity error. (A marker PRESENT alongside a
-    ///   leftover backup is fine — the success path removes the backup
-    ///   best-effort, reads are keyed on the marker, never the backup, and
-    ///   the next advance reconciles the leftover away. A stale backup is
-    ///   NEVER treated as the active floor or restored over a newer one.)
+    ///   mid-flight and its restore of the previous floor A failed. This
+    ///   state is NEVER treated as "no floor" (which would expose the
+    ///   below-floor prefix): the backup is VALIDATED against the SAME
+    ///   integrity binding as the marker — schema version, target binding,
+    ///   the exact snapshot pair, and the matching attempt, checks (a)–(c)
+    ///   above — and, when valid, IS the ACTIVE floor: the read returns A,
+    ///   exactly as if A were still the marker (a reader during a torn
+    ///   state sees the pre-advance floor, never None, never an error). A
+    ///   backup that FAILS validation is NOT trusted: the read fails closed
+    ///   with an integrity error (an unvalidatable backup is never "no
+    ///   floor" either). Recovery of the torn state is
+    ///   [`LocalStore::recover_history_floor_backup`] — the ATOMIC RESTORE
+    ///   of the backup (rename + parent-dir fsync), never its deletion.
+    ///   (A marker PRESENT alongside a leftover backup is fine — the
+    ///   success path removes the backup best-effort, and reads prefer the
+    ///   marker, never the backup.)
     ///
     /// Each violation is an [`Error::integrity`] error, so a corrupted or
     /// tampered marker is NEVER silently treated as "no floor" (which would
@@ -691,22 +782,36 @@ impl LocalStore {
     /// gated readers, never the marker directly.
     pub(crate) fn read_history_floor(&self, target: &str) -> Result<Option<HistoryFloor>> {
         let p = self.history_floor_path(target);
-        // TORN-ADVANCE FAIL-CLOSED CHECK (the transactional-replacement
-        // counterpart): when an ADVANCE (A → B) failed before B's durability
-        // commit point AND the restore of A also failed, the marker may be
-        // left ABSENT while the pre-advance floor A still sits in the
-        // durable, transaction-tagged backup. ANY leftover backup sibling
-        // (tagged `history-floor.json.prev.<tag>` or a legacy untagged
-        // `history-floor.json.prev`) with no marker means an advance was
-        // interrupted mid-flight and the marker cannot be trusted — fail
-        // closed (never "no floor", which would expose the below-floor
-        // prefix). A marker PRESENT alongside a leftover backup is fine:
-        // the success path removes the backup best-effort, reads are keyed
-        // on the marker, never the backup, and the next advance's
-        // reconciliation removes the leftover durably.
+        // TORN-ADVANCE VALIDATED-BACKUP FALLBACK (the
+        // transactional-replacement counterpart): when an ADVANCE (A → B)
+        // failed before B's durability commit point AND the restore of A
+        // also failed, the marker may be left ABSENT while the pre-advance
+        // floor A still sits in a durable backup sibling (a tagged
+        // `history-floor.json.prev.<tag>` or a legacy untagged
+        // `history-floor.json.prev`). ANY leftover backup with no marker
+        // means an advance was interrupted mid-flight and its restore
+        // failed — this is NEVER "no floor" (which would expose the
+        // below-floor prefix): the backup is VALIDATED against the SAME
+        // integrity binding as the marker (schema version, target binding,
+        // exact snapshot pair, matching attempt) and, when valid, IS the
+        // active floor — the read returns A, so a reader during a torn
+        // state sees exactly the pre-advance floor (never None, never an
+        // error). A backup that FAILS validation is NOT trusted: the read
+        // fails closed with an integrity error (an unvalidatable backup is
+        // never "no floor" either). A marker PRESENT alongside a leftover
+        // backup is fine: the success path removes the backup best-effort,
+        // and reads prefer the marker, never the backup.
         if !p.exists() {
+            // The validated-backup fallback: a VALIDATED leftover backup IS
+            // the active floor A — the torn state is read as the
+            // pre-advance floor (never None, never an error).
+            if let Some((_, floor)) = self.validated_backup(target, &p) {
+                return Ok(Some(floor));
+            }
             let leftovers = floor_backup_siblings(&p);
             if !leftovers.is_empty() {
+                // Leftovers exist but NONE validates: fail closed (an
+                // unvalidatable backup is never "no floor" either).
                 return Err(Error::integrity(format!(
                     "history floor for target '{target}' is missing but its durable backup {} exists: a floor ADVANCE was interrupted and its restore failed — refusing to treat this as 'no floor' (which would expose the below-floor prefix)",
                     leftovers[0].display()
@@ -718,20 +823,55 @@ impl LocalStore {
         // wrong types, missing fields) is semantic corruption → Integrity;
         // only an actual filesystem read failure is Store.
         let floor: HistoryFloor = read_json_marker(&p)?;
+        self.validate_history_floor(target, &p, &floor)?;
+        Ok(Some(floor))
+    }
+
+    /// The floor's INTEGRITY BINDING, shared by the marker
+    /// ([`LocalStore::read_history_floor`]'s present-marker path) and the
+    /// validated-backup fallback (a torn advance with the marker ABSENT):
+    /// `floor` read from `source` (the marker path or the durable backup)
+    /// must pass the same checks —
+    ///
+    /// * `schema_version` must be exactly [`SCHEMA_VERSION`]; any other
+    ///   version fails with an error naming the version (a floor written by
+    ///   a different schema is never silently interpreted).
+    /// * the floor's `target` must match the path it was read from
+    ///   (`floor.target == target`): a floor is bound to the target
+    ///   directory it lives in, so a floor smuggled into another target's
+    ///   `refs/` can never gate (or leak into) that target's history.
+    /// * a snapshot must exist with EXACTLY `index == snapshot_index` AND
+    ///   `deployment_id == floor.deployment_id` — the exact snapshot pair,
+    ///   never the index alone (a floor must name a real rollback state
+    ///   that still exists).
+    /// * an attempt must exist with `deployment_id == floor.deployment_id`
+    ///   (the floor's own deployment must be in the target's attempts
+    ///   log).
+    ///
+    /// Every violation is an [`Error::integrity`] error, so a corrupted or
+    /// tampered floor — marker OR backup — is NEVER silently treated as
+    /// "no floor" (which would expose the below-floor prefix).
+    fn validate_history_floor(
+        &self,
+        target: &str,
+        source: &Path,
+        floor: &HistoryFloor,
+    ) -> Result<()> {
         if floor.schema_version != SCHEMA_VERSION {
             return Err(Error::integrity(format!(
-                "history floor for target '{target}' carries unsupported schema_version {} (expected {SCHEMA_VERSION}): only SCHEMA_VERSION is accepted",
+                "history floor at {} carries unsupported schema_version {} (expected {SCHEMA_VERSION}): only SCHEMA_VERSION is accepted",
+                source.display(),
                 floor.schema_version
             )));
         }
-
-        // from. A marker with a foreign `target` is a tampered/corrupted
-        // marker — it is refused, not interpreted as a floor for either the
-        // path target or the named target.
+        // BINDING (a): the floor must name the target directory it lives
+        // in. A floor with a foreign `target` is a tampered/corrupted floor
+        // — it is refused, not interpreted as a floor for either the path
+        // target or the named target.
         if floor.target.as_str() != target {
             return Err(Error::integrity(format!(
-                "history floor marker at {} is not bound to its path: marker.target = '{}' but the marker was read for target '{target}' (a floor marker must name the target directory it lives in)",
-                p.display(),
+                "history floor at {} is not bound to its path: floor.target = '{}' but the floor was read for target '{target}' (a floor must name the target directory it lives in)",
+                source.display(),
                 floor.target
             )));
         }
@@ -746,7 +886,7 @@ impl LocalStore {
             .any(|s| s.index == floor.snapshot_index && s.deployment_id == floor.deployment_id);
         if !bound_snapshot {
             return Err(Error::integrity(format!(
-                "history floor for target '{target}' is not bound to a snapshot: no snapshot has EXACTLY index s{} AND deployment '{}' (the exact snapshot pair the marker names does not exist in refs/snapshots.jsonl)",
+                "history floor for target '{target}' is not bound to a snapshot: no snapshot has EXACTLY index s{} AND deployment '{}' (the exact snapshot pair the floor names does not exist in refs/snapshots.jsonl)",
                 floor.snapshot_index, floor.deployment_id
             )));
         }
@@ -764,7 +904,7 @@ impl LocalStore {
                 floor.deployment_id
             )));
         }
-        Ok(Some(floor))
+        Ok(())
     }
 
     /// Path of the target's pending-checkpoint-cleanup marker
