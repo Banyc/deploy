@@ -199,24 +199,21 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     assert_eq!(
         snapshots.len(),
         1,
-        "one successful snapshot (s0 of production)"
+        "one successful snapshot (keyed by the deployment id)"
     );
-    assert_eq!(snapshots[0].index, 0);
+    assert_eq!(
+        snapshots[0].deployment_id, attempt.deployment_id,
+        "the snapshot is keyed by the deployment that produced it"
+    );
 
     // `deploy log production` renders one line per attempt, each PREFIXED
-    // with the snapshot id (`sN`) of the snapshot that attempt produced —
-    // the same `sN` notation the push reference grammar accepts. This
-    // successful attempt produced the canonical `s0`.
+    // with the DEPLOYMENT ID of the snapshot that attempt produced — the
+    // exact rollback key the push reference grammar accepts.
     let log_lines = cli::render_log(&store, "production", &attempts)?;
     assert_eq!(log_lines.len(), 1, "one line in `deploy log production`");
     assert!(
-        log_lines[0].starts_with(&format!("s{}  ", snapshots[0].index)),
-        "log line must be prefixed with the snapshot id: {}",
-        log_lines[0]
-    );
-    assert!(
-        log_lines[0].starts_with(&format!("s0  {}", attempt.deployment_id)),
-        "successful attempt renders its snapshot id: {}",
+        log_lines[0].starts_with(&format!("{}  ", attempt.deployment_id)),
+        "log line must be prefixed with the rollback deployment id: {}",
         log_lines[0]
     );
 

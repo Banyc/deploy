@@ -3,7 +3,7 @@
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::history::{PushRef, resolve_snapshot};
+use crate::history::{PushRef, resolve_deployment};
 use crate::model::{
     ArtifactRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, ReleaseRecord, ServerId,
     TreeDigest, VariantName,
@@ -111,8 +111,11 @@ pub fn plan_assignments(
             }
             Ok((out, local_release_id.clone(), PlanSource::Head))
         }
-        PushRef::Snapshot { target: ft, index } => {
-            let entry = resolve_snapshot(store, ft, *index)?;
+        PushRef::Deployment {
+            target: ft,
+            deployment_id,
+        } => {
+            let entry = resolve_deployment(store, ft, deployment_id)?;
             let recorded: BTreeSet<String> =
                 entry.slots.keys().map(|s| s.as_str().to_string()).collect();
             let current: BTreeSet<String> =
@@ -132,19 +135,22 @@ pub fn plan_assignments(
             // unverifiable and refuses for the same reason.
             for (slot, sdef) in &members {
                 let slot_id = PlacementSlotId::new(slot.id.clone());
-                let current = PhysicalBinding {
+                let current_binding = PhysicalBinding {
                     server: ServerId::new(sdef.id.clone()),
                     deploy_dir: slot.deploy_dir.to_string_lossy().into_owned(),
                 };
                 let recorded = entry.bindings.get(&slot_id).ok_or_else(|| {
                     Error::rollback(format!(
-                        "slot '{slot_id}' has no recorded physical binding in snapshot s{index} of target '{ft}'; exact rollback cannot verify the deployment location"
+                        "slot '{slot_id}' has no recorded physical binding in deployment '{deployment_id}' of target '{ft}'; exact rollback cannot verify the deployment location"
                     ))
                 })?;
-                if recorded != &current {
+                if recorded != &current_binding {
                     return Err(Error::rollback(format!(
-                        "slot '{slot_id}' was bound to server '{}' at '{}' in snapshot s{index} of target '{ft}', now bound to '{}' at '{}'; exact rollback would deploy to the wrong host",
-                        recorded.server, recorded.deploy_dir, current.server, current.deploy_dir
+                        "slot '{slot_id}' was bound to server '{}' at '{}' in deployment '{deployment_id}' of target '{ft}', now bound to '{}' at '{}'; exact rollback would deploy to the wrong host",
+                        recorded.server,
+                        recorded.deploy_dir,
+                        current_binding.server,
+                        current_binding.deploy_dir
                     )));
                 }
             }
@@ -171,7 +177,11 @@ pub fn plan_assignments(
                     artifact: g.assignment.artifact.clone(),
                 });
             }
-            Ok((out, release, PlanSource::SnapshotRef(*index)))
+            Ok((
+                out,
+                release,
+                PlanSource::DeploymentRef(deployment_id.clone()),
+            ))
         }
         PushRef::Release { release } => {
             let rec = store
@@ -887,7 +897,7 @@ interval_seconds = 0
     /// VARIANT — never the caller's current config. Variant-renamed scenario:
     /// the snapshot's release ships BOTH the historical variant `old` (which
     /// declares p1 at snapshot time) and the current `new` variant, and the
-    /// CURRENT config declares p1 inside `new.toml`. A `PushRef::Snapshot`
+    /// CURRENT config declares p1 inside `new.toml`. A `PushRef::Deployment`
     /// ref must still plan `old` + its tree, not the current declaring file.
     #[test]
     fn snapshot_ref_restores_historical_variant_after_rename() {
@@ -925,7 +935,6 @@ interval_seconds = 0
         let release = consistent(&mut rec);
         store.write_release(&rec).unwrap();
         let snapshot = DeploymentSnapshot {
-            index: 0,
             deployment_id: DeploymentId::new("deploy-snapshot-histvar".to_string()),
             target: TargetName::new("t1".to_string()),
             behavior_sha256: "sha256-aa".to_string(),
@@ -958,26 +967,29 @@ interval_seconds = 0
         // `new` and the release also ships it.
         let (assignments, desired, source) = plan_assignments(
             "t1",
-            &PushRef::Snapshot {
+            &PushRef::Deployment {
                 target: TargetName::new("t1".to_string()),
-                index: 0,
+                deployment_id: DeploymentId::new("deploy-snapshot-histvar".to_string()),
             },
             &ReleaseId::new("unused".to_string()),
             &BTreeMap::new(),
             &store,
             &config,
         )
-        .expect("snapshot ref resolves");
+        .expect("deployment ref resolves");
         assert_eq!(assignments[0].artifact.variant.as_str(), "old");
         assert_eq!(assignments[0].artifact.tree.as_str(), "tree-old");
         assert_eq!(assignments[0].artifact.release, release);
         assert_eq!(desired, release);
-        assert_eq!(source, PlanSource::SnapshotRef(0));
+        assert_eq!(
+            source,
+            PlanSource::DeploymentRef(DeploymentId::new("deploy-snapshot-histvar".to_string()))
+        );
     }
 
     /// A LEGACY snapshot (no `bindings` map — the pre-feature shape)
     /// makes exact rollback unverifiable: `plan_assignments` must REFUSE the
-    /// `sN` ref with a rollback error naming the slot, rather than guessing
+    /// deployment ref with a rollback error naming the slot, rather than guessing
     /// the host/location. The integration tests cover binding MISMATCH
     /// (`rollback_refuses_rebound_slot` / `rollback_refuses_moved_deploy_dir`);
     /// this pins the MISSING-binding refusal (the `#[serde(default)]` empty
@@ -998,7 +1010,6 @@ interval_seconds = 0
         // A snapshot whose `slots` record the generation but whose `bindings`
         // map is EMPTY (legacy pre-feature line).
         let snapshot = DeploymentSnapshot {
-            index: 0,
             deployment_id: DeploymentId::new("deploy-legacy-snapshot".to_string()),
             target: TargetName::new("t1".to_string()),
             behavior_sha256: "sha256-aa".to_string(),
@@ -1022,23 +1033,23 @@ interval_seconds = 0
 
         let err = plan_assignments(
             "t1",
-            &PushRef::Snapshot {
+            &PushRef::Deployment {
                 target: TargetName::new("t1".to_string()),
-                index: 0,
+                deployment_id: DeploymentId::new("deploy-legacy-snapshot".to_string()),
             },
             &ReleaseId::new("unused".to_string()),
             &BTreeMap::new(),
             &store,
             &config,
         )
-        .expect_err("a snapshot ref whose snapshot recorded no physical binding must refuse");
+        .expect_err("a deployment ref whose snapshot recorded no physical binding must refuse");
         let msg = err.to_string();
         assert!(
             msg.contains("no recorded physical binding") && msg.contains("p1"),
             "error must name the unverifiable slot and the missing binding, got: {msg}"
         );
         assert!(
-            msg.contains("s0") || msg.contains("exact rollback"),
+            msg.contains("exact rollback"),
             "error must explain the exact-rollback verification failure, got: {msg}"
         );
     }
@@ -1115,7 +1126,6 @@ interval_seconds = 0
 
         // The SOURCE deployment's snapshot records the OLD binding.
         let snapshot = DeploymentSnapshot {
-            index: 0,
             deployment_id: DeploymentId::new("deploy-source".to_string()),
             target: TargetName::new("t1".to_string()),
             behavior_sha256: "sha256-aa".to_string(),
@@ -1218,9 +1228,9 @@ interval_seconds = 0
             // same refusal as before this feature.
             let err = plan_assignments(
                 "t1",
-                &PushRef::Snapshot {
+                &PushRef::Deployment {
                     target: TargetName::new("t1".to_string()),
-                    index: 0,
+                    deployment_id: DeploymentId::new("deploy-source".to_string()),
                 },
                 &ReleaseId::new("unused".to_string()),
                 &BTreeMap::new(),
@@ -1235,11 +1245,12 @@ interval_seconds = 0
             );
 
             // Cross-target branch: the destination `t2` has ZERO snapshot
-            // history — the release was built/pushed elsewhere. The snapshot-
-            // family refs cannot even RESOLVE there (no chain to step, no
-            // snapshot referencing the release), while the direct form works.
+            // history — the release was built/pushed elsewhere. The
+            // deployment-history refs cannot even RESOLVE there (no chain to
+            // step — the source deployment id is not a t2 deployment), while
+            // the direct form works.
             if cross_target {
-                for token in ["@-", "s0", "parent(@, 1)"] {
+                for token in ["@-", "parent(@, 1)"] {
                     crate::history::resolve_ref_expr(
                         &crate::history::parse_ref_expr(token).expect("family tokens must parse"),
                         "t2",
@@ -1248,12 +1259,17 @@ interval_seconds = 0
                     .expect_err(&format!("{token} on the no-history destination must fail"));
                 }
                 crate::history::resolve_ref_expr(
-                    &crate::history::parse_ref_expr(&format!("parent({release}, 0)"))
-                        .expect("release-id parent must parse"),
+                    &crate::history::parse_ref_expr("deploy-source")
+                        .expect("deployment id must parse"),
                     "t2",
                     &store,
                 )
-                .expect_err("no snapshot references the release on t2; the refid must fail");
+                .expect_err("no snapshot for the deployment on t2; the deployment id must fail");
+                // The removed release-refid / sN forms are rejected at parse.
+                for token in ["s0", &format!("parent({release}, 0)")] {
+                    crate::history::parse_ref_expr(token)
+                        .expect_err(&format!("legacy form '{token}' must be rejected"));
+                }
             }
         }
     }
@@ -1518,6 +1534,121 @@ interval_seconds = 0
                     );
                 }
             }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // DEPLOYMENT-KEYED ROLLBACK PROPERTY: `deploy push <target> <id>` plans
+    // EXACTLY the snapshot recorded for that deployment (the user's
+    // requirement — the plan's slots/behavior/release equal the stored
+    // payload, keyed by deployment id).
+    // ---------------------------------------------------------------------
+
+    // THE DEPLOYMENT-KEYED ROLLBACK PROPERTY: for generated deployment
+    // histories, `PushRef::Deployment { deployment_id }` (the resolution of
+    // `deploy push <target> <deployment-id>`) plans EXACTLY the snapshot
+    // recorded for that deployment — each slot's artifact (release, variant,
+    // tree) equals the snapshot's stored generation ref, the plan's release
+    // is the snapshot's release, and the source is `DeploymentRef(id)`.
+    // The plan runs the exact-binding checks (membership + physical
+    // bindings) against the CURRENT config, so the generated snapshot is
+    // bound to the config's own member slot (`p1` on server `s1` at
+    // `/srv/plan`); a deployment id with NO snapshot never plans.
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            // Bounded + fixed seed: deterministic floor, fast.
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn deployment_ref_plans_exactly_the_recorded_snapshot(
+            tree in "[a-f0-9]{6,16}",
+            generation in "[a-z0-9]{4,10}",
+            behavior in "[a-f0-9]{4,16}",
+        ) {
+            let (_dir, config) = project_with_config();
+            let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
+            let deployment_id = DeploymentId::new("deploy-prop-plan".to_string());
+            let snapshot_release = ReleaseId::new(format!("rel-sha256-{tree}"));
+            let snapshot = DeploymentSnapshot {
+                deployment_id: deployment_id.clone(),
+                target: TargetName::new("t1".to_string()),
+                behavior_sha256: format!("sha256-{behavior}"),
+                slots: BTreeMap::from([(
+                    PlacementSlotId::new("p1".to_string()),
+                    GenerationRef {
+                        generation: GenerationId::new(format!("gen-{generation}")),
+                        assignment: PlacementSlotAssignment {
+                            placement_slot: PlacementSlotId::new("p1".to_string()),
+                            artifact: ArtifactRef {
+                                release: snapshot_release.clone(),
+                                variant: VariantName::new("standard".to_string()),
+                                tree: TreeDigest::new(tree.clone()),
+                            },
+                        },
+                    },
+                )]),
+                bindings: BTreeMap::from([(
+                    PlacementSlotId::new("p1".to_string()),
+                    PhysicalBinding {
+                        server: ServerId::new("s1".to_string()),
+                        deploy_dir: "/srv/plan".to_string(),
+                    },
+                )]),
+            };
+            store.append_snapshot("t1", &snapshot).unwrap();
+
+            let (assignments, desired, source) = plan_assignments(
+                "t1",
+                &PushRef::Deployment {
+                    target: TargetName::new("t1".to_string()),
+                    deployment_id: deployment_id.clone(),
+                },
+                &ReleaseId::new("unused-local".to_string()),
+                &BTreeMap::new(),
+                &store,
+                &config,
+            )
+            .unwrap_or_else(|e| panic!("the deployment id must plan its stored state: {e}"));
+
+            // EXACTLY the stored state: one slot, its artifact (variant +
+            // tree + release) byte-identical to the snapshot's recorded
+            // GenerationRef.
+            assert_eq!(assignments.len(), 1, "one member slot");
+            let a = &assignments[0];
+            let stored = &snapshot.slots[&PlacementSlotId::new("p1")];
+            assert_eq!(a.placement_slot, PlacementSlotId::new("p1"));
+            assert_eq!(a.artifact, stored.assignment.artifact, "the planned artifact must equal the snapshot's stored artifact");
+            assert_eq!(desired, snapshot_release, "the rollout release is the snapshot's release");
+            assert_eq!(
+                source,
+                PlanSource::DeploymentRef(deployment_id.clone()),
+                "the plan source records the deployment key"
+            );
+
+            // A deployment id with NO snapshot never plans (failed / unknown
+            // ids fail closed at the plan boundary too).
+            let missing = DeploymentId::new("deploy-prop-missing".to_string());
+            let err = plan_assignments(
+                "t1",
+                &PushRef::Deployment {
+                    target: TargetName::new("t1".to_string()),
+                    deployment_id: missing.clone(),
+                },
+                &ReleaseId::new("unused".to_string()),
+                &BTreeMap::new(),
+                &store,
+                &config,
+            )
+            .expect_err("an unknown deployment id must refuse to plan");
+            assert!(
+                err.to_string().contains(missing.as_str())
+                    || err.to_string().contains("deployment"),
+                "the refusal must name the missing deployment, got: {err}"
+            );
         }
     }
 }

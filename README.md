@@ -67,9 +67,9 @@ Then deploy:
 
 ```sh
 deploy push production --dry-run   # preview the plan; touches nothing
-deploy push production             # deploy (status: Successful, snapshot s0 of production)
+deploy push production             # deploy (status: Successful; rollback payload keyed by deployment id)
 deploy status production           # what is actually running on each server
-deploy log production              # deployment history (each line prefixed with its snapshot id sN)
+deploy log production              # deployment history (each line prefixed with the rollback deployment id)
 ```
 
 To retain a bounded history, establish a checkpoint once the rollout is
@@ -98,7 +98,7 @@ addresses need neither.
 | --- | --- |
 | `deploy init [PATH]` | Scaffold a fresh project (see above). |
 | `deploy push <target> [ref]` | Deploy local files (or restore a ref) to every server in the target, in rollout batches. |
-| `deploy log <target>` | Deployment history — successful *and* failed attempts, each line prefixed with the snapshot id (`sN`) it produced (`-` for attempts with no snapshot). The visible history is the retained suffix when a checkpoint has been established. |
+| `deploy log <target>` | Deployment history — successful *and* failed attempts, each line prefixed with the rollback deployment id it produced (`-` for attempts with no snapshot). The visible history is the retained suffix when a checkpoint has been established. |
 | `deploy status <target>` | What is actually running on each server right now (generation, release, variant, tree). |
 | `deploy checkpoint <target> <deployment-id>` | Establish a monotonic HISTORY FLOOR at a successful deployment, then compact the history and run best-effort local artifact garbage collection (irreversible — requires `--yes`; `--dry-run` previews the discard list). |
 
@@ -113,37 +113,43 @@ deploy push production --dry-run                 # preview; touches nothing
 deploy push production
 # jj-style references: the target is passed ONCE, never repeated in the
 # reference; every relative form resolves against the target argument.
-deploy push production @-              # roll back to the PREVIOUS successful snapshot
-deploy push production @--             # two snapshots back (the grandparent)
+deploy push production @-              # roll back to the PREVIOUS successful deployment
+deploy push production @--             # two deployments back (the grandparent)
 # parent(...) forms contain a comma — the shell splits them at the space, so
 # quote them on the command line:
-deploy push production 'parent(@, 3)'    # three snapshots back from the latest
+deploy push production 'parent(@, 3)'    # three deployments back from the latest
 # DIRECT release deploy: the named release to the CURRENT target's slots,
 # from the release's OWN stored slot snapshot — no history needed, cross-
 # target capable (release:<id>; the refid forms below are snapshot ancestry).
 # The target's CURRENT slot membership must exactly match the slot set the
 # release froze for it; a drifted membership is rejected before remote access.
 deploy push production release:rel-sha256-41da2f63a950
-# refids resolve to exact snapshots, then step N ancestors (N = 0 is the
-# snapshot itself):
-deploy push production s2              # the exact 2nd successful snapshot
-deploy push production s2--            # two snapshots before snapshot s2
-deploy push production 'parent(s2, 1)'   # one snapshot before s2
-deploy push production deploy-20260821T102000Z--   # 2 before the snapshot that deployed that deployment
-deploy push production rel-sha256-41da2f63--        # 2 before the most recent snapshot referencing that release
+# deployment-id refs resolve to EXACT stored states, then step N ancestors
+# (N = 0 is the deployment itself; positions are DERIVED from the log order):
+deploy push production deploy-20260821T102000Z              # EXACT stored state of that deployment
+deploy push production deploy-20260821T102000Z--            # two deployments before it
+deploy push production 'parent(deploy-20260821T102000Z, 1)'   # one deployment before it
 ```
 
-- Every *successful* deployment appends a snapshot (`s0`, `s1`, …),
-  referenced on the push command as `sN` (e.g. `deploy push production s3`);
-  failed and degraded attempts never
-  advance the rollback ref and cannot be rolled back to.
-- A refid is a snapshot index (`sN`), a deployment id (`deploy-...`), or a
-  release id (`rel-sha256-...` or a bare digest). Deployment/release refids
-  resolve to the MOST RECENT snapshot that deployed the deployment /
-  references the release, then walk the ancestor steps (`s(index - N)`).
+ROLLBACK PAYLOADS ARE KEYED BY DEPLOYMENT ID: `@`, `@-`, `@--`, and
+`parent(...)` walk the target's DEPLOYMENT HISTORY — the snapshot log in
+deployment order (each successful deployment IS a rollback payload keyed by
+its id; failed and degraded attempts never resolve). The old `sN`
+snapshot-index forms (`sN`, `sN-`, `sN--`, `parent(sN, M)`) and the
+release-refid ancestor forms are REMOVED — migrate `sN` to the deployment id
+of that snapshot's deployment (`deploy log` shows it), and reference a
+release only via `release:<id>`.
+
+- Every *successful* deployment appends a snapshot KEYED BY ITS DEPLOYMENT
+  ID; `deploy push <target> <deployment-id>` restores exactly that
+  deployment's stored state; failed and degraded attempts never advance the
+  rollback ref and cannot be rolled back to.
+- A refid is a deployment id (`deploy-...`). It resolves to THAT deployment's
+  stored rollback payload, then walks the ancestor steps (N positions back in
+  the deployment history — positions are derived, never stored).
 - `release:<id>` is the DIRECT release form (shell-safe, no slash): deploy
   the named release to the current target's slots from the release's OWN
-  stored slot-variant snapshot — no snapshot-chain stepping, no
+  stored slot-variant snapshot — no deployment-history stepping, no
   deployment-snapshot exact-binding checks, and no target snapshot history
   required (the release may be built/pushed anywhere; a fresh target
   deploys directly). The target's CURRENT slot membership must EXACTLY
@@ -152,11 +158,10 @@ deploy push production rel-sha256-41da2f63--        # 2 before the most recent s
   membership drift — a slot added, removed, or renamed since the release
   was built — is rejected at plan time, before any remote access, and
   physical bindings (server / `deploy_dir`) are intentionally allowed to
-  differ. The release refid forms above remain snapshot ancestry and keep
-  their exact-binding checks.
+  differ.
 - Out-of-range refs fail closed before anything runs: an empty chain, a
-  missing refid, or walking past the start of the chain is a ref error — never
-  an underflow or a guess.
+  missing deployment id, or walking past the start of the chain is a ref
+  error — never an underflow or a guess.
 - Pushing identical content prints `Everything up to date`.
 - Rollout is batched per `rollout.batch_size`; on a failed server, earlier
   batches roll back by default (`failure_policy: rollback_changed`). The final
@@ -174,12 +179,12 @@ and everything after it is kept.
 
 ```sh
 deploy checkpoint production deploy-20260821T102000Z --dry-run   # preview the discard list; touches nothing
-# would discard 3 snapshots: s0, s1, s2
+# would discard 3 snapshots: deploy-... (the deployments before the checkpoint)
 # would discard 4 attempts: deploy-...
 # would delete 4 deployment directories: ...
 deploy checkpoint production deploy-20260821T102000Z --yes       # establish the floor (IRREVERSIBLE)
 deploy log production       # now shows only the retained suffix
-deploy push production s3   # the checkpoint snapshot stays the oldest rollback
+deploy push production deploy-20260821T102000Z   # the checkpoint deployment stays the oldest rollback
 ```
 
 - The deployment id is an explicit, REQUIRED argument (the operation is

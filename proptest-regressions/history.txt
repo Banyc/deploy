@@ -1,8 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 202662ea72e6c466046849ec9fabb306b73a4765a1add491c7a2017b90447679 # shrinks to (chain_idx, floor) = ([1], None), token = "@-"
-cc dd852523edff9f5e4997646f5a5155fdf9f63e19f702b8a9ba23d53216395ac5 # shrinks to (chain_idx, floor) = ([], None), token = "parent(@, 0)"

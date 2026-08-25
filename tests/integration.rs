@@ -117,6 +117,20 @@ targets = ["production"]
 deploy_dir = "/srv/deploy/example"
 "#;
 
+/// The deployment id of the LAST successful snapshot on `target` — the
+/// deployment-keyed rollback ref (rollback payloads are keyed by deployment
+/// id; the old `sN` index is gone).
+fn latest_deployment_id(store: &deploy::store::local::LocalStore, target: &str) -> String {
+    store
+        .read_snapshots(target)
+        .expect("snapshots readable")
+        .last()
+        .expect("a deployment has been pushed to the target")
+        .deployment_id
+        .as_str()
+        .to_string()
+}
+
 fn write_file(path: &Path, content: &str) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).unwrap();
@@ -431,13 +445,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
     let snapshots = store.read_snapshots("production")?;
     assert_eq!(snapshots.len(), 1);
+    // The rollback ref is the deployment id (the snapshot's key).
+    let dep0 = latest_deployment_id(&store, "production");
     assert_eq!(
         snapshots[0].bindings.get(&PlacementSlotId::new("p1")),
         Some(&PhysicalBinding {
             server: ServerId::new("server-01"),
             deploy_dir: "/srv/deploy/rebind".to_string(),
         }),
-        "s0 records the complete physical binding the slot was deployed onto"
+        "the snapshot records the complete physical binding the slot was deployed onto"
     );
     let s01 = remotes_base.join("server-01");
     assert!(
@@ -467,15 +483,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &config2,
         &PushOptions {
             dry_run: false,
-            ref_token: Some("s0".to_string()),
+            ref_token: Some(dep0.clone()),
         },
     )
     .expect_err("rebound slot must refuse exact rollback");
     let msg = err.to_string();
     assert!(
-        msg.contains(
-            "slot 'p1' was bound to server 'server-01' at '/srv/deploy/rebind' in snapshot s0 of target 'production'"
-        ),
+        msg.contains(&format!(
+            "slot 'p1' was bound to server 'server-01' at '/srv/deploy/rebind' in deployment '{dep0}' of target 'production'"
+        )),
         "error must name the slot, the recorded server and its deploy_dir, got: {msg}"
     );
     assert!(
@@ -632,7 +648,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let current_target = |root: &std::path::Path| std::fs::read_link(root.join("current")).ok();
     let gens_before = gen_count(&root);
     let current_before = current_target(&root);
-    assert!(gens_before >= 1, "s0 minted at least one generation");
+    assert!(
+        gens_before >= 1,
+        "the first deployment minted at least one generation"
+    );
+    let dep0 = latest_deployment_id(&store, "production");
 
     let err = push(
         &config_path,
@@ -642,15 +662,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &config2,
         &PushOptions {
             dry_run: false,
-            ref_token: Some("s0".to_string()),
+            ref_token: Some(dep0.clone()),
         },
     )
     .expect_err("moved deploy_dir must refuse exact rollback");
     let msg = err.to_string();
     assert!(
-        msg.contains(
-            "slot 'p1' was bound to server 'server-01' at '/srv/move/movedir-a' in snapshot s0 of target 'production'"
-        ),
+        msg.contains(&format!(
+            "slot 'p1' was bound to server 'server-01' at '/srv/move/movedir-a' in deployment '{dep0}' of target 'production'"
+        )),
         "error must name the slot, the recorded server AND its deploy_dir, got: {msg}"
     );
     assert!(
@@ -1794,8 +1814,10 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
+    let dep0 = latest_deployment_id(&store, "production");
 
-    // Change the configuration to behavior B, then roll back to s0.
+    // Change the configuration to behavior B, then roll back to the first
+    // deployment (keyed by its deployment id).
     let config_b = setup_single(&proj, "false", true, 1);
     let rrb = push(
         &proj.join("deploy.toml"),
@@ -1805,7 +1827,7 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
         &config_b,
         &PushOptions {
             dry_run: false,
-            ref_token: Some("s0".to_string()),
+            ref_token: Some(dep0),
         },
     )?;
     assert_eq!(rrb.status, Some(DeploymentStatus::Successful));
@@ -1933,6 +1955,7 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
     std::fs::remove_file(&behavior_path)
         .map_err(|e| deploy::error::Error::store(format!("rm {e}")))?;
 
+    let dep0 = latest_deployment_id(&store, "production");
     let config_b = setup_single(&proj, "false", true, 1);
     let rrb = push(
         &proj.join("deploy.toml"),
@@ -1942,7 +1965,7 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
         &config_b,
         &PushOptions {
             dry_run: false,
-            ref_token: Some("s0".to_string()),
+            ref_token: Some(dep0),
         },
     );
     assert!(
@@ -2056,8 +2079,10 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
     let before = remote_fingerprint(&remotes_base);
     let attempts_before = store.read_attempts("production")?.len();
 
-    // Roll back to s0 under a DIFFERENT current configuration (behavior B). The
-    // push must fail closed in preflight, NOT fall back to B.
+    // Roll back to the first deployment (keyed by its deployment id) under a
+    // DIFFERENT current configuration (behavior B). The push must fail
+    // closed in preflight, NOT fall back to B.
+    let dep0 = latest_deployment_id(&store, "production");
     let config_b = setup_single(&proj, "false", true, 1);
     let rrb = push(
         &proj.join("deploy.toml"),
@@ -2067,7 +2092,7 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
         &config_b,
         &PushOptions {
             dry_run: false,
-            ref_token: Some("s0".to_string()),
+            ref_token: Some(dep0),
         },
     );
     let err = match rrb {
@@ -3552,11 +3577,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 /// stored slot snapshot, never the caller's current variant files. Here the
 /// slot `p1` is declared by variant `standard` in the old release, but the
 /// current config moved the declaration into a new `canary` variant file.
-/// `push production parent(<old-release>, 0)` (the release-refid form,
-/// resolving to the most recent snapshot that deployed it) must still assign
-/// p1 to `standard` (with the old tree) — the pre-refactor code resolved the
-/// variant from the current config and failed with `release ... lacks variant
-/// 'canary'`.
+/// `push production <deployment-id>` (the deployment-keyed rollback ref —
+/// rollback payloads are keyed by deployment id) must still assign p1 to
+/// `standard` (with the old tree) — the pre-refactor code resolved the
+/// variant from the current config and failed with `release ... lacks
+/// variant 'canary'`.
 #[test]
 fn historical_release_resolves_slots_from_stored_snapshot() -> Result<()> {
     let tmp = tempfile::tempdir().unwrap();
@@ -3608,6 +3633,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
+    let dep0 = r0
+        .attempt
+        .as_ref()
+        .expect("attempt")
+        .deployment_id
+        .as_str()
+        .to_string();
     let first = r0.attempt.expect("attempt").slots[&PlacementSlotId::new("p1")].clone();
     let old_release = first.artifact.release.clone();
     let old_tree = first.artifact.tree.clone();
@@ -3654,7 +3686,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &config1,
         &PushOptions {
             dry_run: false,
-            ref_token: Some(format!("parent({}, 0)", old_release.as_str())),
+            ref_token: Some(dep0),
         },
     )?;
     assert_eq!(rh.status, Some(DeploymentStatus::Successful));
@@ -4307,7 +4339,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
     }
 
-    // `s0` rollback on EACH target restores that target's own s0 tree.
+    // Rollback on EACH target (keyed by that target's own first deployment
+    // id) restores that target's stored state.
+    let dep0_prod = latest_deployment_id(&store, "production");
+    let dep0_staging = latest_deployment_id(&store, "staging");
     let rrb_prod = push(
         &proj.join("deploy.toml"),
         &store,
@@ -4316,7 +4351,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &config,
         &PushOptions {
             dry_run: false,
-            ref_token: Some("s0".to_string()),
+            ref_token: Some(dep0_prod),
         },
     )?;
     assert_eq!(rrb_prod.status, Some(DeploymentStatus::Successful));
@@ -4358,7 +4393,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &config,
         &PushOptions {
             dry_run: false,
-            ref_token: Some("s0".to_string()),
+            ref_token: Some(dep0_staging),
         },
     )?;
     assert_eq!(rrb_staging.status, Some(DeploymentStatus::Successful));
@@ -4530,14 +4565,15 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
         "@- restores the snapshot before the latest"
     );
 
-    // Refid forms resolve to exact snapshots: `s3--` = s1, `parent(s1, 1)` =
-    // s0, a deployment refid -> the snapshot that deployed it, a release
-    // refid -> the most recent snapshot referencing that release.
+    // Deployment-keyed refs resolve to exact deployments: `deploys[3]--` =
+    // two back = deploys[1], `parent(deploys[1], 1)` = deploys[0], a bare
+    // deployment id = that deployment, and `parent(deploys[1], 0)` = itself.
+    // (The release-refid and sN forms are REMOVED from the grammar.)
     let refids: [(String, usize); 4] = [
-        ("s3--".to_string(), 1),
-        ("parent(s1, 1)".to_string(), 0),
+        (format!("{}--", deploys[3].as_str()), 1),
+        (format!("parent({}, 1)", deploys[1].as_str()), 0),
         (format!("parent({}, 0)", deploys[1].as_str()), 1),
-        (format!("parent({}, 0)", releases[1].as_str()), 1),
+        (deploys[0].as_str().to_string(), 0),
     ];
     for (token, want) in refids {
         let r = push(
@@ -4563,8 +4599,14 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
         );
     }
 
-    // Out-of-range ancestor walks fail closed as ref errors.
-    for bad in ["parent(@, 99)", "s0-", "parent(s99, 0)"] {
+    // Out-of-range ancestor walks fail closed as ref errors (the sN legacy
+    // forms are rejected at parse).
+    for bad in [
+        "parent(@, 99)",
+        &format!("{}--", deploys[0].as_str()),
+        "s0-",
+        "parent(s99, 0)",
+    ] {
         let err = push(
             &config_path,
             &store,

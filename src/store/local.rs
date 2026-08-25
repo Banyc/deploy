@@ -847,19 +847,26 @@ impl LocalStore {
         Ok(out)
     }
 
-    /// Read the snapshot log as the FLOORED history: only the suffix at/after
-    /// the checkpoint's snapshot index (`index >= floor.snapshot_index`). The
-    /// checkpoint snapshot itself stays resolvable; everything below it was
-    /// discarded. The floor marker gates this read even when the physical
-    /// log has not been compacted yet (an interrupted compaction), so history
-    /// below the durable floor is never exposed. The marker is verified
-    /// ([`LocalStore::read_history_floor`]): a corrupted/tampered marker
-    /// makes this read fail closed with an integrity error — never a silent
-    /// downgrade to "no floor" (which would expose the below-floor prefix).
+    /// Read the snapshot log as the FLOORED history: only the suffix
+    /// beginning at the checkpoint deployment's POSITION in the log (the
+    /// deployment-keyed analog of the old `index >= floor.snapshot_index`
+    /// filter — positions are DERIVED from the log order, never stored). The
+    /// checkpoint deployment itself stays resolvable; everything before it
+    /// was discarded. The floor marker gates this read even when the
+    /// physical log has not been compacted yet (an interrupted compaction),
+    /// so history below the durable floor is never exposed. The marker is
+    /// verified ([`LocalStore::read_history_floor`]): a corrupted/tampered
+    /// marker makes this read fail closed with an integrity error — never a
+    /// silent downgrade to "no floor" (which would expose the below-floor
+    /// prefix).
     pub fn read_snapshots(&self, target: &str) -> Result<Vec<DeploymentSnapshot>> {
         let mut out = self.read_snapshots_raw(target)?;
-        if let Some(floor) = self.read_history_floor(target)? {
-            out.retain(|s| s.index >= floor.snapshot_index);
+        if let Some(floor) = self.read_history_floor(target)?
+            && let Some(pos) = out
+                .iter()
+                .position(|s| s.deployment_id == floor.deployment_id)
+        {
+            out.drain(..pos);
         }
         Ok(out)
     }
@@ -1680,15 +1687,16 @@ mod tests {
     /// The floor marker gates the READER reads even when the physical logs
     /// are NOT yet compacted (an interrupted compaction): `read_attempts` /
     /// `read_snapshots` expose only the suffix at/after the floor while the
-    /// raw readers still see the full physical log (the index-minting view,
-    /// never a below-floor escape hatch). The marker also fails closed on a
-    /// foreign `schema_version`.
+    /// raw readers still see the full physical log (never a below-floor
+    /// escape hatch). The marker also fails closed on a foreign
+    /// `schema_version`.
     #[test]
     fn history_floor_gates_reads_before_compaction() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t-floor";
-        // deploy-a (s0), deploy-b (s1), deploy-c (failed — no snapshot).
+        // deploy-a, deploy-b (both successful — rollback payloads), and
+        // deploy-c (failed — no snapshot).
         let base_attempt = |id: &str| DeploymentAttempt {
             deployment_schema_version: SCHEMA_VERSION,
             deployment_id: DeploymentId::new(id.to_string()),
@@ -1707,7 +1715,6 @@ mod tests {
                     .append_snapshot(
                         target,
                         &DeploymentSnapshot {
-                            index: n as u64,
                             deployment_id: DeploymentId::new(id.to_string()),
                             target: TargetName::new(target.to_string()),
                             behavior_sha256: "sha256-aa".to_string(),
@@ -1725,22 +1732,23 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             target: TargetName::new(target.to_string()),
             deployment_id: DeploymentId::from("deploy-b".to_string()),
-            snapshot_index: 1,
             established_at: "2026-01-01T00:00:00Z".to_string(),
         };
         store.write_history_floor(target, &floor).unwrap();
 
-        // Readers gate on the durable floor: only the suffix is visible.
+        // Readers gate on the durable floor: only the suffix is visible
+        // (deploy-b onward; deploy-c failed and carries no snapshot).
         let snaps = store.read_snapshots(target).unwrap();
-        assert_eq!(snaps.len(), 1, "only s1 is visible");
-        assert_eq!(snaps[0].index, 1);
+        assert_eq!(snaps.len(), 1, "only deploy-b is visible");
+        assert_eq!(snaps[0].deployment_id.as_str(), "deploy-b");
         let attempts = store.read_attempts(target).unwrap();
         assert_eq!(attempts.len(), 2, "deploy-b and deploy-c are visible");
         assert_eq!(attempts[0].deployment_id.as_str(), "deploy-b");
         assert_eq!(attempts[1].deployment_id.as_str(), "deploy-c");
 
-        // The raw (physical) view still shows the full log: index minting
-        // sees everything, and no below-floor history is exposed to readers.
+        // The raw (physical) view still shows the full log: the key space is
+        // the deployment-id space, and no below-floor history is exposed to
+        // readers.
         assert_eq!(store.read_snapshots_raw(target).unwrap().len(), 2);
         assert_eq!(store.read_attempts_raw(target).unwrap().len(), 3);
 
@@ -1762,11 +1770,11 @@ mod tests {
     /// `schema_version` — including the legacy version-1 shape that carried
     /// `pending_deployments` — and is INTEGRITY-BOUND like the history
     /// floor: a marker with a foreign `target`, or (when a floor is given)
-    /// a `deployment_id`/`snapshot_index` that does not EXACTLY match the
-    /// floor's, fails closed with an integrity error. The marker is a flag
-    /// only: the removed `pending_deployments` worklist is gone by
-    /// construction (the logs retain the worklist), so a corrupted marker
-    /// can never name retained or unrelated deployment dirs.
+    /// a `deployment_id` that does not EXACTLY match the floor's, fails
+    /// closed with an integrity error. The marker is a flag only: the
+    /// removed `pending_deployments` worklist is gone by construction (the
+    /// logs retain the worklist), so a corrupted marker can never name
+    /// retained or unrelated deployment dirs.
     #[test]
     fn cleanup_pending_marker_roundtrips_and_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1777,7 +1785,6 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             target: TargetName::new(target.to_string()),
             deployment_id: id.clone(),
-            snapshot_index: 1,
             established_at: "2026-01-01T00:00:00Z".to_string(),
         };
         assert!(
@@ -1792,7 +1799,6 @@ mod tests {
             schema_version: CLEANUP_PENDING_SCHEMA_VERSION,
             target: TargetName::new(target.to_string()),
             deployment_id: id.clone(),
-            snapshot_index: 1,
             established_at: "2026-01-01T00:00:00Z".to_string(),
         };
         store.write_cleanup_pending(target, &pending).unwrap();
@@ -1810,7 +1816,6 @@ mod tests {
             .expect("the target binding alone holds without a floor");
         let foreign_floor = HistoryFloor {
             deployment_id: DeploymentId::new("deploy-other".to_string()),
-            snapshot_index: 9,
             ..floor.clone()
         };
         let err = store
@@ -1853,8 +1858,8 @@ mod tests {
             "schema_version": SCHEMA_VERSION,
             "target": target,
             "deployment_id": "deploy-1",
-            "snapshot_index": 1,
             "established_at": "2026-01-01T00:00:00Z",
+            "snapshot_index": 1,
             "pending_deployments": ["deploy-0", "deploy-foreign"],
         });
         write_json(&store.cleanup_pending_path(target), &legacy).unwrap();
@@ -1924,7 +1929,9 @@ mod tests {
         }
 
         // Wrong types: the field is PRESENT but carries the wrong JSON
-        // type (both markers share these three field names).
+        // type (both markers share these field names — `snapshot_index` is
+        // an ignored legacy key now, so the wrong-type pair uses the
+        // identity/age fields instead).
         let mut as_string = obj.clone();
         as_string.insert("schema_version".into(), serde_json::Value::from("1"));
         out.push(serde_json::to_vec(&serde_json::Value::Object(as_string)).unwrap());
@@ -1934,7 +1941,7 @@ mod tests {
         out.push(serde_json::to_vec(&serde_json::Value::Object(as_number)).unwrap());
 
         let mut as_bool = obj.clone();
-        as_bool.insert("snapshot_index".into(), serde_json::Value::from(true));
+        as_bool.insert("established_at".into(), serde_json::Value::from(true));
         out.push(serde_json::to_vec(&serde_json::Value::Object(as_bool)).unwrap());
 
         // Every non-current schema version the current reader must refuse.
@@ -2049,7 +2056,6 @@ mod tests {
             .append_snapshot(
                 target,
                 &DeploymentSnapshot {
-                    index: 1,
                     deployment_id: floor_id.clone(),
                     target: TargetName::new(target.to_string()),
                     behavior_sha256: "sha256-aa".to_string(),
@@ -2062,7 +2068,6 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             target: TargetName::new(target.to_string()),
             deployment_id: floor_id,
-            snapshot_index: 1,
             established_at: "2026-01-01T00:00:00Z".to_string(),
         };
         store.write_history_floor(target, &floor).unwrap();
@@ -2087,7 +2092,6 @@ mod tests {
             schema_version: CLEANUP_PENDING_SCHEMA_VERSION,
             target: TargetName::new(target2.to_string()),
             deployment_id: DeploymentId::new("deploy-1".to_string()),
-            snapshot_index: 1,
             established_at: "2026-01-01T00:00:00Z".to_string(),
         };
         store.write_cleanup_pending(target2, &pending).unwrap();

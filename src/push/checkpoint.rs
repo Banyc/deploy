@@ -172,10 +172,10 @@ use crate::store::local::LocalStore;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointReport {
     pub target: String,
+    /// THE KEY: the checkpoint deployment. Its POSITION in the log (derived,
+    /// never stored) is the floor; everything strictly before it is
+    /// discarded.
     pub deployment_id: DeploymentId,
-    /// The snapshot index the floor sits at (the checkpoint deployment's own
-    /// snapshot — the oldest rollback state).
-    pub snapshot_index: u64,
     /// Exactly what would be / was discarded (attempts lines, snapshot
     /// entries, deployment directories).
     pub discards: FloorDiscards,
@@ -293,15 +293,20 @@ fn plan_floor(
     deployment_id: &DeploymentId,
 ) -> Result<HistoryFloor> {
     // The raw (physical) op log: the requested deployment must have a
-    // snapshot — i.e. be a SUCCESSFUL deployment — with a canonical index.
+    // snapshot — i.e. be a SUCCESSFUL deployment (a successful deployment
+    // owns a snapshot keyed by its id; its POSITION in the log is the floor's
+    // derived position — never stored).
     let snapshots = store.read_snapshots_raw(target)?;
-    let snapshot = match snapshots.iter().find(|s| s.deployment_id == *deployment_id) {
-        Some(s) => s,
+    let snapshot_pos = match snapshots
+        .iter()
+        .position(|s| s.deployment_id == *deployment_id)
+    {
+        Some(p) => p,
         None => {
             let hint = match store.read_history_floor(target)? {
                 Some(f) => format!(
-                    " (the target's history floor is already at s{} — checkpoint {} — so history before it has been discarded)",
-                    f.snapshot_index, f.deployment_id
+                    " (the target's history floor is already at deployment {} — so history before it has been discarded)",
+                    f.deployment_id
                 ),
                 None => String::new(),
             };
@@ -315,20 +320,25 @@ fn plan_floor(
         schema_version: SCHEMA_VERSION,
         target: TargetName::new(target.to_string()),
         deployment_id: deployment_id.clone(),
-        snapshot_index: snapshot.index,
         established_at: crate::remote::helper::now_rfc3339(),
     };
-    // Backward check against the CURRENT durable floor (a different
-    // deployment at an equal-or-newer index can never be re-established).
+    // Backward check against the CURRENT durable floor: a DIFFERENT
+    // deployment at an equal-or-later POSITION in the log can never be
+    // re-established (positions are DERIVED from the log order — the
+    // deployment-keyed analog of the old snapshot-index comparison).
     if let Some(current) = store.read_history_floor(target)?
         && current.deployment_id != floor.deployment_id
-        && current.snapshot_index >= floor.snapshot_index
     {
-        return Err(Error::conflict(format!(
-            "cannot move backward: target '{target}' already has a history floor at snapshot s{} \
-             (checkpoint {}); a checkpoint can never move backward after older history has been discarded",
-            current.snapshot_index, current.deployment_id
-        )));
+        let current_pos = snapshots
+            .iter()
+            .position(|s| s.deployment_id == current.deployment_id);
+        if current_pos.is_none_or(|cp| cp >= snapshot_pos) {
+            return Err(Error::conflict(format!(
+                "cannot move backward: target '{target}' already has a history floor at deployment {} \
+                 (checkpoint {}); a checkpoint can never move backward after older history has been discarded",
+                current.deployment_id, current.deployment_id
+            )));
+        }
     }
     Ok(floor)
 }
@@ -581,7 +591,6 @@ fn cleanup_report(
     CheckpointReport {
         target: target.to_string(),
         deployment_id: floor.deployment_id.clone(),
-        snapshot_index: floor.snapshot_index,
         discards,
         established: post.established,
         history_compacted: post.history_compacted,
@@ -602,14 +611,13 @@ fn cleanup_report(
 /// claim durable debt that a crash/restart would lose. The marker is a
 /// FLAG ONLY — it carries no deletion worklist (the logs retain it; see
 /// [`crate::store::local::LocalStore::checkpoint_compact`]) — its
-/// `target`/`deployment_id`/`snapshot_index` fields exist purely for the
-/// integrity binding on read.
+/// `target`/`deployment_id` fields exist purely for the integrity binding
+/// on read (positions are derived from the log order, never stored).
 fn record_cleanup_pending(store: &LocalStore, target: &str, floor: &HistoryFloor) -> Result<()> {
     let pending = CleanupPending {
         schema_version: CLEANUP_PENDING_SCHEMA_VERSION,
         target: TargetName::new(target.to_string()),
         deployment_id: floor.deployment_id.clone(),
-        snapshot_index: floor.snapshot_index,
         established_at: crate::remote::helper::now_rfc3339(),
     };
     store.write_cleanup_pending(target, &pending)
@@ -628,7 +636,6 @@ fn preview_checkpoint(
     Ok(CheckpointReport {
         target: target.to_string(),
         deployment_id: deployment_id.clone(),
-        snapshot_index: floor.snapshot_index,
         discards,
         established: false,
         history_compacted: false,
@@ -670,23 +677,23 @@ pub fn render_checkpoint_report(report: &CheckpointReport) -> Vec<String> {
         && !report.cleanup_clear_failed;
     let head = if report.dry_run {
         format!(
-            "dry-run: checkpoint at snapshot s{} (deployment {}) of target {}",
-            report.snapshot_index, report.deployment_id, report.target
+            "dry-run: checkpoint at deployment {} of target {}",
+            report.deployment_id, report.target
         )
     } else if report.established {
         format!(
-            "checkpoint established: history floor at snapshot s{} (deployment {}) of target {}",
-            report.snapshot_index, report.deployment_id, report.target
+            "checkpoint established: history floor at deployment {} of target {}",
+            report.deployment_id, report.target
         )
     } else if clean_no_op {
         format!(
-            "checkpoint already established: history floor at snapshot s{} (deployment {}) of target {} — nothing to discard",
-            report.snapshot_index, report.deployment_id, report.target
+            "checkpoint already established: history floor at deployment {} of target {} — nothing to discard",
+            report.deployment_id, report.target
         )
     } else {
         format!(
-            "checkpoint already established: history floor at snapshot s{} (deployment {}) of target {} — cleanup did not converge",
-            report.snapshot_index, report.deployment_id, report.target
+            "checkpoint already established: history floor at deployment {} of target {} — cleanup did not converge",
+            report.deployment_id, report.target
         )
     };
     lines.push(head);
@@ -712,13 +719,7 @@ pub fn render_checkpoint_report(report: &CheckpointReport) -> Vec<String> {
         "{verb} {} snapshot{}: {}",
         report.discards.discarded_snapshots.len(),
         plural(report.discards.discarded_snapshots.len()),
-        report
-            .discards
-            .discarded_snapshots
-            .iter()
-            .map(|i| format!("s{i}"))
-            .collect::<Vec<_>>()
-            .join(", ")
+        report.discards.discarded_snapshots.join(", ")
     ));
     lines.push(format!(
         "{verb} {} attempt{}: {}",
@@ -857,9 +858,8 @@ mod tests {
         }
     }
 
-    fn snapshot_entry(index: u64, id: &str, target: &str) -> DeploymentSnapshot {
+    fn snapshot_entry(id: &str, target: &str) -> DeploymentSnapshot {
         DeploymentSnapshot {
-            index,
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new(target.to_string()),
             behavior_sha256: "sha256-aa".to_string(),
@@ -871,20 +871,33 @@ mod tests {
     /// Seed a target with a history of `(attempt_ok, ...)` flags: every
     /// attempt gets a `deployments/<id>/` directory (the compaction deletes
     /// exactly the below-floor ones); every successful attempt appends a
-    /// snapshot with the next unique index.
+    /// snapshot KEYED BY ITS DEPLOYMENT ID (the log order IS the deployment
+    /// order — positions are derived, never stored).
     fn seed_history(store: &LocalStore, target: &str, prefix: &str, history: &[bool]) {
-        let mut next = 0u64;
         for (n, ok) in history.iter().enumerate() {
             let id = format!("{prefix}-{n:04}");
             store.append_attempt(target, &attempt(&id, target)).unwrap();
             std::fs::create_dir_all(store.deployment_dir(&id)).unwrap();
             if *ok {
                 store
-                    .append_snapshot(target, &snapshot_entry(next, &id, target))
+                    .append_snapshot(target, &snapshot_entry(&id, target))
                     .unwrap();
-                next += 1;
             }
         }
+    }
+
+    /// THE DERIVED FLOOR POSITION of `id` in the target's RAW snapshot log:
+    /// the number of snapshots strictly before it (positions are DERIVED
+    /// from the log order — never stored — so the tests derive them exactly
+    /// as the compaction does). Meaningful ONLY on the PRE-compaction log
+    /// (a compacted log's suffix starts at position 0).
+    fn floor_position(store: &LocalStore, target: &str, id: &str) -> u64 {
+        store
+            .read_snapshots_raw(target)
+            .unwrap()
+            .iter()
+            .position(|s| s.deployment_id.as_str() == id)
+            .expect("the deployment owns a snapshot in the raw log") as u64
     }
 
     /// Seed the never-delete guard rails: a VALID release record + its tree
@@ -968,11 +981,18 @@ mod tests {
 
         let rep = run_checkpoint(&store, TARGET, &target_deploy, false).unwrap();
         assert!(rep.established);
-        assert_eq!(rep.snapshot_index, 1);
+        // The compacted raw log begins at the checkpoint deployment (the
+        // suffix — positions are derived from the log order, never stored).
+        assert_eq!(
+            store.read_snapshots_raw(TARGET).unwrap()[0]
+                .deployment_id
+                .as_str(),
+            rep.deployment_id.as_str()
+        );
         assert_eq!(
             rep.discards.discarded_snapshots,
-            vec![0],
-            "s0 (deploy-0000) is discarded"
+            vec!["deploy-0000".to_string()],
+            "deploy-0000's snapshot (strictly before the floor) is discarded"
         );
         assert_eq!(
             rep.discards.discarded_attempts,
@@ -984,19 +1004,23 @@ mod tests {
             vec!["deploy-0000".to_string(), "deploy-0001".to_string()]
         );
 
-        // The durable marker sits at the checkpoint snapshot's index.
+        // The durable marker sits at the checkpoint deployment (keyed by id
+        // — positions are derived, never stored).
         let marker = store.read_history_floor(TARGET).unwrap().unwrap();
         assert_eq!(marker.deployment_id, target_deploy);
-        assert_eq!(marker.snapshot_index, 1);
         assert_eq!(marker.schema_version, SCHEMA_VERSION);
         assert_eq!(marker.target, TargetName::new(TARGET.to_string()));
         assert!(!marker.established_at.is_empty());
 
-        // Physical logs compacted to the suffix.
+        // Physical logs compacted to the suffix (deployment ids, in log
+        // order).
         let snaps = store.read_snapshots_raw(TARGET).unwrap();
         assert_eq!(
-            snaps.iter().map(|s| s.index).collect::<Vec<_>>(),
-            vec![1, 2]
+            snaps
+                .iter()
+                .map(|s| s.deployment_id.as_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["deploy-0002".to_string(), "deploy-0003".to_string()]
         );
         let attempts = store.read_attempts_raw(TARGET).unwrap();
         assert_eq!(
@@ -1040,38 +1064,56 @@ mod tests {
         );
         let snaps = store.read_snapshots(TARGET).unwrap();
         assert_eq!(
-            snaps.iter().map(|s| s.index).collect::<Vec<_>>(),
-            vec![1, 2]
+            snaps
+                .iter()
+                .map(|s| s.deployment_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["deploy-0002", "deploy-0003"]
         );
 
-        // Ref resolution: the checkpoint snapshot resolves; below it fails
-        // closed with a history-floor error.
+        // Ref resolution: the checkpoint deployment resolves (it IS the
+        // floor — the oldest rollback); below it fails closed with a
+        // history-floor error.
         let target = TargetName::new(TARGET.to_string());
         assert_eq!(
-            history::resolve_ref_expr(&history::parse_ref_expr("s1").unwrap(), TARGET, &store)
-                .unwrap(),
-            PushRef::Snapshot {
+            history::resolve_ref_expr(
+                &history::parse_ref_expr("deploy-0002").unwrap(),
+                TARGET,
+                &store
+            )
+            .unwrap(),
+            PushRef::Deployment {
                 target: target.clone(),
-                index: 1
+                deployment_id: DeploymentId::new("deploy-0002".to_string())
             }
         );
-        let err =
-            history::resolve_ref_expr(&history::parse_ref_expr("s0").unwrap(), TARGET, &store)
-                .unwrap_err();
+        let err = history::resolve_ref_expr(
+            &history::parse_ref_expr("deploy-0000").unwrap(),
+            TARGET,
+            &store,
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("history floor") && msg.contains("deploy-0002"),
             "below-floor ref must name the history floor, got: {msg}"
         );
-        // @- on the floored chain [s1, s2]: latest - 1 = s1 (the floor, fine);
-        // walking one more (parent(s2, 2)) is below the floor.
+        // @- on the floored chain [deploy-0002, deploy-0003]: latest - 1 =
+        // the floor itself (fine); walking one more (parent(@, 2)) steps
+        // past the start of the floored chain — below the floor — and fails
+        // closed.
         let err = history::resolve_ref_expr(
-            &history::parse_ref_expr("parent(s2, 2)").unwrap(),
+            &history::parse_ref_expr("parent(@, 2)").unwrap(),
             TARGET,
             &store,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("history floor"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("before the start of the deployment history")
+                || err.to_string().contains("history floor"),
+            "stepping past the floored chain start must fail closed, got: {err}"
+        );
     }
 
     /// `deploy checkpoint <target> <id> --dry-run` enumerates the discard set
@@ -1088,16 +1130,19 @@ mod tests {
         let rep = run_checkpoint(&store, TARGET, &target_deploy, true).unwrap();
         assert!(rep.dry_run);
         assert!(!rep.established);
-        assert_eq!(rep.discards.discarded_snapshots, vec![0]);
+        assert_eq!(
+            rep.discards.discarded_snapshots,
+            vec!["deploy-0000".to_string()]
+        );
         let lines = render_checkpoint_report(&rep);
         assert_eq!(
             lines[0],
-            "dry-run: checkpoint at snapshot s1 (deployment deploy-0001) of target production"
+            "dry-run: checkpoint at deployment deploy-0001 of target production"
         );
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("would discard 1 snapshot: s0"))
+                .any(|l| l.contains("would discard 1 snapshot: deploy-0000"))
         );
         assert!(
             lines
@@ -1156,7 +1201,7 @@ mod tests {
             (tmp, store)
         };
 
-        // Two-step advance: s0 (deploy-0000) then s2 (deploy-0002).
+        // Two-step advance: deploy-0000 then deploy-0002.
         let (_t1, s1) = build();
         run_checkpoint(
             &s1,
@@ -1173,7 +1218,7 @@ mod tests {
         )
         .unwrap();
 
-        // Directly at s2.
+        // Directly at deploy-0002.
         let (_t2, s2) = build();
         run_checkpoint(
             &s2,
@@ -1185,8 +1230,16 @@ mod tests {
 
         let f1 = s1.read_history_floor(TARGET).unwrap().unwrap();
         let f2 = s2.read_history_floor(TARGET).unwrap().unwrap();
-        assert_eq!(f1.snapshot_index, 2);
-        assert_eq!(f2.snapshot_index, 2);
+        assert_eq!(
+            f1.deployment_id.as_str(),
+            "deploy-0002",
+            "the two-step advance reaches deploy-0002"
+        );
+        assert_eq!(
+            f2.deployment_id.as_str(),
+            "deploy-0002",
+            "the direct checkpoint reaches deploy-0002"
+        );
         assert_eq!(
             s1.read_snapshots(TARGET).unwrap(),
             s2.read_snapshots(TARGET).unwrap()
@@ -1207,11 +1260,11 @@ mod tests {
         );
     }
 
-    /// A checkpoint can never move backward: once the floor sits at s2,
-    /// checkpointing s0 is refused with "cannot move backward" while the
-    /// below-floor snapshot is still physically present (an interrupted
-    /// compaction), and the already-compacted case still fails closed with
-    /// the floor hint.
+    /// A checkpoint can never move backward: once the floor sits at
+    /// deploy-0001, checkpointing deploy-0000 is refused with "cannot move
+    /// backward" while the below-floor snapshot is still physically present
+    /// (an interrupted compaction), and the already-compacted case still
+    /// fails closed with the floor hint.
     #[test]
     fn checkpoint_cannot_move_backward() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1327,7 +1380,13 @@ mod tests {
         )
         .unwrap();
         assert!(rep.established);
-        assert_eq!(rep.snapshot_index, 1);
+        // The compacted raw log begins at the checkpoint deployment.
+        assert_eq!(
+            store.read_snapshots_raw(TARGET).unwrap()[0]
+                .deployment_id
+                .as_str(),
+            rep.deployment_id.as_str()
+        );
         assert!(!store.deployment_dir("deploy-0000").exists());
     }
 
@@ -1361,11 +1420,12 @@ mod tests {
         assert!(store.deployment_dir("deploy-0002").exists());
     }
 
-    /// Appending after compaction mints the next UNIQUE index from the raw
-    /// physical log (never a reused one): a compacted [s2, s3] chain appends
-    /// s4.
+    /// Appending after compaction appends a NEW deployment-keyed entry (the
+    /// log is keyed by deployment id — the identity space can never be
+    /// reused): the compacted suffix [deploy-0003, deploy-0004] gains the
+    /// new deployment as a fresh line.
     #[test]
-    fn append_after_compaction_produces_unique_increasing_index() {
+    fn append_after_compaction_produces_unique_deployment_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         // A0(s0) A1(s1) A2(failed) A3(s2) A4(s3).
@@ -1382,19 +1442,20 @@ mod tests {
                 .read_snapshots_raw(TARGET)
                 .unwrap()
                 .iter()
-                .map(|s| s.index)
+                .map(|s| s.deployment_id.as_str().to_string())
                 .collect::<Vec<_>>(),
-            vec![2, 3],
-            "physical chain after compaction: [s2, s3]"
+            vec!["deploy-0003".to_string(), "deploy-0004".to_string()],
+            "physical chain after compaction: the suffix [deploy-0003, deploy-0004]"
         );
 
         // A new successful attempt after the checkpoint: `ensure_snapshot`
-        // (the REAL index-minting path) must mint 4, never 2 (len) or 0.
+        // appends a NEW line keyed by the NEW deployment id (never a reused
+        // identity).
         let new_id = "deploy-0100";
         store
             .append_attempt(TARGET, &attempt(new_id, TARGET))
             .unwrap();
-        let idx = history::ensure_snapshot(
+        let key = history::ensure_snapshot(
             &store,
             &TargetName::new(TARGET.to_string()),
             &attempt(new_id, TARGET),
@@ -1402,10 +1463,14 @@ mod tests {
             &BTreeMap::new(),
         )
         .unwrap();
-        assert_eq!(idx, 4, "the next index is max + 1, never a reused index");
+        assert_eq!(
+            key.as_str(),
+            new_id,
+            "the snapshot is keyed by the deployment id"
+        );
         let snaps = store.read_snapshots_raw(TARGET).unwrap();
-        let indices: Vec<u64> = snaps.iter().map(|s| s.index).collect();
-        assert_eq!(indices, vec![2, 3, 4], "no index is ever reused");
+        let ids: Vec<&str> = snaps.iter().map(|s| s.deployment_id.as_str()).collect();
+        assert_eq!(ids, vec!["deploy-0003", "deploy-0004", "deploy-0100"]);
         assert_eq!(store.read_snapshots(TARGET).unwrap().len(), 3);
     }
 
@@ -1440,9 +1505,11 @@ mod tests {
         Deploy {
             ok: bool,
         },
-        /// Checkpoint the deployment whose snapshot index is `k % (number
-        /// of snapshots so far)` — randomly at, below, or above the current
-        /// floor, and sometimes missing entirely (empty chain).
+        /// Checkpoint the deployment at POSITION `k % (number of snapshots
+        /// so far)` in the deployment history — randomly at, below, or above
+        /// the current floor, and sometimes missing entirely (empty chain).
+        /// Positions are DERIVED from the log order (never stored); the op
+        /// selects the deployment id at that position.
         Checkpoint {
             k: u64,
         },
@@ -1460,36 +1527,34 @@ mod tests {
     }
 
     /// The invariant bundle asserted after every op: the visible history is
-    /// exactly the suffix at/after the oracle floor; the checkpoint snapshot
-    /// resolves; no ref resolves below it; raw indices are strictly
-    /// increasing/unique; the marker is readable.
+    /// exactly the suffix beginning at the oracle floor's POSITION; the
+    /// checkpoint deployment resolves; no deployment id below it resolves;
+    /// the raw log carries no duplicate deployment ids (the deployment-keyed
+    /// identity space can never be reused); the marker is readable.
     fn assert_floor_invariants(
         store: &LocalStore,
         all_attempts: &[(String, bool)],
-        all_snaps: &[(u64, String)],
-        floor: &Option<(String, u64)>,
+        all_snaps: &[String],
+        floor: &Option<(String, usize)>,
     ) {
-        // 1. Visible snapshots == the suffix at/after the floor.
-        let expected: Vec<u64> = match floor {
-            Some((_, fidx)) => all_snaps
-                .iter()
-                .filter(|(i, _)| *i >= *fidx)
-                .map(|(i, _)| *i)
-                .collect(),
-            None => all_snaps.iter().map(|(i, _)| *i).collect(),
+        // 1. Visible snapshots == the suffix beginning at the floor position.
+        let expected: Vec<String> = match floor {
+            Some((_, fpos)) => all_snaps[*fpos..].to_vec(),
+            None => all_snaps.to_vec(),
         };
-        let got: Vec<u64> = store
+        let got: Vec<String> = store
             .read_snapshots(TARGET)
             .unwrap()
             .iter()
-            .map(|s| s.index)
+            .map(|s| s.deployment_id.as_str().to_string())
             .collect();
         assert_eq!(
             got, expected,
             "visible snapshots must be the floored suffix"
         );
 
-        // Visible attempts == the suffix from the checkpoint's own attempt.
+        // Visible attempts must be the suffix from the checkpoint's own
+        // attempt.
         let expected_attempts: Vec<String> = match floor {
             Some((fid, _)) => {
                 let pos = all_attempts
@@ -1514,56 +1579,53 @@ mod tests {
             "visible attempts must be the suffix from the checkpoint's own attempt"
         );
 
-        // The floor marker is readable and consistent.
-        if let Some((fid, fidx)) = floor {
+        // The floor marker is readable and consistent (keyed by deployment
+        // id — positions are derived, never stored).
+        if let Some((fid, fpos)) = floor {
             let marker = store.read_history_floor(TARGET).unwrap().unwrap();
             assert_eq!(marker.deployment_id.as_str(), fid);
-            assert_eq!(marker.snapshot_index, *fidx);
 
-            // 2. The checkpoint snapshot always resolves.
-            let resolved = history::resolve_ref_expr(
-                &history::parse_ref_expr(&format!("s{fidx}")).unwrap(),
-                TARGET,
-                store,
-            )
-            .unwrap();
+            // 2. The checkpoint deployment always resolves (it IS the floor —
+            // the oldest rollback).
+            let resolved =
+                history::resolve_ref_expr(&history::parse_ref_expr(fid).unwrap(), TARGET, store)
+                    .unwrap();
             assert_eq!(
                 resolved,
-                PushRef::Snapshot {
+                PushRef::Deployment {
                     target: TargetName::new(TARGET.to_string()),
-                    index: *fidx
+                    deployment_id: DeploymentId::new(fid.clone())
                 }
             );
 
-            // 3. No reference resolves below the checkpoint.
-            for k in 0..*fidx {
-                let err = history::resolve_ref_expr(
-                    &history::parse_ref_expr(&format!("s{k}")).unwrap(),
-                    TARGET,
-                    store,
-                )
-                .unwrap_err();
+            // 3. No deployment id below the checkpoint resolves (the suffix
+            //    begins at the floor, so every earlier deployment id fails
+            //    closed).
+            for id in all_snaps.iter().take(*fpos) {
+                let err =
+                    history::resolve_ref_expr(&history::parse_ref_expr(id).unwrap(), TARGET, store)
+                        .unwrap_err();
                 let msg = err.to_string();
                 assert!(
-                    msg.contains("history floor") || msg.contains("no snapshot"),
-                    "below-floor s{k} must fail closed, got: {msg}"
+                    msg.contains("history floor") || msg.contains("no successful deployment"),
+                    "below-floor deployment '{id}' must fail closed, got: {msg}"
                 );
             }
         }
 
-        // 4. Raw snapshot indices are strictly increasing and unique (a
-        //    compaction that reused an index would break this).
-        let raw: Vec<u64> = store
+        // 4. The raw snapshot log has no DUPLICATE deployment id (the
+        //    deployment-keyed identity space is unique — a compaction that
+        //    reused an identity would break this).
+        let raw: Vec<String> = store
             .read_snapshots_raw(TARGET)
             .unwrap()
             .iter()
-            .map(|s| s.index)
+            .map(|s| s.deployment_id.as_str().to_string())
             .collect();
         let mut sorted = raw.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(raw, sorted, "raw indices must be unique and in order");
-        assert!(raw.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(raw, sorted, "raw deployment ids must be unique");
     }
 
     fn run_floor_case(ops: Vec<FloorOp>) {
@@ -1576,8 +1638,8 @@ mod tests {
         let (rel, tree, server) = seed_never_delete(&store);
 
         let mut all_attempts: Vec<(String, bool)> = Vec::new();
-        let mut all_snaps: Vec<(u64, String)> = Vec::new();
-        let mut floor: Option<(String, u64)> = None;
+        let mut all_snaps: Vec<String> = Vec::new();
+        let mut floor: Option<(String, usize)> = None;
         let mut seq = 0u64;
 
         for op in ops {
@@ -1589,9 +1651,9 @@ mod tests {
                     std::fs::create_dir_all(store.deployment_dir(&id)).unwrap();
                     all_attempts.push((id.clone(), ok));
                     if ok {
-                        // The REAL index-minting path (max + 1 over the raw
-                        // log) — a compacted chain must never reuse an index.
-                        let idx = history::ensure_snapshot(
+                        // The REAL snapshot path (keyed by deployment id — a
+                        // compacted log can never reuse an identity).
+                        let key = history::ensure_snapshot(
                             &store,
                             &TargetName::new(TARGET.to_string()),
                             &attempt(&id, TARGET),
@@ -1599,11 +1661,16 @@ mod tests {
                             &BTreeMap::new(),
                         )
                         .unwrap();
-                        assert!(
-                            !all_snaps.iter().any(|(i, _)| *i == idx),
-                            "appending after compaction always produces a unique, increasing index"
+                        assert_eq!(
+                            key.as_str(),
+                            id,
+                            "the snapshot is keyed by the deployment id"
                         );
-                        all_snaps.push((idx, id));
+                        assert!(
+                            !all_snaps.contains(&id),
+                            "appending after compaction always produces a unique deployment entry"
+                        );
+                        all_snaps.push(id);
                     }
                 }
                 FloorOp::Checkpoint { k } => {
@@ -1624,7 +1691,8 @@ mod tests {
                         );
                         continue;
                     }
-                    let (target_idx, target_id) = all_snaps[k as usize % s].clone();
+                    let target_pos = k as usize % s;
+                    let target_id = all_snaps[target_pos].clone();
                     let res = run_checkpoint(
                         &store,
                         TARGET,
@@ -1635,10 +1703,10 @@ mod tests {
                         None => {
                             let rep = res.expect("first checkpoint establishes the floor");
                             assert!(rep.established);
-                            floor = Some((target_id, target_idx));
+                            floor = Some((target_id, target_pos));
                         }
-                        Some((fid, fidx)) => {
-                            if target_idx < *fidx {
+                        Some((fid, fpos)) => {
+                            if target_pos < *fpos {
                                 // 6. A checkpoint can never move backward.
                                 let err = res.expect_err("backward checkpoint must fail");
                                 let msg = err.to_string();
@@ -1650,7 +1718,7 @@ mod tests {
                                         || msg.contains("history floor"),
                                     "backward checkpoint must fail closed, got: {msg}"
                                 );
-                            } else if target_idx == *fidx {
+                            } else if target_pos == *fpos {
                                 // 4. Repeating the same checkpoint is idempotent.
                                 assert_eq!(target_id, *fid);
                                 let out = res.unwrap();
@@ -1664,7 +1732,7 @@ mod tests {
                                     out.established,
                                     "advancing to a later deployment updates the floor"
                                 );
-                                floor = Some((target_id, target_idx));
+                                floor = Some((target_id, target_pos));
                             }
                         }
                     }
@@ -1681,9 +1749,9 @@ mod tests {
                 .read_snapshots("staging")
                 .unwrap()
                 .iter()
-                .map(|s| s.index)
+                .map(|s| s.deployment_id.as_str())
                 .collect::<Vec<_>>(),
-            vec![0, 1]
+            vec!["stage-0000", "stage-0002"]
         );
         // 10. Release records, objects, and pinned artifacts are never deleted.
         assert_never_delete(&store, &rel, &tree, &server);
@@ -1762,7 +1830,14 @@ mod tests {
             "a checkpoint needs at least one success"
         );
         let target_id = ok_ids[checkpoint_at % ok_ids.len()].clone();
-        let floor_index = ok_ids.iter().position(|id| *id == target_id).unwrap() as u64;
+        // The floor's DERIVED position among the successes (positions come
+        // from the log order, never a stored index).
+        let floor_index = floor_position(&store, TARGET, &target_id);
+        let below_id = if floor_index > 0 {
+            Some(ok_ids[(floor_index - 1) as usize].clone())
+        } else {
+            None
+        };
         // The position of the checkpoint attempt in the FULL history: every
         // attempt (successful or failed) before it owns a below-floor
         // `deployments/<id>/` directory.
@@ -1847,21 +1922,21 @@ mod tests {
         // the command reports SUCCESS with cleanup_pending set — never Err.
         let rep = res.expect("a post-marker failure is committed-with-warning, never an Err");
         assert!(rep.established);
-        assert_eq!(rep.snapshot_index, floor_index);
+        assert_eq!(
+            floor_position(&store, TARGET, rep.deployment_id.as_str()),
+            floor_index,
+            "the floor deployment's derived position is its log position"
+        );
 
         // The floor is DURABLE and the readers never expose history below
         // it — the core property.
         let marker = store.read_history_floor(TARGET).unwrap().unwrap();
-        assert_eq!(marker.snapshot_index, floor_index);
         assert_eq!(marker.deployment_id.as_str(), target_id);
         let visible = store.read_snapshots(TARGET).unwrap();
-        assert!(
-            visible.iter().all(|s| s.index >= floor_index),
-            "interrupted cleanup must never expose history below the durable floor"
-        );
         assert_eq!(
-            visible[0].index, floor_index,
-            "the checkpoint snapshot stays the oldest visible"
+            visible[0].deployment_id.as_str(),
+            target_id,
+            "interrupted cleanup must never expose history below the durable floor —              the checkpoint deployment stays the oldest visible"
         );
         let attempts = store.read_attempts(TARGET).unwrap();
         assert_eq!(
@@ -1871,22 +1946,19 @@ mod tests {
         );
         // Below-floor refs refused; the checkpoint itself resolves.
         history::resolve_ref_expr(
-            &history::parse_ref_expr(&format!("s{floor_index}")).unwrap(),
+            &history::parse_ref_expr(&target_id).unwrap(),
             TARGET,
             &store,
         )
-        .expect("the checkpoint snapshot always remains resolvable");
-        if floor_index > 0 {
-            let err = history::resolve_ref_expr(
-                &history::parse_ref_expr(&format!("s{}", floor_index - 1)).unwrap(),
-                TARGET,
-                &store,
-            )
-            .unwrap_err();
+        .expect("the checkpoint deployment always remains resolvable");
+        if let Some(below) = &below_id {
+            let err =
+                history::resolve_ref_expr(&history::parse_ref_expr(below).unwrap(), TARGET, &store)
+                    .unwrap_err();
             assert!(
                 err.to_string().contains("history floor")
-                    || err.to_string().contains("no snapshot"),
-                "below-floor ref must stay refused, got: {err}"
+                    || err.to_string().contains("no successful deployment"),
+                "below-floor ref must stay closed, got: {err}"
             );
         }
 
@@ -1944,7 +2016,6 @@ mod tests {
         assert_eq!(pending.schema_version, CLEANUP_PENDING_SCHEMA_VERSION);
         assert_eq!(pending.target, TargetName::new(TARGET.to_string()));
         assert_eq!(pending.deployment_id.as_str(), target_id);
-        assert_eq!(pending.snapshot_index, floor_index);
         assert!(!pending.established_at.is_empty());
         let lines = render_checkpoint_report(&rep);
         assert!(
@@ -1970,16 +2041,25 @@ mod tests {
             "the debt marker clears once the cleanup completes"
         );
         let marker_after = store.read_history_floor(TARGET).unwrap().unwrap();
-        assert_eq!(marker_after.snapshot_index, floor_index);
+        assert_eq!(marker_after.deployment_id.as_str(), target_id);
         let visible_after = store.read_snapshots(TARGET).unwrap();
-        assert!(visible_after.iter().all(|s| s.index >= floor_index));
-        assert_eq!(visible_after[0].index, floor_index);
+        assert_eq!(
+            visible_after[0].deployment_id.as_str(),
+            target_id,
+            "the checkpoint deployment stays the oldest visible after the retry"
+        );
         // Physical convergence: the RAW logs hold only the suffix and every
         // below-floor deployment dir is deleted (the at/above-floor ones
         // remain).
         let raw_snaps = store.read_snapshots_raw(TARGET).unwrap();
-        assert!(
-            raw_snaps.iter().all(|s| s.index >= floor_index),
+        assert_eq!(
+            raw_snaps[0].deployment_id.as_str(),
+            target_id,
+            "the compacted snapshot log starts at the checkpoint deployment"
+        );
+        assert_eq!(
+            raw_snaps.len(),
+            ok_ids.len() - floor_index as usize,
             "no below-floor snapshot lines remain after convergence"
         );
         let raw_attempts = store.read_attempts_raw(TARGET).unwrap();
@@ -2030,9 +2110,15 @@ mod tests {
             "the retry converges the attempts log to the checkpoint suffix"
         );
         let snaps_after = store.read_snapshots_raw(TARGET).unwrap();
-        assert!(
-            snaps_after.iter().all(|s| s.index >= floor_index),
-            "the retry converges the snapshots log to the floor suffix"
+        assert_eq!(
+            snaps_after[0].deployment_id.as_str(),
+            target_id,
+            "the retry converges the snapshots log to the checkpoint suffix"
+        );
+        assert_eq!(
+            snaps_after.len(),
+            ok_ids.len() - floor_index as usize,
+            "the suffix beginning at the checkpoint deployment is retained"
         );
     }
 
@@ -2148,7 +2234,11 @@ mod tests {
         let rep = run_checkpoint(&store, TARGET, &DeploymentId::new(target_id.clone()), false)
             .expect("post-commit maintenance failures are committed-with-warning, never an Err");
         assert!(rep.established);
-        assert_eq!(rep.snapshot_index, floor_index);
+        assert_eq!(
+            rep.deployment_id.as_str(),
+            target_id,
+            "the checkpoint names the floor deployment (keyed by id)"
+        );
 
         // The report's flags EXACTLY match the matrix cell (truthful
         // reporting in both directions — no phantom pending, no silently
@@ -2215,25 +2305,24 @@ mod tests {
         // — the reopened store exposes exactly the suffix and refuses
         // below-floor refs.
         let visible = reopened.read_snapshots(TARGET).unwrap();
-        assert!(
-            visible.iter().all(|s| s.index >= floor_index),
-            "the reopened store never exposes history below the durable floor"
+        assert_eq!(
+            visible[0].deployment_id.as_str(),
+            target_id,
+            "the reopened store never exposes history below the durable floor —              the checkpoint deployment stays the oldest visible"
         );
-        assert_eq!(visible[0].index, floor_index);
         let attempts = reopened.read_attempts(TARGET).unwrap();
         assert_eq!(
             attempts[0].deployment_id.as_str(),
             target_id,
             "the reopened store shows the suffix from the checkpoint's own attempt"
         );
-        let err = history::resolve_ref_expr(
-            &history::parse_ref_expr(&format!("s{}", floor_index - 1)).unwrap(),
-            TARGET,
-            &reopened,
-        )
-        .unwrap_err();
+        let below = ok_ids[(floor_index - 1) as usize].clone();
+        let err =
+            history::resolve_ref_expr(&history::parse_ref_expr(&below).unwrap(), TARGET, &reopened)
+                .unwrap_err();
         assert!(
-            err.to_string().contains("history floor") || err.to_string().contains("no snapshot"),
+            err.to_string().contains("history floor")
+                || err.to_string().contains("no successful deployment"),
             "below-floor refs stay refused after the reopen, got: {err}"
         );
 
@@ -2279,9 +2368,10 @@ mod tests {
             "converged: attempts.jsonl is compacted to the checkpoint suffix"
         );
         let raw_snaps = reopened.read_snapshots_raw(TARGET).unwrap();
-        assert!(
-            raw_snaps.iter().all(|s| s.index >= floor_index),
-            "converged: snapshots.jsonl is compacted to the floor suffix"
+        assert_eq!(
+            raw_snaps[0].deployment_id.as_str(),
+            target_id,
+            "converged: snapshots.jsonl is compacted to the checkpoint suffix"
         );
         for (n, _) in history.iter().enumerate() {
             let id = format!("deploy-{n:04}");
@@ -2638,7 +2728,9 @@ mod tests {
             "a checkpoint needs at least one success"
         );
         let target_id = ok_ids[checkpoint_at % ok_ids.len()].clone();
-        let floor_index = ok_ids.iter().position(|id| *id == target_id).unwrap() as u64;
+        // The floor's DERIVED position among the successes (positions come
+        // from the log order, never a stored index).
+        let floor_index = floor_position(&store, TARGET, &target_id);
 
         // Arm EXACTLY ONE durability-stage fault, keyed by the checkpoint
         // deployment id (each fault consumes at its own stage).
@@ -2695,7 +2787,6 @@ mod tests {
         );
         let marker = store.read_history_floor(TARGET).unwrap().unwrap();
         assert_eq!(marker.deployment_id.as_str(), target_id);
-        assert_eq!(marker.snapshot_index, floor_index);
         for id in ok_ids.iter().take(floor_index as usize) {
             assert!(
                 !store.deployment_dir(id).exists(),
@@ -2771,15 +2862,16 @@ mod tests {
     }
 
     /// The ENTIRE visible state of `target` under the floor: the gated
-    /// snapshot/attempt lists, the floor's own (deployment, index), and the
+    /// snapshot/attempt lists (deployment ids, in log order — positions are
+    /// DERIVED, never stored), the floor's own deployment id, and the
     /// below-floor ref refusal. A failed ADVANCE must leave this EXACTLY
     /// unchanged (identical lists, the same below-floor refs refused) — the
     /// "exactly the same visible suffix" half of the transactional
     /// replacement invariant.
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct VisibleState {
-        floor: Option<(String, u64)>,
-        snapshots: Vec<(u64, String)>,
+        floor: Option<String>,
+        snapshots: Vec<String>,
         attempts: Vec<String>,
         below_floor_ref_err: Option<String>,
     }
@@ -2789,29 +2881,33 @@ mod tests {
         target: &str,
         floor: &Option<crate::records::HistoryFloor>,
     ) -> VisibleState {
-        // The ref just below the floor must be REFUSED (never a resolved
-        // below-floor snapshot); capture the exact refusal message so the
-        // post-advance state can be compared byte-for-byte.
+        // The ref for the deployment immediately below the floor (in the RAW
+        // log — the floored read no longer exposes it) must be REFUSED;
+        // capture the exact refusal message so the post-advance state can be
+        // compared byte-for-byte.
+        let raw = store.read_snapshots_raw(target).unwrap();
         let below_floor_ref_err = match floor {
-            Some(f) if f.snapshot_index > 0 => {
-                let expr = history::parse_ref_expr(&format!("s{}", f.snapshot_index - 1)).unwrap();
-                Some(
-                    history::resolve_ref_expr(&expr, target, store)
-                        .unwrap_err()
-                        .to_string(),
-                )
-            }
-            _ => None,
+            Some(f) => raw
+                .iter()
+                .position(|s| s.deployment_id == f.deployment_id)
+                .and_then(|pos| {
+                    (pos > 0).then(|| {
+                        let below = raw[pos - 1].deployment_id.as_str().to_string();
+                        let expr = history::parse_ref_expr(&below).unwrap();
+                        history::resolve_ref_expr(&expr, target, store)
+                            .unwrap_err()
+                            .to_string()
+                    })
+                }),
+            None => None,
         };
         VisibleState {
-            floor: floor
-                .as_ref()
-                .map(|f| (f.deployment_id.as_str().to_string(), f.snapshot_index)),
+            floor: floor.as_ref().map(|f| f.deployment_id.as_str().to_string()),
             snapshots: store
                 .read_snapshots(target)
                 .unwrap()
                 .iter()
-                .map(|s| (s.index, s.deployment_id.as_str().to_string()))
+                .map(|s| s.deployment_id.as_str().to_string())
                 .collect(),
             attempts: store
                 .read_attempts(target)
@@ -2837,8 +2933,6 @@ mod tests {
         history: Vec<bool>,
         /// A's deployment id (the ORIGINAL floor).
         a_id: String,
-        /// A's snapshot index.
-        a_index: u64,
         /// A's position in the FULL history (everything before it owns a
         /// below-A `deployments/<id>/` directory — the material an
         /// interrupted A cleanup leaves behind).
@@ -2847,8 +2941,6 @@ mod tests {
         a_floor: HistoryFloor,
         /// B's deployment id (the never-committed advance target).
         b_id: String,
-        /// B's snapshot index.
-        b_index: u64,
         /// The pre-advance visible suffix under floor A.
         pre: VisibleState,
         /// The pre-advance raw attempts-log line count.
@@ -2894,11 +2986,8 @@ mod tests {
         );
 
         // A: the `a_at`-th successful deployment (never the last — B owns
-        // the last success, so B is STRICTLY LATER than A). Its snapshot
-        // index is its position among the successes (snapshots are minted
-        // in order).
+        // the last success, so B is STRICTLY LATER than A).
         let a_id = ok_ids[a_at % (ok_ids.len() - 1)].clone();
-        let a_index = ok_ids.iter().position(|id| *id == a_id).unwrap() as u64;
         // The position of A's attempt in the FULL history: everything
         // before it owns a below-floor `deployments/<id>/` directory (the
         // material an interrupted A cleanup leaves behind).
@@ -2910,7 +2999,6 @@ mod tests {
             .0;
         let b_id = ok_ids.last().unwrap().clone();
         assert_ne!(a_id, b_id, "B must be a later deployment than A");
-        let b_index = (ok_ids.len() - 1) as u64;
 
         // Establish A. When `a_cleanup_interrupted` AND there is material
         // below A, arm a compaction fault (keyed by A's id) so A's
@@ -2927,7 +3015,6 @@ mod tests {
         assert!(rep_a.established, "A is established");
         let a_floor = store.read_history_floor(TARGET).unwrap().unwrap();
         assert_eq!(a_floor.deployment_id.as_str(), a_id);
-        assert_eq!(a_floor.snapshot_index, a_index);
         if a_cleanup_interrupted && a_attempt_pos > 0 {
             assert!(rep_a.cleanup_pending, "A's interrupted cleanup is pending");
             assert!(
@@ -2959,11 +3046,9 @@ mod tests {
             store,
             history,
             a_id,
-            a_index,
             a_attempt_pos,
             a_floor,
             b_id,
-            b_index,
             pre,
             pre_raw_attempts,
             pre_raw_snaps,
@@ -2993,7 +3078,6 @@ mod tests {
         let fx = seed_floor_a(history_in, a_at, a_cleanup_interrupted);
         let store = &fx.store;
         let a_id = fx.a_id.as_str();
-        let a_index = fx.a_index;
         let b_id = fx.b_id.as_str();
         let pre = &fx.pre;
 
@@ -3044,8 +3128,9 @@ mod tests {
                 "the torn read returns the ORIGINAL floor A"
             );
             assert_eq!(
-                f.snapshot_index, a_index,
-                "the torn read returns the ORIGINAL floor index"
+                f.deployment_id.as_str(),
+                a_id,
+                "the torn read returns the ORIGINAL floor deployment"
             );
             let torn_post = capture_visible(store, TARGET, &torn);
             assert_eq!(
@@ -3116,10 +3201,6 @@ mod tests {
                 a_id,
                 "recovery restores the ORIGINAL floor A (same deployment_id)"
             );
-            assert_eq!(
-                f.snapshot_index, a_index,
-                "recovery restores the ORIGINAL floor A (same snapshot_index)"
-            );
             let recovered_post = capture_visible(store, TARGET, &recovered);
             assert_eq!(
                 recovered_post.snapshots, pre.snapshots,
@@ -3176,10 +3257,7 @@ mod tests {
                 a_id,
                 "the ORIGINAL floor deployment A survives the failed {stage:?} advance"
             );
-            assert_eq!(
-                f.snapshot_index, a_index,
-                "the ORIGINAL floor index survives the failed {stage:?} advance"
-            );
+
             let post = capture_visible(store, TARGET, &floor);
             assert_eq!(
                 post.snapshots, pre.snapshots,
@@ -3233,7 +3311,7 @@ mod tests {
         assert!(rep_b.established, "the advancement to B establishes B");
         let floor_b = store.read_history_floor(TARGET).unwrap().unwrap();
         assert_eq!(floor_b.deployment_id.as_str(), b_id);
-        assert_eq!(floor_b.snapshot_index, fx.b_index);
+        assert_eq!(floor_b.deployment_id.as_str(), fx.b_id.as_str());
         assert!(
             floor_backup_leftovers(store).is_empty(),
             "a committed advance leaves no backup behind"
@@ -3377,9 +3455,8 @@ mod tests {
             assert_ne!(
                 f.deployment_id.as_str(),
                 a_id,
-                "{context}: the floor can never regress to A (currently '{}' at snapshot s{})",
-                f.deployment_id,
-                f.snapshot_index
+                "{context}: the floor can never regress to A (currently '{}')",
+                f.deployment_id
             );
         };
 
@@ -3432,10 +3509,6 @@ mod tests {
             f.deployment_id.as_str(),
             b_id,
             "the floor REMAINS B after the failed B→C backup rename — never A (a stale backup must never roll the floor backward)"
-        );
-        assert_eq!(
-            f.snapshot_index, floor_b.snapshot_index,
-            "the floor stays at B's exact snapshot"
         );
         assert_never_a(&store, "after the failed B→C advance");
         // The stale A backup was reconciled away BEFORE the advance started:
@@ -3550,7 +3623,6 @@ mod tests {
         let fx = seed_floor_a(history_in, a_at, a_cleanup_interrupted);
         let store = &fx.store;
         let a_id = fx.a_id.as_str();
-        let a_index = fx.a_index;
         let b_id = fx.b_id.as_str();
         let pre = &fx.pre;
 
@@ -3592,10 +3664,6 @@ mod tests {
             f.deployment_id.as_str(),
             a_id,
             "the torn read returns the ORIGINAL floor A (same deployment_id)"
-        );
-        assert_eq!(
-            f.snapshot_index, a_index,
-            "the torn read returns the ORIGINAL floor A (same snapshot_index)"
         );
         let torn_post = capture_visible(store, TARGET, &torn);
         assert_eq!(
@@ -3664,7 +3732,7 @@ mod tests {
             e.to_string().contains("integrity"),
             "read_attempts propagates the unvalidatable-backup error, got: {e}"
         );
-        for tok in ["s0", "s1", "s2"] {
+        for tok in ["deploy-0000", "deploy-0001", "deploy-9999"] {
             let expr = history::parse_ref_expr(tok).unwrap();
             let e = history::resolve_ref_expr(&expr, TARGET, store).unwrap_err();
             assert!(
@@ -3712,10 +3780,6 @@ mod tests {
             f.deployment_id.as_str(),
             a_id,
             "recovery restores the ORIGINAL floor A (same deployment_id)"
-        );
-        assert_eq!(
-            f.snapshot_index, a_index,
-            "recovery restores the ORIGINAL floor A (same snapshot_index)"
         );
         let recovered_post = capture_visible(store, TARGET, &recovered);
         assert_eq!(
@@ -3766,7 +3830,7 @@ mod tests {
         assert!(rep_b.established, "the advancement to B establishes B");
         let floor_b = store.read_history_floor(TARGET).unwrap().unwrap();
         assert_eq!(floor_b.deployment_id.as_str(), b_id);
-        assert_eq!(floor_b.snapshot_index, fx.b_index);
+        assert_eq!(floor_b.deployment_id.as_str(), fx.b_id.as_str());
         assert!(
             floor_backup_leftovers(store).is_empty(),
             "a committed advance leaves no backup behind"
@@ -3832,7 +3896,6 @@ mod tests {
         let fx = seed_floor_a(history_in, a_at, a_cleanup_interrupted);
         let store = &fx.store;
         let a_id = fx.a_id.as_str();
-        let a_index = fx.a_index;
         let b_id = fx.b_id.as_str();
         let pre = &fx.pre;
 
@@ -3871,10 +3934,6 @@ mod tests {
             a_id,
             "the torn read returns the ORIGINAL floor A (same deployment_id)"
         );
-        assert_eq!(
-            f.snapshot_index, a_index,
-            "the torn read returns the ORIGINAL floor A (same snapshot_index)"
-        );
         let torn_post = capture_visible(store, TARGET, &torn);
         assert_eq!(
             torn_post.snapshots, pre.snapshots,
@@ -3888,12 +3947,23 @@ mod tests {
             torn_post.below_floor_ref_err, pre.below_floor_ref_err,
             "the same below-A refs stay refused during the torn state"
         );
-        for n in 0..a_index {
-            let expr = history::parse_ref_expr(&format!("s{n}")).unwrap();
+        // The deployments strictly before A in the SEEDED history (the raw
+        // log may already be compacted by A's checkpoint — the below-A ids
+        // come from the seeding, not the current log).
+        let below_a: Vec<String> = fx
+            .history
+            .iter()
+            .enumerate()
+            .take(fx.a_attempt_pos)
+            .filter(|(_, ok)| **ok)
+            .map(|(n, _)| format!("deploy-{n:04}"))
+            .collect();
+        for below in below_a {
+            let expr = history::parse_ref_expr(&below).unwrap();
             let e = history::resolve_ref_expr(&expr, TARGET, store).unwrap_err();
             assert!(
-                e.to_string().contains("floor"),
-                "the below-A ref s{n} stays rejected during the torn state, got: {e}"
+                e.to_string().contains("history floor"),
+                "the below-A ref '{below}' stays rejected during the torn state, got: {e}"
             );
         }
 
@@ -3924,10 +3994,6 @@ mod tests {
             a_id,
             "the production repair restored the ORIGINAL floor A (same deployment_id)"
         );
-        assert_eq!(
-            f.snapshot_index, a_index,
-            "the production repair restored the ORIGINAL floor A (same snapshot_index)"
-        );
         let repaired_post = capture_visible(store, TARGET, &repaired);
         assert_eq!(
             repaired_post.snapshots, pre.snapshots,
@@ -3937,16 +4003,25 @@ mod tests {
             repaired_post.attempts, pre.attempts,
             "the visible attempts suffix is EXACTLY unchanged after the production repair"
         );
-        assert_eq!(
-            repaired_post.below_floor_ref_err, pre.below_floor_ref_err,
-            "every below-A ref stays rejected after the production repair"
-        );
-        for n in 0..a_index {
-            let expr = history::parse_ref_expr(&format!("s{n}")).unwrap();
+        // The visible below-floor field may differ from the pre state: the
+        // production repair's cleanup COMPACTED the raw log, so the below-A
+        // deployments are physically gone — the per-ref loop below asserts
+        // each of them stays REJECTED (the exact field is byte-comparable
+        // only when the below-A history is still physically present).
+        let below_a_repair: Vec<String> = fx
+            .history
+            .iter()
+            .enumerate()
+            .take(fx.a_attempt_pos)
+            .filter(|(_, ok)| **ok)
+            .map(|(n, _)| format!("deploy-{n:04}"))
+            .collect();
+        for below in below_a_repair {
+            let expr = history::parse_ref_expr(&below).unwrap();
             let e = history::resolve_ref_expr(&expr, TARGET, store).unwrap_err();
             assert!(
-                e.to_string().contains("floor"),
-                "the below-A ref s{n} stays rejected after the production repair, got: {e}"
+                e.to_string().contains("history floor"),
+                "the below-A ref '{below}' stays rejected after the production repair, got: {e}"
             );
         }
         // The repair may also converge A's interrupted cleanup (the
@@ -3975,7 +4050,7 @@ mod tests {
         assert!(rep_b.established, "the advancement to B establishes B");
         let floor_b = store.read_history_floor(TARGET).unwrap().unwrap();
         assert_eq!(floor_b.deployment_id.as_str(), b_id);
-        assert_eq!(floor_b.snapshot_index, fx.b_index);
+        assert_eq!(floor_b.deployment_id.as_str(), fx.b_id.as_str());
         assert!(
             floor_backup_leftovers(store).is_empty(),
             "a committed advance leaves no backup behind"
@@ -4027,11 +4102,7 @@ mod tests {
     enum FloorMutation {
         /// (1) Retarget the marker to a different target name.
         Retarget,
-        /// (2a) `snapshot_index` BELOW the real one.
-        IndexBelow,
-        /// (2b) `snapshot_index` ABOVE the real one.
-        IndexAbove,
-        /// (3a) `deployment_id` → a deployment that never existed.
+        /// (2a) `deployment_id` → a deployment that never existed.
         ForeignDeployment,
         /// (3b) `deployment_id` → another EXISTING deployment (its snapshot
         /// lives at a different index, so the exact snapshot pair still
@@ -4047,8 +4118,6 @@ mod tests {
     fn floor_mutation_strategy() -> impl Strategy<Value = FloorMutation> {
         prop_oneof![
             1 => Just(FloorMutation::Retarget),
-            1 => Just(FloorMutation::IndexBelow),
-            1 => Just(FloorMutation::IndexAbove),
             1 => Just(FloorMutation::ForeignDeployment),
             1 => Just(FloorMutation::ExistingDeployment),
             1 => Just(FloorMutation::DeleteAnchorSnapshot),
@@ -4064,16 +4133,13 @@ mod tests {
     fn apply_floor_mutation(store: &LocalStore, intact: &HistoryFloor, mutation: FloorMutation) {
         match mutation {
             FloorMutation::DeleteAnchorSnapshot => {
-                // Physically remove the snapshot entry the marker names
-                // (index AND deployment id — the exact pair).
+                // Physically remove the snapshot entry the marker names (the
+                // rollback payload keyed by the marker's deployment id).
                 let keep: Vec<DeploymentSnapshot> = store
                     .read_snapshots_raw(TARGET)
                     .unwrap()
                     .into_iter()
-                    .filter(|s| {
-                        !(s.index == intact.snapshot_index
-                            && s.deployment_id == intact.deployment_id)
-                    })
+                    .filter(|s| s.deployment_id != intact.deployment_id)
                     .collect();
                 let body = keep
                     .iter()
@@ -4118,12 +4184,6 @@ mod tests {
                 match mutation {
                     FloorMutation::Retarget => {
                         m.target = TargetName::new("staging".to_string());
-                    }
-                    FloorMutation::IndexBelow => {
-                        m.snapshot_index = intact.snapshot_index.saturating_sub(1);
-                    }
-                    FloorMutation::IndexAbove => {
-                        m.snapshot_index = intact.snapshot_index + 1;
                     }
                     FloorMutation::ForeignDeployment => {
                         m.deployment_id = DeploymentId::new("deploy-foreign".to_string());
@@ -4171,7 +4231,7 @@ mod tests {
         // Ref resolution reads the gated snapshot chain: the below-floor ref
         // AND the checkpoint ref both fail (never a resolved below-floor
         // snapshot).
-        for token in ["s0", "s1", "s2"] {
+        for token in ["deploy-0000", "deploy-0003", "deploy-9999"] {
             let expr = history::parse_ref_expr(token).unwrap();
             let err = history::resolve_ref_expr(&expr, TARGET, store).unwrap_err();
             assert!(
@@ -4210,11 +4270,13 @@ mod tests {
         // expose exactly the at/above-floor suffix (the property's baseline).
         let intact = store.read_history_floor(TARGET).unwrap().unwrap();
         assert_eq!(intact.deployment_id.as_str(), anchor_id);
-        assert_eq!(intact.snapshot_index, 2);
         let snaps = store.read_snapshots(TARGET).unwrap();
         assert_eq!(
-            snaps.iter().map(|s| s.index).collect::<Vec<_>>(),
-            vec![2],
+            snaps
+                .iter()
+                .map(|s| s.deployment_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["deploy-0003"],
             "intact floor exposes exactly the at/above suffix"
         );
         let attempts = store.read_attempts(TARGET).unwrap();
@@ -4226,13 +4288,21 @@ mod tests {
             vec!["deploy-0003", "deploy-0004"],
             "intact floor exposes the suffix from the checkpoint's own attempt"
         );
-        history::resolve_ref_expr(&history::parse_ref_expr("s2").unwrap(), TARGET, &store)
-            .expect("the checkpoint snapshot resolves on the intact floor");
-        let err =
-            history::resolve_ref_expr(&history::parse_ref_expr("s0").unwrap(), TARGET, &store)
-                .unwrap_err();
+        history::resolve_ref_expr(
+            &history::parse_ref_expr("deploy-0003").unwrap(),
+            TARGET,
+            &store,
+        )
+        .expect("the checkpoint deployment resolves on the intact floor");
+        let err = history::resolve_ref_expr(
+            &history::parse_ref_expr("deploy-0000").unwrap(),
+            TARGET,
+            &store,
+        )
+        .unwrap_err();
         assert!(
-            err.to_string().contains("history floor") || err.to_string().contains("no snapshot"),
+            err.to_string().contains("history floor")
+                || err.to_string().contains("no successful deployment"),
             "a below-floor ref stays refused on the intact floor, got: {err}"
         );
         let lines = crate::cli::render_log(&store, TARGET, &attempts).unwrap();
@@ -4242,8 +4312,8 @@ mod tests {
             "the intact log render shows exactly the suffix"
         );
         assert!(
-            lines[0].starts_with("s2  "),
-            "first rendered line carries the checkpoint's snapshot prefix, got: {}",
+            lines[0].starts_with("deploy-0003  "),
+            "first rendered line carries the checkpoint deployment's prefix, got: {}",
             lines[0]
         );
 
@@ -4263,8 +4333,6 @@ mod tests {
     fn every_floor_mutation_fails_closed_exhaustively() {
         for mutation in [
             FloorMutation::Retarget,
-            FloorMutation::IndexBelow,
-            FloorMutation::IndexAbove,
             FloorMutation::ForeignDeployment,
             FloorMutation::ExistingDeployment,
             FloorMutation::DeleteAnchorSnapshot,
@@ -4315,28 +4383,22 @@ mod tests {
     enum CleanupMutation {
         /// (1) Retarget the marker to a different (unrelated) target name.
         Retarget,
-        /// (2a) `snapshot_index` BELOW the floor's real anchor.
-        IndexBelow,
-        /// (2b) `snapshot_index` ABOVE the floor's real anchor.
-        IndexAbove,
-        /// (3a) `deployment_id` → a deployment that never existed.
+        /// (2a) `deployment_id` → a deployment that never existed.
         ForeignDeployment,
-        /// (3b) `deployment_id` → a REAL RETAINED at/above-floor deployment
+        /// (2b) `deployment_id` → a REAL RETAINED at/above-floor deployment
         /// (the corruption that must never cause its dir to be deleted).
         ExistingDeployment,
-        /// (4) The legacy v1 shape carrying the REMOVED `pending_deployments`
+        /// (3) The legacy v1 shape carrying the REMOVED `pending_deployments`
         /// worklist (stray deployment ids) — the version gate must refuse
         /// it, never silently reinterpret it.
         LegacyShape,
-        /// (5) A foreign marker schema version.
+        /// (4) A foreign marker schema version.
         ForeignVersion,
     }
 
     fn cleanup_mutation_strategy() -> impl Strategy<Value = CleanupMutation> {
         prop_oneof![
             1 => Just(CleanupMutation::Retarget),
-            1 => Just(CleanupMutation::IndexBelow),
-            1 => Just(CleanupMutation::IndexAbove),
             1 => Just(CleanupMutation::ForeignDeployment),
             1 => Just(CleanupMutation::ExistingDeployment),
             1 => Just(CleanupMutation::LegacyShape),
@@ -4422,7 +4484,6 @@ mod tests {
             .unwrap()
             .expect("the durable flag marker records the debt");
         assert_eq!(pending.deployment_id.as_str(), target_id);
-        assert_eq!(pending.snapshot_index, floor.snapshot_index);
         // The debt state: floor present, logs intact, all below-floor dirs
         // still on disk.
         assert!(store.read_history_floor(TARGET).unwrap().is_some());
@@ -4480,8 +4541,8 @@ mod tests {
                     "schema_version": SCHEMA_VERSION,
                     "target": TARGET,
                     "deployment_id": fx.target_id,
-                    "snapshot_index": fx.floor.snapshot_index,
                     "established_at": "2026-01-01T00:00:00Z",
+                    "snapshot_index": 1,
                     "pending_deployments": ["deploy-0000", "stray-foreign"],
                 });
                 std::fs::write(
@@ -4498,12 +4559,6 @@ mod tests {
                 match mutation {
                     CleanupMutation::Retarget => {
                         m.target = TargetName::new("staging".to_string());
-                    }
-                    CleanupMutation::IndexBelow => {
-                        m.snapshot_index = fx.floor.snapshot_index.saturating_sub(1);
-                    }
-                    CleanupMutation::IndexAbove => {
-                        m.snapshot_index = fx.floor.snapshot_index + 1;
                     }
                     CleanupMutation::ForeignDeployment => {
                         m.deployment_id = DeploymentId::new("deploy-foreign".to_string());
@@ -4594,7 +4649,11 @@ mod tests {
         let attempts = store.read_attempts_raw(TARGET).unwrap();
         assert_eq!(attempts[0].deployment_id.as_str(), fx.target_id);
         let snaps = store.read_snapshots_raw(TARGET).unwrap();
-        assert!(snaps.iter().all(|s| s.index >= fx.floor.snapshot_index));
+        assert_eq!(
+            snaps[0].deployment_id.as_str(),
+            fx.target_id,
+            "the compacted snapshot log starts at the checkpoint deployment"
+        );
         for id in &fx.ground_truth.discarded_deployments {
             assert!(
                 !store.deployment_dir(id).exists(),
@@ -4665,7 +4724,11 @@ mod tests {
         let attempts = store.read_attempts_raw(TARGET).unwrap();
         assert_eq!(attempts[0].deployment_id.as_str(), fx.target_id);
         let snaps = store.read_snapshots_raw(TARGET).unwrap();
-        assert!(snaps.iter().all(|s| s.index >= fx.floor.snapshot_index));
+        assert_eq!(
+            snaps[0].deployment_id.as_str(),
+            fx.target_id,
+            "the compacted snapshot log starts at the checkpoint deployment"
+        );
         for id in &fx.ground_truth.discarded_deployments {
             assert!(
                 !store.deployment_dir(id).exists(),
@@ -4681,8 +4744,8 @@ mod tests {
         // present, logs still intact), then (c) runs the intact-marker
         // CONTROL retry — it converges (marker cleared, logs compacted to
         // the suffix) — and injects an ARBITRARY marker mutation (foreign
-        // target name, arbitrary snapshot-index anchors, foreign or retained
-        // deployment ids, a legacy v1 marker with the removed
+        // target name, arbitrary deployment-id anchors (positions are
+        // derived, never stored), a legacy v1 marker with the removed
         // pending_deployments worklist, a foreign schema version): the
         // corrupted read fails closed where the binding applies, and the
         // retry's ACTUAL physical deletion set is EXACTLY A SUBSET of
@@ -4721,8 +4784,6 @@ mod tests {
     fn every_cleanup_marker_mutation_fails_closed_exhaustively() {
         for mutation in [
             CleanupMutation::Retarget,
-            CleanupMutation::IndexBelow,
-            CleanupMutation::IndexAbove,
             CleanupMutation::ForeignDeployment,
             CleanupMutation::ExistingDeployment,
             CleanupMutation::LegacyShape,
@@ -4884,14 +4945,8 @@ mod tests {
         }
     }
 
-    fn gc_snapshot(
-        index: u64,
-        id: &str,
-        target: &str,
-        binding: &ArtifactRef,
-    ) -> DeploymentSnapshot {
+    fn gc_snapshot(id: &str, target: &str, binding: &ArtifactRef) -> DeploymentSnapshot {
         DeploymentSnapshot {
-            index,
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new(target.to_string()),
             behavior_sha256: "sha256-gc".to_string(),
@@ -5098,7 +5153,7 @@ mod tests {
                 None => None,
             };
             let expected_attempts: Vec<String> = (floor_step.unwrap_or(0)..steps.len())
-                .map(|i| format!("{target}-{i:03}"))
+                .map(|i| format!("deploy-{target}-{i:03}"))
                 .collect();
             let got_attempts: Vec<String> = store
                 .read_attempts(target)
@@ -5110,15 +5165,25 @@ mod tests {
                 got_attempts, expected_attempts,
                 "pins must never keep pre-floor attempts visible on {target}"
             );
-            let expected_snaps: Vec<u64> = match floor {
-                Some((_, ord)) => (*ord..successes.len() as u64).collect(),
-                None => (0..successes.len() as u64).collect(),
+            // The visible snapshot suffix: the deployment ids of the
+            // successes from the floor's ordinal onward (positions in the
+            // snapshot log are DERIVED from the deployment order — the
+            // suffix the floored read exposes).
+            let expected_snaps: Vec<String> = match floor {
+                Some((_, ord)) => successes[*ord as usize..]
+                    .iter()
+                    .map(|i| format!("deploy-{target}-{i:03}"))
+                    .collect(),
+                None => successes
+                    .iter()
+                    .map(|i| format!("deploy-{target}-{i:03}"))
+                    .collect(),
             };
-            let got_snaps: Vec<u64> = store
+            let got_snaps: Vec<String> = store
                 .read_snapshots(target)
                 .unwrap()
                 .iter()
-                .map(|s| s.index)
+                .map(|s| s.deployment_id.as_str().to_string())
                 .collect();
             assert_eq!(
                 got_snaps, expected_snaps,
@@ -5127,8 +5192,11 @@ mod tests {
             if let Some((_, ord)) = floor
                 && *ord > 0
             {
+                // The deployment record immediately before the floor — the
+                // below-floor deployment the floored read refuses.
+                let below = successes[*ord as usize - 1];
                 let err = history::resolve_ref_expr(
-                    &history::parse_ref_expr(&format!("s{}", ord - 1)).unwrap(),
+                    &history::parse_ref_expr(&format!("deploy-{target}-{below:03}")).unwrap(),
                     target,
                     store,
                 )
@@ -5136,8 +5204,7 @@ mod tests {
                 assert!(
                     err.to_string().contains("history floor")
                         || err.to_string().contains("no snapshot"),
-                    "below-floor s{} stays refused on {target}, got: {err}",
-                    ord - 1
+                    "below-floor deployment {target}-{below:03} stays refused on {target}, got: {err}"
                 );
             }
         }
@@ -5165,7 +5232,7 @@ mod tests {
         // plan's artifacts are in the oracle above): when t0's last attempt
         // is incomplete and NOT below the floor, its dir survives.
         if case.incomplete && !case.t0_steps.is_empty() {
-            let last_id = format!("t0-{:03}", case.t0_steps.len() - 1);
+            let last_id = format!("deploy-t0-{:03}", case.t0_steps.len() - 1);
             let floor = &floors[0];
             let retained = match floor {
                 Some((fid, _ord)) => {
@@ -5175,7 +5242,7 @@ mod tests {
                         case.t0_steps
                             .iter()
                             .enumerate()
-                            .find(|(n, _)| format!("t0-{n:03}") == id)
+                            .find(|(n, _)| format!("deploy-t0-{n:03}") == id)
                             .map(|(i, _)| i)
                     };
                     let fstep = step_of(fid).unwrap();
@@ -5300,10 +5367,9 @@ mod tests {
                     incomplete: bool|
          -> Vec<(String, bool, ArtifactRef)> {
             let mut facts: Vec<(String, bool, ArtifactRef)> = Vec::new();
-            let mut next_index = 0u64;
             let mut last_success: Option<ArtifactRef> = None;
             for (n, s) in steps.iter().enumerate() {
-                let id = format!("{target}-{n:03}");
+                let id = format!("deploy-{target}-{n:03}");
                 let binding = gc_binding(
                     &releases[s.rel % n_rel],
                     s.variant,
@@ -5322,9 +5388,8 @@ mod tests {
                 let is_last = n + 1 == steps.len();
                 if s.ok {
                     store
-                        .append_snapshot(target, &gc_snapshot(next_index, &id, target, &binding))
+                        .append_snapshot(target, &gc_snapshot(&id, target, &binding))
                         .unwrap();
-                    next_index += 1;
                     if !(incomplete && is_last) {
                         store
                             .append_transition(&id, &DeploymentStatus::Successful, None)
@@ -5625,16 +5690,16 @@ mod tests {
     }
 
     /// Seed one attempt on `target` (attempt + deployment dir + plan +
-    /// snapshot on success + transitions), tracking the target's snapshot
-    /// index counter and the observed artifact (`observed` is set to the
-    /// LAST SUCCESSFUL binding — the fixture's observed state).
+    /// snapshot on success + transitions), tracking the observed artifact
+    /// (`observed` is set to the LAST SUCCESSFUL binding — the fixture's
+    /// observed state). The snapshot is keyed by the deployment id; the log
+    /// order IS the deployment order (positions derived, never an index).
     fn gc_seed_attempt(
         store: &LocalStore,
         target: &str,
         id: &str,
         ok: bool,
         binding: &ArtifactRef,
-        next_index: &mut u64,
         observed: &mut Option<ArtifactRef>,
     ) {
         store
@@ -5647,9 +5712,8 @@ mod tests {
             .unwrap();
         if ok {
             store
-                .append_snapshot(target, &gc_snapshot(*next_index, id, target, binding))
+                .append_snapshot(target, &gc_snapshot(id, target, binding))
                 .unwrap();
-            *next_index += 1;
             store
                 .append_transition(id, &DeploymentStatus::Successful, None)
                 .unwrap();
@@ -5666,7 +5730,7 @@ mod tests {
         store
             .write_slot_observed(
                 &PlacementSlotId::new("p1"),
-                    &ObservedServer {
+                &ObservedServer {
                     generation: None,
                     artifact: observed.clone(),
                     last_deployment: None,
@@ -5698,27 +5762,24 @@ mod tests {
         }
         let r0 = gc_simple_release(&store, "0", &trees[0], &trees[1]);
         let r1 = gc_simple_release(&store, "1", &trees[1], &trees[2]);
-        // t0 history: attempt t0-00 = R1/v1 (T2) → s0; attempt t0-01 =
-        // R0/v0 (T0) → s1. Checkpoint at s1: R1's ONLY reference (t0-00)
-        // lies BELOW the floor and is discarded.
-        let mut next = 0u64;
+        // t0 history: attempt t0-00 = R1/v1 (T2) → snapshot; attempt t0-01 =
+        // R0/v0 (T0) → snapshot. Checkpoint at t0-01: R1's ONLY reference
+        // (t0-00) lies BELOW the floor and is discarded.
         let mut observed: Option<ArtifactRef> = None;
         gc_seed_attempt(
             &store,
             "t0",
-            "t0-00",
+            "deploy-t0-00",
             true,
             &gc_binding(&r1, 1, &trees[2]),
-            &mut next,
             &mut observed,
         );
         gc_seed_attempt(
             &store,
             "t0",
-            "t0-01",
+            "deploy-t0-01",
             true,
             &gc_binding(&r0, 0, &trees[0]),
-            &mut next,
             &mut observed,
         );
         gc_write_observed(&store, "t0", &observed);
@@ -5732,41 +5793,54 @@ mod tests {
             })
             .unwrap();
 
-        let rep = run_checkpoint(&store, "t0", &DeploymentId::new("t0-01".to_string()), false)
-            .expect("the checkpoint commits");
+        let rep = run_checkpoint(
+            &store,
+            "t0",
+            &DeploymentId::new("deploy-t0-01".to_string()),
+            false,
+        )
+        .expect("the checkpoint commits");
         assert!(rep.established);
         assert!(
             !rep.cleanup_pending && rep.gc.completed,
             "the pass converges"
         );
 
-        // HISTORY: only the suffix (s1) is visible; s0 refuses; the pinned
-        // pre-floor deployment is gone from the raw logs too (the pin never
-        // resurrects it).
+        // HISTORY: only the suffix at the checkpoint deployment is visible;
+        // the below-floor deployment refuses; the pinned pre-floor deployment
+        // is gone from the raw logs too (the pin never resurrects it).
         let snaps = store.read_snapshots("t0").unwrap();
         assert_eq!(
-            snaps.iter().map(|s| s.index).collect::<Vec<_>>(),
-            vec![1],
+            snaps
+                .iter()
+                .map(|s| s.deployment_id.as_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["deploy-t0-01".to_string()],
             "only the checkpoint snapshot stays visible"
         );
         assert_eq!(
             store.read_attempts("t0").unwrap()[0].deployment_id.as_str(),
-            "t0-01",
+            "deploy-t0-01",
             "the visible attempts start at the checkpoint attempt"
         );
-        let err = history::resolve_ref_expr(&history::parse_ref_expr("s0").unwrap(), "t0", &store)
-            .unwrap_err();
+        let err = history::resolve_ref_expr(
+            &history::parse_ref_expr("deploy-t0-00").unwrap(),
+            "t0",
+            &store,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("history floor"),
-            "below-floor s0 stays refused even though a pin names its release, got: {err}"
+            "below-floor deployment t0-00 stays refused even though a pin pins its release, got: {err}"
         );
         assert!(
-            !store.deployment_dir("t0-00").exists(),
+            !store.deployment_dir("deploy-t0-00").exists(),
             "the below-floor deployment dir is deleted despite the pin"
         );
         let raw = store.read_attempts_raw("t0").unwrap();
         assert!(
-            !raw.iter().any(|a| a.deployment_id.as_str() == "t0-00"),
+            !raw.iter()
+                .any(|a| a.deployment_id.as_str() == "deploy-t0-00"),
             "the pinned release never reinserts the below-floor attempt"
         );
         // CONTENT: the pinned release record + every variant tree survive.
@@ -5818,44 +5892,44 @@ mod tests {
         let r0 = gc_simple_release(&store, "0", &trees[0], &trees[1]);
         let r1 = gc_simple_release(&store, "1", &trees[1], &trees[2]);
         let r2 = gc_simple_release(&store, "2", &trees[0], &trees[2]);
-        // t0: [ok R1/v1 (s0), ok R0/v0 (s1)] — checkpoint at s1 discards the
+        // t0: [ok R1/v1, ok R0/v0] — checkpoint at t0-01 discards the
         // R1 reference. t1: [ok R1/v1] — full history (no floor) retains it.
-        let mut next0 = 0u64;
         let mut obs0: Option<ArtifactRef> = None;
         gc_seed_attempt(
             &store,
             "t0",
-            "t0-00",
+            "deploy-t0-00",
             true,
             &gc_binding(&r1, 1, &trees[2]),
-            &mut next0,
             &mut obs0,
         );
         gc_seed_attempt(
             &store,
             "t0",
-            "t0-01",
+            "deploy-t0-01",
             true,
             &gc_binding(&r0, 0, &trees[0]),
-            &mut next0,
             &mut obs0,
         );
         gc_write_observed(&store, "t0", &obs0);
-        let mut next1 = 0u64;
         let mut obs1: Option<ArtifactRef> = None;
         gc_seed_attempt(
             &store,
             "t1",
-            "t1-00",
+            "deploy-t1-00",
             true,
             &gc_binding(&r1, 1, &trees[2]),
-            &mut next1,
             &mut obs1,
         );
         gc_write_observed(&store, "t1", &obs1);
 
-        let rep = run_checkpoint(&store, "t0", &DeploymentId::new("t0-01".to_string()), false)
-            .expect("the checkpoint commits");
+        let rep = run_checkpoint(
+            &store,
+            "t0",
+            &DeploymentId::new("deploy-t0-01".to_string()),
+            false,
+        )
+        .expect("the checkpoint commits");
         assert!(rep.established && !rep.cleanup_pending && rep.gc.completed);
 
         // R1 + T2 survive (t1 references them); R2 (referenced by nobody)
@@ -5915,37 +5989,41 @@ mod tests {
             std::fs::create_dir_all(store.object_root(&spare)).unwrap();
             std::fs::write(store.object_root(&spare).join("x"), b"x").unwrap();
             let r0 = gc_simple_release(&store, "0", &trees[0], &trees[1]);
-            // t0: [ok R0/v0 (s0), ok R0/v0 (s1)] — checkpoint at s1; the
+            // t0: [ok R0/v0, ok R0/v0] — checkpoint at t0-01; the
             // RETAINED content is R0 + T0 (the floor attempt's binding).
-            let mut next = 0u64;
             let mut obs: Option<ArtifactRef> = None;
             gc_seed_attempt(
                 &store,
                 "t0",
-                "t0-00",
+                "deploy-t0-00",
                 true,
                 &gc_binding(&r0, 0, &trees[0]),
-                &mut next,
                 &mut obs,
             );
             gc_seed_attempt(
                 &store,
                 "t0",
-                "t0-01",
+                "deploy-t0-01",
                 true,
                 &gc_binding(&r0, 0, &trees[0]),
-                &mut next,
                 &mut obs,
             );
             gc_write_observed(&store, "t0", &obs);
 
             match fault {
-                1 => store.fault_registry().arm_gc_scan("t0-01"),
-                2 => store.fault_registry().arm_gc_delete_releases("t0-01"),
-                _ => store.fault_registry().arm_gc_delete_trees("t0-01"),
+                1 => store.fault_registry().arm_gc_scan("deploy-t0-01"),
+                2 => store
+                    .fault_registry()
+                    .arm_gc_delete_releases("deploy-t0-01"),
+                _ => store.fault_registry().arm_gc_delete_trees("deploy-t0-01"),
             }
-            let rep = run_checkpoint(&store, "t0", &DeploymentId::new("t0-01".to_string()), false)
-                .expect("a post-commit GC fault is committed-with-warning, never an Err");
+            let rep = run_checkpoint(
+                &store,
+                "t0",
+                &DeploymentId::new("deploy-t0-01".to_string()),
+                false,
+            )
+            .expect("a post-commit GC fault is committed-with-warning, never an Err");
             assert!(rep.established, "the floor stands through the fault");
             assert!(
                 rep.cleanup_pending && !rep.gc.completed,
@@ -5972,9 +6050,13 @@ mod tests {
 
             // RETRY: the one-shot fault is disarmed; the same checkpoint
             // recomputes reachability fresh and converges.
-            let retry =
-                run_checkpoint(&store, "t0", &DeploymentId::new("t0-01".to_string()), false)
-                    .expect("the retry converges");
+            let retry = run_checkpoint(
+                &store,
+                "t0",
+                &DeploymentId::new("deploy-t0-01".to_string()),
+                false,
+            )
+            .expect("the retry converges");
             assert!(
                 !retry.cleanup_pending && retry.gc.completed,
                 "fault {fault}: the repeated checkpoint converges"

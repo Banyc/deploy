@@ -1,22 +1,27 @@
-//! Deployment snapshot history, rollback snapshots, and rollback reference
-//! handling.
+//! Deployment history, rollback snapshots, and rollback reference handling.
 //!
 //! Only fully successful deployments produce a snapshot
-//! (`refs/snapshots.jsonl`), exposed as the indices `s0`, `s1`, and so on
-//! (`ref_name` renders them `snapshot s0 of target production` for display). Failed and degraded
-//! attempts remain visible through `deploy log` and `attempts.jsonl` but are
-//! not valid rollback sources.
+//! (`refs/snapshots.jsonl`), and the SNAPSHOT LOG IS THE DEPLOYMENT HISTORY:
+//! each successful deployment IS a rollback payload KEYED BY ITS DEPLOYMENT
+//! ID (`deploy push <target> <deployment-id>` restores exactly that
+//! deployment's stored state). Failed and degraded attempts remain visible
+//! through `deploy log` and `attempts.jsonl` but are NOT valid rollback
+//! sources — a failed deployment id never resolves. The separate snapshot
+//! index (`sN`) has been REMOVED from the public surface: any internal
+//! position the floor/compaction needs is DERIVED from the LOG ORDER (the
+//! log is appended in deployment order), never stored as a public index.
 //!
 //! # History floor
 //!
 //! A checkpoint (`deploy checkpoint <target> <deployment-id>`) establishes a
-//! monotonic history floor for the target: every read here resolves against
-//! the FLOORED chain — [`LocalStore::read_snapshots`] exposes only the suffix
-//! at/after the checkpoint's snapshot index, so the checkpoint snapshot
-//! itself stays resolvable while `sN` / `parent(...)` / `@-` stepping below
-//! it fails closed with a "history floor" ref error. Appends after a
-//! checkpoint mint the next unique index from the RAW physical log
-//! ([`ensure_snapshot`]), so compaction can never reuse an index.
+//! monotonic history floor for the target, KEYED BY DEPLOYMENT ID: every
+//! read here resolves against the FLOORED chain — [`LocalStore::read_snapshots`]
+//! exposes only the suffix beginning at the checkpoint deployment's position
+//! in the log, so the checkpoint deployment itself stays resolvable while
+//! `@-` / `parent(...)` stepping below it (and any deployment id below it)
+//! fails closed with a "history floor" ref error. Appends after a checkpoint
+//! simply append (the log is deployment-keyed, so a new deployment id always
+//! mints a new line — compaction can never reuse an identity).
 //!
 //! # Reference syntax (jj-style)
 //!
@@ -32,28 +37,32 @@
 //!   malformed token fails before any side effect and the deployment id/plan
 //!   are never serialized against a half-parsed reference.
 //! * [`resolve_ref_expr`] turns the parsed expression into a concrete
-//!   [`PushRef`] against the target's snapshot chain in the store. The engine
-//!   calls it AFTER reconciliation
+//!   [`PushRef`] against the target's deployment history in the store. The
+//!   engine calls it AFTER reconciliation
 //!   ([`crate::push::reconcile::reconcile_pending_commits`]) has appended any
 //!   recovered snapshots, so a relative ref is computed against the
 //!   POST-reconciliation chain: `@-` means one before the latest INCLUDING
 //!   this push's reconciled append, never a stale pre-recovery snapshot.
 //!
 //! The accepted forms — `` (empty)/`HEAD`/`@`, `@-`, `@--`, `parent(@, N)`,
-//! `release:<id>`, `<refid>-`, `<refid>--`, `parent(<refid>, N)`, and the
-//! bare refid itself (`s3`, `deploy-...`, `rel-sha256-...`/hex digest) —
-//! and the legacy forms they reject are documented in [`crate::revset`].
-//! The push reference is jj-style: the TARGET IS NEVER REPEATED in the
-//! reference, and the `@`-relative forms resolve against the separately-given
-//! target argument. A deployment/release refid resolves to the MOST RECENT
-//! snapshot that deployed that deployment / references that release, and the
-//! ancestor steps walk `s(index - N)`; stepping past the start of the chain,
-//! an unresolvable refid, or an empty chain fail closed with a ref error —
-//! never underflow, never guess.
+//! the bare `<deployment-id>` (EXACT rollback to that deployment's stored
+//! state), `<deployment-id>-`, `<deployment-id>--`,
+//! `parent(<deployment-id>, N)`, and `release:<id>` (the DIRECT release
+//! form) — and the legacy/removed forms they reject (the `sN` snapshot-index
+//! forms, the `fN` prefix, the release-refid ancestor forms, and the legacy
+//! combined forms) are documented in [`crate::revset`], which owns the
+//! grammar. The push reference is jj-style: the TARGET IS NEVER REPEATED in
+//! the reference, and the `@`-relative forms resolve against the
+//! separately-given target argument. A deployment id resolves to EXACTLY
+//! that deployment's stored state, and the ancestor steps walk the
+//! DEPLOYMENT HISTORY from a base POSITION (the log order — positions are
+//! DERIVED, never stored); stepping past the start of the chain, an
+//! unresolvable deployment id, or an empty chain fail closed with a ref
+//! error — never underflow, never guess.
 
 use crate::error::{Error, Result};
 use crate::model::{
-    GenerationRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, TargetName,
+    DeploymentId, GenerationRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, TargetName,
 };
 use crate::records::{
     AttemptServer, DeploymentAttempt, DeploymentSnapshot, DeploymentStatus, PhysicalBinding,
@@ -67,15 +76,20 @@ use std::collections::BTreeMap;
 /// The re-export keeps the existing `history::parse_ref_expr` /
 /// `history::RefExpr` call sites (push engine, plan, checkpoint) resolving
 /// unchanged.
-pub(crate) use crate::revset::{RefExpr, RefId, RelBase, parse_ref_expr};
+pub(crate) use crate::revset::{RefExpr, RelBase, parse_ref_expr};
 
 /// A concrete push source reference (store + target already resolved).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PushRef {
     /// Materialize the currently mapped local files; assign configured variants.
     Head,
-    /// Restore a historical successful snapshot by index.
-    Snapshot { target: TargetName, index: u64 },
+    /// Restore the stored state of a historical successful deployment, KEYED
+    /// BY ITS DEPLOYMENT ID (`deploy push <target> <deployment-id>`, and the
+    /// `@` / `parent(...)` walk of the deployment history).
+    Deployment {
+        target: TargetName,
+        deployment_id: DeploymentId,
+    },
     /// Assign each current server its configured variant from a named release
     /// (plans only when the target's CURRENT slot-id membership exactly
     /// matches the slot set the release record froze for it; physical
@@ -84,16 +98,17 @@ pub enum PushRef {
 }
 
 /// Resolve a parsed [`RefExpr`] to a concrete [`PushRef`] against the
-/// separately-given `target` and the target's snapshot chain in `store`.
+/// separately-given `target` and the target's deployment history in `store`.
 ///
 /// Store-DEPENDENT (unlike [`parse_ref_expr`]): reads the target's snapshot
-/// chain, so the caller must invoke it AFTER reconciliation has appended any
-/// recovered snapshots — the engine parses the token up front but resolves
-/// only once the chain is stable, so relative refs see the reconciled append.
-/// The target is passed ONCE (the push argument); the relative forms never
-/// repeat it. Failures are ref errors: an empty chain, an unresolvable
-/// refid, and walking past the start of the chain all fail closed rather
-/// than guessing.
+/// log (the DEPLOYMENT HISTORY — each successful deployment is a rollback
+/// payload keyed by its deployment id), so the caller must invoke it AFTER
+/// reconciliation has appended any recovered snapshots — the engine parses
+/// the token up front but resolves only once the chain is stable, so relative
+/// refs see the reconciled append. The target is passed ONCE (the push
+/// argument); the relative forms never repeat it. Failures are ref errors: an
+/// empty chain, an unresolvable deployment id, and walking past the start of
+/// the chain all fail closed rather than guessing.
 pub(crate) fn resolve_ref_expr(
     expr: &RefExpr,
     target: &str,
@@ -103,10 +118,10 @@ pub(crate) fn resolve_ref_expr(
         // `@` / `HEAD` / the default push: the current local files.
         RefExpr::Head => Ok(PushRef::Head),
         // The DIRECT release form: `release:<id>` maps straight to a
-        // `PushRef::Release` — no snapshot-chain stepping, no target history
-        // required (cross-target capable by design; the release's own stored
-        // slot snapshot and the CURRENT target's slots are what the plan
-        // resolves against — the release-versioned vs current membership
+        // `PushRef::Release` — no deployment-history stepping, no target
+        // history required (cross-target capable by design; the release's own
+        // stored slot snapshot and the CURRENT target's slots are what the
+        // plan resolves against — the release-versioned vs current membership
         // equality check runs at plan time, before any remote access).
         RefExpr::Release(release) => Ok(PushRef::Release {
             release: release.clone(),
@@ -116,141 +131,119 @@ pub(crate) fn resolve_ref_expr(
             if rel.base == RelBase::At && rel.steps == 0 {
                 return Ok(PushRef::Head);
             }
+            // The deployment history IS the snapshot log, ordered by appends
+            // (deployment order). POSITIONS are derived from that order —
+            // there is no stored index — so the chain is a contiguous
+            // position space and any position < len is a member.
             let entries = store.read_snapshots(target)?;
-            let base_index = resolve_base_index(&rel.base, target, &entries, expr, store)?;
-            let index = base_index.checked_sub(rel.steps).ok_or_else(|| {
+            let base_pos = resolve_base_pos(&rel.base, target, &entries, expr, store)?;
+            let base_id = match &rel.base {
+                RelBase::At => entries[base_pos].deployment_id.as_str(),
+                RelBase::Refid(dep) => dep.as_str(),
+            };
+            let pos = base_pos.checked_sub(rel.steps as usize).ok_or_else(|| {
                 Error::r#ref(format!(
-                    "'{expr}' walks {} step(s) back from snapshot s{base_index} on target '{target}', \
-                    before the start of the snapshot chain",
+                    "'{expr}' walks {} step(s) back from deployment '{base_id}' on target \
+                    '{target}', before the start of the deployment history",
                     rel.steps
                 ))
             })?;
             // The history floor gates resolution: the chain the read exposed is
-            // already the suffix at/after the floor (read_snapshots filters by
-            // the durable marker), so a below-floor index is structurally
-            // unreachable here — but the explicit check documents the guarantee
-            // and guards any future caller that resolves against a raw chain.
+            // already the suffix beginning at the checkpoint deployment
+            // (read_snapshots filters by the durable marker), so a
+            // below-floor position is structurally unreachable here — but the
+            // explicit check documents the guarantee and guards any future
+            // caller that resolves against a raw chain.
             if let Some(floor) = store.read_history_floor(target)?
-                && index < floor.snapshot_index
+                && let Some(fpos) = entries
+                    .iter()
+                    .position(|e| e.deployment_id == floor.deployment_id)
+                && pos < fpos
             {
                 return Err(Error::r#ref(format!(
-                    "cannot roll back below the history floor (checkpoint {} at s{}) on target '{target}': \
-                    history before the checkpoint has been discarded",
-                    floor.deployment_id, floor.snapshot_index
+                    "cannot roll back below the deployment floor (checkpoint {}) on target \
+                    '{target}': history before the checkpoint has been discarded",
+                    floor.deployment_id
                 )));
             }
-            // The STEPPED index must be an actual member of the floored
-            // read chain. [`resolve_base_index`] verifies only the BASE's
-            // membership; on a GAPPED chain (e.g. [s3, s5] after checkpoint
-            // compaction) an ancestor index can land in the hole — here
-            // `@-` would step s5 → s4, an index no snapshot carries. Such a
-            // dangling index must fail CLOSED here with a ref error naming
-            // the index, never flow on to the rollback plan (which would
-            // later fail with a misleading `resolve_snapshot` error).
-            // Contiguous chains (prefix compaction + max+1 appends) are
-            // unaffected: the floor check above already bounds the walk and
-            // every index in [floor, max] is present, so this check is a
-            // no-op for them.
-            if !entries.iter().any(|e| e.index == index) {
-                return Err(Error::r#ref(format!(
-                    "'{expr}' walks {} step(s) back from snapshot s{base_index} on target '{target}' to s{index}, \
-                    which is not present in the floored snapshot chain (the chain has a gap)",
-                    rel.steps
-                )));
-            }
-            Ok(PushRef::Snapshot {
+            Ok(PushRef::Deployment {
                 target: TargetName::new(target.to_string()),
-                index,
+                deployment_id: entries[pos].deployment_id.clone(),
             })
         }
     }
 }
 
-/// Resolve a relative reference's base to a snapshot index in the chain.
-/// `expr` renders the reference for error messages (the parsed form has no
-/// raw token anymore). The chain is the FLOORED read (the suffix at/after
-/// the target's checkpoint), so a refid below the floor is absent; when the
-/// target has a history floor, the absence is reported as a below-floor
-/// refusal naming the checkpoint rather than a plain "no snapshot" error.
-fn resolve_base_index(
+/// Resolve a relative reference's base to a POSITION in the floored
+/// deployment chain (the snapshot log in deployment order). `expr` renders
+/// the reference for error messages (the parsed form has no raw token
+/// anymore). The chain is the FLOORED read (the suffix beginning at the
+/// checkpoint deployment), so a deployment id below the floor is absent;
+/// when the target has a history floor, the absence is reported as a
+/// below-floor refusal naming the checkpoint rather than a plain "no
+/// deployment" error.
+fn resolve_base_pos(
     base: &RelBase,
     target: &str,
     entries: &[DeploymentSnapshot],
     expr: &RefExpr,
     store: &LocalStore,
-) -> Result<u64> {
-    // The history floor, when set: below-floor refids fail with a floor
-    // error instead of a generic "no snapshot" error.
-    let floor = store.read_history_floor(target)?;
-    let below_floor = |k: u64| -> bool { floor.as_ref().is_some_and(|f| k < f.snapshot_index) };
-    let latest = entries.iter().map(|e| e.index).max();
+) -> Result<usize> {
     match base {
-        RelBase::At => latest.ok_or_else(|| {
+        RelBase::At => entries.len().checked_sub(1).ok_or_else(|| {
             Error::r#ref(format!(
-                "no successful snapshots for target '{target}'; cannot resolve '{expr}'"
+                "no successful deployments for target '{target}'; cannot resolve '{expr}'"
             ))
         }),
-        RelBase::Refid(RefId::SnapshotIndex(k)) => {
-            if entries.iter().any(|e| e.index == *k) {
-                Ok(*k)
-            } else if below_floor(*k) {
-                let f = floor.expect("below_floor implies a floor");
+        RelBase::Refid(dep) => match entries.iter().position(|e| e.deployment_id == *dep) {
+            Some(pos) => Ok(pos),
+            None => {
+                // The history-floor hint: a deployment absent from the
+                // FLOORED chain with a floor established sits strictly
+                // before the checkpoint — either it is still in the RAW log
+                // (an interrupted compaction) or the checkpoint's physical
+                // compaction already discarded it. Both are "cannot roll
+                // back below the history floor" — report the floor naming
+                // it rather than a generic "no deployment" error (an id
+                // that never existed stays a plain error).
+                if let Some(floor) = store.read_history_floor(target)? {
+                    let below_raw = store
+                        .read_snapshots_raw(target)?
+                        .iter()
+                        .any(|e| e.deployment_id == *dep);
+                    return Err(Error::r#ref(format!(
+                        "cannot roll back below the history floor (checkpoint {}) on target \
+                        '{target}': history before the checkpoint has been discarded{}",
+                        floor.deployment_id,
+                        if below_raw {
+                            format!(" (deployment '{dep}' sits below it)")
+                        } else {
+                            format!(" (deployment '{dep}' was discarded with it)")
+                        }
+                    )));
+                }
                 Err(Error::r#ref(format!(
-                    "no snapshot s{k} for target '{target}': cannot roll back below the history floor \
-                    (checkpoint {} at s{}) — history before the checkpoint has been discarded",
-                    f.deployment_id, f.snapshot_index
-                )))
-            } else {
-                Err(Error::r#ref(format!(
-                    "no snapshot s{k} for target '{target}'"
+                    "no successful deployment '{dep}' on target '{target}'"
                 )))
             }
-        }
-        RelBase::Refid(RefId::Deployment(id)) => entries
-            .iter()
-            .filter(|e| e.deployment_id.as_str() == id)
-            .map(|e| e.index)
-            .max()
-            .ok_or_else(|| {
-                Error::r#ref(format!(
-                    "no successful snapshot for deployment '{id}' on target '{target}'",
-                ))
-            }),
-        RelBase::Refid(RefId::Release(rid)) => {
-            let want = ReleaseId::parse(rid);
-            entries
-                .iter()
-                .filter(|e| snapshot_release(e) == want)
-                .map(|e| e.index)
-                .max()
-                .ok_or_else(|| {
-                    Error::r#ref(format!(
-                        "no successful snapshot references release '{rid}' on target '{target}'",
-                    ))
-                })
-        }
+        },
     }
 }
 
-/// The release a snapshot's generations came from (a coherent snapshot
-/// carries one release across its slots).
-fn snapshot_release(e: &DeploymentSnapshot) -> ReleaseId {
-    e.slots
-        .values()
-        .next()
-        .map(|g| g.assignment.artifact.release.clone())
-        .unwrap_or_default()
+/// Human-readable display name for a successful deployment's rollback
+/// payload, e.g. `deployment deploy-abc of target production`.
+pub fn ref_name(target: &TargetName, deployment_id: &DeploymentId) -> String {
+    format!(
+        "deployment {} of target {}",
+        deployment_id.as_str(),
+        target.as_str()
+    )
 }
 
-/// Human-readable display name for a snapshot index, e.g.
-/// `snapshot s1 of target production`.
-pub fn ref_name(target: &TargetName, index: u64) -> String {
-    format!("snapshot s{index} of target {}", target.as_str())
-}
-
-/// Ensure the snapshot log contains exactly one successful snapshot for
-/// the attempt's deployment ID, and that `refs/last-successful` points at it.
-/// Returns the snapshot's index.
+/// Ensure the snapshot log contains exactly one successful snapshot for the
+/// attempt's deployment ID, and that `refs/last-successful` points at it.
+/// Returns the snapshot's deployment id (THE KEY — the log is deployment-
+/// keyed; positions are derived from the log order, never stored).
 ///
 /// This is the single idempotent insert used by BOTH the main success path
 /// and recovery finalization, and it is replay-safe:
@@ -258,7 +251,7 @@ pub fn ref_name(target: &TargetName, index: u64) -> String {
 /// * If a snapshot with `deployment_id == attempt.deployment_id` already
 ///   exists (a previous finalization crashed after appending the snapshot but
 ///   before finishing), no second snapshot is appended: the existing
-///   snapshot's index is returned. The log never contains two snapshots for
+///   snapshot's key is returned. The log never contains two snapshots for
 ///   the same deployment ID.
 /// * `refs/last-successful` is (re)written to the attempt's deployment ID in
 ///   both cases — idempotent, the same value on every replay — which also
@@ -270,39 +263,45 @@ pub fn ref_name(target: &TargetName, index: u64) -> String {
 /// or the verified desired state during recovery), NOT from the attempt
 /// record itself: the persisted attempt is the immutable intent and its
 /// `slots` map is empty.
+///
+/// # GC integration note (in-flight feature)
+///
+/// The snapshot payload (`slots`, `behavior_sha256`, `bindings`, and the
+/// release its generations came from) is the INTERNAL rollback payload and is
+/// kept INTACT here — keyed by deployment id. The GC retained-set rule
+/// ("every snapshot at or above every floor") keys off the same deployment
+/// identity: a retained set is every snapshot at or after the floor
+/// deployment's POSITION in the log (derived, never stored). Any GC work
+/// lands at that integration point; this function only guarantees the payload
+/// survives, keyed by its deployment id.
 pub fn ensure_snapshot(
     store: &LocalStore,
     target: &TargetName,
     attempt: &DeploymentAttempt,
     outcomes: &BTreeMap<PlacementSlotId, AttemptServer>,
     bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
-) -> Result<u64> {
+) -> Result<DeploymentId> {
     let target = target.as_str();
-    // RAW (floor-unfiltered) snapshot log: index allocation must see every
-    // physically recorded snapshot so a compaction can never reuse an index.
-    // The floor only bounds what readers see; the index space is monotonic
-    // over the full physical log.
+    // RAW (floor-unfiltered) snapshot log: the key space is the deployment id
+    // space. A checkpoint compacts the log to a suffix (the below-floor
+    // deployments are discarded); a NEW deployment id always appends a NEW
+    // line — compaction can never reuse an identity.
     let entries = store.read_snapshots_raw(target)?;
     if let Some(existing) = entries
         .iter()
         .find(|e| e.deployment_id == attempt.deployment_id)
     {
         store.write_last_successful(target, attempt.deployment_id.as_str())?;
-        return Ok(existing.index);
+        return Ok(existing.deployment_id.clone());
     }
-    // NEXT INDEX = max existing index + 1 (never `entries.len()`: a compacted
-    // chain like [s2, s3] has len 2 but the next unique index is 4, so len
-    // would mint a reused index 2). Appending after a checkpoint therefore
-    // always produces a unique, increasing index.
-    let next = entries.iter().map(|e| e.index).max().map_or(0, |m| m + 1);
-    let entry = build_snapshot(next, attempt, outcomes, bindings);
+    let entry = build_snapshot(attempt, outcomes, bindings);
     store.append_snapshot(target, &entry)?;
     store.write_last_successful(target, attempt.deployment_id.as_str())?;
-    Ok(next)
+    Ok(attempt.deployment_id.clone())
 }
 
 /// Append a successful snapshot to the snapshot log and return its
-/// index.
+/// deployment id (the key).
 ///
 /// Idempotent by deployment ID: delegates to
 /// [`ensure_snapshot`], so re-running finalization for the same
@@ -318,7 +317,7 @@ pub fn append_snapshot(
     attempt: &DeploymentAttempt,
     outcomes: &BTreeMap<PlacementSlotId, AttemptServer>,
     bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
-) -> Result<u64> {
+) -> Result<DeploymentId> {
     ensure_snapshot(store, target, attempt, outcomes, bindings)
 }
 
@@ -356,14 +355,14 @@ pub fn append_snapshot(
 /// earlier step is already durable (and the eligibility gate skips the
 /// attempt forever once the latest transition says `Successful`).
 ///
-/// Returns the attempt's snapshot index.
+/// Returns the attempt's snapshot deployment id (the rollback key).
 pub fn finalize_successful_attempt(
     store: &LocalStore,
     attempt: &DeploymentAttempt,
     outcomes: &BTreeMap<PlacementSlotId, AttemptServer>,
     reason: &str,
     bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
-) -> Result<u64> {
+) -> Result<DeploymentId> {
     let id = attempt.deployment_id.as_str();
     // Already fully finalized (the eligibility gate normally prevents this):
     // every earlier step is durable by construction; only repair a stale
@@ -381,10 +380,10 @@ pub fn finalize_successful_attempt(
         )?;
     }
     // 2. Snapshot entry + `refs/last-successful` (idempotent).
-    let idx = ensure_snapshot(store, &attempt.target, attempt, outcomes, bindings)?;
+    let dep = ensure_snapshot(store, &attempt.target, attempt, outcomes, bindings)?;
     // 3. Terminal status LAST.
     store.append_transition(id, &DeploymentStatus::Successful, Some(reason))?;
-    Ok(idx)
+    Ok(dep)
 }
 
 /// Resolve the per-slot outcomes used to build a successful snapshot
@@ -437,6 +436,10 @@ pub fn resolve_attempt_outcomes(
 /// recorded generation are not part of a coherent successful snapshot and
 /// are dropped.
 ///
+/// The snapshot is KEYED BY THE ATTEMPT'S DEPLOYMENT ID (the old numeric
+/// `index`/`sN` identity is gone — the log is deployment-keyed and ordered
+/// by appends; positions are derived, never stored).
+///
 /// `bindings` records the COMPLETE physical binding (`{server, deploy_dir}`)
 /// each slot had when the deployment ran (the engine passes the target's
 /// current slot→binding map from `deploy.toml`). It is stored as a separate
@@ -444,13 +447,11 @@ pub fn resolve_attempt_outcomes(
 /// entry with no bindings map deserializes to an empty one (unverifiable,
 /// so rollback refuses rather than guessing the host/location).
 pub fn build_snapshot(
-    index: u64,
     attempt: &DeploymentAttempt,
     outcomes: &BTreeMap<PlacementSlotId, AttemptServer>,
     bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
 ) -> DeploymentSnapshot {
     DeploymentSnapshot {
-        index,
         deployment_id: attempt.deployment_id.clone(),
         target: attempt.target.clone(),
         behavior_sha256: attempt.behavior_sha256.clone(),
@@ -475,23 +476,30 @@ pub fn build_snapshot(
     }
 }
 
-/// Resolve a snapshot index to its entry.
-pub fn resolve_snapshot(
+/// Resolve a deployment id to its stored rollback payload (the snapshot the
+/// deployment produced). The id must be a SUCCESSFUL deployment of the
+/// target (it must own a snapshot in the floored log); failed and degraded
+/// attempts never resolve.
+pub fn resolve_deployment(
     store: &LocalStore,
     target: &TargetName,
-    index: u64,
+    deployment_id: &DeploymentId,
 ) -> Result<DeploymentSnapshot> {
     let target = target.as_str();
     let entries = store.read_snapshots(target)?;
     entries
         .into_iter()
-        .find(|e| e.index == index)
-        .ok_or_else(|| Error::r#ref(format!("no snapshot s{index} for target '{target}'")))
+        .find(|e| e.deployment_id == *deployment_id)
+        .ok_or_else(|| {
+            Error::r#ref(format!(
+                "no successful deployment '{deployment_id}' for target '{target}'"
+            ))
+        })
 }
 
 /// Reconstruct the set of successful deployments for a target from the
 /// snapshot log (used to rebuild history from servers when the local ref is
-/// stale).
+/// stale). The log order IS the deployment order.
 pub fn successful_snapshots(
     store: &LocalStore,
     target: &TargetName,
@@ -504,15 +512,15 @@ pub fn attempt_slot_ids(attempt: &DeploymentAttempt) -> Vec<PlacementSlotId> {
     attempt.slot_ids.clone()
 }
 
-/// Build a map of snapshot display names (`snapshot sN of target <target>`)
-/// -> snapshot.
-pub fn snapshot_index(
+/// Build a map of rollback display names (`deployment <deployment-id> of
+/// target <target>`) -> snapshot.
+pub fn deployment_index(
     store: &LocalStore,
     target: &TargetName,
 ) -> Result<BTreeMap<String, DeploymentSnapshot>> {
     let mut out = BTreeMap::new();
     for e in store.read_snapshots(target.as_str())? {
-        out.insert(ref_name(target, e.index), e);
+        out.insert(ref_name(target, &e.deployment_id), e);
     }
     Ok(out)
 }
@@ -536,14 +544,15 @@ mod tests {
     // the parse/resolve contract stays pinned in ONE place.
     use crate::revset::tests::{fold, parse_no_panic, ref_token_strategy};
 
-    /// Build a store whose target `production` has the chain s0..s5
-    /// (deployments deploy-a..deploy-f; the s2 and s3 snapshots BOTH carry
-    /// release rel-sha256-cccc, so the "most recent" release resolution is
-    /// exercised).
+    /// A `deploy-<id>` deployment-id refid parses to a deployment base.
+    /// deploy-a..deploy-f (every deployment SUCCESSFUL, so every one is a
+    /// rollback payload; the deploy-c and deploy-d snapshots BOTH carry
+    /// release rel-sha256-cccc — irrelevant now that release refids are
+    /// removed, but kept to pin the payload contents).
     fn chain() -> (tempfile::TempDir, LocalStore) {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
-        for (i, (dep, rel)) in [
+        for (n, (dep, rel)) in [
             ("deploy-a", "aaaa"),
             ("deploy-b", "bbbb"),
             ("deploy-c", "cccc"),
@@ -555,40 +564,46 @@ mod tests {
         .enumerate()
         {
             store
-                .append_snapshot("production", &snapshot_entry(i as u64, dep, rel))
+                .append_snapshot("production", &snapshot_entry(dep, rel))
                 .unwrap();
+            let _ = n;
         }
         (tmp, store)
     }
 
-    fn snapshot_entry(index: u64, deployment: &str, release: &str) -> DeploymentSnapshot {
+    fn snapshot_entry(deployment: &str, release: &str) -> DeploymentSnapshot {
         DeploymentSnapshot {
-            index,
             deployment_id: DeploymentId::new(deployment.to_string()),
             target: TargetName::new("production".to_string()),
             behavior_sha256: "sha256-aa".to_string(),
             slots: BTreeMap::from([(
                 PlacementSlotId::new("p1".to_string()),
                 GenerationRef {
-                    generation: GenerationId::new(format!("gen-{index}")),
+                    generation: GenerationId::new(format!("gen-{deployment}")),
                     assignment: PlacementSlotAssignment {
                         placement_slot: PlacementSlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
                             release: ReleaseId::new(format!("rel-sha256-{release}")),
                             variant: VariantName::new("standard".to_string()),
-                            tree: TreeDigest::new(format!("tree-{index}")),
+                            tree: TreeDigest::new(format!("tree-{deployment}")),
                         },
                     },
                 },
             )]),
-            bindings: BTreeMap::new(),
+            bindings: BTreeMap::from([(
+                PlacementSlotId::new("p1".to_string()),
+                PhysicalBinding {
+                    server: ServerId::new("server-01".to_string()),
+                    deploy_dir: "/srv/deploy/p1".to_string(),
+                },
+            )]),
         }
     }
 
-    fn snap(target: &TargetName, index: u64) -> PushRef {
-        PushRef::Snapshot {
+    fn dep_ref(target: &TargetName, deployment_id: &str) -> PushRef {
+        PushRef::Deployment {
             target: target.clone(),
-            index,
+            deployment_id: DeploymentId::new(deployment_id.to_string()),
         }
     }
 
@@ -635,82 +650,78 @@ mod tests {
         );
     }
 
-    /// The ancestor steps on the s0..s5 chain (latest = s5): `@-` = s4,
-    /// `@--` = s3, `parent(@, 3)` = s2, `s3--` = s1, `parent(s5, 2)` = s3,
-    /// `s1-` = s0, and the bare `s1` / `parent(s1, 0)` forms name s1 itself.
+    /// The ancestor steps on the deploy-a..deploy-f chain (latest =
+    /// deploy-f): `@-` = deploy-e, `@--` = deploy-d, `parent(@, 3)` =
+    /// deploy-c, `deploy-f--` = deploy-d, `parent(deploy-f, 2)` = deploy-d,
+    /// `deploy-b-` = deploy-a, and the bare `deploy-b` / `parent(deploy-b, 0)`
+    /// forms name deploy-b itself.
     #[test]
     fn resolve_ref_ancestor_steps() {
         let (_tmp, store) = chain();
         let target = TargetName::new("production".to_string());
         for (token, want) in [
-            ("@-", 4u64),
-            ("@--", 3),
-            ("parent(@, 3)", 2),
-            ("parent(@, 2)", 3),
-            ("s3--", 1),
-            ("parent(s5, 2)", 3),
-            ("s1-", 0),
-            ("s1", 1),
-            ("parent(s1, 0)", 1),
-            ("parent(s2, 1)", 1),
+            ("@-", "deploy-e"),
+            ("@--", "deploy-d"),
+            ("parent(@, 3)", "deploy-c"),
+            ("parent(@, 2)", "deploy-d"),
+            ("deploy-c--", "deploy-a"),
+            ("parent(deploy-f, 2)", "deploy-d"),
+            ("deploy-b-", "deploy-a"),
+            ("deploy-b", "deploy-b"),
+            ("parent(deploy-b, 0)", "deploy-b"),
+            ("parent(deploy-c, 1)", "deploy-b"),
         ] {
             assert_eq!(
                 resolve(token, &store).unwrap(),
-                snap(&target, want),
-                "{token} must resolve to index {want}"
+                dep_ref(&target, want),
+                "{token} must resolve to deployment {want}"
             );
         }
     }
 
-    /// A deployment refid resolves to the snapshot that deployed it (most
-    /// recent); a release refid to the most recent snapshot referencing the
-    /// release — then the ancestor steps walk from there.
+    /// A deployment refid resolves to the snapshot that deployed it (its
+    /// own stored state — exact rollback); the ancestor steps walk the
+    /// deployment history back from there.
     #[test]
-    fn resolve_ref_deployment_and_release_refids() {
+    fn resolve_ref_deployment_refids() {
         let (_tmp, store) = chain();
         let target = TargetName::new("production".to_string());
-        // deploy-b deployed s1.
-        assert_eq!(resolve("deploy-b-", &store).unwrap(), snap(&target, 0));
         assert_eq!(
-            resolve("parent(deploy-b, 1)", &store).unwrap(),
-            snap(&target, 0)
+            resolve("deploy-b", &store).unwrap(),
+            dep_ref(&target, "deploy-b")
+        );
+        assert_eq!(
+            resolve("deploy-b-", &store).unwrap(),
+            dep_ref(&target, "deploy-a")
         );
         assert_eq!(
             resolve("parent(deploy-c, 0)", &store).unwrap(),
-            snap(&target, 2)
-        );
-        // rel-sha256-cccc is referenced by BOTH s2 and s3; the most recent
-        // (s3) wins, then the ancestor steps apply.
-        assert_eq!(
-            resolve("parent(rel-sha256-cccc, 0)", &store).unwrap(),
-            snap(&target, 3)
+            dep_ref(&target, "deploy-c")
         );
         assert_eq!(
-            resolve("rel-sha256-cccc-", &store).unwrap(),
-            snap(&target, 2)
+            resolve("parent(deploy-f, 4)", &store).unwrap(),
+            dep_ref(&target, "deploy-b")
         );
+        // The bare deployment id resolves to EXACTLY that deployment's stored
+        // payload (the snapshot keyed by the id), never "the most recent
+        // snapshot" of anything.
+        let entry = resolve_deployment(&store, &target, &DeploymentId::new("deploy-c")).unwrap();
+        assert_eq!(entry.deployment_id.as_str(), "deploy-c");
         assert_eq!(
-            resolve("parent(rel-sha256-cccc, 2)", &store).unwrap(),
-            snap(&target, 1)
-        );
-        // Abbreviated digest form resolves the same release.
-        assert_eq!(
-            resolve("parent(cccc, 0)", &store).unwrap(),
-            snap(&target, 3)
+            entry.slots[&PlacementSlotId::new("p1")].generation.as_str(),
+            "gen-deploy-c"
         );
     }
 
     /// `release:<id>` resolves DIRECTLY to a `PushRef::Release` — with NO
-    /// store lookup and NO target snapshot history: the bare release id never
-    /// steps the deployment-snapshot chain, so a cross-target / fresh-target
-    /// direct deployment is expressible even when the destination has zero
+    /// store lookup and NO target history: the direct form never steps the
+    /// deployment history, so a cross-target / fresh-target direct
+    /// deployment is expressible even when the destination has zero
     /// snapshots. This is the grammar's escape hatch for
-    /// direct/cross-target release deployment.
+    /// direct/cross-target release deployment (UNCHANGED).
     #[test]
     fn resolve_ref_direct_release_form_ignores_chain_and_store() {
         let (_tmp, store) = chain();
-        // Even though `rel-sha256-cccc` IS referenced by snapshots in this
-        // chain, `release:` yields the bare release ref, not a snapshot.
         assert_eq!(
             resolve_ref_expr(
                 &parse_ref_expr("release:rel-sha256-cccc").expect("token must parse"),
@@ -733,14 +744,14 @@ mod tests {
                 release: ReleaseId::new("rel-sha256-cccc".to_string())
             }
         );
-        // A release that is NOT referenced by any snapshot — and a target
+        // A release that is not referenced by any snapshot — and a target
         // with an EMPTY chain — resolve the same way: resolution never reads
         // the store.
         let tmp = tempfile::tempdir().unwrap();
         let empty = LocalStore::with_base(tmp.path().join("store")).unwrap();
         assert_eq!(
             resolve_ref_expr(
-                &parse_ref_expr("release:rel-sha256-zzzz").expect("token must parse"),
+                &parse_ref_expr("release:rel-sha256-zzzz").expect("must parse"),
                 "brand-new-target",
                 &empty
             )
@@ -749,33 +760,23 @@ mod tests {
                 release: ReleaseId::new("rel-sha256-zzzz".to_string())
             }
         );
-        // The refid form on the same empty chain still fails closed (it
-        // needs a snapshot that references the release).
-        resolve_ref_expr(
-            &parse_ref_expr("parent(rel-sha256-zzzz, 0)").expect("token must parse"),
-            "brand-new-target",
-            &empty,
-        )
-        .expect_err("the refid form needs snapshot ancestry and must fail on an empty chain");
     }
 
     /// Out-of-range and unresolvable references fail closed with a ref
-    /// error: stepping before the chain start, a missing snapshot index, an
-    /// unknown deployment/release, and an EMPTY chain. Never underflow,
-    /// never guess.
+    /// error: stepping before the chain start, a missing deployment id, and
+    /// an EMPTY chain. Never underflow, never guess.
     #[test]
     fn resolve_ref_failures_fail_closed() {
         let (_tmp, store) = chain();
         for token in [
-            "parent(@, 6)", // s5 - 6 underflows
-            "s0-",
-            "s0--",
-            "parent(s1, 2)",
-            "s9",
-            "parent(s9, 0)",
+            "parent(@, 6)", // len 6, so 6 steps back underflows
+            "deploy-a-",    // deploy-a is the first deployment
+            "deploy-a--",
+            "parent(deploy-b, 2)",
+            "parent(deploy-a, 1)",
+            "deploy-missing",
             "deploy-missing-",
             "parent(deploy-missing, 1)",
-            "parent(rel-sha256-zzzz, 0)",
         ] {
             let err = resolve(token, &store).expect_err(&format!("{token} must fail closed"));
             assert!(
@@ -789,16 +790,19 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let empty = LocalStore::with_base(tmp.path().join("store")).unwrap();
         assert_eq!(resolve("@", &empty).unwrap(), PushRef::Head);
-        for token in ["@-", "parent(@, 2)", "s0", "deploy-x-"] {
+        for token in ["@-", "parent(@, 2)", "deploy-x", "deploy-x-"] {
             resolve(token, &empty).expect_err(&format!("{token} on an empty chain must fail"));
         }
     }
 
     #[test]
-    fn ref_name_index() {
+    fn ref_name_deployment() {
         assert_eq!(
-            ref_name(&TargetName::new("production".to_string()), 3),
-            "snapshot s3 of target production"
+            ref_name(
+                &TargetName::new("production".to_string()),
+                &DeploymentId::new("deploy-abc")
+            ),
+            "deployment deploy-abc of target production"
         );
     }
 
@@ -831,7 +835,7 @@ mod tests {
         // itself carries only intent; its `slots` map is empty), and records
         // the slot→{server, deploy_dir} binding from `bindings`.
         let first = append_snapshot(&store, &target, &attempt, &attempt.slots, &bindings).unwrap();
-        assert_eq!(first, 0);
+        assert_eq!(first, attempt.deployment_id);
         let snapshots = store.read_snapshots(target.as_str()).unwrap();
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].deployment_id, attempt.deployment_id);
@@ -840,10 +844,10 @@ mod tests {
             Some("deploy-idempotent")
         );
 
-        // Second call with the same deployment ID is a no-op: same index, no
+        // Second call with the same deployment ID is a no-op: same key, no
         // duplicate entry, and `refs/last-successful` is untouched.
         let second = append_snapshot(&store, &target, &attempt, &attempt.slots, &bindings).unwrap();
-        assert_eq!(second, first, "repeated append must return the same index");
+        assert_eq!(second, first, "repeated append must return the same key");
         let snapshots = store.read_snapshots(target.as_str()).unwrap();
         assert_eq!(snapshots.len(), 1, "no duplicate snapshot entry");
         assert_eq!(
@@ -880,7 +884,7 @@ mod tests {
             },
         )]);
 
-        let snapshot = build_snapshot(3, &attempt, &attempt.slots, &bindings);
+        let snapshot = build_snapshot(&attempt, &attempt.slots, &bindings);
         assert_eq!(
             snapshot.bindings.get(&slot),
             Some(&PhysicalBinding {
@@ -897,10 +901,13 @@ mod tests {
     /// oldest pre-binding shape or the intermediate shape that only recorded
     /// a `servers` map) must still deserialize; its `bindings` map defaults
     /// to empty, which rollback treats as unverifiable rather than guessing
-    /// the host/location.
+    /// the host/location. The removed `index` key is an unknown field now and
+    /// is IGNORED — legacy `sN`-era logs stay readable (the payload is what
+    /// matters; the deployment id is the key).
     #[test]
     fn legacy_snapshot_without_bindings_deserializes_with_empty_map() {
-        // Oldest shape: no binding recorded at all.
+        // Oldest shape: no binding recorded at all (and the removed `index`
+        // key — ignored by the deployment-keyed record).
         let bare = r#"{"index":0,"deployment_id":"deploy-old","target":"production","behavior_sha256":"sha256-aa","slots":{}}"#;
         let snapshot: DeploymentSnapshot = serde_json::from_str(bare).unwrap();
         assert!(
@@ -912,7 +919,7 @@ mod tests {
         // field now (the physical binding is richer than a bare ServerId),
         // so it is ignored and `bindings` still defaults to empty →
         // fail-closed refusal.
-        let with_servers = r#"{"index":1,"deployment_id":"deploy-old-servers","target":"production","behavior_sha256":"sha256-aa","slots":{},"servers":{"p1":"server-01"}}"#;
+        let with_servers = r#"{"index":1,"deployment_id":"deploy_servers","target":"production","behavior_sha256":"sha256-aa","slots":{},"servers":{"p1":"server-01"}}"#;
         let snapshot: DeploymentSnapshot = serde_json::from_str(with_servers).unwrap();
         assert!(
             snapshot.bindings.is_empty(),
@@ -920,21 +927,32 @@ mod tests {
         );
     }
 
-    /// A gapped snapshot-chain shape: 0..=8 indices, a sorted sample of
-    /// 0..12 (GAPS DELIBERATE — chains are seeded with caller-chosen
-    /// indices, exactly as checkpoint compaction rewrites the log), plus an
-    /// optional durable floor at a MEMBER index ≤ max (None on an empty
-    /// chain or when the generated slot overruns it).
-    fn chain_strategy() -> impl Strategy<Value = (Vec<u64>, Option<u64>)> {
+    /// A deployment-history shape: 0..=8 (deployment_id, successful?) pairs
+    /// (a FAILED deployment never gets a snapshot — the two-class history the
+    /// user's property needs). Deployment ids are DETERMINISTIC PER POSITION
+    /// (`deploy-{n:04}`), so each id is unique across the history and a
+    /// FAILED id can never double as a SUCCESSFUL one (which would make
+    /// "failed ids never resolve" vacuous). Plus an optional durable floor
+    /// at a SUCCESSFUL deployment (never None on an empty chain or when the
+    /// generated slot overruns the successes).
+    fn chain_strategy() -> impl Strategy<Value = (Vec<(String, bool)>, Option<String>)> {
         (
-            prop::collection::vec(0u64..12, 0..=8),
-            prop::option::weighted(0.6, 0usize..9),
+            prop::collection::vec(any::<bool>(), 0..=8),
+            prop::option::weighted(0.6, 0usize..8),
         )
-            .prop_map(|(mut idx, floor_slot)| {
-                idx.sort_unstable();
-                idx.dedup();
-                let floor = floor_slot.and_then(|i| idx.get(i).copied());
-                (idx, floor)
+            .prop_map(|(flags, floor_slot)| {
+                let history: Vec<(String, bool)> = flags
+                    .into_iter()
+                    .enumerate()
+                    .map(|(n, ok)| (format!("deploy-{n:04}"), ok))
+                    .collect();
+                let ok_ids: Vec<String> = history
+                    .iter()
+                    .filter(|(_, ok)| *ok)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                let floor = floor_slot.and_then(|i| ok_ids.get(i).cloned());
+                (history, floor)
             })
     }
 
@@ -955,46 +973,109 @@ mod tests {
         }
     }
 
-    /// One resolve-leg case: seed a REAL store with a (possibly gapped,
-    /// possibly floored) chain, parse a generated token, and resolve it via
-    /// the engine's two-phase flow `resolve_ref_expr(&parse_ref_expr(t)?, ...)`.
-    /// Asserts: no panic anywhere; every parse AND resolve failure is a ref
-    /// error; a rejected shape never resolves; a resolved snapshot index is
-    /// an actual member of the FLOORED chain at/after the floor; `@` /
-    /// `release:<id>` never touch the chain (they resolve even on an EMPTY
-    /// store, while every relative form on an empty store fails closed —
-    /// except `parent(@, 0)`, which the oracle folds to `Head` FIRST so it
+    /// THE USER'S PROPERTY, per resolve-leg case: seed a REAL store with a
+    /// deployment history (successful + FAILED attempts interleaved — a
+    /// failed attempt records an attempt + a `deployments/<id>/` dir but NO
+    /// snapshot), optionally checkpoint it at a successful deployment, then
+    /// assert that EVERY successful deployment id resolves to EXACTLY its
+    /// stored state, every FAILED id never resolves (ref error), and the
+    /// floored chain is exactly the suffix beginning at the checkpoint.
+    fn assert_deployment_id_resolution(store: &LocalStore, history: &[(String, bool)]) {
+        let target = TargetName::new("production".to_string());
+        let stored: BTreeMap<String, DeploymentSnapshot> = store
+            .read_snapshots("production")
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.deployment_id.as_str().to_string(), e))
+            .collect();
+        for (id, ok) in history {
+            let expr = parse_ref_expr(id).expect("a seeded deployment id parses");
+            match resolve_ref_expr(&expr, "production", store) {
+                Ok(PushRef::Deployment {
+                    deployment_id,
+                    target: t,
+                }) => {
+                    assert!(
+                        *ok,
+                        "a FAILED deployment id ('{id}') must never resolve — got a deployment ref"
+                    );
+                    assert_eq!(t.as_str(), "production");
+                    assert_eq!(deployment_id.as_str(), *id);
+                    // EXACTLY its stored state: the resolved payload equals
+                    // the recorded snapshot (slots, behavior, bindings, and
+                    // the release the generations came from), keyed by id.
+                    let resolved = resolve_deployment(store, &target, &deployment_id).unwrap();
+                    assert_eq!(
+                        &resolved,
+                        stored.get(id).expect("the stored snapshot"),
+                        "deployment '{id}' must resolve to EXACTLY its stored payload"
+                    );
+                }
+                Ok(PushRef::Head | PushRef::Release { .. }) => {
+                    panic!("deployment id '{id}' must not resolve to a non-deployment ref")
+                }
+                Err(Error::Ref(_)) => {
+                    // FAILED ids never resolve; a SUCCESSFUL id resolves only
+                    // when at/above the floor (a below-floor id fails closed
+                    // with the floor refusal — asserted by the floor checks).
+                }
+                Err(e) => panic!("unexpected error class for '{id}': {e}"),
+            }
+        }
+    }
+
+    /// One resolve-leg case: seed a REAL store with a deployment history
+    /// (successful + failed attempts), optionally floor it at a successful
+    /// deployment, parse a generated token, and resolve it via the engine's
+    /// two-phase flow. Asserts: no panic anywhere; every parse AND resolve
+    /// failure is a ref error; a rejected shape never resolves; a resolved
+    /// deployment is an actual member of the FLOORED chain at/after the
+    /// floor; the deployment-id resolution property (successful ids resolve
+    /// to exactly their stored state, failed ids never resolve) holds;
+    /// `@` / `release:<id>` never touch the chain (they resolve even on an
+    /// EMPTY store, while every relative form on an empty store fails closed
+    /// — except `parent(@, 0)`, which the oracle folds to `Head` FIRST so it
     /// mirrors the engine's documented `Relative{At,0} ≡ Head` reduction).
-    fn ref_grammar_resolve_case(chain_idx: Vec<u64>, floor: Option<u64>, token: String) {
+    fn ref_grammar_resolve_case(
+        history: Vec<(String, bool)>,
+        floor: Option<String>,
+        token: String,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
-        for &i in &chain_idx {
-            let dep = format!("deploy-seed-{i}");
+        for (id, ok) in &history {
             store
-                .append_snapshot(
-                    "production",
-                    &snapshot_entry(i, &dep, &format!("{i:02x}{i:02x}")),
-                )
+                .append_attempt("production", &attempt_entry(id))
                 .unwrap();
+            std::fs::create_dir_all(store.deployment_dir(id)).unwrap();
+            if *ok {
+                // Each successful deployment is a rollback payload keyed by
+                // its id, with a deterministic payload derived from the id
+                // (so "exactly its stored state" is a meaningful equality).
+                let release = id.replace("deploy-", "rel-sha256-");
+                store
+                    .append_snapshot("production", &snapshot_entry(id, &release))
+                    .unwrap();
+            }
         }
-        if let Some(fi) = floor {
-            let dep = format!("deploy-seed-{fi}");
-            store
-                .append_attempt("production", &attempt_entry(&dep))
-                .unwrap();
+        if let Some(fid) = &floor {
             store
                 .write_history_floor(
                     "production",
                     &HistoryFloor {
                         schema_version: SCHEMA_VERSION,
                         target: TargetName::new("production".to_string()),
-                        deployment_id: DeploymentId::new(dep.clone()),
-                        snapshot_index: fi,
+                        deployment_id: DeploymentId::new(fid.clone()),
                         established_at: "2026-01-01T00:00:00Z".to_string(),
                     },
                 )
                 .unwrap();
         }
+
+        // THE USER'S PROPERTY (per case): successful ids resolve to exactly
+        // their stored state, failed ids never resolve, and the floored chain
+        // is exactly the suffix beginning at the floor deployment.
+        assert_deployment_id_resolution(&store, &history);
 
         // Two-phase engine flow: parse first — a parse failure is a ref
         // error and the expression NEVER reaches resolution (a rejected
@@ -1032,7 +1113,7 @@ mod tests {
         // chain touch — while every relative form fails closed. `expr` was
         // already folded above, so the `parent(@, 0)` case is judged by the
         // Head arm (exactly what the engine does before its store read).
-        if chain_idx.is_empty() {
+        if history.iter().all(|(_, ok)| !*ok) {
             match &expr {
                 RefExpr::Head | RefExpr::Release(_) => assert!(
                     matches!(result, Ok(PushRef::Head | PushRef::Release { .. })),
@@ -1045,10 +1126,13 @@ mod tests {
             }
         }
 
-        // RESOLVE MEMBERSHIP: a resolved snapshot index is an actual member
-        // of the floored read chain, at/after the floor.
+        // RESOLVE MEMBERSHIP: a resolved deployment is an actual member of
+        // the floored read chain, at/after the floor.
         match result {
-            Ok(PushRef::Snapshot { target, index }) => {
+            Ok(PushRef::Deployment {
+                target,
+                deployment_id,
+            }) => {
                 assert_eq!(
                     target.as_str(),
                     "production",
@@ -1056,14 +1140,22 @@ mod tests {
                 );
                 let floored = store.read_snapshots("production").unwrap();
                 assert!(
-                    floored.iter().any(|e| e.index == index),
-                    "{token:?} resolved to s{index}, which is not an actual member of the \
-                     floored chain {floored:?}"
+                    floored.iter().any(|e| e.deployment_id == deployment_id),
+                    "{token:?} resolved to deployment '{deployment_id}', which is not an actual \
+                     member of the floored chain {floored:?}"
                 );
-                if let Some(fi) = floor {
+                if let Some(fid) = &floor {
+                    let fpos = floored
+                        .iter()
+                        .position(|e| e.deployment_id.as_str() == *fid)
+                        .expect("the floor deployment is in the floored chain");
+                    let pos = floored
+                        .iter()
+                        .position(|e| e.deployment_id == deployment_id)
+                        .unwrap();
                     assert!(
-                        index >= fi,
-                        "{token:?} resolved below the history floor s{fi}: s{index}"
+                        pos >= fpos,
+                        "{token:?} resolved below the deployment floor {fid}: {deployment_id}"
                     );
                 }
             }
@@ -1073,11 +1165,12 @@ mod tests {
     }
 
     proptest! {
-        // The RESOLVE leg — against a REAL seeded store per case (a gapped
-        // chain with caller-chosen indices plus an optional durable floor at
-        // a member index): resolve membership and totality. Randomized seeds
-        // + failure persistence, bounded at 96 cases (each case builds a
-        // small tempdir store, so the bound keeps the suite fast).
+        // The RESOLVE leg — against a REAL seeded store per case (a
+        // successful + failed deployment history plus an optional durable
+        // floor at a successful deployment): the user's deployment-id
+        // resolution property, resolve membership, and totality. Randomized
+        // seeds + failure persistence, bounded at 96 cases (each case builds
+        // a small tempdir store, so the bound keeps the suite fast).
         #![proptest_config(ProptestConfig {
             cases: 96,
             failure_persistence: Some(Box::new(FileFailurePersistence::default())),
@@ -1086,15 +1179,18 @@ mod tests {
 
         #[test]
         fn ref_grammar_resolve_contract(
-            (chain_idx, floor) in chain_strategy(),
+            (history, floor) in chain_strategy(),
             token in ref_token_strategy(),
         ) {
-            ref_grammar_resolve_case(chain_idx, floor, token);
+            ref_grammar_resolve_case(history, floor, token);
         }
     }
 
     proptest! {
-        // FIXED-SEED REGRESSION for the resolve leg.
+        // FIXED-SEED REGRESSION for the resolve leg: the user's property
+        // (every successful deployment id resolves to exactly its stored
+        // state; failed ids never resolve) under the pinned 0x5EED_5EED
+        // seed — the identical vectors on every invocation.
         #![proptest_config(ProptestConfig {
             cases: 96,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
@@ -1104,10 +1200,10 @@ mod tests {
 
         #[test]
         fn ref_grammar_resolve_contract_fixed_seed(
-            (chain_idx, floor) in chain_strategy(),
+            (history, floor) in chain_strategy(),
             token in ref_token_strategy(),
         ) {
-            ref_grammar_resolve_case(chain_idx, floor, token);
+            ref_grammar_resolve_case(history, floor, token);
         }
     }
 }

@@ -1,5 +1,5 @@
 //! The push reference LANGUAGE: a pure, store-free grammar over reference
-//! tokens (`@`, `@-`, `@--`, `parent(...)`, direct ids, ...). The module
+//! tokens (`@`, `@-`, `@--`, `parent(...)`, deployment ids, ...). The module
 //! owns ONLY the syntax — its [`parse_ref_expr`] returns an AST
 //! ([`RefExpr`]) with no `LocalStore` in scope and no resolution; the
 //! store-dependent resolution that FOLLOWS the AST lives in
@@ -15,57 +15,61 @@
 //!   token fails before any side effect and the deployment id/plan are never
 //!   serialized against a half-parsed reference.
 //! * [`crate::history::resolve_ref_expr`] turns the parsed expression into a
-//!   concrete [`crate::history::PushRef`] against the target's snapshot
-//!   chain in the store.
+//!   concrete [`crate::history::PushRef`] against the target's deployment
+//!   history in the store.
 //!
 //! The accepted forms are:
 //!
 //! * `` (empty), `HEAD`, `@` — the current local files (the default).
-//! * `@-`, `@--` — the snapshot BEFORE the latest, the grandparent.
-//! * `parent(@, N)` — the Nth ancestor of the latest snapshot.
+//! * `@-`, `@--` — the deployment BEFORE the latest successful deployment,
+//!   the grandparent (walking the target's DEPLOYMENT HISTORY — each
+//!   successful deployment is a rollback payload keyed by its id).
+//! * `parent(@, N)` — the Nth ancestor of the latest successful deployment.
+//! * `<deployment-id>` — roll back to THAT deployment's stored state (its
+//!   exact snapshot: slots, behavior, bindings, and the release its
+//!   generations came from). The id is the full `deploy-...` id.
+//! * `<deployment-id>-`, `<deployment-id>--` — N ancestors of the deployment
+//!   (1 or 2 dashes; walking the deployment history back from it).
+//! * `parent(<deployment-id>, N)` — N ancestors of the deployment (N = 0 is
+//!   the deployment itself).
 //! * `release:<id>` — the DIRECT release form: deploy the named release to
 //!   the CURRENT target's slots as they are, from the release's OWN stored
 //!   slot-variant snapshot — but ONLY when the target's CURRENT slot-id
 //!   membership EXACTLY equals the slot set the release record froze for
 //!   that target (membership drift is refused at plan time, before any
 //!   remote access; physical bindings are intentionally not compared).
-//!   No snapshot-chain stepping: cross-target capable —
-//!   the release may have been built/pushed anywhere, and the destination
-//!   needs NO snapshot history at all. The id is a full `rel-sha256-...` id
-//!   or a hex digest.
-//! * `<refid>-`, `<refid>--` — N ancestors of the refid (1 or 2 dashes).
-//! * `parent(<refid>, N)` — N ancestors of the refid (N = 0 is the refid
-//!   itself).
-//! * the bare refid itself — `s3` (snapshot index 3), `deploy-...` (the
-//!   most recent snapshot of that deployment).
+//!   No deployment-history stepping: cross-target capable — the release may
+//!   have been built/pushed anywhere, and the destination needs NO snapshot
+//!   history at all. The id is a full `rel-sha256-...` id or a hex digest.
 //!
-//! `<refid>` is a snapshot index (`s3`), a deployment id (`deploy-...`), or a
-//! release id (`rel-sha256-...` or a bare digest). A snapshot index resolves
-//! to the snapshot with that index; a deployment or release id resolves to
-//! the MOST RECENT snapshot that deployed that deployment / references that
-//! release — SNAPSHOT ANCESTRY, distinct from the direct `release:<id>` form
-//! above. The ancestor steps then walk `s(index - N)`; stepping past the
-//! start of the chain, an unresolvable refid, or an empty chain fail closed
-//! with a ref error — never underflow, never guess.
+//! REMOVED from the public surface (each fails closed with a migration
+//! hint): the `sN` snapshot-index forms (`sN`, `sN-`, `sN--`,
+//! `parent(sN, M)`), the `fN` legacy prefix, the release-refid ancestor
+//! forms (`rel-...--`, `parent(rel-..., M)`), the legacy combined forms
+//! (the target repeated inline, `release/<id>`), and bare release ids.
+//! Rollback payloads are keyed by deployment id; the deployment history is
+//! walked with `@` / `parent(...)`.
 //!
-//! The legacy combined forms — the target repeated inline before an `sN`
-//! index, `release/<id>`, bare release-id, and the old `fN` index prefix —
-//! are NOT accepted (they predate the jj-style grammar); they fail with an
-//! explicit migration hint.
+//! Walking steps from a base POSITION in the deployment history (the log
+//! order — positions are DERIVED, never stored): `parent(@, N)` = the
+//! (len-1-N)-th entry of the floored chain; `parent(<id>, N)` = N positions
+//! back from `<id>`'s position. Stepping past the start of the chain, an
+//! unresolvable deployment id, or an empty chain fail closed with a ref
+//! error — never underflow, never guess.
 
 use crate::error::{Error, Result};
-use crate::model::ReleaseId;
+use crate::model::{DeploymentId, ReleaseId};
 /// A parsed push reference BEFORE store/target resolution.
 ///
 /// The relative forms cannot be turned into a concrete [`PushRef`] without the
-/// target's snapshot chain, so [`parse_ref_expr`] stops at this parsed form
-/// and [`resolve_ref_expr`] finishes the job against the store.
+/// target's deployment history, so [`parse_ref_expr`] stops at this parsed
+/// form and [`resolve_ref_expr`] finishes the job against the store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RefExpr {
     /// `""`, `HEAD`, `@`: materialize the currently mapped local files.
     Head,
     /// `release:<id>`: deploy the named release DIRECTLY to the current
-    /// target's slots — no snapshot-chain stepping, no deployment-snapshot
+    /// target's slots — no deployment-history stepping, no deployment-snapshot
     /// exact-binding checks. The target's CURRENT slot-id membership must
     /// EXACTLY match the slot set the release's OWN stored slot snapshot
     /// froze for it (checked at plan time, before any remote access);
@@ -92,62 +96,40 @@ impl RefExpr {
 }
 
 /// A jj-style relative push reference: `@-`, `@--`, `parent(@, N)`,
-/// `<refid>-`, `<refid>--`, `parent(<refid>, N)`, or the bare refid itself.
+/// `<deployment-id>-`, `<deployment-id>--`, `parent(<deployment-id>, N)`, or
+/// the bare deployment id itself. The ancestor steps walk the target's
+/// DEPLOYMENT HISTORY (the snapshot log in deployment order — each
+/// successful deployment is a rollback payload keyed by its id); positions
+/// are derived from that log order, never a stored index.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RelativeRef {
     /// The chain position the ancestor steps walk back from.
     pub base: RelBase,
     /// How many ancestors to walk (1 for `@-`, 2 for `@--`; 0 = the base
-    /// itself, e.g. the bare `s3` refid form).
+    /// itself, e.g. the bare `<deployment-id>` form).
     pub steps: u64,
 }
 
 /// The chain position a relative reference walks back from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RelBase {
-    /// `@`: the target's LATEST successful snapshot.
+    /// `@`: the target's LATEST successful deployment.
     At,
-    /// `<refid>`: an explicit snapshot index, deployment id, or release id.
-    Refid(RefId),
-}
-
-/// A refid primitive: a snapshot index, a deployment id, or a release id.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RefId {
-    /// `s<K>`: a snapshot index.
-    SnapshotIndex(u64),
-    /// A deployment id (`deploy-...`): the most recent snapshot that deployed it.
-    Deployment(String),
-    /// A release id (`rel-sha256-...` or a bare digest): the most recent
-    /// snapshot that references it.
-    Release(String),
-}
-
-impl std::fmt::Display for RefId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RefId::SnapshotIndex(k) => write!(f, "s{k}"),
-            RefId::Deployment(s) | RefId::Release(s) => write!(f, "{s}"),
-        }
-    }
+    /// `<deployment-id>`: an explicit successful deployment id.
+    Refid(DeploymentId),
 }
 
 impl std::fmt::Display for RelativeRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let id = match &self.base {
             RelBase::At => "@".to_string(),
-            RelBase::Refid(rid) => rid.to_string(),
+            RelBase::Refid(dep) => dep.as_str().to_string(),
         };
         match self.steps {
-            // A bare release id (`rel-sha256-...` or a bare digest) is a
-            // LEGACY form the parser REJECTS, so a 0-step release refid must
-            // render as `parent(<id>, 0)` — every string `Display` prints
-            // must be re-parseable (the canonical round-trip). The `At` base
-            // keeps the bare `@` form: the documented fold
-            // `parent(@, 0) ≡ @` makes `@` the canonical rendering.
-            0 if matches!(self.base, RelBase::Refid(RefId::Release(_))) => {
-                write!(f, "parent({id}, 0)")
-            }
+            // `@` is the canonical rendering of `parent(@, 0)`: the
+            // documented fold `parent(@, 0) ≡ @`. A bare deployment id is
+            // the canonical 0-step refid form (`parent(deploy-x, 0)` renders
+            // as `deploy-x`, re-parseable).
             0 => write!(f, "{id}"),
             1 => write!(f, "{id}-"),
             2 => write!(f, "{id}--"),
@@ -170,11 +152,11 @@ impl std::fmt::Display for RefExpr {
 /// WITHOUT touching the store: pure syntax, no `LocalStore` in scope.
 ///
 /// The target is never part of the token: every relative form resolves
-/// against the separately-given target argument at [`resolve_push_ref`] time.
-/// The legacy combined forms — the target repeated inline before an `sN`
-/// index, `release/<id>`, bare release-id, and the old `fN` index prefix —
-/// are NOT accepted (they predate the jj-style grammar); they fail with an
-/// explicit migration hint.
+/// against the separately-given target argument at [`resolve_ref_expr`] time.
+/// The removed `sN` snapshot-index grammar (and the legacy combined
+/// `fN`/`release/<id>`/target-repeated forms) is NOT accepted — it fails
+/// with an explicit migration hint (rollback payloads are keyed by
+/// deployment id).
 pub(crate) fn parse_ref_expr(token: &str) -> Result<RefExpr> {
     let t = token.trim();
     // HEAD / the default / `@` all mean the current state.
@@ -182,14 +164,16 @@ pub(crate) fn parse_ref_expr(token: &str) -> Result<RefExpr> {
         return Ok(RefExpr::Head);
     }
 
-    // `@-` / `@--`: the latest snapshot's parent / grandparent.
+    // `@-` / `@--`: the deployments before the latest (walking the
+    // deployment history).
     if let Some(rest) = t.strip_prefix('@') {
         let steps = match rest {
             "-" => 1,
             "--" => 2,
             _ => {
                 return Err(Error::r#ref(format!(
-                    "unrecognized reference '{token}' (the only '@' forms are '@', '@-' and '@--')"
+                    "unrecognized reference '{token}' (the only '@' forms are '@', '@-' and '@--'; \
+                    use 'parent(@, N)' for deeper steps)"
                 )));
             }
         };
@@ -213,16 +197,25 @@ pub(crate) fn parse_ref_expr(token: &str) -> Result<RefExpr> {
         let base_tok = base.trim();
         let base = if base_tok == "@" {
             RelBase::At
-        } else if let Some(digits) = f_index_digits(base_tok) {
+        } else if f_index_digits(base_tok).is_some()
+            || (base_tok.len() > 1
+                && base_tok.starts_with('s')
+                && base_tok[1..].chars().all(|c| c.is_ascii_digit()))
+        {
             return Err(Error::r#ref(format!(
-                "legacy 'f{digits}' snapshot-index form is no longer accepted; use 's{digits}'"
+                "legacy snapshot-index base '{base_tok}' in '{token}' is no longer accepted: \
+                rollback payloads are keyed by deployment id — use 'parent(<deployment-id>, N)' \
+                to walk the deployment history, or the deployment id directly"
+            )));
+        } else if base_tok.starts_with("rel-sha256-")
+            || (!base_tok.is_empty() && base_tok.chars().all(|c| c.is_ascii_hexdigit()))
+        {
+            return Err(Error::r#ref(format!(
+                "legacy release-refid base '{base_tok}' in '{token}' is no longer accepted: \
+                use 'release:<id>' for the DIRECT release form"
             )));
         } else {
-            RelBase::Refid(parse_ref_id(base_tok)?.ok_or_else(|| {
-                Error::r#ref(format!(
-                    "unrecognized reference id '{base_tok}' in '{token}'"
-                ))
-            })?)
+            RelBase::Refid(parse_deployment_id(base_tok, token)?)
         };
         return Ok(RefExpr::Relative(RelativeRef { base, steps }));
     }
@@ -232,8 +225,7 @@ pub(crate) fn parse_ref_expr(token: &str) -> Result<RefExpr> {
     // to the CURRENT target's slots from the release's OWN stored slot-variant
     // snapshot. The id may be a full `rel-sha256-...` id or a hex digest; it
     // needs no store lookup beyond shape validation (existence is verified at
-    // plan time). This is distinct from the refid forms: `parent(<id>, N)` /
-    // `<id>--` keep their SNAPSHOT-ANCESTRY semantics.
+    // plan time). UNCHANGED by the deployment-keyed rework.
     if let Some(id) = t.strip_prefix("release:") {
         let valid = if let Some(rest) = id.strip_prefix("rel-sha256-") {
             !rest.is_empty()
@@ -249,7 +241,7 @@ pub(crate) fn parse_ref_expr(token: &str) -> Result<RefExpr> {
         return Ok(RefExpr::Release(ReleaseId::parse(id)));
     }
 
-    // The legacy combined form (the target repeated inline before an `sN`
+    // The legacy combined form (the target repeated inline before a ref).
     if t.contains('@') {
         return Err(Error::r#ref(format!(
             "unrecognized reference '{token}' (the target is passed once, on the command line: \
@@ -260,22 +252,40 @@ pub(crate) fn parse_ref_expr(token: &str) -> Result<RefExpr> {
     if let Some(_id) = t.strip_prefix("release/") {
         return Err(Error::r#ref(format!(
             "legacy 'release/<id>' reference '{token}' is no longer accepted; \
-            use 'release:<id>' for the DIRECT release form, or reference the \
-            release by its id as a refid ('parent(<id>, N)' / '<id>--') for \
-            snapshot ancestry"
+            use 'release:<id>' for the DIRECT release form"
         )));
     }
-    // The legacy `fN` snapshot-index form is not accepted (snapshot indices
-    // are `sN` now).
+    // The `fN` legacy snapshot-index prefix.
     if let Some(digits) = f_index_digits(t) {
         return Err(Error::r#ref(format!(
-            "legacy 'f{digits}' snapshot-index form is no longer accepted; use 's{digits}'"
+            "legacy 'f{digits}' snapshot-index form is no longer accepted: rollback payloads are \
+            keyed by deployment id — use 'deploy push <target> <deployment-id>' or '@- / @-- / \
+            parent(@, N)' to walk the deployment history"
+        )));
+    }
+    // The `sN` snapshot-index forms (bare, or with an ancestor suffix —
+    // `s3---` reaches here only when the dashes count is > 2; `s3--` and
+    // `parent(s3, M)` are caught above).
+    if let Some(digits) = t
+        .strip_prefix('s')
+        .filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
+    {
+        return Err(Error::r#ref(format!(
+            "legacy 's{digits}' snapshot-index form is no longer accepted: rollback payloads are \
+            keyed by deployment id — use 'deploy push <target> <deployment-id>', or '@- / @-- / \
+            parent(@, N)' to walk the deployment history"
+        )));
+    }
+    // Bare release ids (full or digest) are a legacy form too.
+    if t.starts_with("rel-sha256-") || (!t.is_empty() && t.chars().all(|c| c.is_ascii_hexdigit())) {
+        return Err(Error::r#ref(format!(
+            "legacy bare release id '{token}' is no longer accepted; \
+            use 'release:<id>' for the DIRECT release form"
         )));
     }
 
-    // A `<refid>` with an optional trailing `-` / `--` ancestor suffix (1 or
-    // 2 dashes), or the bare refid itself (0 steps, only meaningful for a
-    // snapshot index or a deployment id — a bare release id is a legacy form).
+    // A `<deployment-id>` with an optional trailing `-` / `--` ancestor
+    // suffix (1 or 2 dashes), or the bare deployment id itself (0 steps).
     let dashes = t.len() - t.trim_end_matches('-').len();
     if dashes > 2 {
         return Err(Error::r#ref(format!(
@@ -286,32 +296,11 @@ pub(crate) fn parse_ref_expr(token: &str) -> Result<RefExpr> {
     if id.is_empty() {
         return Err(Error::r#ref(format!("unrecognized reference '{token}'")));
     }
-    // The refid itself may be an `f<digits>` (legacy prefix) even when the
-    // steps made the whole token something else (e.g. `f3--`).
-    if let Some(digits) = f_index_digits(id) {
-        return Err(Error::r#ref(format!(
-            "legacy 'f{digits}' snapshot-index form is no longer accepted; use 's{digits}'"
-        )));
-    }
-    if let Some(rid) = parse_ref_id(id)? {
-        if dashes > 0 || matches!(rid, RefId::SnapshotIndex(_) | RefId::Deployment(_)) {
-            return Ok(RefExpr::Relative(RelativeRef {
-                base: RelBase::Refid(rid),
-                steps: dashes as u64,
-            }));
-        }
-        return Err(Error::r#ref(format!(
-            "legacy bare release id '{token}' is no longer accepted; \
-            reference the release as 'parent(<id>, N)' or '<id>--'"
-        )));
-    }
-    if t.starts_with("rel-sha256-") || (!t.is_empty() && t.chars().all(|c| c.is_ascii_hexdigit())) {
-        return Err(Error::r#ref(format!(
-            "legacy bare release id '{token}' is no longer accepted; \
-            reference the release as 'parent(<id>, N)' or '<id>--'"
-        )));
-    }
-    Err(Error::r#ref(format!("unrecognized reference '{token}'")))
+    let dep = parse_deployment_id(id, token)?;
+    Ok(RefExpr::Relative(RelativeRef {
+        base: RelBase::Refid(dep),
+        steps: dashes as u64,
+    }))
 }
 
 /// The `f<digits>` legacy snapshot-index prefix, if the string has it.
@@ -320,46 +309,20 @@ fn f_index_digits(s: &str) -> Option<&str> {
     (!rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())).then_some(rest)
 }
 
-/// Parse a refid primitive. Ordering is by shape: a `s<digits>` token is a
-/// snapshot index; a `deploy-...` token a deployment id; a `rel-sha256-...`
-/// token or a bare hex digest a release id. The `f<digits>` legacy
-/// snapshot-index prefix is REJECTED (never misread as a bare-hex release
-/// digest — `f3` is hex); callers surface the specific "use sN" hint before
-/// reaching here.
-///
-/// Returns `Ok(Some(rid))` for a recognized refid, `Ok(None)` for a shape
-/// that is not a refid at all, and `Err` when an `s<digits>` index does not
-/// fit a `u64` (e.g. `s999...` at magnitude 10^100). Overflow is a parse
-/// error (`Error::r#ref`), NEVER a panic: the numeric conversion is mapped
-/// to the error rather than unwrapped.
-fn parse_ref_id(s: &str) -> Result<Option<RefId>> {
-    // Legacy `f<digits>` snapshot-index prefix: never a release digest.
-    if f_index_digits(s).is_some() {
-        return Ok(None);
-    }
-    if let Some(digits) = s.strip_prefix('s')
-        && !digits.is_empty()
-        && digits.chars().all(|c| c.is_ascii_digit())
-    {
-        let index = digits
-            .parse::<u64>()
-            .map_err(|_| Error::r#ref(format!("snapshot index 's{digits}' out of range")))?;
-        return Ok(Some(RefId::SnapshotIndex(index)));
-    }
+/// Parse a deployment-id refid primitive (`deploy-...`, non-empty tail). Any
+/// other shape is a ref error naming the token. The removed snapshot-index
+/// (`sN`) and release refid shapes are rejected by the callers BEFORE this
+/// with their migration hints.
+fn parse_deployment_id(s: &str, token: &str) -> Result<DeploymentId> {
     if let Some(rest) = s.strip_prefix("deploy-")
         && !rest.is_empty()
     {
-        return Ok(Some(RefId::Deployment(s.to_string())));
+        return Ok(DeploymentId::new(s.to_string()));
     }
-    if let Some(rest) = s.strip_prefix("rel-sha256-")
-        && !rest.is_empty()
-    {
-        return Ok(Some(RefId::Release(s.to_string())));
-    }
-    if !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Ok(Some(RefId::Release(s.to_string())));
-    }
-    Ok(None)
+    Err(Error::r#ref(format!(
+        "unrecognized reference id '{s}' in '{token}' (expected a deployment id like \
+        'deploy-...', the '@' forms, or 'release:<id>')"
+    )))
 }
 
 #[cfg(test)]
@@ -383,9 +346,11 @@ pub(crate) mod tests {
     }
 
     /// Every jj-style relative form parses WITHOUT touching the store:
-    /// `@-` / `@--` / `parent(@, N)` walk back from the latest snapshot;
-    /// `<refid>-`, `<refid>--`, `parent(<refid>, N)`, and the bare refid
-    /// itself walk back from a snapshot index, deployment id, or release id.
+    /// `@-` / `@--` / `parent(@, N)` walk back from the latest successful
+    /// deployment; `<deployment-id>-`, `<deployment-id>--`,
+    /// `parent(<deployment-id>, N)`, and the bare deployment id itself walk
+    /// back from that deployment. The snapshot-index and release-refid forms
+    /// are GONE from the public grammar.
     #[test]
     fn parse_ref_relative_forms() {
         let rel = |token: &str| parse_ref_expr(token).unwrap();
@@ -411,46 +376,25 @@ pub(crate) mod tests {
             })
         );
         assert_eq!(
-            rel("s3--"),
-            RefExpr::Relative(RelativeRef {
-                base: RelBase::Refid(RefId::SnapshotIndex(3)),
-                steps: 2
-            })
-        );
-        assert_eq!(
-            rel("parent(s5, 2)"),
-            RefExpr::Relative(RelativeRef {
-                base: RelBase::Refid(RefId::SnapshotIndex(5)),
-                steps: 2
-            })
-        );
-        assert_eq!(
-            rel("s1"),
-            RefExpr::Relative(RelativeRef {
-                base: RelBase::Refid(RefId::SnapshotIndex(1)),
-                steps: 0
-            })
-        );
-        assert_eq!(
             rel("deploy-abc123--"),
             RefExpr::Relative(RelativeRef {
-                base: RelBase::Refid(RefId::Deployment("deploy-abc123".to_string())),
+                base: RelBase::Refid(DeploymentId::new("deploy-abc123")),
                 steps: 2
             })
         );
         assert_eq!(
-            rel("parent(rel-sha256-deadbeef, 1)"),
+            rel("parent(deploy-abc123, 2)"),
             RefExpr::Relative(RelativeRef {
-                base: RelBase::Refid(RefId::Release("rel-sha256-deadbeef".to_string())),
-                steps: 1
+                base: RelBase::Refid(DeploymentId::new("deploy-abc123")),
+                steps: 2
             })
         );
-        // An abbreviated digest is a release refid too.
+        // The bare deployment id is the 0-step form.
         assert_eq!(
-            rel("parent(deadbeef, 2)"),
+            rel("deploy-abc123"),
             RefExpr::Relative(RelativeRef {
-                base: RelBase::Refid(RefId::Release("deadbeef".to_string())),
-                steps: 2
+                base: RelBase::Refid(DeploymentId::new("deploy-abc123")),
+                steps: 0
             })
         );
         // N = 0 means the base itself.
@@ -465,8 +409,8 @@ pub(crate) mod tests {
 
     /// `release:<id>` parses to a DIRECT release form — a full
     /// `rel-sha256-...` id or a bare hex digest — WITHOUT touching the store,
-    /// and is distinct from the refid forms (`parent(<id>, N)`, `<id>--`)
-    /// which keep snapshot-ancestry semantics.
+    /// and stays the ONLY way to reference a release (the release-refid
+    /// ancestor forms are removed).
     #[test]
     fn parse_ref_direct_release_form() {
         assert_eq!(
@@ -478,36 +422,38 @@ pub(crate) mod tests {
             parse_ref_expr("release:deadbeef").unwrap(),
             RefExpr::Release(ReleaseId::new("rel-sha256-deadbeef".to_string()))
         );
-        // The refid forms STILL parse as snapshot ancestry.
-        assert!(matches!(
-            parse_ref_expr("rel-sha256-deadbeef--").unwrap(),
-            RefExpr::Relative(_)
-        ));
-        assert!(matches!(
-            parse_ref_expr("parent(rel-sha256-deadbeef, 1)").unwrap(),
-            RefExpr::Relative(_)
-        ));
     }
 
-    /// The legacy grammar is REJECTED with a ref error, never silently
-    /// re-mapped: the target repeated inline before an `sN` index,
-    /// `release/<id>`, bare release ids, the old `fN` snapshot-index prefix,
+    /// The removed and legacy grammar is REJECTED with a ref error, never
+    /// silently re-mapped: the `sN` snapshot-index forms (bare, stepped,
+    /// parent base, oversized), the old `fN` prefix, bare release ids and
+    /// release-refid ancestors, the target repeated inline, `release/<id>`,
     /// `:current`, and malformed relatives.
     #[test]
     fn parse_ref_rejects_legacy_forms() {
         for token in [
+            "s0",
+            "s3",
+            "s3-",
+            "s3--",
+            "s3---",
+            "parent(s5, 2)",
+            "parent(s5, 0)",
+            "f3",
+            "f3--",
+            "parent(f5, 2)",
+            "rel-sha256-x",
+            "rel-sha256-x--",
+            "parent(rel-sha256-x, 1)",
+            "deadbeef",
+            "parent(deadbeef, 2)",
             "production@s0",
             "@s0",
             "release/rel-sha256-x",
-            "rel-sha256-x",
-            "deadbeef",
             "release:",
             "release:rel-sha256-",
             "release:not-hex",
             "release:has/dash",
-            "f3",
-            "f3--",
-            "parent(f5, 2)",
             "HEAD:current",
             "@-:current",
             "@@",
@@ -515,13 +461,34 @@ pub(crate) mod tests {
             "parent(@, x)",
             "parent(@, -1)",
             "parent(@",
-            "s3---",
             "--",
+            "-",
+            "deploy-",
         ] {
             let err = parse_ref_expr(token).expect_err(&format!("{token:?} must be rejected"));
             assert!(
-                err.to_string().contains("reference"),
+                err.to_string().contains("reference")
+                    || err.to_string().contains("step count")
+                    || err.to_string().contains("release"),
                 "error for {token:?} must be a ref error, got: {err}"
+            );
+        }
+    }
+
+    /// A `deploy-<id>` deployment-id refid parses to a deployment base.
+    #[test]
+    fn parse_deployment_id_forms() {
+        for token in ["deploy-a", "deploy-a-", "deploy-a--", "parent(deploy-a, 5)"] {
+            let parsed = parse_ref_expr(token).expect("deployment-id forms parse");
+            assert!(
+                matches!(
+                    parsed,
+                    RefExpr::Relative(RelativeRef {
+                        base: RelBase::Refid(_),
+                        ..
+                    })
+                ),
+                "{token} must parse to a deployment-id relative, got: {parsed:?}"
             );
         }
     }
@@ -538,15 +505,15 @@ pub(crate) mod tests {
         std::panic::catch_unwind(|| parse_ref_expr(token)).expect("parse_ref_expr must never panic")
     }
 
-    // PROPERTY: no reference token, however huge its snapshot index or
-    // ancestor count, may panic the parser, and any index/count that does
-    // not fit a `u64` must be a ref error — never a silently valid parse.
+    // PROPERTY: no reference token, however huge its ancestor count, may
+    // panic the parser, and any count that does not fit a `u64` must be a
+    // ref error — never a silently valid parse.
     //
     // The generated digits are 100 chars with a nonzero lead (magnitude
-    // >= 10^99, far beyond `u64::MAX` ~ 1.8*10^19), covering `sN`, the
-    // dash forms `sN-` / `sN--`, and `parent(sN, M)` with a huge `N`, a
-    // huge `M`, and both. Boundary cases pin `u64::MAX` exactly (the
-    // largest VALID index) against `u64::MAX + 1` (the smallest overflow).
+    // >= 10^99, far beyond `u64::MAX` ~ 1.8*10^19), covering `parent(@, M)`
+    // and `parent(<deployment-id>, M)` with a huge `M`. Boundary cases pin
+    // `u64::MAX` exactly (the largest VALID count) against `u64::MAX + 1`
+    // (the smallest overflow).
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 128,
@@ -556,39 +523,21 @@ pub(crate) mod tests {
         })]
 
         #[test]
-        fn oversized_snapshot_indices_are_errors_never_panics(huge in "[1-9][0-9]{99}") {
-            // `sN`, `sN-`, `sN--`: the index itself overflows. The error must
-            // be the snapshot-index out-of-range ref error, not a panic and
-            // not a silently valid parse.
-            for token in [
-                format!("s{huge}"),
-                format!("s{huge}-"),
-                format!("s{huge}--"),
-            ] {
-                let err = parse_no_panic(&token)
-                    .expect_err(&format!("oversized index '{token}' must be a ref error"));
-                assert!(
-                    err.to_string().contains("out of range"),
-                    "error for '{token}' must report the out-of-range index, got: {err}"
-                );
-            }
+        fn oversized_ancestor_counts_are_errors_never_panics(huge in "[1-9][0-9]{99}") {
+            // `parent(@, M)` with a huge M.
+            let err = parse_no_panic(&format!("parent(@, {huge})"))
+                .expect_err("an oversized ancestor count must be a ref error");
+            assert!(
+                err.to_string().contains("invalid ancestor step count"),
+                "error must report the bad ancestor count, got: {err}"
+            );
 
-            // `parent(sN, M)` with a huge N (M itself small and valid).
-            for m in ["0", "1", "2"] {
-                let token = format!("parent(s{huge}, {m})");
-                let err = parse_no_panic(&token)
-                    .expect_err(&format!("oversized base index '{token}' must be a ref error"));
-                assert!(
-                    err.to_string().contains("out of range"),
-                    "error for '{token}' must report the out-of-range index, got: {err}"
-                );
-            }
-
-            // `parent(sN, M)` with a huge M (and huge M AND huge N: M is
-            // parsed first, so it reports the ancestor-count error).
+            // `parent(<deployment-id>, M)` with a huge M (and huge M AND a
+            // huge count: M is parsed first, so it reports the ancestor-count
+            // error).
             for token in [
-                format!("parent(s1, {huge})"),
-                format!("parent(s{huge}, {huge})"),
+                format!("parent(deploy-a, {huge})"),
+                format!("parent(deploy-a, {huge})"),
             ] {
                 let err = parse_no_panic(&token)
                     .expect_err(&format!("oversized ancestor count '{token}' must be a ref error"));
@@ -598,23 +547,23 @@ pub(crate) mod tests {
                 );
             }
 
-            // Boundary: `u64::MAX` exactly is the largest VALID snapshot
-            // index; `u64::MAX + 1` overflows and is a ref error.
+            // Boundary: `u64::MAX` exactly is the largest VALID ancestor
+            // count; `u64::MAX + 1` overflows and is a ref error.
             let max = u64::MAX.to_string();
             assert_eq!(
-                parse_no_panic(&format!("s{max}")).unwrap(),
+                parse_no_panic(&format!("parent(@, {max})")).unwrap(),
                 RefExpr::Relative(RelativeRef {
-                    base: RelBase::Refid(RefId::SnapshotIndex(u64::MAX)),
-                    steps: 0,
+                    base: RelBase::At,
+                    steps: u64::MAX,
                 }),
             );
             let over = (u64::MAX as u128 + 1).to_string();
-            for token in [format!("s{over}"), format!("parent(s{over}, 1)")] {
+            for token in [format!("parent(@, {over})"), format!("parent(deploy-a, {over})")] {
                 let err = parse_no_panic(&token)
-                    .expect_err(&format!("u64::MAX + 1 index '{token}' must be a ref error"));
+                    .expect_err(&format!("u64::MAX + 1 count '{token}' must be a ref error"));
                 assert!(
-                    err.to_string().contains("out of range"),
-                    "error for '{token}' must report the out-of-range index, got: {err}"
+                    err.to_string().contains("invalid ancestor step count"),
+                    "error for '{token}' must report the bad ancestor count, got: {err}"
                 );
             }
         }
@@ -624,11 +573,11 @@ pub(crate) mod tests {
     // Ref-grammar property suite (parse leg)
     // -------------------------------------------------------------------
 
-    /// One of the ancestor-count / snapshot-index magnitudes the grammar
-    /// must accept or reject by fit: the small steps {0,1,2,3}, exactly
-    /// `u64::MAX` (the largest VALID count/index), `u64::MAX + 1` (the
-    /// smallest overflow — a ref error, never a panic), and a 100-digit
-    /// string (magnitude ~10^99, far beyond `u64`).
+    /// One of the ancestor-count magnitudes the grammar must accept or
+    /// reject by fit: the small steps {0,1,2,3}, exactly `u64::MAX` (the
+    /// largest VALID count), `u64::MAX + 1` (the smallest overflow — a ref
+    /// error, never a panic), and a 100-digit string (magnitude ~10^99, far
+    /// beyond `u64`).
     fn big_num() -> impl Strategy<Value = String> {
         prop_oneof![
             "0".prop_map(String::from),
@@ -646,9 +595,9 @@ pub(crate) mod tests {
         "[a-z][a-z0-9]{0,7}".prop_map(|s| format!("deploy-{s}"))
     }
 
-    /// A release refid: a full `rel-sha256-<hex>` id or a bare hex digest.
-    /// The digest is at least 4 chars so it can never collide with the
-    /// legacy `f<digits>` prefix (e.g. `f3a4` has a non-digit tail).
+    /// A release id for the DIRECT `release:<id>` form: a full
+    /// `rel-sha256-<hex>` id or a bare hex digest. The digest is at least 4
+    /// chars so it can never collide with the legacy `f<digits>` prefix.
     fn rel_id() -> impl Strategy<Value = String> {
         prop_oneof![
             "[0-9a-f]{4,16}".prop_map(|h| format!("rel-sha256-{h}")),
@@ -690,33 +639,17 @@ pub(crate) mod tests {
             Just("@--".to_string()),
             // parent(@, N).
             big_num().prop_map(|n| format!("parent(@, {n})")),
-            // sK / sK- / sK--.
-            big_num().prop_flat_map(|k| {
-                prop_oneof![
-                    Just(format!("s{k}")),
-                    Just(format!("s{k}-")),
-                    Just(format!("s{k}--")),
-                ]
-            }),
-            // parent(sK, M).
-            (big_num(), big_num()).prop_map(|(k, m)| format!("parent(s{k}, {m})")),
-            // deploy-<id> / deploy-<id>- / parent(deploy-<id>, M).
+            // deploy-<id> / deploy-<id>- / deploy-<id>--.
             dep_id().prop_flat_map(|d| {
                 prop_oneof![
                     Just(d.to_string()),
                     Just(format!("{d}-")),
-                    big_num().prop_map(move |m| format!("parent({d}, {m})")),
+                    Just(format!("{d}--")),
                 ]
             }),
-            // rel-sha256-<hex>-- / parent(rel-sha256-<hex>, M) and the bare
-            // digest equivalents.
-            rel_id().prop_flat_map(|r| {
-                prop_oneof![
-                    Just(format!("{r}--")),
-                    big_num().prop_map(move |m| format!("parent({r}, {m})")),
-                ]
-            }),
-            // release:<id> — the DIRECT release form.
+            // parent(<deployment-id>, M).
+            (dep_id(), big_num()).prop_map(|(d, m)| format!("parent({d}, {m})")),
+            // release:<id> — the DIRECT release form (unchanged).
             rel_id().prop_map(|r| format!("release:{r}")),
             // Junk.
             junk_strategy(),

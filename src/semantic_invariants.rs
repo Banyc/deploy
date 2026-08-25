@@ -1011,6 +1011,20 @@ impl Fixture {
         )
     }
 
+    /// The deployment id of the LAST successful snapshot on `t` — the
+    /// deployment-keyed rollback ref for a historical push (rollback
+    /// payloads are keyed by deployment id). Used by the deterministic
+    /// integrity fixtures (which push through [`Fixture::push`], outside the
+    /// property path's `last_prop` bookkeeping).
+    fn latest_deployment_id(&self, t: &str) -> String {
+        self.store
+            .read_snapshots(t)
+            .unwrap_or_default()
+            .last()
+            .map(|s| s.deployment_id.as_str().to_string())
+            .expect("a deployment has been pushed to the target")
+    }
+
     fn push_ref(&self, target_name: &str, ref_token: &str) -> Result<PushReport> {
         push(
             &self.cfg_path,
@@ -1034,7 +1048,7 @@ impl Fixture {
     /// equal the push order for the lifecycle "newest successful" check.
     fn next_prop_id(&self) -> DeploymentId {
         let i = self.prop_ids.fetch_add(1, Ordering::Relaxed);
-        DeploymentId::new(format!("si-{}-{i:04}", self.prop_tag))
+        DeploymentId::new(format!("deploy-si-{}-{i:04}", self.prop_tag))
     }
 
     /// The per-fixture deployment-id tag (derived from the unique tempdir
@@ -1143,7 +1157,10 @@ impl Fixture {
     fn apply_prop(&self, action: &Action, class: FailureClass) -> Outcome {
         match action {
             Action::Push(t) | Action::Retry(t) => self.push_prop(t, None, class),
-            Action::Rollback(t, i) => self.push_prop(t, Some(&format!("s{i}")), class),
+            Action::Rollback(t, i) => {
+                let token = self.rollback_token(t, *i);
+                self.push_prop(t, Some(&token), class)
+            }
             Action::Checkpoint(t, k) => self.checkpoint_prop(t, *k),
             other => {
                 // Build / Rotate / Tamper: nothing consumes a fault, so the
@@ -1178,6 +1195,20 @@ impl Fixture {
         let rep = run_checkpoint_unlocked(&self.store, t, &id)
             .expect("a checkpoint at a recorded successful deployment succeeds");
         Outcome::Checkpoint(Box::new(rep))
+    }
+
+    /// The rollback token for the deployment at POSITION `i` of `t`'s
+    /// visible deployment history (the deployment-keyed grammar: `deploy
+    /// push <target> <deployment-id>`). A position beyond the current chain
+    /// names a deployment that does not exist — the token fails closed at
+    /// resolution, and the model mirrors it by looking up the same position
+    /// on its own chain (positions are DERIVED, never stored).
+    fn rollback_token(&self, t: &str, i: u64) -> String {
+        let snaps = self.store.read_snapshots(t).unwrap_or_default();
+        match snaps.get(i as usize) {
+            Some(s) => s.deployment_id.as_str().to_string(),
+            None => format!("deploy-nonexistent-{t}-{i}"),
+        }
     }
 
     /// Run a push/rollback step with a caller-supplied fixed deployment id
@@ -1500,7 +1531,10 @@ impl Fixture {
                 Outcome::Ok
             }
             Action::Push(t) | Action::Retry(t) => Outcome::Push(Box::new(self.push(t))),
-            Action::Rollback(t, i) => Outcome::Push(Box::new(self.push_ref(t, &format!("s{i}")))),
+            Action::Rollback(t, i) => {
+                let token = self.rollback_token(t, i);
+                Outcome::Push(Box::new(self.push_ref(t, &token)))
+            }
             Action::Rotate => {
                 self.rotate_slot_policy()
                     .expect("standalone rotation succeeds");
@@ -2438,18 +2472,19 @@ fn state_machine_checkpoint_floor_discards_below_pending_keeps_above() {
         !system_has_pending(&f, "t1"),
         "the below-floor pending commit must never be resurrected"
     );
-    // The floor deployment's own attempt + snapshot survive.
-    let raw_snaps: Vec<u64> = f
+    // The floor deployment's own attempt + snapshot survive (keyed by the
+    // checkpoint deployment id).
+    let raw_snaps: Vec<String> = f
         .store
         .read_snapshots_raw("t1")
         .unwrap()
         .iter()
-        .map(|s| s.index)
+        .map(|s| s.deployment_id.as_str().to_string())
         .collect();
     assert_eq!(
         raw_snaps,
-        vec![1],
-        "only the floor's own snapshot (s1) survives"
+        vec![rep.deployment_id.as_str().to_string()],
+        "only the floor deployment's own snapshot survives"
     );
     f.check_invariants();
 
@@ -2499,8 +2534,9 @@ fn state_machine_checkpoint_floor_discards_below_pending_keeps_above() {
         "the finalized pending commit must produce exactly ONE snapshot"
     );
     assert_eq!(
-        matches[0].index, 1,
-        "the snapshot lands at the SAME unique index (s1)"
+        matches[0].deployment_id.as_str(),
+        pending_id,
+        "the snapshot is keyed by the pending deployment id (no duplicate)"
     );
     f.check_invariants();
 }
@@ -3752,7 +3788,6 @@ fn integrity_tampered_stored_release_blocks_historical_push() {
         .flatten()
         .next()
         .unwrap();
-    let id = ReleaseId::new(dir.file_name().to_string_lossy().into_owned());
     let p = dir.path().join("release.json");
     let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
     // Tamper the slot snapshot (an identity-bearing field) with digests
@@ -3761,8 +3796,11 @@ fn integrity_tampered_stored_release_blocks_historical_push() {
     v["slots"]["standard"]["slots"][0]["deploy_dir"] = serde_json::json!("/srv/elsewhere");
     std::fs::write(&p, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
 
+    // The historical ref: the deployment id of the push that recorded the
+    // release (rollback payloads are keyed by deployment id).
+    let dep = f.latest_deployment_id("t1");
     let err = f
-        .push_ref_impl("t1", &format!("parent({}, 0)", id.as_str()))
+        .push_ref_impl("t1", &dep)
         .expect_err("a historical push against a tampered stored release must fail closed");
     assert!(
         err.to_string().contains("identity mismatch"),
@@ -3791,8 +3829,9 @@ fn integrity_tampered_stored_behavior_json_blocks_historical_push() {
         .next()
         .unwrap();
     let id = ReleaseId::new(dir.file_name().to_string_lossy().into_owned());
+    let dep = f.latest_deployment_id("t1");
     let err = f
-        .push_ref_impl("t1", &format!("parent({}, 0)", id.as_str()))
+        .push_ref_impl("t1", &dep)
         .expect_err("a historical push against a tampered behavior snapshot must fail closed");
     let msg = err.to_string();
     assert!(
@@ -3872,8 +3911,9 @@ fn integrity_stored_release_schema_version_tamper_fails_closed() {
             msg.contains("RELEASE_RECORD_SCHEMA_VERSION"),
             "error must name the accepted version, got: {msg}"
         );
+        let dep = f.latest_deployment_id("t1");
         let push_err = f
-            .push_ref_impl("t1", &format!("parent({}, 0)", id.as_str()))
+            .push_ref_impl("t1", &dep)
             .expect_err("a push against a tampered record version must fail closed");
         assert!(
             push_err.to_string().contains("release_schema_version"),
@@ -3887,7 +3927,8 @@ fn integrity_stored_release_schema_version_tamper_fails_closed() {
     f.store
         .read_release(&id)
         .expect("the canonical version reads");
-    f.push_ref_impl("t1", &format!("parent({}, 0)", id.as_str()))
+    let dep = f.latest_deployment_id("t1");
+    f.push_ref_impl("t1", &dep)
         .expect("a push against the restored record succeeds");
 
     // And the dedicated Tamper action rewrites the field the same way.
@@ -4061,21 +4102,21 @@ fn bounds_capacity_edge_corners_fail_safely() {
 /// must report (the driver asserts the actual [`CheckpointReport`] against
 /// it field-for-field). The discard semantics mirror
 /// [`crate::store::local::LocalStore::checkpoint_discards`]: attempts
-/// strictly before the checkpoint's own attempt, snapshots strictly below
-/// the floor's index, and the deduplicated union of their deployment ids
-/// (the dirs the compaction deletes).
+/// strictly before the checkpoint's own attempt, snapshots strictly before
+/// the floor deployment's POSITION in the log (positions are DERIVED, never
+/// stored), and the deduplicated union of their deployment ids (the dirs the
+/// compaction deletes).
 #[derive(Clone, Debug)]
 struct CheckpointExpectation {
     target: &'static str,
     deployment_id: String,
-    snapshot_index: u64,
     /// True when the floor moved (first checkpoint, or an advance to a
     /// DIFFERENT deployment); false for the idempotent re-checkpoint of the
     /// SAME deployment (the visible chain can never offer a snapshot below
-    /// the floor, so the only equal-index case IS the same deployment).
+    /// the floor, so the only equal-position case IS the same deployment).
     established: bool,
     discarded_attempts: Vec<String>,
-    discarded_snapshots: Vec<u64>,
+    discarded_snapshots: Vec<String>,
     discarded_deployments: Vec<String>,
 }
 
@@ -4119,22 +4160,23 @@ struct Model {
     /// stays stale in EVERY member target's view while the other slot's
     /// record (and both views of it) advance.
     observed: BTreeMap<&'static str, ObservedView>,
-    /// Per-target RAW snapshot log: (index, deployment id, content version)
-    /// per physically recorded snapshot — the log the checkpoint compacts.
-    /// The VISIBLE chain is the suffix at/after the target's floor (see
-    /// [`Model::visible_snapshots`]); index allocation is monotonic over the
-    /// RAW log (a compacted chain never reuses an index). The deployment id
-    /// is tracked so the floor's own deployment and the discard sets can be
+    /// Per-target RAW snapshot log: (deployment id, content version) per
+    /// physically recorded snapshot, in LOG ORDER (the deployment order) —
+    /// the log the checkpoint compacts. The VISIBLE chain is the suffix
+    /// beginning at the target's floor deployment's POSITION (see
+    /// [`Model::visible_snapshots`]); positions are DERIVED from this order,
+    /// never stored (the old `sN` index is gone). The deployment id is
+    /// tracked so the floor's own deployment and the discard sets can be
     /// pinned against the system's raw logs.
-    raw_snapshots: BTreeMap<&'static str, Vec<(u64, String, u32)>>,
+    raw_snapshots: BTreeMap<&'static str, Vec<(String, u32)>>,
     /// Per-target RAW deployment-attempt log: (deployment id, content
     /// version) per physically recorded attempt. The VISIBLE chain starts at
     /// the floor's own attempt (see [`Model::visible_attempts`]).
     raw_attempts: BTreeMap<&'static str, Vec<(String, u32)>>,
-    /// Per-target durable history floor: (deployment id, snapshot index)
-    /// the checkpoint marker sits at; `None` before the target's first
-    /// checkpoint.
-    floor: BTreeMap<&'static str, Option<(String, u64)>>,
+    /// Per-target durable history floor: (deployment id, its POSITION in
+    /// the raw snapshot log — derived, never stored) the checkpoint marker
+    /// sits at; `None` before the target's first checkpoint.
+    floor: BTreeMap<&'static str, Option<(String, usize)>>,
     /// Un-finalized pending deployment per target: (deployment id, content
     /// version, the minted-generation counter, whether its snapshot is
     /// ALREADY durable). A `LastSuccessfulWrite` / `TransitionSuccessful`
@@ -4237,15 +4279,24 @@ impl Model {
     fn mint_id(&mut self) -> String {
         let i = self.prop_ids;
         self.prop_ids += 1;
-        format!("si-{}-{i:04}", self.prop_tag)
+        format!("deploy-si-{}-{i:04}", self.prop_tag)
     }
 
-    /// The target's VISIBLE snapshot chain: the raw log filtered to indices
-    /// at/after the floor (mirrors [`crate::store::local::LocalStore::read_snapshots`]).
-    fn visible_snapshots(&self, t: &'static str) -> Vec<(u64, String, u32)> {
+    /// The target's VISIBLE snapshot chain: the raw log filtered to the
+    /// suffix beginning at the floor deployment's POSITION (mirrors
+    /// [`crate::store::local::LocalStore::read_snapshots`]; positions are
+    /// derived from the log order, never stored).
+    fn visible_snapshots(&self, t: &'static str) -> Vec<(String, u32)> {
         let raw = self.raw_snapshots.get(t).cloned().unwrap_or_default();
         match self.floor.get(t).cloned().flatten() {
-            Some((_, fi)) => raw.into_iter().filter(|(i, _, _)| *i >= fi).collect(),
+            // The suffix begins at the floor deployment's CURRENT position in
+            // the raw log (mirrors read_snapshots' position lookup; a
+            // compacted log's first entry IS the floor deployment).
+            Some((fid, _)) => raw
+                .iter()
+                .position(|(id, _)| *id == fid)
+                .map(|pos| raw[pos..].to_vec())
+                .unwrap_or(raw),
             None => raw,
         }
     }
@@ -4266,25 +4317,16 @@ impl Model {
         }
     }
 
-    /// The next snapshot index for `t`: max RAW index + 1 (never
-    /// `len()` — a compacted chain like [s2, s3] has len 2 but the next
-    /// unique index is 4). Appending after a checkpoint therefore always
-    /// produces a unique, increasing index.
-    fn next_snapshot_index(&self, t: &'static str) -> u64 {
-        self.raw_snapshots
-            .get(t)
-            .map(|s| s.iter().map(|(i, _, _)| *i).max().map_or(0, |m| m + 1))
-            .unwrap_or(0)
-    }
-
-    /// Append a NEW successful snapshot for deployment `id` (content `v`) at
-    /// the next unique raw index.
+    /// Append a NEW successful snapshot for deployment `id` (content `v`):
+    /// the log is KEYED BY DEPLOYMENT ID and appended in deployment order —
+    /// positions are derived from that order, never stored (the old
+    /// index-minting is gone; a checkpoint compacts the log to a suffix and
+    /// a new deployment always appends a NEW line).
     fn append_snapshot(&mut self, t: &'static str, id: &str, v: u32) {
-        let idx = self.next_snapshot_index(t);
         self.raw_snapshots
             .entry(t)
             .or_default()
-            .push((idx, id.to_string(), v));
+            .push((id.to_string(), v));
     }
 
     /// Advance the oracle by ONE property step — the action AND its failure
@@ -4343,8 +4385,9 @@ impl Model {
                         self.crash_window,
                     )
                 } else {
-                    let (idx, cid, _) = visible[*k as usize % visible.len()].clone();
-                    self.checkpoint(t, cid, idx);
+                    let pos = *k as usize % visible.len();
+                    let (cid, _) = visible[pos].clone();
+                    self.checkpoint(t, cid, pos);
                     (
                         OutcomeClass::Push {
                             boundary: ReturnBoundary::Ok,
@@ -4393,19 +4436,28 @@ impl Model {
     /// before the floor's own deployment's), and its deployment dir all
     /// vanish from the raw state, so recovery can never re-append it. A
     /// pending commit at/above the floor survives untouched.
-    fn checkpoint(&mut self, t: &'static str, cid: String, idx: u64) {
+    fn checkpoint(&mut self, t: &'static str, cid: String, cpos: usize) {
         let raw_att = self.raw_attempts.get(t).cloned().unwrap_or_default();
         let raw_snaps = self.raw_snapshots.get(t).cloned().unwrap_or_default();
         let keep_from = raw_att
             .iter()
             .position(|(id, _)| *id == cid)
             .expect("the checkpoint deployment is a recorded attempt");
+        // The checkpoint deployment's POSITION in the raw snapshot log
+        // (derived — never stored): everything strictly before it is
+        // discarded, exactly as the compaction computes it.
+        let snap_floor_pos = raw_snaps
+            .iter()
+            .position(|(id, _)| *id == cid)
+            .expect("a successful checkpoint deployment owns a snapshot");
         let mut discarded_deployments: Vec<String> = Vec::new();
-        let mut discarded_snapshots: Vec<u64> = Vec::new();
-        for (i, sid, _) in raw_snaps.iter().filter(|(i, _, _)| *i < idx) {
-            discarded_snapshots.push(*i);
-            if !discarded_deployments.contains(sid) {
-                discarded_deployments.push(sid.clone());
+        let mut discarded_snapshots: Vec<String> = Vec::new();
+        for (pos, (sid, _)) in raw_snaps.iter().enumerate() {
+            if pos < snap_floor_pos {
+                discarded_snapshots.push(sid.clone());
+                if !discarded_deployments.contains(sid) {
+                    discarded_deployments.push(sid.clone());
+                }
             }
         }
         let discarded_attempts: Vec<String> = raw_att[..keep_from]
@@ -4425,20 +4477,14 @@ impl Model {
             self.pending.remove(t);
         }
         self.raw_attempts.insert(t, raw_att[keep_from..].to_vec());
-        self.raw_snapshots.insert(
-            t,
-            raw_snaps
-                .into_iter()
-                .filter(|(i, _, _)| *i >= idx)
-                .collect(),
-        );
+        self.raw_snapshots
+            .insert(t, raw_snaps[snap_floor_pos..].to_vec());
         let prev = self.floor.get(t).cloned().flatten();
         let established = !matches!(prev, Some((fid, _)) if fid == cid);
-        self.floor.insert(t, Some((cid.clone(), idx)));
+        self.floor.insert(t, Some((cid.clone(), cpos)));
         self.last_checkpoint = Some(CheckpointExpectation {
             target: t,
             deployment_id: cid,
-            snapshot_index: idx,
             established,
             discarded_attempts,
             discarded_snapshots,
@@ -4507,38 +4553,37 @@ impl Model {
         }
     }
 
-    /// A snapshot rollback to snapshot `i`. The engine reconciles pending
-    /// attempts BEFORE resolving the ref (the resolution point sits after
-    /// `reconcile_pending_commits`), so the range is evaluated against the
-    /// POST-reconciliation chain — the pending attempt's snapshot is appended
-    /// first, and a ref that only the recovery brought into range now
-    /// resolves. The reconciliation runs even when the ref still fails
-    /// closed after it; the push then returns `Err` (nothing recorded —
-    /// `NoAttempt`) BEFORE the observed refresh, so an open crash window
-    /// STAYS open (the fixture's invariant groups stay suspended until a
-    /// later successful push/no-op refreshes observed).
+    /// A rollback to the deployment at POSITION `i` of the target's visible
+    /// deployment history. The strategy selects the position; the fixture
+    /// passes the deployment id at that position (a position beyond the
+    /// current chain names a deployment that does not exist yet and fails
+    /// closed), and the model looks up the SAME position on its own chain —
+    /// positions are DERIVED from the log order, never stored. The engine
+    /// reconciles pending attempts BEFORE resolving the ref (the resolution
+    /// point sits after `reconcile_pending_commits`); reconciliation appends
+    /// only at the END of the chain, so the deployment id at a given position
+    /// is stable across the reconcile. The reconciliation runs even when the
+    /// ref still fails closed after it; the push then returns `Err` (nothing
+    /// recorded — `NoAttempt`) BEFORE the observed refresh, so an open crash
+    /// window STAYS open (the fixture's invariant groups stay suspended until
+    /// a later successful push/no-op refreshes observed).
     fn rollback(&mut self, t: &'static str, i: u64) -> (OutcomeClass, bool) {
-        // The fixture mints the step's deployment id BEFORE the push runs
-        // (even when the ref then fails closed), so the oracle mints first
-        // too — the counters stay in lockstep.
+        // The fixture mints the step's ID BEFORE the push runs (even when
+        // the ref then fails closed), so the oracle mints first too — the
+        // counters stay in lockstep.
         let id = self.mint_id();
+        // The fixture's token is the deployment id at position `i` of the
+        // PRE-push visible chain (positions derived); the model resolves the
+        // same position on its own chain. A position beyond the chain is
+        // "no such deployment" — fails closed.
+        let v = self.visible_snapshots(t).get(i as usize).map(|(_, v)| *v);
         // The engine reconciles pending attempts ONCE per push, before the
-        // ref is resolved, so the index is evaluated against the
-        // POST-reconciliation chain and the resolved deployment enters the
-        // shared resolved-deploy stage with NO second reconciliation (a
-        // second reconcile would wrongly finalize an attempt the reconcile's
-        // OWN faulted marker write left pending).
+        // ref is resolved, and the resolved deployment enters the shared
+        // resolved-look stage with NO second reconciliation (a second
+        // reconcile would wrongly finalize an attempt the reconcile's OWN
+        // faulted marker write left pending).
         self.reconcile(t);
-        // The engine resolves `sN` against the VISIBLE chain by RAW index
-        // (`resolve_ref_expr` reads the floor-gated log), so the model looks
-        // up the index in its own visible chain — a below-floor index fails
-        // closed.
-        let Some(v) = self
-            .visible_snapshots(t)
-            .iter()
-            .find(|(idx, _, _)| *idx == i)
-            .map(|(_, _, v)| *v)
-        else {
+        let Some(v) = v else {
             return (
                 OutcomeClass::Push {
                     boundary: ReturnBoundary::Err,
@@ -4975,6 +5020,17 @@ impl Model {
                 // dropped step-scoped.
                 self.armed_fault = None;
             }
+            Some(FailureClass::RemoteStatusPreSwap) => {
+                // The no-op's deferred-maintenance retry is a REAL rotation
+                // (`rotate_slot_locked` under the maintenance mutation lock)
+                // whose first `current`-link read is exactly the
+                // pre-swap-moment read the arm targets — with no
+                // `process_server` on the no-op path, that read is the one
+                // that fires the one-shot: the rotation fails with the
+                // injected transport error and the marker STAYS (re-recorded
+                // with the error reason). The arm is consumed.
+                self.armed_fault = None;
+            }
             Some(_) => {
                 // Any other armed class does not touch the no-op's debt
                 // maintenance: the id-keyed store faults (intent, results,
@@ -5015,10 +5071,14 @@ impl Model {
     fn repairs_tamper(&self, action: &Action) -> bool {
         match action {
             Action::Push(_) | Action::Retry(_) => true,
-            Action::Rollback(t, i) => self
-                .visible_snapshots(t)
-                .iter()
-                .any(|(idx, _, _)| *idx == *i),
+            Action::Rollback(t, i) => {
+                // The rollback REPAIRS the tamper only when the strategy's
+                // POSITION names a real deployment in the visible chain (the
+                // fixture's rollback_token resolves it; an out-of-range
+                // position names a nonexistent deployment and fails closed —
+                // the tamper is left unrepaired, so the action is skipped).
+                self.visible_snapshots(t).len() as u64 > *i
+            }
             _ => false,
         }
     }
@@ -5213,10 +5273,11 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
     let pid = PlacementSlotId::new("p1");
     let mut learned: BTreeMap<u32, ArtifactRef> = BTreeMap::new();
 
-    // Snapshot logs: count + per-index artifact/version join, over the
-    // VISIBLE chain (the raw suffix at/after the target's floor — the model
-    // derives it identically, so a checkpoint that discarded a below-floor
-    // snapshot shows up here as a shorter chain).
+    // Snapshot logs: count + per-deployment artifact/version join, over the
+    // VISIBLE chain (the suffix beginning at the target's floor deployment —
+    // the model derives it identically, so a checkpoint that discarded a
+    // below-floor snapshot shows up here as a shorter chain). The log order
+    // IS the deployment order; positions are derived, never stored.
     for t in ["t1", "t2"] {
         let sys_snaps = system.store.read_snapshots(t).unwrap_or_default();
         let want = model.visible_snapshots(t);
@@ -5227,14 +5288,12 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
             sys = sys_snaps.len(),
             model = want.len(),
         );
-        for (ss, (wi, wid, mv)) in sys_snaps.iter().zip(&want) {
-            assert_eq!(ss.index, *wi, "{ctx}: snapshot index for {t}");
+        for (ss, (wid, mv)) in sys_snaps.iter().zip(&want) {
             assert_eq!(
                 ss.deployment_id.as_str(),
                 wid,
-                "{ctx}: snapshot deployment id at index {wi} for {t} — the SAME index must \
-                 never resolve to a different deployment (no duplicate, no re-append below the \
-                 floor)"
+                "{ctx}: snapshot deployment id for {t} — the log order must match the model \
+                 (no duplicate, no re-append below the floor)"
             );
             let art = ss.slots[&pid].assignment.artifact.clone();
             learn_artifact(
@@ -5242,7 +5301,7 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
                 &ctx,
                 *mv,
                 art,
-                &format!("snapshot s{} of {t}", ss.index),
+                &format!("deployment {} of {t}", ss.deployment_id),
             );
         }
     }
@@ -5455,13 +5514,12 @@ fn assert_checkpoint_invariants(model: &Model, system: &Fixture) {
             (Some(_), None) => {
                 panic!("{ctx}: model expects a history floor on {t}, none present")
             }
-            (Some((mid, mi)), Some(f)) => {
+            (Some((mid, _)), Some(f)) => {
                 assert_eq!(
                     f.deployment_id.as_str(),
                     mid,
                     "{ctx}: floor deployment id for {t}"
                 );
-                assert_eq!(f.snapshot_index, mi, "{ctx}: floor snapshot index for {t}");
             }
         }
         // (1) + (3): RAW logs match the model exactly; snapshot indices are
@@ -5487,22 +5545,28 @@ fn assert_checkpoint_invariants(model: &Model, system: &Fixture) {
             want_snaps.len(),
             "{ctx}: raw snapshot count for {t} must match the model"
         );
-        let mut prev: Option<u64> = None;
-        for (ss, (wi, wid, _)) in sys_raw_snaps.iter().zip(&want_snaps) {
-            assert_eq!(ss.index, *wi, "{ctx}: raw snapshot index for {t}");
+        for (ss, (wid, _)) in sys_raw_snaps.iter().zip(&want_snaps) {
             assert_eq!(
                 ss.deployment_id.as_str(),
                 wid,
-                "{ctx}: raw snapshot id at index {wi} for {t}"
+                "{ctx}: raw snapshot id order for {t}"
             );
-            if let Some(p) = prev {
-                assert!(
-                    p < *wi,
-                    "{ctx}: raw snapshot indices on {t} must be strictly increasing (never \
-                     reused after compaction)"
-                );
-            }
-            prev = Some(*wi);
+        }
+        // The deployment-keyed identity space: no DUPLICATE deployment id in
+        // the raw log (a compaction that reused an identity would break
+        // this).
+        {
+            let mut ids: Vec<&str> = sys_raw_snaps
+                .iter()
+                .map(|s| s.deployment_id.as_str())
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(
+                ids.len(),
+                sys_raw_snaps.len(),
+                "{ctx}: raw snapshot deployment ids on {t} must be unique"
+            );
         }
         // (1) the deployment-dir bijection: every retained attempt owns its
         // dir; a below-floor attempt's dir is gone (deleted with the rest of
@@ -5519,7 +5583,7 @@ fn assert_checkpoint_invariants(model: &Model, system: &Fixture) {
                 "{ctx}: duplicate raw attempt id {id} on {t}"
             );
         }
-        for (_, wid, _) in &want_snaps {
+        for (wid, _) in &want_snaps {
             if retained_attempt_ids.contains(wid.as_str()) {
                 assert!(
                     system.store.deployment_dir(wid).exists(),
@@ -5527,41 +5591,44 @@ fn assert_checkpoint_invariants(model: &Model, system: &Fixture) {
                 );
             }
         }
-        // (4) below-floor refs fail closed: the direct index form AND a
-        // relative parent() walk landing below the floor.
-        if let Some((_, fi)) = model.floor.get(t).cloned().flatten()
-            && fi > 0
-        {
-            let below = fi - 1;
-            let err = history::resolve_ref_expr(
-                &history::parse_ref_expr(&format!("s{below}")).unwrap(),
-                t,
-                &system.store,
-            )
-            .unwrap_err();
-            let msg = err.to_string();
-            assert!(
-                msg.contains("history floor") || msg.contains("no snapshot"),
-                "{ctx}: below-floor s{below} on {t} must fail closed, got: {msg}"
-            );
-            let latest = model
-                .visible_snapshots(t)
-                .last()
-                .map(|(i, _, _)| *i)
-                .unwrap_or(fi);
-            if latest > below {
+        // (4) below-floor refs fail closed: the deployment id directly
+        // before the floor (in the raw log) AND a relative parent() walk
+        // landing below the floor.
+        if let Some((fid, _)) = model.floor.get(t).cloned().flatten() {
+            let raw = model.raw_snapshots.get(t).cloned().unwrap_or_default();
+            let below_id = raw
+                .iter()
+                .position(|(id, _)| *id == fid)
+                .and_then(|pos| (pos > 0).then(|| raw[pos - 1].0.clone()));
+            if let Some(below) = below_id {
                 let err = history::resolve_ref_expr(
-                    &history::parse_ref_expr(&format!("parent(s{latest}, {})", latest - below))
-                        .unwrap(),
+                    &history::parse_ref_expr(&below).unwrap(),
                     t,
                     &system.store,
                 )
                 .unwrap_err();
                 let msg = err.to_string();
                 assert!(
-                    msg.contains("history floor") || msg.contains("no snapshot"),
-                    "{ctx}: parent() walking below s{fi} on {t} must fail closed, got: {msg}"
+                    msg.contains("history floor") || msg.contains("no successful deployment"),
+                    "{ctx}: below-floor deployment '{below}' on {t} must fail closed, got: {msg}"
                 );
+                // A parent() walk from the LATEST deployment stepping past
+                // the floor fails closed too.
+                let visible = model.visible_snapshots(t);
+                if let Some((latest_id, _)) = visible.last() {
+                    let steps = visible.len() as u64;
+                    let err = history::resolve_ref_expr(
+                        &history::parse_ref_expr(&format!("parent({latest_id}, {steps})")).unwrap(),
+                        t,
+                        &system.store,
+                    )
+                    .unwrap_err();
+                    let msg = err.to_string();
+                    assert!(
+                        msg.contains("history floor") || msg.contains("no successful deployment"),
+                        "{ctx}: parent() walking past the floor on {t} must fail closed, got: {msg}"
+                    );
+                }
             }
         }
     }
@@ -5736,11 +5803,6 @@ fn run_semantic_state_case(steps: Vec<(Action, FailureClass)>) {
                 rep.deployment_id.as_str(),
                 want.deployment_id,
                 "after action {}: checkpoint deployment id",
-                model.index
-            );
-            assert_eq!(
-                rep.snapshot_index, want.snapshot_index,
-                "after action {}: checkpoint snapshot index",
                 model.index
             );
             assert_eq!(

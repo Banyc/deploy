@@ -388,13 +388,20 @@ impl FloorFsOps for TestFloorFsOps {
 }
 /// The exact set a checkpoint floor discards on one target (the dry-run
 /// preview enumerates precisely this; the compaction deletes precisely this).
+/// Everything is keyed by DEPLOYMENT ID — positions are DERIVED from the log
+/// order (the checkpoint deployment's position in the raw logs), never
+/// stored: the discard set is exactly the log prefix STRICTLY BEFORE the
+/// checkpoint deployment's position.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FloorDiscards {
     /// Deployment ids of the attempts.jsonl lines removed (the checkpoint's
     /// own attempt and everything after it stay).
     pub discarded_attempts: Vec<String>,
-    /// Snapshot indices removed from snapshots.jsonl (index < floor).
-    pub discarded_snapshots: Vec<u64>,
+    /// Deployment ids of the snapshots removed from snapshots.jsonl
+    /// (everything strictly before the checkpoint deployment's position in
+    /// the log — the old `index < floor.snapshot_index` set, now expressed
+    /// by position over the deployment-keyed log).
+    pub discarded_snapshots: Vec<String>,
     /// Deployment ids whose `deployments/<id>/` directories are deleted
     /// (the union of the two sets above, deduplicated).
     pub discarded_deployments: Vec<String>,
@@ -978,14 +985,12 @@ impl LocalStore {
         let content: HistoryFloor = read_json_marker(backup)?;
         if previous_floor != Some(&content) {
             return Err(Error::integrity(format!(
-                "refusing to restore history-floor backup {}: its content (deployment '{}', snapshot s{}) does not match the floor this advance moved aside (deployment '{}', snapshot s{}) — only the backup created and verified by the CURRENT transaction may be restored",
+                "refusing to restore history-floor backup {}: its content (deployment '{}') does not match the floor this advance moved aside (deployment '{}') — only the backup created and verified by the CURRENT transaction may be restored",
                 backup.display(),
                 content.deployment_id,
-                content.snapshot_index,
                 previous_floor
                     .map(|f| f.deployment_id.as_str())
                     .unwrap_or("<none>"),
-                previous_floor.map(|f| f.snapshot_index).unwrap_or(0),
             )));
         }
         std::fs::rename(backup, path)
@@ -1244,18 +1249,19 @@ impl LocalStore {
             )));
         }
         // (b) SNAPSHOT-PAIR BINDING: a snapshot must exist with EXACTLY
-        // `index == floor.snapshot_index` AND `deployment_id ==
-        // floor.deployment_id` — the exact pair, never the index alone (the
-        // checkpoint snapshot is the oldest rollback state; if it no longer
-        // exists the floor points at nothing).
+        // `deployment_id == floor.deployment_id` — the floor names the
+        // checkpoint deployment's rollback payload (a successful deployment
+        // always owns a snapshot keyed by its id; if it no longer exists the
+        // floor points at nothing). Positions are derived from the log
+        // order, never stored — there is no separate index to bind.
         let snapshots = self.read_snapshots_raw(target)?;
         let bound_snapshot = snapshots
             .iter()
-            .any(|s| s.index == floor.snapshot_index && s.deployment_id == floor.deployment_id);
+            .any(|s| s.deployment_id == floor.deployment_id);
         if !bound_snapshot {
             return Err(Error::integrity(format!(
-                "history floor for target '{target}' is not bound to a snapshot: no snapshot has EXACTLY index s{} AND deployment '{}' (the exact snapshot pair the floor names does not exist in refs/snapshots.jsonl)",
-                floor.snapshot_index, floor.deployment_id
+                "history floor for target '{target}' is not bound to a snapshot: no snapshot with deployment '{}' exists in refs/snapshots.jsonl (the exact rollback payload the floor names does not exist)",
+                floor.deployment_id
             )));
         }
         // (c) ATTEMPT BINDING: the floor's own deployment must exist in the
@@ -1341,20 +1347,16 @@ impl LocalStore {
                 pending.target
             )));
         }
-        // BINDING (b): when a floor is present, the marker must name EXACTLY
-        // that floor's deployment + snapshot index — the marker is the
-        // pending-cleanup flag for the floor it accompanies, and a corrupted
-        // anchor must never be trusted for the pending/repair decision.
+        // BINDING (b): when a floor is present, the marker must name
+        // EXACTLY that floor's deployment — the marker is the pending-
+        // cleanup flag for the floor it accompanies, and a corrupted anchor
+        // must never be trusted for the pending/repair decision.
         if let Some(floor) = floor
-            && (pending.deployment_id != floor.deployment_id
-                || pending.snapshot_index != floor.snapshot_index)
+            && pending.deployment_id != floor.deployment_id
         {
             return Err(Error::integrity(format!(
-                "cleanup-pending marker for target '{target}' is not bound to the history floor: marker names deployment '{}' at snapshot s{} but the floor names deployment '{}' at snapshot s{} (a cleanup marker must name exactly the floor it accompanies)",
-                pending.deployment_id,
-                pending.snapshot_index,
-                floor.deployment_id,
-                floor.snapshot_index
+                "cleanup-pending marker for target '{target}' is not bound to the history floor: marker names deployment '{}' but the floor names deployment '{}' (a cleanup marker must name exactly the floor it accompanies)",
+                pending.deployment_id, floor.deployment_id
             )));
         }
         Ok(Some(pending))
@@ -1436,13 +1438,16 @@ impl LocalStore {
     }
 
     /// The exact discard set a checkpoint floor applies on `target`: the
-    /// attempts before the checkpoint's own attempt, the snapshots with
-    /// `index < floor.snapshot_index`, and the union of their deployment ids
-    /// (the `deployments/<id>/` directories the compaction deletes). Pure
-    /// read over the physical logs; the dry-run preview and the compaction
-    /// itself share it, so the preview enumerates EXACTLY what the
-    /// compaction removes. Crate-private: only the checkpoint flow (and the
-    /// in-crate integrity tests) computes discards.
+    /// attempts strictly before the checkpoint's own attempt, the snapshots
+    /// STRICTLY BEFORE the checkpoint deployment's POSITION in the log
+    /// (the deployment-keyed analog of the old `index < floor.snapshot_index`
+    /// — positions are DERIVED from the log order, never stored), and the
+    /// union of their deployment ids (the `deployments/<id>/` directories
+    /// the compaction deletes). Pure read over the physical logs; the
+    /// dry-run preview and the compaction itself share it, so the preview
+    /// enumerates EXACTLY what the compaction removes. Crate-private: only
+    /// the checkpoint flow (and the in-crate integrity tests) computes
+    /// discards.
     pub(crate) fn checkpoint_discards(
         &self,
         target: &str,
@@ -1470,19 +1475,32 @@ impl LocalStore {
             .take(keep_from)
             .map(|a| a.deployment_id.as_str().to_string())
             .collect();
-        let discarded_snapshots: Vec<u64> = snapshots
+        // The snapshot discard set is the log prefix strictly before the
+        // floor deployment's position: every snapshot whose position in the
+        // RAW log precedes the checkpoint deployment's position (the
+        // deployment-keyed analog of `index < floor.snapshot_index` — the
+        // checkpoint deployment's OWN position is the floor, so its snapshot
+        // is never discarded).
+        let snap_floor_pos = snapshots
             .iter()
-            .filter(|s| s.index < floor.snapshot_index)
-            .map(|s| s.index)
+            .position(|s| s.deployment_id == floor.deployment_id);
+        let discarded_snapshots: Vec<String> = snapshots
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| snap_floor_pos.is_some_and(|f| *i < f))
+            .map(|(_, s)| s.deployment_id.as_str().to_string())
             .collect();
         // Deployment dirs strictly before the floor: every snapshot
-        // deployment below the floor plus every failed attempt before the
+        // deployment before the floor plus every failed attempt before the
         // checkpoint's own attempt (failed attempts carry no snapshot entry
         // but still own a `deployments/<id>/` directory). Deduplicated in a
-        // deterministic order: snapshot-derived ids first (by snapshot
-        // index), then attempt-derived ids not already listed.
+        // deterministic order: snapshot-derived ids first (by log position),
+        // then attempt-derived ids not already listed.
         let mut discarded_deployments: Vec<String> = Vec::new();
-        for s in snapshots.iter().filter(|s| s.index < floor.snapshot_index) {
+        for (pos, s) in snapshots.iter().enumerate() {
+            if !snap_floor_pos.is_some_and(|f| pos < f) {
+                break;
+            }
             let id = s.deployment_id.as_str().to_string();
             if !discarded_deployments.contains(&id) {
                 discarded_deployments.push(id);
@@ -1501,7 +1519,7 @@ impl LocalStore {
         })
     }
 
-    /// Physically compact the target's history to the suffix at/after
+    /// Physically compact the target's history to the suffix beginning at
     /// `floor` (the compaction half of a checkpoint; the floor marker must
     /// already be durable — [`LocalStore::write_history_floor`] first):
     ///
@@ -1509,7 +1527,10 @@ impl LocalStore {
     ///    floor.
     /// 2. Atomically rewrite `attempts.jsonl` to the checkpoint's own
     ///    attempt and everything after it.
-    /// 3. Atomically rewrite `snapshots.jsonl` to `index >= floor.snapshot_index`.
+    /// 3. Atomically rewrite `snapshots.jsonl` to the suffix beginning at
+    ///    the checkpoint deployment's position in the log (positions are
+    ///    DERIVED from the log order — never stored; the deployment-keyed
+    ///    analog of the old `index >= floor.snapshot_index`).
     ///
     /// The deletion runs FIRST because it is the only phase whose worklist
     /// lives solely in memory: [`LocalStore::checkpoint_discards`] derives
@@ -1618,7 +1639,8 @@ impl LocalStore {
         let keep = &attempts[pos..];
         write_jsonl_atomic(&self.target_dir(target).join("attempts.jsonl"), keep)?;
 
-        // 3. snapshots.jsonl → the suffix at/after the floor.
+        // 3. snapshots.jsonl → the suffix beginning at the floor
+        //    deployment's position in the log (derived, never stored).
         #[cfg(test)]
         if self
             .fault_registry()
@@ -1629,11 +1651,19 @@ impl LocalStore {
             ));
         }
         let snapshots = self.read_snapshots_raw(target)?;
-        let keep_snaps: Vec<DeploymentSnapshot> = snapshots
+        // FAIL CLOSED: the floor's deployment id must be in the target's
+        // snapshots log (a successful deployment always owns one). The
+        // suffix begins at the floor deployment's position.
+        let snap_pos = snapshots
             .iter()
-            .filter(|s| s.index >= floor.snapshot_index)
-            .cloned()
-            .collect();
+            .position(|s| s.deployment_id == floor.deployment_id)
+            .ok_or_else(|| {
+                Error::integrity(format!(
+                    "checkpoint compaction for target '{target}': the floor's deployment '{}' does not exist in the target's snapshots log — refusing to compact against an unbound floor",
+                    floor.deployment_id
+                ))
+            })?;
+        let keep_snaps: Vec<DeploymentSnapshot> = snapshots[snap_pos..].to_vec();
         write_jsonl_atomic(&self.refs_dir(target).join("snapshots.jsonl"), &keep_snaps)?;
 
         Ok(())
@@ -1668,9 +1698,8 @@ mod tests {
         }
     }
 
-    fn snapshot_entry(index: u64, id: &str, target: &str) -> DeploymentSnapshot {
+    fn snapshot_entry(id: &str, target: &str) -> DeploymentSnapshot {
         DeploymentSnapshot {
-            index,
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new(target.to_string()),
             behavior_sha256: "sha256-aa".to_string(),
@@ -1681,67 +1710,72 @@ mod tests {
 
     /// Seed a target with a history of `(attempt_ok, ...)` flags: every
     /// attempt gets a `deployments/<id>/` directory; every successful
-    /// attempt appends a snapshot with the next unique index (mirroring the
-    /// checkpoint suite's seeding).
+    /// attempt appends a snapshot KEYED BY ITS DEPLOYMENT ID (the log order
+    /// IS the deployment order — positions are derived, never stored;
+    /// mirroring the checkpoint suite's seeding).
     fn seed_history(store: &LocalStore, target: &str, prefix: &str, history: &[bool]) {
-        let mut next = 0u64;
         for (n, ok) in history.iter().enumerate() {
             let id = format!("{prefix}-{n:04}");
             store.append_attempt(target, &attempt(&id, target)).unwrap();
             std::fs::create_dir_all(store.deployment_dir(&id)).unwrap();
             if *ok {
                 store
-                    .append_snapshot(target, &snapshot_entry(next, &id, target))
+                    .append_snapshot(target, &snapshot_entry(&id, target))
                     .unwrap();
-                next += 1;
             }
         }
     }
 
-    /// A floor marker naming `id` at snapshot `index` (the seeded history
-    /// already carries the bound attempt + snapshot, so the marker reads
-    /// back bound to the exact snapshot pair).
-    fn floor_for(target: &str, id: &str, snapshot_index: u64) -> HistoryFloor {
+    /// A floor marker naming `id` (the seeded history already carries the
+    /// bound attempt + snapshot, so the marker reads back bound to the exact
+    /// rollback payload).
+    fn floor_for(target: &str, id: &str) -> HistoryFloor {
         HistoryFloor {
             schema_version: SCHEMA_VERSION,
             target: TargetName::new(target.to_string()),
             deployment_id: DeploymentId::new(id.to_string()),
-            snapshot_index,
             established_at: "2026-01-01T00:00:00Z".to_string(),
         }
     }
 
     /// The ENTIRE visible state of `target` under `floor`: the gated
-    /// snapshot/attempt lists and the below-floor ref refusal. A failed
-    /// ADVANCE must leave this EXACTLY unchanged (identical lists, the same
-    /// below-A refs refused).
+    /// snapshot/attempt lists (deployment ids, in log order) and the
+    /// below-floor ref refusal. A failed ADVANCE must leave this EXACTLY
+    /// unchanged (identical lists, the same below-A refs refused).
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct VisibleState {
-        snapshots: Vec<(u64, String)>,
+        snapshots: Vec<String>,
         attempts: Vec<String>,
         below_floor_ref_err: Option<String>,
     }
 
     fn capture_visible(store: &LocalStore, floor: &HistoryFloor) -> VisibleState {
-        // The ref just below the floor must be REFUSED (never a resolved
-        // below-floor snapshot); capture the exact refusal message so the
-        // post-advance state can be compared byte-for-byte.
-        let below_floor_ref_err = if floor.snapshot_index > 0 {
-            let expr = history::parse_ref_expr(&format!("s{}", floor.snapshot_index - 1)).unwrap();
-            Some(
-                history::resolve_ref_expr(&expr, TARGET, store)
-                    .unwrap_err()
-                    .to_string(),
-            )
-        } else {
-            None
+        // The ref for the deployment immediately below the floor (in the
+        // RAW log — the floored read no longer exposes it) must be REFUSED
+        // (never a resolved below-floor snapshot); capture the exact refusal
+        // message so the post-advance state can be compared byte-for-byte.
+        let raw = store.read_snapshots_raw(TARGET).unwrap();
+        let below_floor_ref_err = match raw
+            .iter()
+            .position(|s| s.deployment_id == floor.deployment_id)
+        {
+            Some(pos) if pos > 0 => {
+                let below = raw[pos - 1].deployment_id.as_str().to_string();
+                let expr = history::parse_ref_expr(&below).unwrap();
+                Some(
+                    history::resolve_ref_expr(&expr, TARGET, store)
+                        .unwrap_err()
+                        .to_string(),
+                )
+            }
+            _ => None,
         };
         VisibleState {
             snapshots: store
                 .read_snapshots(TARGET)
                 .unwrap()
                 .iter()
-                .map(|s| (s.index, s.deployment_id.as_str().to_string()))
+                .map(|s| s.deployment_id.as_str().to_string())
                 .collect(),
             attempts: store
                 .read_attempts(TARGET)
@@ -1878,22 +1912,20 @@ mod tests {
         );
 
         // A: the `a_at`-th successful deployment (never the last — B owns
-        // the last success). Its snapshot index is its position among the
-        // successes (snapshots are minted in order).
+        // the last success). Its POSITION among the successes is the floor's
+        // derived log position (positions are DERIVED from the log order,
+        // never stored).
         let a_id = ok_ids[a_at % (ok_ids.len() - 1)].clone();
-        let a_index = ok_ids.iter().position(|id| *id == a_id).unwrap() as u64;
         let b_id = ok_ids.last().unwrap().clone();
-        let b_index = (ok_ids.len() - 1) as u64;
         assert_ne!(a_id, b_id, "B must be a later deployment than A");
 
         // Establish floor A (direct marker write — the seeded history
         // already carries A's attempt + snapshot, so the marker reads back
         // bound to the exact snapshot pair).
-        let floor_a = floor_for(TARGET, &a_id, a_index);
+        let floor_a = floor_for(TARGET, &a_id);
         store.write_history_floor(TARGET, &floor_a).unwrap();
         let a_floor = store.read_history_floor(TARGET).unwrap().unwrap();
         assert_eq!(a_floor.deployment_id.as_str(), a_id);
-        assert_eq!(a_floor.snapshot_index, a_index);
 
         // PRE-ADVANCE visible state: floor A, the gated suffix, and the
         // below-A ref refusal.
@@ -1920,7 +1952,7 @@ mod tests {
         // DRIVE THE ADVANCE A → B: the real temp→marker rename FAILS (a
         // genuine fs error on the actual call, after A was moved aside to
         // the durable backup).
-        let floor_b = floor_for(TARGET, &b_id, b_index);
+        let floor_b = floor_for(TARGET, &b_id);
         let err = store
             .write_history_floor(TARGET, &floor_b)
             .expect_err("the real temp→marker rename failure must fail the advance");
@@ -1955,10 +1987,6 @@ mod tests {
             a_id,
             "the ORIGINAL floor deployment A survives the real rename failure"
         );
-        assert_eq!(
-            f.snapshot_index, a_index,
-            "the ORIGINAL floor index survives the real rename failure"
-        );
 
         // THE VISIBLE SUFFIX IS EXACTLY UNCHANGED: identical gated
         // snapshots/attempts, and the same below-A refs still refused.
@@ -1989,7 +2017,6 @@ mod tests {
             .expect("the fault-free advance to B succeeds");
         let b_floor = store.read_history_floor(TARGET).unwrap().unwrap();
         assert_eq!(b_floor.deployment_id.as_str(), b_id);
-        assert_eq!(b_floor.snapshot_index, b_index);
     }
 
     /// CONTROL: the injected [`FaultKind::RenameFloor`] fault (fires BEFORE
@@ -2004,12 +2031,12 @@ mod tests {
         seed_history(&store, TARGET, "deploy", &[true, true]);
         let a_id = "deploy-0000".to_string();
         let b_id = "deploy-0001".to_string();
-        let floor_a = floor_for(TARGET, &a_id, 0);
+        let floor_a = floor_for(TARGET, &a_id);
         store.write_history_floor(TARGET, &floor_a).unwrap();
         let a_floor = store.read_history_floor(TARGET).unwrap().unwrap();
         let pre = capture_visible(&store, &a_floor);
 
-        let floor_b = floor_for(TARGET, &b_id, 1);
+        let floor_b = floor_for(TARGET, &b_id);
         store.fault_registry().arm_rename_floor(&b_id);
         let err = store
             .write_history_floor(TARGET, &floor_b)
@@ -2027,7 +2054,6 @@ mod tests {
             .as_ref()
             .expect("the injected RenameFloor fault must retain floor A — never None");
         assert_eq!(f.deployment_id.as_str(), a_id);
-        assert_eq!(f.snapshot_index, 0);
         let post = capture_visible(&store, f);
         assert_eq!(post.snapshots, pre.snapshots);
         assert_eq!(post.attempts, pre.attempts);
@@ -2047,7 +2073,7 @@ mod tests {
         seed_history(&store, TARGET, "deploy", &[true, true]);
         let a_id = "deploy-0000".to_string();
         let b_id = "deploy-0001".to_string();
-        let floor_a = floor_for(TARGET, &a_id, 0);
+        let floor_a = floor_for(TARGET, &a_id);
         store.write_history_floor(TARGET, &floor_a).unwrap();
 
         // Arm the seam to fail the REAL A→backup rename (src = the marker
@@ -2061,7 +2087,7 @@ mod tests {
         });
         let _guard = FloorFsSeamGuard::install(seam);
 
-        let floor_b = floor_for(TARGET, &b_id, 1);
+        let floor_b = floor_for(TARGET, &b_id);
         let err = store
             .write_history_floor(TARGET, &floor_b)
             .expect_err("the real backup-rename failure fails the advance");
@@ -2074,7 +2100,6 @@ mod tests {
         // failed advance leaves the previous floor untouched.
         let floor = store.read_history_floor(TARGET).unwrap().unwrap();
         assert_eq!(floor.deployment_id.as_str(), a_id);
-        assert_eq!(floor.snapshot_index, 0);
         assert!(marker.exists(), "A's marker is never removed");
         assert!(
             !floor_backup_path(&marker, &b_id).exists(),
@@ -2126,7 +2151,7 @@ mod tests {
     fn torn_fixture(tmp: &Path) -> (LocalStore, PathBuf, PathBuf, PathBuf) {
         let store = LocalStore::with_base(tmp.join("store")).unwrap();
         seed_history(&store, TARGET, "deploy", &[true, false]);
-        let floor_a = floor_for(TARGET, "deploy-0000", 0);
+        let floor_a = floor_for(TARGET, "deploy-0000");
         store.write_history_floor(TARGET, &floor_a).unwrap();
         let marker = store.history_floor_path(TARGET);
         let backup = floor_backup_path(&marker, "a-tag");

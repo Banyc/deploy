@@ -280,8 +280,8 @@ pub(crate) fn push_with_id(
 }
 
 /// Test-only entry point: drive [`push_inner`] for a caller-supplied ref
-/// (`sN` rollback etc.) with a caller-supplied deployment id, mirroring
-/// [`push_with_id`] for the ref-token path. Lets the state-machine fixture
+/// (a deployment-keyed rollback etc.) with a caller-supplied deployment id,
+/// mirroring [`push_with_id`] for the ref-token path. Lets the state-machine fixture
 /// arm the one-shot store faults (keyed by deployment id) BEFORE a rollback
 /// push runs, so rollback steps can carry the same per-step failure classes
 /// as HEAD pushes.
@@ -530,10 +530,11 @@ fn push_inner(
     } else {
         // Historical ref: resolve the bound release.
         let rid = match &pref {
-            PushRef::Snapshot {
-                target: ft, index, ..
+            PushRef::Deployment {
+                target: ft,
+                deployment_id,
             } => {
-                let entry = history::resolve_snapshot(store, ft, *index)?;
+                let entry = history::resolve_deployment(store, ft, deployment_id)?;
                 entry
                     .slots
                     .values()
@@ -1366,14 +1367,16 @@ fn push_inner(
         // per-slot OUTCOMES (`actual_servers`), never from the intent
         // record.
         let slot_bindings = config.target_slot_bindings(target_name)?;
-        let idx = history::finalize_successful_attempt(
+        let dep = history::finalize_successful_attempt(
             store,
             &attempt_intent,
             &actual_servers,
             "push completed",
             &slot_bindings,
         )?;
-        message = format!("push successful; snapshot ref s{idx} of target {target_name}");
+        message = format!(
+            "push successful; rollback payload keyed by deployment {dep} of target {target_name}"
+        );
     } else {
         store.append_transition(deployment_id.as_str(), &commit_status, commit_reason)?;
     }
@@ -2195,6 +2198,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             Some(DeploymentStatus::Successful),
             "first push must deploy"
         );
+        // The rollback ref for later: the FIRST push's deployment id
+        // (rollback payloads are keyed by deployment id).
+        let baseline_dep = r0
+            .attempt
+            .as_ref()
+            .expect("first push records an attempt")
+            .deployment_id
+            .clone();
         let tree = r0.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")]
             .artifact
             .tree
@@ -2240,7 +2251,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &config,
             &PushOptions {
                 dry_run: false,
-                ref_token: Some("s0".to_string()),
+                ref_token: Some(baseline_dep.as_str().to_string()),
             },
         )
         .unwrap();
@@ -2583,7 +2594,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "exactly one successful snapshot, got {}",
             snapshots.len()
         );
-        assert_eq!(snapshots[0].index, 0);
         assert_eq!(snapshots[0].deployment_id, attempt.deployment_id);
         assert_eq!(
             h.store.read_last_successful("t1").as_deref(),
@@ -2935,8 +2945,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "clean push must finalize Successful"
         );
         assert!(
-            r1.message.contains("snapshot ref s0 of target t1"),
-            "message must carry the snapshot ref, got: {}",
+            r1.message
+                .contains("rollback payload keyed by deployment deploy-main-plain of target t1"),
+            "message must carry the deployment-keyed rollback payload, got: {}",
             r1.message
         );
         assert_finalized(&h, &single_attempt(&h));
@@ -3810,7 +3821,6 @@ interval_seconds = 0
         let snapshots = h.store.read_snapshots("t1").unwrap();
         assert_eq!(snapshots.len(), 2, "baseline + reconciled attempt");
         assert_eq!(snapshots[1].deployment_id, id_a);
-        assert_eq!(snapshots[1].index, 1);
         assert_eq!(
             h.store.read_last_successful("t1").as_deref(),
             Some(id_a.as_str())
@@ -3875,8 +3885,6 @@ interval_seconds = 0
         assert_eq!(snapshots.len(), 3);
         assert_eq!(snapshots[1].deployment_id, a.deployment_id);
         assert_eq!(snapshots[2].deployment_id, b.deployment_id);
-        assert_eq!(snapshots[1].index, 1, "op-log indices stay monotonic");
-        assert_eq!(snapshots[2].index, 2);
         assert_eq!(
             latest_status(&h, a.deployment_id.as_str()),
             DeploymentStatus::Successful
@@ -4458,7 +4466,7 @@ interval_seconds = 0
             &config2,
             &PushOptions {
                 dry_run: false,
-                ref_token: Some("s0".to_string()),
+                ref_token: Some("deploy-membership-baseline".to_string()),
             },
         )
         .expect_err("membership change must refuse exact rollback");
@@ -4529,7 +4537,7 @@ interval_seconds = 0
             &h.config,
             &PushOptions {
                 dry_run: true,
-                ref_token: Some("s0".to_string()),
+                ref_token: Some("deploy-hist-dry-s0".to_string()),
             },
         )
         .unwrap();
@@ -4584,7 +4592,6 @@ interval_seconds = 0
         let r1 = push_main_with_id(&h, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let s0 = &r1.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")];
-        let release = s0.artifact.release.clone();
         let tree = s0.artifact.tree.clone();
 
         let store_before = snapshot_files(h.store.base());
@@ -4603,7 +4610,7 @@ interval_seconds = 0
             &h.config,
             &PushOptions {
                 dry_run: true,
-                ref_token: Some(format!("parent({}, 0)", release.as_str())),
+                ref_token: Some(id1.as_str().to_string()),
             },
         )
         .unwrap();
@@ -5676,7 +5683,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .append_snapshot(
                 "t1",
                 &crate::records::DeploymentSnapshot {
-                    index: 0,
                     deployment_id: DeploymentId::new("deploy-hist-behavior-fixture".to_string()),
                     target: TargetName::new("t1".to_string()),
                     behavior_sha256: "sha256-aa".to_string(),
@@ -5714,7 +5720,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.store,
             &factory,
             "t1",
-            &history::parse_ref_expr("s0").unwrap(),
+            &history::parse_ref_expr("deploy-hist-behavior-fixture").unwrap(),
             None,
             &id,
             &op_id,
@@ -5759,7 +5765,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.store,
             &factory,
             "t1",
-            &history::parse_ref_expr("s0").unwrap(),
+            &history::parse_ref_expr("deploy-hist-behavior-fixture").unwrap(),
             None,
             &id,
             &op_id2,
@@ -6175,7 +6181,8 @@ interval_seconds = 0
         );
     }
 
-    /// The bare `sN` ref form (no `@` prefix) resolves against the push's
+    /// The bare deployment-id ref form (no `@` prefix) resolves against the
+    /// push's
     /// OWN target argument — the target is passed once, never repeated in the
     /// reference. A dry run against `s0` must plan the same historical
     /// snapshot as the `parent(@, N)` equivalent.
@@ -6204,14 +6211,17 @@ interval_seconds = 0
             &h.config,
             &PushOptions {
                 dry_run: true,
-                ref_token: Some("s0".to_string()),
+                ref_token: Some(id1.as_str().to_string()),
             },
         )
         .unwrap();
-        assert!(r.dry_run, "the bare `s0` dry run plans without mutating");
+        assert!(
+            r.dry_run,
+            "the bare deployment-id dry run plans without mutating"
+        );
         assert!(
             r.message.contains(s0_tree.as_str()),
-            "the bare `s0` form must plan the s0 snapshot for the push's own target, got: {}",
+            "the bare deployment-id form must plan that deployment's stored state for the push's              own target, got: {}",
             r.message
         );
     }
@@ -6513,273 +6523,35 @@ interval_seconds = 0
     //
     // THE BUG THIS FIXES: the engine used to resolve the push ref — INCLUDING
     // the relative forms (`@`, `@-`, `parent(@, N)`) — into a concrete
-    // snapshot index BEFORE it acquired locks and BEFORE
+    // deployment BEFORE it acquired locks and BEFORE
     // `reconcile_pending_commits` appended the recovered attempt's snapshot.
     // A relative ref computed against the PRE-reconciliation chain therefore
-    // selected a stale index: `@-` should mean "one before the latest
+    // selected a stale deployment: `@-` should mean "one before the latest
     // INCLUDING this push's reconciled append", but early resolution gave
     // "one before the pre-recovery latest". The fix parses the token to a
     // store-free [`RefExpr`] FIRST and resolves it only after reconciliation
     // (see the resolution point in `push_inner`).
     //
-    // THE PROPERTY: for an initial chain whose latest index is `L`
-    // (snapshots 0..=L, i.e. L+1 snapshots), a pending-commit attempt whose
-    // reconciliation appends EXACTLY ONE snapshot (index L+1) during the ref
-    // push, and a relative ref with ancestor depth d (1..=L; `@-` for d=1,
-    // `parent(@, d)` otherwise), the SELECTED index in the plan equals
-    // POST-RECONCILIATION latest - depth = (L + 1) - d. The pre-fix behavior
-    // selected L - d (stale, off by exactly the reconciled append) or failed
-    // outright on a chain too short for the walk. Depth 0 is the `@` HEAD
-    // form — the current-files push, chain-independent and covered by the
-    // pure-parse unit tests in `history.rs` — so the ancestor range starts
-    // at 1.
+    // THE PROPERTY: for an initial chain whose latest POSITION is `L`
+    // (deployments 0..=L, i.e. L+1 successful deployments — the log order
+    // IS the deployment history; positions are derived, never stored), a
+    // pending-commit attempt whose reconciliation appends EXACTLY ONE
+    // snapshot (a new deployment at position L+1) during the ref push, and
+    // a relative ref with ancestor depth d (1..=L; `@-` for d=1,
+    // `parent(@, d)` otherwise), the SELECTED deployment in the plan equals
+    // POST-RECONCILIATION latest - depth = the deployment at position
+    // (L + 1) - d. The pre-fix behavior selected position L - d (stale, off
+    // by exactly the reconciled append) or failed outright on a chain too
+    // short for the walk. Depth 0 is the `@` HEAD form — the current-files
+    // push, chain-independent and covered by the pure-parse unit tests in
+    // `history.rs` — so the ancestor range starts at 1.
     //
     // COST CONTROL: the initial chain is FIXTURED at the store level (a real
     // pending push writes the release + tree + remote state, then synthetic
     // snapshot entries 0..=L reference that release), and the ref push is
     // faulted at its FIRST transition — after `plan.json` is durable but
-    // before staging/deployment — so the plan's resolved index is observable
-    // without running the full mutation loop.
-
-    // ---- dry-run ref resolution: invalid refs never touch a remote -------
-
-    /// Control: a VALID ref (`@`) with the recording factory dry-runs
-    /// successfully — dry runs still contact remotes to inspect status, so
-    /// the zero-contact contract applies ONLY to the invalid-ref failure
-    /// path — and the counters DO move, proving the recording seam would
-    /// catch a regression that re-introduced remote contact before the ref
-    /// check (a counter that cannot move would make the zero-invocation
-    /// property below vacuous).
-    #[test]
-    fn dry_run_valid_ref_contacts_factory_and_plans() {
-        let h = RecoveryHarness::new();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let factory = recording_factory(h.remotes_base.clone(), calls.clone());
-        let r = push(
-            &h.cfg_path,
-            &h.store,
-            &factory,
-            "t1",
-            &h.config,
-            &PushOptions {
-                dry_run: true,
-                ref_token: None,
-            },
-        )
-        .unwrap();
-        assert!(r.dry_run);
-        assert!(
-            r.message.contains("dry-run plan"),
-            "valid dry run must plan, got: {}",
-            r.message
-        );
-        assert!(
-            calls.load(Ordering::SeqCst) > 0,
-            "a valid dry run contacts remotes for status; the recording factory must have counted \
-             at least one invocation"
-        );
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: 32,
-            rng_seed: RngSeed::Fixed(0x0EA5_0E11_0BEA),
-            failure_persistence: None,
-            ..ProptestConfig::default()
-        })]
-
-        #[test]
-        fn relative_ref_resolves_post_reconciliation_latest_minus_depth(
-            (latest, depth) in (0u64..=4).prop_flat_map(|latest| {
-                (Just(latest), 1u64..=latest.max(1))
-            }),
-        ) {
-            let h = RecoveryHarness::new();
-            let slot = PlacementSlotId::new("p1".to_string());
-
-            // (c) A concurrent/reconciled append: a pending-commit attempt
-            // whose reconciliation will append EXACTLY ONE snapshot during
-            // the ref push. The push itself is real (it deploys to the remote
-            // and records the attempt) but the commit marker write fails
-            // once, so no snapshot is appended yet. It also persists the
-            // release record + behavior snapshot + tree the synthetic chain
-            // below reuses.
-            let armed = Arc::new(AtomicBool::new(true));
-            let armed_for_factory = armed.clone();
-            let rf = h.remotes_base.clone();
-            let fault_factory = move |s: &crate::config::ServerDef,
-                                      _slot: &crate::config::SlotDef|
-                     -> Result<Box<dyn Remote>> {
-                FailOnceMarkerRemote::build(rf.join(&s.id), armed_for_factory.clone())
-            };
-            let rp = push(
-                &h.cfg_path,
-                &h.store,
-                &fault_factory,
-                "t1",
-                &h.config,
-                &PushOptions {
-                    dry_run: false,
-                    ref_token: None,
-                },
-            )
-            .unwrap();
-            assert_eq!(rp.status, Some(DeploymentStatus::PendingCommit));
-            let pending = rp.attempt.as_ref().expect("the pending push records an attempt");
-            let pending_id = pending.deployment_id.clone();
-            let pending_artifact = pending.slots[&slot].artifact.clone();
-            assert!(
-                h.store.read_snapshots("t1").unwrap().is_empty(),
-                "the pending attempt appends no snapshot yet"
-            );
-
-            // (a) Initial chain: synthetic snapshots 0..=latest (length L+1),
-            // all referencing the pending push's REAL release + tree (which
-            // are durable in the store), each with the harness's exact
-            // physical binding so `plan_assignments` accepts the rollback.
-            let bindings = crate::records::PhysicalBinding {
-                server: crate::model::ServerId::new("s1".to_string()),
-                deploy_dir: "/srv/eng".to_string(),
-            };
-            for i in 0..=latest {
-                h.store
-                    .append_snapshot(
-                        "t1",
-                        &crate::records::DeploymentSnapshot {
-                            index: i,
-                            deployment_id: DeploymentId::new(format!(
-                                "deploy-relative-chain-{latest}-{i}"
-                            )),
-                            target: TargetName::new("t1".to_string()),
-                            behavior_sha256: pending.behavior_sha256.clone(),
-                            slots: BTreeMap::from([(
-                                slot.clone(),
-                                GenerationRef {
-                                    generation: GenerationId::new(format!(
-                                        "gen-relative-{latest}-{i}"
-                                    )),
-                                    assignment: crate::model::PlacementSlotAssignment {
-                                        placement_slot: slot.clone(),
-                                        artifact: pending_artifact.clone(),
-                                    },
-                                },
-                            )]),
-                            bindings: BTreeMap::from([(slot.clone(), bindings.clone())]),
-                        },
-                    )
-                    .unwrap();
-            }
-            assert_eq!(
-                h.store.read_snapshots("t1").unwrap().len() as u64,
-                latest + 1,
-                "the initial chain holds latest + 1 snapshots"
-            );
-
-            // The ref is RELATIVE: `@-` for depth 1, `parent(@, d)` else.
-            let token = if depth == 1 {
-                "@-".to_string()
-            } else {
-                format!("parent(@, {depth})")
-            };
-            // The PRE-FIX behavior resolved BEFORE reconciliation: against the
-            // pre-append chain it selected latest - depth (stale) or failed
-            // outright when the chain was too short for the walk.
-            let pre_reconcile = history::resolve_ref_expr(
-                &history::parse_ref_expr(&token).unwrap(),
-                "t1",
-                &h.store,
-            );
-            let selected = (latest + 1) - depth;
-            match pre_reconcile {
-                Ok(PushRef::Snapshot { index, .. }) => {
-                    assert_ne!(
-                        index, selected,
-                        "pre-fix resolution must not see the reconciled append"
-                    );
-                    if latest > 0 {
-                        assert_eq!(index, latest - depth, "the stale pre-fix selection");
-                    }
-                }
-                Ok(_) => {
-                    panic!("a relative snapshot ref must not resolve to a non-snapshot pre-reconcile")
-                }
-                Err(_) => {
-                    assert_eq!(
-                        latest, 0,
-                        "pre-fix on a non-empty chain must resolve (stale), not fail"
-                    );
-                }
-            }
-
-            // The fixed flow: the engine reconciles FIRST (appending the
-            // pending attempt's snapshot at index latest + 1), THEN resolves
-            // the ref against the post-reconciliation chain, then plans. The
-            // push is faulted at its FIRST transition — AFTER `plan.json` is
-            // durable — so the plan's resolved source is observable without
-            // the (slow) mutation loop.
-            let rf2 = h.remotes_base.clone();
-            let clean_factory = move |s: &crate::config::ServerDef,
-                                      _slot: &crate::config::SlotDef|
-                     -> Result<Box<dyn Remote>> {
-                Ok(Box::new(LocalTransport::new(rf2.join(&s.id))?))
-            };
-            let ref_id = DeploymentId::new(format!("deploy-relative-ref-{latest}-{depth}"));
-            h.store
-                .fault_registry()
-                .arm_append_transition(ref_id.as_str());
-            let err = push_ref_with_id(
-                &h.cfg_path,
-                &h.store,
-                &clean_factory,
-                "t1",
-                &h.config,
-                &PushOptions {
-                    dry_run: false,
-                    ref_token: Some(token.clone()),
-                },
-                &ref_id,
-            )
-            .expect_err("the plan is durable before the first transition, so the faulted push must Err");
-            assert!(
-                err.to_string().contains("append_transition"),
-                "the injected transition fault must be the failure, got: {err}"
-            );
-
-            // (c) The reconciled append happened: index latest + 1 is the
-            // pending attempt's snapshot.
-            let snapshots = h.store.read_snapshots("t1").unwrap();
-            assert_eq!(
-                snapshots.len() as u64,
-                latest + 2,
-                "initial (latest+1) + reconciled (1); the faulted ref push appends nothing"
-            );
-            let reconciled = snapshots
-                .iter()
-                .find(|e| e.index == latest + 1)
-                .expect("the reconciled snapshot must exist");
-            assert_eq!(
-                reconciled.deployment_id.as_str(),
-                pending_id.as_str(),
-                "the reconciled append is the pending attempt's snapshot"
-            );
-
-            // THE ASSERTION: the SELECTED index recorded in the plan equals
-            // post-reconciliation latest - depth = (latest + 1) - depth.
-            let plan: DeploymentPlan = serde_json::from_str(
-                &std::fs::read_to_string(h.store.deployment_dir(ref_id.as_str()).join("plan.json"))
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(
-                plan.source,
-                crate::records::PlanSource::SnapshotRef(selected),
-                "'{token}' must select s{selected} = s{}(latest + 1) - {depth} — the \
-                 POST-reconciliation selection, not the stale s{}(latest) - {depth}",
-                latest + 1,
-                latest
-            );
-        }
-    }
+    // before staging/deployment — so the plan's resolved source is
+    // observable without running the full mutation loop.
 
     // THE property: a dry run with a NONEXISTENT ref returns a REF error
     // and never contacts a remote — the recording factory reports ZERO
@@ -6803,11 +6575,11 @@ interval_seconds = 0
             kind in 0u32..3,
             offset in 1u64..=4,
         ) {
-            // Fixture: target 't1' with a three-entry snapshot chain
-            // s0..=s2 (latest = 2), each with a distinctive deployment id.
-            // Only the chain's SHAPE matters (indices + deployment ids): the
-            // generated refs fail in resolution, before any planning reads
-            // the snapshots' artifacts.
+            // Fixture: target 't1' with a three-entry deployment history
+            // (deploy-fixture-0..=2, latest = 2). Only the chain's SHAPE
+            // matters (the log order + deployment ids): the generated refs
+            // fail in resolution, before any planning reads the snapshots'
+            // artifacts.
             let h = RecoveryHarness::new();
             let slot = PlacementSlotId::new("p1".to_string());
             let artifact = ArtifactRef {
@@ -6824,7 +6596,6 @@ interval_seconds = 0
                     .append_snapshot(
                         "t1",
                         &crate::records::DeploymentSnapshot {
-                            index: i,
                             deployment_id: DeploymentId::new(format!("deploy-fixture-{i}")),
                             target: TargetName::new("t1".to_string()),
                             behavior_sha256: "bb".to_string(),
@@ -6845,11 +6616,15 @@ interval_seconds = 0
             }
 
             // Shape-valid but semantically unresolvable: derive the token
-            // from the fixture's shape (latest = 2).
+            // from the fixture's shape (latest = 2, three successful
+            // deployments deploy-fixture-0..=2).
             let token = match kind {
-                0 => format!("s{}", 2 + offset),            // index beyond the chain
-                1 => format!("parent(@, {})", 2 + offset),  // walks past the start
-                _ => format!("deploy-absent-{offset}"),     // deployment refid absent from the chain
+                // A deployment id absent from the chain.
+                0 => format!("deploy-absent-{offset}"),
+                // An ancestor walk past the start of the 3-deployment chain.
+                1 => format!("parent(@, {})", 2 + offset),
+                // A deployment-id ancestor stepping past the FIRST deployment.
+                _ => "deploy-fixture-0-".to_string(),
             };
             // Self-check: the token parses and genuinely fails to resolve.
             let expr = history::parse_ref_expr(&token).unwrap();

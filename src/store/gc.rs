@@ -20,7 +20,8 @@
 //!
 //! 1. **Every snapshot at/above every target's history floor** — and, for
 //!    a target WITHOUT a floor, its complete history (`read_snapshots_raw`
-//!    filtered by `index >= floor.snapshot_index`, or the full log).
+//!    filtered to the suffix beginning at the floor deployment's POSITION
+//!    in the log — positions are DERIVED, never stored — or the full log).
 //! 2. **Every attempt in the same retained suffix** (its `desired`
 //!    assignments) — the immutable intent records reference artifacts too.
 //! 3. **Every retained deployment record, including unfinished operations**
@@ -274,12 +275,24 @@ impl LocalStore {
             for attempt in &attempts {
                 named_deployments.insert(attempt.deployment_id.as_str().to_string());
             }
-            // Retained snapshots: at/above the floor (or the full log when
-            // no floor exists).
-            for snap in snapshots
-                .iter()
-                .filter(|s| floor.as_ref().is_none_or(|f| s.index >= f.snapshot_index))
-            {
+            // Retained snapshots: at/above the floor — the suffix beginning
+            // at the floor deployment's POSITION in the raw snapshot log
+            // (positions are DERIVED from the log order; the old
+            // `index >= floor.snapshot_index` filter is gone). When no floor
+            // exists, the full log is retained.
+            let keep_from = match &floor {
+                Some(f) => snapshots
+                    .iter()
+                    .position(|s| s.deployment_id == f.deployment_id)
+                    .ok_or_else(|| {
+                        Error::integrity(format!(
+                            "artifact GC: history floor for target '{target}' names deployment '{}' but no snapshot with that id exists in targets/{target}/snapshots.jsonl — refusing to compute reachability against an unbound floor",
+                            f.deployment_id
+                        ))
+                    })?,
+                None => 0,
+            };
+            for snap in snapshots.iter().skip(keep_from) {
                 retained_deployments.insert(snap.deployment_id.as_str().to_string());
                 for generation in snap.slots.values() {
                     retained.add_binding(&generation.assignment.artifact);

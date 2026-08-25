@@ -183,12 +183,19 @@ pub struct PhysicalBinding {
     pub deploy_dir: String,
 }
 
-/// A terminal successful snapshot state used for rollback, referenced as a
-/// snapshot index `sN` on the push command (e.g. `deploy push <target> sN`).
-/// Only successful deployments produce a snapshot
-/// (`refs/snapshots.jsonl` + `refs/last-successful`). Each slot's entry is
-/// the complete [`GenerationRef`] it advanced to (a successful snapshot always
-/// has a generation per slot).
+/// A terminal successful snapshot state used for rollback, KEYED BY ITS
+/// DEPLOYMENT ID: `deploy push <target> <deployment-id>` restores exactly
+/// this stored state, and the relative refs (`@-`, `@--`, `parent(@, N)`,
+/// `parent(<deployment-id>, N)`) walk the target's DEPLOYMENT HISTORY — the
+/// snapshot log IS the deployment history (each successful deployment
+/// produces exactly one snapshot, keyed by its deployment id). The separate
+/// snapshot index (`sN`) has been REMOVED from the public surface: any
+/// internal position the floor/compaction needs is DERIVED from the LOG
+/// ORDER (the [`DeploymentSnapshot`] log is appended in deployment order),
+/// never stored as a public index. Only successful deployments produce a
+/// snapshot (`refs/snapshots.jsonl` + `refs/last-successful`). Each slot's
+/// entry is the complete [`GenerationRef`] it advanced to (a successful
+/// snapshot always has a generation per slot).
 ///
 /// `bindings` records the COMPLETE PHYSICAL BINDING (`{server, deploy_dir}`)
 /// each slot had when the snapshot was taken (the deployment-location
@@ -205,7 +212,12 @@ pub struct PhysicalBinding {
 /// yielding an empty map).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentSnapshot {
-    pub index: u64,
+    /// THE KEY: the deployment that produced this snapshot. A successful
+    /// deployment id resolves to exactly this stored state; failed and
+    /// degraded attempts never resolve. The snapshot log is keyed by
+    /// deployment id and ordered by appends (deployment order) — positions
+    /// are derived from that order, never stored here (the old `index`
+    /// field / `sN` public ref is gone).
     pub deployment_id: DeploymentId,
     pub target: TargetName,
     pub behavior_sha256: String,
@@ -229,6 +241,13 @@ pub struct DeploymentSnapshot {
 /// (`read_attempts`, `read_snapshots`, ref resolution) exposes ONLY the
 /// suffix at/after the floor, and refs refuse to resolve below it.
 ///
+/// KEYED BY DEPLOYMENT ID: the floor names the checkpoint deployment (a
+/// successful deployment, so it owns a snapshot); everything strictly
+/// before that deployment's position in the op log is discarded. Positions
+/// are DERIVED from the LOG ORDER (the deployment's position among the
+/// physically recorded attempts/snapshots), never stored — the old
+/// `snapshot_index` field and the `sN` public ref are gone.
+///
 /// Persisted at `targets/<target>/refs/history-floor.json`. Written FIRST
 /// (durable, atomic temp+rename) before the physical compaction that
 /// rewrites the jsonl logs to the suffix and deletes `deployments/<id>/`
@@ -241,11 +260,11 @@ pub struct DeploymentSnapshot {
 pub struct HistoryFloor {
     pub schema_version: u32,
     pub target: TargetName,
+    /// THE KEY: the checkpoint deployment. Must be a successful deployment
+    /// of the target (it owns a snapshot in `refs/snapshots.jsonl`); the
+    /// retained history is exactly the suffix beginning at its position in
+    /// the log, and everything strictly before it is discarded.
     pub deployment_id: DeploymentId,
-    /// The canonical snapshot index of the snapshot the checkpoint
-    /// deployment produced (the oldest rollback state; everything below it
-    /// is discarded).
-    pub snapshot_index: u64,
     /// When the floor was established (RFC 3339).
     pub established_at: String,
 }
@@ -281,10 +300,9 @@ pub struct CleanupPending {
     pub schema_version: u32,
     pub target: TargetName,
     pub deployment_id: DeploymentId,
-    /// The snapshot index the floor sits at — the pending cleanup is the
-    /// compaction FOR THIS floor (integrity-bound to the floor on read).
-    pub snapshot_index: u64,
-    /// When the pending cleanup was recorded (RFC 3339).
+    /// The deployment id the floor sits at — the pending cleanup is the
+    /// compaction FOR THIS floor (integrity-bound to the floor on read;
+    /// positions are derived from the log order, never stored).
     pub established_at: String,
 }
 
@@ -373,8 +391,10 @@ pub enum PlanSource {
     /// Materialize the currently mapped local files and assign each slot its
     /// target-configured (current) variant.
     Head,
-    /// Restore a historical successful snapshot by index (`sN`).
-    SnapshotRef(u64),
+    /// Restore the stored state of a successful deployment, keyed by its
+    /// deployment id (`deploy push <target> <deployment-id>` and the
+    /// `@` / `parent(...)` deployment-history walk).
+    DeploymentRef(DeploymentId),
     /// Assign each current slot its configured variant from a named release.
     ReleaseRef(ReleaseId),
 }

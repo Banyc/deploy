@@ -59,15 +59,20 @@ deploy push production
 # Show what would change without modifying servers.
 deploy push production --dry-run
 # Inspect the target's deployment history — each line is prefixed with the
-# snapshot id (sN) of the snapshot that attempt produced; `-` means the
-# attempt produced no snapshot.
+# DEPLOYMENT ID of the snapshot that attempt produced (the exact rollback
+# key); `-` means the attempt produced no snapshot.
 deploy log production
 # Inspect the actual generation on every server.
 deploy status production
-# Restore the exact snapshot assignment from an earlier deployment
-# (jj-style: the target is passed once; the reference is relative)
-deploy push production @-              # the previous successful snapshot
-deploy push production 'parent(@, 3)'    # three snapshots back
+# Restore the exact stored state from an earlier deployment
+# (jj-style: the target is passed once; the reference is relative).
+# ROLLBACK PAYLOADS ARE KEYED BY DEPLOYMENT ID: `@`, `@-`, `@--` and
+# parent(...) walk the target's DEPLOYMENT HISTORY (each successful
+# deployment IS a rollback payload keyed by its id; failed attempts never
+# resolve).
+deploy push production @-              # the previous successful deployment
+deploy push production 'parent(@, 3)'    # three deployments back
+deploy push production deploy-20260821T102000Z  # exact state of that deployment
 # Establish a monotonic HISTORY FLOOR at a successful deployment
 # (IRREVERSIBLE — requires --yes; --dry-run previews the discard list):
 deploy checkpoint production deploy-20260821T102000Z --dry-run
@@ -75,13 +80,14 @@ deploy checkpoint production deploy-20260821T102000Z --yes
 ```
 
 `deploy log` output is one line per recorded attempt, newest last, each line
-prefixed with the snapshot id (`sN`) the attempt produced (the same `sN` the
-push reference grammar accepts); attempts that produced no snapshot — failed
-or degraded — render `-` so the columns stay aligned:
+prefixed with the DEPLOYMENT ID of the snapshot that attempt produced — the
+exact rollback key the push reference grammar accepts (`deploy push <target>
+<deployment-id>`); attempts that produced no snapshot — failed or degraded —
+render `-` so the columns stay aligned:
 
 ```
-s0  deploy-20260821T102000Z  Successful  2026-08-21T10:20:00Z
--  deploy-20260822T091400Z  FailedPreflight  2026-08-22T09:15:00Z  (preflight failed)
+deploy-20260821T102000Z  deploy-20260821T102000Z  Successful  2026-08-21T10:20:00Z
+-                        deploy-20260822T091400Z  FailedPreflight  2026-08-22T09:15:00Z  (preflight failed)
 ```
 
 `production` is not a built-in environment type. It is a user-chosen target name, analogous to a Git remote name such as `origin`, except that one target may fan out to multiple servers. Other valid names include `test-lab`, `datacenter-hk`, or `customer-acme`.
@@ -367,70 +373,84 @@ The records model splits deployment identity from mutable status:
 status); each deployment's status is an append-only transition stream
 (`deployments/<id>/transitions.jsonl`) whose LATEST entry is the deployment's
 current status; and successful deployments additionally produce a rollback
-snapshot (`refs/snapshots.jsonl` + `refs/last-successful`), referenced as
-`<target> sN` on the push command (e.g. `deploy push <target> s0`). The
-rollback history is the append-only OP LOG — the term is "op log", never
-"reflog".
+snapshot (`refs/snapshots.jsonl` + `refs/last-successful`) KEYED BY THEIR
+DEPLOYMENT ID — `deploy push <target> <deployment-id>` restores exactly that
+deployment's stored state, and the `@` / `parent(...)` relative forms walk
+the target's DEPLOYMENT HISTORY (the snapshot log IS the deployment history;
+each successful deployment is a rollback payload keyed by its id). The
+SEPARATE SNAPSHOT INDEX (`sN`) HAS BEEN REMOVED from the public surface:
+any internal position the floor/compaction needs is DERIVED from the LOG
+ORDER (the op log is appended in deployment order), never stored as a public
+index. The rollback history is the append-only OP LOG — the term is "op
+log", never "reflog".
 
 ### History floor (checkpoints)
 
 A checkpoint (`deploy checkpoint <target> <deployment-id>`) models the
 target's retained history as a monotonic floor — a small DURABLE MARKER at
 `targets/<target>/refs/history-floor.json`, deliberately NOT another
-snapshot or deployment:
+snapshot or deployment, and KEYED BY THE CHECKPOINT DEPLOYMENT ID:
 
 ```json
 {
   "schema_version": 1,
   "target": "production",
   "deployment_id": "deploy-20260821T102000Z",
-  "snapshot_index": 3,
   "established_at": "2026-08-25T14:00:00Z"
 }
 ```
 
 The deployment referenced by `deployment_id` must be a SUCCESSFUL deployment
-for that target (it must have produced a snapshot); that snapshot (its
-`snapshot_index` in the op log) becomes the OLDEST ROLLBACK STATE. The
-retained history is exactly the suffix at/after the checkpoint: older
-snapshots, older attempts (failed attempts included), and their
-`deployments/<id>/` directories strictly before the floor are discarded; the
-checkpoint deployment and everything after it is kept. A checkpoint does not
-deploy anything, does not contact remote servers, and does not create another
-snapshot.
+for that target (it must have produced a snapshot keyed by its id); that
+deployment's stored rollback payload becomes the OLDEST ROLLBACK STATE. The
+retained history is exactly the suffix beginning at the checkpoint
+deployment's POSITION in the log (positions are DERIVED from the log order,
+never stored): older snapshots, older attempts (failed attempts included),
+and their `deployments/<id>/` directories strictly before the floor are
+discarded; the checkpoint deployment and everything after it is kept. A
+checkpoint does not deploy anything, does not contact remote servers, and
+does not create another snapshot. MIGRATION: `deploy push <target> sN` (the
+old snapshot-index reference) is gone — use the deployment id of that
+snapshot's deployment (`deploy log <target>` shows it), or `@-` /
+`parent(@, N)` to walk the deployment history.
 
 Durability ordering: the floor marker is written FIRST (atomic temp+rename +
 directory fsync — durable before anything is deleted), then the physical
 compaction rewrites `attempts.jsonl` and `snapshots.jsonl` to the suffix
 (atomic temp+rename per file) and deletes the below-floor deployment
 directories. Because EVERY read path — `read_attempts`, `read_snapshots`,
-and ref resolution (`sN`, `parent(...)`, `@-`) — is gated by the marker, an
-interrupted cleanup leaves either the old physical files or the compacted
-files, never visible history below the durable floor. The checkpoint snapshot
-itself stays resolvable; stepping below it fails closed with a history-floor
-ref error. Repeated checkpointing of the same deployment is idempotent (a
-no-op, or a repair that finishes an interrupted compaction); advancing to a
-later deployment updates the floor TRANSACTIONALLY (below); an EARLIER
-deployment than the current floor is refused (a checkpoint can never move
-backward after older history has been discarded). The CLI requires an
-explicit deployment id and `--yes` for the real operation; `--dry-run`
-enumerates exactly what would be discarded and touches nothing. The
-checkpoint's post-commit maintenance then runs in two best-effort passes —
-LOCAL HISTORY COMPACTION (delete the below-floor `deployments/<id>/` dirs,
-atomically rewrite the logs to the retained suffix) followed by GLOBAL
-ARTIFACT GARBAGE COLLECTION (see below) — and the report distinguishes four
-outcomes: (a) the LOGICAL CHECKPOINT is established (the durable floor);
-(b) the HISTORY FILES are compacted; (c) ARTIFACT GARBAGE COLLECTION
-completed; (d) CLEANUP INCOMPLETE and retry required. A failure in either
-post-commit phase NEVER moves or removes the established floor and NEVER
-deletes anything in the retained set: it records the durable
-`targets/<target>/refs/cleanup-pending.json` debt flag and the report warns
-explicitly, and re-running the SAME checkpoint converges. Reachability is
-recomputed fresh on every run — no persisted deletion worklist. The raw
-(unfiltered) readers are kept for the internal index-minting view:
-snapshot indices are always `max(index) + 1` over the physical log, so
-compaction can never reuse an index and appends after a checkpoint stay
-unique and increasing.
+and ref resolution (`<deployment-id>`, `parent(...)`, `@-`) — is gated by the
+marker, an interrupted cleanup leaves either the old physical files or the
+compacted files, so either way nothing below the durable floor is ever
+visible. The checkpoint deployment itself stays resolvable; stepping below
+it (a deployment id below the floor, or `@-` / `parent(...)` walking past
+it) fails closed with a history-floor ref error. Repeated checkpointing of
+the same deployment is idempotent (a no-op, or a repair that finishes an
+interrupted compaction); advancing to a later deployment updates the floor
+TRANSACTIONALLY (below); an EARLIER deployment than the current floor is
+refused (a checkpoint can never move backward after older history has been
+discarded). The CLI requires an explicit deployment id and `--yes` for the
+real operation; `--dry-run` enumerates exactly what would be discarded and
+touches nothing. The checkpoint's post-commit maintenance then runs in two
+best-effort passes — LOCAL HISTORY COMPACTION (delete the below-floor
+`deployments/<id>/` dirs, atomically rewrite the logs to the retained
+suffix) followed by GLOBAL ARTIFACT GARBAGE COLLECTION (see below) — and
+the report distinguishes four outcomes: (a) the LOGICAL CHECKPOINT is
+established (the durable floor); (b) the HISTORY FILES are compacted;
+(c) ARTIFACT GARBAGE COLLECTION completed; (d) CLEANUP INCOMPLETE and
+retry required. A failure in either post-commit phase NEVER changes the
+established floor and NEVER deletes anything in the retained set: it
+records the durable `targets/<target>/refs/cleanup-pending.json` debt flag
+and the report warns explicitly, and re-running the SAME checkpoint
+converges. Reachability is recomputed fresh on every run — no persisted
+deletion worklist. Only `deployments/<id>/` dirs strictly before the floor
+are ever deleted: release records, tree objects, remote generations, and
+pinned artifacts are never removed, and checkpointing one target never
+changes another target's history. The raw (unfiltered) readers are the
+internal position-deriving view: the log is KEYED BY DEPLOYMENT ID and
+appended in deployment order, so compaction rewrites it to the suffix
+beginning at the floor deployment and a new deployment always appends a
+NEW line — the identity space can never be reused.
 
 Advancing the floor is TRANSACTIONAL — replacing the marker must never
 erase the previously durable floor. `write_history_floor` stages B's marker
@@ -732,7 +752,7 @@ verification.
 13. Under the default `failure_policy: rollback_changed`, compensate every server already advanced by this deployment. Compensation uses a compare-and-swap and restores a server only if `current` still names the generation created by this attempt. If all compensation succeeds, mark the attempt `failed_rolled_back`; otherwise mark it `degraded` and retain the actual mixed per-server state. An optional `leave_changed` policy may retain successful advances deliberately; any attempt with failures under that policy is `degraded`.
 14. Record every attempt, not just successful attempts, in `attempts.jsonl` — the immutable INTENT (deployment id, membership, desired assignments, pre-push state; no status, no outcomes) — and refresh `observed.json` from the actual slot generations. The intent is persisted BEFORE any server mutation (right after the plan and the initial `in_progress` transition are written), so a crash after servers advanced to new generations can never lose the deployment: without the durable intent the next push would see every server already at the desired generation and report "Everything up to date" with no attempt/snapshot/ref ever recorded. The actual per-slot OUTCOMES are recorded separately in `deployments/<id>/results.json` after the mutation loop (the outcomes store the snapshot and `observed.json` are built from — never from the intent record). The attempt's status is recorded as an append-only transition on the deployment (`deployments/<id>/transitions.jsonl`): an initial `in_progress` transition, then the final status transition (with a reason when the metadata phase demoted it). A slot may be a member of SEVERAL targets (its on-server `deploy_dir` state is shared). Observed state is stored ONCE PER SLOT (`slots/<slot-id>/observed.json` — the slot's ONE physical record, never replicated per target); the engine's observed refresh writes each advanced slot's record EXACTLY ONCE, and targets are SELECTION VIEWS over the global slot map: `read_observed(target)` returns the physical records of the target's member slots, so every member target's view of a shared slot always agrees with the single physical record (e.g. `deploy status <other>` after a push to a sibling target shows the current generation/artifact for the shared slot).
 15. After every slot's server verifies, write an idempotent, write-once commit marker under each participating server's mutation lock (exclusive create; an existing marker must match byte-for-byte). The marker carries the deployment ID, the generation, and the full placement-slot set of the commit. If this metadata phase is interrupted by a transient failure, mark the attempt `pending_commit`; the next push reconciles it before its own no-op check. Reconciliation also covers attempts whose latest transition is `InProgress` — intent durable (persisted before mutation, step 14) but finalization never completed (a crash between `append_attempt` and the finalize marker, or a faulted `write_results`). It loads the eligible attempts (oldest first, latest transition `PendingCommit` OR `InProgress`), verifies that every recorded participant slot still belongs to the target and that each slot's current generation still equals the generation the attempt recorded (fresh status reads), and only then writes the missing markers (under each server's mutation lock, with the original deployment ID) and finalizes the attempt as `successful` through the SAME replay-safe finalizer the normal success path uses (step 16): first persist the recoverable `pending_commit` marker when the latest transition is not already `pending_commit`, then the snapshot entry and `refs/last-successful` (idempotent — a replay never duplicates the snapshot and repairs the ref), and the terminal `Successful` transition LAST, so a crash mid-finalization leaves the attempt's latest transition still `pending_commit` and therefore re-eligible. The verification is read-only; recovery never reactivates or restarts healthy servers. Any membership or generation mismatch changes the attempt to `degraded` (no snapshot entry). An existing marker whose content differs (an integrity conflict — a concurrent controller recorded a different fact, or the remote state diverged) is likewise NOT transient: the conflicting marker is left untouched and the attempt is finalized `degraded` (transition only, no snapshot entry), never stranded `pending_commit` forever. Only transient failures — lock acquisition, status reads, or transport-level marker writes — leave the attempt `pending_commit` for a later retry rather than falsely reporting `successful` or `degraded`.
-16. Only an attempt whose commit markers are complete becomes `successful`. Both the normal success path and recovery finalize through ONE replay-safe finalizer that writes the recoverable `pending_commit` marker, then the snapshot entry and `refs/last-successful`, and appends the terminal `Successful` transition LAST (snapshot and ref first, status last, so the attempt is never recorded `successful` while its snapshot is missing); the snapshot log (indexed `s0`, `s1`, …; referenced as `sN` on the push command) and `refs/last-successful` advance only for such fully finalized attempts. The snapshot is built from the attempt's OUTCOMES — the per-slot actuals the engine observed on the main path, or `deployments/<id>/results.json` (falling back to the verified desired state when the outcomes were never persisted, e.g. a faulted `write_results`) during recovery — never from the intent record (`attempts.jsonl`), which carries no outcomes.
+16. Only an attempt whose commit markers are complete becomes `successful`. Both the normal success path and recovery finalize through ONE replay-safe finalizer that writes the recoverable `pending_commit` marker, then the snapshot entry and `refs/last-successful`, and appends the terminal `Successful` transition LAST (snapshot and ref first, status last, so the attempt is never recorded `successful` while its snapshot is missing); the snapshot log (KEYED BY DEPLOYMENT ID — `deploy push <target> <deployment-id>` restores that deployment's stored state) and `refs/last-successful` advance only for such fully finalized attempts. The snapshot is built from the attempt's OUTCOMES — the per-slot actuals the engine observed on the main path, or `deployments/<id>/results.json` (falling back to the verified desired state when the outcomes were never persisted, e.g. a faulted `write_results`) during recovery — never from the intent record (`attempts.jsonl`), which carries no outcomes.
 17. Apply rotation under each server's mutation lock using the protection set defined below. The lock is held by an RAII guard for the whole per-slot rotation block (retained-set computation plus mark-and-sweep) and released on drop, so an error mid-rotation can never leak the lock and block later operations on that slot. Rotation is POST-COMMIT MAINTENANCE: by this point the deployment has already committed (servers advanced, snapshot and attempt recorded), so a per-slot rotation failure must NOT change the reported outcome — the push still succeeds. Instead the failure is recorded as a persistent debt marker (per target+slot, under the local store) and surfaced as a warning on the push report; later pushes — including no-ops — retry the maintenance under the same lock-guarded rotation block and clear the marker once the rotation succeeds. The same rule covers a CONTENDED slot lock: if another operation holds the slot's mutation lock when step 17 runs, the rotation cannot run now, and the maintenance is deferred exactly like a rotation failure — best-effort debt marker (persistence faults are warning-only) plus a warning naming the slot — never silently skipped, never an `Err`. The deferral's debt read/write is NON-FALLIBLE post-commit maintenance: if the marker cannot be read or persisted (a debt-file fault coinciding with the contention), the failure is an explicit warning — "rotation debt maintenance deferred: failed to read/write rotation debt" — that says the marker was NOT persisted, so no automatic retryability is claimed and a later push re-deferrals; the committed outcome is unchanged either way. After a successful push every slot is therefore either rotated, or carries debt plus a warning, or the deferral is explicitly warned as unpersisted, and the next unlocked push services any marker. The capacity-preflight rotation (step 8) is likewise best-effort; only a real capacity shortage fails the push.
 
 The tool never claims target-wide atomicity. It reports `successful`, `pending_commit`, `failed_preflight`, `failed_rolled_back`, or `degraded`, including the actual generation on every server. An attempt that fails before any `current` change is `failed_preflight`: a preflight failure AFTER the attempt intent was persisted (capacity, staging) appends the terminal `FailedPreflight` transition to that attempt (never a stranded `in_progress`); a failure BEFORE the intent could be computed (plan resolution, historical behavior snapshot, handshake) surfaces as the push error with no attempt record at all. A later push always reconciles first and can finish an incomplete commit (see step 15) or repair an incomplete target.
@@ -801,35 +821,43 @@ is the LATEST transition. For example:
 {"deployment_id": "deploy-20260821T102000Z", "status": "successful", "recorded_at": "2026-08-21T10:25:00Z"}
 ```
 
-The target snapshot log contains only fully successful snapshots, referenced by snapshot index on the push command (`deploy push production s0`, `deploy push production s1`, and so on). Failed and degraded attempts remain visible through `deploy log production` and `attempts.jsonl`, but are not valid rollback sources. Each snapshot entry records every slot's advanced generation AND the complete physical binding it had (`bindings`, keyed by slot ID — the slot's `{server, deploy_dir}` pair at deployment time): exact rollback maps generations to slots by slot ID, so the recorded binding is what proves a slot still lives at the exact on-host location it was deployed onto.
+The target snapshot log contains only fully successful snapshots, KEYED BY THE DEPLOYMENT ID that produced them (`deploy push production <deployment-id>` restores exactly that deployment's stored state). Failed and degraded attempts remain visible through `deploy log production` and `attempts.jsonl`, but are not valid rollback sources (a failed deployment id never resolves). Each snapshot entry records every slot's advanced generation AND the complete physical binding it had (`bindings`, keyed by slot ID — the slot's `{server, deploy_dir}` pair at deployment time): exact rollback maps generations to slots by slot ID, so the recorded binding is what proves a slot still lives at the exact on-host location it was deployed onto.
 
 A commit is authoritative only when the same deployment ID and placement-slot set are committed on every member. This lets a fresh or repaired local store reconstruct successful snapshot history from the servers instead of trusting a stale local ref.
 
 When a checkpoint has been established on the target, ALL reference resolution
-resolves against the FLOORED chain (the suffix at/after the checkpoint's
-snapshot): the checkpoint snapshot itself stays resolvable, and stepping
-below it — `sN` with `N < floor`, or `parent(...)` / `@-` walking past the
-floor — fails closed with a history-floor ref error (e.g.
-`cannot roll back below the history floor (checkpoint deploy-… at s3)`)
-instead of resolving to a discarded state.
+resolves against the FLOORED chain (the suffix beginning at the checkpoint
+deployment's POSITION in the log — positions are DERIVED, never stored):
+the checkpoint deployment itself stays resolvable, and anything below it —
+a deployment id below the floor, or `parent(...)` / `@-` walking past it —
+fails closed with a history-floor ref error (e.g.
+`cannot roll back below the history floor (checkpoint deploy-…)`) instead of
+resolving to a discarded state.
 
 Pushing an older successful reference restores its complete assignment, including the historical behavior contract and different variants on different servers. References are jj-style: the target is passed ONCE (the push argument) and is never repeated in the reference; the `@`-relative forms resolve against that target's snapshot chain.
 
 ```sh
-deploy push production @-              # the snapshot BEFORE the latest
-deploy push production @--             # two snapshots back
-deploy push production 'parent(@, 3)'    # three snapshots back from the latest
+deploy push production @-              # the deployment BEFORE the latest
+deploy push production @--             # two deployments back
+deploy push production 'parent(@, 3)'    # three deployments back from the latest
 deploy push production release:rel-sha256-2fda63a950  # DIRECT: deploy this release to the current target's slots (cross-target; no snapshot history needed)
-deploy push production s2              # the exact snapshot s2
-deploy push production s2--            # two snapshots before s2
-deploy push production 'parent(s2, 1)'   # one snapshot before s2
-deploy push production 'parent(deploy-20260821T102000Z, 0)'  # the snapshot that deployed that deployment
-deploy push production rel-sha256-41da2f63a950--  # 2 before the most recent snapshot referencing that release
+deploy push production deploy-20260821T102000Z  # EXACT stored state of that deployment
+deploy push production deploy-20260821T102000Z--  # two deployments before it
+deploy push production 'parent(deploy-20260821T102000Z, 1)'  # one deployment before it
 ```
+
+ROLLBACK PAYLOADS ARE KEYED BY DEPLOYMENT ID. The `@` / `parent(...)` forms
+walk the target's DEPLOYMENT HISTORY — the snapshot log in deployment order
+(each successful deployment IS a rollback payload keyed by its id); positions
+are DERIVED from that order, never stored. The old `sN` snapshot-index forms
+(`sN`, `sN-`, `sN--`, `parent(sN, M)`) and the release-refid ancestor forms
+(`rel-...--`, `parent(<release-id>, N)`) are REMOVED — migrate `sN` to the
+deployment id of that snapshot's deployment (`deploy log` shows it), and
+reference a release only via `release:<id>`.
 
 The DIRECT release form `release:<id>` (shell-safe: the token starts with the literal `release:` prefix, no slash; the id is a full `rel-sha256-...` id or a hex digest) deploys the named release to the CURRENT target's slots as they are — each slot's variant from the release's OWN stored slot-variant snapshot, each tree from the release's own variant bindings — but ONLY onto a target whose CURRENT slot membership EXACTLY matches the slot set the release record froze for it: the release-versioned membership is derived from the record's canonical slot snapshot as the union over every variant of the slots whose `targets` list contains the destination target (deduplicated by slot id), and compared for set equality with the target's current slot-id membership at PLAN time, before any remote access. Membership drift — a slot added, removed, or renamed since the release was built — is rejected with a rollback error naming the release and the expected vs current slot sets; the comparison is LOGICAL membership only, so physical bindings (`server`/`deploy_dir`) are intentionally allowed to differ. It is deliberately NOT a snapshot ref: no snapshot-chain stepping, no deployment-snapshot exact physical-binding checks, and NO target snapshot history required — the release may have been built and pushed anywhere (another target, another machine), and a destination with zero snapshots is fully deployable (as long as its current membership matches the release's frozen set). This is the cross-target / direct-release-deployment path; scripts and persistent configuration use the full id.
 
-A refid is a snapshot index (`sN`), a deployment id (`deploy-...`), or a release id (`rel-sha256-...` or a bare digest). A snapshot index resolves to that snapshot; a deployment or release id resolves to the MOST RECENT snapshot that deployed the deployment / references the release, then the ancestor steps walk `s(index - N)` (N = 0 is the ref itself). Every resolution fails closed with a ref error — an empty chain, an unresolvable refid, or stepping before the start of the chain — never underflows and never guesses. A snapshot ref restores the snapshot's OWN historical per-slot artifacts (variant and tree together); the caller's current variant files never re-map them.
+A deployment-id ref resolves to THAT deployment's stored rollback payload (the snapshot keyed by its id — a failed deployment id never resolves), and the ancestor steps walk N POSITIONS back from it in the deployment history (N = 0 is the deployment itself; positions are DERIVED from the log order, never stored). Every resolution fails closed with a ref error — an empty chain, an unresolvable deployment id, or stepping before the start of the chain — never underflows and never guesses. A deployment ref restores the snapshot's OWN historical per-slot artifacts (variant and tree together); the caller's current variant files never re-map them.
 
 Exact snapshot rollback requires the current target to contain the same stable placement-slot set as the saved deployment AND each slot's complete physical binding to match the binding the snapshot recorded (`bindings[slot]` = the `{server, deploy_dir}` pair from the slot's variant-file `[[slots]]` entry): a slot rebound to a different server — or moved to a different `deploy_dir` on the SAME server — would otherwise receive the historical generations on the wrong host or at the wrong on-server location. A legacy snapshot entry that never recorded the binding (pre-feature lines, or the intermediate server-only `servers` shape) is unverifiable and is refused the same way. Addresses may change and are taken from the current target definition after host-identity verification. If membership has changed or any slot's physical binding changed, exact rollback fails during preflight without modifying a server.
 

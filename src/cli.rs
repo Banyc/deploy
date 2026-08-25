@@ -141,23 +141,28 @@ in rollout batches.\n\
 REFERENCE (optional second argument, jj-style — the target is NEVER repeated\n\
 in the reference; every relative form resolves against the target argument):\n\n\
   (none), HEAD, @      the current local files (default)\n\
-  @-                   the snapshot BEFORE the latest successful deployment\n\
+  @-                   the deployment BEFORE the latest successful deployment\n\
   @--                  two steps back (the grandparent)\n\
   parent(@, N)         N steps back from the latest (e.g. parent(@, 2))\n\
+  <deployment-id>      roll back to EXACTLY that deployment's stored state\n\
+                       (its snapshot: slots, behavior, bindings, release)\n\
+  <deployment-id>- / --    N steps back from that deployment in the history\n\
+  parent(<deployment-id>, N)   N steps back from that deployment\n\
   release:<id>         deploy the named release DIRECTLY to the current\n\
                        target's slots, from the release's own stored slot\n\
                        snapshot — no snapshot history needed (cross-target)\n\
-  sN                   the exact Nth successful snapshot (e.g. s3); failed\n\
-                       attempts never count and never produce a snapshot\n\
-  sN- / sN--            N steps back from snapshot sN\n\
-  parent(sN, M)         M steps back from snapshot sN\n\
-  <id>-- / parent(<id>, N)   N steps back from the most recent snapshot that\n\
-                       deployed deployment <id> or referenced release <id>\n\
 \n\
 NOTE: every parent(...) form contains a comma, so the shell splits the\n\
 reference at the space after the comma. shell-quote parent(...) forms —\n\
 e.g. deploy push production 'parent(@, 3)' — in interactive shells.\n\
 \n\
+ROLLBACK PAYLOADS ARE KEYED BY DEPLOYMENT ID: `@`, `@-`, `@--` and\n\
+parent(...) walk the target's DEPLOYMENT HISTORY — each successful\n\
+deployment IS a rollback payload keyed by its id; failed attempts never\n\
+count and never produce a snapshot. The old `sN` snapshot-index forms are\n\
+REMOVED: migrate `deploy push <target> sN` to the deployment id of that\n\
+snapshot's deployment (see `deploy log <target>`), or use `@-` /\n\
+parent(@, N)` for the deployment history.\n\
 --dry-run prints the plan and touches nothing (no store writes, no remote\n\
 state, no locks). Pushing identical content prints 'Everything up to date'.\n\
 Rollout batches per rollout.batch_size; on a failed server, earlier batches\n\
@@ -168,15 +173,17 @@ reported explicitly, including partial states like `degraded`.",
   deploy push production --dry-run     # preview the plan, touch nothing\n\
   deploy push production @-            # roll back to the previous deployment\n\
   deploy push production 'parent(@, 3)'  # roll back 3 deployments\n\
-  deploy push production s3--          # 2 deployments before snapshot s3\n\
+  deploy push production deploy-20260821T102000Z  # roll back to that deployment's stored state\n\
   deploy push production release:rel-sha256-2fda63a950  # DIRECT release deploy to this target (cross-target; no history needed)"
     )]
     Push {
         target: String,
         /// Optional jj-style source reference: blank/HEAD/@ (default),
-        /// @- / @-- / parent(@, N), release:<id> (direct release deploy),
-        /// or a refid relative (sN, <refid>--, parent(<refid>, N)) — never
-        /// repeats the target.
+        /// @- / @-- / parent(@, N), a deployment id (rollback to that
+        /// deployment's stored state) or a deployment-id relative
+        /// (<deployment-id>- / parent(<deployment-id>, N)), or
+        /// release:<id> (direct release deploy) — never repeats the target.
+        /// The `sN` snapshot-index forms are removed.
         reference: Option<String>,
         #[arg(long)]
         dry_run: bool,
@@ -184,12 +191,12 @@ reported explicitly, including partial states like `degraded`.",
     /// Show the target's deployment history (successful and failed).
     #[command(
         long_about = "Show every recorded deployment attempt for the target, newest last:\n\
-snapshot id, deployment ID, status, and timestamp. Each line is prefixed\n\
-with the snapshot id (`sN`) the attempt produced — the same `sN` notation\n\
-`deploy push` accepts as a reference — or `-` for attempts that produced no\n\
-snapshot. Failed and degraded attempts remain visible here but are NOT\n\
-valid rollback refs; only successful deployments produce snapshots (see\n\
-`deploy help push` for the reference syntax)."
+deployment ID, status, and timestamp. Each line is prefixed with the\n\
+DEPLOYMENT ID of the snapshot that attempt produced — the exact rollback\n\
+key `deploy push` accepts (`deploy push <target> <deployment-id>`) — or\n\
+`-` for attempts that produced no snapshot. Failed attempts remain\n\
+visible here but are NOT valid rollback refs; only successful deployments\n\
+produce snapshots (see `deploy help push` for the reference syntax)."
     )]
     Log { target: String },
     /// Show what is actually running on every server.
@@ -205,10 +212,11 @@ id, release id, variant, and tree digest, as observed on the servers themselves\
 deployment, the retained history starts from that attempt and the OLDEST\n\
 rollback is that attempt — everything before it is discarded permanently.\n\
 The checkpoint deployment must be a SUCCESSFUL deployment of the target\n\
-(it must have produced a snapshot); its snapshot becomes the oldest\n\
-rollback state, and snapshots, attempts, and deployment directories\n\
-strictly before it are discarded. The checkpoint deployment and everything\n\
-after it are kept.\n\n\
+(it must have produced a snapshot keyed by its deployment id); its\n\
+rollback payload becomes the OLDEST rollback state, and the snapshots,\n\
+attempts, and deployment directories strictly before it (in the log\n\
+order — positions are derived, never stored) are deleted. The checkpoint\n\
+deployment and everything after it are kept.\n\n\
 The operation is IRREVERSIBLE, so the deployment id is an explicit,\n\
 required positional argument and the real operation requires --yes.\n\
 --dry-run prints exactly what would be discarded and touches NOTHING (no\n\
@@ -242,7 +250,7 @@ another snapshot.",
   deploy checkpoint production deploy-004 --dry-run   # preview what would be discarded\n\
   deploy checkpoint production deploy-004 --yes       # establish the floor (irreversible)\n\
   deploy log production                               # now shows only the retained suffix\n\
-  deploy push production s3                           # the checkpoint snapshot stays the oldest rollback"
+  deploy push production deploy-20260821T102000Z   # the checkpoint deployment stays the oldest rollback"
     )]
     Checkpoint {
         target: String,
@@ -437,30 +445,33 @@ fn effective_status(
 }
 
 /// Render `deploy log <target>` output: one line per recorded attempt,
-/// newest last, each PREFIXED with the snapshot id (`sN`) of the snapshot
-/// that attempt produced — the same `sN` notation the push reference grammar
-/// accepts (`deploy push <target> sN`) — or `-` for attempts that produced
-/// no snapshot (failed/degraded attempts are visible here but are NOT valid
-/// rollback refs). The snapshot id is the snapshot record's canonical
-/// `index` (the 0-based op log position `s0`, `s1`, ...), never a recomputed
-/// Vec position. The CLI prints exactly these lines; the unit test asserts
-/// on them directly because lib unit tests cannot capture the harness-owned
-/// stdout sink.
+/// newest last, each PREFIXED with the DEPLOYMENT ID of the snapshot that
+/// attempt produced — the exact rollback key the push reference grammar
+/// accepts (`deploy push <target> <deployment-id>`) — or `-` for attempts
+/// that produced no snapshot (failed/degraded attempts are visible here but
+/// are NOT valid rollback refs; a failed deployment id never resolves). The
+/// snapshot log IS the deployment history: each successful deployment owns
+/// a snapshot keyed by its deployment id (the old `sN` index prefix is
+/// gone — rollback payloads are keyed by deployment id). The CLI prints
+/// exactly these lines; the unit test asserts on them directly because lib
+/// unit tests cannot capture the harness-owned stdout sink.
 pub fn render_log(
     store: &LocalStore,
     target: &str,
     attempts: &[DeploymentAttempt],
 ) -> Result<Vec<String>> {
     let snapshots = store.read_snapshots(target)?;
-    let index_by_deployment: std::collections::HashMap<&str, u64> = snapshots
+    let rolled_back_by_deployment: std::collections::HashMap<&str, &str> = snapshots
         .iter()
-        .map(|s| (s.deployment_id.as_str(), s.index))
+        .map(|s| (s.deployment_id.as_str(), s.deployment_id.as_str()))
         .collect();
     let mut out = Vec::with_capacity(attempts.len());
     for a in attempts {
         let (status, reason) = effective_status(store, a)?;
-        let prefix = match index_by_deployment.get(a.deployment_id.as_str()) {
-            Some(index) => format!("s{index}"),
+        // The prefix is the deployment id of the snapshot that attempt
+        // produced (the rollback key) or `-` for attempts without one.
+        let prefix = match rolled_back_by_deployment.get(a.deployment_id.as_str()) {
+            Some(_) => a.deployment_id.as_str().to_string(),
             None => "-".to_string(),
         };
         out.push(match reason {
@@ -612,7 +623,6 @@ mod tests {
             .append_snapshot(
                 "production",
                 &DeploymentSnapshot {
-                    index: 0,
                     deployment_id: a_ok.deployment_id.clone(),
                     target: TargetName::new("production".to_string()),
                     behavior_sha256: "sha256-aa".to_string(),
@@ -639,10 +649,11 @@ mod tests {
         let attempts = store.read_attempts("production").unwrap();
         let lines = render_log(&store, "production", &attempts).unwrap();
         assert_eq!(lines.len(), 2, "one line per attempt: {lines:?}");
-        // A successful attempt renders its snapshot id (`sN`) as the prefix.
+        // A successful attempt renders its deployment id (the rollback key)
+        // as the prefix; an attempt without a snapshot renders `-`.
         assert_eq!(
             lines[0],
-            "s0  deploy-log-ok  Successful  2026-01-01T00:00:00Z  (deployed)"
+            "deploy-log-ok  deploy-log-ok  Successful  2026-01-01T00:00:00Z  (deployed)"
         );
         // An attempt with no snapshot keeps the columns aligned via `-`.
         assert_eq!(
@@ -987,8 +998,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let store =
             LocalStore::with_base(data_home.join("simple-deploy").join("checkpoint-cli")).unwrap();
 
-        // Seed a small history: deploy-a (s0), deploy-b (s1), deploy-c (s2).
-        for (n, id) in ["deploy-0", "deploy-1", "deploy-2"].iter().enumerate() {
+        // Seed a small history: deploy-0, deploy-1, deploy-2 (all
+        // successful — each owns a snapshot keyed by its deployment id).
+        for id in ["deploy-0", "deploy-1", "deploy-2"] {
             store
                 .append_attempt(
                     "production",
@@ -1010,7 +1022,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 .append_snapshot(
                     "production",
                     &crate::records::DeploymentSnapshot {
-                        index: n as u64,
                         deployment_id: DeploymentId::new(id.to_string()),
                         target: TargetName::new("production".to_string()),
                         behavior_sha256: "sha256-aa".to_string(),
@@ -1069,7 +1080,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         .expect("the confirmed checkpoint establishes the floor");
         let floor = store.read_history_floor("production").unwrap().unwrap();
         assert_eq!(floor.deployment_id.as_str(), "deploy-1");
-        assert_eq!(floor.snapshot_index, 1);
         assert_eq!(store.read_snapshots("production").unwrap().len(), 2);
         assert_eq!(store.read_attempts("production").unwrap().len(), 2);
         assert!(!store.deployment_dir("deploy-0").exists());

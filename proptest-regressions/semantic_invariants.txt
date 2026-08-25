@@ -10,3 +10,4 @@ cc dd3babbbc2bc0094ba3cf65654af17079364693176c5239ec252a61fc9886265 # shrinks to
 cc b20d4ef3a96ebee120e52a580d28ad8f84837b4d1b43d805c2f84ba5c73dab26 # shrinks to steps = [(Push("t1"), ResultsWrite), (Rollback("t1", 1), RotationInventory)]
 cc c1acb94e891ac6b318004932176e53efaf6fc84ed51717f4c13c7ccbbb904528 # shrinks to steps = [(Push("t2"), LastSuccessfulWrite), (Rollback("t2", 0), CommitMarker)]
 cc 139ae93a8ef8ea650727c2deb9488e5fc2f1621287c1cd9db8fd7f542e48e8c5 # shrinks to steps = [(Push("t2"), None), (Rollback("t2", 0), RemoteStatusPreSwap)]
+cc fd0ccabeba5cff50d9f237a94ec40a7065f7fb3029520f4633afeed894e05629 # shrinks to steps = [(Push("t1"), Step17Contended), (Retry("t1"), RemoteStatusPreSwap)]
