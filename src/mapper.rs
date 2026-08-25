@@ -69,16 +69,81 @@ fn set_mode(path: &Path, mode: Option<u32>) -> Result<()> {
     Ok(())
 }
 
+/// Create every missing ancestor directory of `dst` (not `dst` itself),
+/// applying a canonical, umask-independent mode to each freshly created
+/// directory, so the tree digest never depends on the process umask.
+///
+/// Mode policy: an intermediate that mirrors a source directory — the parent
+/// chain of a copied directory, whose destination path duplicates the source
+/// path below the mapping's source root — inherits that source directory's
+/// mode; every other intermediate is fresh staging scaffolding and gets the
+/// deterministic default 0755. `src_root` is the mapping's source root the
+/// `from` path is relative to (the merge source directory for recursive
+/// walks, the project root for non-recursive directory mappings); pass `None`
+/// for single file/symlink mappings, whose destination parents are always
+/// scaffolding.
+fn create_parent_dirs(src: &Path, dst: &Path, src_root: Option<&Path>) -> Result<()> {
+    let mirror_depth = src_root
+        .and_then(|r| src.strip_prefix(r).ok())
+        .map(|rel| rel.components().count().saturating_sub(1))
+        .unwrap_or(0);
+    let mut missing: Vec<PathBuf> = Vec::new();
+    let mut cur = dst;
+    while let Some(parent) = cur.parent() {
+        if parent.exists() {
+            break;
+        }
+        missing.push(parent.to_path_buf());
+        cur = parent;
+    }
+    // Create top-down so each `create_dir` sees its parent; `idx + 1` is the
+    // depth measured from `dst` (1 = its direct parent), which is the depth
+    // the source ancestor chain is aligned against.
+    for (idx, created) in missing.iter().enumerate().rev() {
+        let depth = idx + 1;
+        let mode = if depth <= mirror_depth {
+            src.ancestors()
+                .nth(depth)
+                .and_then(|counterpart| std::fs::symlink_metadata(counterpart).ok())
+                .filter(|m| m.is_dir())
+                .map(|m| m.mode() & 0o7777)
+                .unwrap_or(0o755)
+        } else {
+            0o755
+        };
+        std::fs::create_dir(created)
+            .map_err(|e| Error::materialization(format!("mkdir {}: {e}", created.display())))?;
+        set_mode(created, Some(mode))?;
+    }
+    Ok(())
+}
+
 /// Copy a single source entry (file or symlink) to a destination, applying the
 /// mapping mode override. When the override is `None` the source's own mode is
-/// preserved (instead of defaulting to 0755). Directories are created with a
-/// canonical 0755 mode.
-fn copy_entry(src: &Path, dst: &Path, mode_override: Option<u32>) -> Result<()> {
+/// preserved (instead of defaulting to 0755). Intermediate directories created
+/// along the way get canonical, umask-independent modes (see
+/// [`create_parent_dirs`]); the final entry itself is always set explicitly.
+fn copy_entry(
+    src: &Path,
+    dst: &Path,
+    mode_override: Option<u32>,
+    src_root: Option<&Path>,
+) -> Result<()> {
     let ft = std::fs::symlink_metadata(src)
         .map_err(|e| Error::materialization(format!("stat {}: {e}", src.display())))?;
     if ft.is_dir() {
-        std::fs::create_dir_all(dst)
-            .map_err(|e| Error::materialization(format!("mkdir {}: {e}", dst.display())))?;
+        create_parent_dirs(src, dst, src_root)?;
+        if dst.exists() {
+            if !dst.is_dir() {
+                return Err(Error::materialization(format!(
+                    "mkdir {}: destination exists and is not a directory",
+                    dst.display()
+                )));
+            }
+        } else {
+            std::fs::create_dir(dst)
+                .map_err(|e| Error::materialization(format!("mkdir {}: {e}", dst.display())))?;
+        }
         let final_mode = mode_override.unwrap_or_else(|| ft.mode() & 0o7777);
         set_mode(dst, Some(final_mode))?;
         return Ok(());
@@ -93,9 +158,7 @@ fn copy_entry(src: &Path, dst: &Path, mode_override: Option<u32>) -> Result<()> 
                 src.display()
             )));
         }
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
+        create_parent_dirs(src, dst, src_root)?;
         // remove existing dst if present (replace policy handled by caller)
         let _ = std::fs::remove_file(dst);
         std::os::unix::fs::symlink(&target, dst).map_err(|e| {
@@ -110,10 +173,7 @@ fn copy_entry(src: &Path, dst: &Path, mode_override: Option<u32>) -> Result<()> 
     // Regular file: preserve the source mode unless an override is given.
     let source_mode = ft.mode() & 0o7777;
     let final_mode = mode_override.unwrap_or(source_mode);
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| Error::materialization(format!("mkdir {}: {e}", parent.display())))?;
-    }
+    create_parent_dirs(src, dst, src_root)?;
     let _ = std::fs::remove_file(dst);
     std::fs::copy(src, dst).map_err(|e| {
         Error::materialization(format!("copy {} -> {}: {e}", src.display(), dst.display()))
@@ -201,7 +261,7 @@ pub fn materialize_variant(
                         ConflictPolicy::Replace => {}
                     }
                 }
-                copy_entry(entry.path(), &dst, mode_override)?;
+                copy_entry(entry.path(), &dst, mode_override, Some(&src))?;
             }
             set_mode(&base, Some(base_mode)).ok();
         } else {
@@ -225,7 +285,11 @@ pub fn materialize_variant(
                     ConflictPolicy::Replace => {}
                 }
             }
-            copy_entry(&src, &dst, mode_override)?;
+            // A copied directory mirrors its own source path below `to`, so its
+            // intermediate parents inherit the source directories' modes; a
+            // single file's parents are fresh staging scaffolding (None).
+            let src_root = src_meta.is_dir().then_some(root);
+            copy_entry(&src, &dst, mode_override, src_root)?;
         }
     }
     Ok(())
@@ -235,10 +299,13 @@ pub fn materialize_variant(
 mod tests {
     use super::*;
     use crate::config::{ConflictPolicy, Mapping};
+    use crate::model::TreeMetadata;
+    use proptest::prelude::*;
+    use proptest::test_runner::{FileFailurePersistence, RngSeed};
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn preserves_source_mode_when_no_override() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("src");
         let app_dir = root.join("app");
@@ -368,5 +435,400 @@ mod tests {
             !dest.join("app").exists(),
             "nothing materialized on a template error"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Umask independence: the tree digest is a pure function of source content
+    // -----------------------------------------------------------------------
+
+    /// RAII restore for the process-global umask. Used ONLY inside a dedicated
+    /// child process (see [`tree_digest_independent_of_umask`]), never in the
+    /// shared test process: `libc::umask` is process-global, so mutating it in
+    /// a thread of the test binary would leak the mask into every concurrently
+    /// running test's `create_dir_all` calls.
+    struct UmaskGuard(libc::mode_t);
+
+    impl UmaskGuard {
+        fn set(mode: u32) -> UmaskGuard {
+            let previous = unsafe { libc::umask(mode as libc::mode_t) };
+            UmaskGuard(previous)
+        }
+    }
+
+    impl Drop for UmaskGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::umask(self.0);
+            }
+        }
+    }
+
+    /// The fixed scenario shared by the umask probe and the shape proptest:
+    /// assorted dirs/files with EXPLICIT modes (`set_permissions` is umask-
+    /// immune), a nested chain, and a relative in-root symlink.
+    fn build_source_tree(root: &Path) {
+        for (rel, mode) in [
+            ("app", 0o755),
+            ("app/sub", 0o750),
+            ("app/sub/deep", 0o700),
+            ("bin", 0o755),
+            ("conf", 0o755),
+            ("share", 0o755),
+        ] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        for (rel, mode) in [
+            ("app.sh", 0o644),
+            ("app/run.sh", 0o755),
+            ("app/sub/deep.ini", 0o644),
+            ("bin/tool", 0o750),
+            ("conf/site.conf", 0o644),
+            ("share/λ.txt", 0o600),
+            ("share/data.bin", 0o600),
+        ] {
+            let p = root.join(rel);
+            std::fs::write(&p, rel.as_bytes()).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        std::os::unix::fs::symlink("app/run.sh", root.join("bin/run")).unwrap();
+    }
+
+    /// The mapping list that must be umask-independent: BOTH leak paths — a
+    /// single-file `to` with a trailing slash forcing fresh intermediate
+    /// directories, and a non-recursive directory mapping — plus
+    /// recursive-merge controls that must keep preserving source modes.
+    fn umask_probe_mappings() -> Vec<Mapping> {
+        vec![
+            Mapping {
+                from: "conf/site.conf".into(),
+                to: "etc/nginx/".into(),
+                recursive: false,
+                conflict: ConflictPolicy::Replace,
+                mode: None,
+                optional: false,
+            },
+            Mapping {
+                from: "share".into(),
+                to: "out/".into(),
+                recursive: false,
+                conflict: ConflictPolicy::Replace,
+                mode: None,
+                optional: false,
+            },
+            Mapping {
+                from: "app/".into(),
+                to: "app/".into(),
+                recursive: true,
+                conflict: ConflictPolicy::Replace,
+                mode: None,
+                optional: false,
+            },
+            Mapping {
+                from: "bin/tool".into(),
+                to: "opt/tools/".into(),
+                recursive: false,
+                conflict: ConflictPolicy::Replace,
+                mode: None,
+                optional: false,
+            },
+            Mapping {
+                from: "app/sub/".into(),
+                to: "mirror/".into(),
+                recursive: false,
+                conflict: ConflictPolicy::Replace,
+                mode: None,
+                optional: false,
+            },
+            Mapping {
+                from: "bin/".into(),
+                to: "bin/".into(),
+                recursive: true,
+                conflict: ConflictPolicy::Replace,
+                mode: None,
+                optional: false,
+            },
+        ]
+    }
+
+    fn materialize_canonicalize(
+        root: &Path,
+        mappings: &[Mapping],
+        dest: &Path,
+    ) -> Result<TreeMetadata> {
+        materialize_variant(
+            root,
+            mappings,
+            &crate::template::TemplateVars::mapping("app", "v1", "standard"),
+            dest,
+        )?;
+        crate::tree::canonicalize_tree(dest)
+    }
+
+    /// Child runner, re-executed once per umask by
+    /// [`tree_digest_independent_of_umask`] in a FRESH PROCESS: sets the umask,
+    /// materializes the fixed scenario twice into fresh staging roots, asserts
+    /// in-process determinism, and writes the canonical metadata to the file
+    /// named by `UMASK_RESULT_FILE`. A no-op when run as part of the normal
+    /// suite (no env var set).
+    #[test]
+    fn umask_probe_child() {
+        let Ok(mode) = std::env::var("UMASK_PROBE_MODE") else {
+            return;
+        };
+        let umask = u32::from_str_radix(&mode, 8).expect("UMASK_PROBE_MODE is an octal mode");
+        let result_file = std::env::var("UMASK_RESULT_FILE").expect("UMASK_RESULT_FILE is set");
+        let _umask_guard = UmaskGuard::set(umask);
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        build_source_tree(&root);
+        let mappings = umask_probe_mappings();
+        let meta_a =
+            materialize_canonicalize(&root, &mappings, &dir.path().join("stage-a")).unwrap();
+        let meta_b =
+            materialize_canonicalize(&root, &mappings, &dir.path().join("stage-b")).unwrap();
+        assert_eq!(
+            meta_a, meta_b,
+            "two materializations under umask {umask:#o} must agree"
+        );
+        std::fs::write(&result_file, serde_json::to_vec(&meta_a).unwrap()).unwrap();
+    }
+
+    /// The tree digest must be a pure function of source content: identical
+    /// sources materialized under different process umasks (which mask freshly
+    /// created intermediate directories) must canonicalize to byte-identical
+    /// metadata with identical digests. The umask is process-global, so each
+    /// umask runs in its own re-executed child process (see [`umask_probe_child`])
+    /// and the parent compares the four snapshots.
+    #[test]
+    fn tree_digest_independent_of_umask() {
+        let exe = std::env::current_exe().expect("current test binary");
+        let dir = tempfile::tempdir().unwrap();
+        let mut snapshots: Vec<(u32, TreeMetadata)> = Vec::new();
+        for umask in [0o022, 0o002, 0o000, 0o077] {
+            let result_file = dir.path().join(format!("umask-{umask:o}.json"));
+            let out = std::process::Command::new(&exe)
+                .arg("umask_probe_child")
+                .env("UMASK_PROBE_MODE", format!("{umask:o}"))
+                .env("UMASK_RESULT_FILE", &result_file)
+                .output()
+                .expect("spawn umask probe child");
+            assert!(
+                out.status.success(),
+                "umask probe child failed under umask {umask:#o}:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let meta: TreeMetadata =
+                serde_json::from_slice(&std::fs::read(&result_file).unwrap()).unwrap();
+            snapshots.push((umask, meta));
+        }
+        let (first_umask, first) = &snapshots[0];
+        for (umask, meta) in &snapshots[1..] {
+            assert_eq!(
+                first, meta,
+                "canonical tree (entries, modes, content digests, symlink targets) \
+                 must not depend on the process umask: {first_umask:#o} vs {umask:#o}"
+            );
+            assert_eq!(
+                first.tree_sha256, meta.tree_sha256,
+                "tree digest must not depend on the process umask: \
+                 {first_umask:#o} vs {umask:#o}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Property: mapping shapes materialize deterministically (fixed umask)
+    // -----------------------------------------------------------------------
+
+    #[derive(Clone, Debug)]
+    struct MapperCase {
+        mappings: Vec<Mapping>,
+    }
+
+    fn existing_from_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            2 => Just("app.sh".to_string()),
+            2 => Just("app/run.sh".to_string()),
+            2 => Just("conf/site.conf".to_string()),
+            1 => Just("app/sub/deep.ini".to_string()),
+            1 => Just("share/λ.txt".to_string()),
+            1 => Just("bin/tool".to_string()),
+            1 => Just("app".to_string()),
+            1 => Just("app/sub".to_string()),
+            1 => Just("bin".to_string()),
+            1 => Just("conf/".to_string()),
+            1 => Just("share".to_string()),
+        ]
+    }
+
+    /// Destination shapes: trailing slash × both, nested dirs, empty `to`, and
+    /// a unicode name. Duplicate/nested destinations occur organically, so
+    /// every conflict policy is exercised (erroring cases are compared by
+    /// error variant in the property).
+    fn to_shape_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            2 => Just("out/".to_string()),
+            1 => Just("out".to_string()),
+            2 => Just("out/nested/".to_string()),
+            1 => Just(String::new()),
+            1 => Just("λ-目的地/".to_string()),
+            1 => Just("deep/er/still/".to_string()),
+        ]
+    }
+
+    fn conflict_strategy() -> impl Strategy<Value = ConflictPolicy> {
+        prop_oneof![
+            1 => Just(ConflictPolicy::Error),
+            1 => Just(ConflictPolicy::Keep),
+            1 => Just(ConflictPolicy::Replace),
+        ]
+    }
+
+    fn mode_strategy() -> impl Strategy<Value = Option<String>> {
+        prop_oneof![
+            3 => Just(None),
+            1 => Just(Some("0644".to_string())),
+            1 => Just(Some("0755".to_string())),
+            1 => Just(Some("0700".to_string())),
+        ]
+    }
+
+    fn mapping_shape_strategy() -> impl Strategy<Value = Mapping> {
+        (
+            existing_from_strategy(),
+            to_shape_strategy(),
+            conflict_strategy(),
+            mode_strategy(),
+            prop::bool::ANY,
+            prop_oneof![
+                4 => Just(None),
+                1 => Just(Some("ghost/missing".to_string())),
+            ],
+        )
+            .prop_map(|(from, to, conflict, mode, recursive, missing)| {
+                let optional = missing.is_some();
+                Mapping {
+                    from: missing.unwrap_or(from),
+                    to,
+                    recursive,
+                    conflict,
+                    mode,
+                    optional,
+                }
+            })
+    }
+
+    fn mapper_case_strategy() -> impl Strategy<Value = MapperCase> {
+        prop::collection::vec(mapping_shape_strategy(), 1..=3)
+            .prop_map(|mappings| MapperCase { mappings })
+    }
+
+    /// Every source mode must survive a single recursive mapping with no
+    /// override: files, dirs, and the merge base all keep their source modes.
+    fn assert_recursive_modes_preserved(root: &Path, dest: &Path, m: &Mapping) {
+        let from = m.from.trim_end_matches('/');
+        let src_dir = root.join(from);
+        let base = dest.join(Path::new(&m.to));
+        let src_root_mode = std::fs::symlink_metadata(&src_dir).unwrap().mode() & 0o7777;
+        let dst_root_mode = std::fs::symlink_metadata(&base).unwrap().mode() & 0o7777;
+        assert_eq!(
+            src_root_mode, dst_root_mode,
+            "merge base must keep the source directory's mode"
+        );
+        for entry in WalkDir::new(&src_dir).min_depth(1) {
+            let entry = entry.unwrap();
+            let rel = entry.path().strip_prefix(&src_dir).unwrap();
+            let src_mode = std::fs::symlink_metadata(entry.path()).unwrap().mode() & 0o7777;
+            let dst_path = base.join(rel);
+            let dst_mode = std::fs::symlink_metadata(&dst_path).unwrap().mode() & 0o7777;
+            assert_eq!(
+                src_mode,
+                dst_mode,
+                "source mode {src_mode:o} of '{}' must be preserved in the merged tree \
+                 (got {dst_mode:o})",
+                rel.display()
+            );
+        }
+    }
+
+    fn run_mapper_case_property(case: &MapperCase) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        build_source_tree(&root);
+        let vars = crate::template::TemplateVars::mapping("app", "v1", "standard");
+        let dest_a = dir.path().join("stage-a");
+        let dest_b = dir.path().join("stage-b");
+        let res_a = materialize_variant(&root, &case.mappings, &vars, &dest_a)
+            .and_then(|()| crate::tree::canonicalize_tree(&dest_a));
+        let res_b = materialize_variant(&root, &case.mappings, &vars, &dest_b)
+            .and_then(|()| crate::tree::canonicalize_tree(&dest_b));
+        match (&res_a, &res_b) {
+            (Ok(meta_a), Ok(meta_b)) => {
+                assert_eq!(
+                    meta_a, meta_b,
+                    "two materializations of the same mapping shapes must produce \
+                     identical canonical trees (entries, modes, digests)"
+                );
+            }
+            (Err(ea), Err(eb)) => {
+                assert_eq!(
+                    std::mem::discriminant(ea),
+                    std::mem::discriminant(eb),
+                    "the two materializations must fail identically: {ea} vs {eb}"
+                );
+            }
+            (a, b) => panic!("materialization must be deterministic: {a:?} vs {b:?}"),
+        }
+        // Recursive-merge shapes with no override preserve source modes exactly.
+        if case.mappings.len() == 1
+            && case.mappings[0].recursive
+            && case.mappings[0].mode.is_none()
+            && res_a.is_ok()
+        {
+            let from = case.mappings[0].from.trim_end_matches('/');
+            if root.join(from).is_dir() {
+                assert_recursive_modes_preserved(&root, &dest_a, &case.mappings[0]);
+            }
+        }
+    }
+
+    proptest! {
+        // Main property: ORDINARY RANDOMIZED SEEDS with FAILURE PERSISTENCE
+        // (proptest's defaults) — a failing vector writes to
+        // `proptest-regressions/mapper.txt` and is replayed on the next run
+        // (commit it so CI keeps reproducing the regression until fixed). The
+        // case count is bounded so the suite stays fast.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            failure_persistence: Some(Box::new(FileFailurePersistence::default())),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn mapping_shapes_materialize_deterministically(case in mapper_case_strategy()) {
+            run_mapper_case_property(&case);
+        }
+    }
+
+    proptest! {
+        // FIXED-SEED REGRESSION: the deterministic floor for CI. The same
+        // generator under the pinned 0x5EED_5EED seed with no persistence runs
+        // the IDENTICAL vectors on every invocation, so the suite stays
+        // reproducible even when no failure has ever been persisted by the
+        // main test. The case count is bounded so the suite stays fast.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn mapping_shapes_deterministic_fixed_seed_regression(case in mapper_case_strategy()) {
+            run_mapper_case_property(&case);
+        }
     }
 }
