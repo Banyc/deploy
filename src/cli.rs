@@ -221,9 +221,23 @@ The floor is stored as a small marker at\n\
 targets/<target>/refs/history-floor.json (durable BEFORE the physical\n\
 compaction rewrites the logs and deletes the below-floor deployment\n\
 directories), so even an interrupted cleanup never exposes history below\n\
-the durable floor. Releases, objects, remote generations, and pinned\n\
-artifacts are never deleted. A checkpoint does not deploy anything,\n\
-contact remote servers, or create another snapshot.",
+the durable floor. After the history compaction, the checkpoint also runs\n\
+LOCAL ARTIFACT GARBAGE COLLECTION: a best-effort, global pass that unlinks\n\
+release records (releases/<release-id>/) and tree objects\n\
+(objects/sha256/<digest>/) no longer reachable from any target's retained\n\
+history, observed state, or configured pins. Reachability is recomputed on\n\
+every run (no persisted deletion worklist); a failure never moves the\n\
+floor or deletes reachable content — the report says \"cleanup incomplete\"\n\
+and re-running the same checkpoint converges. Pins (pins.json) retain\n\
+artifact content ONLY: a pinned release/tree is never reclaimed, but a pin\n\
+never keeps an old deployment, attempt, or snapshot in history.\n\
+\"Disk cleanup\" means unlinking files and syncing directories — not secure\n\
+physical erasure (SSD firmware, copy-on-write filesystems, snapshots,\n\
+journals, and backups may retain old blocks). Remote artifact cleanup\n\
+remains rotation's responsibility: the checkpoint never contacts servers.\n\
+\n\
+A checkpoint does not deploy anything, contact remote servers, or create\n\
+another snapshot.",
         after_help = "Examples:\n\
   deploy checkpoint production deploy-004 --dry-run   # preview what would be discarded\n\
   deploy checkpoint production deploy-004 --yes       # establish the floor (irreversible)\n\

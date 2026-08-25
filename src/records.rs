@@ -288,6 +288,53 @@ pub struct CleanupPending {
     pub established_at: String,
 }
 
+/// A durable pin: retained artifact CONTENT, store-global (a release or
+/// binding is shared by every target that references it, so a pin protects
+/// it everywhere). Persisted at `<base>/pins.json`; the artifact garbage
+/// collector ([`crate::store::gc`]) folds every pin into the retained
+/// binding set BEFORE it unlinks anything, so a pinned release record and
+/// tree object are never deleted. These STORE-LEVEL pins are DISTINCT from
+/// the rotation subsystem's project-file `[[pins]]`
+/// ([`crate::config::Pin`]): the checkpoint flow is store-only (it never
+/// loads the caller's `deploy.toml`), so its retention anchors live in the
+/// store, while rotation's config pins protect the REMOTE retained set and
+/// are never consulted by the local GC.
+///
+/// PINS RETAIN ARTIFACT CONTENT ONLY. A pin is a pure retention anchor for
+/// the artifact store — it never creates, keeps, or reinserts a deployment,
+/// attempt, or snapshot in any target's history, and it never raises or
+/// removes a checkpoint floor. The floor-gated reads
+/// (`read_attempts` / `read_snapshots` / ref resolution) stay keyed on the
+/// history floor alone, so pinning the artifacts of a pre-floor deployment
+/// keeps the bytes but NEVER the history.
+///
+/// Two pin forms (both supported, mix freely):
+///
+/// * `releases` — a RELEASE pin: retains the whole release record AND
+///   every variant/tree binding in that record (the GC expands the record's
+///   `variants` map). The canonical `rel-sha256-<digest>` id is required
+///   (accepted as a bare digest too via [`crate::model::ReleaseId::parse`]);
+///   a release pin whose record is missing fails the GC closed (the pin
+///   cannot be expanded — nothing is deleted that run).
+/// * `bindings` — an EXACT BINDING pin: one (release, variant, tree)
+///   [`ArtifactRef`], which keeps that release record and that tree object.
+///
+/// `schema_version` is exactly [`crate::model::PINS_SCHEMA_VERSION`];
+/// readers refuse any other version (fail closed).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pins {
+    pub schema_version: u32,
+    /// Whole-release pins: every variant/tree in each named release record
+    /// is retained (release pins expand via the release record's `variants`
+    /// map at GC time).
+    #[serde(default)]
+    pub releases: Vec<ReleaseId>,
+    /// Exact-binding pins: each `(release, variant, tree)` retains exactly
+    /// that release record + tree object.
+    #[serde(default)]
+    pub bindings: Vec<ArtifactRef>,
+}
+
 /// Observed remote state for one placement slot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ObservedServer {

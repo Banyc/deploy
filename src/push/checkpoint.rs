@@ -10,6 +10,35 @@
 //! IRREVERSIBLE: the CLI requires `--yes` (or `--dry-run` to preview the
 //! exact discard list) and an explicit deployment id.
 //!
+//! The checkpoint ALSO runs LOCAL HISTORY COMPACTION + ARTIFACT GARBAGE
+//! COLLECTION as its post-commit best-effort maintenance:
+//!
+//! 1. **History compaction** ([`LocalStore::checkpoint_compact`]): delete
+//!    the discarded `deployments/<id>/` dirs and atomically rewrite
+//!    `attempts.jsonl` / `snapshots.jsonl` to the retained suffix.
+//! 2. **Global artifact GC** ([`crate::store::gc`]): after the compaction
+//!    succeeds, scan the WHOLE store, compute the RETAINED SET of artifact
+//!    bindings (release, variant, tree) from every target's retained
+//!    history, every retained deployment record (unfinished operations
+//!    included), every target's current observed artifact, every pin
+//!    ([`crate::records::Pins`], `pins.json` — which retain artifact
+//!    CONTENT ONLY, never history), and the release records/trees they
+//!    reference — then unlink the unreachable `releases/<id>/` and
+//!    `objects/sha256/<digest>/` dirs. Reachability is recomputed fresh on
+//!    EVERY run: there is no persisted deletion worklist.
+//!
+//! Both maintenance passes are post-commit best-effort: a failure NEVER
+//! moves or removes the established floor and NEVER deletes anything in the
+//! retained set — the report says "cleanup incomplete" and the next
+//! checkpoint of the same deployment retries (and converges).
+//!
+//! "Disk cleanup" means unlinking unreachable files/directories and syncing
+//! the affected directories so filesystem space can be reclaimed — NOT
+//! secure physical erasure: SSD firmware, copy-on-write filesystems,
+//! snapshots, journals, and backups may retain old blocks. The checkpoint
+//! never contacts servers; remote artifact cleanup remains rotation's
+//! responsibility.
+//!
 //! # Why a marker, not another snapshot
 //!
 //! The floor is the small [`crate::records::HistoryFloor`] marker at
@@ -135,6 +164,7 @@ use crate::model::{
 };
 use crate::push::lock::FileLock;
 use crate::records::{CleanupPending, HistoryFloor};
+use crate::store::gc::GcOutcome;
 use crate::store::history_floor::FloorDiscards;
 use crate::store::local::LocalStore;
 
@@ -152,11 +182,22 @@ pub struct CheckpointReport {
     /// True when this call established (or advanced / repaired) the floor;
     /// false for a pure idempotent no-op and for dry-run previews.
     pub established: bool,
+    /// True when the checkpoint's HISTORY COMPACTION ran to completion
+    /// (this invocation): the physical attempt/snapshot logs are rewritten
+    /// to the suffix at/after the floor. True even on the idempotent
+    /// no-op path (the compaction maintenance always runs, and a no-op
+    /// leaves the logs already at the suffix); false when the compaction
+    /// itself failed and on dry-run previews.
+    pub history_compacted: bool,
     /// True when the checkpoint TOOK EFFECT (the durable floor was written)
-    /// but the post-commit physical compaction did not complete: the
-    /// command reports SUCCESS with this warning set, a durable
-    /// [`CleanupPending`] debt marker records the pending cleanup, and the
-    /// next checkpoint of the same deployment retries it. The compaction
+    /// but the post-commit physical maintenance did not complete: the
+    /// history compaction and/or the artifact garbage collection (see
+    /// [`CheckpointReport::gc`]) is still pending. The command reports
+    /// SUCCESS with this warning set, a durable [`CleanupPending`] debt
+    /// marker records the pending cleanup, and the next checkpoint of the
+    /// same deployment retries it (retry recomputes both the compaction
+    /// discard set from the logs and the artifact reachability set from the
+    /// whole store — no deletion worklist is persisted). The maintenance
     /// runs on EVERY path — an idempotent retry computes the same flags as
     /// a fresh run, so a maintenance failure on the no-op path is never
     /// suppressed. False when the cleanup completed, on a pure idempotent
@@ -177,6 +218,16 @@ pub struct CheckpointReport {
     /// same-deployment checkpoint re-clears it. False when the clear
     /// succeeded, when no clear was needed, and on dry-run previews.
     pub cleanup_clear_failed: bool,
+    /// The artifact garbage collection outcome of this invocation's
+    /// post-commit pass: whether the global scan + unlink ran to completion
+    /// and how much unreachable artifact content was removed. The GC is
+    /// POST-COMMIT MAINTENANCE (see [`crate::store::gc`]): it never moves
+    /// or removes the established floor and never deletes anything in the
+    /// retained set. When `gc.completed` is false the report warns
+    /// "cleanup incomplete" and the next same-deployment checkpoint retries
+    /// the pass (reachability is recomputed fresh — no persisted deletion
+    /// worklist). Dry-run previews report the default (not attempted).
+    pub gc: GcOutcome,
     /// True when the operation ran read-only (`--dry-run`): no locks, no
     /// writes, no compaction.
     pub dry_run: bool,
@@ -390,10 +441,14 @@ fn finish_cleanup(
                 target,
                 floor,
                 FloorDiscards::default(),
-                established || pending_read_failed || pending.is_some(),
-                true,
-                persist_failed,
-                false,
+                PostCommit {
+                    established: established || pending_read_failed || pending.is_some(),
+                    history_compacted: false,
+                    gc: GcOutcome::default(),
+                    cleanup_pending: true,
+                    cleanup_persistence_failed: persist_failed,
+                    cleanup_clear_failed: false,
+                },
             ));
         }
     };
@@ -414,43 +469,75 @@ fn finish_cleanup(
     // persistence is the last failure surface: if it cannot be written, the
     // report exposes `cleanup_persistence_failed` (truthful reporting — a
     // crash/restart would lose the debt) instead of claiming durable debt.
-    let (cleanup_pending, persist_failed, clear_failed) =
+    //
+    // Post-marker failure point #3: the ARTIFACT GARBAGE COLLECTION, which
+    // runs AFTER the compaction succeeds (a compaction failure leaves the
+    // below-floor worklist in the raw logs and the GC must not run on a
+    // half-compacted store). It is the same post-commit best-effort
+    // maintenance with the same failure contract: a GC failure NEVER moves
+    // or removes the established floor and NEVER deletes anything in the
+    // retained set (it aborts before any unlink — see
+    // [`crate::store::gc`]), it records the SAME durable debt flag (the
+    // marker is a flag only — reachability is recomputed fresh on retry, no
+    // deletion worklist is ever persisted), and the report warns "cleanup
+    // incomplete". The GC runs on EVERY path (including the idempotent
+    // no-op), so a GC failure on the no-op path is never suppressed.
+    let (cleanup_pending, persist_failed, clear_failed, gc, history_compacted) =
         match store.checkpoint_compact(target, floor) {
             Ok(()) => {
-                // The physical cleanup completed: the debt marker clears
-                // DURABLY (remove + parent-dir fsync). A clear failure is
-                // itself post-commit maintenance — the STALE marker
-                // (harmless: every read is keyed on the floor, never the
-                // debt marker) is retried by the next same-deployment
-                // checkpoint — and is surfaced truthfully as
-                // `cleanup_clear_failed` so the report never claims a clean
-                // converged state while a stale marker is on disk.
-                let clear_failed = store.clear_cleanup_pending(target).is_err();
-                (false, false, clear_failed)
+                // The history compaction completed: the physical logs are
+                // rewritten to the retained suffix. Now the artifact GC
+                // runs its global scan + unlink; both are post-commit
+                // maintenance.
+                match store.gc_artifacts(floor.deployment_id.as_str()) {
+                    Ok(outcome) => {
+                        // The physical cleanup completed (history compacted
+                        // AND artifact GC done): the debt marker clears
+                        // DURABLY (remove + parent-dir fsync). A clear
+                        // failure is itself post-commit maintenance — the
+                        // STALE marker (harmless: every read is keyed on
+                        // the floor, never the debt marker) is retried by
+                        // the next same-deployment checkpoint — and is
+                        // surfaced truthfully as `cleanup_clear_failed` so
+                        // the report never claims a clean converged state
+                        // while a stale marker is on disk.
+                        let clear_failed = store.clear_cleanup_pending(target).is_err();
+                        (false, false, clear_failed, outcome, true)
+                    }
+                    Err(_) => {
+                        let persist_failed = record_cleanup_pending(store, target, floor).is_err();
+                        (true, persist_failed, false, GcOutcome::default(), true)
+                    }
+                }
             }
             Err(_) => {
                 let persist_failed = record_cleanup_pending(store, target, floor).is_err();
-                (true, persist_failed, false)
+                (true, persist_failed, false, GcOutcome::default(), false)
             }
         };
 
     // A TRUE no-op: nothing needed repair AND the post-commit maintenance
-    // ran clean (every warning flag false). ONLY this combination returns
-    // the clean no-op report — an idempotent retry whose maintenance step
-    // failed (or whose stale debt marker could not be cleared) falls
-    // through to the report below and surfaces the warnings exactly like a
-    // fresh post-commit run. `established` is the caller's truth: a FRESH
-    // path established the floor even when there was nothing below it to
-    // discard; the same-deployment retry path is a no-op (not established).
-    if !needed_repair && !cleanup_pending && !persist_failed && !clear_failed {
+    // ran clean (every warning flag false, GC completed). ONLY this
+    // combination returns the clean no-op report — an idempotent retry
+    // whose maintenance step failed (or whose stale debt marker could not
+    // be cleared) falls through to the report below and surfaces the
+    // warnings exactly like a fresh post-commit run. `established` is the
+    // caller's truth: a FRESH path established the floor even when there
+    // was nothing below it to discard; the same-deployment retry path is a
+    // no-op (not established).
+    if !needed_repair && !cleanup_pending && !persist_failed && !clear_failed && gc.completed {
         return Ok(cleanup_report(
             target,
             floor,
             FloorDiscards::default(),
-            established,
-            false,
-            false,
-            false,
+            PostCommit {
+                established,
+                history_compacted,
+                gc,
+                cleanup_pending: false,
+                cleanup_persistence_failed: false,
+                cleanup_clear_failed: false,
+            },
         ));
     }
 
@@ -458,11 +545,30 @@ fn finish_cleanup(
         target,
         floor,
         discards,
-        established || needed_repair,
-        cleanup_pending,
-        persist_failed,
-        clear_failed,
+        PostCommit {
+            established: established || needed_repair,
+            history_compacted,
+            gc,
+            cleanup_pending,
+            cleanup_persistence_failed: persist_failed,
+            cleanup_clear_failed: clear_failed,
+        },
     ))
+}
+
+/// The post-commit outcome bits one real checkpoint run accumulates: which
+/// maintenance completed (history compaction + artifact GC), which warning
+/// flags fired, and whether the floor was established/repaired. Bundled so
+/// [`cleanup_report`] stays a small pure constructor (and the report's
+/// truthful dimensions stay decidable in one place).
+#[derive(Debug)]
+struct PostCommit {
+    established: bool,
+    history_compacted: bool,
+    gc: GcOutcome,
+    cleanup_pending: bool,
+    cleanup_persistence_failed: bool,
+    cleanup_clear_failed: bool,
 }
 
 /// Build the report for one real (non-preview) checkpoint run.
@@ -470,20 +576,19 @@ fn cleanup_report(
     target: &str,
     floor: &HistoryFloor,
     discards: FloorDiscards,
-    established: bool,
-    cleanup_pending: bool,
-    cleanup_persistence_failed: bool,
-    cleanup_clear_failed: bool,
+    post: PostCommit,
 ) -> CheckpointReport {
     CheckpointReport {
         target: target.to_string(),
         deployment_id: floor.deployment_id.clone(),
         snapshot_index: floor.snapshot_index,
         discards,
-        established,
-        cleanup_pending,
-        cleanup_persistence_failed,
-        cleanup_clear_failed,
+        established: post.established,
+        history_compacted: post.history_compacted,
+        cleanup_pending: post.cleanup_pending,
+        cleanup_persistence_failed: post.cleanup_persistence_failed,
+        cleanup_clear_failed: post.cleanup_clear_failed,
+        gc: post.gc,
         dry_run: false,
     }
 }
@@ -526,9 +631,11 @@ fn preview_checkpoint(
         snapshot_index: floor.snapshot_index,
         discards,
         established: false,
+        history_compacted: false,
         cleanup_pending: false,
         cleanup_persistence_failed: false,
         cleanup_clear_failed: false,
+        gc: GcOutcome::default(),
         dry_run: true,
     })
 }
@@ -537,6 +644,20 @@ fn preview_checkpoint(
 /// WOULD be discarded; an established floor reports what WAS discarded; a
 /// pure idempotent no-op says so. The CLI prints exactly these lines; the
 /// unit tests assert on them directly.
+///
+/// The four report dimensions are each distinguishable in the output:
+///
+/// (a) LOGICAL CHECKPOINT ESTABLISHED — the head line names the durable
+///     history floor (or the dry-run preview / no-op state);
+/// (b) HISTORY FILES COMPACTED — the discard enumeration plus the explicit
+///     "history files compacted" line (printed iff the compaction ran to
+///     completion, i.e. [`CheckpointReport::history_compacted`]);
+/// (c) ARTIFACT GARBAGE COLLECTION COMPLETED — the explicit GC line with
+///     the removed release/tree counts (printed iff
+///     [`CheckpointReport::gc`].completed);
+/// (d) CLEANUP INCOMPLETE AND RETRY REQUIRED — the `warning:` lines
+///     (cleanup_pending / cleanup_persistence_failed /
+///     cleanup_clear_failed).
 ///
 /// The "nothing to discard" no-op claim is gated on ALL warning flags FALSE:
 /// when a maintenance step failed on the idempotent path the report must
@@ -569,10 +690,16 @@ pub fn render_checkpoint_report(report: &CheckpointReport) -> Vec<String> {
         )
     };
     lines.push(head);
-    // A pure idempotent no-op has nothing to enumerate — but the warning
-    // lines must STILL print when a maintenance step failed (the head
-    // already dropped the "nothing to discard" claim).
+    // A pure idempotent no-op has nothing to enumerate — but the
+    // maintenance status lines (history compaction / artifact GC) and the
+    // warning lines must STILL print when they carry truth (the head
+    // already dropped the "nothing to discard" claim when a maintenance
+    // step failed).
     if !report.dry_run && !report.established {
+        if report.history_compacted {
+            lines.push(history_compacted_line());
+        }
+        push_gc_line(&mut lines, report);
         push_checkpoint_warnings(&mut lines, report);
         return lines;
     }
@@ -610,8 +737,48 @@ pub fn render_checkpoint_report(report: &CheckpointReport) -> Vec<String> {
         plural(report.discards.discarded_deployments.len()),
         report.discards.discarded_deployments.join(", ")
     ));
+    // (b) history files compacted: printed iff the compaction ran to
+    // completion (never on a dry-run preview, never when the compaction
+    // itself failed).
+    if !report.dry_run && report.history_compacted {
+        lines.push(history_compacted_line());
+    }
+    // (c) artifact garbage collection: printed iff the global GC completed.
+    push_gc_line(&mut lines, report);
     push_checkpoint_warnings(&mut lines, report);
     lines
+}
+
+/// The dimension-(b) line: the physical history compaction completed.
+fn history_compacted_line() -> String {
+    "history files compacted: attempts.jsonl and snapshots.jsonl rewritten to the suffix at/after the checkpoint".to_string()
+}
+
+/// The dimension-(c) line: the artifact garbage collection completed (the
+/// global reachability-based reclamation). Only ever printed when
+/// `gc.completed` — a failed/aborted pass is never claimed as completed;
+/// its truth lives in the warning lines instead.
+fn push_gc_line(lines: &mut Vec<String>, report: &CheckpointReport) {
+    if report.dry_run {
+        return;
+    }
+    if !report.gc.completed {
+        return;
+    }
+    if report.gc.removed_releases == 0 && report.gc.removed_trees == 0 {
+        lines.push(
+            "artifact garbage collection completed: no unreachable artifact content to remove"
+                .to_string(),
+        );
+    } else {
+        lines.push(format!(
+            "artifact garbage collection completed: removed {} release record{} and {} tree object{}",
+            report.gc.removed_releases,
+            plural(report.gc.removed_releases),
+            report.gc.removed_trees,
+            plural(report.gc.removed_trees),
+        ));
+    }
 }
 
 /// The checkpoint warning lines, each printed IFF its flag is set (the CLI
@@ -619,23 +786,27 @@ pub fn render_checkpoint_report(report: &CheckpointReport) -> Vec<String> {
 /// Every flag produces its OWN warning — a flagged report never renders as a
 /// clean no-op.
 fn push_checkpoint_warnings(lines: &mut Vec<String>, report: &CheckpointReport) {
-    // A post-marker cleanup failure leaves the checkpoint committed but the
-    // physical compaction unfinished: the CLI prints the explicit warning
-    // (and exits SUCCESS — the checkpoint took effect) and a re-run of the
-    // same checkpoint converges.
+    // Dimension (d): a post-marker maintenance failure (the history
+    // compaction and/or the artifact GC) leaves the checkpoint committed
+    // but the physical cleanup unfinished: the CLI prints the explicit
+    // "cleanup incomplete; retry required" warning (and exits SUCCESS — the
+    // checkpoint took effect) and a re-run of the same checkpoint
+    // converges. The "cleanup pending" phrasing is retained for the
+    // durable-debt semantics: the flag is the same debt flag the compaction
+    // failures record.
     if report.cleanup_pending {
         lines.push(format!(
-            "warning: checkpoint established; cleanup pending — re-run `deploy checkpoint {} {}` to converge",
+            "warning: cleanup incomplete — history compaction and/or artifact garbage collection did not complete (cleanup pending); re-run `deploy checkpoint {} {}` to retry and converge",
             report.target, report.deployment_id
         ));
     }
     // The debt marker's OWN persistence failed: the report must NOT claim
     // durable debt — this line is the explicit, truthful signal that a
     // crash/restart would lose the pending-cleanup state (the retry
-    // recomputes it from the logs and converges).
+    // recomputes it from the logs / store and converges).
     if report.cleanup_persistence_failed {
         lines.push(format!(
-            "warning: cleanup pending but the debt marker could not be persisted — re-run `deploy checkpoint {} {}` to converge",
+            "warning: cleanup incomplete but the debt marker could not be persisted — re-run `deploy checkpoint {} {}` to converge",
             report.target, report.deployment_id
         ));
     }
@@ -657,11 +828,17 @@ fn plural(n: usize) -> &'static str {
 mod tests {
     use super::*;
     use crate::history::{self, PushRef};
-    use crate::model::{DeploymentId, ReleaseId, SCHEMA_VERSION, TargetName, TreeDigest};
-    use crate::records::{DeploymentAttempt, DeploymentSnapshot};
+    use crate::model::{
+        ArtifactRef, DeploymentId, GenerationId, GenerationRef, PlacementSlotAssignment,
+        PlacementSlotId, ReleaseId, SCHEMA_VERSION, TargetName, TreeDigest, VariantName,
+    };
+    use crate::records::{
+        DeploymentAttempt, DeploymentPlan, DeploymentSnapshot, DeploymentStatus, ObservedServer,
+        ObservedTarget, Pins, PlanSource, ServerPlan,
+    };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 
     const TARGET: &str = "production";
@@ -710,17 +887,54 @@ mod tests {
         }
     }
 
-    /// Seed the never-delete guard rails: a release record + aux, a tree
-    /// object, and a server state file. These must survive every checkpoint.
+    /// Seed the never-delete guard rails: a VALID release record + its tree
+    /// object, PINNED via the store's pins API (a release pin — every
+    /// variant/tree in the record is retained — plus the exact binding), and
+    /// a server state file. These must survive every checkpoint: the pins
+    /// retain the artifact CONTENT and the GC never touches servers. The
+    /// never-delete fixtures double as the pins contract test: the seeded
+    /// release/tree are referenced by NOTHING in any history, so they would
+    /// be reclaimed by the artifact GC — only the pins keep them.
     fn seed_never_delete(store: &LocalStore) -> (ReleaseId, TreeDigest, String) {
-        let rel = ReleaseId::new("rel-sha256-checkpoint-never".to_string());
-        let dir = store.release_dir(&rel);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("release.json"), b"{}").unwrap();
         let tree = TreeDigest::new("tree-never-delete".to_string());
+        let variant = "standard";
+        // A real, content-verified release record (write_release verifies;
+        // read_release re-verifies at pin-expansion time).
+        let variants = BTreeMap::from([(VariantName::new(variant), tree.clone())]);
+        let slots: BTreeMap<String, Vec<crate::config::SlotDef>> = BTreeMap::from([(
+            variant.to_string(),
+            vec![crate::config::SlotDef {
+                id: "p1".to_string(),
+                server: "s1".to_string(),
+                deploy_dir: Path::new("/srv/deploy/p1").to_path_buf(),
+                targets: vec!["t1".to_string()],
+            }],
+        )]);
+        let rec = crate::release::build_release(
+            "map-never",
+            "behavior-never",
+            &variants,
+            &slots,
+            Path::new("."),
+        );
+        let rel = ReleaseId::new(rec.release_id.clone());
+        store.write_release(&rec).unwrap();
+        // The tree object dir (GC keys retention on the digest dir name).
         let root = store.object_root(&tree);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("x"), b"x").unwrap();
+        // PIN the content: a release pin (marks every variant/tree in the
+        // record) AND the exact binding pin.
+        let pins = Pins {
+            schema_version: crate::model::PINS_SCHEMA_VERSION,
+            releases: vec![rel.clone()],
+            bindings: vec![ArtifactRef {
+                release: rel.clone(),
+                variant: VariantName::new(variant),
+                tree: tree.clone(),
+            }],
+        };
+        store.write_pins(&pins).unwrap();
         let server = store.base().join("servers").join("s-never.json");
         std::fs::write(&server, b"{}").unwrap();
         (rel, tree, server.to_string_lossy().into_owned())
@@ -729,11 +943,11 @@ mod tests {
     fn assert_never_delete(store: &LocalStore, rel: &ReleaseId, tree: &TreeDigest, server: &str) {
         assert!(
             store.release_dir(rel).join("release.json").exists(),
-            "release records are never deleted"
+            "pinned release records are never deleted"
         );
         assert!(
             store.object_root(tree).join("x").exists(),
-            "objects are never deleted"
+            "pinned tree objects are never deleted"
         );
         assert!(
             Path::new(server).exists(),
@@ -4516,5 +4730,1359 @@ mod tests {
         ] {
             run_cleanup_marker_mutation_case(&[true, true, false, true], 1, mutation);
         }
+    }
+    // -------------------------------------------------------------------
+    // GLOBAL ARTIFACT GARBAGE COLLECTION (the property test)
+    // -------------------------------------------------------------------
+    //
+    // The checkpoint's post-commit pass now ends with a GLOBAL,
+    // reachability-based artifact GC (`crate::store::gc`). The property
+    // family below drives the whole path — generated targets, per-target
+    // histories, SHARED releases and SHARED trees, pins, incomplete
+    // (pending) operations, and injected GC faults — and asserts the eight
+    // invariants:
+    //
+    // 1. no reachable or pinned artifact is ever deleted;
+    // 2. a pin never keeps pre-floor history visible;
+    // 3. another target's references protect shared content;
+    // 4. without faults, every unreachable release/tree is removed;
+    // 5. with faults, extra garbage may remain but required content never
+    //    disappears;
+    // 6. repeating cleanup converges;
+    // 7. repeating a completed checkpoint is idempotent;
+    // 8. advancing one target never truncates another target's history.
+    //
+    // The ORACLE mirrors the collector's reachability sources over the
+    // floor-gated reads (the well-tested enforcement point): the retained
+    // binding set = retained attempts' + snapshots' slot artifacts, every
+    // retained deployment record's plan (unfinished operations included),
+    // every target's observed artifact, and every pin; releases = the
+    // bindings' releases + plan `desired_release`s + pins; trees = the
+    // bindings' trees + every pinned release's variant trees.
+
+    /// One generated attempt step: `ok` (produces a snapshot), a release
+    /// index, and a variant index. The tree of `(rel, variant)` comes from
+    /// the release's OWN variant map, and the maps are built so trees are
+    /// SHARED across releases and targets (trees[(2*rel+variant) % n]).
+    #[derive(Debug, Clone)]
+    struct GcStep {
+        ok: bool,
+        rel: usize,
+        variant: usize,
+    }
+
+    /// One generated GC case.
+    #[derive(Debug, Clone)]
+    struct GcCase {
+        n_trees: usize,
+        n_releases: usize,
+        t0_steps: Vec<GcStep>,
+        t1_steps: Vec<GcStep>,
+        /// Checkpoint index into t0's successful steps (0..4; modulo the
+        /// success count).
+        t0_ck: usize,
+        /// Optional checkpoint index into t1's successful steps.
+        t1_ck: Option<usize>,
+        /// Optional whole-release pin (release index).
+        pin_release: Option<usize>,
+        /// Also pin the exact (release, v0, tree) binding.
+        pin_binding: bool,
+        /// t0's LAST attempt is an INCOMPLETE operation (its latest
+        /// transition stays `InProgress` — no terminal transition).
+        incomplete: bool,
+        /// 0 = no fault; 1 = the GC SCAN fails; 2 = the release deletion
+        /// phase fails; 3 = the tree deletion phase fails.
+        fault: u8,
+        /// Checkpoint t0 a SECOND time at a STRICTLY LATER success.
+        advance: bool,
+    }
+
+    fn gc_step_strategy() -> impl Strategy<Value = GcStep> {
+        (any::<bool>(), 0usize..4, 0usize..2).prop_map(|(ok, rel, variant)| GcStep {
+            ok,
+            rel,
+            variant,
+        })
+    }
+
+    fn gc_case_strategy() -> impl Strategy<Value = GcCase> {
+        (
+            1usize..=3,
+            1usize..=3,
+            prop::collection::vec(gc_step_strategy(), 0..8),
+            prop::collection::vec(gc_step_strategy(), 0..8),
+            0usize..4,
+            prop::option::of(0usize..4),
+            prop::option::of(0usize..4),
+            any::<bool>(),
+            any::<bool>(),
+            0u8..4,
+            any::<bool>(),
+        )
+            .prop_map(
+                |(
+                    n_trees,
+                    n_releases,
+                    t0_steps,
+                    t1_steps,
+                    t0_ck,
+                    t1_ck,
+                    pin_release,
+                    pin_binding,
+                    incomplete,
+                    fault,
+                    advance,
+                )| {
+                    GcCase {
+                        n_trees,
+                        n_releases,
+                        t0_steps,
+                        t1_steps,
+                        t0_ck,
+                        t1_ck,
+                        pin_release,
+                        pin_binding,
+                        incomplete,
+                        fault,
+                        advance,
+                    }
+                },
+            )
+    }
+
+    /// The artifact-reference carrier records the fixture writes: an
+    /// attempt (`desired` map), a snapshot (`slots` map), and the
+    /// deployment plan (per-slot artifacts + `desired_release`).
+    fn gc_binding(release: &ReleaseId, variant: usize, tree: &TreeDigest) -> ArtifactRef {
+        ArtifactRef {
+            release: release.clone(),
+            variant: VariantName::new(if variant == 0 { "v0" } else { "v1" }),
+            tree: tree.clone(),
+        }
+    }
+
+    fn gc_attempt(target: &str, id: &str, binding: &ArtifactRef) -> DeploymentAttempt {
+        DeploymentAttempt {
+            deployment_schema_version: SCHEMA_VERSION,
+            deployment_id: DeploymentId::new(id.to_string()),
+            target: TargetName::new(target.to_string()),
+            slot_ids: vec![PlacementSlotId::new("p1")],
+            behavior_sha256: "sha256-gc".to_string(),
+            attempted_at: format!("2026-01-01T00:00:00Z-{id}"),
+            desired: BTreeMap::from([(
+                PlacementSlotId::new("p1"),
+                GenerationRef {
+                    generation: GenerationId::new(format!("gen-{id}")),
+                    assignment: PlacementSlotAssignment {
+                        placement_slot: PlacementSlotId::new("p1"),
+                        artifact: binding.clone(),
+                    },
+                },
+            )]),
+            pre_push: BTreeMap::new(),
+            slots: BTreeMap::new(),
+        }
+    }
+
+    fn gc_snapshot(
+        index: u64,
+        id: &str,
+        target: &str,
+        binding: &ArtifactRef,
+    ) -> DeploymentSnapshot {
+        DeploymentSnapshot {
+            index,
+            deployment_id: DeploymentId::new(id.to_string()),
+            target: TargetName::new(target.to_string()),
+            behavior_sha256: "sha256-gc".to_string(),
+            slots: BTreeMap::from([(
+                PlacementSlotId::new("p1"),
+                GenerationRef {
+                    generation: GenerationId::new(format!("gen-{id}")),
+                    assignment: PlacementSlotAssignment {
+                        placement_slot: PlacementSlotId::new("p1"),
+                        artifact: binding.clone(),
+                    },
+                },
+            )]),
+            bindings: BTreeMap::new(),
+        }
+    }
+
+    fn gc_plan(target: &str, id: &str, binding: &ArtifactRef) -> DeploymentPlan {
+        DeploymentPlan {
+            deployment_id: DeploymentId::new(id.to_string()),
+            target: TargetName::new(target.to_string()),
+            behavior_sha256: "sha256-gc".to_string(),
+            behaviors: BTreeMap::new(),
+            slot_ids: vec![PlacementSlotId::new("p1")],
+            slots: BTreeMap::from([(
+                PlacementSlotId::new("p1"),
+                ServerPlan {
+                    slot_id: PlacementSlotId::new("p1"),
+                    artifact: binding.clone(),
+                    expected_generation: None,
+                    expected_tree: None,
+                },
+            )]),
+            source: PlanSource::Head,
+            desired_release: binding.release.clone(),
+        }
+    }
+
+    /// The retained-set ORACLE, mirrored from the collector's sources via
+    /// the floor-gated reads (the enforcement point): retained attempts +
+    /// snapshots per floor, retained deployment plans (unfinished included),
+    /// observed state, and pins. Returns (bindings, releases, trees).
+    fn gc_oracle(
+        store: &LocalStore,
+        targets: &[&str],
+    ) -> (
+        BTreeSet<ArtifactRef>,
+        BTreeSet<ReleaseId>,
+        BTreeSet<TreeDigest>,
+    ) {
+        let mut bindings: BTreeSet<ArtifactRef> = BTreeSet::new();
+        let mut releases: BTreeSet<ReleaseId> = BTreeSet::new();
+        let mut trees: BTreeSet<TreeDigest> = BTreeSet::new();
+        let mut retained_dirs: BTreeSet<String> = BTreeSet::new();
+        let mut named_dirs: BTreeSet<String> = BTreeSet::new();
+        for target in targets {
+            for a in store.read_attempts(target).unwrap() {
+                for g in a.desired.values() {
+                    bindings.insert(g.assignment.artifact.clone());
+                }
+                retained_dirs.insert(a.deployment_id.as_str().to_string());
+            }
+            for a in store.read_attempts_raw(target).unwrap() {
+                named_dirs.insert(a.deployment_id.as_str().to_string());
+            }
+            for s in store.read_snapshots(target).unwrap() {
+                for g in s.slots.values() {
+                    bindings.insert(g.assignment.artifact.clone());
+                }
+                retained_dirs.insert(s.deployment_id.as_str().to_string());
+            }
+            let observed = store.read_observed(target).unwrap();
+            for slot in observed.slots.values() {
+                if let Some(a) = &slot.artifact {
+                    bindings.insert(a.clone());
+                }
+            }
+        }
+        for entry in std::fs::read_dir(store.base().join("deployments"))
+            .unwrap()
+            .flatten()
+        {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            let retained_or_orphan = retained_dirs.contains(&id) || !named_dirs.contains(&id);
+            if retained_or_orphan && let Ok(plan) = store.read_plan(&id) {
+                for sp in plan.slots.values() {
+                    bindings.insert(sp.artifact.clone());
+                }
+                releases.insert(plan.desired_release.clone());
+                if let PlanSource::ReleaseRef(r) = &plan.source {
+                    releases.insert(r.clone());
+                }
+            }
+        }
+        let pins = store.read_pins().unwrap();
+        for rid in &pins.releases {
+            releases.insert(rid.clone());
+            let rec = store.read_release(rid).unwrap();
+            for (variant, tree) in &rec.variants {
+                bindings.insert(ArtifactRef {
+                    release: rid.clone(),
+                    variant: VariantName::new(variant.as_str()),
+                    tree: TreeDigest::new(tree.as_str()),
+                });
+                trees.insert(TreeDigest::new(tree.as_str()));
+            }
+        }
+        for b in &pins.bindings {
+            bindings.insert(b.clone());
+        }
+        for b in &bindings {
+            releases.insert(b.release.clone());
+            trees.insert(b.tree.clone());
+        }
+        (bindings, releases, trees)
+    }
+
+    fn store_release_ids(store: &LocalStore) -> BTreeSet<ReleaseId> {
+        let root = store.base().join(crate::layout::RELEASES);
+        std::fs::read_dir(&root)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .map(|e| ReleaseId::new(e.file_name().to_string_lossy().into_owned()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn store_tree_ids(store: &LocalStore) -> BTreeSet<TreeDigest> {
+        let root = store.base().join(crate::layout::objects());
+        std::fs::read_dir(&root)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .map(|e| TreeDigest::new(e.file_name().to_string_lossy().into_owned()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Assert the ENTIRE retained-set + reclamation contract of one
+    /// CONVERGED fixture. `case` supplies the expected visible history (the
+    /// floors the runner established) for the pin-never-keeps-history
+    /// invariant.
+    fn assert_gc_converged(store: &LocalStore, case: &GcCase, floors: &[Option<(String, u64)>]) {
+        let (bindings, releases, trees) = gc_oracle(store, &["t0", "t1"]);
+
+        // 1. NO REACHABLE OR PINNED ARTIFACT IS EVER DELETED: every
+        //    retained binding's release record + tree object exist.
+        for b in &bindings {
+            assert!(
+                store.release_dir(&b.release).join("release.json").exists(),
+                "reachable/pinned binding {}|{}|{} was deleted",
+                b.release,
+                b.variant,
+                b.tree
+            );
+            assert!(
+                store
+                    .base()
+                    .join(crate::layout::objects())
+                    .join(b.tree.as_str())
+                    .exists(),
+                "reachable/pinned tree {} was deleted",
+                b.tree
+            );
+        }
+        for rid in &releases {
+            assert!(
+                store.release_dir(rid).join("release.json").exists(),
+                "retained release record {rid} was deleted"
+            );
+        }
+        for t in &trees {
+            assert!(
+                store
+                    .base()
+                    .join(crate::layout::objects())
+                    .join(t.as_str())
+                    .exists(),
+                "retained tree object {t} was deleted"
+            );
+        }
+
+        // 2. PINS NEVER KEEP PRE-FLOOR HISTORY VISIBLE: the visible history
+        //    is EXACTLY the floored suffix (computed from the fixture data,
+        //    INDEPENDENT of the pins) — a pin retains artifact content only
+        //    and never reinserts a discarded attempt/snapshot.
+        for (target, floor) in [("t0", &floors[0]), ("t1", &floors[1])] {
+            let steps: &[GcStep] = if target == "t0" {
+                &case.t0_steps
+            } else {
+                &case.t1_steps
+            };
+            let successes: Vec<usize> = steps
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.ok)
+                .map(|(i, _)| i)
+                .collect();
+            let floor_step = match floor {
+                Some((_id, ord)) => successes.get(*ord as usize).copied(),
+                None => None,
+            };
+            let expected_attempts: Vec<String> = (floor_step.unwrap_or(0)..steps.len())
+                .map(|i| format!("{target}-{i:03}"))
+                .collect();
+            let got_attempts: Vec<String> = store
+                .read_attempts(target)
+                .unwrap()
+                .iter()
+                .map(|a| a.deployment_id.as_str().to_string())
+                .collect();
+            assert_eq!(
+                got_attempts, expected_attempts,
+                "pins must never keep pre-floor attempts visible on {target}"
+            );
+            let expected_snaps: Vec<u64> = match floor {
+                Some((_, ord)) => (*ord..successes.len() as u64).collect(),
+                None => (0..successes.len() as u64).collect(),
+            };
+            let got_snaps: Vec<u64> = store
+                .read_snapshots(target)
+                .unwrap()
+                .iter()
+                .map(|s| s.index)
+                .collect();
+            assert_eq!(
+                got_snaps, expected_snaps,
+                "pins never keep pre-floor snapshots visible on {target}"
+            );
+            if let Some((_, ord)) = floor
+                && *ord > 0
+            {
+                let err = history::resolve_ref_expr(
+                    &history::parse_ref_expr(&format!("s{}", ord - 1)).unwrap(),
+                    target,
+                    store,
+                )
+                .unwrap_err();
+                assert!(
+                    err.to_string().contains("history floor")
+                        || err.to_string().contains("no snapshot"),
+                    "below-floor s{} stays refused on {target}, got: {err}",
+                    ord - 1
+                );
+            }
+        }
+
+        // 3. ANOTHER TARGET'S REFERENCES PROTECT SHARED CONTENT: covered by
+        //    assertion 1 (every retained binding from EVERY target survives)
+        //    — a release/tree referenced by t1's retained history survives
+        //    even when t0's floor discarded its own references to it.
+
+        // 4/6. WITHOUT FAULTS (or after the converging retry), EVERY
+        //      UNREACHABLE RELEASE/TREE IS REMOVED: the on-disk inventory
+        //      equals the oracle EXACTLY.
+        assert_eq!(
+            store_release_ids(store),
+            releases,
+            "without faults, no unreachable release record may remain"
+        );
+        assert_eq!(
+            store_tree_ids(store),
+            trees,
+            "without faults, no unreachable tree object may remain"
+        );
+
+        // The incomplete operation's deployment record stays retained (its
+        // plan's artifacts are in the oracle above): when t0's last attempt
+        // is incomplete and NOT below the floor, its dir survives.
+        if case.incomplete && !case.t0_steps.is_empty() {
+            let last_id = format!("t0-{:03}", case.t0_steps.len() - 1);
+            let floor = &floors[0];
+            let retained = match floor {
+                Some((fid, _ord)) => {
+                    // The incomplete op is retained iff it is at/above the
+                    // floor's step.
+                    let step_of = |id: &str| {
+                        case.t0_steps
+                            .iter()
+                            .enumerate()
+                            .find(|(n, _)| format!("t0-{n:03}") == id)
+                            .map(|(i, _)| i)
+                    };
+                    let fstep = step_of(fid).unwrap();
+                    let lstep = case.t0_steps.len() - 1;
+                    lstep >= fstep
+                }
+                None => true,
+            };
+            if retained {
+                assert!(
+                    store.deployment_dir(&last_id).exists(),
+                    "an unfinished operation at/above the floor is retained"
+                );
+            }
+        }
+    }
+
+    /// One generated GC case body (see [`GcCase`]). Seeds the store, runs
+    /// the checkpoints (with the optional injected GC fault on the first
+    /// one), converges the fault retry, and asserts all eight invariants.
+    fn run_gc_case(case: &GcCase) {
+        let n_trees = case.n_trees.max(1);
+        let n_rel = case.n_releases.max(1);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+
+        // ---- SHARED tree pool + unreachable spare content ---------------
+        let trees: Vec<TreeDigest> = (0..n_trees)
+            .map(|i| TreeDigest::new(format!("tree-gc-{i}")))
+            .collect();
+        for t in &trees {
+            let root = store.object_root(t);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("x"), b"x").unwrap();
+        }
+        // A spare tree object NO release or history ever references: the
+        // baseline unreachable content that must be reclaimed (invariant 4).
+        let spare_tree = TreeDigest::new("tree-gc-spare");
+        std::fs::create_dir_all(store.object_root(&spare_tree)).unwrap();
+        std::fs::write(store.object_root(&spare_tree).join("x"), b"x").unwrap();
+
+        // ---- releases (trees SHARED across releases) --------------------
+        let mut releases: Vec<ReleaseId> = Vec::new();
+        for i in 0..n_rel {
+            let v0 = trees[(2 * i) % n_trees].clone();
+            let v1 = trees[(2 * i + 1) % n_trees].clone();
+            let variants = BTreeMap::from([
+                (VariantName::new("v0"), v0.clone()),
+                (VariantName::new("v1"), v1.clone()),
+            ]);
+            let slots: BTreeMap<String, Vec<crate::config::SlotDef>> = variants
+                .keys()
+                .map(|v| {
+                    (
+                        v.as_str().to_string(),
+                        vec![crate::config::SlotDef {
+                            id: format!("p1-{}", v.as_str()),
+                            server: "s1".to_string(),
+                            deploy_dir: Path::new("/srv/deploy/p1").to_path_buf(),
+                            targets: vec!["t1".to_string()],
+                        }],
+                    )
+                })
+                .collect();
+            let rec = crate::release::build_release(
+                &format!("map-gc-{i}"),
+                &format!("bh-gc-{i}"),
+                &variants,
+                &slots,
+                Path::new("."),
+            );
+            let id = ReleaseId::new(rec.release_id.clone());
+            store.write_release(&rec).unwrap();
+            releases.push(id);
+        }
+        // A spare RELEASE record (with its own unique tree) no binding ever
+        // references: unreachable from the start (invariant 4).
+        let spare_variants =
+            BTreeMap::from([(VariantName::new("v0"), TreeDigest::new("tree-gc-spare2"))]);
+        let spare_slots: BTreeMap<String, Vec<crate::config::SlotDef>> = BTreeMap::from([(
+            "v0".to_string(),
+            vec![crate::config::SlotDef {
+                id: "p1-v0".to_string(),
+                server: "s1".to_string(),
+                deploy_dir: Path::new("/srv/deploy/p1").to_path_buf(),
+                targets: vec!["t1".to_string()],
+            }],
+        )]);
+        let spare_rec = crate::release::build_release(
+            "map-gc-spare",
+            "bh-gc-spare",
+            &spare_variants,
+            &spare_slots,
+            Path::new("."),
+        );
+        store.write_release(&spare_rec).unwrap();
+        let spare_tree2 = TreeDigest::new("tree-gc-spare2");
+        std::fs::create_dir_all(store.object_root(&spare_tree2)).unwrap();
+        std::fs::write(store.object_root(&spare_tree2).join("x"), b"x").unwrap();
+
+        let variant_tree =
+            |rel: usize, variant: usize| trees[(2 * (rel % n_rel) + variant) % n_trees].clone();
+
+        // ---- pins --------------------------------------------------------
+        let mut pins = Pins {
+            schema_version: crate::model::PINS_SCHEMA_VERSION,
+            releases: Vec::new(),
+            bindings: Vec::new(),
+        };
+        if let Some(p) = case.pin_release {
+            let rid = releases[p % n_rel].clone();
+            pins.releases.push(rid.clone());
+            if case.pin_binding {
+                pins.bindings.push(gc_binding(&rid, 0, &variant_tree(p, 0)));
+            }
+        }
+        store.write_pins(&pins).unwrap();
+
+        // ---- seed the two targets ----------------------------------------
+        let seed = |target: &str,
+                    steps: &[GcStep],
+                    incomplete: bool|
+         -> Vec<(String, bool, ArtifactRef)> {
+            let mut facts: Vec<(String, bool, ArtifactRef)> = Vec::new();
+            let mut next_index = 0u64;
+            let mut last_success: Option<ArtifactRef> = None;
+            for (n, s) in steps.iter().enumerate() {
+                let id = format!("{target}-{n:03}");
+                let binding = gc_binding(
+                    &releases[s.rel % n_rel],
+                    s.variant,
+                    &variant_tree(s.rel, s.variant),
+                );
+                store
+                    .append_attempt(target, &gc_attempt(target, &id, &binding))
+                    .unwrap();
+                std::fs::create_dir_all(store.deployment_dir(&id)).unwrap();
+                store
+                    .write_plan(&id, &gc_plan(target, &id, &binding))
+                    .unwrap();
+                store
+                    .append_transition(&id, &DeploymentStatus::InProgress, None)
+                    .unwrap();
+                let is_last = n + 1 == steps.len();
+                if s.ok {
+                    store
+                        .append_snapshot(target, &gc_snapshot(next_index, &id, target, &binding))
+                        .unwrap();
+                    next_index += 1;
+                    if !(incomplete && is_last) {
+                        store
+                            .append_transition(&id, &DeploymentStatus::Successful, None)
+                            .unwrap();
+                    }
+                    last_success = Some(binding.clone());
+                } else if !(incomplete && is_last) {
+                    store
+                        .append_transition(&id, &DeploymentStatus::FailedRolledBack, None)
+                        .unwrap();
+                }
+                facts.push((id, s.ok, binding));
+            }
+            let observed = ObservedTarget {
+                target: TargetName::new(target.to_string()),
+                slots: BTreeMap::from([(
+                    PlacementSlotId::new("p1"),
+                    ObservedServer {
+                        generation: None,
+                        artifact: last_success,
+                        last_deployment: None,
+                    },
+                )]),
+            };
+            store.write_observed(target, &observed).unwrap();
+            facts
+        };
+        let f0 = seed("t0", &case.t0_steps, case.incomplete);
+        let f1 = seed("t1", &case.t1_steps, false);
+
+        let s0: Vec<String> = f0.iter().filter(|f| f.1).map(|f| f.0.clone()).collect();
+        let s1: Vec<String> = f1.iter().filter(|f| f.1).map(|f| f.0.clone()).collect();
+
+        // The floors the runner establishes, per target: (deployment id,
+        // snapshot ordinal).
+        let mut floor0: Option<(String, u64)> = None;
+        let mut floor1: Option<(String, u64)> = None;
+        let mut fault_armed = case.fault != 0;
+        let mut ran_any_checkpoint = false;
+        let mut last_ck: Option<(String, String)> = None;
+
+        // t0's checkpoint (the first GC trigger).
+        if !s0.is_empty() {
+            let pos = case.t0_ck % s0.len();
+            let id = s0[pos].clone();
+            if fault_armed {
+                match case.fault {
+                    1 => store.fault_registry().arm_gc_scan(&id),
+                    2 => store.fault_registry().arm_gc_delete_releases(&id),
+                    _ => store.fault_registry().arm_gc_delete_trees(&id),
+                }
+            }
+            let rep = run_checkpoint(&store, "t0", &DeploymentId::new(id.clone()), false).expect(
+                "the checkpoint commits (post-commit GC failure is committed-with-warning)",
+            );
+            assert!(rep.established, "t0's checkpoint establishes the floor");
+            floor0 = Some((id.clone(), pos as u64));
+            ran_any_checkpoint = true;
+            last_ck = Some(("t0".to_string(), id.clone()));
+            if fault_armed {
+                fault_armed = false;
+                // 5. WITH FAULTS, EXTRA GARBAGE MAY REMAIN but required
+                // content never disappears: the GC failure is surfaced as
+                // cleanup_pending (never an Err), the floor stands, and
+                // nothing was deleted (the spare tree is still on disk).
+                assert!(
+                    rep.cleanup_pending,
+                    "the injected GC fault is surfaced as cleanup_pending"
+                );
+                assert!(!rep.gc.completed, "the faulted GC did not complete");
+                // The floor stands: it never moved and the visible history
+                // is already the floored suffix.
+                assert_eq!(
+                    store
+                        .read_history_floor("t0")
+                        .unwrap()
+                        .unwrap()
+                        .deployment_id
+                        .as_str(),
+                    id
+                );
+                assert!(
+                    store.object_root(&spare_tree).join("x").exists(),
+                    "with a fault, extra garbage may remain — nothing was deleted"
+                );
+                // 6. REPEATING CLEANUP CONVERGES: the one-shot fault is
+                // disarmed, so re-running the SAME checkpoint recomputes
+                // reachability fresh and finishes the reclamation.
+                let retry = run_checkpoint(&store, "t0", &DeploymentId::new(id.clone()), false)
+                    .expect("the retry converges");
+                assert!(
+                    !retry.cleanup_pending && retry.gc.completed,
+                    "repeating the same checkpoint after a GC fault converges"
+                );
+            }
+            // 8. ADVANCING one target never truncates another target's
+            // history: capture t1's local state, advance t0 to a strictly
+            // later success, and assert t1 is byte-for-byte untouched.
+            if case.advance && pos + 1 < s0.len() {
+                let id2 = s0[pos + 1].clone();
+                let t1_before_attempts = store.read_attempts_raw("t1").unwrap().len();
+                let t1_before_snaps = store.read_snapshots_raw("t1").unwrap().len();
+                let t1_before_dirs: Vec<String> = f1
+                    .iter()
+                    .map(|(id, _, _)| id.clone())
+                    .filter(|id| store.deployment_dir(id).exists())
+                    .collect();
+                let t1_before_releases = store_release_ids(&store);
+                let rep2 = run_checkpoint(&store, "t0", &DeploymentId::new(id2.clone()), false)
+                    .expect("the advancement to a later deployment commits");
+                assert!(
+                    rep2.established,
+                    "the t0 advance establishes the later floor"
+                );
+                floor0 = Some((id2.clone(), pos as u64 + 1));
+                last_ck = Some(("t0".to_string(), id2));
+                assert_eq!(
+                    store.read_attempts_raw("t1").unwrap().len(),
+                    t1_before_attempts,
+                    "advancing t0 never truncates t1's attempts"
+                );
+                assert_eq!(
+                    store.read_snapshots_raw("t1").unwrap().len(),
+                    t1_before_snaps,
+                    "advancing t0 never truncates t1's snapshots"
+                );
+                for id in t1_before_dirs {
+                    assert!(
+                        store.deployment_dir(&id).exists(),
+                        "advancing t0 never deletes t1's deployment dir {id}"
+                    );
+                }
+                // t1's retained ARTIFACT content survives t0's advance + GC
+                // (shared-content protection across targets).
+                let after = store_release_ids(&store);
+                for rid in &t1_before_releases {
+                    if gc_oracle(&store, &["t1"]).1.contains(rid) {
+                        assert!(
+                            after.contains(rid),
+                            "advancing t0 must not delete t1's retained release {rid}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // t1's checkpoint (if any).
+        if let (Some(ck), false) = (&case.t1_ck, s1.is_empty()) {
+            let pos = ck % s1.len();
+            let id = s1[pos].clone();
+            let rep = run_checkpoint(&store, "t1", &DeploymentId::new(id.clone()), false)
+                .expect("t1's checkpoint commits");
+            assert!(rep.established, "t1's checkpoint establishes the floor");
+            assert!(
+                !rep.cleanup_pending && rep.gc.completed,
+                "t1's post-commit pass converges"
+            );
+            floor1 = Some((id.clone(), pos as u64));
+            ran_any_checkpoint = true;
+            last_ck = Some(("t1".to_string(), id));
+        }
+
+        // When NOTHING could run a checkpoint (both targets have no
+        // successful deployment), drive the GC directly so the reclamation
+        // invariants still hold (the fault, if any, is injected the same
+        // way — one-shot, keyed by an anchor, converged by the retry).
+        if !ran_any_checkpoint {
+            if fault_armed {
+                match case.fault {
+                    1 => store.fault_registry().arm_gc_scan("fault-direct"),
+                    2 => store
+                        .fault_registry()
+                        .arm_gc_delete_releases("fault-direct"),
+                    _ => store.fault_registry().arm_gc_delete_trees("fault-direct"),
+                }
+                let err = store
+                    .gc_artifacts("fault-direct")
+                    .expect_err("the injected GC fault aborts the pass");
+                assert!(
+                    err.to_string().contains("test fault"),
+                    "the injected GC fault aborts, got: {err}"
+                );
+                assert!(
+                    store.object_root(&spare_tree).join("x").exists(),
+                    "with faults, extra garbage may remain"
+                );
+                let out = store
+                    .gc_artifacts("fault-direct")
+                    .expect("the retry recomputes reachability and converges");
+                assert!(out.completed, "the retried pass completes");
+            } else {
+                store
+                    .gc_artifacts("test-direct")
+                    .expect("the direct pass converges");
+            }
+        }
+
+        // The CONVERGED state: assert the retained/reclaimed contract and
+        // the visible history (invariants 1-4, 6).
+        let floors0 = [floor0.clone(), floor1.clone()];
+        assert_gc_converged(&store, case, &floors0);
+
+        // 7. REPEATING A COMPLETED CHECKPOINT IS IDEMPOTENT: re-running
+        // the last checkpoint reports a no-op, leaves the durable floor
+        // untouched, and deletes nothing new (the re-run's own GC finds the
+        // same retained set).
+        if let Some((t, id)) = &last_ck {
+            let floor_before = store.read_history_floor(t).unwrap();
+            let releases_before = store_release_ids(&store);
+            let trees_before = store_tree_ids(&store);
+            let rep = run_checkpoint(&store, t, &DeploymentId::new(id.clone()), false)
+                .expect("repeating a completed checkpoint succeeds");
+            assert!(
+                !rep.established,
+                "repeating a completed checkpoint is an idempotent no-op"
+            );
+            assert!(
+                !rep.cleanup_pending && rep.gc.completed,
+                "the idempotent repeat stays converged"
+            );
+            assert_eq!(
+                store.read_history_floor(t).unwrap(),
+                floor_before,
+                "the durable floor is untouched by the repeat"
+            );
+            assert_eq!(
+                store_release_ids(&store),
+                releases_before,
+                "the idempotent repeat deletes no release record"
+            );
+            assert_eq!(
+                store_tree_ids(&store),
+                trees_before,
+                "the idempotent repeat deletes no tree object"
+            );
+        }
+    }
+
+    proptest! {
+        // THE GC PROPERTY FAMILY: over generated (targets, per-target
+        // histories, SHARED releases, SHARED trees, pins, incomplete
+        // operations, injected GC faults), asserting all eight invariants —
+        // no reachable/pinned artifact ever deleted; a pin never keeps
+        // pre-floor history visible; another target's references protect
+        // shared content; without faults every unreachable release/tree is
+        // removed; with faults extra garbage may remain but required
+        // content never disappears; repeating cleanup converges; repeating a
+        // completed checkpoint is idempotent; advancing one target never
+        // truncates another target's history. Fixed seed 0x5EED_5EED +
+        // bounded cases — the same vectors run on every invocation.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn artifact_gc_properties(case in gc_case_strategy()) {
+            run_gc_case(&case);
+        }
+    }
+    /// A minimal hand-built release with variants `{v0: v0_tree, v1:
+    /// v1_tree}` — a valid, content-verified record. The caller creates the
+    /// object dirs for the trees itself.
+    fn gc_simple_release(
+        store: &LocalStore,
+        label: &str,
+        v0_tree: &TreeDigest,
+        v1_tree: &TreeDigest,
+    ) -> ReleaseId {
+        let variants = BTreeMap::from([
+            (VariantName::new("v0"), v0_tree.clone()),
+            (VariantName::new("v1"), v1_tree.clone()),
+        ]);
+        let slots: BTreeMap<String, Vec<crate::config::SlotDef>> = variants
+            .keys()
+            .map(|v| {
+                (
+                    v.as_str().to_string(),
+                    vec![crate::config::SlotDef {
+                        id: format!("p1-{}", v.as_str()),
+                        server: "s1".to_string(),
+                        deploy_dir: Path::new("/srv/deploy/p1").to_path_buf(),
+                        targets: vec!["t1".to_string()],
+                    }],
+                )
+            })
+            .collect();
+        let rec = crate::release::build_release(
+            &format!("map-gc-{label}"),
+            &format!("bh-gc-{label}"),
+            &variants,
+            &slots,
+            Path::new("."),
+        );
+        let id = ReleaseId::new(rec.release_id.clone());
+        store.write_release(&rec).unwrap();
+        id
+    }
+
+    /// Seed one attempt on `target` (attempt + deployment dir + plan +
+    /// snapshot on success + transitions), tracking the target's snapshot
+    /// index counter and the observed artifact (`observed` is set to the
+    /// LAST SUCCESSFUL binding — the fixture's observed state).
+    fn gc_seed_attempt(
+        store: &LocalStore,
+        target: &str,
+        id: &str,
+        ok: bool,
+        binding: &ArtifactRef,
+        next_index: &mut u64,
+        observed: &mut Option<ArtifactRef>,
+    ) {
+        store
+            .append_attempt(target, &gc_attempt(target, id, binding))
+            .unwrap();
+        std::fs::create_dir_all(store.deployment_dir(id)).unwrap();
+        store.write_plan(id, &gc_plan(target, id, binding)).unwrap();
+        store
+            .append_transition(id, &DeploymentStatus::InProgress, None)
+            .unwrap();
+        if ok {
+            store
+                .append_snapshot(target, &gc_snapshot(*next_index, id, target, binding))
+                .unwrap();
+            *next_index += 1;
+            store
+                .append_transition(id, &DeploymentStatus::Successful, None)
+                .unwrap();
+            *observed = Some(binding.clone());
+        } else {
+            store
+                .append_transition(id, &DeploymentStatus::FailedRolledBack, None)
+                .unwrap();
+        }
+    }
+
+    /// Write a target's observed.json from the tracked `observed` artifact.
+    fn gc_write_observed(store: &LocalStore, target: &str, observed: &Option<ArtifactRef>) {
+        let o = ObservedTarget {
+            target: TargetName::new(target.to_string()),
+            slots: BTreeMap::from([(
+                PlacementSlotId::new("p1"),
+                ObservedServer {
+                    generation: None,
+                    artifact: observed.clone(),
+                    last_deployment: None,
+                },
+            )]),
+        };
+        store.write_observed(target, &o).unwrap();
+    }
+
+    /// INVARIANT 2 (deterministic): a PIN retains artifact content ONLY. A
+    /// whole-release pin on a release whose ONLY history reference is below
+    /// the new floor keeps the release record and EVERY variant tree — but
+    /// the pre-floor attempt/snapshot STAYS discarded: the floor-gated reads
+    /// expose only the suffix, the below-floor ref stays refused, and the
+    /// pin never reinserts or resurrects history.
+    #[test]
+    fn gc_pin_never_keeps_prefloor_history_visible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        // Trees T0,T1,T2; R0 {v0:T0, v1:T1}; R1 {v0:T1, v1:T2}.
+        let trees = [
+            TreeDigest::new("t0".to_string()),
+            TreeDigest::new("t1".to_string()),
+            TreeDigest::new("t2".to_string()),
+        ];
+        for t in &trees {
+            let root = store.object_root(t);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("x"), b"x").unwrap();
+        }
+        let r0 = gc_simple_release(&store, "0", &trees[0], &trees[1]);
+        let r1 = gc_simple_release(&store, "1", &trees[1], &trees[2]);
+        // t0 history: attempt t0-00 = R1/v1 (T2) → s0; attempt t0-01 =
+        // R0/v0 (T0) → s1. Checkpoint at s1: R1's ONLY reference (t0-00)
+        // lies BELOW the floor and is discarded.
+        let mut next = 0u64;
+        let mut observed: Option<ArtifactRef> = None;
+        gc_seed_attempt(
+            &store,
+            "t0",
+            "t0-00",
+            true,
+            &gc_binding(&r1, 1, &trees[2]),
+            &mut next,
+            &mut observed,
+        );
+        gc_seed_attempt(
+            &store,
+            "t0",
+            "t0-01",
+            true,
+            &gc_binding(&r0, 0, &trees[0]),
+            &mut next,
+            &mut observed,
+        );
+        gc_write_observed(&store, "t0", &observed);
+        // PIN R1: its record and EVERY variant tree (T1, T2) must survive
+        // the GC even though its only history reference is discarded.
+        store
+            .write_pins(&Pins {
+                schema_version: crate::model::PINS_SCHEMA_VERSION,
+                releases: vec![r1.clone()],
+                bindings: Vec::new(),
+            })
+            .unwrap();
+
+        let rep = run_checkpoint(&store, "t0", &DeploymentId::new("t0-01".to_string()), false)
+            .expect("the checkpoint commits");
+        assert!(rep.established);
+        assert!(
+            !rep.cleanup_pending && rep.gc.completed,
+            "the pass converges"
+        );
+
+        // HISTORY: only the suffix (s1) is visible; s0 refuses; the pinned
+        // pre-floor deployment is gone from the raw logs too (the pin never
+        // resurrects it).
+        let snaps = store.read_snapshots("t0").unwrap();
+        assert_eq!(
+            snaps.iter().map(|s| s.index).collect::<Vec<_>>(),
+            vec![1],
+            "only the checkpoint snapshot stays visible"
+        );
+        assert_eq!(
+            store.read_attempts("t0").unwrap()[0].deployment_id.as_str(),
+            "t0-01",
+            "the visible attempts start at the checkpoint attempt"
+        );
+        let err = history::resolve_ref_expr(&history::parse_ref_expr("s0").unwrap(), "t0", &store)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("history floor"),
+            "below-floor s0 stays refused even though a pin names its release, got: {err}"
+        );
+        assert!(
+            !store.deployment_dir("t0-00").exists(),
+            "the below-floor deployment dir is deleted despite the pin"
+        );
+        let raw = store.read_attempts_raw("t0").unwrap();
+        assert!(
+            !raw.iter().any(|a| a.deployment_id.as_str() == "t0-00"),
+            "the pinned release never reinserts the below-floor attempt"
+        );
+        // CONTENT: the pinned release record + every variant tree survive.
+        assert!(store.release_dir(&r1).join("release.json").exists());
+        for t in [&trees[1], &trees[2]] {
+            assert!(
+                store
+                    .base()
+                    .join(crate::layout::objects())
+                    .join(t.as_str())
+                    .exists(),
+                "a release pin retains every variant tree, got {t} missing"
+            );
+        }
+        // The release record R0 (retained via the floor attempt's binding)
+        // survives; T0 survives (its binding is retained).
+        assert!(store.release_dir(&r0).join("release.json").exists());
+        assert!(
+            store
+                .base()
+                .join(crate::layout::objects())
+                .join("t0")
+                .exists()
+        );
+    }
+
+    /// INVARIANT 3 (deterministic): another target's references protect
+    /// SHARED content. t0's checkpoint discards its own references to R1
+    /// and its tree; t1's (floor-less, fully retained) history references
+    /// R1/T2, so R1 and T2 survive the global GC. A release referenced by
+    /// NOBODY (R2) and the tree nobody binds (T1 — only named by release
+    /// variant maps, never by a binding or pin) are reclaimed.
+    #[test]
+    fn gc_shared_content_protected_across_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        let trees = [
+            TreeDigest::new("t0".to_string()),
+            TreeDigest::new("t1".to_string()),
+            TreeDigest::new("t2".to_string()),
+        ];
+        for t in &trees {
+            let root = store.object_root(t);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("x"), b"x").unwrap();
+        }
+        // R0 {v0:T0, v1:T1}; R1 {v0:T1, v1:T2}; R2 {v0:T0, v1:T2} (never
+        // referenced by any history).
+        let r0 = gc_simple_release(&store, "0", &trees[0], &trees[1]);
+        let r1 = gc_simple_release(&store, "1", &trees[1], &trees[2]);
+        let r2 = gc_simple_release(&store, "2", &trees[0], &trees[2]);
+        // t0: [ok R1/v1 (s0), ok R0/v0 (s1)] — checkpoint at s1 discards the
+        // R1 reference. t1: [ok R1/v1] — full history (no floor) retains it.
+        let mut next0 = 0u64;
+        let mut obs0: Option<ArtifactRef> = None;
+        gc_seed_attempt(
+            &store,
+            "t0",
+            "t0-00",
+            true,
+            &gc_binding(&r1, 1, &trees[2]),
+            &mut next0,
+            &mut obs0,
+        );
+        gc_seed_attempt(
+            &store,
+            "t0",
+            "t0-01",
+            true,
+            &gc_binding(&r0, 0, &trees[0]),
+            &mut next0,
+            &mut obs0,
+        );
+        gc_write_observed(&store, "t0", &obs0);
+        let mut next1 = 0u64;
+        let mut obs1: Option<ArtifactRef> = None;
+        gc_seed_attempt(
+            &store,
+            "t1",
+            "t1-00",
+            true,
+            &gc_binding(&r1, 1, &trees[2]),
+            &mut next1,
+            &mut obs1,
+        );
+        gc_write_observed(&store, "t1", &obs1);
+
+        let rep = run_checkpoint(&store, "t0", &DeploymentId::new("t0-01".to_string()), false)
+            .expect("the checkpoint commits");
+        assert!(rep.established && !rep.cleanup_pending && rep.gc.completed);
+
+        // R1 + T2 survive (t1 references them); R2 (referenced by nobody)
+        // and T1 (bound by no retained binding — only release maps) are
+        // reclaimed; R0 + T0 survive (t0's floor attempt references them).
+        assert!(store.release_dir(&r0).join("release.json").exists());
+        assert!(
+            store.release_dir(&r1).join("release.json").exists(),
+            "t1's references protect shared release R1"
+        );
+        assert!(
+            !store.release_dir(&r2).join("release.json").exists(),
+            "R2 is unreachable and reclaimed"
+        );
+        for (t, present) in [(&trees[0], true), (&trees[1], false), (&trees[2], true)] {
+            let exists = store
+                .base()
+                .join(crate::layout::objects())
+                .join(t.as_str())
+                .exists();
+            assert_eq!(
+                exists,
+                present,
+                "tree {} must {} after the GC",
+                t,
+                if present { "survive" } else { "be reclaimed" }
+            );
+        }
+        // t1's history is untouched (no floor on t1).
+        assert!(store.read_history_floor("t1").unwrap().is_none());
+        assert_eq!(store.read_snapshots("t1").unwrap().len(), 1);
+    }
+
+    /// INVARIANTS 5 + 6 (deterministic, exhaustive over the three GC fault
+    /// kinds): with a fault, the GC aborts fail-closed — the checkpoint
+    /// reports cleanup_pending (never an Err), the floor stands, NOTHING
+    /// required is deleted, and the unreachable spare content REMAINS
+    /// (extra garbage). Repeating the SAME checkpoint (the one-shot fault
+    /// disarmed) recomputes reachability fresh and CONVERGES: the spare
+    /// content is reclaimed and the required content is untouched.
+    #[test]
+    fn every_gc_fault_keeps_required_content_and_retry_converges_exhaustively() {
+        for fault in [1u8, 2, 3] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+            let trees = [
+                TreeDigest::new("t0".to_string()),
+                TreeDigest::new("t1".to_string()),
+            ];
+            for t in &trees {
+                let root = store.object_root(t);
+                std::fs::create_dir_all(&root).unwrap();
+                std::fs::write(root.join("x"), b"x").unwrap();
+            }
+            // Spare tree: unreachable from the start.
+            let spare = TreeDigest::new("spare".to_string());
+            std::fs::create_dir_all(store.object_root(&spare)).unwrap();
+            std::fs::write(store.object_root(&spare).join("x"), b"x").unwrap();
+            let r0 = gc_simple_release(&store, "0", &trees[0], &trees[1]);
+            // t0: [ok R0/v0 (s0), ok R0/v0 (s1)] — checkpoint at s1; the
+            // RETAINED content is R0 + T0 (the floor attempt's binding).
+            let mut next = 0u64;
+            let mut obs: Option<ArtifactRef> = None;
+            gc_seed_attempt(
+                &store,
+                "t0",
+                "t0-00",
+                true,
+                &gc_binding(&r0, 0, &trees[0]),
+                &mut next,
+                &mut obs,
+            );
+            gc_seed_attempt(
+                &store,
+                "t0",
+                "t0-01",
+                true,
+                &gc_binding(&r0, 0, &trees[0]),
+                &mut next,
+                &mut obs,
+            );
+            gc_write_observed(&store, "t0", &obs);
+
+            match fault {
+                1 => store.fault_registry().arm_gc_scan("t0-01"),
+                2 => store.fault_registry().arm_gc_delete_releases("t0-01"),
+                _ => store.fault_registry().arm_gc_delete_trees("t0-01"),
+            }
+            let rep = run_checkpoint(&store, "t0", &DeploymentId::new("t0-01".to_string()), false)
+                .expect("a post-commit GC fault is committed-with-warning, never an Err");
+            assert!(rep.established, "the floor stands through the fault");
+            assert!(
+                rep.cleanup_pending && !rep.gc.completed,
+                "fault {fault}: the GC failure is surfaced as cleanup_pending"
+            );
+            // REQUIRED content never disappears.
+            assert!(store.release_dir(&r0).join("release.json").exists());
+            assert!(
+                store
+                    .base()
+                    .join(crate::layout::objects())
+                    .join("t0")
+                    .exists()
+            );
+            // EXTRA garbage may remain (nothing was deleted).
+            assert!(
+                store.object_root(&spare).join("x").exists(),
+                "fault {fault}: extra garbage may remain — the spare tree is untouched"
+            );
+            // The visible history is already the floored suffix (the floor
+            // is the enforcement point even mid-GC-failure).
+            assert_eq!(store.read_snapshots("t0").unwrap().len(), 1);
+            assert_eq!(store.read_snapshots_raw("t0").unwrap().len(), 1);
+
+            // RETRY: the one-shot fault is disarmed; the same checkpoint
+            // recomputes reachability fresh and converges.
+            let retry =
+                run_checkpoint(&store, "t0", &DeploymentId::new("t0-01".to_string()), false)
+                    .expect("the retry converges");
+            assert!(
+                !retry.cleanup_pending && retry.gc.completed,
+                "fault {fault}: the repeated checkpoint converges"
+            );
+            assert!(
+                !store.object_root(&spare).exists(),
+                "fault {fault}: the converged retry reclaims the spare tree"
+            );
+            assert!(store.release_dir(&r0).join("release.json").exists());
+            assert!(
+                store
+                    .base()
+                    .join(crate::layout::objects())
+                    .join("t0")
+                    .exists()
+            );
+        }
+    }
+
+    /// INVARIANTS 7 + 8 (deterministic): repeating a completed checkpoint is
+    /// idempotent (no-op, floor untouched, no new deletions) and advancing
+    /// one target never truncates the other target's history or artifact
+    /// content. Both are asserted inside [`run_gc_case`] too; these fixed
+    /// scenarios guarantee the flags always exercise them.
+    #[test]
+    fn gc_idempotent_repeat_and_advance_deterministic() {
+        // A two-success, two-target case with a SHARED release, an advance
+        // on t0, and no faults: exercises convergence + idempotency (the
+        // final repeat) + cross-target protection (the advance).
+        run_gc_case(&GcCase {
+            n_trees: 2,
+            n_releases: 2,
+            t0_steps: vec![
+                GcStep {
+                    ok: true,
+                    rel: 0,
+                    variant: 0,
+                },
+                GcStep {
+                    ok: true,
+                    rel: 1,
+                    variant: 1,
+                },
+                GcStep {
+                    ok: true,
+                    rel: 0,
+                    variant: 1,
+                },
+            ],
+            t1_steps: vec![
+                GcStep {
+                    ok: true,
+                    rel: 1,
+                    variant: 1,
+                },
+                GcStep {
+                    ok: true,
+                    rel: 1,
+                    variant: 0,
+                },
+            ],
+            t0_ck: 0,
+            t1_ck: None,
+            pin_release: None,
+            pin_binding: false,
+            incomplete: true,
+            fault: 0,
+            advance: true,
+        });
+        // A fault case with BOTH targets checkpointed: the faulted retry
+        // converges, t1's checkpoint converges, and the final repeat (of
+        // t1) is idempotent.
+        run_gc_case(&GcCase {
+            n_trees: 3,
+            n_releases: 2,
+            t0_steps: vec![
+                GcStep {
+                    ok: true,
+                    rel: 0,
+                    variant: 1,
+                },
+                GcStep {
+                    ok: false,
+                    rel: 1,
+                    variant: 0,
+                },
+                GcStep {
+                    ok: true,
+                    rel: 1,
+                    variant: 1,
+                },
+            ],
+            t1_steps: vec![GcStep {
+                ok: true,
+                rel: 0,
+                variant: 0,
+            }],
+            t0_ck: 2,
+            t1_ck: Some(0),
+            pin_release: Some(1),
+            pin_binding: true,
+            incomplete: false,
+            fault: 3,
+            advance: false,
+        });
     }
 }

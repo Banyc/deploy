@@ -100,7 +100,7 @@ addresses need neither.
 | `deploy push <target> [ref]` | Deploy local files (or restore a ref) to every server in the target, in rollout batches. |
 | `deploy log <target>` | Deployment history — successful *and* failed attempts, each line prefixed with the snapshot id (`sN`) it produced (`-` for attempts with no snapshot). The visible history is the retained suffix when a checkpoint has been established. |
 | `deploy status <target>` | What is actually running on each server right now (generation, release, variant, tree). |
-| `deploy checkpoint <target> <deployment-id>` | Establish a monotonic HISTORY FLOOR at a successful deployment (irreversible — requires `--yes`; `--dry-run` previews the discard list). |
+| `deploy checkpoint <target> <deployment-id>` | Establish a monotonic HISTORY FLOOR at a successful deployment, then compact the history and run best-effort local artifact garbage collection (irreversible — requires `--yes`; `--dry-run` previews the discard list). |
 
 Global flag: `--config <path>` selects a different `deploy.toml` than
 `./deploy.toml` (usable anywhere on the command line).
@@ -211,10 +211,41 @@ deploy push production s3   # the checkpoint snapshot stays the oldest rollback
   floor" — and the NEXT checkpoint repairs the torn state AUTOMATICALLY by
   restoring the validated backup (rename + parent fsync): recovery
   restores, never deletes, the only valid floor.
-- Only `deployments/<id>/` directories strictly before the floor are
-  deleted: release records, tree objects, remote generations, and pinned
-  artifacts are never touched, and checkpointing one target never changes
-  another target's history.
+- The checkpoint ALSO runs LOCAL HISTORY COMPACTION + ARTIFACT GARBAGE
+  COLLECTION as its post-commit best-effort maintenance, reported as four
+  distinguishable outcomes: (a) the logical checkpoint is established
+  (the durable floor); (b) the history files are compacted (the below-floor
+  `deployments/<id>/` directories deleted and `attempts.jsonl` /
+  `snapshots.jsonl` rewritten to the retained suffix); (c) artifact garbage
+  collection completed — a GLOBAL, reachability-based pass that unlinks the
+  release records (`releases/<release-id>/`) and tree objects
+  (`objects/sha256/<digest>/`) no longer reachable from any target's
+  retained history, any retained deployment record (unfinished operations
+  included), any target's current observed artifact, or any configured pin;
+  (d) cleanup incomplete and retry required — a post-commit maintenance
+  failure never moves or removes the established floor and never deletes
+  anything in the retained set, the report says so explicitly, and
+  re-running the same checkpoint converges. Reachability is recomputed from
+  the whole store on every run: there is no persisted deletion worklist.
+- PINS (`<store>/pins.json`) retain ARTIFACT CONTENT ONLY. A pin — by
+  release id (marks every variant/tree in that release record) or by exact
+  binding `(release, variant, tree)` — protects the release record and tree
+  object from the garbage collector, but it NEVER keeps an old deployment,
+  attempt, or snapshot in history: the floor-gated reads stay keyed on the
+  history floor, so a pinned pre-floor artifact's bytes survive while its
+  history stays discarded. These store-level pins are the checkpoint GC's
+  anchors, distinct from the rotation subsystem's project-file `[[pins]]`
+  (which protect the remote rotation retained set; the checkpoint flow is
+  store-only and never loads `deploy.toml`).
+- "Disk cleanup" means unlinking unreachable files/directories and syncing
+  the affected directories so filesystem space can be reclaimed — NOT secure
+  physical erasure: SSD firmware, copy-on-write filesystems, snapshots,
+  journals, and backups may retain old blocks. The checkpoint never contacts
+  servers; remote artifact cleanup remains rotation's responsibility.
+- Checkpointing one target never changes another target's history: the
+  floor, compaction, and cleanup are per-target for history and global only
+  for the shared artifact store (where another target's references protect
+  shared content).
 
 ## Project structure (forced)
 

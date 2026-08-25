@@ -88,6 +88,14 @@ pub const TREE_SCHEMA_VERSION: u32 = 1;
 /// intact logs, which converges and clears the stale marker.
 pub const CLEANUP_PENDING_SCHEMA_VERSION: u32 = 2;
 
+/// The `pins.json` record format version (`Pins.schema_version`). Pins are
+/// durable, store-global retention anchors for artifact CONTENT ONLY (see
+/// [`crate::records::Pins`]): a pin never retains or reinserts an old
+/// deployment, attempt, or snapshot in history. Readers refuse any other
+/// version (fail closed — a pins file from a different schema is never
+/// silently interpreted).
+pub const PINS_SCHEMA_VERSION: u32 = 1;
+
 fn new_uuid_v7() -> String {
     Uuid::now_v7().to_string()
 }
@@ -356,7 +364,7 @@ pub struct ResolvedVariant {
 /// the artifact relationship — plans, attempts, observed state, generation
 /// records, and snapshots all express it through [`ArtifactRef`] instead
 /// of re-declaring the three fields.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default)]
 pub struct ArtifactRef {
     pub release: ReleaseId,
     pub variant: VariantName,

@@ -226,6 +226,22 @@ pub(crate) mod test_faults {
         /// re-clears; the report surfaces it truthfully as
         /// `CheckpointReport::cleanup_clear_failed`.
         ClearCleanupPending,
+        /// The artifact garbage collection SCAN (the retained-set
+        /// computation of [`crate::store::gc`]), keyed by the checkpoint
+        /// deployment id. Post-commit maintenance: a failure aborts the
+        /// pass BEFORE any deletion (fail closed — nothing is ever unlinked
+        /// against a partial retained set), the durable debt flag records
+        /// the pending cleanup, and the retry recomputes reachability
+        /// fresh.
+        GcScan,
+        /// The artifact GC's RELEASE-RECORD deletion phase, keyed by the
+        /// checkpoint deployment id. Fires before any release dir is
+        /// removed: the unreachable release records stay on disk (extra
+        /// garbage, never less) and the retry reclaims them.
+        GcDeleteReleases,
+        /// The artifact GC's TREE-OBJECT deletion phase, keyed by the
+        /// checkpoint deployment id. Fires before any tree dir is removed.
+        GcDeleteTrees,
     }
 
     /// A per-fixture one-shot fault registry.
@@ -530,6 +546,29 @@ pub(crate) mod test_faults {
         /// the report as `cleanup_clear_failed`.
         pub(crate) fn arm_clear_cleanup_pending(&self, target: &str) {
             self.arm(FaultKind::ClearCleanupPending, target);
+        }
+
+        /// Arm the next artifact-GC SCAN for `deployment_id` (the
+        /// checkpoint that triggers the GC) to fail once: the retained-set
+        /// computation aborts BEFORE any deletion (fail closed), the
+        /// checkpoint reports cleanup pending, and the retry recomputes
+        /// reachability fresh.
+        pub(crate) fn arm_gc_scan(&self, deployment_id: &str) {
+            self.arm(FaultKind::GcScan, deployment_id);
+        }
+
+        /// Arm the next artifact-GC RELEASE deletion phase to fail once
+        /// (keyed by the checkpoint deployment id): the unreachable release
+        /// records stay on disk (extra garbage, never less) and the retry
+        /// reclaims them.
+        pub(crate) fn arm_gc_delete_releases(&self, deployment_id: &str) {
+            self.arm(FaultKind::GcDeleteReleases, deployment_id);
+        }
+
+        /// Arm the next artifact-GC TREE deletion phase to fail once (keyed
+        /// by the checkpoint deployment id).
+        pub(crate) fn arm_gc_delete_trees(&self, deployment_id: &str) {
+            self.arm(FaultKind::GcDeleteTrees, deployment_id);
         }
     }
 }

@@ -350,6 +350,7 @@ The local store contains the exact immutable trees sent to servers, immutable re
       plan.json
       results.json
       transitions.jsonl
+  pins.json                  # optional store-global artifact retention pins
 ```
 
 The records model splits deployment identity from mutable status:
@@ -404,11 +405,20 @@ later deployment updates the floor TRANSACTIONALLY (below); an EARLIER
 deployment than the current floor is refused (a checkpoint can never move
 backward after older history has been discarded). The CLI requires an
 explicit deployment id and `--yes` for the real operation; `--dry-run`
-enumerates exactly what would be discarded and touches nothing. Only
-`deployments/<id>/` dirs strictly before the floor are ever deleted: release
-records, tree objects, remote generations, and pinned artifacts are never
-removed, and checkpointing one target never changes another target's
-history. The raw (unfiltered) readers are the internal index-minting view:
+enumerates exactly what would be discarded and touches nothing. The
+checkpoint's post-commit maintenance then runs in two best-effort passes —
+LOCAL HISTORY COMPACTION (delete the below-floor `deployments/<id>/` dirs,
+atomically rewrite the logs to the retained suffix) followed by GLOBAL
+ARTIFACT GARBAGE COLLECTION (see below) — and the report distinguishes four
+outcomes: (a) the LOGICAL CHECKPOINT is established (the durable floor);
+(b) the HISTORY FILES are compacted; (c) ARTIFACT GARBAGE COLLECTION
+completed; (d) CLEANUP INCOMPLETE and retry required. A failure in either
+post-commit phase NEVER moves or removes the established floor and NEVER
+deletes anything in the retained set: it records the durable
+`targets/<target>/refs/cleanup-pending.json` debt flag and the report warns
+explicitly, and re-running the SAME checkpoint converges. Reachability is
+recomputed fresh on every run — no persisted deletion worklist. The raw
+(unfiltered) readers are kept for the internal index-minting view:
 snapshot indices are always `max(index) + 1` over the physical log, so
 compaction can never reuse an index and appends after a checkpoint stay
 unique and increasing.
@@ -505,10 +515,96 @@ metadata lives outside the tree object. For example, `release.json` is:
 This separation allows two releases or variants with identical bytes to share one tree safely. The `slots` member is the release's OWN canonical per-variant slot snapshot — each variant's `[[slots]]` declarations in canonical form (`id`/`server`/`deploy_dir`/`targets`, `deploy_dir` lexically normalized, `targets` sorted, slots sorted by id) — frozen into the record and folded into the release digest. Historical and rollback pushes resolve slot→variant bindings from this snapshot rather than the caller's current variant files. A record with an EMPTY slot snapshot (the pre-snapshot shape) is rejected at the store boundary: `write_release` refuses to persist it and `read_release` refuses to return it, so the old current-config fallback for `slots`-less records is unreachable for any verified record (fail closed). Release records and tree objects are immutable; attempts to replace an existing ID or digest with different content fail.
 
 Local target state is a mirror and cache, not unquestioned authority. Before a mutating operation, the tool reconciles it with the actual remote generation, object inventory, and in-progress transaction state. If a remote retains a
-verified tree that is missing locally, reconciliation downloads it into local staging, verifies its canonical digest, and republishes it into the local object store. Local-store rotation is PLANNED, not yet implemented: it must never remove an object still retained on a known remote server. Today rotation is remote-only — per server, under the mutation lock — so the local object store never deletes published trees and always keeps them recoverable.
+verified tree that is missing locally, reconciliation downloads it into local staging, verifies its canonical digest, and republishes it into the local object store. Remote artifact cleanup remains ROTATION's responsibility (per server, under the mutation lock); the checkpoint's local GC (below) never contacts servers. The only LOCAL artifact deletion path is the checkpoint's reachability-based garbage collection: it deletes release records and tree objects that are unreachable from every target's retained history, observed state, retained deployment records, and pins — a checkpoint can never delete content a server still runs, because the current observed artifact of every target is always in the retained set.
 
 The local store is created with permissions accessible only to its owning user. The system treats all tree bytes as confidential because it cannot know which files contain sensitive material. It never logs file contents; manifests and logs contain paths, modes, and digests only.
 
+
+### Local artifact garbage collection (checkpoints) and pins
+
+A checkpoint's post-commit maintenance ends with a GLOBAL, best-effort
+ARTIFACT GARBAGE COLLECTION pass (`src/store/gc.rs`): after the history
+floor + compaction succeed, it scans the WHOLE local store, computes the
+RETAINED SET of complete artifact bindings `(release_id, variant,
+tree_digest)`, and unlinks every `releases/<release-id>/` directory and
+`objects/sha256/<digest>/` directory that is NOT in it. Retaining a binding
+keeps BOTH its release record and its tree object.
+
+GC is GLOBAL because release records and tree objects are content-addressed
+and SHARED: the same release or tree can be referenced by many targets, so
+the retained set cannot be computed per target. It is derived from:
+
+1. Every snapshot at/above every target's history floor — and, for a target
+   WITHOUT a floor, its complete history (the same floor-gated suffix every
+   read path exposes).
+2. Every attempt in the same retained suffix (its `desired` assignments).
+3. Every retained deployment record, including unfinished operations — every
+   `deployments/<id>/` directory the retained history names (and every
+   orphaned/torn directory no log names at all), whose `plan.json` carries
+   the per-slot artifact references, the `desired_release`, and the plan
+   source. A pending/in-progress operation whose deployment is retained
+   stays recoverable: its plan's references are retained with it. A
+   deployment record BELOW a floor is discarded with the rest of the
+   below-floor history (its artifacts are garbage unless another source
+   references them).
+4. Every target's CURRENT OBSERVED artifact (`observed.json`).
+5. Every configured pin (below).
+6. Recovery-required local state — the retained deployment plans, the
+   observed artifacts, and the release records/tree objects they name; the
+   staging area is rebuildable and never retained.
+
+"Disk cleanup" means unlinking the unreachable files/directories and syncing
+the affected parent directories (`releases/`, `objects/sha256/`) so the
+space can be reclaimed. It is NOT secure physical erasure: SSD firmware,
+copy-on-write filesystems, snapshots, journals, and backups may retain old
+blocks after the unlink.
+
+The pass is POST-COMMIT MAINTENANCE with the checkpoint's failure contract:
+a failure never moves or removes the established floor and never deletes
+anything in the retained set — the scan fails CLOSED before any unlink it
+cannot prove safe (an unreadable floor, log, plan, observed record, pins
+file, or pinned release record aborts the pass) — the durable
+`cleanup-pending.json` debt flag records the outstanding cleanup, and the
+report says "cleanup incomplete" (the re-run of the same checkpoint retries
+and converges). Reachability is RECOMPUTED fresh on every run: no deletion
+worklist is ever persisted.
+
+PINS (`<store>/pins.json`) are store-global retention anchors for ARTIFACT
+CONTENT ONLY:
+
+```json
+{
+  "schema_version": 1,
+  "releases": ["rel-sha256-..."],                       // whole-release pins
+  "bindings": [{"release": "...", "variant": "...", "tree": "..."}]  // exact-binding pins
+}
+```
+
+A RELEASE pin marks every variant/tree in that release record (the record is
+read and its `variants` map is expanded at GC time; a pin whose record is
+missing or unverifiable closes the pass — the content it might protect is
+never deleted). An EXACT-BINDING pin keeps the `(release, variant, tree)`
+triple directly. A pin NEVER keeps an old deployment, attempt, or snapshot
+in history — the floor-gated reads and ref resolution stay keyed on the
+history floor alone, so pinning a pre-floor deployment's artifacts keeps the
+bytes but never the history — and never raises or removes a floor. These
+STORE-LEVEL pins are DISTINCT from the rotation subsystem's project-file
+`[[pins]]` (rotation pins protect the REMOTE retained set and are evaluated
+only by rotation, never by the local GC): the checkpoint flow is store-only
+by construction — it never loads `deploy.toml` and never contacts servers —
+so its retention anchors live in the store.
+
+The property test (`artifact_gc_properties`, fixed seed 0x5EED_5EED,
+bounded cases) drives the whole path over generated targets, histories,
+SHARED releases, SHARED trees, pins, incomplete operations, and injected GC
+faults and asserts: no reachable/pinned artifact is ever deleted; a pin
+never keeps pre-floor history visible; another target's references protect
+shared content; without faults every unreachable release/tree is removed;
+with faults extra garbage may remain but required content never disappears;
+repeating cleanup converges; repeating a completed checkpoint is idempotent;
+advancing one target never truncates another target's history.
+
+## Remote storage
 ## Remote storage
 Each server stores only variants it has actually received:
 
