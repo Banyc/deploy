@@ -1,3 +1,15 @@
+# The Constitution
+
+This is what the operator actually needs:
+- Push this release.
+- Return to that deployment.
+- Keep these artifacts.
+- Forget everything before this checkpoint.
+- Show what is currently running.
+
+everything else derives from and serves these rules.
+
+
 # Simple Deployment System Plan
 ## Goal
 Build a small deployment system with a Git-push-style interface
