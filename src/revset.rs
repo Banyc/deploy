@@ -59,6 +59,12 @@
 
 use crate::error::{Error, Result};
 use crate::model::{DeploymentId, ReleaseId};
+use winnow::ascii::digit1;
+use winnow::combinator::{alt, cut_err, eof, peek, preceded, terminated};
+use winnow::error::{ErrMode, ParserError};
+use winnow::stream::Stream;
+use winnow::token::{literal, rest, take_while};
+use winnow::{ModalResult, Parser};
 /// A parsed push reference BEFORE store/target resolution.
 ///
 /// The relative forms cannot be turned into a concrete [`PushRef`] without the
@@ -159,170 +165,338 @@ impl std::fmt::Display for RefExpr {
 /// deployment id).
 pub(crate) fn parse_ref_expr(token: &str) -> Result<RefExpr> {
     let t = token.trim();
-    // HEAD / the default / `@` all mean the current state.
-    if t.is_empty() || t == "HEAD" || t == "@" {
-        return Ok(RefExpr::Head);
+    let mut parser = ref_expr(token);
+    match parser.parse(t) {
+        Ok(expr) => Ok(expr),
+        Err(err) => Err(Error::r#ref(err.into_inner().0)),
+    }
+}
+
+/// A ref-grammar parse failure carrying the exact user-facing message.
+///
+/// The parser is written with `winnow` combinators over this custom error
+/// type so each failing branch can report the SAME message the hand-written
+/// parser did (the tests assert message substrings, e.g. "invalid ancestor
+/// step count").
+#[derive(Debug)]
+struct RefErr(String);
+
+impl<I> ParserError<I> for RefErr
+where
+    I: Stream,
+{
+    type Inner = Self;
+
+    fn from_input(_input: &I) -> Self {
+        RefErr("unrecognized reference".to_string())
     }
 
-    // `@-` / `@--`: the deployments before the latest (walking the
-    // deployment history).
-    if let Some(rest) = t.strip_prefix('@') {
-        let steps = match rest {
-            "-" => 1,
-            "--" => 2,
-            _ => {
-                return Err(Error::r#ref(format!(
-                    "unrecognized reference '{token}' (the only '@' forms are '@', '@-' and '@--'; \
-                    use 'parent(@, N)' for deeper steps)"
-                )));
-            }
-        };
-        return Ok(RefExpr::Relative(RelativeRef {
+    fn into_inner(self) -> std::result::Result<Self::Inner, Self> {
+        Ok(self)
+    }
+}
+
+/// A parser that always fails with the given ref message, as a CUT error:
+/// the enclosing `alt` commits to this branch's diagnosis (its shape already
+/// matched) instead of trying the next branch.
+fn ref_fail<'i, O>(msg: String) -> impl Parser<&'i str, O, ErrMode<RefErr>> {
+    move |_input: &mut &'i str| Err(ErrMode::Cut(RefErr(msg.clone())))
+}
+
+/// Zero or more whitespace, matching `str::trim`'s unicode whitespace so the
+/// `parent(...)` argument tolerance is exactly what the hand-written parser
+/// accepted (`parent(@, 3)`, `parent(@,3)`, `parent( @ , 3 )`, ...).
+fn ws0<'i>(input: &mut &'i str) -> ModalResult<&'i str, RefErr> {
+    take_while(0.., |c: char| c.is_whitespace()).parse_next(input)
+}
+
+/// The ref-grammar parser: `@`/`@-`/`@--`, `parent(<base>, N)`,
+/// `<deployment-id>[-|--]`, `release:<id>`, and the legacy forms that fail
+/// with migration hints. The `alt` order mirrors the documented dispatch;
+/// every branch consumes the WHOLE token or fails, and each branch that
+/// diagnoses a specific failure commits with a CUT error so its message
+/// survives the `alt`.
+fn ref_expr<'i>(token: &'i str) -> impl Parser<&'i str, RefExpr, ErrMode<RefErr>> + 'i {
+    move |input: &mut &'i str| {
+        alt((
+            |i: &mut &str| head_form(i),
+            |i: &mut &str| at_relative(i, token),
+            |i: &mut &str| parent_form(i, token),
+            |i: &mut &str| release_form(i, token),
+            |i: &mut &str| legacy_forms(i, token),
+            |i: &mut &str| deployment_form(i, token),
+        ))
+        .parse_next(input)
+    }
+}
+
+/// `""`, `HEAD`, `@` — the current local files (the default push).
+fn head_form(input: &mut &str) -> ModalResult<RefExpr, RefErr> {
+    alt((
+        eof.value(RefExpr::Head),
+        terminated(literal("HEAD"), eof).value(RefExpr::Head),
+        terminated(literal("@"), eof).value(RefExpr::Head),
+    ))
+    .parse_next(input)
+}
+
+/// `@-` / `@--` — 1 or 2 steps back from the latest successful deployment.
+/// Any other `@`-prefixed token is a ref error (the only `@` forms).
+fn at_relative(input: &mut &str, token: &str) -> ModalResult<RefExpr, RefErr> {
+    preceded(
+        literal('@'),
+        alt((
+            terminated(literal("-"), eof).value(1u64),
+            terminated(literal("--"), eof).value(2u64),
+            ref_fail(format!(
+                "unrecognized reference '{token}' (the only '@' forms are '@', '@-' and '@--'; \
+                use 'parent(@, N)' for deeper steps)"
+            )),
+        )),
+    )
+    .map(|steps| {
+        RefExpr::Relative(RelativeRef {
             base: RelBase::At,
             steps,
-        }));
-    }
+        })
+    })
+    .parse_next(input)
+}
 
-    // `parent(<base>, <N>)`.
-    if let Some(inner) = t.strip_prefix("parent(").and_then(|s| s.strip_suffix(')')) {
-        let (base, n) = inner.split_once(',').ok_or_else(|| {
-            Error::r#ref(format!(
-                "malformed parent() reference '{token}' (expected 'parent(<ref>, N)')"
-            ))
-        })?;
-        let steps: u64 = n
-            .trim()
-            .parse()
-            .map_err(|_| Error::r#ref(format!("invalid ancestor step count in '{token}'")))?;
-        let base_tok = base.trim();
-        let base = if base_tok == "@" {
-            RelBase::At
-        } else if f_index_digits(base_tok).is_some()
-            || (base_tok.len() > 1
-                && base_tok.starts_with('s')
-                && base_tok[1..].chars().all(|c| c.is_ascii_digit()))
-        {
-            return Err(Error::r#ref(format!(
-                "legacy snapshot-index base '{base_tok}' in '{token}' is no longer accepted: \
-                rollback payloads are keyed by deployment id — use 'parent(<deployment-id>, N)' \
-                to walk the deployment history, or the deployment id directly"
-            )));
-        } else if base_tok.starts_with("rel-sha256-")
-            || (!base_tok.is_empty() && base_tok.chars().all(|c| c.is_ascii_hexdigit()))
-        {
-            return Err(Error::r#ref(format!(
-                "legacy release-refid base '{base_tok}' in '{token}' is no longer accepted: \
-                use 'release:<id>' for the DIRECT release form"
-            )));
-        } else {
-            RelBase::Refid(parse_deployment_id(base_tok, token)?)
-        };
-        return Ok(RefExpr::Relative(RelativeRef { base, steps }));
-    }
+/// `parent(<base>, N)` — N ancestors of the base. Commits (CUT) once the
+/// `parent(` prefix is seen, so a malformed parent() is diagnosed here
+/// rather than falling through to the legacy checks.
+fn parent_form(input: &mut &str, token: &str) -> ModalResult<RefExpr, RefErr> {
+    preceded(
+        literal("parent("),
+        cut_err(|i: &mut &str| parent_inner(i, token)),
+    )
+    .parse_next(input)
+}
 
-    // `release:<id>` — the DIRECT release form (shell-safe: the token starts
-    // with the literal `release:` prefix, no slash): deploy the named release
-    // to the CURRENT target's slots from the release's OWN stored slot-variant
-    // snapshot. The id may be a full `rel-sha256-...` id or a hex digest; it
-    // needs no store lookup beyond shape validation (existence is verified at
-    // plan time). UNCHANGED by the deployment-keyed rework.
-    if let Some(id) = t.strip_prefix("release:") {
-        let valid = if let Some(rest) = id.strip_prefix("rel-sha256-") {
-            !rest.is_empty()
-        } else {
-            !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit())
-        };
-        if !valid {
-            return Err(Error::r#ref(format!(
-                "unrecognized release id '{id}' in '{token}' \
-                (expected 'release:<rel-sha256-...>' or 'release:<hex digest>')"
-            )));
-        }
-        return Ok(RefExpr::Release(ReleaseId::parse(id)));
-    }
+fn parent_inner(input: &mut &str, token: &str) -> ModalResult<RefExpr, RefErr> {
+    let _ = ws0.parse_next(input)?;
+    let base = parent_base(input, token)?;
+    let _ = (ws0, literal(',')).parse_next(input).map_err(|_| {
+        ErrMode::Cut(RefErr(format!(
+            "malformed parent() reference '{token}' (expected 'parent(<ref>, N)')"
+        )))
+    })?;
+    let _ = ws0.parse_next(input)?;
+    let steps = terminated(
+        take_while(1.., |c: char| c.is_ascii_digit()),
+        peek((ws0, literal(')'))),
+    )
+    .parse_next(input)
+    .map_err(|_| ErrMode::Cut(RefErr(format!("invalid ancestor step count in '{token}'"))))?;
+    let steps = steps
+        .parse::<u64>()
+        .map_err(|_| ErrMode::Cut(RefErr(format!("invalid ancestor step count in '{token}'"))))?;
+    let _ = (ws0, literal(')'), eof).parse_next(input).map_err(|_| {
+        ErrMode::Cut(RefErr(format!(
+            "malformed parent() reference '{token}' (expected 'parent(<ref>, N)')"
+        )))
+    })?;
+    Ok(RefExpr::Relative(RelativeRef { base, steps }))
+}
 
-    // The legacy combined form (the target repeated inline before a ref).
-    if t.contains('@') {
-        return Err(Error::r#ref(format!(
+/// The base of a `parent(<base>, N)`: `@`, a deployment id, or a legacy
+/// snapshot-index / release-refid shape (rejected with its migration hint).
+fn parent_base(input: &mut &str, token: &str) -> ModalResult<RelBase, RefErr> {
+    alt((
+        |i: &mut &str| literal("@").value(RelBase::At).parse_next(i),
+        |i: &mut &str| legacy_snapshot_base(i, token),
+        |i: &mut &str| legacy_release_base(i, token),
+        |i: &mut &str| deployment_id_base(i, token),
+    ))
+    .parse_next(input)
+}
+
+/// The legacy `f<digits>` / `s<digits>` snapshot-index base inside
+/// `parent(...)` — rejected with the deployment-keyed migration hint.
+fn legacy_snapshot_base(input: &mut &str, token: &str) -> ModalResult<RelBase, RefErr> {
+    let base = terminated(
+        (alt((literal('f'), literal('s'))), digit1).take(),
+        peek((ws0, literal(','))),
+    )
+    .parse_next(input)?;
+    Err(ErrMode::Cut(RefErr(format!(
+        "legacy snapshot-index base '{base}' in '{token}' is no longer accepted: \
+        rollback payloads are keyed by deployment id — use 'parent(<deployment-id>, N)' \
+        to walk the deployment history, or the deployment id directly"
+    ))))
+}
+
+/// The legacy release-refid base inside `parent(...)` (a `rel-sha256-...`
+/// id or a bare hex digest) — rejected: use `release:<id>` for the DIRECT
+/// release form.
+fn legacy_release_base(input: &mut &str, token: &str) -> ModalResult<RelBase, RefErr> {
+    let base = alt((
+        preceded(literal("rel-sha256-"), take_while(0.., |c: char| c != ',')),
+        terminated(
+            take_while(1.., |c: char| c.is_ascii_hexdigit()),
+            peek((ws0, literal(','))),
+        ),
+    ))
+    .take()
+    .parse_next(input)?;
+    Err(ErrMode::Cut(RefErr(format!(
+        "legacy release-refid base '{base}' in '{token}' is no longer accepted: \
+        use 'release:<id>' for the DIRECT release form"
+    ))))
+}
+
+/// A deployment-id refid primitive (`deploy-...`, non-empty tail) inside
+/// `parent(...)`.
+fn deployment_id_base(input: &mut &str, token: &str) -> ModalResult<RelBase, RefErr> {
+    let base = take_while(0.., |c: char| c != ',').parse_next(input)?;
+    let base = base.trim();
+    if let Some(rest) = base.strip_prefix("deploy-")
+        && !rest.is_empty()
+    {
+        return Ok(RelBase::Refid(DeploymentId::new(base.to_string())));
+    }
+    Err(ErrMode::Backtrack(RefErr(format!(
+        "unrecognized reference id '{base}' in '{token}' (expected a deployment id like \
+        'deploy-...', the '@' forms, or 'release:<id>')"
+    ))))
+}
+
+/// `release:<id>` — the DIRECT release form: a full `rel-sha256-...` id or
+/// a bare hex digest.
+fn release_form(input: &mut &str, token: &str) -> ModalResult<RefExpr, RefErr> {
+    preceded(
+        literal("release:"),
+        cut_err(|i: &mut &str| release_id(i, token)),
+    )
+    .map(RefExpr::Release)
+    .parse_next(input)
+}
+
+fn release_id(input: &mut &str, token: &str) -> ModalResult<ReleaseId, RefErr> {
+    let id = rest.parse_next(input)?;
+    let valid = if let Some(r) = id.strip_prefix("rel-sha256-") {
+        !r.is_empty()
+    } else {
+        !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit())
+    };
+    if !valid {
+        return Err(ErrMode::Cut(RefErr(format!(
+            "unrecognized release id '{id}' in '{token}' (expected 'release:<rel-sha256-...>' or \
+            'release:<hex digest>')"
+        ))));
+    }
+    Ok(ReleaseId::parse(id))
+}
+
+/// The removed/legacy grammar, each shape failing with its migration hint.
+/// Every branch matches its shape then commits with a CUT error, so the hint
+/// survives the enclosing `alt`.
+fn legacy_forms(input: &mut &str, token: &str) -> ModalResult<RefExpr, RefErr> {
+    alt((
+        |i: &mut &str| legacy_target_repeated(i, token),
+        |i: &mut &str| legacy_release_slash(i, token),
+        |i: &mut &str| legacy_f_index(i),
+        |i: &mut &str| legacy_s_index(i),
+        |i: &mut &str| legacy_bare_release(i, token),
+    ))
+    .parse_next(input)
+}
+
+/// The target repeated inline (`<target>@<ref>`) — the target is passed
+/// once, on the command line.
+fn legacy_target_repeated(input: &mut &str, token: &str) -> ModalResult<RefExpr, RefErr> {
+    preceded(
+        (take_while(0.., |c: char| c != '@'), literal('@')).void(),
+        ref_fail(format!(
             "unrecognized reference '{token}' (the target is passed once, on the command line: \
             the '@' forms are '@', '@-', '@--', and 'parent(@, N)')"
-        )));
-    }
-    // The legacy `release/<id>` form is not accepted either.
-    if let Some(_id) = t.strip_prefix("release/") {
-        return Err(Error::r#ref(format!(
+        )),
+    )
+    .parse_next(input)
+}
+
+/// The legacy `release/<id>` form.
+fn legacy_release_slash(input: &mut &str, token: &str) -> ModalResult<RefExpr, RefErr> {
+    preceded(
+        literal("release/"),
+        ref_fail(format!(
             "legacy 'release/<id>' reference '{token}' is no longer accepted; \
             use 'release:<id>' for the DIRECT release form"
-        )));
-    }
-    // The `fN` legacy snapshot-index prefix.
-    if let Some(digits) = f_index_digits(t) {
-        return Err(Error::r#ref(format!(
-            "legacy 'f{digits}' snapshot-index form is no longer accepted: rollback payloads are \
-            keyed by deployment id — use 'deploy push <target> <deployment-id>' or '@- / @-- / \
-            parent(@, N)' to walk the deployment history"
-        )));
-    }
-    // The `sN` snapshot-index forms (bare, or with an ancestor suffix —
-    // `s3---` reaches here only when the dashes count is > 2; `s3--` and
-    // `parent(s3, M)` are caught above).
-    if let Some(digits) = t
-        .strip_prefix('s')
-        .filter(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()))
-    {
-        return Err(Error::r#ref(format!(
-            "legacy 's{digits}' snapshot-index form is no longer accepted: rollback payloads are \
-            keyed by deployment id — use 'deploy push <target> <deployment-id>', or '@- / @-- / \
-            parent(@, N)' to walk the deployment history"
-        )));
-    }
-    // Bare release ids (full or digest) are a legacy form too.
-    if t.starts_with("rel-sha256-") || (!t.is_empty() && t.chars().all(|c| c.is_ascii_hexdigit())) {
-        return Err(Error::r#ref(format!(
+        )),
+    )
+    .parse_next(input)
+}
+
+/// The legacy `f<digits>` snapshot-index prefix.
+fn legacy_f_index(input: &mut &str) -> ModalResult<RefExpr, RefErr> {
+    let digits = terminated(preceded(literal('f'), digit1), eof).parse_next(input)?;
+    Err(ErrMode::Cut(RefErr(format!(
+        "legacy 'f{digits}' snapshot-index form is no longer accepted: rollback payloads are \
+        keyed by deployment id — use 'deploy push <target> <deployment-id>' or '@- / @-- / \
+        parent(@, N)' to walk the deployment history"
+    ))))
+}
+
+/// The legacy `s<digits>` snapshot-index forms (bare, or with an ancestor
+/// suffix — `s3---` reaches here only when the dashes count is > 2; `s3--`
+/// and `parent(s3, M)` are caught above).
+fn legacy_s_index(input: &mut &str) -> ModalResult<RefExpr, RefErr> {
+    let digits = terminated(preceded(literal('s'), digit1), eof).parse_next(input)?;
+    Err(ErrMode::Cut(RefErr(format!(
+        "legacy 's{digits}' snapshot-index form is no longer accepted: rollback payloads are \
+        keyed by deployment id — use 'deploy push <target> <deployment-id>', or '@- / @-- / \
+        parent(@, N)' to walk the deployment history"
+    ))))
+}
+
+/// Bare release ids (full `rel-sha256-...` or a hex digest) — the DIRECT
+/// form requires the `release:` prefix.
+fn legacy_bare_release(input: &mut &str, token: &str) -> ModalResult<RefExpr, RefErr> {
+    preceded(
+        alt((
+            literal("rel-sha256-"),
+            terminated(take_while(1.., |c: char| c.is_ascii_hexdigit()), eof),
+        )),
+        ref_fail(format!(
             "legacy bare release id '{token}' is no longer accepted; \
             use 'release:<id>' for the DIRECT release form"
-        )));
-    }
+        )),
+    )
+    .parse_next(input)
+}
 
-    // A `<deployment-id>` with an optional trailing `-` / `--` ancestor
-    // suffix (1 or 2 dashes), or the bare deployment id itself (0 steps).
+/// `<deployment-id>` with an optional `-` / `--` ancestor suffix, or the
+/// bare deployment id itself (0 steps). The id is a `deploy-...` primitive
+/// (any non-empty tail, internal dashes allowed); the trailing-dash count is
+/// derived from the token exactly as the hand-written parser did.
+fn deployment_form(input: &mut &str, token: &str) -> ModalResult<RefExpr, RefErr> {
+    let t = rest.parse_next(input)?;
     let dashes = t.len() - t.trim_end_matches('-').len();
     if dashes > 2 {
-        return Err(Error::r#ref(format!(
+        return Err(ErrMode::Backtrack(RefErr(format!(
             "unrecognized reference '{token}' (only '-' and '--' ancestor steps are accepted)"
-        )));
+        ))));
     }
     let id = &t[..t.len() - dashes];
     if id.is_empty() {
-        return Err(Error::r#ref(format!("unrecognized reference '{token}'")));
+        return Err(ErrMode::Backtrack(RefErr(format!(
+            "unrecognized reference '{token}'"
+        ))));
     }
-    let dep = parse_deployment_id(id, token)?;
+    let dep = match id.strip_prefix("deploy-") {
+        Some(tail) if !tail.is_empty() => DeploymentId::new(id.to_string()),
+        _ => {
+            return Err(ErrMode::Backtrack(RefErr(format!(
+                "unrecognized reference id '{id}' in '{token}' (expected a deployment id like \
+                'deploy-...', the '@' forms, or 'release:<id>')"
+            ))));
+        }
+    };
     Ok(RefExpr::Relative(RelativeRef {
         base: RelBase::Refid(dep),
         steps: dashes as u64,
     }))
-}
-
-/// The `f<digits>` legacy snapshot-index prefix, if the string has it.
-fn f_index_digits(s: &str) -> Option<&str> {
-    let rest = s.strip_prefix('f')?;
-    (!rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())).then_some(rest)
-}
-
-/// Parse a deployment-id refid primitive (`deploy-...`, non-empty tail). Any
-/// other shape is a ref error naming the token. The removed snapshot-index
-/// (`sN`) and release refid shapes are rejected by the callers BEFORE this
-/// with their migration hints.
-fn parse_deployment_id(s: &str, token: &str) -> Result<DeploymentId> {
-    if let Some(rest) = s.strip_prefix("deploy-")
-        && !rest.is_empty()
-    {
-        return Ok(DeploymentId::new(s.to_string()));
-    }
-    Err(Error::r#ref(format!(
-        "unrecognized reference id '{s}' in '{token}' (expected a deployment id like \
-        'deploy-...', the '@' forms, or 'release:<id>')"
-    )))
 }
 
 #[cfg(test)]
