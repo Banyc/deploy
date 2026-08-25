@@ -44,8 +44,11 @@
 //! * `parent(@, N)` — the Nth ancestor of the latest snapshot.
 //! * `release:<id>` — the DIRECT release form: deploy the named release to
 //!   the CURRENT target's slots as they are, from the release's OWN stored
-//!   slot-variant snapshot. No snapshot-chain stepping and no
-//!   deployment-snapshot membership/binding checks: cross-target capable —
+//!   slot-variant snapshot — but ONLY when the target's CURRENT slot-id
+//!   membership EXACTLY equals the slot set the release record froze for
+//!   that target (membership drift is refused at plan time, before any
+//!   remote access; physical bindings are intentionally not compared).
+//!   No snapshot-chain stepping: cross-target capable —
 //!   the release may have been built/pushed anywhere, and the destination
 //!   needs NO snapshot history at all. The id is a full `rel-sha256-...` id
 //!   or a hex digest.
@@ -81,7 +84,10 @@ pub enum PushRef {
     Head,
     /// Restore a historical successful snapshot by index.
     Snapshot { target: TargetName, index: u64 },
-    /// Assign each current server its configured variant from a named release.
+    /// Assign each current server its configured variant from a named release
+    /// (plans only when the target's CURRENT slot-id membership exactly
+    /// matches the slot set the release record froze for it; physical
+    /// bindings are not compared).
     Release { release: ReleaseId },
 }
 
@@ -96,8 +102,11 @@ pub enum RefExpr {
     Head,
     /// `release:<id>`: deploy the named release DIRECTLY to the current
     /// target's slots — no snapshot-chain stepping, no deployment-snapshot
-    /// membership/binding checks. Resolves to [`PushRef::Release`] without
-    /// touching the store.
+    /// exact-binding checks. The target's CURRENT slot-id membership must
+    /// EXACTLY match the slot set the release's OWN stored slot snapshot
+    /// froze for it (checked at plan time, before any remote access);
+    /// physical bindings are intentionally not compared. Resolves to
+    /// [`PushRef::Release`] without touching the store.
     Release(ReleaseId),
     /// A jj-style relative reference needing the store + target.
     Relative(RelativeRef),
@@ -399,7 +408,8 @@ pub fn resolve_ref_expr(expr: &RefExpr, target: &str, store: &LocalStore) -> Res
         // `PushRef::Release` — no snapshot-chain stepping, no target history
         // required (cross-target capable by design; the release's own stored
         // slot snapshot and the CURRENT target's slots are what the plan
-        // resolves against).
+        // resolves against — the release-versioned vs current membership
+        // equality check runs at plan time, before any remote access).
         RefExpr::Release(release) => Ok(PushRef::Release {
             release: release.clone(),
         }),

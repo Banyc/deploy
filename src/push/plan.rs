@@ -126,6 +126,39 @@ pub fn plan_assignments(
             let rec = store
                 .read_release(release)
                 .map_err(|_| Error::rollback(format!("release {release} not available locally")))?;
+            // DIRECT-RELEASE MEMBERSHIP CHECK (before any remote access):
+            // the release's OWN canonical slot snapshot freezes the slot
+            // membership every target was materialized from. A direct release
+            // deploys onto the CURRENT target's slots, so the destination
+            // target's CURRENT slot-id set must EXACTLY equal the slot-id set
+            // the release record froze for that target — the union over every
+            // variant in the record's snapshot of the slots whose `targets`
+            // list contains the destination target (variants share slots, so
+            // the union is deduplicated by slot id; the membership is a set).
+            // The comparison is LOGICAL membership only: physical bindings
+            // (server / deploy_dir) are intentionally allowed to differ —
+            // unlike the exact-rollback `Snapshot` branch, which also demands
+            // identical physical bindings. A target whose membership DRIFTED
+            // since the release was built — a slot added, removed, or renamed
+            // — is refused at PLAN time, before any assignment is built and
+            // before any remote access, rather than deploying to the wrong
+            // slot set.
+            let expected: BTreeSet<String> = rec
+                .slots
+                .values()
+                .flat_map(|cs| cs.slots.iter())
+                .filter(|s| s.targets.iter().any(|t| t == target_name))
+                .map(|s| s.id.clone())
+                .collect();
+            let current: BTreeSet<String> =
+                slot_ids.iter().map(|s| s.as_str().to_string()).collect();
+            if expected != current {
+                return Err(Error::rollback(format!(
+                    "release {release} targets slots [{}] but target '{target_name}' currently has [{}]; direct release membership drift is rejected before remote access",
+                    expected.iter().cloned().collect::<Vec<_>>().join(", "),
+                    current.iter().cloned().collect::<Vec<_>>().join(", "),
+                )));
+            }
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
                 let slot_id = PlacementSlotId::new(slot.id.clone());
@@ -459,17 +492,19 @@ interval_seconds = 0
         );
     }
 
-    /// A NON-legacy release record whose stored slot snapshot does NOT declare
-    /// a member slot must fail closed (rollback error naming the slot) rather
-    /// than guessing a variant — the stored snapshot is authoritative for
-    /// records that carry one.
+    /// A NON-legacy release record whose stored slot snapshot does NOT
+    /// declare the current target's member slot must fail closed with the
+    /// MEMBERSHIP-DRIFT refusal before any remote access: the release froze a
+    /// DIFFERENT slot set (here a renamed slot `pX` where the current config
+    /// has `p1`) — the stored snapshot is authoritative, so direct release
+    /// planning refuses rather than deploying to the wrong slot set.
     #[test]
-    fn release_snapshot_missing_slot_fails_rollback() {
+    fn release_snapshot_missing_slot_refuses_drift() {
         let (_dir, config) = project_with_config();
         let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
         let mut rec = legacy_record("unused", "tree-x");
         // A stored snapshot that declares a DIFFERENT slot (not the target's
-        // member p1).
+        // member p1): renamed-slot drift.
         rec.slots = BTreeMap::from([(
             "standard".to_string(),
             CanonicalSlots {
@@ -494,11 +529,246 @@ interval_seconds = 0
             &store,
             &config,
         )
-        .expect_err("a stored snapshot that lacks a member slot must refuse");
+        .expect_err("a stored snapshot whose slot set drifts from the target must refuse");
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("declares no slot 'p1'"),
-            "error must name the unresolved slot, got: {err}"
+            msg.contains("release") && msg.contains("drift"),
+            "error must be the membership-drift refusal, got: {msg}"
         );
+        assert!(
+            msg.contains("pX") && msg.contains("p1"),
+            "error must name the expected vs current slot sets, got: {msg}"
+        );
+        assert!(
+            msg.contains("before remote access"),
+            "error must explain the refusal happens before remote access, got: {msg}"
+        );
+    }
+
+    /// MISSING-SLOT drift: the current target has a slot `p2` the release's
+    /// stored snapshot does not declare — direct release planning refuses
+    /// with the membership-drift error (expected [p1] vs current [p1, p2]).
+    #[test]
+    fn release_membership_drift_missing_slot_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        // Current config: TWO slots for t1 (p1 and p2, distinct servers).
+        std::fs::write(
+            release_dir.join("standard.toml"),
+            r#"
+[[slots]]
+id = "p1"
+server = "s1"
+targets = ["t1"]
+deploy_dir = "/srv/plan"
+
+[[slots]]
+id = "p2"
+server = "s2"
+targets = ["t1"]
+deploy_dir = "/srv/plan-2"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#,
+        )
+        .unwrap();
+        let cfg_path = project.join("deploy.toml");
+        // A second server entry so slot p2's server exists.
+        std::fs::write(
+            &cfg_path,
+            DEPLOY_TOML.replace(
+                "[[servers]]\nid = \"s1\"",
+                "[[servers]]\nid = \"s2\"\naddress = \"a2\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n[[servers]]\nid = \"s1\"",
+            ),
+        )
+        .unwrap();
+        let config = Config::load(&cfg_path).unwrap();
+        assert_eq!(config.target_slot_ids("t1").unwrap(), ["p1", "p2"]);
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+
+        // The release's own snapshot pins ONLY p1 (p2 was added to the target
+        // after the release was built elsewhere).
+        let mut rec = legacy_record("unused", "tree-x");
+        rec.slots = BTreeMap::from([(
+            "standard".to_string(),
+            CanonicalSlots {
+                slots: vec![CanonicalSlot {
+                    id: "p1".to_string(),
+                    server: "s1".to_string(),
+                    deploy_dir: "/srv/plan".to_string(),
+                    targets: vec!["t1".to_string()],
+                }],
+            },
+        )]);
+        let release = consistent(&mut rec);
+        store.write_release(&rec).unwrap();
+
+        let err = plan_assignments(
+            "t1",
+            &PushRef::Release {
+                release: release.clone(),
+            },
+            &ReleaseId::new("unused".to_string()),
+            &BTreeMap::new(),
+            &store,
+            &config,
+        )
+        .expect_err("a release whose snapshot lacks a current member slot must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("membership") && msg.contains("[p1]") && msg.contains("[p1, p2]"),
+            "drift error must name expected [p1] vs current [p1, p2], got: {msg}"
+        );
+    }
+
+    /// EXTRA-SLOT drift: the release's own snapshot pins a slot `p2` the
+    /// current target does not have — direct release refuses (expected
+    /// [p1, p2] vs current [p1]).
+    #[test]
+    fn release_membership_drift_extra_slot_refuses() {
+        let (_dir, config) = project_with_config();
+        let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
+        let mut rec = legacy_record("unused", "tree-x");
+        // The release pins p1 AND a p2 the current t1 has no member for.
+        rec.slots = BTreeMap::from([(
+            "standard".to_string(),
+            CanonicalSlots {
+                slots: vec![
+                    CanonicalSlot {
+                        id: "p1".to_string(),
+                        server: "s1".to_string(),
+                        deploy_dir: "/srv/plan".to_string(),
+                        targets: vec!["t1".to_string()],
+                    },
+                    CanonicalSlot {
+                        id: "p2".to_string(),
+                        server: "s2".to_string(),
+                        deploy_dir: "/srv/plan-2".to_string(),
+                        targets: vec!["t1".to_string()],
+                    },
+                ],
+            },
+        )]);
+        let release = consistent(&mut rec);
+        store.write_release(&rec).unwrap();
+
+        let err = plan_assignments(
+            "t1",
+            &PushRef::Release {
+                release: release.clone(),
+            },
+            &ReleaseId::new("unused".to_string()),
+            &BTreeMap::new(),
+            &store,
+            &config,
+        )
+        .expect_err("a release whose snapshot pins a slot the target lacks must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("membership") && msg.contains("[p1, p2]") && msg.contains("[p1]"),
+            "error must name expected [p1, p2] vs current [p1], got: {msg}"
+        );
+    }
+
+    /// LOGICAL-ONLY: a slot whose PHYSICAL binding changed (different server,
+    /// same id) but whose id stays is still a member — the membership check
+    /// compares slot IDs only, so a slot rebound to another server plans
+    /// (contrast with the exact-rollback Snapshot branch, which refuses).
+    #[test]
+    fn release_membership_physical_binding_drift_plans() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        // CURRENT config: p1 rebound to server s2 at a moved deploy_dir.
+        std::fs::write(
+            release_dir.join("standard.toml"),
+            r#"
+[[slots]]
+id = "p1"
+server = "s2"
+targets = ["t1"]
+deploy_dir = "/srv/moved"
+
+[[artifact.mappings]]
+from = "src/artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#,
+        )
+        .unwrap();
+        let cfg_path = project.join("deploy.toml");
+        std::fs::write(
+            &cfg_path,
+            DEPLOY_TOML.replace(
+                "[[servers]]\nid = \"s1\"",
+                "[[servers]]\nid = \"s2\"\naddress = \"a2\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n[[servers]]\nid = \"s1\"",
+            ),
+        )
+        .unwrap();
+        let config = Config::load(&cfg_path).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+
+        // The release's OWN snapshot froze p1 at its ORIGINAL physical
+        // binding (s1, /srv/plan) — the membership set is unchanged, so the
+        // direct release plans onto the current (moved) binding.
+        let mut rec = legacy_record("unused", "tree-x");
+        rec.slots = BTreeMap::from([(
+            "standard".to_string(),
+            CanonicalSlots {
+                slots: vec![CanonicalSlot {
+                    id: "p1".to_string(),
+                    server: "s1".to_string(),
+                    deploy_dir: "/srv/plan".to_string(),
+                    targets: vec!["t1".to_string()],
+                }],
+            },
+        )]);
+        let release = consistent(&mut rec);
+        store.write_release(&rec).unwrap();
+
+        let (assignments, desired, source) = plan_assignments(
+            "t1",
+            &PushRef::Release {
+                release: release.clone(),
+            },
+            &ReleaseId::new("unused".to_string()),
+            &BTreeMap::new(),
+            &store,
+            &config,
+        )
+        .expect("physical binding drift must not block logical-membership planning");
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].placement_slot, PlacementSlotId::new("p1"));
+        assert_eq!(desired, release);
+        assert_eq!(source, PlanSource::ReleaseRef(release));
     }
 
     /// The TREE must come from the release record's own variant bindings: a
@@ -788,6 +1058,13 @@ interval_seconds = 0
     /// (tree `tree-direct`), and a snapshot on `t1` that records `old` as
     /// p1's physical binding at deployment time — the binding the CURRENT
     /// config no longer has.
+    ///
+    /// The record's canonical slot carries the SAME `targets` list as the
+    /// current config's `p1` (`["t1", "t2"]`), so the release-versioned
+    /// membership and the CURRENT membership both reduce to the set `{p1}`
+    /// on every target — the planning-succeeds side of the direct-release
+    /// membership rule (only the PHYSICAL binding differs, which is
+    /// intentionally allowed).
     fn direct_release_fixture(
         old_binding: &(String, String),
     ) -> (tempfile::TempDir, Config, LocalStore, ReleaseId) {
@@ -860,6 +1137,10 @@ interval_seconds = 0
     // equivalent SNAPSHOT ref retains its exact physical-binding refusal
     // (a snapshot that recorded the old binding fails closed; on the
     // no-history destination the snapshot-family refs cannot even resolve).
+    // The membership rule is satisfied on both targets: the record's
+    // snapshot and the current config bind the same slot set `{p1}`, so the
+    // direct form passes its logical-membership check; only the physical
+    // binding differs, which the direct form intentionally allows.
     proptest! {
         #![proptest_config(ProptestConfig {
             // Bounded + fixed seed: deterministic floor, fast.
@@ -955,6 +1236,273 @@ interval_seconds = 0
                     &store,
                 )
                 .expect_err("no snapshot references the release on t2; the refid must fail");
+            }
+        }
+    }
+
+    // The slot universe + fixed members the membership property draws from:
+    // `p1`/`p2`/`p3` are the generated COMMON members (declared for BOTH
+    // targets), `iso` is a `t2`-ONLY member (cross-target isolation: it must
+    // never leak into t1's derived membership), and `phys` is a constant
+    // member whose PHYSICAL binding (server) the fixture may drift while its
+    // id stays (logical-only comparison). Each slot owns a distinct server so
+    // the config's per-target server-uniqueness validation passes for every
+    // generated membership.
+    const SLOT_UNIVERSE: [&str; 3] = ["p1", "p2", "p3"];
+
+    /// Build the membership-drift property fixture from two generated
+    /// membership sets: `release_inc[i]` says whether universe slot `i` is
+    /// frozen in the release record's OWN canonical slot snapshot (targets
+    /// `t1`+`t2`); `current_inc[i]` says whether it is declared in the
+    /// CURRENT config for both targets. `iso` (t2-only) and `phys`
+    /// (t1+t2) are constant members of BOTH the record and the config;
+    /// `physical_drift` rebinds `phys` to a different server in the config
+    /// only (its id stays — logical membership unchanged). Returns the
+    /// fixture plus the written record (so the test can cross-check the
+    /// realized physical drift against the canonical binding).
+    fn membership_drift_fixture(
+        release_inc: [bool; 3],
+        current_inc: [bool; 3],
+        physical_drift: bool,
+    ) -> (
+        tempfile::TempDir,
+        Config,
+        LocalStore,
+        ReleaseId,
+        ReleaseRecord,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+
+        // Current variant file: one slot entry per generated current member,
+        // plus the constant `iso` (t2-only) and `phys` (rebound when
+        // `physical_drift`).
+        let mut variant = String::new();
+        let add_slot = |variant: &mut String, id: &str, server: &str, targets: &str, dir: &str| {
+            variant.push_str(&format!(
+                "[[slots]]\nid = \"{id}\"\nserver = \"{server}\"\ntargets = [{targets}]\ndeploy_dir = \"{dir}\"\n\n"
+            ));
+        };
+        for (i, inc) in current_inc.iter().enumerate() {
+            if *inc {
+                let id = SLOT_UNIVERSE[i];
+                add_slot(
+                    &mut variant,
+                    id,
+                    &format!("s{}", i + 1),
+                    "\"t1\", \"t2\"",
+                    &format!("/srv/{id}"),
+                );
+            }
+        }
+        add_slot(&mut variant, "iso", "s4", "\"t2\"", "/srv/iso");
+        add_slot(
+            &mut variant,
+            "phys",
+            if physical_drift { "s6" } else { "s5" },
+            "\"t1\", \"t2\"",
+            "/srv/phys",
+        );
+        variant.push_str(
+            "[[artifact.mappings]]\nfrom = \"artifacts/build/output/\"\nto = \"app/\"\nrecursive = true\n\n[activation]\nadapter = \"none\"\n\n[verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
+        );
+        std::fs::write(release_dir.join("standard.toml"), variant).unwrap();
+
+        let mut servers = String::new();
+        for i in 1..=6 {
+            servers.push_str(&format!(
+                "[[servers]]\nid = \"s{i}\"\naddress = \"a{i}\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n"
+            ));
+        }
+        let cfg_path = project.join("deploy.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "schema_version = 1\napplication = \"plan\"\nrelease = \"v1\"\n\n\
+                 [targets.t1.rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n\
+                 [targets.t1.rotation.deployment]\nprotect_deployments = 1\n\n\
+                 [targets.t2.rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n\
+                 [targets.t2.rotation.deployment]\nprotect_deployments = 1\n\n\
+                 {servers}\
+                 [targets.t1]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n\n\
+                 [targets.t2]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n"
+            ),
+        )
+        .unwrap();
+        let config = Config::load(&cfg_path).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+
+        // The release's OWN frozen canonical snapshot: the generated
+        // membership (targets t1+t2) plus the constant phys (t1+t2, at its
+        // ORIGINAL server s5) and iso (t2-only), exactly mirroring the
+        // current config's targets lists.
+        let mut rec = legacy_record("unused", "tree-x");
+        let mut canonical: Vec<CanonicalSlot> = Vec::new();
+        for (i, id) in SLOT_UNIVERSE.iter().enumerate() {
+            if release_inc[i] {
+                canonical.push(CanonicalSlot {
+                    id: id.to_string(),
+                    server: format!("s{}", i + 1),
+                    deploy_dir: format!("/srv/{id}"),
+                    targets: vec!["t1".to_string(), "t2".to_string()],
+                });
+            }
+        }
+        canonical.push(CanonicalSlot {
+            id: "phys".to_string(),
+            server: "s5".to_string(),
+            deploy_dir: "/srv/phys".to_string(),
+            targets: vec!["t1".to_string(), "t2".to_string()],
+        });
+        canonical.push(CanonicalSlot {
+            id: "iso".to_string(),
+            server: "s4".to_string(),
+            deploy_dir: "/srv/iso".to_string(),
+            targets: vec!["t2".to_string()],
+        });
+        canonical.sort_by(|a, b| a.id.cmp(&b.id));
+        rec.slots = BTreeMap::from([("standard".to_string(), CanonicalSlots { slots: canonical })]);
+        let release = consistent(&mut rec);
+        store.write_release(&rec).unwrap();
+
+        (dir, config, store, release, rec)
+    }
+
+    // THE REQUIRED DIRECT-RELEASE MEMBERSHIP PROPERTY: for generated
+    // release-versioned and current membership sets, direct release planning
+    // onto the destination target SUCCEEDS iff the two slot-ID sets match
+    // EXACTLY (logical equality) and REFUSES with the membership-drift error
+    // otherwise — the drift refusal lands at PLAN time, before any remote
+    // access. Also: cross-target isolation (t2's extra `iso` member never
+    // disturbs t1's derived membership) and logical-only comparison (phys's
+    // SERVER rebind with an unchanged id still plans).
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            // Bounded + fixed seed: deterministic floor, fast.
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn direct_release_membership_must_match_release_record(
+            release_inc in prop::array::uniform3(prop::bool::ANY),
+            current_inc in prop::array::uniform3(prop::bool::ANY),
+            physical_drift in prop::bool::ANY,
+        ) {
+            let (_dir, config, store, release, rec) =
+                membership_drift_fixture(release_inc, current_inc, physical_drift);
+            let release_ref = PushRef::Release {
+                release: release.clone(),
+            };
+            let expected: BTreeSet<String> = SLOT_UNIVERSE
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| release_inc[*i])
+                .map(|(_, id)| id.to_string())
+                .collect();
+            let current: BTreeSet<String> = SLOT_UNIVERSE
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| current_inc[*i])
+                .map(|(_, id)| id.to_string())
+                .collect();
+
+            if expected == current {
+                // Membership match: the direct release plans on BOTH targets.
+                // Cross-target isolation: t2's extra `iso` member (frozen in
+                // the record AND declared in the config) must not disturb
+                // t1's derived membership — t1 plans exactly its own set.
+                for dest in ["t1", "t2"] {
+                    let (assignments, desired, source) = plan_assignments(
+                        dest,
+                        &release_ref,
+                        &ReleaseId::new("unused-local".to_string()),
+                        &BTreeMap::new(),
+                        &store,
+                        &config,
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!("release:<id> must plan on target {dest} when the membership matches: {e}")
+                    });
+                    let mut want: Vec<String> = expected.iter().cloned().collect();
+                    want.push("phys".to_string());
+                    if dest == "t2" {
+                        want.push("iso".to_string());
+                    }
+                    want.sort();
+                    let mut got: Vec<String> = assignments
+                        .iter()
+                        .map(|a| a.placement_slot.as_str().to_string())
+                        .collect();
+                    got.sort();
+                    assert_eq!(
+                        got, want,
+                        "target {dest} must plan exactly its frozen membership"
+                    );
+                    for a in &assignments {
+                        assert_eq!(a.artifact.variant.as_str(), "standard");
+                        assert_eq!(a.artifact.release, release);
+                    }
+                    assert_eq!(desired, release);
+                    assert_eq!(source, PlanSource::ReleaseRef(release.clone()));
+                }
+                // LOGICAL-ONLY: when the fixture realized a physical binding
+                // change (phys's server rebound), planning still succeeded
+                // above — the membership check compares slot IDs only, never
+                // server or deploy_dir. Cross-check the fixture actually
+                // drifted (config server differs from the record's frozen
+                // canonical binding) so the assertion is meaningful.
+                if physical_drift {
+                    let rec_phys = rec
+                        .slots["standard"]
+                        .slots
+                        .iter()
+                        .find(|s| s.id == "phys")
+                        .expect("phys is frozen in the record");
+                    let bindings = config.target_slot_bindings("t1").unwrap();
+                    let cfg_phys = bindings
+                        .get(&PlacementSlotId::new("phys"))
+                        .expect("phys is a member of t1");
+                    assert_ne!(
+                        cfg_phys.server.as_str(),
+                        rec_phys.server,
+                        "the fixture must realize the physical drift: config server {} vs record server {}",
+                        cfg_phys.server,
+                        rec_phys.server
+                    );
+                    assert_eq!(
+                        cfg_phys.deploy_dir, rec_phys.deploy_dir,
+                        "only the server drifted; deploy_dir stays put"
+                    );
+                }
+            } else {
+                // Membership drift (missing / extra / renamed slots): REFUSED
+                // at plan time, on every target, with the drift error naming
+                // the release, the expected vs current slot sets, and the
+                // before-remote-access clause.
+                for dest in ["t1", "t2"] {
+                    let err = plan_assignments(
+                        dest,
+                        &release_ref,
+                        &ReleaseId::new("unused-local".to_string()),
+                        &BTreeMap::new(),
+                        &store,
+                        &config,
+                    )
+                    .expect_err("membership drift must refuse direct release planning");
+                    let msg = err.to_string();
+                    assert!(
+                        msg.contains("release")
+                            && msg.contains("drift")
+                            && msg.contains("before remote access"),
+                        "refusal must be the membership-drift error, got: {msg}"
+                    );
+                }
             }
         }
     }

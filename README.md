@@ -120,7 +120,9 @@ deploy push production @--             # two snapshots back (the grandparent)
 deploy push production 'parent(@, 3)'    # three snapshots back from the latest
 # DIRECT release deploy: the named release to the CURRENT target's slots,
 # from the release's OWN stored slot snapshot — no history needed, cross-
-# target capable (release:<id>; the refid forms below are snapshot ancestry):
+# target capable (release:<id>; the refid forms below are snapshot ancestry).
+# The target's CURRENT slot membership must exactly match the slot set the
+# release froze for it; a drifted membership is rejected before remote access.
 deploy push production release:rel-sha256-41da2f63a950
 # refids resolve to exact snapshots, then step N ancestors (N = 0 is the
 # snapshot itself):
@@ -142,10 +144,16 @@ deploy push production rel-sha256-41da2f63--        # 2 before the most recent s
 - `release:<id>` is the DIRECT release form (shell-safe, no slash): deploy
   the named release to the current target's slots from the release's OWN
   stored slot-variant snapshot — no snapshot-chain stepping, no
-  deployment-snapshot membership/binding checks, and no target snapshot
-  history required (the release may be built/pushed anywhere; a fresh target
-  deploys directly). The release refid forms above remain snapshot ancestry
-  and keep their exact-binding checks.
+  deployment-snapshot exact-binding checks, and no target snapshot history
+  required (the release may be built/pushed anywhere; a fresh target
+  deploys directly). The target's CURRENT slot membership must EXACTLY
+  equal the slot set the release record froze for it (derived from the
+  record's per-variant canonical slots whose `targets` contain the target):
+  membership drift — a slot added, removed, or renamed since the release
+  was built — is rejected at plan time, before any remote access, and
+  physical bindings (server / `deploy_dir`) are intentionally allowed to
+  differ. The release refid forms above remain snapshot ancestry and keep
+  their exact-binding checks.
 - Out-of-range refs fail closed before anything runs: an empty chain, a
   missing refid, or walking past the start of the chain is a ref error — never
   an underflow or a guess.
