@@ -3678,7 +3678,7 @@ impl Model {
                     self.crash_window,
                 )
             }
-            Action::Push(t) | Action::Retry(t) => self.deploy(t, None),
+            Action::Push(t) | Action::Retry(t) => self.deploy(t),
             Action::Rollback(t, i) => self.rollback(t, *i),
             Action::Rotate => (
                 OutcomeClass::Push {
@@ -3784,6 +3784,12 @@ impl Model {
     /// STAYS open (the fixture's invariant groups stay suspended until a
     /// later successful push/no-op refreshes observed).
     fn rollback(&mut self, t: &'static str, i: u64) -> (OutcomeClass, bool) {
+        // The engine reconciles pending attempts ONCE per push, before the
+        // ref is resolved, so the index is evaluated against the
+        // POST-reconciliation chain and the resolved deployment enters the
+        // shared resolved-deploy stage with NO second reconciliation (a
+        // second reconcile would wrongly finalize an attempt the reconcile's
+        // OWN faulted marker write left pending).
         self.reconcile(t);
         let Some(v) = self
             .snapshots
@@ -3799,18 +3805,37 @@ impl Model {
                 self.crash_window,
             );
         };
-        self.deploy(t, Some(v))
+        self.deploy_resolved(t, Some(v))
     }
 
     /// A HEAD push / no-op retry (`Push` and `Retry` are the same operation
-    /// in the fixture) or a valid snapshot rollback (deploying `rollback_version`),
-    /// under the step's failure class. Returns the expected outcome class and
-    /// the NEW crash-window state.
-    fn deploy(&mut self, t: &'static str, rollback_version: Option<u32>) -> (OutcomeClass, bool) {
+    /// in the fixture) under the step's failure class. The engine reconciles
+    /// pending attempts once, then decides no-op-vs-deploy against the
+    /// post-reconciliation state and enters the shared resolved-deploy stage.
+    fn deploy(&mut self, t: &'static str) -> (OutcomeClass, bool) {
+        self.reconcile(t);
+        // HEAD push: deploy exactly when the remote current no longer
+        // equals the materialized head (the engine's complete
+        // ArtifactRef equality — a tampered current forces a fresh push).
+        let version = if self.current_tampered || self.current != Some(self.head_version) {
+            Some(self.head_version)
+        } else {
+            None
+        };
+        self.deploy_resolved(t, version)
+    }
+
+    /// The shared POST-RECONCILIATION deployment stage — everything the
+    /// engine runs after `reconcile_pending_commits`, ref resolution, and
+    /// planning: the mutation-lock preflight, then either the up-to-date
+    /// no-op (no records) or the real deployment under the step's failure
+    /// class. Returns the expected outcome class and the NEW crash-window
+    /// state.
+    fn deploy_resolved(&mut self, t: &'static str, version: Option<u32>) -> (OutcomeClass, bool) {
         // A contended push aborts with `Err` and records NOTHING — no attempt,
         // no recovery, no observed refresh — so the expected class is `Err` +
-        // `NoAttempt`. The engine's mutation-lock preflight check now sits in
-        // the mutating remote phase (AFTER reconciliation, resolution, and
+        // `NoAttempt`. The engine's mutation-lock preflight check sits in the
+        // mutating remote phase (AFTER reconciliation, resolution, and
         // planning — the resolution point moved behind
         // `reconcile_pending_commits`), but the reconcile under contention
         // never finalizes (its marker lock acquisition contends too), so the
@@ -3828,20 +3853,6 @@ impl Model {
                 self.crash_window,
             );
         }
-        self.reconcile(t);
-        let version = match rollback_version {
-            Some(v) => Some(v),
-            None => {
-                // HEAD push: deploy exactly when the remote current no longer
-                // equals the materialized head (the engine's complete
-                // ArtifactRef equality — a tampered current forces a real push).
-                if self.current_tampered || self.current != Some(self.head_version) {
-                    Some(self.head_version)
-                } else {
-                    None
-                }
-            }
-        };
         let Some(v) = version else {
             // Up-to-date no-op: no records. The deferred-maintenance hook
             // services rotation debt, and the no-op path refreshes observed

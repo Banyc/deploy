@@ -8,3 +8,4 @@ cc f8208b4509b4571453dcd6c0fc8e2aaaf279983c81122a004849c9b7116648da # shrinks to
 cc 6e94341891b5b9e18f545014d30fe498e7ff1d79098a1b37f9c5fa62abc720f6 # shrinks to steps = [(Push("t1"), DebtRead), (Tamper(StoredAssignmentVariant), None), (Push("t1"), IntentPersist)]
 cc dd3babbbc2bc0094ba3cf65654af17079364693176c5239ec252a61fc9886265 # shrinks to steps = [(Build(0), None), (Push("t1"), ObservedWriteServer), (Rollback("t1", 0), TransitionSuccessful), (Build(1), None), (Push("t2"), None), (Push("t1"), None)]
 cc b20d4ef3a96ebee120e52a580d28ad8f84837b4d1b43d805c2f84ba5c73dab26 # shrinks to steps = [(Push("t1"), ResultsWrite), (Rollback("t1", 1), RotationInventory)]
+cc c1acb94e891ac6b318004932176e53efaf6fc84ed51717f4c13c7ccbbb904528 # shrinks to steps = [(Push("t2"), LastSuccessfulWrite), (Rollback("t2", 0), CommitMarker)]
