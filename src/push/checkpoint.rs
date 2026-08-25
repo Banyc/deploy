@@ -96,7 +96,8 @@ use crate::model::{
 };
 use crate::push::lock::FileLock;
 use crate::records::{CleanupPending, HistoryFloor};
-use crate::store::local::{FloorDiscards, LocalStore};
+use crate::store::history_floor::FloorDiscards;
+use crate::store::local::LocalStore;
 
 /// The outcome of one checkpoint invocation (preview or real).
 #[derive(Clone, Debug, PartialEq, Eq)]
