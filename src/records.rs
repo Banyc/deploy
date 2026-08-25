@@ -219,6 +219,37 @@ pub struct DeploymentSnapshot {
     pub bindings: BTreeMap<PlacementSlotId, PhysicalBinding>,
 }
 
+/// A monotonic history floor for one target: the durable marker that says
+/// "retained history for this target starts at this deployment".
+///
+/// The floor is a SMALL MARKER, deliberately NOT another deployment or
+/// snapshot: the actual rollback state stays the snapshot referenced by
+/// `deployment_id` (`refs/snapshots.jsonl` — see [`DeploymentSnapshot`]).
+/// Once a checkpoint is established on a target, every read path
+/// (`read_attempts`, `read_snapshots`, ref resolution) exposes ONLY the
+/// suffix at/after the floor, and refs refuse to resolve below it.
+///
+/// Persisted at `targets/<target>/refs/history-floor.json`. Written FIRST
+/// (durable, atomic temp+rename) before the physical compaction that
+/// rewrites the jsonl logs to the suffix and deletes `deployments/<id>/`
+/// directories strictly before the floor, so an interrupted compaction
+/// leaves either the old physical files or the compacted files — never
+/// history below the durable floor (every read path is gated by this
+/// marker). `schema_version` is exactly [`crate::model::SCHEMA_VERSION`];
+/// readers refuse any other version (fail closed).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryFloor {
+    pub schema_version: u32,
+    pub target: TargetName,
+    pub deployment_id: DeploymentId,
+    /// The canonical snapshot index of the snapshot the checkpoint
+    /// deployment produced (the oldest rollback state; everything below it
+    /// is discarded).
+    pub snapshot_index: u64,
+    /// When the floor was established (RFC 3339).
+    pub established_at: String,
+}
+
 /// Observed remote state for one placement slot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ObservedServer {

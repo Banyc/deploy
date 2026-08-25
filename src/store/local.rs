@@ -11,10 +11,26 @@
 //! <base>/
 //!   objects/sha256/<digest>/root/ , tree.json
 //!   releases/<release-id>/mapping.toml, behavior.json, release.json
-//!   targets/<target>/observed.json, rotation-debt.json, attempts.jsonl, refs/last-successful, refs/snapshots.jsonl
+//!   targets/<target>/observed.json, rotation-debt.json, attempts.jsonl,
+//!     refs/last-successful, refs/snapshots.jsonl, refs/history-floor.json
 //!   servers/<server-id>.json
 //!   deployments/<deployment-id>/plan.json, results.json, transitions.jsonl
 //! ```
+//!
+//! The rollback history is the append-only OP LOG (`refs/snapshots.jsonl` +
+//! `refs/last-successful`) — the term is "op log", never "reflog". A
+//! checkpoint (`deploy checkpoint <target> <deployment-id>`) establishes a
+//! monotonic HISTORY FLOOR (`refs/history-floor.json`, see
+//! [`crate::records::HistoryFloor`]) for a target: the floor marker is
+//! written FIRST (durable), then physical compaction rewrites the jsonl
+//! logs to the suffix at/after the floor and deletes `deployments/<id>/`
+//! dirs strictly before it. EVERY read path in this module is gated by the
+//! floor ([`LocalStore::read_attempts`], [`LocalStore::read_snapshots`]), so
+//! an interrupted compaction never exposes history below the durable floor;
+//! the raw readers ([`LocalStore::read_attempts_raw`],
+//! [`LocalStore::read_snapshots_raw`]) are the internal index-minting view
+//! (never a below-floor escape hatch — index allocation uses them so
+//! compaction can never reuse an index).
 //!
 //! # Test-only fault injection (per-fixture registry)
 //!
@@ -36,7 +52,7 @@ use crate::model::{
 };
 use crate::records::{
     DeploymentAttempt, DeploymentResults, DeploymentSnapshot, DeploymentStatus,
-    DeploymentTransition, ObservedTarget, ServerState,
+    DeploymentTransition, HistoryFloor, ObservedTarget, ServerState,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -170,6 +186,68 @@ fn write_atomic_cas(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Durably replace a mutable marker file (the history floor): write a
+/// UNIQUE temp file in the same directory, fsync it, rename over the target
+/// (atomic on POSIX — a reader never sees a torn record), then fsync the
+/// parent directory. Unlike [`write_atomic_cas`] (immutable records) this
+/// REPLACES existing content: the floor advances. The durability of this
+/// write is the checkpoint's ordering guarantee — the floor marker must be
+/// durable BEFORE the compaction deletes anything, so an interrupted
+/// compaction can never expose history below the floor.
+fn write_atomic_replace(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::store(format!("mkdir {}: {e}", parent.display())))?;
+    }
+    let tmp = path.with_file_name(format!(
+        ".{}.tmp.{}.{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default(),
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| Error::store(format!("create {}: {e}", tmp.display())))?;
+        f.write_all(bytes)
+            .map_err(|e| Error::store(format!("write {}: {e}", tmp.display())))?;
+        f.sync_all()
+            .map_err(|e| Error::store(format!("fsync {}: {e}", tmp.display())))?;
+    }
+    std::fs::rename(&tmp, path)
+        .map_err(|e| Error::store(format!("rename {}: {e}", path.display())))?;
+    set_private(path)?;
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Atomically rewrite a JSONL file with the serialized lines of `entries`
+/// (temp + fsync + rename + dir fsync; see [`write_atomic_replace`]). The
+/// checkpoint compaction uses this so a reader never observes a torn log:
+/// an interrupted compaction leaves either the old jsonl or the compacted
+/// jsonl, never a half-written one.
+fn write_jsonl_atomic<T: Serialize>(path: &Path, entries: &[T]) -> Result<()> {
+    let mut buf = Vec::new();
+    for e in entries {
+        let line = serde_json::to_string(e)
+            .map_err(|e| Error::store(format!("serialize {}: {e}", path.display())))?;
+        buf.extend_from_slice(line.as_bytes());
+        buf.push(b'\n');
+    }
+    write_atomic_replace(path, &buf)
+}
+
 fn ensure_private_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)
         .map_err(|e| Error::store(format!("mkdir {}: {e}", path.display())))?;
@@ -225,6 +303,20 @@ pub struct LocalStore {
     /// step-17-equivalent lock acquisition. See `src/testutil.rs`.
     #[cfg(test)]
     step17_hook: Arc<Step17Hook>,
+}
+
+/// The exact set a checkpoint floor discards on one target (the dry-run
+/// preview enumerates precisely this; the compaction deletes precisely this).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FloorDiscards {
+    /// Deployment ids of the attempts.jsonl lines removed (the checkpoint's
+    /// own attempt and everything after it stay).
+    pub discarded_attempts: Vec<String>,
+    /// Snapshot indices removed from snapshots.jsonl (index < floor).
+    pub discarded_snapshots: Vec<u64>,
+    /// Deployment ids whose `deployments/<id>/` directories are deleted
+    /// (the union of the two sets above, deduplicated).
+    pub discarded_deployments: Vec<String>,
 }
 
 impl LocalStore {
@@ -630,7 +722,14 @@ impl LocalStore {
         set_private(&p)
     }
 
-    pub fn read_attempts(&self, target: &str) -> Result<Vec<DeploymentAttempt>> {
+    /// Read the FULL attempts log UNFILTERED by any history floor. This is
+    /// the physical view of `attempts.jsonl` (never a below-floor escape
+    /// hatch for consumers: every public read goes through
+    /// [`LocalStore::read_attempts`]); the checkpoint compaction and the
+    /// discard preview use it to compute the exact suffix at/after a floor,
+    /// and index allocation must see the full log so compaction can never
+    /// reuse an index.
+    pub fn read_attempts_raw(&self, target: &str) -> Result<Vec<DeploymentAttempt>> {
         let p = self.target_dir(target).join("attempts.jsonl");
         if !p.exists() {
             return Ok(vec![]);
@@ -659,9 +758,28 @@ impl LocalStore {
         Ok(out)
     }
 
+    /// Read the attempts log as the FLOOR-GATED history: only the suffix
+    /// beginning at the checkpoint's own attempt (everything before it —
+    /// failed attempts included — was discarded when the checkpoint was
+    /// established). No floor marker: the full log. The checkpoint's own
+    /// deployment is always retained, so its attempt is the first line the
+    /// readers expose; attempts AFTER it (including later failed attempts)
+    /// remain visible.
+    pub fn read_attempts(&self, target: &str) -> Result<Vec<DeploymentAttempt>> {
+        let mut out = self.read_attempts_raw(target)?;
+        if let Some(floor) = self.read_history_floor(target)?
+            && let Some(pos) = out
+                .iter()
+                .position(|a| a.deployment_id == floor.deployment_id)
+        {
+            out.drain(..pos);
+        }
+        Ok(out)
+    }
+
     // ---- rollback snapshots (refs) --------------------------------------
 
-    fn refs_dir(&self, target: &str) -> PathBuf {
+    pub(crate) fn refs_dir(&self, target: &str) -> PathBuf {
         self.target_dir(target).join("refs")
     }
 
@@ -688,6 +806,186 @@ impl LocalStore {
         std::fs::read_to_string(p)
             .ok()
             .filter(|s| !s.trim().is_empty())
+    }
+
+    // ---- checkpoint history floor --------------------------------------
+
+    /// Path of the target's durable history-floor marker
+    /// (`refs/history-floor.json`). The marker is written FIRST (durable)
+    /// before the physical compaction, and every read path in this module is
+    /// gated by it — see [`LocalStore::read_attempts`] /
+    /// [`LocalStore::read_snapshots`].
+    pub fn history_floor_path(&self, target: &str) -> PathBuf {
+        self.refs_dir(target).join("history-floor.json")
+    }
+
+    /// Write the target's history floor marker durably (atomic temp+rename;
+    /// see [`write_atomic_replace`]). The checkpoint flow writes this FIRST
+    /// — before any compaction — so the floor is durable before anything is
+    /// discarded.
+    pub fn write_history_floor(&self, target: &str, floor: &HistoryFloor) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fault_registry
+            .consume(FaultKind::WriteHistoryFloor, floor.deployment_id.as_str())
+        {
+            return Err(Error::store(
+                "test fault: write_history_floor forced to fail once",
+            ));
+        }
+        let bytes = serde_json::to_vec_pretty(floor)
+            .map_err(|e| Error::store(format!("serialize history floor: {e}")))?;
+        write_atomic_replace(&self.history_floor_path(target), &bytes)
+    }
+
+    /// Read the target's history-floor marker, or `None` when no checkpoint
+    /// has been established. `schema_version` must be exactly
+    /// [`SCHEMA_VERSION`]; any other version fails closed with an error
+    /// naming the version (a floor written by a different schema is never
+    /// silently interpreted).
+    pub fn read_history_floor(&self, target: &str) -> Result<Option<HistoryFloor>> {
+        let p = self.history_floor_path(target);
+        if !p.exists() {
+            return Ok(None);
+        }
+        let floor: HistoryFloor = read_json(&p)?;
+        if floor.schema_version != SCHEMA_VERSION {
+            return Err(Error::store(format!(
+                "history floor for target '{target}' carries unsupported schema_version {} (expected {SCHEMA_VERSION}): only SCHEMA_VERSION is accepted",
+                floor.schema_version
+            )));
+        }
+        Ok(Some(floor))
+    }
+
+    /// The exact discard set a checkpoint floor applies on `target`: the
+    /// attempts before the checkpoint's own attempt, the snapshots with
+    /// `index < floor.snapshot_index`, and the union of their deployment ids
+    /// (the `deployments/<id>/` directories the compaction deletes). Pure
+    /// read over the physical logs; the dry-run preview and the compaction
+    /// itself share it, so the preview enumerates EXACTLY what the
+    /// compaction removes.
+    pub fn checkpoint_discards(&self, target: &str, floor: &HistoryFloor) -> Result<FloorDiscards> {
+        let attempts = self.read_attempts_raw(target)?;
+        let snapshots = self.read_snapshots_raw(target)?;
+        let keep_from = attempts
+            .iter()
+            .position(|a| a.deployment_id == floor.deployment_id)
+            .unwrap_or(0);
+        let discarded_attempts: Vec<String> = attempts
+            .iter()
+            .take(keep_from)
+            .map(|a| a.deployment_id.as_str().to_string())
+            .collect();
+        let discarded_snapshots: Vec<u64> = snapshots
+            .iter()
+            .filter(|s| s.index < floor.snapshot_index)
+            .map(|s| s.index)
+            .collect();
+        // Deployment dirs strictly before the floor: every snapshot
+        // deployment below the floor plus every failed attempt before the
+        // checkpoint's own attempt (failed attempts carry no snapshot entry
+        // but still own a `deployments/<id>/` directory). Deduplicated in a
+        // deterministic order: snapshot-derived ids first (by snapshot
+        // index), then attempt-derived ids not already listed.
+        let mut discarded_deployments: Vec<String> = Vec::new();
+        for s in snapshots.iter().filter(|s| s.index < floor.snapshot_index) {
+            let id = s.deployment_id.as_str().to_string();
+            if !discarded_deployments.contains(&id) {
+                discarded_deployments.push(id);
+            }
+        }
+        for a in attempts.iter().take(keep_from) {
+            let id = a.deployment_id.as_str().to_string();
+            if !discarded_deployments.contains(&id) {
+                discarded_deployments.push(id);
+            }
+        }
+        Ok(FloorDiscards {
+            discarded_attempts,
+            discarded_snapshots,
+            discarded_deployments,
+        })
+    }
+
+    /// Physically compact the target's history to the suffix at/after
+    /// `floor` (the compaction half of a checkpoint; the floor marker must
+    /// already be durable — [`LocalStore::write_history_floor`] first):
+    ///
+    /// 1. Atomically rewrite `attempts.jsonl` to the checkpoint's own
+    ///    attempt and everything after it.
+    /// 2. Atomically rewrite `snapshots.jsonl` to `index >= floor.snapshot_index`.
+    /// 3. Delete every `deployments/<id>/` directory strictly before the
+    ///    floor.
+    ///
+    /// Each rewrite is a temp+rename so a reader never sees a torn log, and
+    /// the floor marker already gates every read path — an interruption at
+    /// any point leaves the durable floor bounding the visible history (old
+    /// physical files remain but are invisible below the floor). The delete
+    /// set is captured from the pre-compaction logs, so a compaction that
+    /// finished the rewrites but crashed before deleting still removes the
+    /// below-floor snapshot dirs on a later retry (failed-attempt dirs below
+    /// the floor survive an interrupted run only as invisible, harmless
+    /// artifacts — the floor is the enforcement point, not the cleanup).
+    pub fn checkpoint_compact(&self, target: &str, floor: &HistoryFloor) -> Result<()> {
+        let discards = self.checkpoint_discards(target, floor)?;
+
+        // 1. attempts.jsonl → the suffix from the checkpoint's own attempt.
+        #[cfg(test)]
+        if self
+            .fault_registry
+            .consume(FaultKind::CompactAttempts, floor.deployment_id.as_str())
+        {
+            return Err(Error::store(
+                "test fault: checkpoint attempts rewrite forced to fail once",
+            ));
+        }
+        let attempts = self.read_attempts_raw(target)?;
+        let pos = attempts
+            .iter()
+            .position(|a| a.deployment_id == floor.deployment_id);
+        let keep = pos.map(|p| &attempts[p..]).unwrap_or(&attempts[..]);
+        write_jsonl_atomic(&self.target_dir(target).join("attempts.jsonl"), keep)?;
+
+        // 2. snapshots.jsonl → the suffix at/after the floor.
+        #[cfg(test)]
+        if self
+            .fault_registry
+            .consume(FaultKind::CompactSnapshots, floor.deployment_id.as_str())
+        {
+            return Err(Error::store(
+                "test fault: checkpoint snapshots rewrite forced to fail once",
+            ));
+        }
+        let snapshots = self.read_snapshots_raw(target)?;
+        let keep_snaps: Vec<DeploymentSnapshot> = snapshots
+            .iter()
+            .filter(|s| s.index >= floor.snapshot_index)
+            .cloned()
+            .collect();
+        write_jsonl_atomic(&self.refs_dir(target).join("snapshots.jsonl"), &keep_snaps)?;
+
+        // 3. Delete deployment dirs strictly before the floor (only the
+        //    deployment ids the target's own history names — never a
+        //    directory of another target, never releases/objects/servers).
+        #[cfg(test)]
+        if self
+            .fault_registry
+            .consume(FaultKind::CompactDeployments, floor.deployment_id.as_str())
+        {
+            return Err(Error::store(
+                "test fault: checkpoint deployment dir deletion forced to fail once",
+            ));
+        }
+        for id in &discards.discarded_deployments {
+            let dir = self.deployment_dir(id);
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir).map_err(|e| {
+                    Error::store(format!("remove deployment dir {}: {e}", dir.display()))
+                })?;
+            }
+        }
+        Ok(())
     }
 
     /// Append a terminal successful snapshot (`refs/snapshots.jsonl`),
@@ -720,7 +1018,12 @@ impl LocalStore {
         set_private(&p)
     }
 
-    pub fn read_snapshots(&self, target: &str) -> Result<Vec<DeploymentSnapshot>> {
+    /// Read the FULL snapshot log UNFILTERED by any checkpoint floor. This
+    /// is the physical view of `refs/snapshots.jsonl` (never a below-floor
+    /// escape hatch for consumers: [`LocalStore::read_snapshots`] is the
+    /// gated read). Index allocation and the compaction suffix use it, so
+    /// compacted logs never reuse an index.
+    pub fn read_snapshots_raw(&self, target: &str) -> Result<Vec<DeploymentSnapshot>> {
         let p = self.refs_dir(target).join("snapshots.jsonl");
         if !p.exists() {
             return Ok(vec![]);
@@ -736,6 +1039,20 @@ impl LocalStore {
                 serde_json::from_str::<DeploymentSnapshot>(line)
                     .map_err(|e| Error::store(format!("parse snapshot: {e}")))?,
             );
+        }
+        Ok(out)
+    }
+
+    /// Read the snapshot log as the FLOORED history: only the suffix at/after
+    /// the checkpoint's snapshot index (`index >= floor.snapshot_index`). The
+    /// checkpoint snapshot itself stays resolvable; everything below it was
+    /// discarded. The floor marker gates this read even when the physical
+    /// log has not been compacted yet (an interrupted compaction), so history
+    /// below the durable floor is never exposed.
+    pub fn read_snapshots(&self, target: &str) -> Result<Vec<DeploymentSnapshot>> {
+        let mut out = self.read_snapshots_raw(target)?;
+        if let Some(floor) = self.read_history_floor(target)? {
+            out.retain(|s| s.index >= floor.snapshot_index);
         }
         Ok(out)
     }
@@ -1465,6 +1782,86 @@ mod tests {
             slots: Default::default(),
         };
         assert!(store.write_results("deploy-1", &conflicting).is_err());
+    }
+
+    /// The floor marker gates the READER reads even when the physical logs
+    /// are NOT yet compacted (an interrupted compaction): `read_attempts` /
+    /// `read_snapshots` expose only the suffix at/after the floor while the
+    /// raw readers still see the full physical log (the index-minting view,
+    /// never a below-floor escape hatch). The marker also fails closed on a
+    /// foreign `schema_version`.
+    #[test]
+    fn history_floor_gates_reads_before_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let target = "t-floor";
+        // deploy-a (s0), deploy-b (s1), deploy-c (failed — no snapshot).
+        let base_attempt = |id: &str| DeploymentAttempt {
+            deployment_schema_version: SCHEMA_VERSION,
+            deployment_id: DeploymentId::new(id.to_string()),
+            target: TargetName::new(target.to_string()),
+            slot_ids: vec![],
+            behavior_sha256: "sha256-aa".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            desired: BTreeMap::new(),
+            pre_push: BTreeMap::new(),
+            slots: BTreeMap::new(),
+        };
+        for (n, id) in ["deploy-a", "deploy-b", "deploy-c"].iter().enumerate() {
+            store.append_attempt(target, &base_attempt(id)).unwrap();
+            if n < 2 {
+                store
+                    .append_snapshot(
+                        target,
+                        &DeploymentSnapshot {
+                            index: n as u64,
+                            deployment_id: DeploymentId::new(id.to_string()),
+                            target: TargetName::new(target.to_string()),
+                            behavior_sha256: "sha256-aa".to_string(),
+                            slots: BTreeMap::new(),
+                            bindings: BTreeMap::new(),
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+
+        // Write the floor marker WITHOUT compacting (durable-first ordering;
+        // the physical cleanup is still pending — the interrupted state).
+        let floor = HistoryFloor {
+            schema_version: SCHEMA_VERSION,
+            target: TargetName::new(target.to_string()),
+            deployment_id: DeploymentId::from("deploy-b".to_string()),
+            snapshot_index: 1,
+            established_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        store.write_history_floor(target, &floor).unwrap();
+
+        // Readers gate on the durable floor: only the suffix is visible.
+        let snaps = store.read_snapshots(target).unwrap();
+        assert_eq!(snaps.len(), 1, "only s1 is visible");
+        assert_eq!(snaps[0].index, 1);
+        let attempts = store.read_attempts(target).unwrap();
+        assert_eq!(attempts.len(), 2, "deploy-b and deploy-c are visible");
+        assert_eq!(attempts[0].deployment_id.as_str(), "deploy-b");
+        assert_eq!(attempts[1].deployment_id.as_str(), "deploy-c");
+
+        // The raw (physical) view still shows the full log: index minting
+        // sees everything, and no below-floor history is exposed to readers.
+        assert_eq!(store.read_snapshots_raw(target).unwrap().len(), 2);
+        assert_eq!(store.read_attempts_raw(target).unwrap().len(), 3);
+
+        // The floor round-trips and fails closed on a foreign schema version.
+        let read = store.read_history_floor(target).unwrap().unwrap();
+        assert_eq!(read, floor);
+        let mut foreign = floor.clone();
+        foreign.schema_version = SCHEMA_VERSION + 1;
+        write_json(&store.history_floor_path(target), &foreign).unwrap();
+        let err = store.read_history_floor(target).unwrap_err();
+        assert!(
+            err.to_string().contains("schema_version"),
+            "a foreign floor schema version must fail closed, got: {err}"
+        );
     }
 
     /// The one-shot intent/outcomes faults are deployment-id keyed and

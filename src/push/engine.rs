@@ -1905,13 +1905,23 @@ fn validate_behavior_coverage(
 /// makes the stale-lock double-ownership race impossible: a dead controller's
 /// lock is released by the kernel rather than lingering, and two live
 /// contenders can never both win the acquisition.
-struct FileLock {
+/// An advisory (flock) lock held by an open file descriptor. While the guard
+/// is alive the kernel prevents any other process from acquiring the same lock,
+/// and the lock is released automatically if the owning process dies. This
+/// makes the stale-lock double-ownership race impossible: a dead controller's
+/// lock is released by the kernel rather than lingering, and two live
+/// contenders can never both win the acquisition.
+///
+/// `pub(crate)` so the checkpoint command ([`crate::push::checkpoint`]) runs
+/// under the SAME lock discipline as pushes: the application-store lock then
+/// the target lock, exactly like [`crate::push::engine::push`].
+pub(crate) struct FileLock {
     file: std::fs::File,
     path: std::path::PathBuf,
 }
 
 impl FileLock {
-    fn acquire(path: &Path, op_id: &str) -> Result<Self> {
+    pub(crate) fn acquire(path: &Path, op_id: &str) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| Error::preflight(format!("mkdir {}: {e}", parent.display())))?;

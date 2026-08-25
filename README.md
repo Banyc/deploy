@@ -72,6 +72,10 @@ deploy status production           # what is actually running on each server
 deploy log production              # deployment history (each line prefixed with its snapshot id sN)
 ```
 
+To retain a bounded history, establish a checkpoint once the rollout is
+confirmed — see [Checkpoints (history floors)](#checkpoints-history-floors)
+below.
+
 To deploy to a real server instead of the local endpoint, either pass flags at
 scaffold time:
 
@@ -94,8 +98,9 @@ addresses need neither.
 | --- | --- |
 | `deploy init [PATH]` | Scaffold a fresh project (see above). |
 | `deploy push <target> [ref]` | Deploy local files (or restore a ref) to every server in the target, in rollout batches. |
-| `deploy log <target>` | Deployment history — successful *and* failed attempts, each line prefixed with the snapshot id (`sN`) it produced (`-` for attempts with no snapshot). |
+| `deploy log <target>` | Deployment history — successful *and* failed attempts, each line prefixed with the snapshot id (`sN`) it produced (`-` for attempts with no snapshot). The visible history is the retained suffix when a checkpoint has been established. |
 | `deploy status <target>` | What is actually running on each server right now (generation, release, variant, tree). |
+| `deploy checkpoint <target> <deployment-id>` | Establish a monotonic HISTORY FLOOR at a successful deployment (irreversible — requires `--yes`; `--dry-run` previews the discard list). |
 
 Global flag: `--config <path>` selects a different `deploy.toml` than
 `./deploy.toml` (usable anywhere on the command line).
@@ -148,6 +153,49 @@ deploy push production rel-sha256-41da2f63--        # 2 before the most recent s
 - Rollout is batched per `rollout.batch_size`; on a failed server, earlier
   batches roll back by default (`failure_policy: rollback_changed`). The final
   status is reported explicitly, including partial states like `degraded`.
+
+## Checkpoints (history floors)
+
+A checkpoint models the target's retained history as a monotonic FLOOR, not
+another deployment or snapshot. Once you checkpoint a successful deployment,
+the retained history starts at that attempt, the checkpoint deployment's
+snapshot becomes the OLDEST rollback state, and everything strictly before
+it — older snapshots, older attempts (failed attempts included), and their
+`deployments/<id>/` directories — is discarded. The checkpoint deployment
+and everything after it is kept.
+
+```sh
+deploy checkpoint production deploy-20260821T102000Z --dry-run   # preview the discard list; touches nothing
+# would discard 3 snapshots: s0, s1, s2
+# would discard 4 attempts: deploy-...
+# would delete 4 deployment directories: ...
+deploy checkpoint production deploy-20260821T102000Z --yes       # establish the floor (IRREVERSIBLE)
+deploy log production       # now shows only the retained suffix
+deploy push production s3   # the checkpoint snapshot stays the oldest rollback
+```
+
+- The deployment id is an explicit, REQUIRED argument (the operation is
+  irreversible) and `--yes` is required for the real operation; without
+  `--yes` and without `--dry-run` the command is refused up front.
+- The deployment must be a SUCCESSFUL deployment of the target (it must have
+  produced a snapshot); otherwise the checkpoint fails with
+  `checkpoint requires a successful deployment`.
+- A checkpoint does NOT deploy anything, does NOT contact remote servers, and
+  does NOT create another snapshot. The checkpoint deployment's existing
+  snapshot remains the actual rollback state.
+- The floor is stored as a small marker at
+  `targets/<target>/refs/history-floor.json` (not another state snapshot),
+  written durably BEFORE the physical compaction rewrites the logs and
+  deletes the below-floor deployment directories. Because every read path is
+  gated by the marker, an interrupted cleanup can never expose history below
+  the durable floor.
+- Repeating the same checkpoint is idempotent (a no-op); advancing it to a
+  LATER deployment updates the floor; a checkpoint can NEVER move backward —
+  an earlier deployment than the current floor is refused.
+- Only `deployments/<id>/` directories strictly before the floor are
+  deleted: release records, tree objects, remote generations, and pinned
+  artifacts are never touched, and checkpointing one target never changes
+  another target's history.
 
 ## Project structure (forced)
 

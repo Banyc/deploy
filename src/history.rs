@@ -7,6 +7,17 @@
 //! attempts remain visible through `deploy log` and `attempts.jsonl` but are
 //! not valid rollback sources.
 //!
+//! # History floor
+//!
+//! A checkpoint (`deploy checkpoint <target> <deployment-id>`) establishes a
+//! monotonic history floor for the target: every read here resolves against
+//! the FLOORED chain — [`LocalStore::read_snapshots`] exposes only the suffix
+//! at/after the checkpoint's snapshot index, so the checkpoint snapshot
+//! itself stays resolvable while `sN` / `parent(...)` / `@-` stepping below
+//! it fails closed with a "history floor" ref error. Appends after a
+//! checkpoint mint the next unique index from the RAW physical log
+//! ([`ensure_snapshot`]), so compaction can never reuse an index.
+//!
 //! # Reference syntax (jj-style)
 //!
 //! The push reference is jj-style: the TARGET IS NEVER REPEATED in the
@@ -398,7 +409,7 @@ pub fn resolve_ref_expr(expr: &RefExpr, target: &str, store: &LocalStore) -> Res
                 return Ok(PushRef::Head);
             }
             let entries = store.read_snapshots(target)?;
-            let base_index = resolve_base_index(&rel.base, target, &entries, expr)?;
+            let base_index = resolve_base_index(&rel.base, target, &entries, expr, store)?;
             let index = base_index.checked_sub(rel.steps).ok_or_else(|| {
                 Error::r#ref(format!(
                     "'{expr}' walks {} step(s) back from snapshot s{base_index} on target '{target}', \
@@ -406,6 +417,20 @@ pub fn resolve_ref_expr(expr: &RefExpr, target: &str, store: &LocalStore) -> Res
                     rel.steps
                 ))
             })?;
+            // The history floor gates resolution: the chain the read exposed is
+            // already the suffix at/after the floor (read_snapshots filters by
+            // the durable marker), so a below-floor index is structurally
+            // unreachable here — but the explicit check documents the guarantee
+            // and guards any future caller that resolves against a raw chain.
+            if let Some(floor) = store.read_history_floor(target)?
+                && index < floor.snapshot_index
+            {
+                return Err(Error::r#ref(format!(
+                    "cannot roll back below the history floor (checkpoint {} at s{}) on target '{target}': \
+                    history before the checkpoint has been discarded",
+                    floor.deployment_id, floor.snapshot_index
+                )));
+            }
             Ok(PushRef::Snapshot {
                 target: TargetName::new(target.to_string()),
                 index,
@@ -416,13 +441,21 @@ pub fn resolve_ref_expr(expr: &RefExpr, target: &str, store: &LocalStore) -> Res
 
 /// Resolve a relative reference's base to a snapshot index in the chain.
 /// `expr` renders the reference for error messages (the parsed form has no
-/// raw token anymore).
+/// raw token anymore). The chain is the FLOORED read (the suffix at/after
+/// the target's checkpoint), so a refid below the floor is absent; when the
+/// target has a history floor, the absence is reported as a below-floor
+/// refusal naming the checkpoint rather than a plain "no snapshot" error.
 fn resolve_base_index(
     base: &RelBase,
     target: &str,
     entries: &[DeploymentSnapshot],
     expr: &RefExpr,
+    store: &LocalStore,
 ) -> Result<u64> {
+    // The history floor, when set: below-floor refids fail with a floor
+    // error instead of a generic "no snapshot" error.
+    let floor = store.read_history_floor(target)?;
+    let below_floor = |k: u64| -> bool { floor.as_ref().is_some_and(|f| k < f.snapshot_index) };
     let latest = entries.iter().map(|e| e.index).max();
     match base {
         RelBase::At => latest.ok_or_else(|| {
@@ -433,6 +466,13 @@ fn resolve_base_index(
         RelBase::Refid(RefId::SnapshotIndex(k)) => {
             if entries.iter().any(|e| e.index == *k) {
                 Ok(*k)
+            } else if below_floor(*k) {
+                let f = floor.expect("below_floor implies a floor");
+                Err(Error::r#ref(format!(
+                    "no snapshot s{k} for target '{target}': cannot roll back below the history floor \
+                    (checkpoint {} at s{}) — history before the checkpoint has been discarded",
+                    f.deployment_id, f.snapshot_index
+                )))
             } else {
                 Err(Error::r#ref(format!(
                     "no snapshot s{k} for target '{target}'"
@@ -446,7 +486,7 @@ fn resolve_base_index(
             .max()
             .ok_or_else(|| {
                 Error::r#ref(format!(
-                    "no successful snapshot for deployment '{id}' on target '{target}'"
+                    "no successful snapshot for deployment '{id}' on target '{target}'",
                 ))
             }),
         RelBase::Refid(RefId::Release(rid)) => {
@@ -458,7 +498,7 @@ fn resolve_base_index(
                 .max()
                 .ok_or_else(|| {
                     Error::r#ref(format!(
-                        "no successful snapshot references release '{rid}' on target '{target}'"
+                        "no successful snapshot references release '{rid}' on target '{target}'",
                     ))
                 })
         }
@@ -511,7 +551,11 @@ pub fn ensure_snapshot(
     bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
 ) -> Result<u64> {
     let target = target.as_str();
-    let entries = store.read_snapshots(target)?;
+    // RAW (floor-unfiltered) snapshot log: index allocation must see every
+    // physically recorded snapshot so a compaction can never reuse an index.
+    // The floor only bounds what readers see; the index space is monotonic
+    // over the full physical log.
+    let entries = store.read_snapshots_raw(target)?;
     if let Some(existing) = entries
         .iter()
         .find(|e| e.deployment_id == attempt.deployment_id)
@@ -519,7 +563,11 @@ pub fn ensure_snapshot(
         store.write_last_successful(target, attempt.deployment_id.as_str())?;
         return Ok(existing.index);
     }
-    let next = entries.len() as u64;
+    // NEXT INDEX = max existing index + 1 (never `entries.len()`: a compacted
+    // chain like [s2, s3] has len 2 but the next unique index is 4, so len
+    // would mint a reused index 2). Appending after a checkpoint therefore
+    // always produces a unique, increasing index.
+    let next = entries.iter().map(|e| e.index).max().map_or(0, |m| m + 1);
     let entry = build_snapshot(next, attempt, outcomes, bindings);
     store.append_snapshot(target, &entry)?;
     store.write_last_successful(target, attempt.deployment_id.as_str())?;

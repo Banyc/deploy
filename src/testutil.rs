@@ -125,6 +125,20 @@ pub(crate) mod test_faults {
         /// `write_rotation_debt` (rotation maintenance debt write), keyed by
         /// target.
         WriteRotationDebt,
+        /// The checkpoint floor marker write (`write_history_floor`) — the
+        /// FIRST durable step of a checkpoint; a failure here leaves no
+        /// floor (and therefore no compaction).
+        WriteHistoryFloor,
+        /// The checkpoint's attempts.jsonl suffix rewrite (the first
+        /// compaction phase, after the floor marker is already durable).
+        CompactAttempts,
+        /// The checkpoint's snapshots.jsonl suffix rewrite (the second
+        /// compaction phase, after the floor marker is already durable).
+        CompactSnapshots,
+        /// The checkpoint's `deployments/<id>/` directory deletion (the
+        /// third compaction phase, after the floor marker is already
+        /// durable).
+        CompactDeployments,
     }
 
     /// A per-fixture one-shot fault registry.
@@ -311,6 +325,39 @@ pub(crate) mod test_faults {
         /// debt-I/O sibling agent's `arm_write_rotation_debt`.
         pub(crate) fn arm_write_rotation_debt(&self, target: &str) {
             self.arm(FaultKind::WriteRotationDebt, target);
+        }
+
+        /// Arm the next `write_history_floor` call for `deployment_id` (the
+        /// checkpoint deployment) to fail once. A failure here fires BEFORE
+        /// the floor marker is durable: no floor, no compaction — the
+        /// checkpoint fails cleanly with history fully intact.
+        pub(crate) fn arm_write_history_floor(&self, deployment_id: &str) {
+            self.arm(FaultKind::WriteHistoryFloor, deployment_id);
+        }
+
+        /// Arm the next checkpoint attempts.jsonl suffix rewrite for
+        /// `deployment_id` (the checkpoint deployment) to fail once. The
+        /// floor marker is ALREADY durable when this fires (the floor is
+        /// written first), so an interrupted compaction must never expose
+        /// history below the durable floor.
+        pub(crate) fn arm_compact_attempts(&self, deployment_id: &str) {
+            self.arm(FaultKind::CompactAttempts, deployment_id);
+        }
+
+        /// Arm the next checkpoint snapshots.jsonl suffix rewrite for
+        /// `deployment_id` (the checkpoint deployment) to fail once. The
+        /// floor marker is ALREADY durable when this fires.
+        pub(crate) fn arm_compact_snapshots(&self, deployment_id: &str) {
+            self.arm(FaultKind::CompactSnapshots, deployment_id);
+        }
+
+        /// Arm the next checkpoint `deployments/<id>/` directory deletion
+        /// pass for `deployment_id` (the checkpoint deployment) to fail
+        /// once. The floor marker is ALREADY durable when this fires, so
+        /// even a total deletion failure leaves the visible history bounded
+        /// below by the durable floor.
+        pub(crate) fn arm_compact_deployments(&self, deployment_id: &str) {
+            self.arm(FaultKind::CompactDeployments, deployment_id);
         }
     }
 }

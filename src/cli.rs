@@ -9,6 +9,7 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::init::{InitOptions, init_project};
+use crate::model::DeploymentId;
 use crate::push::engine::{PushOptions, PushReport, push};
 use crate::records::{DeploymentAttempt, DeploymentStatus, ObservedTarget};
 use crate::remote::create_remote;
@@ -198,6 +199,51 @@ id, release id, variant, and tree digest, as observed on the servers themselves\
 (right now — not from local history)."
     )]
     Status { target: String },
+    /// Establish a checkpoint (monotonic history floor) on a target.
+    #[command(
+        long_about = "Model a checkpoint as a monotonic HISTORY FLOOR: once you checkpoint a\n\
+deployment, the retained history starts from that attempt and the OLDEST\n\
+rollback is that attempt — everything before it is discarded permanently.\n\
+The checkpoint deployment must be a SUCCESSFUL deployment of the target\n\
+(it must have produced a snapshot); its snapshot becomes the oldest\n\
+rollback state, and snapshots, attempts, and deployment directories\n\
+strictly before it are discarded. The checkpoint deployment and everything\n\
+after it are kept.\n\n\
+The operation is IRREVERSIBLE, so the deployment id is an explicit,\n\
+required positional argument and the real operation requires --yes.\n\
+--dry-run prints exactly what would be discarded and touches NOTHING (no\n\
+locks, no writes, no remote contact); --yes performs the compaction.\n\n\
+Checkpointing the deployment the floor already sits at is a no-op\n\
+(idempotent); an EARLIER deployment than the current floor is refused (a\n\
+checkpoint can never move backward after older history has been\n\
+discarded).\n\n\
+The floor is stored as a small marker at\n\
+targets/<target>/refs/history-floor.json (durable BEFORE the physical\n\
+compaction rewrites the logs and deletes the below-floor deployment\n\
+directories), so even an interrupted cleanup never exposes history below\n\
+the durable floor. Releases, objects, remote generations, and pinned\n\
+artifacts are never deleted. A checkpoint does not deploy anything,\n\
+contact remote servers, or create another snapshot.",
+        after_help = "Examples:\n\
+  deploy checkpoint production deploy-004 --dry-run   # preview what would be discarded\n\
+  deploy checkpoint production deploy-004 --yes       # establish the floor (irreversible)\n\
+  deploy log production                               # now shows only the retained suffix\n\
+  deploy push production s3                           # the checkpoint snapshot stays the oldest rollback"
+    )]
+    Checkpoint {
+        target: String,
+        /// The successful deployment to checkpoint (required: the operation
+        /// is irreversible, so the id must be explicit).
+        deployment_id: DeploymentId,
+        /// Preview exactly what would be discarded; touches nothing (no
+        /// locks, no writes, no remote).
+        #[arg(long)]
+        dry_run: bool,
+        /// Confirm the irreversible operation. Required for the real
+        /// operation; rejected without it.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// CLI entry point.
@@ -304,6 +350,26 @@ where
         Command::Status { target } => {
             let observed = store.read_observed(&target)?;
             for line in render_status(&observed) {
+                println!("{line}");
+            }
+        }
+        Command::Checkpoint {
+            target,
+            deployment_id,
+            dry_run,
+            yes,
+        } => {
+            // The real operation is irreversible: without --yes (and without
+            // a --dry-run preview) it is refused up front.
+            if !dry_run && !yes {
+                return Err(Error::preflight(
+                    "checkpoint is irreversible: pass --yes to establish the history floor \
+                     (or --dry-run to preview exactly what would be discarded)",
+                ));
+            }
+            let report =
+                crate::push::checkpoint::run_checkpoint(&store, &target, &deployment_id, dry_run)?;
+            for line in crate::push::checkpoint::render_checkpoint_report(&report) {
                 println!("{line}");
             }
         }
@@ -780,6 +846,211 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     fn init_defaults_to_current_directory() {
         let cli = Cli::try_parse_from(["deploy", "init"]).unwrap();
         assert!(matches!(cli.command, Command::Init { .. }));
+    }
+
+    /// `deploy checkpoint <target>` without a deployment id is a parse
+    /// error (the id is an explicit required positional: the operation is
+    /// irreversible).
+    #[test]
+    fn checkpoint_requires_explicit_deployment_id() {
+        let err = Cli::try_parse_from(["deploy", "checkpoint", "production"])
+            .err()
+            .expect("the deployment id is required");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("deployment_id") || msg.contains("required"),
+            "error must name the missing id, got: {msg}"
+        );
+        // With an id the flags parse (--dry-run and --yes are both optional).
+        let cli = Cli::try_parse_from([
+            "deploy",
+            "checkpoint",
+            "production",
+            "deploy-004",
+            "--dry-run",
+            "--yes",
+        ])
+        .unwrap();
+        let Command::Checkpoint {
+            target,
+            deployment_id,
+            dry_run,
+            yes,
+        } = cli.command
+        else {
+            panic!("expected checkpoint");
+        };
+        assert_eq!(target, "production");
+        assert_eq!(deployment_id.as_str(), "deploy-004");
+        assert!(dry_run && yes);
+    }
+
+    /// End-to-end `deploy checkpoint`: a bare invocation (no --yes, no
+    /// --dry-run) is refused as irreversible; `--dry-run` previews and
+    /// touches NOTHING; `--yes` establishes the durable floor; repeating it
+    /// is an idempotent no-op.
+    #[test]
+    fn checkpoint_dispatch_refuses_without_confirmation_and_is_idempotent() {
+        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        std::fs::write(
+            release_dir.join("standard.toml"),
+            r#"[[slots]]
+id = "p1"
+server = "s1"
+targets = ["production"]
+deploy_dir = "/srv/ckpt"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("deploy.toml"),
+            r#"schema_version = 1
+application = "checkpoint-cli"
+release = "v1"
+
+[[servers]]
+id = "s1"
+address = "a"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[targets.production]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#,
+        )
+        .unwrap();
+        let cfg_path = project.join("deploy.toml");
+        let data_home = dir.path().join("data");
+        unsafe { std::env::set_var("XDG_DATA_HOME", &data_home) };
+        // `run_with` resolves the store as `LocalStore::new("checkpoint-cli")`
+        // = XDG_DATA_HOME/simple-deploy/checkpoint-cli.
+        let store =
+            LocalStore::with_base(data_home.join("simple-deploy").join("checkpoint-cli")).unwrap();
+
+        // Seed a small history: deploy-a (s0), deploy-b (s1), deploy-c (s2).
+        for (n, id) in ["deploy-0", "deploy-1", "deploy-2"].iter().enumerate() {
+            store
+                .append_attempt(
+                    "production",
+                    &crate::records::DeploymentAttempt {
+                        deployment_schema_version: SCHEMA_VERSION,
+                        deployment_id: DeploymentId::new(id.to_string()),
+                        target: TargetName::new("production".to_string()),
+                        slot_ids: vec![],
+                        behavior_sha256: "sha256-aa".to_string(),
+                        attempted_at: "2026-01-01T00:00:00Z".to_string(),
+                        desired: BTreeMap::new(),
+                        pre_push: BTreeMap::new(),
+                        slots: BTreeMap::new(),
+                    },
+                )
+                .unwrap();
+            std::fs::create_dir_all(store.deployment_dir(id)).unwrap();
+            store
+                .append_snapshot(
+                    "production",
+                    &crate::records::DeploymentSnapshot {
+                        index: n as u64,
+                        deployment_id: DeploymentId::new(id.to_string()),
+                        target: TargetName::new("production".to_string()),
+                        behavior_sha256: "sha256-aa".to_string(),
+                        slots: BTreeMap::new(),
+                        bindings: BTreeMap::new(),
+                    },
+                )
+                .unwrap();
+        }
+
+        // Bare checkpoint (no --yes, no --dry-run): refused as irreversible
+        // BEFORE any store mutation.
+        let err = run_with([
+            "deploy",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "checkpoint",
+            "production",
+            "deploy-1",
+        ])
+        .expect_err("a bare checkpoint must be refused");
+        assert!(
+            err.to_string().contains("irreversible"),
+            "must explain the confirmation requirement, got: {err}"
+        );
+        assert!(store.read_history_floor("production").unwrap().is_none());
+
+        // --dry-run: succeeds, enumerates the discards, writes NOTHING.
+        run_with([
+            "deploy",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "checkpoint",
+            "production",
+            "deploy-1",
+            "--dry-run",
+        ])
+        .expect("dry-run checkpoint succeeds");
+        assert!(
+            store.read_history_floor("production").unwrap().is_none(),
+            "dry-run must not write the floor marker"
+        );
+        assert_eq!(store.read_snapshots_raw("production").unwrap().len(), 3);
+        assert_eq!(store.read_attempts_raw("production").unwrap().len(), 3);
+
+        // --yes: establishes the durable floor and compacts.
+        run_with([
+            "deploy",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "checkpoint",
+            "production",
+            "deploy-1",
+            "--yes",
+        ])
+        .expect("the confirmed checkpoint establishes the floor");
+        let floor = store.read_history_floor("production").unwrap().unwrap();
+        assert_eq!(floor.deployment_id.as_str(), "deploy-1");
+        assert_eq!(floor.snapshot_index, 1);
+        assert_eq!(store.read_snapshots("production").unwrap().len(), 2);
+        assert_eq!(store.read_attempts("production").unwrap().len(), 2);
+        assert!(!store.deployment_dir("deploy-0").exists());
+        assert!(store.deployment_dir("deploy-1").exists());
+        assert!(store.deployment_dir("deploy-2").exists());
+
+        // Repeating the same checkpoint: idempotent no-op.
+        run_with([
+            "deploy",
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "checkpoint",
+            "production",
+            "deploy-1",
+            "--yes",
+        ])
+        .expect("a repeated checkpoint is idempotent");
+        let floor2 = store.read_history_floor("production").unwrap().unwrap();
+        assert_eq!(floor2, floor);
+
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        drop(_lock);
     }
 
     // Host identity is exactly one source: `--known-hosts` and

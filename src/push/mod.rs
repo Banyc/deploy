@@ -1,6 +1,7 @@
 //! Push transaction: planning and execution.
 
 pub mod capacity;
+pub mod checkpoint;
 pub mod engine;
 pub mod plan;
 pub mod reconcile;

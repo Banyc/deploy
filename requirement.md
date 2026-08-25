@@ -68,6 +68,10 @@ deploy status production
 # (jj-style: the target is passed once; the reference is relative)
 deploy push production @-              # the previous successful snapshot
 deploy push production 'parent(@, 3)'    # three snapshots back
+# Establish a monotonic HISTORY FLOOR at a successful deployment
+# (IRREVERSIBLE — requires --yes; --dry-run previews the discard list):
+deploy checkpoint production deploy-20260821T102000Z --dry-run
+deploy checkpoint production deploy-20260821T102000Z --yes
 ```
 
 `deploy log` output is one line per recorded attempt, newest last, each line
@@ -336,6 +340,7 @@ The local store contains the exact immutable trees sent to servers, immutable re
       refs/
         last-successful
         snapshots.jsonl
+        history-floor.json   # optional checkpoint marker (monotonic history floor)
   servers/
     server-01.json
     server-02.json
@@ -353,7 +358,59 @@ status); each deployment's status is an append-only transition stream
 (`deployments/<id>/transitions.jsonl`) whose LATEST entry is the deployment's
 current status; and successful deployments additionally produce a rollback
 snapshot (`refs/snapshots.jsonl` + `refs/last-successful`), referenced as
-`<target> sN` on the push command (e.g. `deploy push <target> s0`).
+`<target> sN` on the push command (e.g. `deploy push <target> s0`). The
+rollback history is the append-only OP LOG — the term is "op log", never
+"reflog".
+
+### History floor (checkpoints)
+
+A checkpoint (`deploy checkpoint <target> <deployment-id>`) models the
+target's retained history as a monotonic floor — a small DURABLE MARKER at
+`targets/<target>/refs/history-floor.json`, deliberately NOT another
+snapshot or deployment:
+
+```json
+{
+  "schema_version": 1,
+  "target": "production",
+  "deployment_id": "deploy-20260821T102000Z",
+  "snapshot_index": 3,
+  "established_at": "2026-08-25T14:00:00Z"
+}
+```
+
+The deployment referenced by `deployment_id` must be a SUCCESSFUL deployment
+for that target (it must have produced a snapshot); that snapshot (its
+`snapshot_index` in the op log) becomes the OLDEST ROLLBACK STATE. The
+retained history is exactly the suffix at/after the checkpoint: older
+snapshots, older attempts (failed attempts included), and their
+`deployments/<id>/` directories strictly before the floor are discarded; the
+checkpoint deployment and everything after it is kept. A checkpoint does not
+deploy anything, does not contact remote servers, and does not create another
+snapshot.
+
+Durability ordering: the floor marker is written FIRST (atomic temp+rename +
+directory fsync — durable before anything is deleted), then the physical
+compaction rewrites `attempts.jsonl` and `snapshots.jsonl` to the suffix
+(atomic temp+rename per file) and deletes the below-floor deployment
+directories. Because EVERY read path — `read_attempts`, `read_snapshots`,
+and ref resolution (`sN`, `parent(...)`, `@-`) — is gated by the marker, an
+interrupted cleanup leaves either the old physical files or the compacted
+files, never visible history below the durable floor. The checkpoint snapshot
+itself stays resolvable; stepping below it fails closed with a history-floor
+ref error. Repeated checkpointing of the same deployment is idempotent (a
+no-op, or a repair that finishes an interrupted compaction); advancing to a
+later deployment updates the floor; an EARLIER deployment than the current
+floor is refused (a checkpoint can never move backward after older history
+has been discarded). The CLI requires an explicit deployment id and `--yes`
+for the real operation; `--dry-run` enumerates exactly what would be
+discarded and touches nothing. Only `deployments/<id>/` dirs strictly before
+the floor are ever deleted: release records, tree objects, remote
+generations, and pinned artifacts are never removed, and checkpointing one
+target never changes another target's history. The raw (unfiltered) readers
+are the internal index-minting view: snapshot indices are always
+`max(index) + 1` over the physical log, so compaction can never reuse an
+index and appends after a checkpoint stay unique and increasing.
 
 Tree metadata is identity-neutral. For example,
 
@@ -605,6 +662,14 @@ is the LATEST transition. For example:
 The target snapshot log contains only fully successful snapshots, referenced by snapshot index on the push command (`deploy push production s0`, `deploy push production s1`, and so on). Failed and degraded attempts remain visible through `deploy log production` and `attempts.jsonl`, but are not valid rollback sources. Each snapshot entry records every slot's advanced generation AND the complete physical binding it had (`bindings`, keyed by slot ID — the slot's `{server, deploy_dir}` pair at deployment time): exact rollback maps generations to slots by slot ID, so the recorded binding is what proves a slot still lives at the exact on-host location it was deployed onto.
 
 A commit is authoritative only when the same deployment ID and placement-slot set are committed on every member. This lets a fresh or repaired local store reconstruct successful snapshot history from the servers instead of trusting a stale local ref.
+
+When a checkpoint has been established on the target, ALL reference resolution
+resolves against the FLOORED chain (the suffix at/after the checkpoint's
+snapshot): the checkpoint snapshot itself stays resolvable, and stepping
+below it — `sN` with `N < floor`, or `parent(...)` / `@-` walking past the
+floor — fails closed with a history-floor ref error (e.g.
+`cannot roll back below the history floor (checkpoint deploy-… at s3)`)
+instead of resolving to a discarded state.
 
 Pushing an older successful reference restores its complete assignment, including the historical behavior contract and different variants on different servers. References are jj-style: the target is passed ONCE (the push argument) and is never repeated in the reference; the `@`-relative forms resolve against that target's snapshot chain.
 
