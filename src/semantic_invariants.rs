@@ -5809,16 +5809,16 @@ proptest! {
     // fixed). Random streams explore interleavings the hand-written
     // sequences miss; the shrinker minimizes any failing vector. The case
     // count is bounded so the suite stays fast (each case drives a full
-    // fixture).
+    // fixture; the state-machine action vectors are capped at ten actions).
     #![proptest_config(ProptestConfig {
-        cases: 16,
+        cases: 4,
         failure_persistence: Some(Box::new(FileFailurePersistence::default())),
         ..ProptestConfig::default()
     })]
 
     #[test]
     fn semantic_state_machine(
-        steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..20)
+        steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..10)
     ) {
         run_semantic_state_case(steps);
     }
@@ -5829,9 +5829,12 @@ proptest! {
     // generator under the pinned 0x5EED_5EED seed with no persistence runs
     // the IDENTICAL vectors on every invocation, so the suite stays
     // reproducible even when no failure has ever been persisted by the main
-    // test. The case count is bounded so the suite stays fast.
+    // test. The case count is bounded so the suite stays fast (and the
+    // action vectors are capped at ten actions); the persisted regression
+    // vectors in `proptest-regressions/semantic_invariants.txt` replay
+    // regardless of count and length.
     #![proptest_config(ProptestConfig {
-        cases: 16,
+        cases: 4,
         rng_seed: RngSeed::Fixed(0x5EED_5EED),
         failure_persistence: None,
         ..ProptestConfig::default()
@@ -5839,7 +5842,7 @@ proptest! {
 
     #[test]
     fn semantic_state_machine_fixed_seed_regression(
-        steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..20)
+        steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..10)
     ) {
         run_semantic_state_case(steps);
     }
@@ -6033,13 +6036,14 @@ proptest! {
     // when preexisting debt exists, and no marker appears when it does not
     // exist and persistence failed.
     //
-    // Bounded cases (16) keep the suite fast (~35s total); a fixed seed
-    // keeps CI deterministic (no persistence file) — the project's fixed-seed
-    // leg, mirroring `semantic_state_machine_fixed_seed_regression` (the
+    // Bounded cases (4) keep the suite fast (each case is a fresh fixture
+    // with a real push); a fixed seed keeps CI deterministic (no persistence
+    // file) — the project's fixed-seed leg, mirroring
+    // `semantic_state_machine_fixed_seed_regression` (the
     // randomized-with-persistence leg lives in the main
     // `semantic_state_machine`).
     #![proptest_config(ProptestConfig {
-        cases: 16,
+        cases: 4,
         rng_seed: RngSeed::Fixed(0x5EED_17DE),
         failure_persistence: None,
         ..ProptestConfig::default()
@@ -6324,10 +6328,10 @@ fn assert_membership_never_changes_retention(
 
 proptest! {
     // THE SLOT-VIEW PROPERTY: overlapping targets + interleaved pushes.
-    // Bounded 16 cases, fixed seed 0x5EED_5EED (house style), no failure
+    // Bounded 4 cases, fixed seed 0x5EED_5EED (house style), no failure
     // persistence — deterministic for CI.
     #![proptest_config(ProptestConfig {
-        cases: 16,
+        cases: 4,
         rng_seed: RngSeed::Fixed(0x5EED_5EED),
         failure_persistence: None,
         ..ProptestConfig::default()

@@ -72,12 +72,14 @@ fn make_fake_bin(tmp: &Path, address: &str) -> FakeSsh {
 
     std::fs::write(
         bin.join("ssh"),
-        r#"#!/bin/sh
+        r#"#!/bin/bash
 # Fake `ssh` for tests: emulates a remote host whose filesystem is a local
 # directory. `FAKE_SSH_ROOT` is the local dir; `FAKE_SSH_REMOTE_PREFIX` is the
 # configured remote deploy dir (e.g. /srv/deploy/app). Every occurrence of the
 # remote prefix in the (fully shell-quoted) remote command is remapped to
 # $FAKE_SSH_ROOT$FAKE_SSH_REMOTE_PREFIX, then the command runs with `sh -c`.
+# Bash literal pattern substitution (no awk subprocess) keeps each remote
+# op to a single fork+exec of this shim.
 FAKE_ROOT="${FAKE_SSH_ROOT:?FAKE_SSH_ROOT not set}"
 REMOTE_PREFIX="${FAKE_SSH_REMOTE_PREFIX:?FAKE_SSH_REMOTE_PREFIX not set}"
 cmd=""
@@ -90,8 +92,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$cmd" ] || exit 0
-remapped=$(printf '%s' "$cmd" | awk -v old="$REMOTE_PREFIX" -v new="$FAKE_ROOT$REMOTE_PREFIX" '{ gsub(old, new); printf "%s", $0 }')
-exec sh -c "$remapped"
+remapped=${cmd//"$REMOTE_PREFIX"/"$FAKE_ROOT$REMOTE_PREFIX"}
+eval "$remapped"
 "#,
     )
     .unwrap();
@@ -123,31 +125,32 @@ printf '%s %s\n' "$host" '{pubkey}'
 
     std::fs::write(
         bin.join("stat"),
-        r#"#!/bin/sh
+        r##"#!/usr/bin/perl
 # Emulate GNU coreutils `stat -c` (macOS stat lacks it): the transport's
 # list/metadata scripts use `stat -c '%f'` (raw mode in hex) and
-# `stat -c '%s %f'` (size + raw mode hex).
-fmt=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -c) fmt="$2"; shift 2 ;;
-    -L) shift ;;
-    -*) shift ;;
-    *) break ;;
-  esac
-done
-case "$fmt" in
-  "%f")
-    perl -e 'my @s = lstat($ARGV[0]); printf "%x\n", $s[2] & 0xffff;' "$1"
-    ;;
-  "%s %f")
-    perl -e 'my @s = lstat($ARGV[0]); printf "%s %x\n", $s[7], $s[2] & 0xffff;' "$1"
-    ;;
-  *)
-    exec /usr/bin/stat "$@"
-    ;;
-esac
-"#,
+# `stat -c '%s %f'` (size + raw mode hex). Direct perl (no sh wrapper)
+# keeps each metadata call a single exec.
+my $fmt = "";
+my @rest = ();
+while (@ARGV) {
+    my $a = shift @ARGV;
+    if ($a eq "-c") { $fmt = shift @ARGV; }
+    elsif ($a eq "-L") { }
+    elsif ($a =~ /^-/) { }
+    else { @rest = ($a, @ARGV); last; }
+}
+if ($fmt eq "%f") {
+    my @s = lstat($rest[0]);
+    printf "%x\n", $s[2] & 0xffff;
+    exit 0;
+}
+if ($fmt eq "%s %f") {
+    my @s = lstat($rest[0]);
+    printf "%s %x\n", $s[7], $s[2] & 0xffff;
+    exit 0;
+}
+exec "/usr/bin/stat", @rest;
+"##,
     )
     .unwrap();
 

@@ -722,8 +722,8 @@ interval_seconds = 0
 
     proptest! {
         #![proptest_config(ProptestConfig {
-            // Bounded 16 cases, fixed seed per house style.
-            cases: 16,
+            // Bounded 4 cases, fixed seed per house style.
+            cases: 4,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()

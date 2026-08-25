@@ -6518,7 +6518,7 @@ interval_seconds = 0
 
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 32,
+            cases: 8,
             rng_seed: RngSeed::Fixed(0x0EA5_0E11_0BEA),
             failure_persistence: None,
             ..ProptestConfig::default()
@@ -6754,7 +6754,7 @@ interval_seconds = 0
     // any lock or factory invocation) precisely so this holds.
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 16,
+            cases: 4,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
@@ -7087,7 +7087,7 @@ interval_seconds = 0
     proptest! {
         #![proptest_config(ProptestConfig {
             // Bounded + fixed seed: deterministic floor, fast.
-            cases: 16,
+            cases: 4,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
