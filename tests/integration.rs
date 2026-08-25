@@ -24,14 +24,13 @@ recursive = true
 
 [[artifact.mappings]]
 from = "artifacts/deployment/common/"
-to = "app/"
+to = "app-common/"
 recursive = true
 
 [[artifact.mappings]]
 from = "artifacts/deployment/variants/{{ variant }}/"
-to = "app/"
+to = "app-variant/"
 recursive = true
-conflict = "replace"
 
 [activation]
 adapter = "none"
@@ -1531,7 +1530,7 @@ recursive = true
 
 [[artifact.mappings]]
 from = "artifacts/deployment/common/"
-to = "app/"
+to = "app-common/"
 recursive = true
 
 [activation]
@@ -3432,7 +3431,7 @@ recursive = true
 
 [[artifact.mappings]]
 from = "artifacts/deployment/common/"
-to = "app/"
+to = "app-common/"
 recursive = true
 
 [activation]
@@ -4100,7 +4099,7 @@ recursive = true
 
 [[artifact.mappings]]
 from = "artifacts/deployment/common/"
-to = "app/"
+to = "app-common/"
 recursive = true
 
 [activation]

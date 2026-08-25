@@ -7,30 +7,29 @@
 //!   `{{ variant }}` only — trees are content-addressed and shared across
 //!   slots, so slot-level variables (`deploy_dir`, `server`, `target`) are
 //!   never available here and fail loudly if referenced.
-//! * Mappings are applied in declaration order.
-//! * Recursive directory mappings merge; their conflict policy applies to
-//!   colliding descendant entries rather than deleting unrelated entries.
-//! * Symlinks are fail-closed. A relative target means what it means where the
-//!   link LIVES, so the target is validated from the DESTINATION parent
-//!   (`dst.parent().join(target)`) and must resolve beneath the staging root.
-//!   And no destination operation may pass through a symlink: every component
-//!   of a destination is walked with no-follow `symlink_metadata` semantics
-//!   before any write, so a symlink ancestor refuses the whole mapping instead
-//!   of redirecting writes to its target.
+//! * STRICT MAPPING SEMANTICS: regular files and directories only; no
+//!   symbolic links in sources; no overlapping destinations; collisions
+//!   always error; missing sources always error. A full pre-validation pass
+//!   of the mapping set + source tree runs BEFORE any staging write, so an
+//!   invalid mapping set (symlink, overlap, escaping path, missing source,
+//!   destination collision) fails without modifying the staging directory.
+//! * The staging tree is a disposable cache: it is cleared and rebuilt, so
+//!   re-running the same push over the same staging is an idempotent no-op
+//!   (byte-identical output); a mapping set whose expanded destinations
+//!   collide is rejected before any write.
+//! * No-follow destination defense: every component of a destination is
+//!   walked with no-follow `symlink_metadata` semantics before any write, so
+//!   a symlink ancestor (hostile destination state) refuses the whole
+//!   mapping instead of redirecting writes to its target.
 
-use crate::config::{ConflictPolicy, Mapping, resolved_mode};
+use crate::config::{Mapping, destinations_overlap, resolved_mode};
 use crate::error::{Error, Result};
+use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
-
-/// Normalize a path string to NFC and forward slashes.
-pub fn normalize_rel(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    s.nfc().collect::<String>().replace('\\', "/")
-}
 
 fn ensure_within_root(root: &Path, candidate: &Path) -> Result<PathBuf> {
     let root_c = root
@@ -87,7 +86,7 @@ fn set_mode(path: &Path, mode: Option<u32>) -> Result<()> {
 /// deterministic default 0755. `src_root` is the mapping's source root the
 /// `from` path is relative to (the merge source directory for recursive
 /// walks, the project root for non-recursive directory mappings); pass `None`
-/// for single file/symlink mappings, whose destination parents are always
+/// for single-file mappings, whose destination parents are always
 /// scaffolding.
 fn create_parent_dirs(src: &Path, dst: &Path, src_root: Option<&Path>) -> Result<()> {
     let mirror_depth = src_root
@@ -134,22 +133,32 @@ struct CopyEntryOptions<'a> {
     dest_root: &'a Path,
 }
 
-/// Copy a single source entry (file or symlink) to a destination, applying the
-/// mapping mode override. When the override is `None` the source's own mode is
-/// preserved (instead of defaulting to 0755). Intermediate directories created
-/// along the way get canonical, umask-independent modes (see
+/// Copy a single source entry (regular file or directory) to a destination,
+/// applying the mapping mode override to FILES. When the override is `None`
+/// the source's own mode is preserved (instead of defaulting to 0755).
+/// Directories always keep their source mode (a non-traversable override
+/// would break the no-follow destination walk). Intermediate directories
+/// created along the way get canonical, umask-independent modes (see
 /// [`create_parent_dirs`]); the final entry itself is always set explicitly.
 ///
-/// The destination is fail-closed against symlinks: any symlink component of
-/// the destination path refuses the copy before any write (a write would
-/// resolve to the link's target instead of the intended staging location), and
-/// a relative symlink target must resolve beneath `opts.dest_root` from `dst`'s
-/// own parent directory.
+/// STRICT SEMANTICS: symbolic links and every other non-regular entry (FIFO,
+/// socket, device) are rejected outright — the pre-validation pass already
+/// refused them, this re-check is defense-in-depth. The destination is also
+/// fail-closed against symlinks: any symlink component of the destination
+/// path refuses the copy before any write (a write would resolve to the
+/// link's target instead of the intended staging location).
 fn copy_entry(src: &Path, dst: &Path, opts: &CopyEntryOptions<'_>) -> Result<()> {
     let ft = std::fs::symlink_metadata(src)
         .map_err(|e| Error::materialization(format!("stat {}: {e}", src.display())))?;
+    if !(ft.is_dir() || ft.is_file()) {
+        return Err(Error::mapping(format!(
+            "source '{}' is not a regular file or directory (type {:?})",
+            src.display(),
+            ft.file_type()
+        )));
+    }
     // Refuse BEFORE any write: a symlink component would redirect every
-    // subsequent mkdir/remove_file/copy/symlink/set_mode to its target.
+    // subsequent mkdir/remove_file/copy/set_mode to its target.
     ensure_no_symlink_ancestor(opts.dest_root, dst)?;
     if ft.is_dir() {
         create_parent_dirs(src, dst, opts.src_root)?;
@@ -161,7 +170,7 @@ fn copy_entry(src: &Path, dst: &Path, opts: &CopyEntryOptions<'_>) -> Result<()>
                     dst.display()
                 )));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e) if e.kind() == ErrorKind::NotFound => {
                 std::fs::create_dir(dst)
                     .map_err(|e| Error::materialization(format!("mkdir {}: {e}", dst.display())))?;
             }
@@ -172,33 +181,12 @@ fn copy_entry(src: &Path, dst: &Path, opts: &CopyEntryOptions<'_>) -> Result<()>
                 )));
             }
         }
-        let final_mode = opts.mode_override.unwrap_or_else(|| ft.mode() & 0o7777);
+        // Directories ALWAYS keep their source mode: the mapping mode
+        // override is a FILE-mode policy, and applying a non-traversable
+        // override (e.g. 0644) to a directory would break every later
+        // no-follow destination walk through it.
+        let final_mode = ft.mode() & 0o7777;
         set_mode(dst, Some(final_mode))?;
-        return Ok(());
-    }
-    if ft.is_symlink() {
-        let target = std::fs::read_link(src)
-            .map_err(|e| Error::materialization(format!("readlink {}: {e}", src.display())))?;
-        if target.is_absolute() {
-            return Err(Error::mapping(format!(
-                "absolute symlink {} is not allowed",
-                src.display()
-            )));
-        }
-        // A relative target resolves against the DESTINATION parent — the
-        // relocation into staging changes what it means — so reject any target
-        // whose resolved destination location escapes the staging root.
-        ensure_symlink_target_within(opts.dest_root, dst, &target)?;
-        create_parent_dirs(src, dst, opts.src_root)?;
-        // remove existing dst if present (replace policy handled by caller)
-        let _ = std::fs::remove_file(dst);
-        std::os::unix::fs::symlink(&target, dst).map_err(|e| {
-            Error::materialization(format!(
-                "symlink {} -> {}: {e}",
-                dst.display(),
-                target.display()
-            ))
-        })?;
         return Ok(());
     }
     // Regular file: preserve the source mode unless an override is given.
@@ -239,7 +227,8 @@ fn resolve_lexically(base: &Path, rel: &Path) -> Option<PathBuf> {
 /// instead of the intended staging location, so a symlink component — the
 /// final one included, which a replace would otherwise write through — refuses
 /// the operation. Real directories are unaffected, so recursive merges keep
-/// their semantics.
+/// their semantics. This is defense-in-depth for hostile destination state:
+/// the pre-validation pass already walked every destination.
 fn ensure_no_symlink_ancestor(dest_root: &Path, dst: &Path) -> Result<()> {
     let rel = dst.strip_prefix(dest_root).map_err(|_| {
         Error::mapping(format!(
@@ -276,7 +265,7 @@ fn ensure_no_symlink_ancestor(dest_root: &Path, dst: &Path) -> Result<()> {
             Ok(_) => {}
             // A missing component cannot have anything below it, so the rest
             // of the destination is safe by construction.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) if e.kind() == ErrorKind::NotFound => break,
             Err(e) => {
                 return Err(Error::materialization(format!(
                     "lstat {}: {e}",
@@ -284,32 +273,6 @@ fn ensure_no_symlink_ancestor(dest_root: &Path, dst: &Path) -> Result<()> {
                 )));
             }
         }
-    }
-    Ok(())
-}
-
-/// Reject a symlink whose relative `target` resolves OUTSIDE the destination
-/// root when copied to `dst`: resolve the target against the DESTINATION
-/// parent (`dst.parent().join(target)`) — relocation into staging changes what
-/// a relative target means, so the source-side absolute check alone does not
-/// protect destination operations.
-fn ensure_symlink_target_within(dest_root: &Path, dst: &Path, target: &Path) -> Result<()> {
-    let base = dst.parent().unwrap_or(dest_root);
-    let resolved = resolve_lexically(base, target).ok_or_else(|| {
-        Error::mapping(format!(
-            "symlink '{}' target '{}' resolves above its destination parent '{}'",
-            dst.display(),
-            target.display(),
-            base.display()
-        ))
-    })?;
-    if !resolved.starts_with(dest_root) {
-        return Err(Error::mapping(format!(
-            "symlink '{}' target '{}' escapes staging root: {}",
-            dst.display(),
-            target.display(),
-            resolved.display()
-        )));
     }
     Ok(())
 }
@@ -343,8 +306,130 @@ fn ensure_within_dest(dest_root: &Path, dst: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 
+/// Reject a source entry that is not a regular file or directory. Symbolic
+/// links — and any other special entry (FIFO, socket, device) — are refused
+/// outright: they carry target/relocation semantics that have no place in a
+/// canonical content-addressed tree.
+fn ensure_regular_source_type(ft: &std::fs::Metadata, idx: usize, what: &str) -> Result<()> {
+    if !(ft.is_dir() || ft.is_file()) {
+        return Err(Error::mapping(format!(
+            "mapping[{idx}] source '{what}' is not a regular file or directory (type {:?})",
+            ft.file_type()
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a destination that would receive content from MORE THAN ONE source
+/// entry of the same mapping expansion: the second entry is a divergent
+/// collision (or a duplicate normalized path `canonicalize_tree` would reject
+/// anyway). Identical destinations across mappings are already rejected by the
+/// overlap check; this catches within-mapping collisions such as two source
+/// names that NFC-normalize to the same destination path.
+fn ensure_destination_free(
+    dest_root: &Path,
+    dst: &Path,
+    seen: &mut std::collections::HashSet<String>,
+) -> Result<()> {
+    let rel = dst.strip_prefix(dest_root).unwrap_or(dst).to_string_lossy();
+    let normalized: String = rel.nfc().collect();
+    if !seen.insert(normalized.clone()) {
+        return Err(Error::conflict(format!(
+            "destination '{normalized}' is written by more than one source entry"
+        )));
+    }
+    Ok(())
+}
+
+/// PRE-VALIDATION PASS — runs BEFORE any staging write. A fully-valid mapping
+/// set + source tree is the only thing that reaches materialization, so an
+/// invalid set (overlapping destinations, missing source, symlink or special
+/// source entry, escaping source/destination, or a destination written by two
+/// source entries) fails without modifying the staging directory.
+///
+/// Order is deterministic: (1) the pair-wise destination-overlap check on the
+/// mapping list, then (2) per mapping, in declaration order, the rendered
+/// source's existence/type/escape checks and the destination's escape and
+/// no-follow-ancestor checks — recursive directory mappings walk their full
+/// source tree so every nested entry is validated and every normalized
+/// destination is unique within the expansion.
+fn validate_mapping_set(
+    root: &Path,
+    mappings: &[Mapping],
+    vars: &crate::template::TemplateVars,
+    dest: &Path,
+) -> Result<()> {
+    // (1) Overlapping destinations: identical, or one a component-prefix of
+    // the other (a nested `to` descending into another mapping's `to` tree).
+    for i in 0..mappings.len() {
+        for j in (i + 1)..mappings.len() {
+            if destinations_overlap(&mappings[i].to, &mappings[j].to) {
+                return Err(Error::mapping(format!(
+                    "mapping destinations overlap: mappings[{i}] '{}' and mappings[{j}] '{}'",
+                    mappings[i].to, mappings[j].to
+                )));
+            }
+        }
+    }
+    // (2) Per mapping, declaration order: source + destination validation.
+    for (idx, m) in mappings.iter().enumerate() {
+        let from = crate::template::render_template(&m.from, vars)?;
+        let src = root.join(&from);
+        let src_ft = match std::fs::symlink_metadata(&src) {
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Err(Error::mapping(format!(
+                    "mapping[{idx}] source '{from}' does not exist"
+                )));
+            }
+            Err(e) => {
+                return Err(Error::mapping(format!("stat {}: {e}", src.display())));
+            }
+            Ok(ft) => ft,
+        };
+        ensure_regular_source_type(&src_ft, idx, &from)?;
+        ensure_within_root(root, &src)?;
+        if src_ft.is_dir() && m.recursive {
+            let base = ensure_within_dest(dest, &dest.join(Path::new(&m.to)))?;
+            ensure_no_symlink_ancestor(dest, &base)?;
+            let mut seen = std::collections::HashSet::new();
+            for entry in WalkDir::new(&src).min_depth(1).into_iter() {
+                let entry = entry.map_err(|e| Error::mapping(format!("walk {e}")))?;
+                let rel = entry
+                    .path()
+                    .strip_prefix(&src)
+                    .map_err(|e| Error::mapping(format!("{e}")))?;
+                let dst = ensure_within_dest(dest, &base.join(rel))?;
+                ensure_no_symlink_ancestor(dest, &dst)?;
+                ensure_destination_free(dest, &dst, &mut seen)?;
+                let eft = std::fs::symlink_metadata(entry.path())
+                    .map_err(|e| Error::mapping(format!("stat {}: {e}", entry.path().display())))?;
+                ensure_regular_source_type(&eft, idx, &from)?;
+            }
+        } else {
+            let dst = dest_for(
+                dest,
+                &m.to,
+                src_ft.is_dir() && !m.recursive,
+                Path::new(&from),
+            );
+            let dst = ensure_within_dest(dest, &dst)?;
+            ensure_no_symlink_ancestor(dest, &dst)?;
+        }
+    }
+    Ok(())
+}
+
 /// Apply all mappings for `variant` to assemble a complete staging tree at
 /// `dest`. `dest` is created/cleared before mapping.
+///
+/// The FULL mapping set + source tree is pre-validated first
+/// ([`validate_mapping_set`]) and only a fully-valid set reaches
+/// materialization: overlapping destinations, missing sources, symlink/special
+/// sources, escaping paths, and destination collisions all fail BEFORE the
+/// staging directory is touched. The staging tree itself is a disposable
+/// cache: it is cleared and rebuilt, so re-running the same push over the same
+/// staging is an idempotent no-op (byte-identical output), while a mapping set
+/// whose expanded destinations collide (or diverge) is rejected up front.
 ///
 /// `vars` is the mapping context ([`TemplateVars::mapping`]): only
 /// per-variant values (`variant`, `application`, `release`) are available,
@@ -357,6 +442,8 @@ pub fn materialize_variant(
     vars: &crate::template::TemplateVars,
     dest: &Path,
 ) -> Result<()> {
+    validate_mapping_set(root, mappings, vars, dest)?;
+
     if dest.exists() {
         std::fs::remove_dir_all(dest)
             .map_err(|e| Error::materialization(format!("clear {}: {e}", dest.display())))?;
@@ -369,18 +456,9 @@ pub fn materialize_variant(
         let from = crate::template::render_template(&m.from, vars)?;
         let src = root.join(&from);
         let mode_override = resolved_mode(&m.mode)?;
-        if !src.exists() {
-            if m.optional {
-                continue;
-            }
-            return Err(Error::mapping(format!(
-                "mapping[{idx}] source '{}' does not exist",
-                m.from
-            )));
-        }
-        ensure_within_root(root, &src)?;
         let src_meta = std::fs::symlink_metadata(&src)
             .map_err(|e| Error::mapping(format!("stat {}: {e}", src.display())))?;
+        ensure_regular_source_type(&src_meta, idx, &from)?;
 
         if src_meta.is_dir() && m.recursive {
             // Merge directory contents into `to`.
@@ -398,18 +476,6 @@ pub fn materialize_variant(
                     .strip_prefix(&src)
                     .map_err(|e| Error::mapping(format!("{e}")))?;
                 let dst = ensure_within_dest(dest, &base.join(rel))?;
-                if dst.exists() {
-                    match m.conflict {
-                        ConflictPolicy::Error => {
-                            return Err(Error::conflict(format!(
-                                "mapping[{idx}] destination '{}' already exists",
-                                normalize_rel(rel)
-                            )));
-                        }
-                        ConflictPolicy::Keep => continue,
-                        ConflictPolicy::Replace => {}
-                    }
-                }
                 copy_entry(
                     entry.path(),
                     &dst,
@@ -430,18 +496,6 @@ pub fn materialize_variant(
                 Path::new(&from),
             );
             let dst = ensure_within_dest(dest, &dst)?;
-            if dst.exists() {
-                match m.conflict {
-                    ConflictPolicy::Error => {
-                        return Err(Error::conflict(format!(
-                            "mapping[{idx}] destination '{}' already exists",
-                            normalize_rel(dst.strip_prefix(dest).unwrap_or(dst.as_path()))
-                        )));
-                    }
-                    ConflictPolicy::Keep => continue,
-                    ConflictPolicy::Replace => {}
-                }
-            }
             // A copied directory's intermediate parents inherit the source
             // directories' modes; a single file's parents are fresh staging
             // scaffolding (None). `copy_entry` itself refuses any destination
@@ -470,6 +524,16 @@ mod tests {
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
     use std::os::unix::fs::PermissionsExt;
 
+    fn mapping(from: &str, to: &str) -> Mapping {
+        Mapping {
+            from: from.to_string(),
+            to: to.to_string(),
+            recursive: true,
+            conflict: ConflictPolicy::Error,
+            mode: None,
+        }
+    }
+
     #[test]
     fn preserves_source_mode_when_no_override() {
         let dir = tempfile::tempdir().unwrap();
@@ -487,14 +551,7 @@ mod tests {
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o750)).unwrap();
         std::fs::write(sub.join("inside"), b"y").unwrap();
 
-        let mappings = vec![Mapping {
-            from: "app/".into(),
-            to: "out/".into(),
-            recursive: true,
-            conflict: ConflictPolicy::Replace,
-            mode: None,
-            optional: false,
-        }];
+        let mappings = vec![mapping("app/", "out/")];
         let dest = dir.path().join("dest");
         materialize_variant(
             &root,
@@ -516,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn interpolation_and_conflict_replace() {
+    fn interpolation_and_recursive_mappings() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("src");
         std::fs::create_dir_all(root.join("deployment/common")).unwrap();
@@ -525,31 +582,13 @@ mod tests {
         std::fs::write(root.join("deployment/variants/standard/extra"), b"std").unwrap();
         std::fs::create_dir_all(root.join("build/output")).unwrap();
         std::fs::write(root.join("build/output/server"), b"srv").unwrap();
+        // Strict semantics: every destination is disjoint — the merge that the
+        // old conflict-policy fixtures produced (three sources into `app/`) is
+        // now a rejected overlap, so each recursive mapping owns its own tree.
         let mappings = vec![
-            Mapping {
-                from: "build/output/".into(),
-                to: "app/".into(),
-                recursive: true,
-                conflict: ConflictPolicy::Keep,
-                mode: None,
-                optional: false,
-            },
-            Mapping {
-                from: "deployment/common/".into(),
-                to: "app/".into(),
-                recursive: true,
-                conflict: ConflictPolicy::Keep,
-                mode: None,
-                optional: false,
-            },
-            Mapping {
-                from: "deployment/variants/{{ variant }}/".into(),
-                to: "app/".into(),
-                recursive: true,
-                conflict: ConflictPolicy::Replace,
-                mode: None,
-                optional: false,
-            },
+            mapping("build/output/", "app/"),
+            mapping("deployment/common/", "common/"),
+            mapping("deployment/variants/{{ variant }}/", "variant/"),
         ];
         let dest = dir.path().join("dest");
         materialize_variant(
@@ -559,9 +598,9 @@ mod tests {
             &dest,
         )
         .unwrap();
-        assert!(dest.join("app/README").exists());
-        assert!(dest.join("app/extra").exists());
         assert!(dest.join("app/server").exists());
+        assert!(dest.join("common/README").exists());
+        assert!(dest.join("variant/extra").exists());
     }
 
     #[test]
@@ -574,14 +613,7 @@ mod tests {
         let root = dir.path().join("src");
         std::fs::create_dir_all(root.join("deployment")).unwrap();
         std::fs::write(root.join("deployment/x"), b"x").unwrap();
-        let mappings = vec![Mapping {
-            from: "deployment/{{ user }}/".into(),
-            to: "app/".into(),
-            recursive: true,
-            conflict: ConflictPolicy::Replace,
-            mode: None,
-            optional: false,
-        }];
+        let mappings = vec![mapping("deployment/{{ user }}/", "app/")];
         let dest = dir.path().join("dest");
         let err = materialize_variant(
             &root,
@@ -595,11 +627,202 @@ mod tests {
                 .contains("variable 'user' is not available in this context"),
             "mapping must reject a server-scoped variable: {err}"
         );
-        // The staging dir exists (created before mapping) but nothing was
-        // materialized into it — no slot-dependent tree content.
+        // Pre-validation failed before any write: nothing was materialized.
         assert!(
-            !dest.join("app").exists(),
-            "nothing materialized on a template error"
+            !dest.exists(),
+            "nothing materialized on a template error (staging untouched)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Strict semantics: pre-validation rejects before any staging write
+    // -----------------------------------------------------------------------
+
+    /// A recursive snapshot of a staging dir: every entry as a sorted
+    /// `(rel path, mode, file bytes or None for dirs)`. A missing dir
+    /// snapshots to the empty list, so "staging is unmodified" can be
+    /// asserted across a failed materialization whether or not the dir
+    /// existed before.
+    fn snapshot_staging(root: &Path) -> Vec<(String, u32, Option<Vec<u8>>)> {
+        let mut out = Vec::new();
+        let Ok(rd) = std::fs::read_dir(root) else {
+            return out;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            let m = std::fs::symlink_metadata(&p).unwrap();
+            let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+            let mode = m.mode() & 0o7777;
+            if m.is_dir() {
+                out.push((format!("{rel}/"), mode, None));
+                out.extend(snapshot_staging(&p));
+            } else if m.is_file() {
+                out.push((rel, mode, Some(std::fs::read(&p).unwrap())));
+            } else {
+                out.push((rel, mode, None));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Assert a materialization that must FAIL leaves the staging directory
+    /// byte-for-byte untouched (existence included).
+    fn assert_fails_without_touching_staging(
+        root: &Path,
+        mappings: &[Mapping],
+        dest: &Path,
+        needle: &str,
+    ) -> Error {
+        let before = snapshot_staging(dest);
+        let err = materialize_variant(
+            root,
+            mappings,
+            &crate::template::TemplateVars::mapping("app", "v1", "standard"),
+            dest,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(needle),
+            "error must mention '{needle}', got: {err}"
+        );
+        let after = snapshot_staging(dest);
+        assert_eq!(
+            before,
+            after,
+            "failed materialization must leave staging unmodified (dest: {})",
+            dest.display()
+        );
+        err
+    }
+
+    #[test]
+    fn overlapping_destinations_rejected_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::write(root.join("app/run.sh"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("conf")).unwrap();
+        std::fs::write(root.join("conf/site.conf"), b"y").unwrap();
+        let dest = dir.path().join("staging");
+        let mappings = vec![mapping("app/", "out/"), mapping("conf/", "out/nested/")];
+        let err = assert_fails_without_touching_staging(&root, &mappings, &dest, "overlap");
+        assert!(
+            err.to_string().contains("out/"),
+            "error names the overlapping destinations: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_source_rejected_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        std::fs::create_dir_all(&root).unwrap();
+        let dest = dir.path().join("staging");
+        let mappings = vec![mapping("ghost/missing", "out/")];
+        assert_fails_without_touching_staging(&root, &mappings, &dest, "does not exist");
+    }
+
+    #[test]
+    fn escaping_destination_rejected_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("app.sh"), b"x").unwrap();
+        let dest = dir.path().join("staging");
+        let mappings = vec![Mapping {
+            from: "app.sh".into(),
+            to: "../escape".into(),
+            recursive: false,
+            conflict: ConflictPolicy::Error,
+            mode: None,
+        }];
+        assert_fails_without_touching_staging(&root, &mappings, &dest, "escape");
+    }
+
+    #[test]
+    fn symlink_source_rejected_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin/tool"), b"x").unwrap();
+        std::os::unix::fs::symlink("tool", root.join("bin/run")).unwrap();
+        let dest = dir.path().join("staging");
+        // A recursive mapping walks into the symlink.
+        let mappings = vec![mapping("bin/", "out/")];
+        assert_fails_without_touching_staging(&root, &mappings, &dest, "regular file or directory");
+        // A direct mapping of the symlink itself is rejected too.
+        let mappings = vec![Mapping {
+            from: "bin/run".into(),
+            to: "out/run".into(),
+            recursive: false,
+            conflict: ConflictPolicy::Error,
+            mode: None,
+        }];
+        assert_fails_without_touching_staging(&root, &mappings, &dest, "regular file or directory");
+    }
+
+    #[test]
+    fn colliding_destinations_error_but_re_materialization_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("app.sh"), b"version-1").unwrap();
+        let dest = dir.path().join("staging");
+        let vars = crate::template::TemplateVars::mapping("app", "v1", "standard");
+        let mappings = vec![Mapping {
+            from: "app.sh".into(),
+            to: "bin/tool".into(),
+            recursive: false,
+            conflict: ConflictPolicy::Error,
+            mode: None,
+        }];
+        materialize_variant(&root, &mappings, &vars, &dest).unwrap();
+
+        // Re-running the same push over the same staging is an idempotent
+        // no-op: the disposable staging is rebuilt to byte-identical output.
+        let before = snapshot_staging(&dest);
+        materialize_variant(&root, &mappings, &vars, &dest).unwrap();
+        assert_eq!(
+            before,
+            snapshot_staging(&dest),
+            "re-running the same push over the same staging must be a no-op"
+        );
+
+        // A DIVERGENT mapping set (a changed source now colliding with another
+        // entry's destination) is rejected BEFORE the staging is touched.
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin/tool"), b"other").unwrap();
+        let divergent = vec![
+            mapping("bin/", "out/"),
+            Mapping {
+                from: "app.sh".into(),
+                to: "out/tool".into(),
+                recursive: false,
+                conflict: ConflictPolicy::Error,
+                mode: None,
+            },
+        ];
+        assert_fails_without_touching_staging(&root, &divergent, &dest, "overlap");
+    }
+
+    #[test]
+    fn within_mapping_destination_collision_rejected() {
+        // Two source entries that NFC-normalize to the SAME destination path
+        // (a decomposed vs precomposed unicode name) are a divergent
+        // collision: `canonicalize_tree` would reject the duplicate anyway,
+        // so the mapper must refuse before writing anything. On a
+        // normalization-insensitive filesystem (APFS) such a pair cannot even
+        // be constructed, so the uniqueness check is exercised directly here
+        // and stays as defense-in-depth for normalization-preserving ones.
+        let root = Path::new("/tmp/mapper-collision-test");
+        let mut seen = std::collections::HashSet::new();
+        ensure_destination_free(root, &root.join("out/caf\u{00e9}.txt"), &mut seen).unwrap();
+        let err = ensure_destination_free(root, &root.join("out/cafe\u{0301}.txt"), &mut seen)
+            .expect_err("normalized duplicate destination must be refused");
+        assert!(
+            err.to_string().contains("more than one source"),
+            "got: {err}"
         );
     }
 
@@ -631,7 +854,8 @@ mod tests {
 
     /// The fixed scenario shared by the umask probe and the shape proptest:
     /// assorted dirs/files with EXPLICIT modes (`set_permissions` is umask-
-    /// immune), a nested chain, and a relative in-root symlink.
+    /// immune) and a nested chain. No symlinks: strict mapping semantics
+    /// reject symlink sources outright, so the scenario stays fully valid.
     fn build_source_tree(root: &Path) {
         for (rel, mode) in [
             ("app", 0o755),
@@ -658,63 +882,45 @@ mod tests {
             std::fs::write(&p, rel.as_bytes()).unwrap();
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
         }
-        std::os::unix::fs::symlink("app/run.sh", root.join("bin/run")).unwrap();
     }
 
     /// The mapping list that must be umask-independent: BOTH leak paths — a
     /// single-file `to` with a trailing slash forcing fresh intermediate
     /// directories, and a non-recursive directory mapping — plus
     /// recursive-merge controls that must keep preserving source modes.
+    /// Every destination is disjoint (strict semantics: no overlaps).
     fn umask_probe_mappings() -> Vec<Mapping> {
         vec![
             Mapping {
                 from: "conf/site.conf".into(),
                 to: "etc/nginx/".into(),
                 recursive: false,
-                conflict: ConflictPolicy::Replace,
+                conflict: ConflictPolicy::Error,
                 mode: None,
-                optional: false,
             },
             Mapping {
                 from: "share".into(),
                 to: "out/".into(),
                 recursive: false,
-                conflict: ConflictPolicy::Replace,
+                conflict: ConflictPolicy::Error,
                 mode: None,
-                optional: false,
             },
-            Mapping {
-                from: "app/".into(),
-                to: "app/".into(),
-                recursive: true,
-                conflict: ConflictPolicy::Replace,
-                mode: None,
-                optional: false,
-            },
+            mapping("app/", "app/"),
             Mapping {
                 from: "bin/tool".into(),
                 to: "opt/tools/".into(),
                 recursive: false,
-                conflict: ConflictPolicy::Replace,
+                conflict: ConflictPolicy::Error,
                 mode: None,
-                optional: false,
             },
             Mapping {
                 from: "app/sub/".into(),
                 to: "mirror/".into(),
                 recursive: false,
-                conflict: ConflictPolicy::Replace,
+                conflict: ConflictPolicy::Error,
                 mode: None,
-                optional: false,
             },
-            Mapping {
-                from: "bin/".into(),
-                to: "bin/".into(),
-                recursive: true,
-                conflict: ConflictPolicy::Replace,
-                mode: None,
-                optional: false,
-            },
+            mapping("bin/", "bin/"),
         ]
     }
 
@@ -794,7 +1000,7 @@ mod tests {
         for (umask, meta) in &snapshots[1..] {
             assert_eq!(
                 first, meta,
-                "canonical tree (entries, modes, content digests, symlink targets) \
+                "canonical tree (entries, modes, content digests) \
                  must not depend on the process umask: {first_umask:#o} vs {umask:#o}"
             );
             assert_eq!(
@@ -806,7 +1012,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Property: mapping shapes materialize deterministically (fixed umask)
+    // Property (a): VALID mappings (regular files/dirs only, non-overlapping,
+    // all sources present) always materialize deterministically — two
+    // materializations produce byte-identical staging and identical canonical
+    // tree digests, and re-materializing over the SAME staging is a no-op.
     // -----------------------------------------------------------------------
 
     #[derive(Clone, Debug)]
@@ -830,29 +1039,6 @@ mod tests {
         ]
     }
 
-    /// Destination shapes: trailing slash × both, nested dirs, empty `to`, and
-    /// a unicode name. Duplicate/nested destinations occur organically, so
-    /// every conflict policy is exercised (erroring cases are compared by
-    /// error variant in the property).
-    fn to_shape_strategy() -> impl Strategy<Value = String> {
-        prop_oneof![
-            2 => Just("out/".to_string()),
-            1 => Just("out".to_string()),
-            2 => Just("out/nested/".to_string()),
-            1 => Just(String::new()),
-            1 => Just("λ-目的地/".to_string()),
-            1 => Just("deep/er/still/".to_string()),
-        ]
-    }
-
-    fn conflict_strategy() -> impl Strategy<Value = ConflictPolicy> {
-        prop_oneof![
-            1 => Just(ConflictPolicy::Error),
-            1 => Just(ConflictPolicy::Keep),
-            1 => Just(ConflictPolicy::Replace),
-        ]
-    }
-
     fn mode_strategy() -> impl Strategy<Value = Option<String>> {
         prop_oneof![
             3 => Just(None),
@@ -862,34 +1048,37 @@ mod tests {
         ]
     }
 
-    fn mapping_shape_strategy() -> impl Strategy<Value = Mapping> {
-        (
-            existing_from_strategy(),
-            to_shape_strategy(),
-            conflict_strategy(),
-            mode_strategy(),
-            prop::bool::ANY,
-            prop_oneof![
-                4 => Just(None),
-                1 => Just(Some("ghost/missing".to_string())),
-            ],
-        )
-            .prop_map(|(from, to, conflict, mode, recursive, missing)| {
-                let optional = missing.is_some();
-                Mapping {
-                    from: missing.unwrap_or(from),
-                    to,
-                    recursive,
-                    conflict,
-                    mode,
-                    optional,
-                }
-            })
-    }
+    /// Destination pool: every member is pairwise NON-OVERLAPPING (flat, so
+    /// no destination is nested beneath another), so any subset is a valid
+    /// strict-mapping destination set.
+    const DEST_POOL: [&str; 8] = [
+        "out/", "etc/", "share/", "bin/", "conf/", "mirror/", "opt/", "app/",
+    ];
 
-    fn mapper_case_strategy() -> impl Strategy<Value = MapperCase> {
-        prop::collection::vec(mapping_shape_strategy(), 1..=3)
-            .prop_map(|mappings| MapperCase { mappings })
+    /// Generated VALID mapping cases: sources all exist in
+    /// [`build_source_tree`], destinations are pairwise non-overlapping, and
+    /// `conflict` is always `Error` (the only policy).
+    fn valid_mapper_case_strategy() -> impl Strategy<Value = MapperCase> {
+        (1usize..=3)
+            .prop_flat_map(|k| {
+                (
+                    prop::sample::subsequence(DEST_POOL.to_vec(), k),
+                    prop::collection::vec(existing_from_strategy(), k),
+                    prop::collection::vec(mode_strategy(), k),
+                    prop::collection::vec(prop::bool::ANY, k),
+                )
+            })
+            .prop_map(|(dests, froms, modes, recs)| MapperCase {
+                mappings: (0..dests.len())
+                    .map(|i| Mapping {
+                        from: froms[i].clone(),
+                        to: dests[i].to_string(),
+                        recursive: recs[i],
+                        conflict: ConflictPolicy::Error,
+                        mode: modes[i].clone(),
+                    })
+                    .collect(),
+            })
     }
 
     /// Every source mode must survive a single recursive mapping with no
@@ -927,32 +1116,34 @@ mod tests {
         let vars = crate::template::TemplateVars::mapping("app", "v1", "standard");
         let dest_a = dir.path().join("stage-a");
         let dest_b = dir.path().join("stage-b");
-        let res_a = materialize_variant(&root, &case.mappings, &vars, &dest_a)
-            .and_then(|()| crate::tree::canonicalize_tree(&dest_a));
-        let res_b = materialize_variant(&root, &case.mappings, &vars, &dest_b)
-            .and_then(|()| crate::tree::canonicalize_tree(&dest_b));
-        match (&res_a, &res_b) {
-            (Ok(meta_a), Ok(meta_b)) => {
-                assert_eq!(
-                    meta_a, meta_b,
-                    "two materializations of the same mapping shapes must produce \
-                     identical canonical trees (entries, modes, digests)"
-                );
-            }
-            (Err(ea), Err(eb)) => {
-                assert_eq!(
-                    std::mem::discriminant(ea),
-                    std::mem::discriminant(eb),
-                    "the two materializations must fail identically: {ea} vs {eb}"
-                );
-            }
-            (a, b) => panic!("materialization must be deterministic: {a:?} vs {b:?}"),
-        }
+
+        // Every generated case is VALID by construction: it must materialize.
+        materialize_variant(&root, &case.mappings, &vars, &dest_a).unwrap();
+        // Re-running over the SAME staging is an idempotent no-op.
+        materialize_variant(&root, &case.mappings, &vars, &dest_a).unwrap();
+        // A second materialization into a FRESH staging is byte-identical.
+        materialize_variant(&root, &case.mappings, &vars, &dest_b).unwrap();
+
+        assert_eq!(
+            snapshot_staging(&dest_a),
+            snapshot_staging(&dest_b),
+            "two materializations of the same valid mapping set must produce \
+             byte-identical staging: {case:?}"
+        );
+        let meta_a = crate::tree::canonicalize_tree(&dest_a).unwrap();
+        let meta_b = crate::tree::canonicalize_tree(&dest_b).unwrap();
+        assert_eq!(
+            meta_a, meta_b,
+            "two materializations of the same valid mapping set must produce \
+             identical canonical trees (entries, modes, digests): {case:?}"
+        );
+        assert_eq!(
+            meta_a.tree_sha256, meta_b.tree_sha256,
+            "tree digest must be deterministic: {case:?}"
+        );
+
         // Recursive-merge shapes with no override preserve source modes exactly.
-        if case.mappings.len() == 1
-            && case.mappings[0].recursive
-            && case.mappings[0].mode.is_none()
-            && res_a.is_ok()
+        if case.mappings.len() == 1 && case.mappings[0].recursive && case.mappings[0].mode.is_none()
         {
             let from = case.mappings[0].from.trim_end_matches('/');
             if root.join(from).is_dir() {
@@ -974,7 +1165,7 @@ mod tests {
         })]
 
         #[test]
-        fn mapping_shapes_materialize_deterministically(case in mapper_case_strategy()) {
+        fn valid_mappings_materialize_deterministically(case in valid_mapper_case_strategy()) {
             run_mapper_case_property(&case);
         }
     }
@@ -993,68 +1184,226 @@ mod tests {
         })]
 
         #[test]
-        fn mapping_shapes_deterministic_fixed_seed_regression(case in mapper_case_strategy()) {
+        fn valid_mappings_deterministic_fixed_seed_regression(case in valid_mapper_case_strategy()) {
             run_mapper_case_property(&case);
         }
     }
 
     // -----------------------------------------------------------------------
-    // Property: relocated symlinks never write outside staging (fail-closed)
+    // Property (b): ANY invalid case — a symlink source, an overlap, an
+    // escaping destination path, a missing source — FAILS and the staging
+    // directory is UNMODIFIED (byte-identical after the failed call).
     // -----------------------------------------------------------------------
 
-    /// A generated symlink-escape scenario: the symlinked tree is copied into
-    /// a RELOCATED destination (so its relative targets resolve differently),
-    /// and a LATER mapping descends through the relocated symlink. The mapper
-    /// must either refuse (destination-parent validation of the target, or the
-    /// no-follow ancestor walk) or complete WITHOUT writing through a symlink
-    /// — the outside-staging canary is the oracle either way.
     #[derive(Clone, Debug)]
-    struct SymlinkEscapeCase {
-        /// Nested real-directory depth between the relocated tree's root and
-        /// the final symlink `ln`, so its relative target sits at a depth.
-        depth: usize,
-        /// Destination the symlinked tree is relocated to.
-        reloc: String,
-        /// Number of `..` hops in an in-staging target (0 = no hops).
-        hops: usize,
-        /// Whether the target must escape to the canary (outside staging).
-        escape: bool,
-        /// File name the nested mapping writes through the relocated link.
-        nested_name: String,
-        nested_policy: ConflictPolicy,
+    enum InvalidKind {
+        SymlinkSource,
+        Overlap,
+        EscapeDestination,
+        MissingSource,
     }
 
-    fn symlink_escape_case_strategy() -> impl Strategy<Value = SymlinkEscapeCase> {
+    #[derive(Clone, Debug)]
+    struct InvalidCase {
+        kind: InvalidKind,
+        mappings: Vec<Mapping>,
+    }
+
+    fn invalid_case_strategy() -> impl Strategy<Value = InvalidCase> {
+        prop_oneof![
+            1 => Just(InvalidCase {
+                kind: InvalidKind::SymlinkSource,
+                mappings: vec![
+                    Mapping {
+                        from: "bin".into(),
+                        to: "out/".into(),
+                        recursive: true,
+                        conflict: ConflictPolicy::Error,
+                        mode: None,
+                    },
+                ],
+            }),
+            1 => Just(InvalidCase {
+                kind: InvalidKind::SymlinkSource,
+                mappings: vec![Mapping {
+                    from: "bin/run".into(),
+                    to: "out/run".into(),
+                    recursive: false,
+                    conflict: ConflictPolicy::Error,
+                    mode: None,
+                }],
+            }),
+            1 => Just(InvalidCase {
+                kind: InvalidKind::Overlap,
+                mappings: vec![
+                    Mapping {
+                        from: "app.sh".into(),
+                        to: "out/".into(),
+                        recursive: false,
+                        conflict: ConflictPolicy::Error,
+                        mode: None,
+                    },
+                    Mapping {
+                        from: "bin/tool".into(),
+                        to: "out/nested/".into(),
+                        recursive: false,
+                        conflict: ConflictPolicy::Error,
+                        mode: None,
+                    },
+                ],
+            }),
+            1 => Just(InvalidCase {
+                kind: InvalidKind::Overlap,
+                mappings: vec![
+                    Mapping {
+                        from: "app.sh".into(),
+                        to: "out".into(),
+                        recursive: false,
+                        conflict: ConflictPolicy::Error,
+                        mode: None,
+                    },
+                    Mapping {
+                        from: "bin/tool".into(),
+                        to: "out".into(),
+                        recursive: false,
+                        conflict: ConflictPolicy::Error,
+                        mode: None,
+                    },
+                ],
+            }),
+            1 => Just(InvalidCase {
+                kind: InvalidKind::EscapeDestination,
+                mappings: vec![Mapping {
+                    from: "app.sh".into(),
+                    to: "../escape".into(),
+                    recursive: false,
+                    conflict: ConflictPolicy::Error,
+                    mode: None,
+                }],
+            }),
+            1 => Just(InvalidCase {
+                kind: InvalidKind::MissingSource,
+                mappings: vec![Mapping {
+                    from: "ghost/missing".into(),
+                    to: "out/".into(),
+                    recursive: false,
+                    conflict: ConflictPolicy::Error,
+                    mode: None,
+                }],
+            }),
+        ]
+    }
+
+    fn run_invalid_case_property(case: &InvalidCase) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        build_source_tree(&root);
+        // A symlink source for the SymlinkSource cases.
+        std::os::unix::fs::symlink("app/run.sh", root.join("bin/run")).unwrap();
+        let dest = dir.path().join("staging");
+
+        let before = snapshot_staging(&dest);
+        let res = materialize_variant(
+            &root,
+            &case.mappings,
+            &crate::template::TemplateVars::mapping("app", "v1", "standard"),
+            &dest,
+        );
+        let after = snapshot_staging(&dest);
+
+        let err = res.expect_err("invalid case must fail before staging is modified");
+        let needle = match case.kind {
+            InvalidKind::SymlinkSource => "regular file or directory",
+            InvalidKind::Overlap => "overlap",
+            InvalidKind::EscapeDestination => "escape",
+            InvalidKind::MissingSource => "does not exist",
+        };
+        assert!(
+            err.to_string().contains(needle),
+            "{:?} must be rejected with '{needle}', got: {err}",
+            case.kind
+        );
+        assert_eq!(
+            before, after,
+            "an invalid case must leave staging byte-for-byte unmodified: {case:?}"
+        );
+    }
+
+    proptest! {
+        // Main property: ORDINARY RANDOMIZED SEEDS with FAILURE PERSISTENCE
+        // (house style). Bounded count keeps the suite fast.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            failure_persistence: Some(Box::new(FileFailurePersistence::default())),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn invalid_mappings_fail_before_staging_is_modified(case in invalid_case_strategy()) {
+            run_invalid_case_property(&case);
+        }
+    }
+
+    proptest! {
+        // FIXED-SEED REGRESSION (0x5EED_5EED, per house style): the identical
+        // invalid vectors on every run, so CI always exercises the rejections
+        // even with no persisted failure.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn invalid_mappings_fixed_seed_regression(case in invalid_case_strategy()) {
+            run_invalid_case_property(&case);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Property: relocated symlink sources are REJECTED without writing
+    // -----------------------------------------------------------------------
+
+    /// A generated symlink scenario: a symlinked tree under `sym/` would be
+    /// relocated into `reloc/` (its relative targets would resolve
+    /// differently), and a nested mapping descends through the relocated
+    /// link. STRICT SEMANTICS: the symlink source is refused outright, so the
+    /// outside-staging canary trivially survives — no relocation logic ever
+    /// runs, and the staging directory is untouched.
+    #[derive(Clone, Debug)]
+    struct SymlinkRejectionCase {
+        /// Nested real-directory depth between the relocated tree's root and
+        /// the final symlink `ln`.
+        depth: usize,
+        /// Destination the symlinked tree would be relocated to.
+        reloc: String,
+        /// File name a later mapping would write through the link.
+        nested_name: String,
+    }
+
+    fn symlink_rejection_case_strategy() -> impl Strategy<Value = SymlinkRejectionCase> {
         let depth = 0usize..=2;
         let reloc = prop_oneof![
             2 => Just("reloc/".to_string()),
             1 => Just("deep/nested/".to_string()),
         ];
-        let hops = 0usize..=2;
-        let escape = prop::bool::ANY;
         let nested_name = prop_oneof![
             1 => Just("can.txt".to_string()),
             1 => Just("esc.txt".to_string()),
             1 => Just("canary.txt".to_string()),
         ];
-        let nested_policy = conflict_strategy();
-        (depth, reloc, hops, escape, nested_name, nested_policy).prop_map(
-            |(depth, reloc, hops, escape, nested_name, nested_policy)| SymlinkEscapeCase {
-                depth,
-                reloc,
-                hops,
-                escape,
-                nested_name,
-                nested_policy,
-            },
-        )
+        (depth, reloc, nested_name).prop_map(|(depth, reloc, nested_name)| SymlinkRejectionCase {
+            depth,
+            reloc,
+            nested_name,
+        })
     }
 
     /// Build the source tree: under `sym/`, `depth` nested real directories
-    /// each carrying a relative symlink `s{i} -> d{i}` (relative targets at
-    /// various depths), a final symlink `ln` with the generated target at the
-    /// deepest level, plus `payload/p.txt` for the nested mapping to write.
-    fn build_symlink_source(root: &Path, depth: usize, target: &str) {
+    /// each carrying a relative symlink `s{i} -> d{i}`, a final symlink `ln`
+    /// at the deepest level, plus `payload/p.txt` for a later mapping.
+    fn build_symlink_source(root: &Path, depth: usize) {
         let mut cur = root.join("sym");
         std::fs::create_dir_all(&cur).unwrap();
         for i in 0..depth {
@@ -1062,32 +1411,16 @@ mod tests {
             cur = cur.join(format!("d{i}"));
             std::fs::create_dir_all(&cur).unwrap();
         }
-        std::os::unix::fs::symlink(target, cur.join("ln")).unwrap();
+        std::os::unix::fs::symlink("payload/", cur.join("ln")).unwrap();
         let payload = root.join("payload");
         std::fs::create_dir_all(&payload).unwrap();
         std::fs::write(payload.join("payload.txt"), b"payload").unwrap();
     }
 
-    fn run_symlink_escape_property(case: &SymlinkEscapeCase) {
+    fn run_symlink_rejection_property(case: &SymlinkRejectionCase) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("src");
-
-        // The number of components between the staging root and the symlink's
-        // destination parent decides how many `..` hops the relative target
-        // needs to escape: the very same target resolves DIFFERENTLY per
-        // relocation/depth combination.
-        let reloc_comps = Path::new(&case.reloc).components().count();
-        let below = reloc_comps + case.depth;
-        let target = if case.escape {
-            // Resolves EXACTLY onto the canary directory (the staging root's
-            // parent), so an escaping copy or write-through hits it.
-            format!("{}{}", "../".repeat(below + 1), "canary/")
-        } else {
-            // Stays inside staging: capped hops keep the resolution at or
-            // below the staging root for every relocation/depth combination.
-            format!("{}{}", "../".repeat(case.hops.min(below)), "payload/")
-        };
-        build_symlink_source(&root, case.depth, &target);
+        build_symlink_source(&root, case.depth);
 
         // Outside-staging canary, unique per case via the fresh tempdir so
         // parallel cases can never collide.
@@ -1097,8 +1430,8 @@ mod tests {
         let canary = canary_dir.join("canary.txt");
         std::fs::write(&canary, b"SENTINEL-CANARY").unwrap();
 
-        // The relocated link lives at `reloc/d0/.../d{depth-1}/ln`; the nested
-        // mapping descends through it.
+        // The symlinked tree under `sym/` is mapped into the RELOCATED
+        // destination; a LATER mapping descends through the deepest link.
         let mut link_rel = PathBuf::new();
         for i in 0..case.depth {
             link_rel.push(format!("d{i}"));
@@ -1106,40 +1439,44 @@ mod tests {
         link_rel.push("ln");
         let nested_to = format!("{}{}/{}", case.reloc, link_rel.display(), case.nested_name);
         let mappings = vec![
-            Mapping {
-                from: "sym/".into(),
-                to: case.reloc.clone(),
-                recursive: true,
-                conflict: ConflictPolicy::Replace,
-                mode: None,
-                optional: false,
-            },
+            mapping("sym/", &case.reloc),
             Mapping {
                 from: "payload/payload.txt".into(),
                 to: nested_to,
                 recursive: false,
-                conflict: case.nested_policy.clone(),
+                conflict: ConflictPolicy::Error,
                 mode: None,
-                optional: false,
             },
         ];
+
+        // STRICT SEMANTICS: the symlink source is refused — before ANY
+        // staging write, so the canary trivially survives and the staging
+        // directory is untouched.
+        let before = snapshot_staging(&staging);
         let res = materialize_variant(
             &root,
             &mappings,
             &crate::template::TemplateVars::mapping("app", "v1", "standard"),
             &staging,
         );
-
-        // Oracle: the canary must be byte-identical after EVERY materialization
-        // (a write through the relocated symlink would land here), and nothing
-        // else may appear in the canary directory.
+        assert!(
+            res.is_err(),
+            "a symlink source must be refused: depth {} reloc {}",
+            case.depth,
+            case.reloc
+        );
+        assert_eq!(
+            snapshot_staging(&staging),
+            before,
+            "the refused materialization must leave staging untouched"
+        );
         assert_eq!(
             std::fs::read(&canary).unwrap(),
             b"SENTINEL-CANARY",
-            "outside-staging canary was written: depth {} reloc {} target {}",
+            "outside-staging canary must survive (no write ever escaped): \
+             depth {} reloc {}",
             case.depth,
-            case.reloc,
-            target
+            case.reloc
         );
         let leaked: Vec<String> = std::fs::read_dir(&canary_dir)
             .unwrap()
@@ -1148,43 +1485,13 @@ mod tests {
             .filter(|n| n != "canary.txt")
             .collect();
         assert!(leaked.is_empty(), "canary dir leaked entries: {leaked:?}");
-
-        match res {
-            Ok(()) => {
-                // Accepted staging must be canonical: no escaping or absolute
-                // symlink survives and every entry sits inside the staging root
-                // (no writes outside the intended destinations).
-                crate::tree::canonicalize_tree(&staging)
-                    .expect("an accepted mapping must canonicalize");
-                // The nested mapping may not have been resolved through the
-                // link: the write would have landed at the target's RESOLVED
-                // location instead of the lexical destination.
-                let link_dir = staging
-                    .join(&case.reloc)
-                    .join(link_rel.parent().unwrap_or(Path::new("")));
-                let resolved = resolve_lexically(&link_dir, Path::new(&target))
-                    .expect("in-staging target resolves");
-                if resolved.starts_with(&staging) {
-                    let through = resolved.join(&case.nested_name);
-                    assert!(
-                        !through.exists(),
-                        "nested mapping leaked through the relocated symlink to {}",
-                        through.display()
-                    );
-                }
-            }
-            Err(_) => {
-                // Fail-closed refusal is the expected outcome for an escaping
-                // target (destination-parent validation) or for a write through
-                // the relocated symlink (no-follow ancestor walk).
-            }
-        }
     }
 
     proptest! {
-        // Property: MAIN RANDOMIZED RUN with FAILURE PERSISTENCE (house
-        // style) — a failing vector is written to `proptest-regressions/
-        // mapper.txt` and replayed until fixed. Bounded count keeps it fast.
+        // Main property: ORDINARY RANDOMIZED SEEDS with FAILURE PERSISTENCE
+        // (house style) — a failing vector is written to
+        // `proptest-regressions/mapper.txt` and replayed until fixed. Bounded
+        // count keeps it fast.
         #![proptest_config(ProptestConfig {
             cases: 16,
             failure_persistence: Some(Box::new(FileFailurePersistence::default())),
@@ -1192,8 +1499,8 @@ mod tests {
         })]
 
         #[test]
-        fn symlink_relocation_never_escapes_staging(case in symlink_escape_case_strategy()) {
-            run_symlink_escape_property(&case);
+        fn symlink_sources_are_rejected_before_writing(case in symlink_rejection_case_strategy()) {
+            run_symlink_rejection_property(&case);
         }
     }
 
@@ -1209,8 +1516,8 @@ mod tests {
         })]
 
         #[test]
-        fn symlink_relocation_fixed_seed_regression(case in symlink_escape_case_strategy()) {
-            run_symlink_escape_property(&case);
+        fn symlink_rejection_fixed_seed_regression(case in symlink_rejection_case_strategy()) {
+            run_symlink_rejection_property(&case);
         }
     }
 }

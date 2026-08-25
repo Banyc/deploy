@@ -502,7 +502,7 @@ recursive = true
 
 [[artifact.mappings]]
 from = "artifacts/deployment/common/"
-to = "app/"
+to = "app-common/"
 recursive = true
 
 [activation]
@@ -553,7 +553,7 @@ recursive = true
 
 [[artifact.mappings]]
 from = "artifacts/deployment/common/"
-to = "app/"
+to = "app-common/"
 recursive = true
 
 [[artifact.mappings]]
@@ -839,7 +839,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .join(crate::layout::objects())
             .join(h.tree.as_str())
             .join("root")
-            .join("app")
+            .join("app-common")
             .join("README");
         assert!(obj_file.exists(), "expected object file to exist");
         std::fs::write(&obj_file, "TAMPERED").unwrap();

@@ -385,19 +385,20 @@ fn standard_variant(deploy_dir: &Path) -> VariantConfig {
     }
 }
 
-/// The `systemd` example variant: same artifact mappings as `standard`, but
-/// activation links, enables, and restarts a real user unit shipped as an
-/// artifact (`releases/v1/artifacts/systemd/example.service`). It declares
-/// NO slots: it is an example you bind by adding a `[[slots]]` entry (with a
-/// `targets` list) to this file.
+/// The `systemd` example variant: ships the real user unit shipped as an
+/// artifact (`releases/v1/artifacts/systemd/example.service`) mapped to
+/// `app/`. It declares NO slots: it is an example you bind by adding a
+/// `[[slots]]` entry (with a `targets` list) to this file.
+///
+/// STRICT MAPPING SEMANTICS: destinations must not overlap, so this variant
+/// maps only its own unit tree — the `standard` variant's `app/` destination
+/// is deliberately not repeated here (repeating it would be a rejected
+/// overlap).
 fn systemd_variant() -> VariantConfig {
     VariantConfig {
         description: Some("Systemd-managed deployment".to_string()),
         artifact: ArtifactConfig {
-            mappings: vec![
-                mapping("artifacts/build/output/app/", "app/"),
-                mapping("artifacts/systemd/", "app/"),
-            ],
+            mappings: vec![mapping("artifacts/systemd/", "app/")],
         },
         activation: ActivationConfig {
             adapter: "systemd".to_string(),
@@ -424,7 +425,6 @@ fn mapping(from: &str, to: &str) -> Mapping {
         recursive: true,
         conflict: ConflictPolicy::Error,
         mode: None,
-        optional: false,
     }
 }
 
@@ -481,10 +481,12 @@ const STANDARD_DOC: &str = "\
 
 /// The doc for `releases/v1/systemd.toml`.
 const SYSTEMD_DOC: &str = "\
-# The `systemd` example variant — same artifact mappings as `standard`, but
-# activation renders, installs, enables, and restarts the shipped user unit
-# (releases/v1/artifacts/systemd/example.service) through the systemd
-# adapter. The unit file is rendered per slot at activation time with the
+# The `systemd` example variant — ships the shipped user unit
+# (releases/v1/artifacts/systemd/example.service) into the artifact as
+# `app/example.service` (strict mapping semantics: one file-tree destination
+# per variant, so this variant maps only its own unit tree — the `standard`
+# variant's `app/` destination is not repeated). The unit file is rendered
+# per slot at activation time with the
 # template module: `{{ deploy_dir }}` resolves to the slot's deploy_dir and
 # `{{ user }}` to the per-server deployment account (the tree itself stays
 # slot-independent), so `ExecStart` points through the

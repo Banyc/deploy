@@ -254,7 +254,7 @@ recursive = true
 
 [[artifact.mappings]]
 from = "artifacts/deployment/common/"
-to = "app/"
+to = "app-common/"
 recursive = true
 
 [activation]

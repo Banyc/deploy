@@ -320,7 +320,8 @@ deploy_dir = "/srv/deploy/my-app"   # absolute path on the server
 from = "artifacts/build/output/"   # relative to the release directory
 to = "app/"
 recursive = true
-# conflict = "error" | "replace" | "keep"     (default "error")
+# conflict = "error"                (strict semantics: collisions always error —
+#                                    overlapping destinations are rejected up front)
 # mode = "0755"                              (or "preserve")
 
 [activation]

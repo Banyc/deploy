@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
 
 /// Reject any path that is absolute or contains a parent/root/prefix component,
 /// so a mapping destination cannot escape the artifact-relative namespace.
@@ -45,13 +46,44 @@ pub fn validate_relative_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A mapping's destination-collision policy. Strict semantics: a collision is
+/// ALWAYS an error. `keep`/`replace` behavior is intentionally not offered —
+/// overlapping destinations are rejected before any staging write, and the
+/// staging tree itself is a disposable cache that is cleared and rebuilt, so
+/// re-materializing the same push is an idempotent no-op. Because this is the
+/// only variant, any other `conflict = "..."` value is rejected at config
+/// parse.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ConflictPolicy {
     #[default]
     Error,
-    Replace,
-    Keep,
+}
+
+/// Normalize a mapping destination for comparison: NFC, forward slashes,
+/// trailing `/` stripped — a trailing slash only selects the directory-merge
+/// semantics, so `app/` and `app` name the same destination tree.
+pub fn normalize_destination(to: &str) -> String {
+    let s = to.nfc().collect::<String>().replace('\\', "/");
+    s.trim_end_matches('/').to_string()
+}
+
+/// Whether two mapping destinations overlap: identical, or one is a
+/// component-wise prefix of the other (a nested `to` descending into another
+/// mapping's `to` tree). An empty destination (the entry lands at the staging
+/// root) is a prefix of every destination. Overlapping destinations would make
+/// the materialized tree depend on declaration order, so they are rejected.
+pub fn destinations_overlap(a: &str, b: &str) -> bool {
+    let a_norm = normalize_destination(a);
+    let b_norm = normalize_destination(b);
+    let ac: Vec<_> = Path::new(&a_norm).components().collect();
+    let bc: Vec<_> = Path::new(&b_norm).components().collect();
+    let (short, long) = if ac.len() <= bc.len() {
+        (&ac, &bc)
+    } else {
+        (&bc, &ac)
+    };
+    short == &long[..short.len()]
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -73,8 +105,6 @@ pub struct Mapping {
     /// `preserve` or an explicit octal mode such as `"0644"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
-    #[serde(default)]
-    pub optional: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -671,6 +701,22 @@ impl Config {
             validate_relative_path(Path::new(&m.to))
                 .map_err(|e| Error::config(format!("variant '{name}' mapping[{i}] to: {e}")))?;
         }
+
+        // No overlapping destinations: identical `to` values, or one destination
+        // nested beneath another mapping's destination, would make the
+        // materialized tree declaration-order-dependent.
+        let mappings = &variant.artifact.mappings;
+        for i in 0..mappings.len() {
+            for j in (i + 1)..mappings.len() {
+                if destinations_overlap(&mappings[i].to, &mappings[j].to) {
+                    return Err(Error::config(format!(
+                        "variant '{name}' mapping destinations overlap: \
+                         mappings[{i}] '{}' and mappings[{j}] '{}'",
+                        mappings[i].to, mappings[j].to
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -953,6 +999,84 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             Config::load(&p).is_err(),
             "escaping mapping `to` must be rejected"
         );
+    }
+
+    #[test]
+    fn overlapping_mapping_destinations_are_rejected_at_load() {
+        // Two mappings whose destinations overlap (identical, or one nested
+        // beneath the other) are rejected at config load: the materialized
+        // tree would depend on declaration order.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        let deploy_toml = r#"
+schema_version = 1
+application = "ovl"
+release = "v1"
+
+[targets.t1.rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[targets.t1.rotation.deployment]
+protect_deployments = 1
+
+[[servers]]
+id = "s1"
+address = "a"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#;
+        let p = project.join("deploy.toml");
+        std::fs::write(&p, deploy_toml).unwrap();
+
+        // Identical destinations (with and without the trailing slash).
+        std::fs::write(
+            release_dir.join("standard.toml"),
+            "[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntargets = [\"t1\"]\ndeploy_dir = \"/srv/ovl\"\n\n\
+             [[artifact.mappings]]\nfrom = \"a/\"\nto = \"app/\"\nrecursive = true\n\n\
+             [[artifact.mappings]]\nfrom = \"b/\"\nto = \"app\"\nrecursive = true\n\n\
+             [activation]\nadapter = \"none\"\n\n\
+             [verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
+        )
+        .unwrap();
+        let err = Config::load(&p).expect_err("identical destinations must be rejected");
+        assert!(
+            err.to_string().contains("overlap"),
+            "error must name the overlap, got: {err}"
+        );
+
+        // A nested `to` descending into another mapping's `to` tree.
+        std::fs::write(
+            release_dir.join("standard.toml"),
+            "[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntargets = [\"t1\"]\ndeploy_dir = \"/srv/ovl\"\n\n[[artifact.mappings]]\nfrom = \"a/\"\nto = \"app/\"\nrecursive = true\n\n\
+             [[artifact.mappings]]\nfrom = \"b/\"\nto = \"app/nested/\"\nrecursive = true\n\n\
+             [activation]\nadapter = \"none\"\n\n\
+             [verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
+        )
+        .unwrap();
+        let err = Config::load(&p).expect_err("nested destinations must be rejected");
+        assert!(
+            err.to_string().contains("overlap"),
+            "error must name the overlap, got: {err}"
+        );
+
+        // Non-overlapping destinations still load.
+        std::fs::write(
+            release_dir.join("standard.toml"),
+            "[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntargets = [\"t1\"]\ndeploy_dir = \"/srv/ovl\"\n\n[[artifact.mappings]]\nfrom = \"a/\"\nto = \"app/\"\nrecursive = true\n\n\
+             [[artifact.mappings]]\nfrom = \"b/\"\nto = \"other/\"\nrecursive = true\n\n\
+             [activation]\nadapter = \"none\"\n\n\
+             [verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
+        )
+        .unwrap();
+        Config::load(&p).expect("non-overlapping destinations load");
     }
 
     #[test]
@@ -1729,6 +1853,26 @@ slots = ["p1"]
         let err = toml::from_str::<Mapping>("from = \"a\"\nto = \"b\"\nconflict = \"nope\"")
             .expect_err("unknown conflict variant must fail");
         assert!(err.to_string().contains("unknown variant"), "got: {err}");
+
+        // Strict mapping semantics: only `conflict = \"error\"` is valid —
+        // `replace` and `keep` are rejected at parse (they no longer exist),
+        // and `optional` was removed (deny_unknown_fields refuses it).
+        for rejected in ["replace", "keep"] {
+            let err = toml::from_str::<Mapping>(&format!(
+                "from = \"a\"\nto = \"b\"\nconflict = \"{rejected}\""
+            ))
+            .expect_err("non-error conflict policies must be rejected");
+            assert!(
+                err.to_string().contains("unknown variant"),
+                "conflict = \"{rejected}\" must fail at parse, got: {err}"
+            );
+        }
+        let err = toml::from_str::<Mapping>("from = \"a\"\nto = \"b\"\noptional = true")
+            .expect_err("optional sources must be rejected");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "optional = true must fail at parse, got: {err}"
+        );
 
         // The known-good fixtures still load under the strict rules.
         let fixture = project.join("deploy.toml");

@@ -1,6 +1,7 @@
-# The `systemd` variant: the same artifact mappings as `standard`, but with a
-# REAL systemd unit instead of a commented-out block. The unit file is an
-# artifact (`artifacts/systemd/example.service`) whose CONTENT is rendered per
+# The `systemd` variant: ships a REAL systemd unit as its own artifact tree
+# (strict mapping semantics: one file-tree destination per variant, so the
+# `standard` variant's `app/` destination is not repeated here). The unit file
+# is an artifact (`artifacts/systemd/example.service`) whose CONTENT is rendered per
 # slot at activation time (`{{ deploy_dir }}` resolves to the slot's
 # deploy_dir, `{{ user }}` to the per-server deployment account — the tree
 # itself stays slot-independent); the rendered copy is
@@ -18,13 +19,12 @@
 # wrapper unit and never links artifact unit files into /etc/systemd/system.
 description = "Systemd-managed deployment"
 
-[[artifact.mappings]]
-from = "artifacts/build/output/"
-to = "app/"
-recursive = true
-
-# The unit file is an artifact too: it lands at `app/example.service` in the
-# release tree, matching `artifact_path` below.
+# STRICT MAPPING SEMANTICS: destinations must not overlap, so this variant
+# maps only its own unit tree — the `standard` variant's `app/` destination
+# is not repeated here. The unit file is an artifact
+# (`artifacts/systemd/example.service`) whose CONTENT is rendered per slot at
+# activation time; it lands at `app/example.service` in the release tree,
+# matching `artifact_path` below.
 [[artifact.mappings]]
 from = "artifacts/systemd/"
 to = "app/"

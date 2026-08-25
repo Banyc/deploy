@@ -2048,7 +2048,7 @@ recursive = true
 
 [[artifact.mappings]]
 from = "artifacts/deployment/common/"
-to = "app/"
+to = "app-common/"
 recursive = true
 
 [activation]
@@ -3627,7 +3627,7 @@ recursive = true
 
 [[artifact.mappings]]
 from = "artifacts/deployment/common/"
-to = "app/"
+to = "app-common/"
 recursive = true
 
 [activation]
@@ -6264,7 +6264,7 @@ recursive = true
 
 [[artifact.mappings]]
 from = "artifacts/deployment/common/"
-to = "app/"
+to = "app-common/"
 recursive = true
 
 [activation]
@@ -6285,7 +6285,7 @@ recursive = true
 
 [[artifact.mappings]]
 from = "artifacts/deployment/common/"
-to = "app/"
+to = "app-common/"
 recursive = true
 
 [activation]
@@ -6312,7 +6312,7 @@ recursive = true
 
 [[artifact.mappings]]
 from = "artifacts/deployment/common/"
-to = "app/"
+to = "app-common/"
 recursive = true
 
 [activation]
@@ -6333,7 +6333,7 @@ recursive = true
 
 [[artifact.mappings]]
 from = "artifacts/deployment/common/"
-to = "app/"
+to = "app-common/"
 recursive = true
 
 [activation]
@@ -6976,7 +6976,7 @@ interval_seconds = 0
         );
         variant.push_str(
             "[[artifact.mappings]]\nfrom = \"artifacts/build/output/\"\nto = \"app/\"\nrecursive = true\n\n\
-             [[artifact.mappings]]\nfrom = \"artifacts/deployment/common/\"\nto = \"app/\"\nrecursive = true\n\n\
+             [[artifact.mappings]]\nfrom = \"artifacts/deployment/common/\"\nto = \"app-common/\"\nrecursive = true\n\n\
              [activation]\nadapter = \"none\"\n\n\
              [verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
         );
