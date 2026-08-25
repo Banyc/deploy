@@ -483,7 +483,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let msg = err.to_string();
     assert!(
         msg.contains(
-            "slot 'p1' was bound to server 'server-01' at '/srv/deploy/rebind' in production@s0"
+            "slot 'p1' was bound to server 'server-01' at '/srv/deploy/rebind' in snapshot s0 of target 'production'"
         ),
         "error must name the slot, the recorded server and its deploy_dir, got: {msg}"
     );
@@ -666,7 +666,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let msg = err.to_string();
     assert!(
         msg.contains(
-            "slot 'p1' was bound to server 'server-01' at '/srv/move/movedir-a' in production@s0"
+            "slot 'p1' was bound to server 'server-01' at '/srv/move/movedir-a' in snapshot s0 of target 'production'"
         ),
         "error must name the slot, the recorded server AND its deploy_dir, got: {msg}"
     );
@@ -730,7 +730,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 }
 
 /// Deploy variant `old`, replace it with `new` in the configuration (the old
-/// variant file is removed entirely), then restore the `@s0` snapshot.
+/// variant file is removed entirely), then restore the `s0` snapshot.
 /// The historical deployment restores variant `old` from the immutable release
 /// record even though the caller's current configuration no longer declares it.
 /// Capacity is NOT part of that snapshot: it is a per-server policy resolved
@@ -3698,7 +3698,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 /// Capacity headroom is ALWAYS resolved from the caller's current server
 /// configuration — even for a historical rollback push, because servers have no
 /// per-release history. Here the s0 tree is rotated off the server, then a
-/// rollback to @s0 with a huge CURRENT reserve fails preflight before any
+/// rollback to `s0` with a huge CURRENT reserve fails preflight before any
 /// remote mutation; lowering the reserve lets the same rollback succeed.
 #[test]
 fn rollback_preflight_uses_current_server_capacity() -> Result<()> {
@@ -3797,7 +3797,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     );
     let current_before = std::fs::read_link(remotes_base.join("server-01/current"))?;
 
-    // Raise the server's CURRENT reserve to a huge value: the @s0 rollback must
+    // Raise the server's CURRENT reserve to a huge value: the `s0` rollback must
     // now fail preflight (it has to re-upload T0) — proving the headroom came
     // from today's server config, not from any per-release snapshot.
     let body = std::fs::read_to_string(&config_path)?;
@@ -3830,7 +3830,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "`current` must be unchanged by the failed attempt"
     );
 
-    // Lower the reserve back to zero: the same rollback to @s0 now succeeds.
+    // Lower the reserve back to zero: the same rollback to `s0` now succeeds.
     let body = std::fs::read_to_string(&config_path)?;
     let low = body.replace(
         "capacity = { reserve_bytes = 1099511627776, reserve_percent = 0 }",
@@ -4160,7 +4160,7 @@ interval_seconds = 0
 }
 
 /// A slot may be a member of SEVERAL targets: pushing each target deploys the
-/// slot independently, with per-target attempts/snapshots/observed, and `@s0`
+/// slot independently, with per-target attempts/snapshots/observed, and `s0`
 /// rollback works on each target's own snapshot.
 #[test]
 fn slot_in_two_targets_deploys_per_target_and_rolls_back_each() -> Result<()> {
@@ -4331,7 +4331,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
     }
 
-    // `@s0` rollback on EACH target restores that target's own s0 tree.
+    // `s0` rollback on EACH target restores that target's own s0 tree.
     let rrb_prod = push(
         &proj.join("deploy.toml"),
         &store,

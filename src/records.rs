@@ -33,7 +33,8 @@
 //!   is the deployment's mutable status lifecycle: the current status of an
 //!   attempt is the LATEST transition.
 //! * [`DeploymentSnapshot`] — a terminal successful FLEET state used for
-//!   rollback, exposed as `<target>@sN`. Only successful deployments produce
+//!   rollback, referenced as a snapshot index `sN` on the push command
+//!   (e.g. `deploy push <target> sN`). Only successful deployments produce
 //!   a snapshot (`refs/snapshots.jsonl` + `refs/last-successful`). It records
 //!   each slot's advanced [`GenerationRef`] keyed by the DEPLOYMENT-LOCATION
 //!   identity AND the complete physical binding ([`PhysicalBinding`]
@@ -182,8 +183,9 @@ pub struct PhysicalBinding {
     pub deploy_dir: String,
 }
 
-/// A terminal successful snapshot state used for rollback, exposed as
-/// `<target>@sN`. Only successful deployments produce a snapshot
+/// A terminal successful snapshot state used for rollback, referenced as a
+/// snapshot index `sN` on the push command (e.g. `deploy push <target> sN`).
+/// Only successful deployments produce a snapshot
 /// (`refs/snapshots.jsonl` + `refs/last-successful`). Each slot's entry is
 /// the complete [`GenerationRef`] it advanced to (a successful snapshot always
 /// has a generation per slot).
@@ -255,7 +257,7 @@ pub enum PlanSource {
     /// Materialize the currently mapped local files and assign each slot its
     /// target-configured (current) variant.
     Head,
-    /// Restore a historical successful snapshot by index (`@sN`).
+    /// Restore a historical successful snapshot by index (`sN`).
     SnapshotRef(u64),
     /// Assign each current slot its configured variant from a named release.
     ReleaseRef(ReleaseId),

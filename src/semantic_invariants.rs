@@ -2168,7 +2168,7 @@ fn observed_scope_crash_before_refresh_recovered_by_noop_retry() {
 
 /// (b) Rollback on ONE target: a snapshot rollback is a REAL push; its observed
 /// refresh must land the rolled-back assignment in EVERY member target's
-/// projection, so after rolling t1 back to its own `@s0` both t1 and t2
+/// projection, so after rolling t1 back to its own `s0` both t1 and t2
 /// observe the restored assignment (generation + artifact).
 #[test]
 fn observed_scope_rollback_refreshes_every_member_projection() {
@@ -2283,7 +2283,7 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     assert!(err.to_string().contains("append_attempt"), "{err}");
     f.assert_observed_scope_property();
 
-    // (b) Rollback t1 to its own `@s0` (tree v1): a real push whose refresh
+    // (b) Rollback t1 to its own `s0` (tree v1): a real push whose refresh
     // propagates the restored assignment to BOTH member targets.
     let r = f.apply(Action::Rollback("t1", 0));
     let Outcome::Push(res) = r else {
@@ -3548,7 +3548,8 @@ fn bounds_capacity_edge_corners_fail_safely() {
 /// * the remote `current` generation's expected content version;
 /// * each member target's expected observed projection (a completed
 ///   push/rollback propagates the shared slot to BOTH members);
-/// * the per-target snapshot log (`t@s{i}` rollback refs) and the
+/// * the per-target snapshot log (`s{i}` rollback refs, one chain per
+///   target) and the
 ///   deployment-attempt log (one entry per real deployment);
 /// * pending-commit state — a CommitMarker-write fault leaves the attempt
 ///   un-finalized until the next push of that target reconciles it (or
@@ -4347,7 +4348,13 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
         for (i, (ss, mv)) in sys_snaps.iter().zip(&want).enumerate() {
             assert_eq!(ss.index, i as u64, "{ctx}: snapshot index order for {t}");
             let art = ss.slots[&pid].assignment.artifact.clone();
-            learn_artifact(&mut learned, &ctx, *mv, art, &format!("snapshot {t}@s{i}"));
+            learn_artifact(
+                &mut learned,
+                &ctx,
+                *mv,
+                art,
+                &format!("snapshot s{i} of {t}"),
+            );
         }
     }
     // Deployment-attempt logs: exactly one record per real deployment.

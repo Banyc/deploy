@@ -3,7 +3,7 @@
 //!
 //! Only fully successful deployments produce a snapshot
 //! (`refs/snapshots.jsonl`), exposed as the indices `s0`, `s1`, and so on
-//! (`ref_name` renders them `production@s0` for display). Failed and degraded
+//! (`ref_name` renders them `snapshot s0 of target production` for display). Failed and degraded
 //! attempts remain visible through `deploy log` and `attempts.jsonl` but are
 //! not valid rollback sources.
 //!
@@ -114,9 +114,10 @@ pub enum RefId {
 ///
 /// The target is never part of the token: every relative form resolves
 /// against the separately-given target argument at [`resolve_push_ref`] time.
-/// The old `<target>@sN` / `release/<id>` / bare release-id / `fN` index
-/// forms are NOT accepted (they repeat the target and predate the jj-style
-/// grammar); they fail with an explicit migration hint.
+/// The legacy combined forms — the target repeated inline before an `sN`
+/// index, `release/<id>`, bare release-id, and the old `fN` index prefix —
+/// are NOT accepted (they predate the jj-style grammar); they fail with an
+/// explicit migration hint.
 pub fn parse_push_ref(token: &str) -> Result<RefExpr> {
     let t = token.trim();
     // HEAD / the default / `@` all mean the current state.
@@ -191,7 +192,7 @@ pub fn parse_push_ref(token: &str) -> Result<RefExpr> {
         return Ok(RefExpr::Release(ReleaseId::parse(id)));
     }
 
-    // The legacy `<target>@sN` form repeats the target and is not accepted.
+    // The legacy combined form (the target repeated inline before an `sN`
     if t.contains('@') {
         return Err(Error::r#ref(format!(
             "unrecognized reference '{token}' (the target is passed once, on the command line: \
@@ -330,7 +331,7 @@ pub fn resolve_push_ref(token: &str, target: &str, store: &LocalStore) -> Result
             let base_index = resolve_base_index(&rel.base, target, &entries, token)?;
             let index = base_index.checked_sub(rel.steps).ok_or_else(|| {
                 Error::r#ref(format!(
-                    "'{token}' walks {} step(s) back from @s{base_index} on target '{target}', \
+                    "'{token}' walks {} step(s) back from snapshot s{base_index} on target '{target}', \
                     before the start of the snapshot chain",
                     rel.steps
                 ))
@@ -362,7 +363,7 @@ fn resolve_base_index(
                 Ok(*k)
             } else {
                 Err(Error::r#ref(format!(
-                    "no snapshot ref @s{k} for target '{target}'"
+                    "no snapshot s{k} for target '{target}'"
                 )))
             }
         }
@@ -402,9 +403,10 @@ fn snapshot_release(e: &DeploymentSnapshot) -> ReleaseId {
         .unwrap_or_default()
 }
 
-/// Human-readable ref name for a snapshot index, e.g. `production@s1`.
+/// Human-readable display name for a snapshot index, e.g.
+/// `snapshot s1 of target production`.
 pub fn ref_name(target: &TargetName, index: u64) -> String {
-    format!("{}@s{index}", target.as_str())
+    format!("snapshot s{index} of target {}", target.as_str())
 }
 
 /// Ensure the snapshot log contains exactly one successful snapshot for
@@ -637,7 +639,7 @@ pub fn resolve_snapshot(
     entries
         .into_iter()
         .find(|e| e.index == index)
-        .ok_or_else(|| Error::r#ref(format!("no snapshot ref @s{index} for target '{target}'")))
+        .ok_or_else(|| Error::r#ref(format!("no snapshot s{index} for target '{target}'")))
 }
 
 /// Reconstruct the set of successful deployments for a target from the
@@ -655,7 +657,8 @@ pub fn attempt_slot_ids(attempt: &DeploymentAttempt) -> Vec<PlacementSlotId> {
     attempt.slot_ids.clone()
 }
 
-/// Build a map of `<target>@sN` -> snapshot for display.
+/// Build a map of snapshot display names (`snapshot sN of target <target>`)
+/// -> snapshot.
 pub fn snapshot_index(
     store: &LocalStore,
     target: &TargetName,
@@ -799,9 +802,9 @@ mod tests {
     }
 
     /// The legacy grammar is REJECTED with a ref error, never silently
-    /// re-mapped: `<target>@sN` (target repeated), `release/<id>`, bare
-    /// release ids, the old `fN` snapshot-index prefix, `:current`, and
-    /// malformed relatives.
+    /// re-mapped: the target repeated inline before an `sN` index,
+    /// `release/<id>`, bare release ids, the old `fN` snapshot-index prefix,
+    /// `:current`, and malformed relatives.
     #[test]
     fn parse_ref_rejects_legacy_forms() {
         for token in [
@@ -1056,7 +1059,7 @@ mod tests {
     fn ref_name_index() {
         assert_eq!(
             ref_name(&TargetName::new("production".to_string()), 3),
-            "production@s3"
+            "snapshot s3 of target production"
         );
     }
 

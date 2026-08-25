@@ -221,7 +221,7 @@ pub(crate) fn push_with_id(
 }
 
 /// Test-only entry point: drive [`push_inner`] for a caller-supplied ref
-/// (`@sN` rollback etc.) with a caller-supplied deployment id, mirroring
+/// (`sN` rollback etc.) with a caller-supplied deployment id, mirroring
 /// [`push_with_id`] for the ref-token path. Lets the state-machine fixture
 /// arm the one-shot store faults (keyed by deployment id) BEFORE a rollback
 /// push runs, so rollback steps can carry the same per-step failure classes
@@ -1266,7 +1266,7 @@ fn push_inner(
             "push completed",
             &slot_bindings,
         )?;
-        message = format!("push successful; snapshot ref {}@s{idx}", target_name);
+        message = format!("push successful; snapshot ref s{idx} of target {target_name}");
     } else {
         store.append_transition(deployment_id.as_str(), &commit_status, commit_reason)?;
     }
@@ -2971,7 +2971,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "clean push must finalize Successful"
         );
         assert!(
-            r1.message.contains("snapshot ref t1@s0"),
+            r1.message.contains("snapshot ref s0 of target t1"),
             "message must carry the snapshot ref, got: {}",
             r1.message
         );

@@ -67,7 +67,7 @@ Then deploy:
 
 ```sh
 deploy push production --dry-run   # preview the plan; touches nothing
-deploy push production             # deploy (status: Successful, ref production@s0)
+deploy push production             # deploy (status: Successful, snapshot s0 of production)
 deploy status production           # what is actually running on each server
 deploy log production              # deployment history
 ```
@@ -126,8 +126,9 @@ deploy push production deploy-20260821T102000Z--   # 2 before the snapshot that 
 deploy push production rel-sha256-41da2f63--        # 2 before the most recent snapshot referencing that release
 ```
 
-- Every *successful* deployment appends a snapshot (`s0`, `s1`, …; `deploy
-  log` shows them as `production@sN`); failed and degraded attempts never
+- Every *successful* deployment appends a snapshot (`s0`, `s1`, …),
+  referenced on the push command as `sN` (e.g. `deploy push production s3`);
+  failed and degraded attempts never
   advance the rollback ref and cannot be rolled back to.
 - A refid is a snapshot index (`sN`), a deployment id (`deploy-...`), or a
   release id (`rel-sha256-...` or a bare digest). Deployment/release refids

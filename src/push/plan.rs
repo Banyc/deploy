@@ -87,12 +87,12 @@ pub fn plan_assignments(
                 };
                 let recorded = entry.bindings.get(&slot_id).ok_or_else(|| {
                     Error::rollback(format!(
-                        "slot '{slot_id}' has no recorded physical binding in {ft}@s{index}; exact rollback cannot verify the deployment location"
+                        "slot '{slot_id}' has no recorded physical binding in snapshot s{index} of target '{ft}'; exact rollback cannot verify the deployment location"
                     ))
                 })?;
                 if recorded != &current {
                     return Err(Error::rollback(format!(
-                        "slot '{slot_id}' was bound to server '{}' at '{}' in {ft}@s{index}, now bound to '{}' at '{}'; exact rollback would deploy to the wrong host",
+                        "slot '{slot_id}' was bound to server '{}' at '{}' in snapshot s{index} of target '{ft}', now bound to '{}' at '{}'; exact rollback would deploy to the wrong host",
                         recorded.server, recorded.deploy_dir, current.server, current.deploy_dir
                     )));
                 }
@@ -689,7 +689,7 @@ interval_seconds = 0
 
     /// A LEGACY snapshot (no `bindings` map — the pre-feature shape)
     /// makes exact rollback unverifiable: `plan_assignments` must REFUSE the
-    /// `@sN` ref with a rollback error naming the slot, rather than guessing
+    /// `sN` ref with a rollback error naming the slot, rather than guessing
     /// the host/location. The integration tests cover binding MISMATCH
     /// (`rollback_refuses_rebound_slot` / `rollback_refuses_moved_deploy_dir`);
     /// this pins the MISSING-binding refusal (the `#[serde(default)]` empty

@@ -692,7 +692,8 @@ impl LocalStore {
 
     /// Append a terminal successful snapshot (`refs/snapshots.jsonl`),
     /// one JSON line per entry. Snapshots are the immutable rollback source
-    /// (`<target>@sN`); only successful deployments produce them.
+    /// (referenced as a snapshot index `sN`, e.g. `deploy push <target> sN`);
+    /// only successful deployments produce them.
     pub fn append_snapshot(&self, target: &str, entry: &DeploymentSnapshot) -> Result<()> {
         #[cfg(test)]
         if self
