@@ -122,6 +122,36 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
         .map_err(|e| Error::store(format!("deserialize {}: {e}", path.display())))
 }
 
+/// Parse-sensitive variant of [`read_json`] for CHECKPOINT MARKERS only.
+///
+/// The class split this feature enforces: [`Error::store`] is reserved for
+/// mechanical FILESYSTEM I/O (open/read/rename/fsync failures), while a
+/// PRESENT file whose CONTENT fails to deserialize is semantic CORRUPTION
+/// and maps to [`Error::integrity`] — the file exists, it is just not a
+/// valid marker. [`read_json`] folds both into [`Error::store`], which is
+/// correct for its other callers (observed.json, rotation-debt.json, tree
+/// metadata, ...) but would let callers mistake "this marker is corrupt"
+/// for "disk read failed".
+///
+/// Callers must still perform their own schema-version check after a
+/// successful parse (also [`Error::integrity`]): an unsupported
+/// `schema_version` is a marker-format violation, not an I/O failure.
+fn read_json_marker<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    // Filesystem read failure: mechanical I/O → Store (unchanged class).
+    let bytes =
+        std::fs::read(path).map_err(|e| Error::store(format!("read {}: {e}", path.display())))?;
+    // Present-but-malformed content: semantic corruption → Integrity. The
+    // file EXISTS (the read above succeeded) but its bytes are not a valid
+    // marker — truncation, wrong field types, or missing fields all land
+    // here and MUST NOT be reported as a store/IO error.
+    serde_json::from_slice(&bytes).map_err(|e| {
+        Error::integrity(format!(
+            "marker at {} is malformed (the file exists but its content is not a valid marker): {e}",
+            path.display()
+        ))
+    })
+}
+
 fn set_private(path: &Path) -> Result<()> {
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(path, perms)
@@ -990,6 +1020,12 @@ impl LocalStore {
     /// * `schema_version` must be exactly [`SCHEMA_VERSION`]; any other
     ///   version fails with an error naming the version (a floor written by
     ///   a different schema is never silently interpreted).
+    /// * a PRESENT but MALFORMED marker (truncated JSON, wrong field types,
+    ///   missing fields) is a parse failure — also [`Error::integrity`]
+    ///   via [`read_json_marker`]. [`Error::store`] is reserved for
+    ///   mechanical filesystem I/O (open/read failures) so a caller can
+    ///   always distinguish "this marker is corrupt" from "disk read
+    ///   failed".
     /// * (a) the marker's `target` must match the path it was read from
     ///   (`marker.target == target`): a marker is bound to the target
     ///   directory it lives in, so a marker smuggled into another target's
@@ -1013,9 +1049,12 @@ impl LocalStore {
         if !p.exists() {
             return Ok(None);
         }
-        let floor: HistoryFloor = read_json(&p)?;
+        // Parse-sensitive read: a present-but-malformed marker (truncation,
+        // wrong types, missing fields) is semantic corruption → Integrity;
+        // only an actual filesystem read failure is Store.
+        let floor: HistoryFloor = read_json_marker(&p)?;
         if floor.schema_version != SCHEMA_VERSION {
-            return Err(Error::store(format!(
+            return Err(Error::integrity(format!(
                 "history floor for target '{target}' carries unsupported schema_version {} (expected {SCHEMA_VERSION}): only SCHEMA_VERSION is accepted",
                 floor.schema_version
             )));
@@ -1106,9 +1145,11 @@ impl LocalStore {
         if !p.exists() {
             return Ok(None);
         }
-        let pending: CleanupPending = read_json(&p)?;
+        // Parse-sensitive read: malformed CONTENT is Integrity, filesystem
+        // I/O failure is Store (same class split as the history floor).
+        let pending: CleanupPending = read_json_marker(&p)?;
         if pending.schema_version != CLEANUP_PENDING_SCHEMA_VERSION {
-            return Err(Error::store(format!(
+            return Err(Error::integrity(format!(
                 "cleanup-pending marker for target '{target}' carries unsupported schema_version {} (expected {CLEANUP_PENDING_SCHEMA_VERSION}): only CLEANUP_PENDING_SCHEMA_VERSION is accepted (the legacy version-1 shape with pending_deployments is refused, never reinterpreted)",
                 pending.schema_version
             )));
@@ -2354,6 +2395,229 @@ mod tests {
         assert!(
             err.to_string().contains("integrity"),
             "a cleanup marker naming a foreign target must fail closed, got: {err}"
+        );
+    }
+
+    /// Enumerate EVERY corruption mutation for a checkpoint marker's
+    /// serialized JSON. The mutation space is small and CLOSED, so the
+    /// property below runs it EXHAUSTIVELY (deterministic, no sampling):
+    ///
+    /// * TRUNCATION: cut the serialized bytes at several prefix lengths
+    ///   (0 = empty file, 1, mid, len-1);
+    /// * MISSING FIELDS: drop each field of the JSON object;
+    /// * WRONG TYPES: `schema_version` as a string, `deployment_id` as a
+    ///   number, `snapshot_index` as a bool (present but wrong type);
+    /// * EVERY NON-CURRENT SCHEMA VERSION: `0..SCHEMA_VERSION`,
+    ///   `SCHEMA_VERSION + 1`, and `u32::MAX` — the set is DERIVED from the
+    ///   CURRENT constant so it stays exhaustive if the schema version
+    ///   changes (a sibling cleanup-marker hardening may introduce a
+    ///   marker-specific constant at merge time; the keep-both resolution
+    ///   should point this at whichever constant the reader enforces).
+    ///
+    /// Every mutation must classify as `Error::Integrity` — NEVER
+    /// `Error::Store` (that class is reserved for filesystem I/O).
+    fn marker_corruption_mutations(valid: &serde_json::Value, current_schema: u32) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let bytes = serde_json::to_vec(valid).expect("a valid marker serializes");
+
+        // Truncations (deduped prefix lengths; all < bytes.len()).
+        let mut cuts = vec![0usize, 1, bytes.len() / 2, bytes.len().saturating_sub(1)];
+        cuts.sort_unstable();
+        cuts.dedup();
+        for cut in cuts {
+            out.push(bytes[..cut].to_vec());
+        }
+
+        let obj = match valid {
+            serde_json::Value::Object(o) => o,
+            _ => panic!("a marker must serialize as a JSON object"),
+        };
+
+        // Missing fields: drop each field in turn (serde fails on the
+        // absent field → Integrity via the parse-sensitive helper).
+        for field in obj.keys() {
+            let mut m = obj.clone();
+            m.remove(field);
+            out.push(serde_json::to_vec(&serde_json::Value::Object(m)).unwrap());
+        }
+
+        // Wrong types: the field is PRESENT but carries the wrong JSON
+        // type (both markers share these three field names).
+        let mut as_string = obj.clone();
+        as_string.insert("schema_version".into(), serde_json::Value::from("1"));
+        out.push(serde_json::to_vec(&serde_json::Value::Object(as_string)).unwrap());
+
+        let mut as_number = obj.clone();
+        as_number.insert("deployment_id".into(), serde_json::Value::from(7));
+        out.push(serde_json::to_vec(&serde_json::Value::Object(as_number)).unwrap());
+
+        let mut as_bool = obj.clone();
+        as_bool.insert("snapshot_index".into(), serde_json::Value::from(true));
+        out.push(serde_json::to_vec(&serde_json::Value::Object(as_bool)).unwrap());
+
+        // Every non-current schema version the current reader must refuse.
+        for v in non_current_schema_versions(current_schema) {
+            let mut m = obj.clone();
+            m.insert("schema_version".into(), serde_json::Value::from(v));
+            out.push(serde_json::to_vec(&serde_json::Value::Object(m)).unwrap());
+        }
+
+        out
+    }
+
+    /// Every `u32` schema version the current reader must refuse:
+    /// `0..SCHEMA_VERSION`, `SCHEMA_VERSION + 1`, `u32::MAX` (derived from
+    /// the CURRENT constant — see [`marker_corruption_mutations`]).
+    fn non_current_schema_versions(current: u32) -> Vec<u32> {
+        let mut v: Vec<u32> = (0..current).collect();
+        v.push(current.wrapping_add(1));
+        v.push(u32::MAX);
+        v.sort_unstable();
+        v
+    }
+
+    /// Run the corruption-classification property for one marker reader:
+    /// the INTACT marker reads as `Ok(Some(_))`; EVERY corruption mutation
+    /// fails with EXACTLY the `Error::Integrity` variant — asserted via
+    /// `matches!` on the ENUM, never message text; a genuine filesystem
+    /// I/O failure (the marker path is a DIRECTORY, so open/read fails at
+    /// the OS level) stays `Error::Store`; an absent marker is `Ok(None)`.
+    /// Both checkpoint markers go through the shared parse-sensitive
+    /// [`read_json_marker`] helper, so one generic property covers both.
+    fn assert_marker_corruption_classification<T: std::fmt::Debug>(
+        path: &Path,
+        valid: &serde_json::Value,
+        mutations: &[Vec<u8>],
+        read: impl Fn() -> Result<Option<T>>,
+    ) {
+        // Control: the intact marker parses AND passes the schema check.
+        std::fs::write(path, serde_json::to_vec(valid).unwrap()).unwrap();
+        assert!(
+            read().expect("the intact marker must read").is_some(),
+            "the intact marker must read as Ok(Some(_))"
+        );
+
+        // Every corruption mutation → Integrity (semantic corruption), never
+        // Store (mechanical I/O) — the class split this feature enforces.
+        for m in mutations {
+            std::fs::write(path, m).unwrap();
+            match read() {
+                Err(Error::Integrity(_)) => {}
+                other => panic!(
+                    "marker corruption must classify as Error::Integrity, got: {other:?}\n  bytes: {}",
+                    String::from_utf8_lossy(m)
+                ),
+            }
+        }
+
+        // Class split: a real filesystem I/O failure (marker path is a
+        // directory → EISDIR on open/read) stays Error::Store.
+        std::fs::remove_file(path).unwrap();
+        std::fs::create_dir(path).unwrap();
+        match read() {
+            Err(Error::Store(_)) => {}
+            other => {
+                panic!("a filesystem I/O failure must classify as Error::Store, got: {other:?}")
+            }
+        }
+        std::fs::remove_dir(path).unwrap();
+
+        // Absent marker → Ok(None), never an error.
+        assert!(
+            read().expect("an absent marker must be Ok(None)").is_none(),
+            "an absent marker must read as Ok(None)"
+        );
+    }
+
+    /// THE BYTE/JSON MUTATION PROPERTY: present-but-malformed marker
+    /// CONTENT (truncated JSON, wrong field types, missing fields) and
+    /// unsupported marker SCHEMAS classify as `Error::Integrity` for BOTH
+    /// checkpoint marker readers, while `Error::Store` stays reserved for
+    /// actual filesystem I/O. The mutation space is small and closed, so
+    /// the property enumerates it exhaustively over fresh fixtures
+    /// (deterministic — every mutation in the family runs every time).
+    #[test]
+    fn marker_corruption_is_integrity_and_io_is_store() {
+        // ---- history floor marker ----
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let target = "t-floor";
+        let floor_id = DeploymentId::new("deploy-floor".to_string());
+        // Seed the attempt + snapshot the intact marker binds to, so the
+        // control (`Ok(Some(_))`) passes the snapshot-pair and attempt
+        // binding checks in `read_history_floor` (those checks are ALREADY
+        // Integrity — this property exercises the parse/schema branch).
+        store
+            .append_attempt(
+                target,
+                &DeploymentAttempt {
+                    deployment_schema_version: SCHEMA_VERSION,
+                    deployment_id: floor_id.clone(),
+                    target: TargetName::new(target.to_string()),
+                    slot_ids: vec![],
+                    behavior_sha256: "sha256-aa".to_string(),
+                    attempted_at: "2026-01-01T00:00:00Z".to_string(),
+                    desired: BTreeMap::new(),
+                    pre_push: BTreeMap::new(),
+                    slots: BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        store
+            .append_snapshot(
+                target,
+                &DeploymentSnapshot {
+                    index: 1,
+                    deployment_id: floor_id.clone(),
+                    target: TargetName::new(target.to_string()),
+                    behavior_sha256: "sha256-aa".to_string(),
+                    slots: BTreeMap::new(),
+                    bindings: BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        let floor = HistoryFloor {
+            schema_version: SCHEMA_VERSION,
+            target: TargetName::new(target.to_string()),
+            deployment_id: floor_id,
+            snapshot_index: 1,
+            established_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        store.write_history_floor(target, &floor).unwrap();
+
+        let floor_valid = serde_json::to_value(&floor).unwrap();
+        let floor_mutations = marker_corruption_mutations(&floor_valid, SCHEMA_VERSION);
+        assert!(
+            !floor_mutations.is_empty(),
+            "the mutation family must be non-empty"
+        );
+        assert_marker_corruption_classification(
+            &store.history_floor_path(target),
+            &floor_valid,
+            &floor_mutations,
+            || store.read_history_floor(target),
+        );
+
+        // ---- cleanup-pending marker: the same property through the shared
+        // parse-sensitive helper (no binding checks to seed here).
+        let target2 = "t-pending";
+        let pending = CleanupPending {
+            schema_version: CLEANUP_PENDING_SCHEMA_VERSION,
+            target: TargetName::new(target2.to_string()),
+            deployment_id: DeploymentId::new("deploy-1".to_string()),
+            snapshot_index: 1,
+            established_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        store.write_cleanup_pending(target2, &pending).unwrap();
+
+        let pending_valid = serde_json::to_value(&pending).unwrap();
+        let pending_mutations =
+            marker_corruption_mutations(&pending_valid, CLEANUP_PENDING_SCHEMA_VERSION);
+        assert_marker_corruption_classification(
+            &store.cleanup_pending_path(target2),
+            &pending_valid,
+            &pending_mutations,
+            || store.read_cleanup_pending(target2, None),
         );
     }
 
