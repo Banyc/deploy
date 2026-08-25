@@ -860,7 +860,13 @@ mod tests {
             },
         )]);
 
-        let rollback = build_rollback(&attempt, &actuals, &bindings, None, std::slice::from_ref(&slot));
+        let rollback = build_rollback(
+            &attempt,
+            &actuals,
+            &bindings,
+            None,
+            std::slice::from_ref(&slot),
+        );
         assert_eq!(
             rollback.bindings.get(&slot),
             Some(&PhysicalBinding {
