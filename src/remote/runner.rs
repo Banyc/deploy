@@ -2,20 +2,26 @@
 //!
 //! EVERY ssh operation runs through ONE bounded subprocess runner
 //! ([`SshRunner`]): the runner spawns the child, waits with a HARD deadline,
-//! on deadline KILLS the child (SIGKILL) and then REAPS it (joins the wait
-//! thread that owns the child) before returning a Timeout. Nothing is
-//! unbounded: `-o ConnectTimeout=N` in the fixed `ssh` arguments bounds only
-//! the CONNECTION phase, so the runner's deadline bounds every operation
-//! AFTER connection establishment — a remote that hangs mid-command, mid-
-//! upload, mid-keyscan, or mid-`exec` fails fast instead of hanging the whole
-//! push. The kill-then-reap ordering is deterministic: the wait thread owns
-//! the child, and the deadline path kills and then JOINS that thread, so the
-//! child is always collected before the runner returns (no kill-vs-wait race,
-//! no zombies, no return-before-reap). A stdin-write failure is held to the
-//! same rule: the wait closure saves the write error, ALWAYS runs
-//! `wait_with_output` (drains and collects the child — after the deadline kill
-//! this returns the killed status promptly), and only then returns the saved
-//! error, so a write error can never leave an uncollected child either.
+//! on deadline requests a kill through the OWNED child handle (SIGKILL via
+//! [`std::process::Child::kill`] — never a detached pid) and then REAPS it
+//! (joins the wait thread that owns the child) before returning a Timeout.
+//! Nothing is unbounded: `-o ConnectTimeout=N` in the fixed `ssh` arguments
+//! bounds only the CONNECTION phase, so the runner's deadline bounds every
+//! operation AFTER connection establishment — a remote that hangs mid-
+//! command, mid-upload, mid-keyscan, or mid-`exec` fails fast instead of
+//! hanging the whole push. The kill-then-reap ordering is deterministic: the
+//! wait thread owns the child, and the deadline path kills and then JOINS
+//! that thread, so the child is always collected before the runner returns
+//! (no kill-vs-wait race, no zombies, no return-before-reap). The kill never
+//! touches a detached pid: the runner and the wait thread share the child
+//! EXCLUSIVELY (an `Arc<Mutex<Option<Child>>>`), so once the wait thread has
+//! reaped the child the kill handle is CONSUMED and a late kill is a no-op by
+//! construction — a pid the OS recycled to an unrelated process can never be
+//! signalled. A stdin-write failure is held to the same rule: the wait
+//! closure saves the write error, ALWAYS collects the child (drains its pipes
+//! and reaps it — after the deadline kill this returns the killed status
+//! promptly), and only then returns the saved error, so a write error can
+//! never leave an uncollected child either.
 //!
 //! Deadline policy: the connect-bound `ssh-keyscan` pin keeps
 //! [`SSH_CONNECT_TIMEOUT_SECS`] (it IS a connection-establishment probe);
@@ -24,8 +30,9 @@
 //! remote legitimately needs longer than connection establishment once
 //! connected), and `Remote::exec` keeps its caller-supplied timeout.
 
+use std::os::fd::AsRawFd;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 // Connect timeout in seconds applied to every `ssh` connection (`-o
@@ -78,7 +85,7 @@ pub(crate) enum RunError {
     Spawn(String),
     /// The stdin payload write failed (e.g. EPIPE after the deadline kill
     /// closed the pipe). Returned only AFTER the child was reaped: the wait
-    /// closure always runs `wait_with_output` before surfacing a saved write
+    /// closure always collects the child before surfacing a saved write
     /// error.
     StdinWrite(String),
     /// Waiting on the child failed (wait error, read error, …).
@@ -87,38 +94,46 @@ pub(crate) enum RunError {
     Timeout { after: Duration },
 }
 
-/// A spawned child owned by the runner: the runner keeps the pid (for the
-/// deadline kill) and a reaping closure that the wait thread runs. The closure
-/// returns once the child exits — including after [`SshRunnerSeam::kill`] — so
-/// the runner's join is a deterministic reap.
+/// A spawned child owned by one supervisor. The runner keeps the EXCLUSIVE
+/// handle to the live child — its `kill` requests the kill on the OWNED
+/// [`std::process::Child`] (never a detached pid) — and a reaping closure the
+/// wait thread runs. The closure returns once the child exits — including
+/// after a kill request — so the runner's join is a deterministic reap. Once
+/// the wait thread has reaped the child the handle is CONSUMED: a kill on it
+/// is a no-op by construction, so a pid the OS recycled to an unrelated
+/// process can never be signalled.
 struct SpawnedChild {
-    pid: u32,
+    /// Request the force-kill of the live child (SIGKILL on the owned
+    /// handle). A no-op once the wait thread has reaped the child. The real
+    /// seam locks the child slot shared with the wait thread and calls
+    /// [`std::process::Child::kill`]; the fake seam records the Kill event
+    /// against its own per-child control block.
+    kill: Box<dyn Fn() -> std::io::Result<()> + Send>,
     /// Drain stdout/stderr and wait for the child; must return promptly once
-    /// the child exits (or is killed). ALWAYS reaps the child before returning
-    /// an error: a saved stdin-write error is surfaced only AFTER
-    /// `wait_with_output` has run, so an error can never leave the child
+    /// the child exits (or is killed). ALWAYS reaps the child before
+    /// returning an error: a saved stdin-write error is surfaced only AFTER
+    /// the child was collected, so an error can never leave the child
     /// uncollected (no return-before-reap).
     wait: Box<dyn FnOnce() -> std::result::Result<std::process::Output, RunError> + Send>,
 }
 
 /// The subprocess seam behind [`SshRunner`]. The production implementation
 /// spawns real `ssh` / `ssh-keyscan` processes; tests inject a fake that
-/// RECORDS every operation (`spawn(kind, argv)`, `kill`, `reap`) and simulates
-/// the stall points, so the runner's deadline logic is driven without any real
-/// subprocess or sleep.
+/// RECORDS every operation (`spawn(kind, argv)`, and per-handle kills and
+/// reaps) and simulates the stall points, so the runner's deadline logic is
+/// driven without any real subprocess or sleep.
 trait SshRunnerSeam: Send + Sync {
     /// Spawn `argv[0]` with the remaining arguments. When `stdin` is `Some`,
     /// those bytes are piped to the child's stdin as part of the wait, so a
     /// child that stops reading is covered by the same deadline. Returns a
-    /// handle whose `wait` drains the child and returns once it exits.
+    /// handle whose `kill` requests the kill on the OWNED child and whose
+    /// `wait` drains the child and returns once it exits.
     fn spawn(
         &self,
         op: OpKind,
         argv: &[String],
         stdin: Option<Vec<u8>>,
     ) -> std::io::Result<SpawnedChild>;
-    /// Force-kill `pid` (SIGKILL).
-    fn kill(&self, pid: u32) -> std::io::Result<()>;
 }
 
 /// Production seam: real `ssh` / `ssh-keyscan` subprocesses.
@@ -138,55 +153,165 @@ impl SshRunnerSeam for RealRunner {
         if stdin.is_some() {
             cmd.stdin(Stdio::piped());
         }
-        let mut child = cmd.spawn()?;
-        let pid = child.id();
-        // The stdin payload is written from INSIDE the wait closure (which the
-        // runner's deadline bounds): a remote that stops reading stdin mid-
-        // upload blocks this write, the deadline fires, the kill closes the
-        // pipe, and the write fails with EPIPE (SIGPIPE is ignored by the Rust
-        // runtime). Without this, a >pipe-buffer upload to a hung remote would
-        // hang the write indefinitely.
+        let child = cmd.spawn()?;
+        // The child is shared EXCLUSIVELY between the runner's deadline path
+        // and the wait thread through this slot: the wait thread polls the
+        // child (`try_wait`) with the slot locked and CONSUMES it on exit
+        // (the slot becomes None), the deadline path locks the same slot and
+        // calls `Child::kill` on the OWNED handle — never a detached pid. A
+        // kill on a slot the wait thread already reaped (None) is a no-op by
+        // construction: a consumed handle cannot signal anything, so a pid
+        // the OS recycled to an unrelated process can never be hit.
+        let child: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(Some(child)));
+        let kill_child = child.clone();
+        let kill: Box<dyn Fn() -> std::io::Result<()> + Send> = Box::new(move || {
+            match kill_child.lock().unwrap().as_mut() {
+                // SAFETY is provided by std: `Child::kill` SIGKILLs the
+                // process this runner spawned and owns.
+                Some(child) => child.kill(),
+                None => Ok(()),
+            }
+        });
+        let wait_child = child.clone();
+        // The stdin payload is written from INSIDE the wait closure (which
+        // the runner's deadline bounds) but WITHOUT holding the child slot:
+        // the payload pipe is taken out of the child, the slot is released,
+        // and the blocking write is interrupted by the deadline kill (the
+        // child's read end closes on death, the write fails with EPIPE —
+        // SIGPIPE is ignored by the Rust runtime). A remote that stops
+        // reading stdin mid-upload therefore blocks only until the deadline,
+        // never indefinitely, and — crucially — the blocked write does not
+        // pin the child out of the slot, so the deadline can still kill it.
         let wait: Box<dyn FnOnce() -> std::result::Result<std::process::Output, RunError> + Send> =
             Box::new(move || {
+                use std::io::Write;
+                let mut stdin_pipe = wait_child
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .and_then(|c| c.stdin.take());
                 // Write the payload FIRST, saving any error: `?` here would
                 // return BEFORE the child is collected — a write error (EPIPE
                 // after the deadline kill, or a hung-remote pipe) would leave
-                // an un-reaped child. The error is therefore saved, and
-                // `wait_with_output` ALWAYS runs (it drains the child's pipes
-                // and collects it; after the deadline kill this returns the
-                // killed status promptly). The saved write error is returned
-                // only AFTER the child has been reaped.
-                use std::io::Write;
-                let write_res = if let Some(data) = stdin
-                    && let Some(mut sin) = child.stdin.take()
-                {
-                    sin.write_all(&data)
-                } else {
-                    Ok(())
+                // an un-reaped child. The error is therefore saved, and the
+                // poll loop below ALWAYS collects the child before the saved
+                // write error is surfaced.
+                let write_res = match (&stdin, stdin_pipe.as_mut()) {
+                    (Some(data), Some(sin)) => sin.write_all(data),
+                    _ => Ok(()),
                 };
-                let wait_res = child.wait_with_output();
+                drop(stdin_pipe);
+                // Poll loop: the child lives in the shared slot; every pass
+                // drains its pipes (non-blocking) so a large output can never
+                // fill a pipe and stall the child, then `try_wait`. Between
+                // passes the slot is released so the runner's deadline kill
+                // can grab it — each pass is short, so a kill never blocks
+                // long. When the child exits the slot is consumed (reaped)
+                // and the remaining output drained to EOF.
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                let wait_res = loop {
+                    let mut exited: Option<(std::process::Child, std::process::ExitStatus)> = None;
+                    {
+                        let mut guard = wait_child.lock().unwrap();
+                        let c = guard
+                            .as_mut()
+                            .expect("the wait thread is the sole consumer of the child slot");
+                        drain_available(&mut c.stdout, &mut stdout)?;
+                        drain_available(&mut c.stderr, &mut stderr)?;
+                        match c.try_wait() {
+                            Ok(Some(status)) => {
+                                exited = guard.take().map(|c| (c, status));
+                            }
+                            Ok(None) => {}
+                            Err(e) => return Err(RunError::Wait(format!("wait: {e}"))),
+                        }
+                    }
+                    if let Some((mut c, status)) = exited {
+                        drain_to_eof(&mut c.stdout, &mut stdout)?;
+                        drain_to_eof(&mut c.stderr, &mut stderr)?;
+                        break Ok(std::process::Output {
+                            status,
+                            stdout,
+                            stderr,
+                        });
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                // The saved stdin-write error is surfaced only AFTER the
+                // child was collected.
                 match write_res {
                     Err(e) => Err(RunError::StdinWrite(format!("stdin write: {e}"))),
-                    Ok(()) => wait_res.map_err(|e| RunError::Wait(format!("wait: {e}"))),
+                    Ok(()) => wait_res,
                 }
             });
-        Ok(SpawnedChild { pid, wait })
+        Ok(SpawnedChild { kill, wait })
     }
+}
 
-    fn kill(&self, pid: u32) -> std::io::Result<()> {
-        // SAFETY: `pid` is a pid the runner spawned (and holds a child for), so
-        // the target is a child process of ours; SIGKILL cannot be blocked.
-        let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-        Ok(())
+/// Drain whatever bytes a running child currently has buffered in a pipe
+/// WITHOUT blocking: `poll(2)` with a zero timeout reports readability first,
+/// then a single `read` (a pipe that became readable stays readable for the
+/// immediate read, and at EOF the read returns 0), so the wait thread's poll
+/// loop never parks on a pipe while the child is still running — the
+/// non-blocking equivalent of the concurrent drain `wait_with_output` used to
+/// perform, so a child that produces a lot of output is drained while running
+/// instead of filling its pipe and stalling.
+fn drain_available<R>(stream: &mut Option<R>, buf: &mut Vec<u8>) -> Result<(), RunError>
+where
+    R: std::io::Read + std::os::fd::AsFd,
+{
+    let Some(stream) = stream.as_mut() else {
+        return Ok(());
+    };
+    let mut pfd = libc::pollfd {
+        fd: stream.as_fd().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `poll` on a real pipe read end this runner opened for its own
+    // child; a zero timeout never blocks and the fd is always valid here.
+    if unsafe { libc::poll(&mut pfd, 1, 0) } <= 0 {
+        return Ok(());
+    }
+    let mut chunk = [0u8; 8192];
+    match stream.read(&mut chunk) {
+        Ok(0) => Ok(()),
+        Ok(n) => {
+            buf.extend_from_slice(&chunk[..n]);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        Err(e) => Err(RunError::Wait(format!("read: {e}"))),
+    }
+}
+
+/// Drain a child pipe to EOF. Called only AFTER the child exited, when its
+/// write ends are closed: the reads return the buffered data then 0, never
+/// blocking — collecting the child's full output.
+fn drain_to_eof<R: std::io::Read>(
+    stream: &mut Option<R>,
+    buf: &mut Vec<u8>,
+) -> Result<(), RunError> {
+    let Some(stream) = stream.as_mut() else {
+        return Ok(());
+    };
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => return Ok(()),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) => return Err(RunError::Wait(format!("read: {e}"))),
+        }
     }
 }
 
 /// THE single subprocess runner for every ssh operation: spawn the child, wait
-/// with a hard deadline, on deadline KILL (-9) then REAP — join the wait
-/// thread that owns the child, so the child is deterministically collected
-/// before the runner returns (no kill-vs-wait race, no zombie, no
-/// return-before-reap). On success the `Output` is returned; spawn/wait
-/// failures and the deadline map to [`RunError`].
+/// with a hard deadline, on deadline KILL (-9) through the OWNED child handle
+/// then REAP — join the wait thread that owns the child, so the child is
+/// deterministically collected before the runner returns (no kill-vs-wait race,
+/// no zombie, no return-before-reap). On success the `Output` is returned;
+/// spawn/wait failures and the deadline map to [`RunError`].
 ///
 /// The deadline policy: `exec` uses its caller-supplied timeout; the
 /// `ssh-keyscan` pin uses the connect deadline; every other operation uses the
@@ -247,17 +372,21 @@ impl SshRunner {
             .seam
             .spawn(op, argv, stdin.map(<[u8]>::to_vec))
             .map_err(|e| RunError::Spawn(format!("spawn {:?}: {e}", argv)))?;
-        let pid = child.pid;
+        // Split the owned handle into the kill request (the deadline path)
+        // and the wait closure (the wait thread). The kill and the wait share
+        // the child EXCLUSIVELY through the seam's handle, so the deadline
+        // path can kill while the wait thread is mid-wait and a kill after
+        // the wait has reaped the child is a no-op by construction.
+        let SpawnedChild { kill, wait } = child;
         let (tx, rx) = std::sync::mpsc::channel();
-        let wait = child.wait;
         let handle = std::thread::spawn(move || {
             let res = wait();
             let _ = tx.send(res);
         });
         match rx.recv_timeout(deadline) {
             Ok(Ok(out)) => {
-                // Success: the wait thread reaped the child (wait_with_output
-                // collects it) and sent the output. Join so the thread — and
+                // Success: the wait thread reaped the child (its poll loop
+                // collected it) and sent the output. Join so the thread — and
                 // therefore the child's collection — is complete before we
                 // return.
                 let _ = handle.join();
@@ -266,20 +395,22 @@ impl SshRunner {
             Ok(Err(e)) => {
                 // The wait closure already reaped the child before returning
                 // the error (a saved stdin-write error is surfaced only after
-                // `wait_with_output` ran), and the join collects the thread —
+                // the child was collected), and the join collects the thread —
                 // so an error path never leaves an uncollected child either.
                 let _ = handle.join();
                 Err(e)
             }
             Err(_) => {
-                // HARD DEADLINE: kill, then reap. The SIGKILL makes the child
-                // exit; the join collects the wait thread that owns the child
-                // (its `wait` returns promptly after the kill). Both complete
-                // before this function returns, so the child is determinis-
-                // tically collected — no zombie, no kill-vs-wait race, and the
-                // caller can never observe a returned Timeout with the child
-                // still un-reaped.
-                let _ = self.seam.kill(pid);
+                // HARD DEADLINE: request a kill through the OWNED child handle
+                // — never a libc::kill of a detached pid — then reap by
+                // joining the wait thread that owns the child (its `wait`
+                // returns promptly after the kill). Both complete before this
+                // function returns, so the child is deterministically
+                // collected — no zombie, no kill-vs-wait race, no
+                // return-before-reap — and a pid the OS recycled after the
+                // reap can never be signalled: a kill on a consumed handle is
+                // a no-op by construction.
+                let _ = kill();
                 let _ = handle.join();
                 Err(RunError::Timeout { after: deadline })
             }
@@ -406,6 +537,10 @@ mod runner_property_tests {
     struct ChildCtl {
         pid: u32,
         killed: AtomicBool,
+        /// Set the instant the wait has collected the child: from then on a
+        /// kill request on this handle is a NO-OP — the fake's mirror of the
+        /// real runner's consumed `Child` handle.
+        reaped: AtomicBool,
         stall: Stall,
         /// Whether the op pipes a stdin payload: the write-error stall is
         /// meaningful only when there is something to write (the upload op).
@@ -413,18 +548,34 @@ mod runner_property_tests {
         /// Real host-key line the fake keyscan emits on Complete, so the pin
         /// path succeeds end-to-end (fingerprint verified with real ssh-keygen).
         keyscan_line: Option<String>,
+        /// Test-only barrier for the pid-reuse property: the wait parks on it
+        /// AFTER recording its reap and BEFORE returning, exposing the
+        /// reaped-but-not-yet-completed window in which a detached-pid kill
+        /// would be catastrophic.
+        after_reap_barrier: Option<Arc<std::sync::Barrier>>,
         state: Arc<FakeState>,
     }
 
     impl ChildCtl {
         /// The wait closure body: finish immediately (Complete / NonZero /
         /// vacuous StdinWriteError), block until killed (Hang), or fail AFTER
-        /// recording the reap (StdinWriteError with a payload / WaitError);
-        /// record the reap, return the stubbed output or error.
+        /// the reap (StdinWriteError with a payload / WaitError); the caller
+        /// records the single reap and returns the stubbed output or error.
         fn wait(&self) -> std::result::Result<std::process::Output, RunError> {
             self.state.live_waiters.fetch_add(1, Ordering::SeqCst);
             let res = self.wait_inner();
+            // The child is fully reaped now — and the reaped flag is armed
+            // BEFORE the Reap becomes observable, so from the moment the log
+            // shows the reap a kill request on this handle is a no-op (the
+            // real runner's consumed-handle no-op). The barrier parks the wait
+            // AFTER the reap but BEFORE the completion notification — the
+            // window the pid-reuse test exploits; only that test sets it.
+            self.reaped.store(true, Ordering::SeqCst);
+            self.state.push(LogEntry::Reap { pid: self.pid });
             self.state.live_waiters.fetch_sub(1, Ordering::SeqCst);
+            if let Some(barrier) = &self.after_reap_barrier {
+                barrier.wait();
+            }
             res
         }
 
@@ -443,16 +594,8 @@ mod runner_property_tests {
                 out
             };
             match self.stall {
-                Stall::Complete => {
-                    let res = output(0);
-                    self.state.push(LogEntry::Reap { pid: self.pid });
-                    Ok(res)
-                }
-                Stall::NonZero => {
-                    let res = output(1);
-                    self.state.push(LogEntry::Reap { pid: self.pid });
-                    Ok(res)
-                }
+                Stall::Complete => Ok(output(0)),
+                Stall::NonZero => Ok(output(1)),
                 Stall::Hang => {
                     // Block until the runner kills us at the deadline. A bounded
                     // backstop turns a broken runner (one that never kills) into
@@ -466,33 +609,27 @@ mod runner_property_tests {
                         "stalled child {} was never killed: the runner must kill then reap on deadline",
                         self.pid
                     );
-                    self.state.push(LogEntry::Reap { pid: self.pid });
                     Ok(output(0))
                 }
                 Stall::StdinWriteError => {
                     if self.has_stdin {
                         // The stdin write fails — but the closure STILL reaps
-                        // (wait_with_output runs; recorded as Reap) and only
-                        // THEN returns the saved write error: a
-                        // return-before-reap on this path would show up as a
-                        // missing Reap.
-                        self.state.push(LogEntry::Reap { pid: self.pid });
+                        // (the caller records the Reap) and only THEN returns
+                        // the saved write error: a return-before-reap on this
+                        // path would show up as a missing Reap.
                         Err(RunError::StdinWrite(
                             "simulated stdin write failure".to_string(),
                         ))
                     } else {
                         // No stdin payload: there is nothing to write, so the
                         // stall is vacuous and the child completes normally.
-                        let res = output(0);
-                        self.state.push(LogEntry::Reap { pid: self.pid });
-                        Ok(res)
+                        Ok(output(0))
                     }
                 }
                 Stall::WaitError => {
-                    // The reap is ATTEMPTED (wait_with_output runs; recorded as
-                    // Reap) but the wait itself fails: surfaces as a wait error
-                    // after the reap attempt.
-                    self.state.push(LogEntry::Reap { pid: self.pid });
+                    // The reap is ATTEMPTED (the caller records the Reap) but
+                    // the wait itself fails: surfaces as a wait error after
+                    // the reap attempt.
                     Err(RunError::Wait("simulated wait failure".to_string()))
                 }
                 Stall::SpawnError => unreachable!("spawn errors never yield a child"),
@@ -500,14 +637,18 @@ mod runner_property_tests {
         }
     }
 
-    /// The injected fake seam: records every spawn (kind + argv), kill, and
-    /// reap, and simulates the generated stall point.
+    /// The injected fake seam: records every spawn (kind + argv), and the
+    /// per-handle kills and reaps, and simulates the generated stall point.
     struct FakeSeam {
         state: Arc<FakeState>,
         stall: Stall,
         next_pid: AtomicU32,
-        children: Mutex<Vec<Arc<ChildCtl>>>,
         keyscan_line: Option<String>,
+        /// Test-only barrier for the pid-reuse property: the NEXT spawned
+        /// child's wait parks on it AFTER recording its reap and BEFORE
+        /// returning, exposing the reaped-but-not-yet-completed window in
+        /// which a detached-pid kill would be catastrophic.
+        after_reap_barrier: Option<Arc<std::sync::Barrier>>,
     }
 
     impl FakeSeam {
@@ -517,10 +658,35 @@ mod runner_property_tests {
                 state: state.clone(),
                 stall,
                 next_pid: AtomicU32::new(1),
-                children: Mutex::new(Vec::new()),
                 keyscan_line,
+                after_reap_barrier: None,
             };
             (Arc::new(seam), state)
+        }
+
+        /// The pid-reuse simulation: spawn a fresh UNRELATED child that
+        /// recycles `pid` — the pid a real OS hands to a new process the
+        /// instant the original child is reaped. The spawn is recorded in the
+        /// log so the reuse is observable; the returned control block lets the
+        /// caller assert the unrelated child was never killed (its wait is
+        /// never invoked — only its kill flag is inspected).
+        fn spawn_reused_pid(&self, pid: u32, op: OpKind, argv: &[String]) -> Arc<ChildCtl> {
+            self.state.push(LogEntry::Spawn {
+                op,
+                argv: argv.to_vec(),
+                pid,
+            });
+            Arc::new(ChildCtl {
+                pid,
+                killed: AtomicBool::new(false),
+                reaped: AtomicBool::new(false),
+                // Benign: the reused child's wait never runs in the test.
+                stall: Stall::Complete,
+                has_stdin: false,
+                keyscan_line: None,
+                after_reap_barrier: None,
+                state: self.state.clone(),
+            })
         }
     }
 
@@ -543,27 +709,33 @@ mod runner_property_tests {
             let ctl = Arc::new(ChildCtl {
                 pid,
                 killed: AtomicBool::new(false),
+                reaped: AtomicBool::new(false),
                 stall: self.stall,
                 has_stdin: stdin.is_some(),
                 keyscan_line: self.keyscan_line.clone(),
+                after_reap_barrier: self.after_reap_barrier.clone(),
                 state: self.state.clone(),
             });
-            self.children.lock().unwrap().push(ctl.clone());
+            // The kill handle: the runner's deadline path requests the kill
+            // through THIS handle — never through a detached pid — and the
+            // fake records it against the same child the wait reaps. On a
+            // child the wait already reaped (its reaped flag is armed) it is
+            // a NO-OP: nothing is recorded, so the log stays proof that a
+            // reaped child is never killed.
+            let kill_ctl = ctl.clone();
+            let kill: Box<dyn Fn() -> std::io::Result<()> + Send> = Box::new(move || {
+                if kill_ctl.reaped.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                kill_ctl.state.push(LogEntry::Kill { pid: kill_ctl.pid });
+                kill_ctl.killed.store(true, Ordering::SeqCst);
+                Ok(())
+            });
+            let wait_ctl = ctl;
             let wait: Box<
                 dyn FnOnce() -> std::result::Result<std::process::Output, RunError> + Send,
-            > = Box::new(move || ctl.wait());
-            Ok(SpawnedChild { pid, wait })
-        }
-
-        fn kill(&self, pid: u32) -> std::io::Result<()> {
-            let children = self.children.lock().unwrap();
-            let ctl = children
-                .iter()
-                .find(|c| c.pid == pid)
-                .expect("kill of an unknown pid: the runner must only kill children it spawned");
-            self.state.push(LogEntry::Kill { pid });
-            ctl.killed.store(true, Ordering::SeqCst);
-            Ok(())
+            > = Box::new(move || wait_ctl.wait());
+            Ok(SpawnedChild { kill, wait })
         }
     }
 
@@ -1082,6 +1254,57 @@ mod runner_property_tests {
         assert!(matches!(err, RunError::Spawn(_)));
     }
 
+    /// Real-runner check for the consumed-handle contract: a kill request on
+    /// a child whose wait ALREADY reaped it must not raise an error and —
+    /// where observable from this side of the seam — must not signal
+    /// anything: the pid is gone (the process was collected), and because the
+    /// kill goes through the OWNED handle (never a detached pid), it can
+    /// never land on a process the OS recycled the pid to.
+    #[test]
+    fn kill_after_reap_does_not_raise_or_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("child.pid");
+        let seam = Arc::new(RealRunner);
+        let child = seam
+            .spawn(
+                OpKind::Exec,
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("echo $$ > {}; exit 7", pidfile.display()),
+                ],
+                None,
+            )
+            .expect("spawn must succeed");
+        let SpawnedChild { kill, wait } = child;
+        let out = std::thread::spawn(wait)
+            .join()
+            .unwrap()
+            .expect("a promptly-completing child must reap normally");
+        assert_eq!(
+            out.status.code(),
+            Some(7),
+            "the child's exit status must be preserved"
+        );
+        // The child was REAPED (the wait consumed the handle): a kill request
+        // now must be a no-op that raises no error.
+        let kill_res = kill();
+        assert!(
+            kill_res.is_ok(),
+            "a kill after the reap must not raise an error, got: {kill_res:?}"
+        );
+        // Where observable: nothing was signalled — the pid is gone (reaped,
+        // not a zombie), so the kill cannot land on an unrelated process.
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("the child must have recorded its pid before exiting")
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: `kill(pid, 0)` only probes existence; it sends no signal.
+        let still_exists = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!still_exists, "reaped child {pid} must be gone");
+    }
+
     fn stall_strategy() -> impl Strategy<Value = Stall> {
         prop_oneof![
             Just(Stall::Hang),
@@ -1106,6 +1329,105 @@ mod runner_property_tests {
     #[test]
     fn wait_error_is_returned_after_the_reap() {
         run_one_pair(OpKind::Upload, Stall::WaitError);
+    }
+
+    /// THE reused-PID property: the fake reaps the child, then — the barrier
+    /// parks the wait AFTER the reap but BEFORE the completion notification —
+    /// the OS recycles the child's pid to a fresh UNRELATED child, exactly
+    /// what a real OS does the moment a pid is reaped. A kill request made in
+    /// that window (the old code would libc::kill the DETACHED pid and murder
+    /// the unrelated process) must be a NO-OP on the consumed handle: no Kill
+    /// is recorded after the reap, and the unrelated child holding the
+    /// recycled pid is never killed.
+    #[test]
+    fn kill_after_reap_is_a_noop_even_when_the_pid_is_reused() {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let state = Arc::new(FakeState::default());
+        let seam = Arc::new(FakeSeam {
+            state: state.clone(),
+            stall: Stall::Hang,
+            next_pid: AtomicU32::new(1),
+            keyscan_line: None,
+            after_reap_barrier: Some(barrier.clone()),
+        });
+        let argv = vec!["ssh".to_string(), "true".to_string()];
+        let child = seam
+            .spawn(OpKind::Exec, &argv, None)
+            .expect("the fake must spawn the stalling child");
+        let (_, _, pid) = state.spawn();
+        // Split the handle exactly as the runner does: the kill request (the
+        // deadline path) and the wait closure (the wait thread).
+        let SpawnedChild { kill, wait } = child;
+
+        // The runner's deadline path: request the kill through the OWNED
+        // handle.
+        kill().expect("killing a live child must succeed");
+
+        // The wait thread reaps the child, then parks on the barrier (reaped
+        // but not yet completed).
+        let waiter = std::thread::spawn(wait);
+        let budget = Instant::now() + Duration::from_secs(5);
+        while !state.reap_pids().contains(&pid) && Instant::now() < budget {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            state.reap_pids().contains(&pid),
+            "the fake must reap the child before parking on the barrier"
+        );
+
+        // PID REUSE: the OS hands the just-reaped pid to an unrelated process.
+        let reused = seam.spawn_reused_pid(pid, OpKind::Exec, &argv);
+
+        // An attempted timeout kill on the CONSUMED handle — exactly what the
+        // old detached-pid kill could still do — must be a NO-OP: no error,
+        // nothing recorded, nothing signalled.
+        kill().expect("a kill after the reap must not raise an error");
+        assert!(
+            !reused.killed.load(Ordering::SeqCst),
+            "the unrelated process holding the recycled pid must never be killed"
+        );
+
+        // The log: exactly one kill of the reaped child, before its single
+        // reap, and NOTHING after the reap can target the pid again — not
+        // even once the pid was recycled to the unrelated child.
+        assert_eq!(
+            state.kill_pids(),
+            vec![pid],
+            "the reaped child must be killed exactly once"
+        );
+        assert_eq!(
+            state.reap_pids(),
+            vec![pid],
+            "the reaped child must be reaped exactly once"
+        );
+        let log = state.log.lock().unwrap();
+        let kill_pos = log
+            .iter()
+            .position(|e| matches!(e, LogEntry::Kill { .. }))
+            .expect("the kill must be recorded");
+        let reap_pos = log
+            .iter()
+            .position(|e| matches!(e, LogEntry::Reap { .. }))
+            .expect("the reap must be recorded");
+        assert!(kill_pos < reap_pos, "kill must precede reap");
+        assert!(
+            !log[reap_pos + 1..]
+                .iter()
+                .any(|e| matches!(e, LogEntry::Kill { pid: p } if *p == pid)),
+            "no kill may target the reaped child's pid after its reap"
+        );
+        assert!(
+            matches!(log.last(), Some(LogEntry::Spawn { pid: p, .. }) if *p == pid),
+            "the reused-pid spawn must be the last recorded event"
+        );
+
+        // Release the reaped waiter and collect it.
+        barrier.wait();
+        waiter
+            .join()
+            .expect("the wait thread must finish")
+            .expect("the reaped child returns its output");
+        assert_eq!(state.live_waiters(), 0);
     }
 
     proptest! {
