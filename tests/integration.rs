@@ -32,6 +32,14 @@ from = "artifacts/deployment/variants/{{ variant }}/"
 to = "app-variant/"
 recursive = true
 
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 2
+
 [activation]
 adapter = "none"
 
@@ -47,14 +55,6 @@ const CONFIG: &str = r#"
 schema_version = 1
 application = "example"
 release = "v1"
-
-[targets.production.rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[targets.production.rotation.deployment]
-protect_deployments = 2
 
 [[servers]]
 id = "server-01"
@@ -266,7 +266,7 @@ fn end_to_end_push_rollback() -> Result<()> {
         Some(DeploymentStatus::Successful),
         "rollback succeeds"
     );
-    let observed = store.read_observed("production")?;
+    let observed = store.read_observed("production", &config)?;
     let restored = observed.slots[&PlacementSlotId::new("p1")]
         .artifact
         .as_ref()
@@ -376,14 +376,6 @@ fn rollback_refuses_rebound_slot() -> Result<()> {
 schema_version = 1
 application = "rebind"
 release = "v1"
-
-[targets.production.rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[targets.production.rotation.deployment]
-protect_deployments = 2
 
 [[servers]]
 id = "server-01"
@@ -553,14 +545,6 @@ fn rollback_refuses_moved_deploy_dir() -> Result<()> {
 schema_version = 1
 application = "movedir"
 release = "v1"
-
-[targets.production.rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[targets.production.rotation.deployment]
-protect_deployments = 2
 
 [[servers]]
 id = "server-01"
@@ -864,7 +848,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         Some(DeploymentStatus::Successful),
         "exact rollback must succeed after the variant was renamed"
     );
-    let observed = store.read_observed("production")?;
+    let observed = store.read_observed("production", &config0)?;
     let restored = &observed.slots[&PlacementSlotId::new("p1")];
     assert_eq!(
         restored.artifact.as_ref().map(|a| &a.tree),
@@ -916,7 +900,7 @@ fn dry_run_reports_plan() -> Result<()> {
     assert!(r.message.contains("dry-run plan"), "reports a plan");
 
     // No remote state should have been created.
-    let observed = store.read_observed("production")?;
+    let observed = store.read_observed("production", &config)?;
     assert!(
         observed.slots.is_empty(),
         "dry-run leaves no observed state"
@@ -1533,6 +1517,14 @@ from = "artifacts/deployment/common/"
 to = "app-common/"
 recursive = true
 
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 2
+
 [activation]
 adapter = "none"
 
@@ -1556,14 +1548,6 @@ fn single_target_toml(stop_on_failure: bool, batch_size: u32) -> String {
 schema_version = 1
 application = "example"
 release = "v1"
-
-[targets.production.rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[targets.production.rotation.deployment]
-protect_deployments = 2
 
 [[servers]]
 id = "server-01"
@@ -1612,14 +1596,6 @@ schema_version = 1
 application = "example"
 release = "v1"
 
-[targets.production.rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[targets.production.rotation.deployment]
-protect_deployments = 2
-
 [[servers]]
 id = "server-01"
 address = "local:///dev/null/should-not-be-used"
@@ -1639,6 +1615,14 @@ deploy_dir = "/srv/deploy/example"
 from = "artifacts/build/output/"
 to = "app/"
 recursive = true
+
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 2
 
 [activation]
 adapter = "none"
@@ -2134,14 +2118,6 @@ schema_version = 1
 application = "example"
 release = "v1"
 
-[targets.production.rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[targets.production.rotation.deployment]
-protect_deployments = 2
-
 [[servers]]
 id = "server-01"
 address = "a"
@@ -2186,6 +2162,14 @@ deploy_dir = "/srv/deploy/example"
 from = "artifacts/build/output/"
 to = "app/"
 recursive = true
+
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 2
 
 [activation]
 adapter = "none"
@@ -3434,6 +3418,14 @@ from = "artifacts/deployment/common/"
 to = "app-common/"
 recursive = true
 
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 2
+
 [activation]
 adapter = "none"
 
@@ -3467,14 +3459,6 @@ fn slot_only_change_creates_new_release_id() -> Result<()> {
 schema_version = 1
 application = "example"
 release = "v1"
-
-[targets.production.rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[targets.production.rotation.deployment]
-protect_deployments = 2
 
 [[servers]]
 id = "server-01"
@@ -3586,14 +3570,6 @@ fn historical_release_resolves_slots_from_stored_snapshot() -> Result<()> {
 schema_version = 1
 application = "example"
 release = "v1"
-
-[targets.production.rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[targets.production.rotation.deployment]
-protect_deployments = 2
 
 [[servers]]
 id = "server-01"
@@ -3710,18 +3686,12 @@ fn rollback_preflight_uses_current_server_capacity() -> Result<()> {
 
     // Aggressive rotation: after s1 only the newest tree stays on the server,
     // so the s0 rollback below must re-upload T0 and pass through preflight.
+    // The policy is the slot's OWNING VARIANT's (rotation lives in the
+    // variant file, never on the target).
     let deploy_toml = r#"
 schema_version = 1
 application = "example"
 release = "v1"
-
-[targets.production.rotation.per_server]
-keep_distinct_artifacts = 1
-keep_days = 0
-protect_previous = false
-
-[targets.production.rotation.deployment]
-protect_deployments = 1
 
 [[servers]]
 id = "server-01"
@@ -3733,7 +3703,14 @@ host_key_fingerprint = "SHA256:test"
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 "#;
     let config_path = write_string(&proj.join("deploy.toml"), deploy_toml);
-    write_variant_file(&proj, "standard", &single_variant_body("true"));
+    write_variant_file(
+        &proj,
+        "standard",
+        &single_variant_body("true").replace(
+            "[rotation.per_server]\nkeep_distinct_artifacts = 5\nkeep_days = 14\nprotect_previous = true\n\n[rotation.deployment]\nprotect_deployments = 2",
+            "[rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = false\n\n[rotation.deployment]\nprotect_deployments = 1",
+        ),
+    );
     let artifacts = proj.join("releases").join("v1").join("artifacts");
     write_file(&artifacts.join("build/output/app/server"), "v1\n");
     write_file(&artifacts.join("deployment/common/README"), "common\n");
@@ -3853,7 +3830,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         Some(DeploymentStatus::Successful),
         "rollback must succeed once the current reserve is lowered"
     );
-    let observed = store.read_observed("production")?;
+    let observed = store.read_observed("production", &config0)?;
     assert_eq!(
         observed.slots[&PlacementSlotId::new("p1")]
             .artifact
@@ -4102,6 +4079,14 @@ from = "artifacts/deployment/common/"
 to = "app-common/"
 recursive = true
 
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 2
+
 [activation]
 adapter = "none"
 
@@ -4184,6 +4169,14 @@ from = "artifacts/build/output/"
 to = "app/"
 recursive = true
 
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 2
+
 [activation]
 adapter = "none"
 
@@ -4200,22 +4193,6 @@ interval_seconds = 0
 schema_version = 1
 application = "example"
 release = "v1"
-
-[targets.production.rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[targets.production.rotation.deployment]
-protect_deployments = 2
-
-[targets.staging.rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[targets.staging.rotation.deployment]
-protect_deployments = 2
 
 [[servers]]
 id = "server-01"
@@ -4272,7 +4249,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // push: staging (never pushed) already carries the ACTUAL tree/generation
     // the production push deployed, not merely a present-but-stale entry.
     for tname in ["production", "staging"] {
-        let observed = store.read_observed(tname)?;
+        let observed = store.read_observed(tname, &config)?;
         let os = &observed.slots[&PlacementSlotId::new("p1")];
         assert_eq!(
             os.artifact.as_ref().expect("observed artifact").tree,
@@ -4316,7 +4293,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // assignment even though production itself was not pushed, and staging's
     // own record carries its fresh actual too.
     for tname in ["production", "staging"] {
-        let obs = store.read_observed(tname)?;
+        let obs = store.read_observed(tname, &config)?;
         let os = &obs.slots[&PlacementSlotId::new("p1")];
         assert_eq!(
             os.artifact.as_ref().expect("observed artifact").tree,
@@ -4345,7 +4322,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     assert_eq!(rrb_prod.status, Some(DeploymentStatus::Successful));
     let restored_prod_slot =
         &rrb_prod.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")];
-    let restored_prod = store.read_observed("production")?;
+    let restored_prod = store.read_observed("production", &config)?;
     assert_eq!(
         restored_prod.slots[&PlacementSlotId::new("p1")]
             .artifact
@@ -4362,7 +4339,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     );
     // The rollback refreshed the shared slot in staging too: staging's
     // observed now carries production's restored s0 tree (fresh, not stale).
-    let restored_staging = store.read_observed("staging")?;
+    let restored_staging = store.read_observed("staging", &config)?;
     assert_eq!(
         restored_staging.slots[&PlacementSlotId::new("p1")]
             .artifact
@@ -4385,7 +4362,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(rrb_staging.status, Some(DeploymentStatus::Successful));
-    let restored_staging = store.read_observed("staging")?;
+    let restored_staging = store.read_observed("staging", &config)?;
     assert_eq!(
         restored_staging.slots[&PlacementSlotId::new("p1")]
             .artifact
@@ -4492,7 +4469,7 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
     let tree_at = |idx: usize| trees[idx].clone();
     let observed_tree = |store: &LocalStore| -> Result<Option<TreeDigest>> {
         Ok(
-            store.read_observed("production")?.slots[&PlacementSlotId::new("p1")]
+            store.read_observed("production", &config)?.slots[&PlacementSlotId::new("p1")]
                 .artifact
                 .as_ref()
                 .map(|a| a.tree.clone()),

@@ -362,7 +362,10 @@ where
             }
         }
         Command::Status { target } => {
-            let observed = store.read_observed(&target)?;
+            // The target view over the single physical slot state: the global
+            // slot map (`slots/<slot-id>/observed.json`) filtered to this
+            // target's member slots.
+            let observed = store.read_observed(&target, &config)?;
             for line in render_status(&observed) {
                 println!("{line}");
             }
@@ -511,7 +514,7 @@ mod tests {
         DeploymentId, GenerationId, PlacementSlotId, ReleaseId, SCHEMA_VERSION, TargetName,
         TreeDigest, VariantName,
     };
-    use crate::records::{DeploymentSnapshot, ObservedServer, ObservedTarget};
+    use crate::records::{DeploymentSnapshot, ObservedServer};
     use std::collections::BTreeMap;
 
     fn pending_attempt(id: &str) -> DeploymentAttempt {
@@ -667,7 +670,10 @@ mod tests {
         let release_dir = project.join("releases").join("v1");
         std::fs::create_dir_all(&release_dir).unwrap();
         // A minimal but VALID project: `Config::load` requires the release
-        // directory to exist with at least one variant file.
+        // directory to exist with at least one variant file. The variant
+        // declares the three rendered slots (all members of `production`) and
+        // owns their retention policy (rotation lives in the variant file,
+        // not on the target).
         std::fs::write(
             release_dir.join("standard.toml"),
             r#"[[slots]]
@@ -676,10 +682,30 @@ server = "s1"
 targets = ["production"]
 deploy_dir = "/srv/status"
 
+[[slots]]
+id = "p2"
+server = "s2"
+targets = ["production"]
+deploy_dir = "/srv/status2"
+
+[[slots]]
+id = "p3"
+server = "s3"
+targets = ["production"]
+deploy_dir = "/srv/status3"
+
 [[artifact.mappings]]
 from = "artifacts/build/output/"
 to = "app/"
 recursive = true
+
+[rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 1
 
 [activation]
 adapter = "none"
@@ -699,16 +725,20 @@ interval_seconds = 0
 application = "status-cli"
 release = "v1"
 
-[targets.production.rotation.per_server]
-keep_distinct_artifacts = 1
-keep_days = 0
-protect_previous = true
-
-[targets.production.rotation.deployment]
-protect_deployments = 1
-
 [[servers]]
 id = "s1"
+address = "a"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s2"
+address = "a"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s3"
 address = "a"
 user = "u"
 host_key_fingerprint = "SHA256:test"
@@ -719,8 +749,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         )
         .unwrap();
         let cfg_path = project.join("deploy.toml");
+        let config = Config::load(&cfg_path).unwrap();
 
-        // Point the store at a hermetic `XDG_DATA_HOME` and seed observed.json
+        // Point the store at a hermetic `XDG_DATA_HOME` and seed the ONE
+        // physical observed record per slot (`slots/<slot-id>/observed.json`)
         // with three slots: p1 has a full assignment, p2 has NO known
         // assignment (never observed / rotated away), and p3 has a known
         // generation but no known artifact (the assignment could not be read).
@@ -728,42 +760,36 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         unsafe { std::env::set_var("XDG_DATA_HOME", &data_home) };
         let store = LocalStore::with_base(data_home.join("simple-deploy")).unwrap();
         store
-            .write_observed(
-                "production",
-                &ObservedTarget {
-                    target: TargetName::new("production".to_string()),
-                    slots: BTreeMap::from([
-                        (
-                            PlacementSlotId::new("p1".to_string()),
-                            ObservedServer {
-                                generation: Some(GenerationId::new("gen-41da".to_string())),
-                                artifact: Some(crate::model::ArtifactRef {
-                                    release: ReleaseId::new("rel-sha256-status".to_string()),
-                                    variant: VariantName::new("standard".to_string()),
-                                    tree: TreeDigest::new("tree-2c4f".to_string()),
-                                }),
-                                last_deployment: Some(DeploymentId::new(
-                                    "deploy-status-1".to_string(),
-                                )),
-                            },
-                        ),
-                        (
-                            PlacementSlotId::new("p2".to_string()),
-                            ObservedServer {
-                                generation: None,
-                                artifact: None,
-                                last_deployment: None,
-                            },
-                        ),
-                        (
-                            PlacementSlotId::new("p3".to_string()),
-                            ObservedServer {
-                                generation: Some(GenerationId::new("gen-9f00".to_string())),
-                                artifact: None,
-                                last_deployment: None,
-                            },
-                        ),
-                    ]),
+            .write_slot_observed(
+                &PlacementSlotId::new("p1".to_string()),
+                &ObservedServer {
+                    generation: Some(GenerationId::new("gen-41da".to_string())),
+                    artifact: Some(crate::model::ArtifactRef {
+                        release: ReleaseId::new("rel-sha256-status".to_string()),
+                        variant: VariantName::new("standard".to_string()),
+                        tree: TreeDigest::new("tree-2c4f".to_string()),
+                    }),
+                    last_deployment: Some(DeploymentId::new("deploy-status-1".to_string())),
+                },
+            )
+            .unwrap();
+        store
+            .write_slot_observed(
+                &PlacementSlotId::new("p2".to_string()),
+                &ObservedServer {
+                    generation: None,
+                    artifact: None,
+                    last_deployment: None,
+                },
+            )
+            .unwrap();
+        store
+            .write_slot_observed(
+                &PlacementSlotId::new("p3".to_string()),
+                &ObservedServer {
+                    generation: Some(GenerationId::new("gen-9f00".to_string())),
+                    artifact: None,
+                    last_deployment: None,
                 },
             )
             .unwrap();
@@ -787,8 +813,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         drop(_lock);
 
         // The rendered lines are exactly what the CLI printed, one per slot
-        // (BTreeMap order: p1, p2, p3).
-        let lines = render_status(&store.read_observed("production").unwrap());
+        // (BTreeMap order: p1, p2, p3). The read goes through the TARGET VIEW
+        // (the global slot map filtered to the target's member slots).
+        let lines = render_status(&store.read_observed("production", &config).unwrap());
         assert_eq!(lines.len(), 3, "one line per observed slot: {lines:?}");
         let p1 = &lines[0];
         assert!(p1.contains("p1  generation="), "p1 line: {p1}");

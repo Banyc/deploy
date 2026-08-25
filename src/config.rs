@@ -10,8 +10,11 @@
 //! one or more top-level targets. Artifact sources conventionally live beneath
 //! `releases/<name>/artifacts/`. Capacity is a per-server policy declared on
 //! the server entry. Servers and targets are declared once at the top level of
-//! `deploy.toml`; targets carry rollout + rotation only, and their member
-//! slots are DERIVED from the slots' `targets` lists.
+//! `deploy.toml`; targets carry ROLLOUT only, and their member slots are
+//! DERIVED from the slots' `targets` lists. Retention (rotation) is owned by
+//! the SLOT, resolved from the slot's OWNING VARIANT file (the `*.toml` that
+//! declares the slot's `[[slots]]` entry) — one policy per slot, never a
+//! per-target policy union.
 //!
 //! The same local inputs always produce one target-independent release identity
 //! (see `model::ReleaseDigest`): the name-sorted per-variant mappings, the
@@ -224,8 +227,12 @@ pub struct DeploymentRotation {
     pub protect_deployments: u32,
 }
 
-/// Deployment-snapshot retention policy (the `protect_deployments` window),, declared once at the top level of
-/// `deploy.toml` (not per variant). Applied on every rotation.
+/// The slot's ONE retention policy: `per_server` (distinct-artifact count,
+/// age window, previous protection) plus the `deployment` snapshot window.
+/// OWNED BY THE SLOT — declared inside the variant file that declares the
+/// slot (the slot's owning variant), so a slot has exactly one policy no
+/// matter how many targets it is a member of, and membership changes never
+/// change retention.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RotationConfig {
@@ -238,9 +245,11 @@ pub struct RotationConfig {
 /// A per-release variant's own artifact, deployment, and slot policy. Each
 /// variant is described by a `*.toml` file directly inside the release
 /// directory named by `deploy.toml` (`releases/<name>/<variant>.toml`).
-/// Rotation is not per-variant: it lives at the top level of `deploy.toml`.
-/// Capacity is not per-variant either: it is a per-server policy declared on
-/// the server entry and resolved from the caller's current configuration.
+/// Rotation IS per-variant: the variant file owns the retention policy of
+/// every slot it declares (a slot's owning variant is its single retention
+/// source — never a union across the slot's member targets). Capacity is not
+/// per-variant either: it is a per-server policy declared on the server entry
+/// and resolved from the caller's current configuration.
 /// Slots ARE per-variant: the `[[slots]]` entries of this file declare the
 /// variant's deployment slots, and the declaring file is each slot's variant
 /// binding.
@@ -258,6 +267,13 @@ pub struct VariantConfig {
     /// `variant` field on [`SlotDef`].
     #[serde(default)]
     pub slots: Vec<SlotDef>,
+    /// The retention policy applied on every rotation of EVERY slot this
+    /// variant file declares. A slot's owning variant is its SINGLE retention
+    /// source: the policy never depends on which targets the slot is a
+    /// member of (target configuration owns rollout behavior only), so
+    /// changing a slot's `targets` membership never changes its retention.
+    #[serde(default)]
+    pub rotation: RotationConfig,
 }
 
 /// Durable protection for one whole release: every variant's artifact in the
@@ -410,11 +426,12 @@ pub struct SlotDef {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TargetDef {
+    /// ROLLOUT behavior only (batch_size, stop_on_failure, failure_policy).
+    /// Retention is NOT a target surface: a slot's retention comes from its
+    /// owning variant (see [`VariantConfig::rotation`]), so a target that
+    /// shares a slot with other targets can never change that slot's policy.
     #[serde(default)]
     pub rollout: RolloutConfig,
-    /// Retention policy applied to this target's servers on every rotation.
-    #[serde(default)]
-    pub rotation: RotationConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -730,6 +747,14 @@ impl Config {
             .ok_or_else(|| Error::config(format!("unknown release variant '{name}'")))
     }
 
+    /// Mutable access to one loaded variant (test-only: the engine resolves
+    /// retention from the caller's current config, and tests that strengthen
+    /// a slot's owning-variant policy need to mutate it in place).
+    #[cfg(test)]
+    pub(crate) fn variant_mut(&mut self, name: &str) -> Option<&mut VariantConfig> {
+        self.variants.get_mut(name)
+    }
+
     /// The aggregated slot declarations of every variant: each variant's
     /// `[[slots]]` entries in deterministic order — variants in name order
     /// (the `BTreeMap` is already sorted), then each variant's slots in file
@@ -753,6 +778,16 @@ impl Config {
         Err(Error::config(format!(
             "slot '{slot_id}' is not declared by any variant"
         )))
+    }
+
+    /// The slot's ONE retention policy: the rotation config of the slot's
+    /// OWNING VARIANT (the file that declares the slot). Retention is
+    /// slot-owned — a shared slot's policy is resolved here, from a single
+    /// source, regardless of how many targets the slot is a member of, so
+    /// membership changes never change retention.
+    pub fn slot_rotation(&self, slot_id: &str) -> Result<&RotationConfig> {
+        let variant_name = self.slot_variant(slot_id)?;
+        Ok(&self.variant(variant_name)?.rotation)
     }
 
     /// Resolve a target's member slots, pairing each slot with its declared
@@ -976,14 +1011,6 @@ schema_version = 1
 application = "esc"
 release = "v1"
 
-[targets.t1.rotation.per_server]
-keep_distinct_artifacts = 1
-keep_days = 0
-protect_previous = true
-
-[targets.t1.rotation.deployment]
-protect_deployments = 1
-
 [[servers]]
 id = "s1"
 address = "a"
@@ -1016,13 +1043,6 @@ schema_version = 1
 application = "ovl"
 release = "v1"
 
-[targets.t1.rotation.per_server]
-keep_distinct_artifacts = 1
-keep_days = 0
-protect_previous = true
-
-[targets.t1.rotation.deployment]
-protect_deployments = 1
 
 [[servers]]
 id = "s1"
@@ -1101,6 +1121,14 @@ from = "build/output/"
 to = "app/"
 recursive = true
 
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 2
+
 [activation]
 adapter = "none"
 
@@ -1139,14 +1167,6 @@ schema_version = 1
 application = "example"
 release = "v1"
 
-[targets.t1.rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[targets.t1.rotation.deployment]
-protect_deployments = 2
-
 [[servers]]
 id = "s1"
 address = "a"
@@ -1161,14 +1181,32 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         std::fs::write(&p, deploy_toml).unwrap();
 
         let cfg = Config::load(&p).expect("config loads with sibling variant files");
+        // Retention is SLOT-OWNED: the policy lives on the owning variant
+        // (`standard` declares slot `p1`), never on the target.
         assert_eq!(
-            cfg.targets["t1"]
+            cfg.variant("standard")
+                .unwrap()
                 .rotation
                 .per_server
                 .keep_distinct_artifacts,
             5
         );
-        assert_eq!(cfg.targets["t1"].rotation.deployment.protect_deployments, 2);
+        assert_eq!(
+            cfg.variant("standard")
+                .unwrap()
+                .rotation
+                .deployment
+                .protect_deployments,
+            2
+        );
+        assert_eq!(
+            cfg.slot_rotation("p1")
+                .unwrap()
+                .per_server
+                .keep_distinct_artifacts,
+            5,
+            "slot_rotation resolves the owning variant's policy"
+        );
         let names = cfg.variant_names();
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"standard".to_string()));
@@ -1224,20 +1262,25 @@ targets = ["t1"]
 deploy_dir = "/srv/forced"
 "#;
 
+    /// The `standard` variant's retention policy — the single retention
+    /// source for its declared slot `p1` (a slot's owning variant owns its
+    /// policy; targets carry rollout only).
+    const STANDARD_ROTATION: &str = r#"
+[rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 1
+"#;
+
     fn deploy_toml(release_value: &str) -> String {
         format!(
             r#"
 schema_version = 1
 application = "forced"
 release = "{release_value}"
-
-[targets.t1.rotation.per_server]
-keep_distinct_artifacts = 1
-keep_days = 0
-protect_previous = true
-
-[targets.t1.rotation.deployment]
-protect_deployments = 1
 
 [[servers]]
 id = "s1"
@@ -1255,10 +1298,11 @@ rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_
         let release_dir = project.join("releases").join(release);
         std::fs::create_dir_all(&release_dir).unwrap();
         // The standard variant file declares the `p1` slot the `deploy_toml()`
-        // target references.
+        // target references AND owns its retention policy (rotation lives in
+        // the variant file, not on the target).
         std::fs::write(
             release_dir.join("standard.toml"),
-            format!("{MINIMAL_VARIANT}\n{STANDARD_SLOTS}"),
+            format!("{MINIMAL_VARIANT}\n{STANDARD_SLOTS}\n{STANDARD_ROTATION}"),
         )
         .unwrap();
     }
@@ -2096,14 +2140,16 @@ interval_seconds = 0
             "error must name the unknown mapping field, got: {msg}"
         );
 
-        // Unknown field inside the [targets.t1.rotation] tables.
-        let bad_rotation = deploy_toml("v1").replacen(
-            "[targets.t1.rotation.per_server]",
-            "[targets.t1.rotation]\nprotect_nothing = 1\n\n[targets.t1.rotation.per_server]",
-            1,
-        );
-        std::fs::write(project.join("releases/v1/standard.toml"), MINIMAL_VARIANT).unwrap();
-        std::fs::write(&p, bad_rotation).unwrap();
+        // Unknown field inside the variant's [rotation] tables (retention is
+        // slot-owned — it lives in the slot's owning variant file).
+        let bad_rotation = format!("{MINIMAL_VARIANT}\n{STANDARD_SLOTS}\n{STANDARD_ROTATION}")
+            .replacen(
+                "[rotation.per_server]",
+                "[rotation]\nprotect_nothing = 1\n\n[rotation.per_server]",
+                1,
+            );
+        std::fs::write(project.join("releases/v1/standard.toml"), bad_rotation).unwrap();
+        std::fs::write(&p, deploy_toml("v1")).unwrap();
         let err = Config::load(&p).expect_err("unknown rotation field must fail");
         let msg = err.to_string();
         assert!(

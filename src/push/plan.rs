@@ -256,14 +256,6 @@ schema_version = 1
 application = "plan"
 release = "v1"
 
-[targets.t1.rotation.per_server]
-keep_distinct_artifacts = 1
-keep_days = 0
-protect_previous = true
-
-[targets.t1.rotation.deployment]
-protect_deployments = 1
-
 [[servers]]
 id = "s1"
 address = "a"
@@ -283,22 +275,6 @@ schema_version = 1
 application = "plan"
 release = "v1"
 
-[targets.t1.rotation.per_server]
-keep_distinct_artifacts = 1
-keep_days = 0
-protect_previous = true
-
-[targets.t1.rotation.deployment]
-protect_deployments = 1
-
-[targets.t2.rotation.per_server]
-keep_distinct_artifacts = 1
-keep_days = 0
-protect_previous = true
-
-[targets.t2.rotation.deployment]
-protect_deployments = 1
-
 [[servers]]
 id = "s1"
 address = "a"
@@ -313,7 +289,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 "#;
 
     /// The `standard` variant file declares slot `p1` on server `s1` for
-    /// target `t1`: the declaring file is the slot's CURRENT variant binding.
+    /// target `t1`: the declaring file is the slot's CURRENT variant binding
+    /// and owns the slot's ONE retention policy.
     const VARIANT_TOML: &str = r#"
 [[slots]]
 id = "p1"
@@ -325,6 +302,14 @@ deploy_dir = "/srv/plan"
 from = "artifacts/build/output/"
 to = "app/"
 recursive = true
+
+[rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 1
 
 [activation]
 adapter = "none"
@@ -339,6 +324,7 @@ interval_seconds = 0
 
     /// The direct-release property's variant: slot `p1` bound to server `s1`
     /// at `/srv/plan` for BOTH targets `t1` (source) and `t2` (destination).
+    /// The owning variant file carries the slot's single retention policy.
     const VARIANT_TOML_TWO: &str = r#"
 [[slots]]
 id = "p1"
@@ -350,6 +336,14 @@ deploy_dir = "/srv/plan"
 from = "artifacts/build/output/"
 to = "app/"
 recursive = true
+
+[rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 1
 
 [activation]
 adapter = "none"
@@ -1331,7 +1325,7 @@ interval_seconds = 0
             "/srv/phys",
         );
         variant.push_str(
-            "[[artifact.mappings]]\nfrom = \"artifacts/build/output/\"\nto = \"app/\"\nrecursive = true\n\n[activation]\nadapter = \"none\"\n\n[verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
+            "[[artifact.mappings]]\nfrom = \"artifacts/build/output/\"\nto = \"app/\"\nrecursive = true\n\n[rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n[rotation.deployment]\nprotect_deployments = 1\n\n[activation]\nadapter = \"none\"\n\n[verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
         );
         std::fs::write(release_dir.join("standard.toml"), variant).unwrap();
 
@@ -1346,10 +1340,6 @@ interval_seconds = 0
             &cfg_path,
             format!(
                 "schema_version = 1\napplication = \"plan\"\nrelease = \"v1\"\n\n\
-                 [targets.t1.rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n\
-                 [targets.t1.rotation.deployment]\nprotect_deployments = 1\n\n\
-                 [targets.t2.rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n\
-                 [targets.t2.rotation.deployment]\nprotect_deployments = 1\n\n\
                  {servers}\
                  [targets.t1]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n\n\
                  [targets.t2]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n"

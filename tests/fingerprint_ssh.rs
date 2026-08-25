@@ -257,6 +257,14 @@ from = "artifacts/deployment/common/"
 to = "app-common/"
 recursive = true
 
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 2
+
 [activation]
 adapter = "none"
 
@@ -278,14 +286,6 @@ fn single_target_toml(address: &str) -> String {
 schema_version = 1
 application = "example"
 release = "v1"
-
-[targets.production.rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[targets.production.rotation.deployment]
-protect_deployments = 2
 
 [[servers]]
 id = "server-01"

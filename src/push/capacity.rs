@@ -71,9 +71,11 @@ pub(crate) fn capacity_preflight(
         // or panicking in a debug build. `capacity_fits` never adds (see the
         // helper for the disjunctive form).
         if !capacity_fits(need, reserve, fs.available) {
-            // Run protected rotation under the slot's FULL member-target
-            // policy union, then recheck capacity directly rather than failing
-            // the restore. Best-effort by design: rotation is only an
+            // Run protected rotation under the slot's ONE policy — the
+            // policy of the slot's OWNING VARIANT (a slot has exactly one
+            // retention policy; its member targets own rollout behavior
+            // only), then recheck capacity directly rather than failing the
+            // restore. Best-effort by design: rotation is only an
             // optimization to free capacity, and the hard capacity check below
             // decides the outcome.
             // A rotation failure is not recoverable at this point (the push
@@ -87,8 +89,10 @@ pub(crate) fn capacity_preflight(
             // stranding every later operation on this slot with "mutation
             // lock held by ...".
             if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
-                let retained =
-                    compute_retained(helper, &config.pins, store, config, &slot.targets)?;
+                let rotation = config
+                    .slot_rotation(&slot.id)
+                    .expect("the assignment's slot is declared by its owning variant");
+                let retained = compute_retained(helper, &config.pins, store, rotation)?;
                 let active = HashSet::from([deployment_id.as_str().to_string()]);
                 helper.rotate(&retained, &active).ok();
             }
@@ -241,6 +245,14 @@ server = "s1"
 targets = ["t1"]
 deploy_dir = "/srv"
 
+[rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 1
+
 [activation]
 adapter = "none"
 
@@ -256,14 +268,6 @@ interval_seconds = 0
 schema_version = 1
 application = "cap"
 release = "v1"
-
-[targets.t1.rotation.per_server]
-keep_distinct_artifacts = 1
-keep_days = 0
-protect_previous = true
-
-[targets.t1.rotation.deployment]
-protect_deployments = 1
 
 [[servers]]
 id = "s1"

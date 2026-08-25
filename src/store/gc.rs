@@ -229,6 +229,16 @@ impl LocalStore {
         // never been discarded by any floor and is retained).
         let mut named_deployments: BTreeSet<String> = BTreeSet::new();
 
+        // Every slot's CURRENT OBSERVED artifact: the global physical map —
+        // ONE record per slot (targets are views over it, so the union of
+        // all target views IS this map — no per-target replication).
+        let global_observed = self.read_global_observed()?;
+        for slot in global_observed.values() {
+            if let Some(artifact) = &slot.artifact {
+                retained.add_binding(artifact);
+            }
+        }
+
         // (1)(3) Per-target retained history + observed state.
         for target in enumerate_dirs(&self.base().join("targets"))? {
             // The floor gates every read: the retained history is the suffix
@@ -273,14 +283,6 @@ impl LocalStore {
                 retained_deployments.insert(snap.deployment_id.as_str().to_string());
                 for generation in snap.slots.values() {
                     retained.add_binding(&generation.assignment.artifact);
-                }
-            }
-            // Every target's CURRENT OBSERVED artifact (the live
-            // assignment).
-            let observed = self.read_observed(&target)?;
-            for slot in observed.slots.values() {
-                if let Some(artifact) = &slot.artifact {
-                    retained.add_binding(artifact);
                 }
             }
         }

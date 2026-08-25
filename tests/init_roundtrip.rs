@@ -220,7 +220,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         log_lines[0]
     );
 
-    let observed = store.read_observed("production")?;
+    let observed = store.read_observed("production", &config)?;
     let obs = &observed.slots[&deploy::model::PlacementSlotId::new("app-1")];
     assert_eq!(
         obs.generation.as_ref(),

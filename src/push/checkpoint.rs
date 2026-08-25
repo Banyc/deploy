@@ -834,7 +834,7 @@ mod tests {
     };
     use crate::records::{
         DeploymentAttempt, DeploymentPlan, DeploymentSnapshot, DeploymentStatus, ObservedServer,
-        ObservedTarget, Pins, PlanSource, ServerPlan,
+        Pins, PlanSource, ServerPlan,
     };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -4963,8 +4963,8 @@ mod tests {
                 }
                 retained_dirs.insert(s.deployment_id.as_str().to_string());
             }
-            let observed = store.read_observed(target).unwrap();
-            for slot in observed.slots.values() {
+            let observed = store.read_global_observed().unwrap();
+            for slot in observed.values() {
                 if let Some(a) = &slot.artifact {
                     bindings.insert(a.clone());
                 }
@@ -5338,18 +5338,16 @@ mod tests {
                 }
                 facts.push((id, s.ok, binding));
             }
-            let observed = ObservedTarget {
-                target: TargetName::new(target.to_string()),
-                slots: BTreeMap::from([(
-                    PlacementSlotId::new("p1"),
-                    ObservedServer {
+            store
+                .write_slot_observed(
+                    &PlacementSlotId::new("p1"),
+                    &ObservedServer {
                         generation: None,
                         artifact: last_success,
                         last_deployment: None,
                     },
-                )]),
-            };
-            store.write_observed(target, &observed).unwrap();
+                )
+                .unwrap();
             facts
         };
         let f0 = seed("t0", &case.t0_steps, case.incomplete);
@@ -5664,19 +5662,17 @@ mod tests {
     }
 
     /// Write a target's observed.json from the tracked `observed` artifact.
-    fn gc_write_observed(store: &LocalStore, target: &str, observed: &Option<ArtifactRef>) {
-        let o = ObservedTarget {
-            target: TargetName::new(target.to_string()),
-            slots: BTreeMap::from([(
-                PlacementSlotId::new("p1"),
-                ObservedServer {
+    fn gc_write_observed(store: &LocalStore, _target: &str, observed: &Option<ArtifactRef>) {
+        store
+            .write_slot_observed(
+                &PlacementSlotId::new("p1"),
+                    &ObservedServer {
                     generation: None,
                     artifact: observed.clone(),
                     last_deployment: None,
                 },
-            )]),
-        };
-        store.write_observed(target, &o).unwrap();
+            )
+            .unwrap();
     }
 
     /// INVARIANT 2 (deterministic): a PIN retains artifact content ONLY. A

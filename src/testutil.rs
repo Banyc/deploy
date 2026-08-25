@@ -129,9 +129,10 @@ pub(crate) mod test_faults {
         /// Post-commit observed-refresh per-server record write
         /// (`servers/<id>.json`), keyed by (deployment id, target).
         WriteServer,
-        /// Post-commit observed-refresh observed record write
-        /// (`targets/<target>/observed.json`), keyed by (deployment id,
-        /// target).
+        /// Post-commit observed-refresh SLOT record write
+        /// (`slots/<slot-id>/observed.json` — the slot's ONE physical
+        /// observed state, never replicated per target), keyed by
+        /// (deployment id, SLOT id).
         WriteObserved,
         /// `read_rotation_debt` (rotation maintenance debt read), keyed by
         /// target.
@@ -407,13 +408,14 @@ pub(crate) mod test_faults {
             self.arm_target(FaultKind::WriteServer, deployment_id, target);
         }
 
-        /// Arm the next `write_observed` call that writes `deployment_id`'s
-        /// slot into `target`'s observed record to fail once. The
-        /// primary-target write is the last observed-refresh operation; the
-        /// other-member writes happen per shared slot inside the propagation
-        /// loop. The target half of the key selects exactly one of them.
-        pub(crate) fn arm_write_observed(&self, deployment_id: &str, target: &str) {
-            self.arm_target(FaultKind::WriteObserved, deployment_id, target);
+        /// Arm the next `write_slot_observed` call that writes
+        /// `deployment_id`'s SLOT record (`slots/<slot-id>/observed.json`) to
+        /// fail once. Observed state is ONE PHYSICAL RECORD PER SLOT — the
+        /// engine writes each advanced slot exactly once, never per target —
+        /// so the slot half of the key selects exactly one physical write
+        /// (e.g. a fixture's FIRST vs SECOND advanced slot).
+        pub(crate) fn arm_write_observed(&self, deployment_id: &str, slot: &str) {
+            self.arm_target(FaultKind::WriteObserved, deployment_id, slot);
         }
 
         /// Arm the next `read_rotation_debt` call for `target` to fail once

@@ -27,6 +27,16 @@ from = "artifacts/build/output/"
 to = "app/"
 recursive = true
 
+# Retention (rotation) — the slot-owned policy applied on every rotation of
+# the slots this variant file declares. How aggressively its servers rotate.
+[rotation.per_server]
+keep_distinct_artifacts = 5   # keep the newest 5 distinct artifacts per server
+keep_days = 14                # ...and everything activated in the last 14 days
+protect_previous = true       # never delete the artifact `current` can roll back to
+
+[rotation.deployment]
+protect_deployments = 2       # keep each server's artifacts of the newest 2 successful deployments
+
 # Activation: what happens after `current` is atomically swapped.
 #
 # `adapter = "none"` is a pure file push: the mapped artifacts land under

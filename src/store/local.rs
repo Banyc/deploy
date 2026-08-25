@@ -11,13 +11,20 @@
 //! <base>/
 //!   objects/sha256/<digest>/root/ , tree.json
 //!   releases/<release-id>/mapping.toml, behavior.json, release.json
-//!   targets/<target>/observed.json, rotation-debt.json, attempts.jsonl,
+//!   targets/<target>/rotation-debt.json, attempts.jsonl,
 //!     refs/last-successful, refs/snapshots.jsonl, refs/history-floor.json,
 //!     refs/cleanup-pending.json
+//!   slots/<slot-id>/observed.json   (the slot's ONE physical observed state)
 //!   servers/<server-id>.json
 //!   deployments/<deployment-id>/plan.json, results.json, transitions.jsonl
 //!   pins.json (store-global artifact retention pins)
 //! ```
+//!
+//! Observed state is stored ONCE per placement slot (`slots/<slot-id>/observed.json`),
+//! never per target: targets are SELECTION VIEWS over the global slot map
+//! (see [`LocalStore::read_observed`]), so a slot shared across several
+//! targets has a single physical record and every target's view agrees with
+//! it by construction.
 //!
 //! # Test-only fault injection (per-fixture registry)
 //!
@@ -34,12 +41,12 @@
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::model::{
-    BehaviorContract, DeploymentId, ReleaseId, ReleaseRecord, SCHEMA_VERSION, TREE_SCHEMA_VERSION,
-    TreeDigest, TreeMetadata,
+    BehaviorContract, DeploymentId, PlacementSlotId, ReleaseId, ReleaseRecord, SCHEMA_VERSION,
+    TREE_SCHEMA_VERSION, TreeDigest, TreeMetadata,
 };
 use crate::records::{
     DeploymentAttempt, DeploymentPlan, DeploymentResults, DeploymentSnapshot, DeploymentStatus,
-    DeploymentTransition, ObservedTarget, Pins, ServerState,
+    DeploymentTransition, ObservedServer, ObservedTarget, Pins, ServerState,
 };
 use crate::store::atomic::{
     copy_dir_recursive, ensure_private_dir, path_state, read_json, set_private,
@@ -202,6 +209,7 @@ impl LocalStore {
         ensure_private_dir(&base.join(layout::objects()))?;
         ensure_private_dir(&base.join(layout::RELEASES))?;
         ensure_private_dir(&base.join("targets"))?;
+        ensure_private_dir(&base.join("slots"))?;
         ensure_private_dir(&base.join("servers"))?;
         ensure_private_dir(&base.join("deployments"))?;
         ensure_private_dir(&base.join("staging"))?;
@@ -463,43 +471,126 @@ impl LocalStore {
         self.base.join("targets").join(sanitize(target))
     }
 
-    pub fn write_observed(&self, target: &str, observed: &ObservedTarget) -> Result<()> {
-        // Post-commit observed-refresh fault injection: the observed refresh
-        // runs AFTER the deployment is durably committed, so a fault here is
-        // reported as a maintenance warning by the engine, never a push error.
-        #[cfg(test)]
-        if observed
-            .slots
-            .values()
-            .filter_map(|s| s.last_deployment.as_ref())
-            .any(|d| {
-                self.fault_registry
-                    .consume_target(FaultKind::WriteObserved, d.as_str(), target)
-            })
-        {
-            return Err(Error::store(
-                "test fault: write_observed forced to fail once",
-            ));
-        }
-        let dir = self.target_dir(target);
-        ensure_private_dir(&dir)?;
-        write_json(&dir.join("observed.json"), observed)
+    // ---- slots: the ONE physical observed state ---------------------------
+
+    /// Path of a placement slot's single physical observed record
+    /// (`slots/<slot-id>/observed.json`). Observed state is stored EXACTLY
+    /// ONCE per placement slot — never replicated per target: targets are
+    /// selection views over the global slot map (see
+    /// [`LocalStore::read_observed`]).
+    pub fn slot_observed_path(&self, slot: &PlacementSlotId) -> PathBuf {
+        self.base
+            .join("slots")
+            .join(sanitize(slot.as_str()))
+            .join("observed.json")
     }
 
-    pub fn read_observed(&self, target: &str) -> Result<ObservedTarget> {
-        let p = self.target_dir(target).join("observed.json");
-        // Tri-state: only a genuine NotFound is "no observed record" (the
-        // default); a stat failure propagates as a Store error (a
-        // permission error on the record must not read as "never
-        // observed").
-        if path_state(&p)? {
-            read_json(&p)
-        } else {
-            Ok(ObservedTarget {
-                target: crate::model::TargetName::new(target.to_string()),
-                slots: Default::default(),
-            })
+    /// Write ONE placement slot's physical observed state. The engine's
+    /// post-commit observed-refresh writes each advanced slot EXACTLY ONCE
+    /// (never once per member target), so a slot shared across several
+    /// targets has a single record and every target's view of it agrees with
+    /// the physical record by construction.
+    ///
+    /// Post-commit observed-refresh fault injection: the observed refresh
+    /// runs AFTER the deployment is durably committed, so a fault here is
+    /// reported as a maintenance warning by the engine, never a push error.
+    /// The fault is keyed by (deployment id, SLOT id) — one write selects
+    /// exactly one slot's physical record.
+    pub fn write_slot_observed(
+        &self,
+        slot: &PlacementSlotId,
+        observed: &ObservedServer,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if let Some(d) = observed.last_deployment.as_ref()
+            && self.fault_registry.consume_target(
+                FaultKind::WriteObserved,
+                d.as_str(),
+                slot.as_str(),
+            )
+        {
+            return Err(Error::store(
+                "test fault: write_slot_observed forced to fail once",
+            ));
         }
+        let p = self.slot_observed_path(slot);
+        let dir = p
+            .parent()
+            .expect("a slot observed record always sits inside a slot directory");
+        ensure_private_dir(dir)?;
+        write_json(&p, observed)
+    }
+
+    /// Read one placement slot's physical observed record. `None` when the
+    /// slot has never been observed (or its record was removed). Tri-state:
+    /// only a genuine NotFound is "no observed record"; a stat failure
+    /// propagates as a Store error (a permission error on the record must
+    /// not read as "never observed").
+    pub fn read_slot_observed(&self, slot: &PlacementSlotId) -> Result<Option<ObservedServer>> {
+        let p = self.slot_observed_path(slot);
+        if path_state(&p)? {
+            read_json(&p).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The GLOBAL physical slot map: every placement slot's single observed
+    /// record (`slots/<slot-id>/observed.json`), keyed by [`PlacementSlotId`].
+    /// This is the ONE physical state the per-target views are filtered
+    /// from — a shared slot exists here exactly once.
+    pub fn read_global_observed(&self) -> Result<BTreeMap<PlacementSlotId, ObservedServer>> {
+        let root = self.base.join("slots");
+        let mut out = BTreeMap::new();
+        let entries = match std::fs::read_dir(&root) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(Error::store(format!("read slots {}: {e}", root.display()))),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| Error::store(format!("read slots: {e}")))?;
+            let rec = entry.path().join("observed.json");
+            if !path_state(&rec)? {
+                continue;
+            }
+            let observed: ObservedServer = read_json(&rec)?;
+            out.insert(
+                PlacementSlotId::new(entry.file_name().to_string_lossy().into_owned()),
+                observed,
+            );
+        }
+        Ok(out)
+    }
+
+    /// The TARGET VIEW over the single physical slot state: the global slot
+    /// map ([`LocalStore::read_global_observed`]) filtered to the target's
+    /// member slots. Membership is DERIVED from the config's slot-declaration
+    /// `targets` lists (as everywhere in the codebase): `deploy status
+    /// <target>` and every other consumer see exactly the physical records of
+    /// the target's member slots — never a replicated per-target copy, so
+    /// every member target's view of a shared slot agrees with the ONE
+    /// physical record (generation, artifact, last_deployment). A member
+    /// slot with no physical record yet is simply absent from the view.
+    pub fn read_observed(
+        &self,
+        target: &str,
+        config: &crate::config::Config,
+    ) -> Result<ObservedTarget> {
+        let members: std::collections::HashSet<&str> = config
+            .slot_defs()
+            .iter()
+            .filter(|s| s.targets.iter().any(|t| t == target))
+            .map(|s| s.id.as_str())
+            .collect();
+        let slots = self
+            .read_global_observed()?
+            .into_iter()
+            .filter(|(id, _)| members.contains(id.as_str()))
+            .collect();
+        Ok(ObservedTarget {
+            target: crate::model::TargetName::new(target.to_string()),
+            slots,
+        })
     }
 
     // ---- rotation maintenance debt ---------------------------------------
@@ -777,7 +868,7 @@ impl LocalStore {
 
     pub fn write_server(&self, state: &ServerState) -> Result<()> {
         // Post-commit observed-refresh fault injection, keyed by the recorded
-        // deployment id AND target (see `write_observed`).
+        // deployment id AND target (see `write_slot_observed`).
         #[cfg(test)]
         if let (Some(deployment_id), Some(target)) = (
             state
@@ -1041,12 +1132,12 @@ pub fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DeploymentId, TargetName};
+    use crate::model::{DeploymentId, GenerationId, PlacementSlotId, TargetName};
 
     /// `sanitize` must neutralize path-traversal components. `.` and `..` are
     /// the one case the character filter lets through untouched (dots are
     /// legal in ids), and an unsuffixed component named `..` would make
-    /// `targets/..` resolve to the STORE ROOT — the `..`/`.` names are
+    /// `slots/..` resolve to the STORE ROOT — the `..`/`.` names are
     /// reachable via the CLI (`deploy status ..`) or a quoted TOML target key
     /// (`[targets.".."]`), so escaping the layout must be impossible.
     #[test]
@@ -1061,32 +1152,45 @@ mod tests {
         // Ordinary ids pass through unchanged.
         assert_eq!(sanitize("normal-name_1.x"), "normal-name_1.x");
 
-        // End-to-end: a target named `..` must stay inside the target tree,
-        // never resolve to the store root.
+        // End-to-end: a SLOT id named `..` must stay inside the slot tree,
+        // never resolve to the store root (the slot's ONE physical observed
+        // record lives at `slots/<slot-id>/observed.json`).
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let evil = PlacementSlotId::new("..".to_string());
         assert_eq!(
-            store.target_dir(".."),
-            dir.path().join("store").join("targets").join("_"),
-            "a '..' target must be confined to its own target dir, not the store root"
+            store.slot_observed_path(&evil),
+            dir.path()
+                .join("store")
+                .join("slots")
+                .join("_")
+                .join("observed.json"),
+            "a '..' slot must be confined to its own slot dir, not the store root"
         );
-        store
-            .write_observed(
-                "..",
-                &ObservedTarget {
-                    target: TargetName::new("..".to_string()),
-                    ..ObservedTarget::default()
-                },
-            )
-            .unwrap();
+        let observed = ObservedServer {
+            generation: Some(GenerationId::new("g-..".to_string())),
+            artifact: None,
+            last_deployment: None,
+        };
+        store.write_slot_observed(&evil, &observed).unwrap();
         assert!(
             !dir.path().join("store").join("observed.json").exists(),
-            "observed state for a '..' target must never land at the store root"
+            "observed state for a '..' slot must never land at the store root"
         );
         assert_eq!(
-            store.read_observed("..").unwrap().target.as_str(),
-            "..",
-            "the sanitized path must not corrupt the recorded target identity"
+            store.read_slot_observed(&evil).unwrap(),
+            Some(observed.clone()),
+            "the sanitized path must not corrupt the recorded slot identity"
+        );
+        let global = store.read_global_observed().unwrap();
+        assert_eq!(
+            global.get(&PlacementSlotId::new("_".to_string())),
+            Some(&observed),
+            "the global slot map keys by the SANITIZED slot directory name"
+        );
+        assert!(
+            !global.contains_key(&evil),
+            "an unsanitized '..' id never appears as a global key"
         );
     }
 

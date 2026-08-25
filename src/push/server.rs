@@ -505,6 +505,14 @@ from = "artifacts/deployment/common/"
 to = "app-common/"
 recursive = true
 
+[rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 1
+
 [activation]
 adapter = "none"
 
@@ -520,14 +528,6 @@ interval_seconds = 0
 schema_version = 1
 application = "eng"
 release = "v1"
-
-[targets.t1.rotation.per_server]
-keep_distinct_artifacts = 1
-keep_days = 0
-protect_previous = true
-
-[targets.t1.rotation.deployment]
-protect_deployments = 1
 
 [[servers]]
 id = "s1"
@@ -561,6 +561,14 @@ from = "artifacts/units/"
 to = "integration/systemd/"
 recursive = true
 
+[rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 1
+
 [activation]
 adapter = "systemd"
 scope = "user"
@@ -583,14 +591,6 @@ interval_seconds = 0
 schema_version = 1
 application = "eng"
 release = "v1"
-
-[targets.t1.rotation.per_server]
-keep_distinct_artifacts = 1
-keep_days = 0
-protect_previous = true
-
-[targets.t1.rotation.deployment]
-protect_deployments = 1
 
 [[servers]]
 id = "s1"

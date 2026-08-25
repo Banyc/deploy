@@ -160,32 +160,32 @@ targets = ["debtfx"]
 deploy_dir = "/srv/si-debt"
 "#;
 
-/// Two CONTRASTING rotation policies over the shared slot: `t1` is AGGRESSIVE
-/// (newest 1 distinct binding, no age window, no previous protection, 1 snapshot
-/// deployment) while `t2` is CONSERVATIVE (newest 5 distinct bindings, 30
-/// days of age, the protected previous, 2 deployments). The union is
-/// strictly larger than either policy alone, so a rotation that consults only
-/// the pushing target's policy sweeps content the other member retains.
-const DEPLOY_TOML: &str = r#"
-schema_version = 1
-application = "si"
-release = "v1"
-
-[targets.t1.rotation.per_server]
-keep_distinct_artifacts = 1
-keep_days = 0
-protect_previous = false
-
-[targets.t1.rotation.deployment]
-protect_deployments = 1
-
-[targets.t2.rotation.per_server]
+/// The fixture's ONE retention policy — owned by the slot (the `standard`
+/// variant file declares all three slots, so it is the single retention
+/// source for each): CONSERVATIVE (newest 5 distinct bindings, 30 days of
+/// age, the protected previous, 2 deployments). Targets own rollout only;
+/// neither `t1` nor `t2` has a retention surface, and membership changes
+/// never change what a slot retains.
+const ROTATION_BODY: &str = r#"
+[rotation.per_server]
 keep_distinct_artifacts = 5
 keep_days = 30
 protect_previous = true
 
-[targets.t2.rotation.deployment]
+[rotation.deployment]
 protect_deployments = 2
+"#;
+
+/// Targets own ROLLOUT behavior only: retention is slot-owned (the slot's
+/// OWNING VARIANT file declares the single policy for every slot it
+/// declares; see [`ROTATION_BODY`]). A shared slot (`p1`, `p2` — members of
+/// BOTH `t1` and `t2`) rotates under that ONE policy regardless of which
+/// target pushes it: neither `t1` nor `t2` — nor the `debtfx` single-member
+/// target — carries a rotation surface here.
+const DEPLOY_TOML: &str = r#"
+schema_version = 1
+application = "si"
+release = "v1"
 
 [[servers]]
 id = "s1"
@@ -204,14 +204,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
 [targets.t2]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-
-[targets.debtfx.rotation.per_server]
-keep_distinct_artifacts = 1
-keep_days = 0
-protect_previous = false
-
-[targets.debtfx.rotation.deployment]
-protect_deployments = 1
 
 [targets.debtfx]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
@@ -243,11 +235,12 @@ pub(crate) enum FailureStep {
     /// Post-commit observed-refresh `write_server` (store) — runs after the
     /// deployment is durably committed.
     ObservedWriteServer,
-    /// Post-commit observed-refresh `write_observed` for the PUSH'S OWN target
-    /// (store) — the last write of the refresh, after the durable commit point.
+    /// Post-commit observed-refresh `write_slot_observed` for the FIRST
+    /// advanced slot (`p1`) — the slot's ONE physical record write, after
+    /// the durable commit point.
     ObservedPrimaryWrite,
-    /// Post-commit observed-refresh `write_observed` for the OTHER member
-    /// target of the shared slot (store) — the shared-slot propagation.
+    /// Post-commit observed-refresh `write_slot_observed` for the SECOND
+    /// advanced slot (`p2`) — the other physical slot record write.
     ObservedOtherWrite,
     /// Post-commit rotation-debt READ (`LocalStore::read_rotation_debt`,
     /// target-keyed) — the marker read during the deferred-rotation retry or
@@ -593,14 +586,16 @@ pub(crate) enum FailureClass {
     /// attempt stays `InProgress`.
     TransitionPending,
     /// Post-commit observed-refresh `write_server` fails (warning-only): the
-    /// observed maps themselves still refresh.
+    /// observed slot records themselves still refresh.
     ObservedWriteServer,
-    /// Post-commit observed-refresh `write_observed` for the PUSH'S OWN
-    /// target fails: that target's projection stays stale.
+    /// Post-commit observed-refresh `write_slot_observed` fails for the
+    /// FIRST advanced slot (`p1`): that slot's ONE physical record stays
+    /// stale — in every member target's view, since the views filter the
+    /// single physical map.
     ObservedPrimaryWrite,
-    /// Post-commit observed-refresh `write_observed` for the OTHER member
-    /// target of the shared slot fails: the other member's projection stays
-    /// stale.
+    /// Post-commit observed-refresh `write_slot_observed` fails for the
+    /// SECOND advanced slot (`p2`): that slot's ONE physical record stays
+    /// stale — in every member target's view.
     ObservedOtherWrite,
     /// Rotation-debt marker READ fails (target-keyed: the store's debt
     /// methods carry no deployment id, so the arm lands on the pushed
@@ -848,7 +843,7 @@ impl Fixture {
         std::fs::create_dir_all(&release_dir).unwrap();
         std::fs::write(
             release_dir.join("standard.toml"),
-            format!("{VARIANT_BODY}\n{SLOT_BODY}"),
+            format!("{VARIANT_BODY}\n{SLOT_BODY}\n{ROTATION_BODY}"),
         )
         .unwrap();
         // canary declares no slots; identical mappings -> same tree bytes.
@@ -1059,7 +1054,6 @@ impl Fixture {
     /// arm (the fixture holds the lock itself).
     fn arm_prop_fault(&self, class: FailureClass, pushed: &str, id: &DeploymentId) {
         let reg = self.store.fault_registry();
-        let other = if pushed == "t1" { "t2" } else { "t1" };
         match class {
             FailureClass::CommitMarker | FailureClass::RotationInventory => {
                 self.set_remote_fault(match class {
@@ -1074,8 +1068,14 @@ impl Fixture {
             FailureClass::TransitionSuccessful => reg.arm_append_transition_successful(id.as_str()),
             FailureClass::TransitionPending => reg.arm_append_transition_pending(id.as_str()),
             FailureClass::ObservedWriteServer => reg.arm_write_server(id.as_str(), pushed),
-            FailureClass::ObservedPrimaryWrite => reg.arm_write_observed(id.as_str(), pushed),
-            FailureClass::ObservedOtherWrite => reg.arm_write_observed(id.as_str(), other),
+            // The observed-refresh SLOT-write faults are keyed by deployment
+            // id AND SLOT: the engine writes each advanced slot's ONE
+            // physical record (`slots/<slot-id>/observed.json`), so the
+            // primary arm selects the FIRST planned slot's write (`p1`) and
+            // the other arm the SECOND (`p2`). A faulted write leaves that
+            // slot's physical record stale in EVERY member target's view.
+            FailureClass::ObservedPrimaryWrite => reg.arm_write_observed(id.as_str(), "p1"),
+            FailureClass::ObservedOtherWrite => reg.arm_write_observed(id.as_str(), "p2"),
             FailureClass::DebtRead => reg.arm_read_rotation_debt(pushed),
             FailureClass::DebtWrite | FailureClass::DebtRemove => {
                 reg.arm_write_rotation_debt(pushed)
@@ -1385,7 +1385,8 @@ impl Fixture {
                 Outcome::Ok
             }
             Action::Rotate => {
-                self.rotate_union().expect("standalone rotation succeeds");
+                self.rotate_slot_policy()
+                    .expect("standalone rotation succeeds");
                 Outcome::Ok
             }
             Action::Tamper(kind) => {
@@ -1411,11 +1412,13 @@ impl Fixture {
             FailureStep::TransitionSuccessful => reg.arm_append_transition_successful(id.as_str()),
             FailureStep::TransitionPending => reg.arm_append_transition_pending(id.as_str()),
             // The post-commit observed-refresh faults are keyed by deployment
-            // id AND target: the fixture's single shared slot (`p1`) belongs to
-            // `t1` (the pushed target) and `t2` (the other member).
+            // id AND SLOT: the fixture's shared slots are `p1` (written first
+            // in a t1/t2 push — the "primary" write) and `p2` (written second
+            // — the "other" write). A faulted slot write leaves THAT slot's
+            // one physical record stale in every member target's view.
             FailureStep::ObservedWriteServer => reg.arm_write_server(id.as_str(), "t1"),
-            FailureStep::ObservedPrimaryWrite => reg.arm_write_observed(id.as_str(), "t1"),
-            FailureStep::ObservedOtherWrite => reg.arm_write_observed(id.as_str(), "t2"),
+            FailureStep::ObservedPrimaryWrite => reg.arm_write_observed(id.as_str(), "p1"),
+            FailureStep::ObservedOtherWrite => reg.arm_write_observed(id.as_str(), "p2"),
             // The rotation-debt faults are keyed by the TARGET only (the debt
             // methods carry no deployment id) and fire on `debtfx` — the
             // fixture target no other test pushes — so no concurrent test's
@@ -1460,7 +1463,10 @@ impl Fixture {
     fn assert_observed_scope_property(&self) {
         for (slot_id, asn) in self.current_assignments() {
             for target in ["t1", "t2"] {
-                let observed = self.store.read_observed(target).expect("observed reads");
+                let observed = self
+                    .store
+                    .read_observed(target, &self.config)
+                    .expect("observed reads");
                 let slot = observed.slots.get(&slot_id).unwrap_or_else(|| {
                     panic!("{target}: observed {slot_id} entry must be present")
                 });
@@ -1496,7 +1502,8 @@ impl Fixture {
             Action::Push(t) | Action::Retry(t) => Outcome::Push(Box::new(self.push(t))),
             Action::Rollback(t, i) => Outcome::Push(Box::new(self.push_ref(t, &format!("s{i}")))),
             Action::Rotate => {
-                self.rotate_union().expect("standalone rotation succeeds");
+                self.rotate_slot_policy()
+                    .expect("standalone rotation succeeds");
                 Outcome::Ok
             }
             Action::Checkpoint(t, k) => {
@@ -1531,21 +1538,18 @@ impl Fixture {
         )
     }
 
-    /// Standalone rotation under the FULL member policy union, exactly as
-    /// step 17 runs it (mutation lock + union retained set), for EVERY shared
-    /// slot's server.
-    fn rotate_union(&self) -> Result<()> {
+    /// Standalone rotation under each shared slot's ONE policy — the policy
+    /// of the slot's OWNING VARIANT (`standard` declares `p1`/`p2`; retention
+    /// is slot-owned, never a member-target union), exactly as step 17 runs
+    /// it (mutation lock + the single policy's retained set), for EVERY
+    /// shared slot's server.
+    fn rotate_slot_policy(&self) -> Result<()> {
+        let rotation = &self.config.variant("standard").unwrap().rotation;
         for server in ["s1", "s2"] {
             self.with_helper_for(server, |helper| {
                 let op = OperationId::generate();
                 let _guard = helper.acquire_lock_guard(op.as_str())?;
-                let retained = compute_retained(
-                    &helper,
-                    &self.config.pins,
-                    &self.store,
-                    &self.config,
-                    &["t1".to_string(), "t2".to_string()],
-                )?;
+                let retained = compute_retained(&helper, &self.config.pins, &self.store, rotation)?;
                 helper.rotate(&retained, &HashSet::new())
             })?;
         }
@@ -1702,13 +1706,17 @@ impl Fixture {
     /// [`Fixture::push_with_id`] mid-sequence and never evaluates here; the
     /// recovery action that closes the window refreshes the projections (the
     /// no-op retry path does too), so by the time `check_invariants` runs the
-    /// entry must exist; (2) each shared slot's retained set is the union of
-    /// every member's policy; (3) every tree the union retains actually
-    /// survives the post-push rotation.
+    /// entry must exist; (2) each shared slot's retained set is computed
+    /// under its ONE policy (the slot's OWNING VARIANT — never a member
+    /// union); (3) every tree that policy retains actually survives the
+    /// post-push rotation.
     fn check_scope(&self) {
         for (slot_id, asn) in self.current_assignments() {
             for target in ["t1", "t2"] {
-                let observed = self.store.read_observed(target).expect("observed reads");
+                let observed = self
+                    .store
+                    .read_observed(target, &self.config)
+                    .expect("observed reads");
                 let slot = match observed.slots.get(&slot_id) {
                     Some(slot) => slot,
                     None => panic!(
@@ -1738,46 +1746,21 @@ impl Fixture {
             }
         }
         for server in ["s1", "s2"] {
-            let (single_t1, single_t2, full) = self.with_helper_for(server, |helper| {
-                let single_t1 = compute_retained(
-                    &helper,
-                    &self.config.pins,
-                    &self.store,
-                    &self.config,
-                    &["t1".to_string()],
-                )
-                .expect("retained under t1");
-                let single_t2 = compute_retained(
-                    &helper,
-                    &self.config.pins,
-                    &self.store,
-                    &self.config,
-                    &["t2".to_string()],
-                )
-                .expect("retained under t2");
-                let full = compute_retained(
-                    &helper,
-                    &self.config.pins,
-                    &self.store,
-                    &self.config,
-                    &["t1".to_string(), "t2".to_string()],
-                )
-                .expect("retained under the full union");
-                (single_t1, single_t2, full)
+            let retained = self.with_helper_for(server, |helper| {
+                // The slot's ONE policy, resolved from its OWNING VARIANT
+                // (`standard` declares the shared slots) — never a union of
+                // member-target policies.
+                let rotation = &self.config.variant("standard").unwrap().rotation;
+                compute_retained(&helper, &self.config.pins, &self.store, rotation)
+                    .expect("retained under the slot's owning-variant policy")
             });
-            let union: HashSet<String> = single_t1.union(&single_t2).cloned().collect();
-            assert_eq!(
-                full, union,
-                "the shared slot's retained set on {server} must be the union of every member \
-                 target's policy"
-            );
-            // Every tree the union retains must actually survive the rotation the
-            // last push (or standalone rotate) performed.
+            // Every tree the single policy retains must actually survive the
+            // rotation the last push (or standalone rotate) performed.
             let remote = self.remote_for(server);
-            for tree in &full {
+            for tree in &retained {
                 assert!(
                     remote.exists(&layout::tree_root(tree)),
-                    "union-retained tree {tree} on {server} must survive rotation"
+                    "policy-retained tree {tree} on {server} must survive rotation"
                 );
             }
         }
@@ -2554,7 +2537,7 @@ fn observed_scope_crash_before_refresh_recovered_by_noop_retry() {
     f.current_assignment()
         .expect("remote advanced past the crash");
     for t in ["t1", "t2"] {
-        let observed = f.store.read_observed(t).unwrap();
+        let observed = f.store.read_observed(t, &f.config).unwrap();
         assert!(
             !observed.slots.contains_key(&PlacementSlotId::new("p1")),
             "{t}: the crash window must leave the shared slot's observed entry absent"
@@ -2607,8 +2590,8 @@ fn observed_scope_preflight_failure_leaves_observed_equal() {
     f.apply(Action::Build(1));
     f.apply(Action::Push("t1"));
     f.assert_observed_scope_property();
-    let t1_before = f.store.read_observed("t1").unwrap();
-    let t2_before = f.store.read_observed("t2").unwrap();
+    let t1_before = f.store.read_observed("t1", &f.config).unwrap();
+    let t2_before = f.store.read_observed("t2", &f.config).unwrap();
 
     // HEAD advances to v2 so the t2 push is a REAL push (not an up-to-date
     // no-op, which never persists an attempt) — it then fails at the intent
@@ -2625,12 +2608,12 @@ fn observed_scope_preflight_failure_leaves_observed_equal() {
         "error must name the injected fault, got: {err}"
     );
     assert_eq!(
-        f.store.read_observed("t1").unwrap(),
+        f.store.read_observed("t1", &f.config).unwrap(),
         t1_before,
         "a failed preflight must not change t1's observed"
     );
     assert_eq!(
-        f.store.read_observed("t2").unwrap(),
+        f.store.read_observed("t2", &f.config).unwrap(),
         t2_before,
         "a failed preflight must not change t2's observed"
     );
@@ -2707,7 +2690,7 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     // the rolled-back v1 assignment).
     let stale = f
         .store
-        .read_observed("t1")
+        .read_observed("t1", &f.config)
         .unwrap()
         .slots
         .get(&PlacementSlotId::new("p1"))
@@ -2809,8 +2792,8 @@ fn observed_scope_pre_swap_failure_keeps_prior_record_untouched() {
         Some(DeploymentStatus::Successful)
     );
     f.assert_observed_scope_property();
-    let t1_before = f.store.read_observed("t1").unwrap();
-    let t2_before = f.store.read_observed("t2").unwrap();
+    let t1_before = f.store.read_observed("t1", &f.config).unwrap();
+    let t2_before = f.store.read_observed("t2", &f.config).unwrap();
 
     // HEAD advances so the t2 push is a REAL push (never an up-to-date
     // no-op), then the pre-swap status read fails exactly once.
@@ -2842,12 +2825,12 @@ fn observed_scope_pre_swap_failure_keeps_prior_record_untouched() {
     // The observed projections are UNTOUCHED — byte-for-byte the prior
     // records in every member target (never fabricated, never re-stamped).
     assert_eq!(
-        f.store.read_observed("t1").unwrap(),
+        f.store.read_observed("t1", &f.config).unwrap(),
         t1_before,
         "t1's observed records must be untouched by a push that advanced nothing"
     );
     assert_eq!(
-        f.store.read_observed("t2").unwrap(),
+        f.store.read_observed("t2", &f.config).unwrap(),
         t2_before,
         "t2's observed records must be untouched by a push that advanced nothing"
     );
@@ -2993,54 +2976,54 @@ fn identity_canonical_serialization_round_trips() {
 // Property tests — Scope
 // ===========================================================================
 
-/// The shared slot's retained set is the union of every member target's
-/// policy: computing with the full member list equals the union of the
-/// per-member computations.
+/// The shared slot's retained set is computed under its ONE policy — the
+/// slot's OWNING VARIANT (`standard` declares the shared slots), resolved
+/// via the same `Config::slot_rotation` path the engine uses. Membership is
+/// irrelevant: `t1` and `t2` both view the same physical slot, and the
+/// retained set is identical whether the slot is thought of as a `t1` slot
+/// or a `t2` slot — there is no per-target policy to union.
 #[test]
-fn scope_retained_is_union_of_member_policies() {
+fn scope_retained_is_the_owning_variants_single_policy() {
     let f = Fixture::new();
     // Build history interleaved across both targets.
     for (v, t) in [(1u32, "t1"), (2, "t2"), (3, "t1"), (4, "t2"), (5, "t1")] {
         f.apply(Action::Build(v));
         f.apply(Action::Push(t));
     }
-    let (t1, t2, full) = f.with_helper(|helper| {
-        let t1 = compute_retained(
+    let via_p1 = f.with_helper(|helper| {
+        compute_retained(
             &helper,
             &f.config.pins,
             &f.store,
-            &f.config,
-            &["t1".to_string()],
+            f.config.slot_rotation("p1").unwrap(),
         )
-        .unwrap();
-        let t2 = compute_retained(
-            &helper,
-            &f.config.pins,
-            &f.store,
-            &f.config,
-            &["t2".to_string()],
-        )
-        .unwrap();
-        let full = compute_retained(
-            &helper,
-            &f.config.pins,
-            &f.store,
-            &f.config,
-            &["t1".to_string(), "t2".to_string()],
-        )
-        .unwrap();
-        (t1, t2, full)
+        .unwrap()
     });
-    let union: HashSet<String> = t1.union(&t2).cloned().collect();
+    let via_p2 = f.with_helper(|helper| {
+        compute_retained(
+            &helper,
+            &f.config.pins,
+            &f.store,
+            f.config.slot_rotation("p2").unwrap(),
+        )
+        .unwrap()
+    });
     assert_eq!(
-        full, union,
-        "the shared slot's retained set must be the union of every member's policy"
+        via_p1, via_p2,
+        "a shared slot's retained set must not depend on which slot id resolves it \
+         (both shared slots' owning variant is `standard`, one policy)"
+    );
+    assert!(
+        !via_p1.is_empty(),
+        "the interleaved history is retained under the fixture's conservative policy"
     );
 }
 
-/// Strengthening a retention policy — more distinct artifacts, a wider age
-/// window, protecting the previous — never REDUCES the retained set; neither
-/// does adding a member target.
+/// Strengthening the slot's retention policy — more distinct artifacts, a
+/// wider age window, protecting the previous — never REDUCES the retained
+/// set. The policy is the slot's OWNING VARIANT's (`standard` declares the
+/// shared slots), mutated through the same config the engine resolves
+/// retention from.
 #[test]
 fn scope_strengthening_policy_never_reduces_retained() {
     let f = Fixture::new();
@@ -3054,22 +3037,22 @@ fn scope_strengthening_policy_never_reduces_retained() {
                 &helper,
                 &cfg.pins,
                 &f.store,
-                cfg,
-                &["t1".to_string(), "t2".to_string()],
+                cfg.slot_rotation("p1").unwrap(),
             )
             .unwrap()
         })
     };
     let weak = baseline(&f.config);
 
-    // Strengthen t1's policy: keep 5 distinct (was 1), protect the previous,
-    // protect 2 deployments.
+    // Strengthen the owning variant's policy: keep 5 distinct (was 5),
+    // protect the previous, protect 2 deployments — all already at the
+    // fixture's conservative values, so widen the strongest window instead.
     let mut strong_config = f.config.clone();
-    let r = strong_config.targets.get_mut("t1").unwrap();
+    let r = strong_config.variant_mut("standard").unwrap();
     r.rotation.per_server.keep_distinct_artifacts = 5;
     r.rotation.per_server.protect_previous = true;
     r.rotation.deployment.protect_deployments = 2;
-    let strong = baseline(&mut strong_config);
+    let strong = baseline(&strong_config);
     assert!(
         strong.is_superset(&weak),
         "strengthening a retention policy must never reduce the retained set"
@@ -3078,32 +3061,37 @@ fn scope_strengthening_policy_never_reduces_retained() {
     // Widening the age window is monotone too.
     let mut wider = strong_config.clone();
     wider
-        .targets
-        .get_mut("t1")
+        .variant_mut("standard")
         .unwrap()
         .rotation
         .per_server
         .keep_days = 90;
-    let wider_retained = baseline(&mut wider);
+    let wider_retained = baseline(&wider);
     assert!(
         wider_retained.is_superset(&strong),
         "widening keep_days must never reduce the retained set"
     );
 
-    // Adding a member target never reduces the retained set.
-    let single: HashSet<String> = f.with_helper(|helper| {
-        compute_retained(
-            &helper,
-            &f.config.pins,
-            &f.store,
-            &f.config,
-            &["t1".to_string()],
-        )
+    // The retained set is INDEPENDENT of membership: computing it via the
+    // slot's owning-variant policy is the only way to compute it (there is
+    // no per-target policy), so a membership-only config edit (adding a
+    // member target to the slot's `targets` list) cannot change retention.
+    let mut edited = f.config.clone();
+    edited
+        .variant_mut("standard")
         .unwrap()
-    });
-    assert!(
-        weak.is_superset(&single),
-        "adding a member target must never reduce the retained set"
+        .slots
+        .iter_mut()
+        .for_each(|s| {
+            if s.id == "p1" {
+                s.targets = vec!["t1".to_string(), "t2".to_string(), "t3".to_string()]
+            }
+        });
+    let _ = baseline(&edited);
+    assert_eq!(
+        baseline(&edited),
+        weak,
+        "changing a slot's membership must never change its retained set"
     );
 }
 
@@ -4091,6 +4079,12 @@ struct CheckpointExpectation {
     discarded_deployments: Vec<String>,
 }
 
+/// One target's expected observed VIEW over the shared placement slots: per
+/// slot, the (content version, minting deployment id) the target's filtered
+/// view of the ONE physical slot map must show, or `None` before the first
+/// completed mutation.
+type ObservedView = BTreeMap<PlacementSlotId, Option<(u32, String)>>;
+
 #[derive(Clone, Debug)]
 struct Model {
     /// Content version the next HEAD push materializes. The fixture writes
@@ -4117,12 +4111,14 @@ struct Model {
     /// identity is deliberately inconsistent and the identity comparison
     /// defers until the next real push replaces the record.
     current_tampered: bool,
-    /// Expected per-target observed projection: (content version, minting
-    /// deployment id) per member target, or `None` before the first completed
-    /// mutation. Every member target observes the SAME live assignment for
-    /// each shared slot (both slots advance together), so one pair describes
-    /// a target's whole observed map.
-    observed: BTreeMap<&'static str, Option<(u32, String)>>,
+    /// Expected observed projection, PER MEMBER TARGET AND PER SLOT: the
+    /// (content version, minting deployment id) each target's view shows for
+    /// each shared placement slot, or `None` before the first completed
+    /// mutation. Observed state is ONE PHYSICAL RECORD PER SLOT and targets
+    /// are SELECTION VIEWS over it, so a slot whose physical write faulted
+    /// stays stale in EVERY member target's view while the other slot's
+    /// record (and both views of it) advance.
+    observed: BTreeMap<&'static str, ObservedView>,
     /// Per-target RAW snapshot log: (index, deployment id, content version)
     /// per physically recorded snapshot — the log the checkpoint compacts.
     /// The VISIBLE chain is the suffix at/after the target's floor (see
@@ -4203,7 +4199,22 @@ impl Model {
             unknown: false,
             current: None,
             current_tampered: false,
-            observed: BTreeMap::from([("t1", None), ("t2", None)]),
+            observed: BTreeMap::from([
+                (
+                    "t1",
+                    BTreeMap::from([
+                        (PlacementSlotId::new("p1".to_string()), None),
+                        (PlacementSlotId::new("p2".to_string()), None),
+                    ]),
+                ),
+                (
+                    "t2",
+                    BTreeMap::from([
+                        (PlacementSlotId::new("p1".to_string()), None),
+                        (PlacementSlotId::new("p2".to_string()), None),
+                    ]),
+                ),
+            ]),
             raw_snapshots: BTreeMap::from([("t1", Vec::new()), ("t2", Vec::new())]),
             raw_attempts: BTreeMap::from([("t1", Vec::new()), ("t2", Vec::new())]),
             floor: BTreeMap::from([("t1", None), ("t2", None)]),
@@ -4597,11 +4608,23 @@ impl Model {
             // Up-to-date no-op: no records. The deferred-maintenance hook
             // services rotation debt, and the no-op path refreshes observed
             // from the EXISTING generation into EVERY member target (the
-            // crash-window recovery path), closing any open window.
+            // crash-window recovery path), closing any open window. The
+            // no-op re-projects each slot's ONE physical record from the
+            // EXISTING generation, so every member target's view converges
+            // too.
             self.noop_maintenance(t);
             if let Some(c) = self.current.clone() {
-                self.observed.insert("t1", Some(c.clone()));
-                self.observed.insert("t2", Some(c));
+                for tgt in ["t1", "t2"] {
+                    for slot in [
+                        PlacementSlotId::new("p1".to_string()),
+                        PlacementSlotId::new("p2".to_string()),
+                    ] {
+                        self.observed
+                            .get_mut(tgt)
+                            .unwrap()
+                            .insert(slot, Some(c.clone()));
+                    }
+                }
             }
             return (
                 OutcomeClass::Push {
@@ -4669,6 +4692,11 @@ impl Model {
                     | FailureClass::TransitionPending
             )
         );
+        // The slot-write staleness flags: `primary_stale` means the FIRST
+        // advanced slot's physical record write faulted (`p1`), `other_stale`
+        // the SECOND's (`p2`). A faulted slot write leaves that slot's ONE
+        // record stale in every member target's view; the other slot's
+        // record (and both views of it) advance.
         let primary_stale = matches!(fault, Some(FailureClass::ObservedPrimaryWrite));
         let other_stale = matches!(fault, Some(FailureClass::ObservedOtherWrite));
         self.current_gen += 1;
@@ -4828,16 +4856,27 @@ impl Model {
                 }
             }
         }
-        // The post-finalize observed refresh: every member target is rebuilt
-        // unless the step faulted inside the refresh (one member stays stale)
-        // or crashed before it (all members stay stale).
+        // The post-finalize observed refresh: each advanced slot's ONE
+        // physical record is rewritten unless the step faulted inside the
+        // refresh (that slot's record stays stale) or crashed before it (all
+        // records stay stale). Every member target's VIEW of a refreshed slot
+        // equals the physical record; a stale slot is stale in every member's
+        // view alike (the views filter the single physical map).
         if !crash {
             let other = if t == "t1" { "t2" } else { "t1" };
-            if !primary_stale {
-                self.observed.insert(t, Some((v, id.clone())));
-            }
-            if !other_stale {
-                self.observed.insert(other, Some((v, id.clone())));
+            for (slot, stale) in [
+                (PlacementSlotId::new("p1".to_string()), primary_stale),
+                (PlacementSlotId::new("p2".to_string()), other_stale),
+            ] {
+                if stale {
+                    continue;
+                }
+                for tgt in [t, other] {
+                    self.observed
+                        .get_mut(tgt)
+                        .unwrap()
+                        .insert(slot.clone(), Some((v, id.clone())));
+                }
             }
         }
         let window = crash || primary_stale || other_stale;
@@ -5278,19 +5317,30 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
         }
     }
 
-    // Observed projection for EVERY member target of EVERY shared slot: the
-    // projection's generation + artifact + `last_deployment` must equal the
-    // model's expectation — the (version, minting deployment) of the live
-    // remote assignment. A slot the last push did NOT advance (skipped /
-    // unreachable pre-swap) keeps its PRIOR record: same generation,
-    // artifact, and last_deployment — never fabricated, never re-stamped by
-    // a deployment that did not touch it.
+    // Observed projections: EVERY member target's VIEW of EVERY shared slot
+    // must equal the model's expectation — the (version, minting deployment)
+    // of the live remote assignment — and, because targets are SELECTION
+    // VIEWS over the ONE physical slot map, each target's view of a slot
+    // equals the slot's single physical record by construction (the same
+    // assertion the property test hammers with overlapping targets). A slot
+    // the last push did NOT advance (skipped / unreachable pre-swap) keeps
+    // its PRIOR record: same generation, artifact, and last_deployment —
+    // never fabricated, never re-stamped by a deployment that did not touch
+    // it.
     for t in ["t1", "t2"] {
-        let obs = system.store.read_observed(t).unwrap_or_default();
-        let want_observed = model.observed.get(t).cloned().flatten();
+        let obs = system
+            .store
+            .read_observed(t, &system.config)
+            .unwrap_or_default();
         for slot_id in [PlacementSlotId::new("p1"), PlacementSlotId::new("p2")] {
+            let want_observed = model
+                .observed
+                .get(t)
+                .and_then(|m| m.get(&slot_id))
+                .cloned()
+                .flatten();
             let entry = obs.slots.get(&slot_id);
-            match (want_observed.clone(), entry) {
+            match (want_observed, entry) {
                 (None, None) => {}
                 (None, Some(_)) => panic!("{ctx}: {t} observed an unexpected {slot_id} entry"),
                 (Some(_), None) => {
@@ -5985,5 +6035,292 @@ proptest! {
         )
     ) {
         run_step17_contention_debt_case(preexisting_reason.as_deref(), fault);
+    }
+}
+
+// ===========================================================================
+// Property — slot views agree with the one physical state; membership never
+// changes retention
+// ===========================================================================
+
+/// Generate a mini project with THREE overlapping targets (`t1`/`t2`/`t3`,
+/// each with a DIFFERENT rollout config — rollout is the only target surface
+/// left, retention is slot-owned) and THREE slots, each a member of a
+/// generated 1..3-target subset. Coverage is fixed up deterministically so
+/// every slot and every target owns at least one member. `pushes` is an
+/// interleaved sequence of target pushes, each preceded by an artifact
+/// content bump so every push is a REAL deployment (never an up-to-date
+/// no-op).
+///
+/// After EVERY push the property asserts:
+/// (1) EVERY target's view (`read_observed(target)`) equals the SINGLE
+///     physical slot state filtered to that target's member slots — the same
+///     generation, artifact, and last_deployment, exactly — so a slot shared
+///     across targets has ONE physical record and all member views agree
+///     with it by construction;
+/// (2) CHANGING MEMBERSHIP (adding/removing a target in a slot's `targets`
+///     list — a config-level membership change, reloaded through
+///     `Config::load`) does NOT change RETENTION: the retained digest set is
+///     computed under the slot's OWNING VARIANT policy (the single source),
+///     so the set before and after the membership edit is IDENTICAL.
+/// The three overlapping targets of the slot-view property.
+const VIEW_TARGETS: [&str; 3] = ["t1", "t2", "t3"];
+
+fn run_slot_view_property(members: Vec<Vec<bool>>, pushes: Vec<usize>) {
+    // Every slot must belong to at least one target, and every target must
+    // own at least one slot: fix the generated membership deterministically.
+    let mut member: Vec<Vec<&str>> = members
+        .iter()
+        .enumerate()
+        .map(|(si, m)| {
+            let mut t = VIEW_TARGETS
+                .iter()
+                .enumerate()
+                .filter(|(ti, _)| m.get(*ti) == Some(&true) || *ti == si)
+                .map(|(_, t)| *t)
+                .collect::<Vec<_>>();
+            t.sort_unstable();
+            t.dedup();
+            t
+        })
+        .collect();
+    // Slot 0 also carries any target the generated memberships left out.
+    for t in VIEW_TARGETS {
+        if !member.iter().any(|m| m.contains(&t)) {
+            member[0].push(t);
+            member[0].sort_unstable();
+            member[0].dedup();
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let release_dir = project.join("releases").join("v1");
+    std::fs::create_dir_all(&release_dir).unwrap();
+
+    // The ONE owning variant: declares every slot (each on its OWN server, so
+    // the remote generation state stays independent per slot) and carries the
+    // slot-owned retention policy (targets own rollout only).
+    let mut variant = String::new();
+    for (si, m) in member.iter().enumerate() {
+        variant.push_str(&format!(
+            "[[slots]]\nid = \"s{}\"\nserver = \"h{}\"\ntargets = [{}]\ndeploy_dir = \"/srv/s{}-{}\"\n\n",
+            si + 1,
+            si + 1,
+            m.iter()
+                .map(|t| format!("\"{t}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
+            si + 1,
+            si + 1,
+        ));
+    }
+    variant.push_str(
+        "[[artifact.mappings]]\nfrom = \"artifacts/build/output/\"\nto = \"app/\"\nrecursive = true\n\n\
+         [rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = false\n\n\
+         [rotation.deployment]\nprotect_deployments = 1\n\n\
+         [activation]\nadapter = \"none\"\n\n\
+         [verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
+    );
+    std::fs::write(release_dir.join("standard.toml"), variant).unwrap();
+
+    // THREE targets with DIFFERENT rollout configs — the only target surface.
+    let mut deploy_toml =
+        String::from("schema_version = 1\napplication = \"views\"\nrelease = \"v1\"\n\n");
+    for si in 0..member.len() {
+        deploy_toml.push_str(&format!(
+            "[[servers]]\nid = \"h{}\"\naddress = \"a\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n",
+            si + 1
+        ));
+    }
+    deploy_toml.push_str(
+        "[targets.t1]\nrollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }\n\n\
+         [targets.t2]\nrollout = { batch_size = 2, stop_on_failure = false, failure_policy = \"leave_changed\" }\n\n\
+         [targets.t3]\nrollout = { batch_size = 1, stop_on_failure = false, failure_policy = \"rollback_changed\" }\n",
+    );
+    let cfg_path = project.join("deploy.toml");
+    std::fs::write(&cfg_path, deploy_toml).unwrap();
+    let config = Config::load(&cfg_path).unwrap();
+    for t in VIEW_TARGETS {
+        assert!(
+            !config.target_slots(t).unwrap().is_empty(),
+            "every generated target must own at least one slot"
+        );
+    }
+
+    let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+    let remotes_base = dir.path().join("remotes");
+    std::fs::create_dir_all(&remotes_base).unwrap();
+    let rf = remotes_base.clone();
+    let factory = move |s: &crate::config::ServerDef,
+                        _slot: &crate::config::SlotDef|
+          -> Result<Box<dyn Remote>> {
+        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+    };
+
+    // The artifact source the variant maps; rewritten before every push so
+    // each push is a REAL deployment.
+    let artifacts = release_dir.join("artifacts/build/output/app");
+    std::fs::create_dir_all(&artifacts).unwrap();
+    let mut content_version = 0u32;
+
+    for (step, ti) in pushes.into_iter().enumerate() {
+        content_version += 1;
+        std::fs::write(artifacts.join("server"), format!("v{content_version}\n")).unwrap();
+        let config = Config::load(&cfg_path).unwrap();
+        let t = VIEW_TARGETS[ti % 3];
+        let r = push(
+            &cfg_path,
+            &store,
+            &factory,
+            t,
+            &config,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+            },
+        )
+        .unwrap_or_else(|e| panic!("push {step} to {t} failed: {e}"));
+        assert!(
+            r.attempt.is_some(),
+            "every property push must be a REAL push (content bumped): step {step} to {t}"
+        );
+
+        // (1) EVERY target's view == the single physical slot state, filtered.
+        assert_views_match_physical(&store, &config);
+        // (2) Membership never changes retention.
+        assert_membership_never_changes_retention(
+            &store,
+            &cfg_path,
+            &config,
+            &release_dir,
+            &remotes_base,
+        );
+    }
+}
+
+/// (1) EVERY target's view equals the single physical slot state: for each
+/// member slot of the target, the view's entry (generation, artifact,
+/// last_deployment) is EXACTLY the slot's one physical record
+/// (`slots/<slot-id>/observed.json`) — the view is the global map filtered
+/// to the target's member slots, so shared slots appear once, physically, and
+/// every member target's view agrees with it by construction.
+fn assert_views_match_physical(store: &LocalStore, config: &Config) {
+    let physical = store.read_global_observed().unwrap();
+    for t in config.targets.keys() {
+        let view = store.read_observed(t, config).unwrap();
+        let members: std::collections::HashSet<&str> = config
+            .slot_defs()
+            .iter()
+            .filter(|s| s.targets.iter().any(|x| x == t))
+            .map(|s| s.id.as_str())
+            .collect();
+        let want: BTreeMap<_, _> = physical
+            .iter()
+            .filter(|(id, _)| members.contains(id.as_str()))
+            .map(|(id, s)| (id.clone(), s.clone()))
+            .collect();
+        assert_eq!(
+            view.slots, want,
+            "target '{t}': its view must equal the single physical slot state filtered to its \
+             member slots (same generation/artifact/last_deployment)"
+        );
+    }
+}
+
+/// (2) MEMBERSHIP NEVER CHANGES RETENTION: the retained digest set is
+/// computed under the slot's OWNING VARIANT policy (the single source; see
+/// `Config::slot_rotation`), so a config-level membership edit — adding or
+/// removing a target in a slot's `targets` list, reloaded through
+/// `Config::load` — leaves the retained set IDENTICAL.
+fn assert_membership_never_changes_retention(
+    store: &LocalStore,
+    cfg_path: &std::path::Path,
+    config: &Config,
+    release_dir: &std::path::Path,
+    remotes_base: &std::path::Path,
+) {
+    // Pick the FIRST slot: a slot with >1 members gets one member removed; a
+    // single-member slot gets a NEW member added (both are membership
+    // changes; the owning variant — and its policy — is untouched either way).
+    let slot_def = config.slot_defs()[0];
+    let slot_id = &slot_def.id;
+    let members0 = &slot_def.targets;
+    let retained = |cfg: &Config| -> HashSet<String> {
+        let remote = LocalTransport::new(remotes_base.join("h1")).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        compute_retained(
+            &helper,
+            &cfg.pins,
+            store,
+            cfg.slot_rotation(slot_id).unwrap(),
+        )
+        .unwrap()
+    };
+    let before = retained(config);
+
+    let variant_path = release_dir.join("standard.toml");
+    let variant2 = std::fs::read_to_string(&variant_path).unwrap();
+    let slot_header = format!("[[slots]]\nid = \"{slot_id}\"\nserver = \"h1\"\ntargets = [");
+    let start = variant2
+        .find(&slot_header)
+        .expect("the first slot's declaration");
+    let head = &variant2[..start];
+    let tail = &variant2[start..];
+    let list_end = tail.find(']').expect("targets list end");
+    let list = &tail[..list_end + 1];
+    let rest = &tail[list_end + 1..];
+    let edited_list = if members0.len() > 1 {
+        // Drop the LAST member (keep at least one; the target keeps its
+        // other slots, so the config stays valid).
+        let drop = members0.last().unwrap();
+        list.replace(&format!(", \"{drop}\""), "")
+            .replace(&format!("\"{drop}\", "), "")
+    } else {
+        // Add a new member target.
+        let added = VIEW_TARGETS
+            .iter()
+            .copied()
+            .find(|t| !members0.iter().any(|x| x.as_str() == *t))
+            .expect("a target not already a member exists");
+        list.replacen("targets = [", &format!("targets = [\"{added}\", "), 1)
+    };
+    let variant2 = format!("{head}{edited_list}{rest}");
+    std::fs::write(&variant_path, variant2).unwrap();
+    let config2 = Config::load(cfg_path).unwrap();
+    // The membership edit may not have changed the slot's OWNING VARIANT.
+    assert_eq!(
+        config2.slot_variant(slot_id).unwrap(),
+        config.slot_variant(slot_id).unwrap(),
+        "the membership edit must not move the slot to another variant"
+    );
+    let after = retained(&config2);
+    assert_eq!(
+        before, after,
+        "changing a slot's target membership must never change its retained set"
+    );
+}
+
+proptest! {
+    // THE SLOT-VIEW PROPERTY: overlapping targets + interleaved pushes.
+    // Bounded 16 cases, fixed seed 0x5EED_5EED (house style), no failure
+    // persistence — deterministic for CI.
+    #![proptest_config(ProptestConfig {
+        cases: 16,
+        rng_seed: RngSeed::Fixed(0x5EED_5EED),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn slot_views_agree_with_physical_state_and_membership_never_changes_retention(
+        memberships in prop::collection::vec(
+            prop::collection::vec(prop::bool::ANY, 3),
+            3,
+        ),
+        pushes in prop::collection::vec(prop::sample::select([0usize, 1, 2].as_slice()), 1..4),
+    ) {
+        run_slot_view_property(memberships, pushes);
     }
 }

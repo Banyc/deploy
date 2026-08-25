@@ -288,21 +288,14 @@ fn build_docs(
         }],
         targets: BTreeMap::from([(
             "production".to_string(),
+            // Targets own ROLLOUT behavior only; retention is slot-owned
+            // (it lives in the slot's OWNING VARIANT file, see
+            // [`standard_variant`]).
             TargetDef {
                 rollout: RolloutConfig {
                     batch_size: 1,
                     stop_on_failure: true,
                     failure_policy: "rollback_changed".to_string(),
-                },
-                rotation: RotationConfig {
-                    per_server: PerServerRotation {
-                        keep_distinct_artifacts: 5,
-                        keep_days: 14,
-                        protect_previous: true,
-                    },
-                    deployment: DeploymentRotation {
-                        protect_deployments: 2,
-                    },
                 },
             },
         )]),
@@ -382,6 +375,19 @@ fn standard_variant(deploy_dir: &Path) -> VariantConfig {
             deploy_dir: deploy_dir.to_path_buf(),
             targets: vec!["production".to_string()],
         }],
+        // The slot's ONE retention policy: the standard variant file owns the
+        // policy of the slot it declares (app-1). A slot's owning variant is
+        // its single retention source — never a per-target policy.
+        rotation: RotationConfig {
+            per_server: PerServerRotation {
+                keep_distinct_artifacts: 5,
+                keep_days: 14,
+                protect_previous: true,
+            },
+            deployment: DeploymentRotation {
+                protect_deployments: 2,
+            },
+        },
     }
 }
 
@@ -413,6 +419,9 @@ fn systemd_variant() -> VariantConfig {
         },
         verification: command_verification(),
         slots: Vec::new(),
+        // The systemd example declares no slots, so no slot owns it as a
+        // retention source; its (unused) policy is the default.
+        rotation: RotationConfig::default(),
     }
 }
 

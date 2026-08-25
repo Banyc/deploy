@@ -8,7 +8,7 @@
 //! per-server rotation.
 
 use crate::adapter::verify::run_verification;
-use crate::config::{Config, Mapping, SlotDef};
+use crate::config::{Config, Mapping, RotationConfig, SlotDef};
 use crate::error::{Error, Result};
 use crate::history::{self, PushRef, RefExpr};
 use crate::layout;
@@ -25,7 +25,7 @@ use crate::push::server::{
 use crate::push::staging::{StagingCleanup, cleanup_dry_run_staging, remove_tree_restoring_write};
 use crate::records::{
     AttemptServer, DeploymentAttempt, DeploymentPlan, DeploymentResults, DeploymentStatus,
-    ObservedServer, ObservedTarget, ServerOutcomeKind, ServerPlan, ServerResult,
+    ObservedServer, ServerOutcomeKind, ServerPlan, ServerResult,
 };
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::transport::Remote;
@@ -1380,39 +1380,35 @@ fn push_inner(
 
     // Refresh observed state — the shared [`refresh_observed`] helper, also
     // used by the no-op path so the projection is IDENTICAL whichever path
-    // last touched a slot. Observed maps are keyed by placement slot (the
-    // deployment-location identity); the per-server record (`servers/<id>.json`)
-    // keeps the actual [`crate::model::ServerId`] for transport identity. A slot
-    // may be a member of SEVERAL targets (its on-server `deploy_dir` state is
-    // shared across them): a shared slot's observed entry is refreshed in EVERY
-    // member target whenever it changes, so that `deploy status <other>` and any
-    // consumer of that target's observed.json see the CURRENT assignment
-    // (generation, artifact, last deployment), never a stale one left by an
-    // earlier push to another target.
+    // last touched a slot. Observed state is stored ONCE PER PLACEMENT SLOT
+    // (`slots/<slot-id>/observed.json`), never per target: targets are
+    // SELECTION VIEWS over the global slot map, so `deploy status <other>`
+    // and every consumer of a target's observed view see the CURRENT
+    // assignment (generation, artifact, last deployment) through the slot's
+    // single physical record — a shared slot is written ONCE regardless of
+    // how many targets it is a member of. The per-server record
+    // (`servers/<id>.json`) keeps the actual [`crate::model::ServerId`] for
+    // transport identity.
     //
     // POST-COMMIT MAINTENANCE: this refresh runs AFTER the terminal transition
     // was written — for a Successful attempt the shared finalizer already
     // appended the snapshot, `refs/last-successful`, and the terminal
     // `Successful` transition — so the deployment is DURABLY committed here.
-    // A local store fault in this block (a `write_server`, `read_observed`, or
-    // `write_observed` failure) must therefore NEVER turn the push into an
-    // `Err`: it is recorded as a warning on the report (merged into the same
+    // A local store fault in this block (a `write_server`, `read_slot_observed`,
+    // or `write_slot_observed` failure) must therefore NEVER turn the push into
+    // an `Err`: it is recorded as a warning on the report (merged into the same
     // `maintenance` channel as rotation) and the push still returns `Ok` with
     // the committed status.
     //
     // Unlike rotation there is deliberately NO persistent debt marker. The
-    // observed maps are exactly that — PROJECTIONS of already-durable facts
-    // (generations, artifacts, deployments), none of which depend on this
-    // refresh — so a failure is only a projection lag. Convergence needs no
-    // marker to retry: the next real push re-projects from current state, and
-    // the refresh is not incremental — the primary write rebuilds the FULL
-    // observed map from the LIVE per-slot assignments, and the other-member
-    // propagation (which reads the member's existing map and merges this
-    // slot's CURRENT observed value into it) is refreshed by the next real
-    // push to ANY member target of the shared slot, which re-runs the same
-    // propagation. Retries therefore converge without duplicate history: the
-    // projection refresh never re-records an attempt, snapshot, or
-    // transition.
+    // observed records are exactly that — PROJECTIONS of already-durable
+    // facts (generations, artifacts, deployments), none of which depend on
+    // this refresh — so a failure is only a projection lag. Convergence needs
+    // no marker to retry: the next real push re-projects from current state,
+    // and the refresh is not incremental — it rewrites each advanced slot's
+    // physical record from the LIVE per-slot assignments. Retries therefore
+    // converge without duplicate history: the projection refresh never
+    // re-records an attempt, snapshot, or transition.
     //
     // THE PROJECTION MUST EQUAL THE LIVE REMOTE ASSIGNMENT — never the
     // desired plan and never this deployment's id for a slot it did not
@@ -1423,17 +1419,16 @@ fn push_inner(
     // SKIPPED (stop_on_failure) or UNREACHABLE pre-swap (its `process_server`
     // aborted `Ok(Failed)` before the swap) kept its prior live generation
     // yet had its truthful observed record overwritten with a fabricated
-    // `{generation: None, artifact: desired}` and a false `last_deployment`
-    // — a shared slot's lie fanning out to every member target. The
-    // projection is therefore rebuilt from each slot's LIVE generation
+    // `{generation: None, artifact: desired}` and a false `last_deployment`.
+    // The projection is therefore rebuilt from each slot's LIVE generation
     // assignment (read directly, not from `actual_servers`): a slot this
     // deployment advanced IS the live assignment this deployment created
     // (same generation, artifact, and deployment id as before — behavior
     // preserved), while a skipped/unreachable/unadvanced slot keeps the
     // assignment's OWN deployment id — the deployment that actually created
     // the live generation — and, when the live assignment cannot be read,
-    // carries its PRIOR observed record over verbatim (never fabricated,
-    // never re-stamped).
+    // carries its PRIOR physical observed record over verbatim (never
+    // fabricated, never re-stamped).
     let mut observed_warnings: Vec<String> = Vec::new();
     let mut observed_servers: BTreeMap<PlacementSlotId, ObservedServer> = BTreeMap::new();
     for (slot, _sdef) in &members {
@@ -1462,15 +1457,13 @@ fn push_inner(
             None => {
                 // No readable live assignment (the server was never deployed,
                 // or its status/assignment read failed — the
-                // pre-swap-unreachable slot): carry the slot's PRIOR observed
-                // record over VERBATIM, so the projection never fabricates
-                // state this push did not establish and never re-stamps a
-                // deployment that did not touch the slot. A slot with no
-                // prior record and no live assignment stays absent.
-                if let Ok(prior) = store.read_observed(target_name)
-                    && let Some(prior_server) = prior.slots.get(&slot_id)
-                {
-                    observed_servers.insert(slot_id.clone(), prior_server.clone());
+                // pre-swap-unreachable slot): carry the slot's PRIOR PHYSICAL
+                // observed record over VERBATIM, so the projection never
+                // fabricates state this push did not establish and never
+                // re-stamps a deployment that did not touch the slot. A slot
+                // with no prior record and no live assignment stays absent.
+                if let Ok(Some(prior_server)) = store.read_slot_observed(&slot_id) {
+                    observed_servers.insert(slot_id.clone(), prior_server);
                 }
             }
         }
@@ -1485,23 +1478,16 @@ fn push_inner(
 
     // 17. Per-slot rotation under each slot's mutation lock. Rotation uses
     // the slot's ACTUAL final assignment (read after any compensation), not
-    // the desired plan: a compensated slot restored its prior variant. The
-    // retention policy is the target's `rotation` configuration from
-    // `deploy.toml`, so it applies uniformly regardless of which variant each
-    // slot ended up running.
-    // the desired plan: a compensated slot restored its prior variant. A slot
-    // may belong to SEVERAL targets with DIFFERENT retention policies; the
-    // retained set is the UNION of every member target's policy applied to
-    // the generations that target created (`rotation::compute_retained`), so
-    // rotation under this push's target can never delete a generation or
-    // artifact another member target's policy retains. The policies resolve
-    // from the caller's current `deploy.toml` (retention is never part of a
-    // release snapshot).
-
-    // the desired plan: a compensated slot restored its prior variant. The
-    // retention policy is the target's `rotation` configuration from
-    // `deploy.toml`, so it applies uniformly regardless of which variant each
-    // slot ended up running.
+    // the desired plan: a compensated slot restored its prior variant.
+    //
+    // RETENTION IS SLOT-OWNED: each slot has ONE policy — the policy of its
+    // OWNING VARIANT (the variant file whose `[[slots]]` entry declares the
+    // slot), resolved from the caller's current `deploy.toml` via
+    // `Config::slot_rotation` (retention is never part of a release
+    // snapshot). There is NO per-target policy and NO union across the
+    // slot's member targets: a slot shared across targets rotates under its
+    // single owning-variant policy, so which target triggered this push (or
+    // which targets the slot is a member of) never changes what is retained.
     //
     // POST-COMMIT MAINTENANCE: by this point the deployment has ALREADY
     // committed (servers advanced, snapshot recorded, attempt recorded), so a
@@ -1546,14 +1532,11 @@ fn push_inner(
     ));
     for sid in &servers_order {
         let helper = &helpers[sid];
-        // The slot's FULL member target list (union retention), resolved from
-        // the current config.
-        let slot_targets: Vec<String> = config
-            .slot_defs()
-            .iter()
-            .find(|s| s.id.as_str() == sid.as_str())
-            .map(|s| s.targets.clone())
-            .unwrap_or_default();
+        // The slot's ONE retention policy, from its OWNING VARIANT (the
+        // variant that declares the slot) — never a member-target union.
+        let slot_rotation = config
+            .slot_rotation(sid.as_str())
+            .expect("every planned slot is declared by some variant");
         // TEST-ONLY step-17 phase hook: when a test armed the barrier for
         // THIS deployment id, signal "at step-17 lock acquisition" (with the
         // FRESH-STEP-17 phase — this push's own per-slot rotation, whose
@@ -1566,7 +1549,7 @@ fn push_inner(
         #[cfg(test)]
         store.step17_hook_barrier(deployment_id, HookPhase::FreshStep17);
         if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
-            match rotate_slot_locked(helper, store, config, &slot_targets, deployment_id) {
+            match rotate_slot_locked(helper, store, config, slot_rotation, deployment_id) {
                 Ok(()) => {
                     // Maintenance done for this slot: clear any marker left by
                     // an earlier push whose rotation failed after commit. The
@@ -1647,16 +1630,19 @@ fn push_inner(
 /// retries, so both paths apply the same retention semantics and the same
 /// lock discipline. `deployment_id` marks this operation's incoming
 /// directory as active so rotation never sweeps a deployment currently being
-/// published. Pins are the config's own pins (policy lives in the
-/// caller-supplied `config` settings object, never a separate argument).
+/// published. `rotation` is the slot's ONE policy, already resolved from its
+/// OWNING VARIANT by the caller (`Config::slot_rotation`) — retention is
+/// slot-owned, never a per-target surface. Pins are the config's own pins
+/// (policy lives in the caller-supplied `config` settings object, never a
+/// separate argument).
 fn rotate_slot_locked(
     helper: &RemoteHelper,
     store: &LocalStore,
     config: &Config,
-    slot_targets: &[String],
+    rotation: &RotationConfig,
     deployment_id: &DeploymentId,
 ) -> Result<()> {
-    let retained = compute_retained(helper, &config.pins, store, config, slot_targets)?;
+    let retained = compute_retained(helper, &config.pins, store, rotation)?;
     let active_incoming = HashSet::from([deployment_id.as_str().to_string()]);
     helper.rotate(&retained, &active_incoming)?;
     Ok(())
@@ -1745,17 +1731,26 @@ fn clear_rotation_deferred(
 /// feeds it the EXISTING generation's assignment, since an up-to-date push
 /// creates no records) both run this exact block, so a shared slot's
 /// projection in every member target is refreshed identically by whichever
-/// path last touched it. Observed maps are keyed by placement slot (the
-/// deployment-location identity); the per-server record (`servers/<id>.json`)
-/// keeps the actual [`crate::model::ServerId`] for transport identity. A slot
-/// may be a member of SEVERAL targets (its on-server `deploy_dir` state is
-/// shared across them): a shared slot's observed entry is refreshed in EVERY
-/// member target whenever it changes, so `deploy status <other>` and any
-/// consumer of that target's observed.json see the CURRENT assignment
-/// (generation, artifact, last deployment), never a stale one left by an
-/// earlier push to another target. A member slot with no entry in
-/// `observed_servers` is skipped (single-target slots whose projection is
-/// absent, e.g. a slot the caller's push did not plan).
+/// Refresh the PHYSICAL observed state for `target_name`'s member slots: each
+/// advanced slot's ONE record is written EXACTLY ONCE (`slots/<slot-id>/observed.json`),
+/// never once per member target — targets are selection views over the global
+/// slot map, so a shared slot's single physical record serves every member
+/// target's `read_observed` view. Every store fault in this block is
+/// WARNING-ONLY: the refresh runs after the deployment durably committed, so a
+/// fault must never change the push's reported outcome. The warnings are
+/// pushed into `observed_warnings` (merged into the report's `maintenance`
+/// warning channel); this function NEVER returns `Err`.
+///
+/// The single source of truth for the observed refresh: the REAL-push path
+/// (which feeds it the actual post-mutation state) and the NO-OP path (which
+/// feeds it the EXISTING generation's assignment, since an up-to-date push
+/// creates no records) both run this exact block, so a shared slot's
+/// physical record is refreshed identically by whichever path last touched
+/// it. Observed maps are keyed by placement slot (the deployment-location
+/// identity); the per-server record (`servers/<id>.json`) keeps the actual
+/// [`crate::model::ServerId`] for transport identity. A member slot with no
+/// entry in `observed_servers` is skipped (slots the caller's push did not
+/// plan keep their prior physical record untouched).
 fn refresh_observed(
     store: &LocalStore,
     target_name: &str,
@@ -1763,18 +1758,11 @@ fn refresh_observed(
     observed_servers: &BTreeMap<PlacementSlotId, ObservedServer>,
     observed_warnings: &mut Vec<String>,
 ) {
-    let mut observed = ObservedTarget {
-        target: TargetName::new(target_name.to_string()),
-        slots: Default::default(),
-    };
     for (slot, sdef) in members {
         let slot_id = PlacementSlotId::new(slot.id.clone());
         let Some(observed_server) = observed_servers.get(&slot_id) else {
             continue;
         };
-        observed
-            .slots
-            .insert(slot_id.clone(), observed_server.clone());
         if let Err(e) = store.write_server(&crate::records::ServerState {
             id: crate::model::ServerId::new(sdef.id.clone()),
             last_seen_target: Some(TargetName::new(target_name.to_string())),
@@ -1787,47 +1775,20 @@ fn refresh_observed(
                 sdef.id.as_str()
             ));
         }
-        // Propagate the refreshed slot to EVERY other member target of the
-        // shared slot (single-target slots have no other members and are
-        // skipped harmlessly). The slot's server is the same physical server
-        // across all member targets, so no per-server record semantics change.
-        // The read of the member's existing map and the merged write are both
-        // post-commit maintenance: a fault leaves that member's projection
-        // stale, and the next real push to ANY member target of the shared
-        // slot re-runs this propagation and repairs it.
-        for other_target in &slot.targets {
-            if other_target == target_name {
-                continue;
-            }
-            match store.read_observed(other_target) {
-                Ok(mut other_observed) => {
-                    other_observed
-                        .slots
-                        .insert(slot_id.clone(), observed_server.clone());
-                    if let Err(e) = store.write_observed(other_target, &other_observed) {
-                        observed_warnings.push(format!(
-                            "observed refresh deferred for target '{}': {e}",
-                            other_target.as_str()
-                        ));
-                    }
-                }
-                Err(e) => {
-                    observed_warnings.push(format!(
-                        "observed refresh deferred for target '{}': {e}",
-                        other_target.as_str()
-                    ));
-                }
-            }
+        // ONE physical write per slot — the slot's own observed record. A
+        // shared slot is written ONCE regardless of how many targets it is a
+        // member of: every member target's view (a filter over the global
+        // slot map) sees the same physical record, so no per-target
+        // propagation is needed (or possible) anymore.
+        if let Err(e) = store.write_slot_observed(&slot_id, observed_server) {
+            // A fault leaves only THIS slot's physical record stale — every
+            // member target's view of it lags together. The next real push
+            // re-projects from durable facts, so convergence needs no marker.
+            observed_warnings.push(format!(
+                "observed refresh deferred for slot '{}': {e}",
+                slot_id.as_str()
+            ));
         }
-    }
-    if let Err(e) = store.write_observed(target_name, &observed) {
-        // The push's OWN target projection is the last write; a fault leaves
-        // only this target's map stale. The next real push rebuilds the map
-        // from scratch, so convergence needs no marker.
-        observed_warnings.push(format!(
-            "observed refresh deferred for target '{}': {e}",
-            target_name
-        ));
     }
 }
 
@@ -1891,15 +1852,22 @@ fn retry_deferred_rotations(
         #[cfg(test)]
         store.step17_hook_barrier(deployment_id, HookPhase::DeferredRetry);
         if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
-            // The slot's FULL member target list (union retention), resolved
-            // from the current config.
-            let slot_targets: Vec<String> = config
-                .slot_defs()
-                .iter()
-                .find(|s| s.id.as_str() == slot_str.as_str())
-                .map(|s| s.targets.clone())
-                .unwrap_or_default();
-            match rotate_slot_locked(helper, store, config, &slot_targets, deployment_id) {
+            // The slot's ONE retention policy, from its OWNING VARIANT
+            // (resolved from the current config — retention is never a
+            // member-target union).
+            let slot_rotation = match config.slot_rotation(slot_str.as_str()) {
+                Ok(rotation) => rotation,
+                Err(e) => {
+                    // The slot is no longer declared by any variant: its
+                    // rotation cannot be serviced from here; keep the marker
+                    // and say so.
+                    still_deferred.push(format!(
+                        "rotation still deferred for slot '{slot_str}': {e}"
+                    ));
+                    continue;
+                }
+            };
+            match rotate_slot_locked(helper, store, config, slot_rotation, deployment_id) {
                 Ok(()) => serviced.push(slot_str.clone()),
                 Err(e) => {
                     // Keep the marker with the fresh reason.
@@ -2051,6 +2019,14 @@ from = "artifacts/deployment/common/"
 to = "app-common/"
 recursive = true
 
+[rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 1
+
 [activation]
 adapter = "none"
 
@@ -2066,14 +2042,6 @@ interval_seconds = 0
 schema_version = 1
 application = "eng"
 release = "v1"
-
-[targets.t1.rotation.per_server]
-keep_distinct_artifacts = 1
-keep_days = 0
-protect_previous = true
-
-[targets.t1.rotation.deployment]
-protect_deployments = 1
 
 [[servers]]
 id = "s1"
@@ -3603,7 +3571,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "the no-op push must not touch any store file (attempts, transitions, observed, refs)"
         );
         // Observed still reflects the successful push.
-        let observed = h.store.read_observed("t1").unwrap();
+        let observed = h.store.read_observed("t1", &h.config).unwrap();
         assert_eq!(
             observed.slots[&PlacementSlotId::new("p1")].generation,
             r1.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")].generation
@@ -3785,7 +3753,7 @@ interval_seconds = 0
             3,
             "no new transition may be appended to the first deployment"
         );
-        let observed = h.store.read_observed("t1").unwrap();
+        let observed = h.store.read_observed("t1", &h.config).unwrap();
         assert_eq!(
             observed.slots[&PlacementSlotId::new("p1")]
                 .generation
@@ -4124,7 +4092,7 @@ interval_seconds = 0
         // failed id2 did not), never the desired (failed) v2 tree and never
         // the failed deployment re-stamped onto a generation it did not
         // create.
-        let observed = h.store.read_observed("t1").unwrap();
+        let observed = h.store.read_observed("t1", &h.config).unwrap();
         let os = &observed.slots[&PlacementSlotId::new("p1")];
         assert_eq!(os.generation, Some(prior_gen.clone()));
         let oa = os.artifact.as_ref().expect("observed artifact");
@@ -4189,14 +4157,6 @@ schema_version = 1
 application = "batched"
 release = "v1"
 
-[targets.t1.rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[targets.t1.rotation.deployment]
-protect_deployments = 2
-
 [[servers]]
 id = "s1"
 address = "a"
@@ -4231,7 +4191,9 @@ rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "rollback_c
         std::fs::create_dir_all(&release_dir).unwrap();
         // Variant `good` (sorts first, so its slots come first in the plan)
         // declares p1/p2 with PASSING verification; variant `z-failing`
-        // declares p3/p4 with FAILING verification.
+        // declares p3/p4 with FAILING verification. BOTH own the retention
+        // policy of the slots they declare (rotation lives in the slot's
+        // owning variant file).
         let good = r#"
 [[slots]]
 id = "p1"
@@ -4249,6 +4211,14 @@ deploy_dir = "/srv/p2"
 from = "artifacts/build/output/"
 to = "app/"
 recursive = true
+
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 2
 
 [activation]
 adapter = "none"
@@ -4277,6 +4247,14 @@ deploy_dir = "/srv/p4"
 from = "artifacts/build/output/"
 to = "app/"
 recursive = true
+
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 2
 
 [activation]
 adapter = "none"
@@ -4402,7 +4380,7 @@ interval_seconds = 0
         // observed map must NOT fabricate entries: no `{generation: None,
         // artifact: desired}` lie for a slot nothing deployed to, no
         // re-stamped `last_deployment`.
-        let observed = store.read_observed("t1").unwrap();
+        let observed = store.read_observed("t1", &config).unwrap();
         assert!(
             observed.slots.is_empty(),
             "slots without a live assignment (and without a prior record) must stay absent — \
@@ -4465,7 +4443,7 @@ interval_seconds = 0
         // `plan_assignments` (before the remote phase opens a connection);
         // `push()`'s advisory lock files are the only bytes created.
         let remotes_before = snapshot_files(&h.remotes_base);
-        let observed_before = h.store.read_observed("t1").unwrap();
+        let observed_before = h.store.read_observed("t1", &h.config).unwrap();
         let rf = h.remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotDef|
@@ -4502,7 +4480,10 @@ interval_seconds = 0
             h.store.read_last_successful("t1").as_deref(),
             Some(id1.as_str())
         );
-        assert_eq!(h.store.read_observed("t1").unwrap(), observed_before);
+        assert_eq!(
+            h.store.read_observed("t1", &h.config).unwrap(),
+            observed_before
+        );
         assert_eq!(
             remotes_before,
             snapshot_files(&h.remotes_base),
@@ -4589,7 +4570,8 @@ interval_seconds = 0
         assert_eq!(h.store.read_attempts("t1").unwrap().len(), 1);
         assert_eq!(h.store.read_snapshots("t1").unwrap().len(), 1);
         assert_eq!(
-            h.store.read_observed("t1").unwrap().slots[&PlacementSlotId::new("p1")].generation,
+            h.store.read_observed("t1", &h.config).unwrap().slots[&PlacementSlotId::new("p1")]
+                .generation,
             Some(s0_gen),
             "observed state untouched by the dry run"
         );
@@ -4960,7 +4942,7 @@ interval_seconds = 0
         // failed id2 did not). It must NOT reflect the desired (failed) v2
         // tree, and the failed attempt must not be re-stamped onto a slot it
         // did not leave live.
-        let observed = h.store.read_observed("t1").unwrap();
+        let observed = h.store.read_observed("t1", &h.config).unwrap();
         let os = &observed.slots[&PlacementSlotId::new("p1")];
         assert_eq!(os.generation, Some(prior_gen.clone()));
         let oa = os.artifact.as_ref().expect("observed artifact");
@@ -5090,7 +5072,7 @@ interval_seconds = 0
             Some(prior_gen.as_str()),
             "the compensation swap-back is visible on the remote current"
         );
-        let observed = h.store.read_observed("t1").unwrap();
+        let observed = h.store.read_observed("t1", &h.config).unwrap();
         let os = &observed.slots[&PlacementSlotId::new("p1")];
         assert_eq!(os.generation, Some(prior_gen.clone()));
         assert_eq!(
@@ -5521,14 +5503,6 @@ schema_version = 1
 application = "two-slot"
 release = "v1"
 
-[targets.t1.rotation.per_server]
-keep_distinct_artifacts = 1
-keep_days = 0
-protect_previous = true
-
-[targets.t1.rotation.deployment]
-protect_deployments = 1
-
 [[servers]]
 id = "s1"
 address = "a"
@@ -5910,7 +5884,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // over VERBATIM — the real generation/artifact/last_deployment the
         // baseline push recorded — never the desired v2 artifact, never an
         // unknown (default) marker, never the failed deployment re-stamped.
-        let observed = h.store.read_observed("t1").unwrap();
+        let observed = h.store.read_observed("t1", &h.config).unwrap();
         let os = &observed.slots[&PlacementSlotId::new("p1")];
         assert_eq!(
             os.generation,
@@ -5988,14 +5962,6 @@ schema_version = 1
 application = "leave"
 release = "v1"
 
-[targets.t1.rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[targets.t1.rotation.deployment]
-protect_deployments = 2
-
 [[servers]]
 id = "s1"
 address = "a"
@@ -6030,7 +5996,8 @@ rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "leave_chan
         std::fs::create_dir_all(&release_dir).unwrap();
         // Variant `good` (sorts first) declares p1/p2 with PASSING
         // verification; variant `z-failing` declares p3/p4 with FAILING
-        // verification.
+        // verification. BOTH variants own the retention policy of the slots
+        // they declare (rotation lives in the slot's owning variant file).
         let good = r#"
 [[slots]]
 id = "p1"
@@ -6048,6 +6015,14 @@ deploy_dir = "/srv/p2"
 from = "artifacts/build/output/"
 to = "app/"
 recursive = true
+
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 2
 
 [activation]
 adapter = "none"
@@ -6076,6 +6051,14 @@ deploy_dir = "/srv/p4"
 from = "artifacts/build/output/"
 to = "app/"
 recursive = true
+
+[rotation.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 2
 
 [activation]
 adapter = "none"
@@ -6977,6 +6960,8 @@ interval_seconds = 0
         variant.push_str(
             "[[artifact.mappings]]\nfrom = \"artifacts/build/output/\"\nto = \"app/\"\nrecursive = true\n\n\
              [[artifact.mappings]]\nfrom = \"artifacts/deployment/common/\"\nto = \"app-common/\"\nrecursive = true\n\n\
+             [rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n\
+             [rotation.deployment]\nprotect_deployments = 1\n\n\
              [activation]\nadapter = \"none\"\n\n\
              [verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
         );
@@ -6993,10 +6978,6 @@ interval_seconds = 0
             &cfg_path,
             format!(
                 "schema_version = 1\napplication = \"eng\"\nrelease = \"v1\"\n\n\
-                 [targets.t1.rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n\
-                 [targets.t1.rotation.deployment]\nprotect_deployments = 1\n\n\
-                 [targets.t2.rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n\
-                 [targets.t2.rotation.deployment]\nprotect_deployments = 1\n\n\
                  {servers}\
                  [targets.t1]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n\n\
                  [targets.t2]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n"

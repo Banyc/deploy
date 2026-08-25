@@ -44,7 +44,7 @@ What it generates (also visible in `deploy init --help`):
 
 ```text
 my-app/
-  deploy.toml                          # schema v1: one server, target `production` (rollout+rotation)
+  deploy.toml                          # schema v1: one server, target `production` (rollout only)
   releases/v1/standard.toml            # the `standard` variant (mappings + its slot + policies)
   releases/v1/systemd.toml             # example `systemd` activation variant with a real unit
   releases/v1/artifacts/build/output/app/hello   # placeholder artifact source
@@ -250,7 +250,7 @@ deploy push production s3   # the checkpoint snapshot stays the oldest rollback
 ## Project structure (forced)
 
 ```text
-deploy.toml                    # names the active release, servers, and targets (rollout + rotation)
+deploy.toml                    # names the active release, servers, and targets (rollout only)
 releases/<name>/              # the release directory named by `release:`
 releases/<name>/<variant>.toml  # every *.toml file here is a variant (file stem = name);
                                 # each variant declares its own [[slots]] (server, deploy_dir, targets)
@@ -269,10 +269,13 @@ releases/<name>/artifacts/    # artifact sources referenced by variant mappings
   absolute `deploy_dir` on the server, and declares the targets it belongs to
   (`targets = ["..."]`). A slot may be a member of several targets, and two
   slots may share one server in different targets, but within a single target
-  each server appears at most once. A **target** carries the rollout and
-  rotation policy; its member slots are DERIVED from the slots' `targets`
-  lists — targets do not list their slots.
-- Retention (`rotation`) belongs to the target, not the variant.
+  each server appears at most once. A **target** carries ROLLOUT behavior
+  only; its member slots are DERIVED from the slots' `targets` lists —
+  targets do not list their slots.
+- Retention (`rotation`) belongs to the SLOT, not the target: the variant
+  file that declares the slot owns its one retention policy, so a slot shared
+  across several targets keeps exactly one policy and membership changes never
+  change retention.
 
 ## Config reference (condensed)
 
@@ -291,18 +294,13 @@ capacity = { reserve_bytes = 0, reserve_percent = 0 }  # per-server headroom, ze
 # known_hosts = "/etc/ssh/known_hosts"   # absolute path
 # host_key_fingerprint = "SHA256:..."    # pre-verified fingerprint; both together are rejected
 
-[targets.production]         # targets carry rollout + rotation only: their member
+[targets.production]         # targets carry ROLLOUT only: their member slots
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-                            # slots are derived from the slots' `targets` lists
-
-[targets.production.rotation.per_server]   # retention is per target
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
+                            # are derived from the slots' `targets` lists
 ```
 
 A variant file (`releases/<release>/<name>.toml`) is a mapping plus policy —
-plus the variant's deployment slots:
+plus the variant's deployment slots and its slot-owned retention policy:
 
 ```toml
 description = "Standard deployment"
@@ -337,6 +335,14 @@ argv = ["{{ deploy_dir }}/current/app/server", "health-check"]  # rendered per s
 timeout_seconds = 5
 attempts = 1
 interval_seconds = 0
+
+[rotation.per_server]         # SLOT-OWNED retention (the slot's one policy;
+keep_distinct_artifacts = 5   # targets carry rollout only, so membership
+keep_days = 14                # changes never change retention)
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 2
 ```
 
 `argv` (and, for the systemd adapter, unit-file content) is rendered through a
