@@ -200,6 +200,22 @@ pub fn run_checkpoint(
     result
 }
 
+/// Test-only entry point: drive [`checkpoint_inner`] for a REAL checkpoint
+/// with the advisory LOCK ACQUISITION SKIPPED — mirroring the fixture's push
+/// entry points ([`crate::push::engine::push_with_id`], which skip the local
+/// `FileLock` acquisition the same way). The state-machine fixture is
+/// single-threaded, so the locks would only add I/O; the validation, the
+/// durable floor write (the commit point), and the full
+/// `checkpoint_discards` / `checkpoint_compact` path run UNMODIFIED.
+#[cfg(test)]
+pub(crate) fn run_checkpoint_unlocked(
+    store: &LocalStore,
+    target: &str,
+    deployment_id: &DeploymentId,
+) -> Result<CheckpointReport> {
+    checkpoint_inner(store, target, deployment_id)
+}
+
 /// Shared validation: the checkpoint deployment must have produced a
 /// snapshot (i.e. be a successful deployment of this target), and the target
 /// must not already sit at an equal-or-newer floor for a DIFFERENT deployment

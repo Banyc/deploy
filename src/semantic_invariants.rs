@@ -66,11 +66,13 @@
 
 use crate::config::{Config, SlotDef};
 use crate::error::Result;
+use crate::history;
 use crate::layout;
 use crate::model::{
     ArtifactRef, DeploymentId, OperationId, PlacementSlotId, ReleaseId, TreeDigest, VariantName,
 };
 use crate::push::capacity::capacity_fits;
+use crate::push::checkpoint::{CheckpointReport, run_checkpoint_unlocked};
 use crate::push::engine::{PushOptions, PushReport, push, push_with_id};
 use crate::records::DeploymentStatus;
 use crate::release::{
@@ -364,6 +366,19 @@ pub(crate) enum Action {
     Rollback(&'static str, u64),
     /// Run a standalone rotation pass under the FULL member policy union.
     Rotate,
+    /// Establish a checkpoint history floor on the target at the deployment
+    /// whose snapshot is the `k`-th of the target's VISIBLE snapshots (the
+    /// fixture resolves the deployment id — the strategy cannot mint ids,
+    /// which are generated per-fixture at runtime, so the action carries the
+    /// generated selector and "arms on a successful deployment id already
+    /// recorded in the target's history" by construction: the selector can
+    /// only ever name a recorded successful deployment). Runs the REAL
+    /// `run_checkpoint` / `checkpoint_discards` / `checkpoint_compact` path
+    /// (the local advisory locks skipped, exactly as the fixture's push
+    /// entry points do). LOW weight: the floor is a rare operation, and the
+    /// pending-commit × floor interactions it pins are this property's
+    /// focus.
+    Checkpoint(&'static str, u64),
     /// Arm a one-shot remote failure for the next push.
     InjectFailure(FailureStep),
     /// Tamper with a specific record. Deliberately VIOLATES the Integrity
@@ -394,6 +409,10 @@ pub(crate) enum TamperKind {
 /// The outcome of one applied action.
 pub(crate) enum Outcome {
     Push(Box<Result<PushReport>>),
+    /// A real checkpoint run (the floor write + compaction path); the report
+    /// is kept so the driver can assert the discard sets and the
+    /// established/idempotent flag against the model's expectation.
+    Checkpoint(Box<CheckpointReport>),
     Ok,
     Tampered,
 }
@@ -610,6 +629,10 @@ fn classify_outcome(
 ) -> OutcomeClass {
     match outcome {
         Outcome::Ok => OutcomeClass::Push {
+            boundary: ReturnBoundary::Ok,
+            disposition: Disposition::NoAttempt,
+        },
+        Outcome::Checkpoint(_) => OutcomeClass::Push {
             boundary: ReturnBoundary::Ok,
             disposition: Disposition::NoAttempt,
         },
@@ -890,6 +913,15 @@ impl Fixture {
         DeploymentId::new(format!("si-{}-{i:04}", self.prop_tag))
     }
 
+    /// The per-fixture deployment-id tag (derived from the unique tempdir
+    /// name). The MODEL mints the SAME id sequence from it (see
+    /// [`Model::mint_id`]) so the oracle's deployment ids equal the system's
+    /// — the checkpoint floor and the raw-log comparisons pin ids, so the
+    /// two sides must mint identical strings.
+    fn prop_tag(&self) -> &str {
+        &self.prop_tag
+    }
+
     /// Arm the step's [`FailureClass`] for a push of `pushed` with deployment
     /// id `id`. The local-store arms are keyed by the deployment id (and, for
     /// the observed-refresh arms, by the target); the remote arms are
@@ -979,12 +1011,40 @@ impl Fixture {
         match action {
             Action::Push(t) | Action::Retry(t) => self.push_prop(t, None, class),
             Action::Rollback(t, i) => self.push_prop(t, Some(&format!("s{i}")), class),
+            Action::Checkpoint(t, k) => self.checkpoint_prop(t, *k),
             other => {
                 // Build / Rotate / Tamper: nothing consumes a fault, so the
                 // class is dropped without arming.
                 self.apply_no_checks(other.clone())
             }
         }
+    }
+
+    /// Run the REAL checkpoint path on `t` at the deployment whose snapshot
+    /// is the `k`-th of the target's VISIBLE (floor-gated) chain — a
+    /// "recorded successful deployment" by construction. An empty visible
+    /// chain is a no-op step (the model predicts the same: there is no
+    /// deployment to checkpoint). The local advisory locks are skipped
+    /// exactly like the fixture's push entry points
+    /// ([`crate::push::engine::push_with_id`]); the durable floor write, the
+    /// `checkpoint_discards` enumeration, and the `checkpoint_compact`
+    /// compaction all run UNMODIFIED on the per-fixture store (its fault
+    /// registry hooks are the checkpoint path's own — the generated failure
+    /// classes are push-oriented and never armed for a checkpoint, so the
+    /// step-scoped fault is dropped like any unconsumed arm).
+    fn checkpoint_prop(&self, t: &str, k: u64) -> Outcome {
+        let snaps = self.store.read_snapshots(t).unwrap_or_default();
+        if snaps.is_empty() {
+            // No recorded successful deployment on the visible chain: the
+            // model no-ops too (nothing to checkpoint, nothing changes).
+            return Outcome::Ok;
+        }
+        let id = snaps[(k % snaps.len() as u64) as usize]
+            .deployment_id
+            .clone();
+        let rep = run_checkpoint_unlocked(&self.store, t, &id)
+            .expect("a checkpoint at a recorded successful deployment succeeds");
+        Outcome::Checkpoint(Box::new(rep))
     }
 
     /// Run a push/rollback step with a caller-supplied fixed deployment id
@@ -1285,6 +1345,11 @@ impl Fixture {
             Action::Rotate => {
                 self.rotate_union().expect("standalone rotation succeeds");
                 Outcome::Ok
+            }
+            Action::Checkpoint(t, k) => {
+                let out = self.checkpoint_prop(t, k);
+                self.check_invariants();
+                return out;
             }
             Action::InjectFailure(step) => {
                 self.set_remote_fault(step);
@@ -2110,6 +2175,140 @@ fn state_machine_mixed_sequence_invariants() {
         panic!("expected push")
     };
     res.expect("no-op retry succeeds");
+    f.check_invariants();
+}
+
+/// The PENDING-COMMIT × CHECKPOINT-FLOOR contract, DETERMINISTICALLY (the
+/// property test drives the same interaction with random streams; this pins
+/// the two documented branches):
+///
+/// (a) a pending commit BELOW the new floor is discarded with the rest of
+///     the below-floor history — its attempt line, its deployment dir, and
+///     (when it has one) its snapshot entry vanish from the RAW logs, so no
+///     recovery can resurrect it;
+/// (b) a pending commit AT/ABOVE the floor survives untouched and the next
+///     push finalizes it EXACTLY once — one snapshot at the SAME unique
+///     index (never a duplicate, never a re-append below the floor).
+#[test]
+fn state_machine_checkpoint_floor_discards_below_pending_keeps_above() {
+    // (a) BELOW the floor: a pending commit whose attempt precedes the
+    // checkpoint deployment is discarded.
+    let f = Fixture::new();
+    // Push 1: a clean deployment (s0).
+    let r1 = f.push_prop("t1", None, FailureClass::None);
+    assert!(matches!(&r1, Outcome::Push(b) if b.is_ok()));
+    // Push 2 (new content): a crash-window fault leaves a recoverable-pending
+    // commit with NO snapshot. (Build runs WITHOUT the invariant checks — a
+    // crash window is open and only a later push/no-op refreshes observed.)
+    f.apply_no_checks(Action::Build(2));
+    let p = f.push_prop("t1", None, FailureClass::SnapshotAppend);
+    let pending_id = {
+        let last = f.last_prop.lock().unwrap();
+        last.as_ref().unwrap().1.clone()
+    };
+    assert!(matches!(&p, Outcome::Push(b) if b.is_err()));
+    assert!(
+        system_has_pending(&f, "t1"),
+        "the faulted push left a pending commit"
+    );
+    // Push 3 (new content): the CHECKPOINT DEPLOYMENT — its commit-marker
+    // fault is consumed by the pending commit's reconcile (so the pending
+    // attempt STAYS pending while this deployment commits and mints s1).
+    f.apply_no_checks(Action::Build(3));
+    let d = f.push_prop("t1", None, FailureClass::CommitMarker);
+    assert!(matches!(&d, Outcome::Push(b) if b.is_ok()));
+    // The checkpoint at the SECOND successful deployment (s1): the pending
+    // commit's attempt sits strictly BEFORE it, so it is below the floor.
+    let c = f.checkpoint_prop("t1", 1);
+    let Outcome::Checkpoint(rep) = c else {
+        panic!("expected a checkpoint outcome")
+    };
+    assert!(rep.established);
+    // The pending commit was BELOW the floor: its attempt line and dir are
+    // GONE from the raw logs and it is no longer pending — no resurrection.
+    let raw_att: Vec<String> = f
+        .store
+        .read_attempts_raw("t1")
+        .unwrap()
+        .iter()
+        .map(|a| a.deployment_id.as_str().to_string())
+        .collect();
+    assert!(
+        !raw_att.contains(&pending_id),
+        "the below-floor pending attempt line must be discarded"
+    );
+    assert!(
+        !f.store.deployment_dir(&pending_id).exists(),
+        "the below-floor pending deployment dir must be deleted"
+    );
+    assert!(
+        !system_has_pending(&f, "t1"),
+        "the below-floor pending commit must never be resurrected"
+    );
+    // The floor deployment's own attempt + snapshot survive.
+    let raw_snaps: Vec<u64> = f
+        .store
+        .read_snapshots_raw("t1")
+        .unwrap()
+        .iter()
+        .map(|s| s.index)
+        .collect();
+    assert_eq!(
+        raw_snaps,
+        vec![1],
+        "only the floor's own snapshot (s1) survives"
+    );
+    f.check_invariants();
+
+    // (b) AT/ABOVE the floor: a pending commit recorded after the
+    // checkpoint deployment survives and is finalized by the next push
+    // exactly once.
+    let f = Fixture::new();
+    let r1 = f.push_prop("t1", None, FailureClass::None);
+    assert!(matches!(&r1, Outcome::Push(b) if b.is_ok()));
+    // A pending commit AT/ABOVE the floor (recorded after s0, new content).
+    f.apply_no_checks(Action::Build(2));
+    let p = f.push_prop("t1", None, FailureClass::CommitMarker);
+    assert!(matches!(&p, Outcome::Push(b) if b.is_ok()));
+    assert!(system_has_pending(&f, "t1"));
+    let pending_id = {
+        let last = f.last_prop.lock().unwrap();
+        last.as_ref().unwrap().1.clone()
+    };
+    let c = f.checkpoint_prop("t1", 0);
+    let Outcome::Checkpoint(rep) = c else {
+        panic!("expected a checkpoint outcome")
+    };
+    assert!(rep.established);
+    // The pending commit survives the checkpoint (its attempt precedes
+    // nothing below the floor).
+    assert!(
+        system_has_pending(&f, "t1"),
+        "the at/above-floor pending survives"
+    );
+    // The next push finalizes it EXACTLY once: one snapshot, at the SAME
+    // unique index (max raw + 1), never a duplicate.
+    f.apply_no_checks(Action::Build(3));
+    let r = f.push_prop("t1", None, FailureClass::None);
+    assert!(matches!(&r, Outcome::Push(b) if b.is_ok()));
+    assert!(
+        !system_has_pending(&f, "t1"),
+        "the next push finalizes the at/above-floor pending commit"
+    );
+    let snaps = f.store.read_snapshots_raw("t1").unwrap();
+    let matches = snaps
+        .iter()
+        .filter(|s| s.deployment_id.as_str() == pending_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matches.len(),
+        1,
+        "the finalized pending commit must produce exactly ONE snapshot"
+    );
+    assert_eq!(
+        matches[0].index, 1,
+        "the snapshot lands at the SAME unique index (s1)"
+    );
     f.check_invariants();
 }
 
@@ -3566,6 +3765,44 @@ fn bounds_capacity_edge_corners_fail_safely() {
 /// identities (release id, tree sha) are NOT recomputed: the
 /// version→artifact join is performed by [`assert_semantic_invariants`]
 /// against the system's durable snapshots and attempts.
+///
+/// The checkpoint dimension adds the per-target durable HISTORY FLOOR: the
+/// model tracks the RAW attempt/snapshot logs (the physical files the
+/// checkpoint compacts) and derives the visible chains as the suffix
+/// at/after the floor, so a [`Action::Checkpoint`] step can predict exactly
+/// what the real `checkpoint_discards` / `checkpoint_compact` path discards
+/// — including a BELOW-FLOOR pending commit (discarded with the rest of the
+/// below-floor history, never resurrected by recovery) versus an
+/// AT/ABOVE-FLOOR one (survives and is finalized by the next push exactly
+/// once).
+///
+/// The oracle's deployment ids are MINTED IN LOCKSTEP with the fixture
+/// ([`Model::mint_id`] mirrors [`Fixture::next_prop_id`] from the SAME
+/// per-fixture tag and counter), so the model's raw logs, the floor marker,
+/// and the pending state can be compared id-for-id with the system's.
+/// The oracle's expectation for ONE checkpoint step: the floor it
+/// establishes and the EXACT discard sets the real `checkpoint_discards`
+/// must report (the driver asserts the actual [`CheckpointReport`] against
+/// it field-for-field). The discard semantics mirror
+/// [`crate::store::local::LocalStore::checkpoint_discards`]: attempts
+/// strictly before the checkpoint's own attempt, snapshots strictly below
+/// the floor's index, and the deduplicated union of their deployment ids
+/// (the dirs the compaction deletes).
+#[derive(Clone, Debug)]
+struct CheckpointExpectation {
+    target: &'static str,
+    deployment_id: String,
+    snapshot_index: u64,
+    /// True when the floor moved (first checkpoint, or an advance to a
+    /// DIFFERENT deployment); false for the idempotent re-checkpoint of the
+    /// SAME deployment (the visible chain can never offer a snapshot below
+    /// the floor, so the only equal-index case IS the same deployment).
+    established: bool,
+    discarded_attempts: Vec<String>,
+    discarded_snapshots: Vec<u64>,
+    discarded_deployments: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 struct Model {
     /// Content version the next HEAD push materializes. The fixture writes
@@ -3587,16 +3824,45 @@ struct Model {
     /// Expected per-target observed projection (content version), or `None`
     /// before the first completed mutation.
     observed: BTreeMap<&'static str, Option<u32>>,
-    /// Per-target snapshot log: content version per snapshot index.
-    snapshots: BTreeMap<&'static str, Vec<u32>>,
-    /// Per-target deployment-attempt log: content version per attempt.
-    attempts: BTreeMap<&'static str, Vec<u32>>,
-    /// Un-finalized pending deployment per target: (content version, the
-    /// minted-generation counter, whether its snapshot is ALREADY durable).
-    /// A `LastSuccessfulWrite` / `TransitionSuccessful` fault leaves the
-    /// snapshot appended while the attempt stays pending, so the reconcile
-    /// must not append it a second time.
-    pending: BTreeMap<&'static str, (u32, u64, bool)>,
+    /// Per-target RAW snapshot log: (index, deployment id, content version)
+    /// per physically recorded snapshot — the log the checkpoint compacts.
+    /// The VISIBLE chain is the suffix at/after the target's floor (see
+    /// [`Model::visible_snapshots`]); index allocation is monotonic over the
+    /// RAW log (a compacted chain never reuses an index). The deployment id
+    /// is tracked so the floor's own deployment and the discard sets can be
+    /// pinned against the system's raw logs.
+    raw_snapshots: BTreeMap<&'static str, Vec<(u64, String, u32)>>,
+    /// Per-target RAW deployment-attempt log: (deployment id, content
+    /// version) per physically recorded attempt. The VISIBLE chain starts at
+    /// the floor's own attempt (see [`Model::visible_attempts`]).
+    raw_attempts: BTreeMap<&'static str, Vec<(String, u32)>>,
+    /// Per-target durable history floor: (deployment id, snapshot index)
+    /// the checkpoint marker sits at; `None` before the target's first
+    /// checkpoint.
+    floor: BTreeMap<&'static str, Option<(String, u64)>>,
+    /// Un-finalized pending deployment per target: (deployment id, content
+    /// version, the minted-generation counter, whether its snapshot is
+    /// ALREADY durable). A `LastSuccessfulWrite` / `TransitionSuccessful`
+    /// fault leaves the snapshot appended while the attempt stays pending,
+    /// so the reconcile must not append it a second time. The deployment id
+    /// lets the checkpoint DISCARD a below-floor pending commit (its line
+    /// and its snapshot entry vanish from the raw logs — no resurrection on
+    /// recovery) while an at/above-floor one survives.
+    pending: BTreeMap<&'static str, (String, u32, u64, bool)>,
+    /// The deployment-id counter + tag for the CURRENT step's push,
+    /// MIRRORING [`Fixture::next_prop_id`] so the oracle mints the SAME ids
+    /// as the system (the floor pins ids in the raw logs; the comparisons
+    /// would be meaningless if the two sides minted different strings). The
+    /// model is single-threaded, so the counter is a plain `u64` (the
+    /// fixture's `AtomicU64` exists only for its scoped-thread paths).
+    prop_ids: u64,
+    prop_tag: String,
+    /// The last checkpoint step's expected report — the floor it established
+    /// and the EXACT discard set the real `checkpoint_discards` must have
+    /// enumerated. The driver asserts the actual [`CheckpointReport`]
+    /// against it. `None` when the step was not a checkpoint (or the visible
+    /// chain was empty, so the step no-opped).
+    last_checkpoint: Option<CheckpointExpectation>,
     /// Monotone counter of deployed generations: every real deployment
     /// (push, rollback, or faulted push) mints exactly one new generation,
     /// and a pending attempt finalizes only while its OWN generation is
@@ -3631,7 +3897,7 @@ struct Model {
 }
 
 impl Model {
-    fn new() -> Model {
+    fn new_with_tag(tag: &str) -> Model {
         Model {
             head_version: 1,
             armed_fault: None,
@@ -3639,9 +3905,13 @@ impl Model {
             current: None,
             current_tampered: false,
             observed: BTreeMap::from([("t1", None), ("t2", None)]),
-            snapshots: BTreeMap::from([("t1", Vec::new()), ("t2", Vec::new())]),
-            attempts: BTreeMap::from([("t1", Vec::new()), ("t2", Vec::new())]),
+            raw_snapshots: BTreeMap::from([("t1", Vec::new()), ("t2", Vec::new())]),
+            raw_attempts: BTreeMap::from([("t1", Vec::new()), ("t2", Vec::new())]),
+            floor: BTreeMap::from([("t1", None), ("t2", None)]),
             pending: BTreeMap::new(),
+            prop_ids: 0,
+            prop_tag: tag.to_string(),
+            last_checkpoint: None,
             current_gen: 0,
             debt: BTreeMap::from([("t1", false), ("t2", false)]),
             crash_window: false,
@@ -3649,6 +3919,62 @@ impl Model {
             last_was_tamper: false,
             index: 0,
         }
+    }
+
+    /// The next deployment id for the CURRENT step's push/rollback,
+    /// mirroring [`Fixture::next_prop_id`] (same tag, same zero-padded
+    /// counter) so the oracle and the system mint identical ids.
+    fn mint_id(&mut self) -> String {
+        let i = self.prop_ids;
+        self.prop_ids += 1;
+        format!("si-{}-{i:04}", self.prop_tag)
+    }
+
+    /// The target's VISIBLE snapshot chain: the raw log filtered to indices
+    /// at/after the floor (mirrors [`crate::store::local::LocalStore::read_snapshots`]).
+    fn visible_snapshots(&self, t: &'static str) -> Vec<(u64, String, u32)> {
+        let raw = self.raw_snapshots.get(t).cloned().unwrap_or_default();
+        match self.floor.get(t).cloned().flatten() {
+            Some((_, fi)) => raw.into_iter().filter(|(i, _, _)| *i >= fi).collect(),
+            None => raw,
+        }
+    }
+
+    /// The target's VISIBLE attempt chain: the raw log from the floor's own
+    /// attempt onward (mirrors
+    /// [`crate::store::local::LocalStore::read_attempts`], including the
+    /// no-drain when the floor's own attempt is absent).
+    fn visible_attempts(&self, t: &'static str) -> Vec<(String, u32)> {
+        let raw = self.raw_attempts.get(t).cloned().unwrap_or_default();
+        match self.floor.get(t).cloned().flatten() {
+            Some((fid, _)) => raw
+                .iter()
+                .position(|(id, _)| *id == fid)
+                .map(|pos| raw[pos..].to_vec())
+                .unwrap_or(raw),
+            None => raw,
+        }
+    }
+
+    /// The next snapshot index for `t`: max RAW index + 1 (never
+    /// `len()` — a compacted chain like [s2, s3] has len 2 but the next
+    /// unique index is 4). Appending after a checkpoint therefore always
+    /// produces a unique, increasing index.
+    fn next_snapshot_index(&self, t: &'static str) -> u64 {
+        self.raw_snapshots
+            .get(t)
+            .map(|s| s.iter().map(|(i, _, _)| *i).max().map_or(0, |m| m + 1))
+            .unwrap_or(0)
+    }
+
+    /// Append a NEW successful snapshot for deployment `id` (content `v`) at
+    /// the next unique raw index.
+    fn append_snapshot(&mut self, t: &'static str, id: &str, v: u32) {
+        let idx = self.next_snapshot_index(t);
+        self.raw_snapshots
+            .entry(t)
+            .or_default()
+            .push((idx, id.to_string(), v));
     }
 
     /// Advance the oracle by ONE property step — the action AND its failure
@@ -3687,6 +4013,37 @@ impl Model {
                 },
                 self.crash_window,
             ),
+            Action::Checkpoint(t, k) => {
+                // The fixture resolves the deployment id from the target's
+                // VISIBLE snapshots; the model resolves the SAME id from its
+                // own visible chain (in lockstep). An empty visible chain is
+                // a no-op step (no recorded successful deployment yet). The
+                // step's failure class is NOT consumed: the checkpoint is
+                // local-only and the generated classes are push-oriented,
+                // so the arm is dropped step-scoped like any unconsumed
+                // fault (the fixture never arms one for a checkpoint).
+                let visible = self.visible_snapshots(t);
+                if visible.is_empty() {
+                    self.last_checkpoint = None;
+                    (
+                        OutcomeClass::Push {
+                            boundary: ReturnBoundary::Ok,
+                            disposition: Disposition::NoAttempt,
+                        },
+                        self.crash_window,
+                    )
+                } else {
+                    let (idx, cid, _) = visible[*k as usize % visible.len()].clone();
+                    self.checkpoint(t, cid, idx);
+                    (
+                        OutcomeClass::Push {
+                            boundary: ReturnBoundary::Ok,
+                            disposition: Disposition::NoAttempt,
+                        },
+                        self.crash_window,
+                    )
+                }
+            }
             Action::InjectFailure(_) => {
                 // The property injects faults per step (never via this action);
                 // a stray sticky arm cannot be cross-checked.
@@ -3715,6 +4072,70 @@ impl Model {
         class
     }
 
+    /// Establish (or re-affirm) the target's history floor at the deployment
+    /// `cid` (whose snapshot index is `idx`), mirroring `checkpoint_inner`:
+    /// raw attempts are trimmed to the floor's own attempt onward, raw
+    /// snapshots to `index >= idx`, and the discard set mirrors
+    /// [`crate::store::local::LocalStore::checkpoint_discards`] EXACTLY. A
+    /// pending commit whose attempt line was trimmed is DISCARDED: its line,
+    /// its snapshot entry (an already-snapped pending attempt below the
+    /// floor always has its index below the floor — the snapshot was minted
+    /// before the floor's own deployment's), and its deployment dir all
+    /// vanish from the raw state, so recovery can never re-append it. A
+    /// pending commit at/above the floor survives untouched.
+    fn checkpoint(&mut self, t: &'static str, cid: String, idx: u64) {
+        let raw_att = self.raw_attempts.get(t).cloned().unwrap_or_default();
+        let raw_snaps = self.raw_snapshots.get(t).cloned().unwrap_or_default();
+        let keep_from = raw_att
+            .iter()
+            .position(|(id, _)| *id == cid)
+            .expect("the checkpoint deployment is a recorded attempt");
+        let mut discarded_deployments: Vec<String> = Vec::new();
+        let mut discarded_snapshots: Vec<u64> = Vec::new();
+        for (i, sid, _) in raw_snaps.iter().filter(|(i, _, _)| *i < idx) {
+            discarded_snapshots.push(*i);
+            if !discarded_deployments.contains(sid) {
+                discarded_deployments.push(sid.clone());
+            }
+        }
+        let discarded_attempts: Vec<String> = raw_att[..keep_from]
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        for (aid, _) in raw_att.iter().take(keep_from) {
+            if !discarded_deployments.contains(aid) {
+                discarded_deployments.push(aid.clone());
+            }
+        }
+        // A below-floor pending commit is discarded with the rest of the
+        // below-floor history.
+        if let Some((pid, _, _, _)) = self.pending.get(t)
+            && raw_att[..keep_from].iter().any(|(id, _)| id == pid)
+        {
+            self.pending.remove(t);
+        }
+        self.raw_attempts.insert(t, raw_att[keep_from..].to_vec());
+        self.raw_snapshots.insert(
+            t,
+            raw_snaps
+                .into_iter()
+                .filter(|(i, _, _)| *i >= idx)
+                .collect(),
+        );
+        let prev = self.floor.get(t).cloned().flatten();
+        let established = !matches!(prev, Some((fid, _)) if fid == cid);
+        self.floor.insert(t, Some((cid.clone(), idx)));
+        self.last_checkpoint = Some(CheckpointExpectation {
+            target: t,
+            deployment_id: cid,
+            snapshot_index: idx,
+            established,
+            discarded_attempts,
+            discarded_snapshots,
+            discarded_deployments,
+        });
+    }
+
     /// Reconcile a pending attempt of `t` at the START of a push/rollback,
     /// mirroring `reconcile_pending_commits` (which runs before the early
     /// no-op check): verify the attempt's generation, then write its missing
@@ -3729,7 +4150,7 @@ impl Model {
     /// lock acquisition fails BEFORE any write, so the attempt stays pending
     /// and the fault is NOT consumed.
     fn reconcile(&mut self, t: &'static str) {
-        let Some((pv, pg, already_snapped)) = self.pending.remove(t) else {
+        let Some((pid, pv, pg, already_snapped)) = self.pending.remove(t) else {
             return;
         };
         // The engine's reconciliation FIRST verifies the pending attempt's
@@ -3744,21 +4165,24 @@ impl Model {
                 // The reconcile's marker write contends on the held lock: the
                 // attempt stays pending, no write was attempted, so the fault
                 // (a step-scoped contention marker) is not consumed.
-                self.pending.insert(t, (pv, pg, already_snapped));
+                self.pending.insert(t, (pid, pv, pg, already_snapped));
             }
             Some(FailureClass::CommitMarker) => {
                 // The pending attempt's marker write consumes the armed fault
                 // and fails, so the attempt stays pending.
                 self.armed_fault = None;
-                self.pending.insert(t, (pv, pg, already_snapped));
+                self.pending.insert(t, (pid, pv, pg, already_snapped));
             }
             Some(_) => {
                 // Any other armed class: the reconcile's writes are keyed to
                 // the OLD attempt's id, so they pass through untouched and the
                 // attempt finalizes (the step's fault stays armed for the
                 // step's own deployment writes, or is dropped by a no-op).
+                // The snapshot is appended at the next unique RAW index (a
+                // checkpoint may have compacted the chain — the index is
+                // never reused).
                 if !already_snapped {
-                    self.snapshots.entry(t).or_default().push(pv);
+                    self.append_snapshot(t, &pid, pv);
                 }
             }
             None => {
@@ -3767,7 +4191,7 @@ impl Model {
                 // advanced). A finalize fault (LastSuccessful etc.) already
                 // recorded the snapshot, so it must not be duplicated.
                 if !already_snapped {
-                    self.snapshots.entry(t).or_default().push(pv);
+                    self.append_snapshot(t, &pid, pv);
                 }
             }
         }
@@ -3784,6 +4208,10 @@ impl Model {
     /// STAYS open (the fixture's invariant groups stay suspended until a
     /// later successful push/no-op refreshes observed).
     fn rollback(&mut self, t: &'static str, i: u64) -> (OutcomeClass, bool) {
+        // The fixture mints the step's deployment id BEFORE the push runs
+        // (even when the ref then fails closed), so the oracle mints first
+        // too — the counters stay in lockstep.
+        let id = self.mint_id();
         // The engine reconciles pending attempts ONCE per push, before the
         // ref is resolved, so the index is evaluated against the
         // POST-reconciliation chain and the resolved deployment enters the
@@ -3791,11 +4219,15 @@ impl Model {
         // second reconcile would wrongly finalize an attempt the reconcile's
         // OWN faulted marker write left pending).
         self.reconcile(t);
+        // The engine resolves `sN` against the VISIBLE chain by RAW index
+        // (`resolve_ref_expr` reads the floor-gated log), so the model looks
+        // up the index in its own visible chain — a below-floor index fails
+        // closed.
         let Some(v) = self
-            .snapshots
-            .get(t)
-            .and_then(|snaps| snaps.get(i as usize))
-            .copied()
+            .visible_snapshots(t)
+            .iter()
+            .find(|(idx, _, _)| *idx == i)
+            .map(|(_, _, v)| *v)
         else {
             return (
                 OutcomeClass::Push {
@@ -3805,7 +4237,7 @@ impl Model {
                 self.crash_window,
             );
         };
-        self.deploy_resolved(t, Some(v))
+        self.deploy_resolved(t, Some(v), id)
     }
 
     /// A HEAD push / no-op retry (`Push` and `Retry` are the same operation
@@ -3813,6 +4245,7 @@ impl Model {
     /// pending attempts once, then decides no-op-vs-deploy against the
     /// post-reconciliation state and enters the shared resolved-deploy stage.
     fn deploy(&mut self, t: &'static str) -> (OutcomeClass, bool) {
+        let id = self.mint_id();
         self.reconcile(t);
         // HEAD push: deploy exactly when the remote current no longer
         // equals the materialized head (the engine's complete
@@ -3822,16 +4255,22 @@ impl Model {
         } else {
             None
         };
-        self.deploy_resolved(t, version)
+        self.deploy_resolved(t, version, id)
     }
 
     /// The shared POST-RECONCILIATION deployment stage — everything the
     /// engine runs after `reconcile_pending_commits`, ref resolution, and
     /// planning: the mutation-lock preflight, then either the up-to-date
     /// no-op (no records) or the real deployment under the step's failure
-    /// class. Returns the expected outcome class and the NEW crash-window
-    /// state.
-    fn deploy_resolved(&mut self, t: &'static str, version: Option<u32>) -> (OutcomeClass, bool) {
+    /// class. `id` is the CURRENT step's minted deployment id (the attempt
+    /// and snapshot records are keyed by it). Returns the expected outcome
+    /// class and the NEW crash-window state.
+    fn deploy_resolved(
+        &mut self,
+        t: &'static str,
+        version: Option<u32>,
+        id: String,
+    ) -> (OutcomeClass, bool) {
         // A contended push aborts with `Err` and records NOTHING — no attempt,
         // no recovery, no observed refresh — so the expected class is `Err` +
         // `NoAttempt`. The engine's mutation-lock preflight check sits in the
@@ -3905,10 +4344,13 @@ impl Model {
         self.current_gen += 1;
         self.current = Some(v);
         self.current_tampered = false;
-        self.attempts.entry(t).or_default().push(v);
+        self.raw_attempts
+            .entry(t)
+            .or_default()
+            .push((id.clone(), v));
         match fault {
             None | Some(FailureClass::None) => {
-                self.snapshots.entry(t).or_default().push(v);
+                self.append_snapshot(t, &id, v);
                 self.debt.insert(t, false);
             }
             Some(FailureClass::CommitMarker) => {
@@ -3917,7 +4359,7 @@ impl Model {
                 // the snapshot/ref finalization defers to the next push of
                 // this target. Step-17 rotation still succeeds (the fault is
                 // spent), so no debt.
-                self.pending.insert(t, (v, self.current_gen, false));
+                self.pending.insert(t, (id, v, self.current_gen, false));
                 self.debt.insert(t, false);
             }
             Some(FailureClass::RotationInventory) => {
@@ -3926,7 +4368,7 @@ impl Model {
                 // fails, then the push's own slot rotation succeeds and
                 // CLEARS the marker. With no prior marker, the fault hits the
                 // push's own rotation, which defers it as a new marker.
-                self.snapshots.entry(t).or_default().push(v);
+                self.append_snapshot(t, &id, v);
                 self.debt.insert(t, !had_debt);
             }
             Some(FailureClass::Step17Contended) => {
@@ -3941,19 +4383,19 @@ impl Model {
                 // "rotation deferred for slot 'p1'" warning naming the slot,
                 // never silent. A later clean unlocked no-op services the
                 // marker.
-                self.snapshots.entry(t).or_default().push(v);
+                self.append_snapshot(t, &id, v);
                 self.debt.insert(t, true);
                 self.expected_warning = Some(&[STEP17_CONTENTION_WARNING]);
             }
             Some(FailureClass::ObservedWriteServer) => {
                 // The per-server projection write fails (warning-only); the
                 // observed maps themselves still refresh.
-                self.snapshots.entry(t).or_default().push(v);
+                self.append_snapshot(t, &id, v);
                 self.debt.insert(t, false);
             }
             Some(FailureClass::ObservedPrimaryWrite) | Some(FailureClass::ObservedOtherWrite) => {
                 // One member's observed projection stays stale (crash window).
-                self.snapshots.entry(t).or_default().push(v);
+                self.append_snapshot(t, &id, v);
                 self.debt.insert(t, false);
             }
             Some(FailureClass::DebtRead)
@@ -3967,7 +4409,7 @@ impl Model {
                 // any marker via `clear_rotation_deferred` (its later debt
                 // write passes — the one-shot arm was already consumed by
                 // the retry).
-                self.snapshots.entry(t).or_default().push(v);
+                self.append_snapshot(t, &id, v);
                 self.debt.insert(t, false);
             }
             Some(FailureClass::ResultsWrite)
@@ -3979,14 +4421,14 @@ impl Model {
                 // returns `Err` but the intent WAS persisted — the expected
                 // class is `Err` + `Pending` (the attempt stays
                 // recoverable-pending).
-                self.pending.insert(t, (v, self.current_gen, false));
+                self.pending.insert(t, (id, v, self.current_gen, false));
             }
             Some(FailureClass::LastSuccessfulWrite) | Some(FailureClass::TransitionSuccessful) => {
                 // The snapshot was already appended before the ref / terminal
                 // transition write failed; the attempt stays pending and the
                 // recovery must not duplicate the snapshot.
-                self.snapshots.entry(t).or_default().push(v);
-                self.pending.insert(t, (v, self.current_gen, true));
+                self.append_snapshot(t, &id, v);
+                self.pending.insert(t, (id, v, self.current_gen, true));
             }
             Some(FailureClass::IntentPersist) | Some(FailureClass::LockContention) => {
                 unreachable!("handled before the real-deployment mutation")
@@ -3999,7 +4441,7 @@ impl Model {
                 // step-17 loop defers the rotation as a debt marker. The
                 // deferral I/O is NON-FALLIBLE — a debt read/write failure
                 // warns but never changes the committed outcome.
-                self.snapshots.entry(t).or_default().push(v);
+                self.append_snapshot(t, &id, v);
                 match fault {
                     Some(FailureClass::Step17ContentionDebtRead) => {
                         // The debt READ arm is armed ONLY at the fresh
@@ -4165,23 +4607,23 @@ impl Model {
     fn lingering_crash(&self) -> bool {
         self.pending
             .values()
-            .any(|(_, _, already_snapped)| *already_snapped)
+            .any(|(_, _, _, already_snapped)| *already_snapped)
     }
 
     /// Whether `action` would replace the tampered current record with a new
     /// pristine generation. Only a REAL deployment does: a HEAD push/retry
     /// always deploys after a tamper (the tampered artifact never equals the
     /// materialized head), while a snapshot rollback repairs only when its ref
-    /// resolves — an out-of-range index errors at plan time, before any
-    /// mutation, leaving the tampered record in place.
+    /// resolves — an out-of-range index (including a below-floor one, which
+    /// fails closed) errors before any mutation, leaving the tampered record
+    /// in place.
     fn repairs_tamper(&self, action: &Action) -> bool {
         match action {
             Action::Push(_) | Action::Retry(_) => true,
             Action::Rollback(t, i) => self
-                .snapshots
-                .get(t)
-                .map(|s| (*i as usize) < s.len())
-                .unwrap_or(false),
+                .visible_snapshots(t)
+                .iter()
+                .any(|(idx, _, _)| *idx == *i),
             _ => false,
         }
     }
@@ -4206,6 +4648,17 @@ fn action_strategy() -> impl Strategy<Value = Action> {
             .prop_map(|(t, i)| Action::Rollback(t, i)),
         // Standalone rotation under the full member-policy union.
         1 => Just(Action::Rotate),
+        // Checkpoint history floor at a randomly chosen recorded successful
+        // deployment of the target (the selector `k` is resolved against the
+        // target's VISIBLE snapshots by the fixture and the model alike, so
+        // it can only ever name a successful deployment already in the
+        // history). LOW weight: the floor is a rare operation, and its
+        // pending-commit × floor interaction — a below-floor pending commit
+        // discarded with the rest of the below-floor history, an at/above-
+        // floor one finalized by the next push — is the interaction this
+        // property pins.
+        2 => (prop::sample::select(["t1", "t2"].as_slice()), 0u64..8)
+            .prop_map(|(t, k)| Action::Checkpoint(t, k)),
         // Deliberate integrity violation; the property loop skips it while no
         // live generation exists (the fixture's tamper requires one), and the
         // system's own checks defer until the next real push.
@@ -4358,10 +4811,13 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
     let pid = PlacementSlotId::new("p1");
     let mut learned: BTreeMap<u32, ArtifactRef> = BTreeMap::new();
 
-    // Snapshot logs: count + per-index artifact/version join.
+    // Snapshot logs: count + per-index artifact/version join, over the
+    // VISIBLE chain (the raw suffix at/after the target's floor — the model
+    // derives it identically, so a checkpoint that discarded a below-floor
+    // snapshot shows up here as a shorter chain).
     for t in ["t1", "t2"] {
         let sys_snaps = system.store.read_snapshots(t).unwrap_or_default();
-        let want = model.snapshots.get(t).cloned().unwrap_or_default();
+        let want = model.visible_snapshots(t);
         assert_eq!(
             sys_snaps.len(),
             want.len(),
@@ -4369,28 +4825,41 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
             sys = sys_snaps.len(),
             model = want.len(),
         );
-        for (i, (ss, mv)) in sys_snaps.iter().zip(&want).enumerate() {
-            assert_eq!(ss.index, i as u64, "{ctx}: snapshot index order for {t}");
+        for (ss, (wi, wid, mv)) in sys_snaps.iter().zip(&want) {
+            assert_eq!(ss.index, *wi, "{ctx}: snapshot index for {t}");
+            assert_eq!(
+                ss.deployment_id.as_str(),
+                wid,
+                "{ctx}: snapshot deployment id at index {wi} for {t} — the SAME index must \
+                 never resolve to a different deployment (no duplicate, no re-append below the \
+                 floor)"
+            );
             let art = ss.slots[&pid].assignment.artifact.clone();
             learn_artifact(
                 &mut learned,
                 &ctx,
                 *mv,
                 art,
-                &format!("snapshot s{i} of {t}"),
+                &format!("snapshot s{} of {t}", ss.index),
             );
         }
     }
-    // Deployment-attempt logs: exactly one record per real deployment.
+    // Deployment-attempt logs: exactly one record per real deployment, over
+    // the VISIBLE chain (from the floor's own attempt onward).
     for t in ["t1", "t2"] {
         let sys_att = system.store.read_attempts(t).unwrap_or_default();
-        let want = model.attempts.get(t).cloned().unwrap_or_default();
+        let want = model.visible_attempts(t);
         assert_eq!(
             sys_att.len(),
             want.len(),
             "{ctx}: attempt count for {t} must match the model"
         );
-        for (sa, mv) in sys_att.iter().zip(&want) {
+        for (sa, (wid, mv)) in sys_att.iter().zip(&want) {
+            assert_eq!(
+                sa.deployment_id.as_str(),
+                wid,
+                "{ctx}: attempt id order for {t}"
+            );
             let art = sa.desired[&pid].assignment.artifact.clone();
             learn_artifact(&mut learned, &ctx, *mv, art, "attempt {t}");
         }
@@ -4468,13 +4937,20 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
             sys_pending,
             "{ctx}: pending-commit state for {t}"
         );
-        if let Some((pv, _, _)) = model.pending.get(t) {
+        if let Some((pid, pv, _, _)) = model.pending.get(t) {
             // The pending attempt need not be the target's NEWEST attempt: a
             // later deployment can commit after the pending one (e.g. its
             // reconcile marker write consumed a newly-armed fault), so the
-            // pending version must simply have a recorded attempt.
+            // pending attempt must simply have a recorded (raw) attempt —
+            // and a checkpoint at/above the floor never discards it, while a
+            // below-floor one is removed from `pending` by the model and the
+            // system alike.
             assert!(
-                model.attempts[t].contains(pv),
+                model.raw_attempts[t].iter().any(|(id, _)| id == pid),
+                "{ctx}: the pending deployment {pid} must have a recorded attempt"
+            );
+            assert!(
+                model.raw_attempts[t].iter().any(|(_, v)| v == pv),
                 "{ctx}: the pending deployment version {pv} must have a recorded attempt"
             );
         }
@@ -4491,6 +4967,158 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
             model.debt[t], sys_debt,
             "{ctx}: rotation-debt marker for {t}"
         );
+    }
+}
+
+/// The PENDING-COMMIT × CHECKPOINT-FLOOR invariant bundle, asserted after
+/// EVERY step and at the end of a state-machine run (alongside
+/// [`assert_semantic_invariants`]). Pins the documented contract
+/// ([`crate::push::checkpoint`]): a pending-commit attempt whose history lies
+/// BELOW the new floor is discarded with the rest of the below-floor history
+/// (its attempt line, its snapshot entry, and its deployment dir all vanish
+/// from the RAW logs — no resurrection on recovery); one at or above it
+/// stays and is finalized by the next push exactly as before.
+///
+/// (1) the RAW attempt/snapshot logs match the model EXACTLY (ids + indices
+///     + order) — a below-floor pending commit is gone from BOTH raw logs
+///     and its deployment dir is deleted, while an at/above-floor one
+///     survives;
+/// (2) the SAME-index binding — a snapshot index never resolves to a
+///     different deployment id, so the finalized pending attempt keeps its
+///     index (no duplicate snapshot, no re-append below the floor);
+/// (3) RAW snapshot indices are strictly increasing and unique (a
+///     compaction that reused an index would break this);
+/// (4) NO ref (sN, @-, parent(...)) resolves below the floor — below-floor
+///     refs fail closed;
+/// (5) the durable floor marker matches the model per target, and every
+///     comparison runs for BOTH targets — checkpointing t1 never changes
+///     t2's floor, logs, or pending state (cross-target isolation).
+///
+/// The deployment-dir bijection is asserted per retained attempt (its dir
+/// exists) and per retained snapshot (its dir exists exactly when its
+/// attempt line is retained — the documented position-based discard can
+/// leave an at/above-floor snapshot of a below-floor attempt without a dir;
+/// the snapshot stays a valid rollback state, its deployment dir is gone).
+fn assert_checkpoint_invariants(model: &Model, system: &Fixture) {
+    let ctx = format!("after action {}", model.index);
+    for t in ["t1", "t2"] {
+        // (5) the durable floor marker matches the model.
+        let sys_floor = system.store.read_history_floor(t).unwrap_or_default();
+        match (model.floor.get(t).cloned().flatten(), sys_floor) {
+            (None, None) => {}
+            (None, Some(f)) => panic!("{ctx}: unexpected history floor on {t}: {f:?}"),
+            (Some(_), None) => {
+                panic!("{ctx}: model expects a history floor on {t}, none present")
+            }
+            (Some((mid, mi)), Some(f)) => {
+                assert_eq!(
+                    f.deployment_id.as_str(),
+                    mid,
+                    "{ctx}: floor deployment id for {t}"
+                );
+                assert_eq!(f.snapshot_index, mi, "{ctx}: floor snapshot index for {t}");
+            }
+        }
+        // (1) + (3): RAW logs match the model exactly; snapshot indices are
+        // strictly increasing and unique (never reused after compaction).
+        let sys_raw_att = system.store.read_attempts_raw(t).unwrap_or_default();
+        let want_att = model.raw_attempts.get(t).cloned().unwrap_or_default();
+        assert_eq!(
+            sys_raw_att.len(),
+            want_att.len(),
+            "{ctx}: raw attempt count for {t} must match the model"
+        );
+        for (sa, (wid, _)) in sys_raw_att.iter().zip(&want_att) {
+            assert_eq!(
+                sa.deployment_id.as_str(),
+                wid,
+                "{ctx}: raw attempt id order for {t}"
+            );
+        }
+        let sys_raw_snaps = system.store.read_snapshots_raw(t).unwrap_or_default();
+        let want_snaps = model.raw_snapshots.get(t).cloned().unwrap_or_default();
+        assert_eq!(
+            sys_raw_snaps.len(),
+            want_snaps.len(),
+            "{ctx}: raw snapshot count for {t} must match the model"
+        );
+        let mut prev: Option<u64> = None;
+        for (ss, (wi, wid, _)) in sys_raw_snaps.iter().zip(&want_snaps) {
+            assert_eq!(ss.index, *wi, "{ctx}: raw snapshot index for {t}");
+            assert_eq!(
+                ss.deployment_id.as_str(),
+                wid,
+                "{ctx}: raw snapshot id at index {wi} for {t}"
+            );
+            if let Some(p) = prev {
+                assert!(
+                    p < *wi,
+                    "{ctx}: raw snapshot indices on {t} must be strictly increasing (never \
+                     reused after compaction)"
+                );
+            }
+            prev = Some(*wi);
+        }
+        // (1) the deployment-dir bijection: every retained attempt owns its
+        // dir; a below-floor attempt's dir is gone (deleted with the rest of
+        // the below-floor history). A retained snapshot's dir exists exactly
+        // when its attempt line is retained.
+        let mut retained_attempt_ids: HashSet<&str> = HashSet::new();
+        for (id, _) in &want_att {
+            assert!(
+                system.store.deployment_dir(id).exists(),
+                "{ctx}: the deployment dir of retained attempt {id} on {t} must exist"
+            );
+            assert!(
+                retained_attempt_ids.insert(id.as_str()),
+                "{ctx}: duplicate raw attempt id {id} on {t}"
+            );
+        }
+        for (_, wid, _) in &want_snaps {
+            if retained_attempt_ids.contains(wid.as_str()) {
+                assert!(
+                    system.store.deployment_dir(wid).exists(),
+                    "{ctx}: the deployment dir of retained snapshot {wid} on {t} must exist"
+                );
+            }
+        }
+        // (4) below-floor refs fail closed: the direct index form AND a
+        // relative parent() walk landing below the floor.
+        if let Some((_, fi)) = model.floor.get(t).cloned().flatten()
+            && fi > 0
+        {
+            let below = fi - 1;
+            let err = history::resolve_ref_expr(
+                &history::parse_ref_expr(&format!("s{below}")).unwrap(),
+                t,
+                &system.store,
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("history floor") || msg.contains("no snapshot"),
+                "{ctx}: below-floor s{below} on {t} must fail closed, got: {msg}"
+            );
+            let latest = model
+                .visible_snapshots(t)
+                .last()
+                .map(|(i, _, _)| *i)
+                .unwrap_or(fi);
+            if latest > below {
+                let err = history::resolve_ref_expr(
+                    &history::parse_ref_expr(&format!("parent(s{latest}, {})", latest - below))
+                        .unwrap(),
+                    t,
+                    &system.store,
+                )
+                .unwrap_err();
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("history floor") || msg.contains("no snapshot"),
+                    "{ctx}: parent() walking below s{fi} on {t} must fail closed, got: {msg}"
+                );
+            }
+        }
     }
 }
 
@@ -4515,8 +5143,11 @@ fn run_semantic_state_case(steps: Vec<(Action, FailureClass)>) {
     // registry (see `src/testutil.rs`), so the 128 cases run concurrently
     // with the fault-matrix and engine fault tests without any shared
     // process-global slot to race over.
-    let mut model = Model::new();
     let system = Fixture::new();
+    // The oracle mints the SAME deployment ids as the fixture (same tag,
+    // same counter), so its raw logs, floor, and pending state can be
+    // compared id-for-id with the system's.
+    let mut model = Model::new_with_tag(system.prop_tag());
     for (action, fault) in steps {
         // A Tamper needs a live generation (it edits the CURRENT assignment);
         // generated tampers before the first deployment are skipped rather
@@ -4639,7 +5270,70 @@ fn run_semantic_state_case(steps: Vec<(Action, FailureClass)>) {
         // invariant groups); internally suspended while the crash window is
         // open or the step was a tamper / an unknown class.
         assert_semantic_invariants(&model, &system);
+        // THE CHECKPOINT REPORT ORACLE: when the step was a checkpoint, the
+        // ACTUAL report must match the model's expectation field-for-field —
+        // the floor it established and the EXACT discard sets the real
+        // `checkpoint_discards` enumerated. A no-op checkpoint step (no
+        // visible snapshot) returns a plain [`Outcome::Ok`] from both sides.
+        if matches!(&action, Action::Checkpoint(..))
+            && let Outcome::Checkpoint(rep) = &outcome
+        {
+            let want = model
+                .last_checkpoint
+                .as_ref()
+                .expect("a checkpoint step records the model's expectation");
+            assert_eq!(
+                rep.target, want.target,
+                "after action {}: checkpoint target",
+                model.index
+            );
+            assert_eq!(
+                rep.deployment_id.as_str(),
+                want.deployment_id,
+                "after action {}: checkpoint deployment id",
+                model.index
+            );
+            assert_eq!(
+                rep.snapshot_index, want.snapshot_index,
+                "after action {}: checkpoint snapshot index",
+                model.index
+            );
+            assert_eq!(
+                rep.established, want.established,
+                "after action {}: checkpoint established flag (first/advance vs \
+                 idempotent re-checkpoint)",
+                model.index
+            );
+            assert!(
+                !rep.cleanup_pending
+                    && !rep.cleanup_persistence_failed
+                    && !rep.cleanup_clear_failed,
+                "after action {}: a clean checkpoint must report no cleanup debt",
+                model.index
+            );
+            assert_eq!(
+                rep.discards.discarded_attempts, want.discarded_attempts,
+                "after action {}: checkpoint discard set (attempts below the floor)",
+                model.index
+            );
+            assert_eq!(
+                rep.discards.discarded_snapshots, want.discarded_snapshots,
+                "after action {}: checkpoint discard set (snapshots below the floor)",
+                model.index
+            );
+            assert_eq!(
+                rep.discards.discarded_deployments, want.discarded_deployments,
+                "after action {}: checkpoint discard set (deployment dirs)",
+                model.index
+            );
+        }
+        // The pending-commit × checkpoint-floor invariants (raw logs, floor
+        // marker, below-floor refs, deployment-dir bijection) — after EVERY
+        // step.
+        assert_checkpoint_invariants(&model, &system);
     }
+    // End of run: the same invariant bundle once more.
+    assert_checkpoint_invariants(&model, &system);
 }
 
 proptest! {
