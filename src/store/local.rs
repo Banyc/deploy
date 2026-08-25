@@ -40,7 +40,9 @@ use crate::records::{
     DeploymentAttempt, DeploymentResults, DeploymentSnapshot, DeploymentStatus,
     DeploymentTransition, ObservedTarget, ServerState,
 };
-use crate::store::atomic::{copy_dir_recursive, ensure_private_dir, read_json, set_private};
+use crate::store::atomic::{
+    copy_dir_recursive, ensure_private_dir, path_state, read_json, set_private,
+};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -484,7 +486,11 @@ impl LocalStore {
 
     pub fn read_observed(&self, target: &str) -> Result<ObservedTarget> {
         let p = self.target_dir(target).join("observed.json");
-        if p.exists() {
+        // Tri-state: only a genuine NotFound is "no observed record" (the
+        // default); a stat failure propagates as a Store error (a
+        // permission error on the record must not read as "never
+        // observed").
+        if path_state(&p)? {
             read_json(&p)
         } else {
             Ok(ObservedTarget {
@@ -528,7 +534,10 @@ impl LocalStore {
             ));
         }
         let p = self.rotation_debt_path(target);
-        if p.exists() {
+        // Tri-state: only a genuine NotFound is "no maintenance debt" (the
+        // empty map); a stat failure propagates as a Store error (an
+        // unreadable debt marker must not read as "no debt").
+        if path_state(&p)? {
             read_json(&p)
         } else {
             Ok(BTreeMap::new())
@@ -551,7 +560,10 @@ impl LocalStore {
         }
         let p = self.rotation_debt_path(target);
         if debt.is_empty() {
-            if p.exists() {
+            // Tri-state removal decision: a genuine NotFound is nothing to
+            // remove; any other stat error propagates (an unreadable marker
+            // must not silently survive as a stale "debt" record).
+            if path_state(&p)? {
                 std::fs::remove_file(&p).map_err(|e| {
                     Error::store(format!("remove rotation debt {}: {e}", p.display()))
                 })?;
@@ -597,7 +609,11 @@ impl LocalStore {
     /// floor-gated [`LocalStore::read_attempts`].
     pub(crate) fn read_attempts_raw(&self, target: &str) -> Result<Vec<DeploymentAttempt>> {
         let p = self.target_dir(target).join("attempts.jsonl");
-        if !p.exists() {
+        // Tri-state: only a genuine NotFound is "no attempts log" (the
+        // empty list); a stat failure propagates as a Store error (an
+        // unreadable log must not read as "no history" — the floor binding
+        // would then fail open below the floor).
+        if !path_state(&p)? {
             return Ok(vec![]);
         }
         let text =
@@ -716,7 +732,11 @@ impl LocalStore {
     /// consumers must use the floor-gated [`LocalStore::read_snapshots`].
     pub(crate) fn read_snapshots_raw(&self, target: &str) -> Result<Vec<DeploymentSnapshot>> {
         let p = self.refs_dir(target).join("snapshots.jsonl");
-        if !p.exists() {
+        // Tri-state: only a genuine NotFound is "no snapshots log" (the
+        // empty vector); a stat failure propagates as a Store error (an
+        // unreadable log must not read as "no history" — a floor binding
+        // check would then fail open).
+        if !path_state(&p)? {
             return Ok(vec![]);
         }
         let text = std::fs::read_to_string(&p)
@@ -892,7 +912,10 @@ impl LocalStore {
     /// Read the full append-only transition stream for a deployment.
     pub fn read_transitions(&self, id: &str) -> Result<Vec<DeploymentTransition>> {
         let p = self.deployment_dir(id).join("transitions.jsonl");
-        if !p.exists() {
+        // Tri-state: only a genuine NotFound is "no transition stream" (the
+        // empty vector); a stat failure propagates as a Store error (an
+        // unreadable log must not read as "no history").
+        if !path_state(&p)? {
             return Ok(vec![]);
         }
         let text = std::fs::read_to_string(&p)

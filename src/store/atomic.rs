@@ -17,8 +17,9 @@
 //!
 //! The helpers here are the shared plumbing — `pub(crate)` free functions
 //! imported by [`crate::store::local`] and [`crate::store::history_floor`]:
-//! the fail-closed parent-dir fsync ([`sync_parent_dir`]), unique temp
-//! naming ([`temp_name_for`]), the atomic marker/JSONL rewrites
+//! the tri-state existence check ([`path_state`]), the fail-closed
+//! parent-dir fsync ([`sync_parent_dir`]), unique temp naming
+//! ([`temp_name_for`]), the atomic marker/JSONL rewrites
 //! ([`write_atomic_replace`], [`write_jsonl_atomic`]), private permissions
 //! ([`set_private`], [`ensure_private_dir`]), the tree-object directory
 //! copy ([`copy_dir_recursive`]), and the JSON readers.
@@ -77,6 +78,214 @@ pub(crate) fn read_json_marker<T: serde::de::DeserializeOwned>(path: &Path) -> R
         ))
     })
 }
+/// TRI-STATE existence check for marker/backup/log DISCOVERY: is `path`
+/// present? A genuine [`std::io::ErrorKind::NotFound`] from
+/// [`std::fs::symlink_metadata`] is the ONE outcome that reads as ABSENCE
+/// (`Ok(false)`); EVERY other filesystem error (EACCES, EIO, ENOTDIR, ...)
+/// is a real failure → [`Error::store`], NEVER treated as absence. This is
+/// the fail-closed replacement for the boolean `.exists()` checks that
+/// silently read a permission/I/O error on the marker directory as "no
+/// floor" / "no pending cleanup" / "no backups".
+///
+/// The store's WRITE-path open-or-create checks (`append_attempt`,
+/// `append_snapshot`, `write_atomic_cas`) are deliberately NOT converted:
+/// there a swallowed `exists()` error lands in the subsequent open/create
+/// call, which fails and propagates anyway — no silent absence is possible.
+///
+/// Under `#[cfg(test)]` the check routes through the injectable
+/// [`MarkerIoOps`] seam when a test installed one, so the tri-state
+/// property can force each outcome on the marker path.
+pub(crate) fn path_state(path: &Path) -> Result<bool> {
+    #[cfg(test)]
+    if let Some(ops) = MARKER_IO_OPS.with(|s| s.borrow().clone()) {
+        return match ops.exists(path) {
+            Ok(present) => Ok(present),
+            Err(e) => absent_or_store(e, path),
+        };
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) => absent_or_store(e, path),
+    }
+}
+
+/// Classify a metadata error tri-state: ONLY a genuine
+/// [`std::io::ErrorKind::NotFound`] is absence (`Ok(false)`); any other io
+/// error is [`Error::store`] (a permission/read failure is never "no
+/// marker").
+fn absent_or_store(e: std::io::Error, path: &Path) -> Result<bool> {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        Ok(false)
+    } else {
+        Err(Error::store(format!("stat {}: {e}", path.display())))
+    }
+}
+
+/// INJECTABLE FILESYSTEM-IO BOUNDARY for marker discovery (test-only
+/// seam): the tri-state existence check ([`path_state`]), the refs-dir
+/// backup-sibling enumeration
+/// ([`crate::store::history_floor::floor_backup_siblings`]), and the
+/// backup read
+/// ([`crate::store::history_floor::LocalStore::validated_backup`]) route
+/// through this slot when a test installed a seam — so the tri-state
+/// property can force each outcome (NotFound vs EACCES vs EIO) at the
+/// marker path's metadata, the refs-dir `read_dir`, and the backup read,
+/// and assert the fail-closed class. Production never installs a seam: the
+/// routed helpers fall through to the REAL filesystem. The seam is
+/// PER-THREAD (mirroring the floor-transaction [`FloorFsOps`](crate::store::history_floor::FloorFsOps) seam), so
+/// two fixtures in different test threads can never interfere;
+/// [`MarkerIoSeamGuard`] scopes one installation to one test case.
+#[cfg(test)]
+pub(crate) trait MarkerIoOps: Send + Sync {
+    /// The marker path's existence stat: `Ok(true)` present, `Ok(false)`
+    /// absent, `Err(io)` for a forced/real failure.
+    fn exists(&self, path: &Path) -> std::io::Result<bool>;
+    /// Enumerate a directory (the refs dir holding the backup siblings).
+    fn read_dir(&self, path: &Path) -> std::io::Result<Vec<PathBuf>>;
+    /// Read a backup/marker file's bytes.
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>>;
+}
+
+// The installed seam for the current thread ([`MarkerIoOps`]). `None` in
+// production and in tests that did not install one — discovery then
+// performs the REAL filesystem calls.
+#[cfg(test)]
+thread_local! {
+    static MARKER_IO_OPS: std::cell::RefCell<Option<std::sync::Arc<dyn MarkerIoOps>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Route a directory enumeration for marker/backup discovery through the
+/// injectable filesystem boundary: production performs the REAL
+/// [`std::fs::read_dir`] (with per-entry errors PROPAGATED — an entry that
+/// cannot be read is never silently dropped from the list); a test that
+/// installed a seam performs the seam's enumeration instead.
+pub(crate) fn routed_read_dir(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    #[cfg(test)]
+    if let Some(ops) = MARKER_IO_OPS.with(|s| s.borrow().clone()) {
+        return ops.read_dir(path);
+    }
+    std::fs::read_dir(path)?
+        .map(|e| e.map(|e| e.path()))
+        .collect()
+}
+
+/// Route a marker/backup read through the [`MarkerIoOps`] boundary
+/// (production: the REAL [`std::fs::read`]).
+pub(crate) fn routed_read_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(test)]
+    if let Some(ops) = MARKER_IO_OPS.with(|s| s.borrow().clone()) {
+        return ops.read(path);
+    }
+    std::fs::read(path)
+}
+
+/// Test-only RAII guard scoping a [`MarkerIoOps`] seam to one marker
+/// discovery case: installs the seam for the CURRENT thread and restores
+/// the previous seam on drop, so a proptest case cannot leak its arming
+/// into the next case (or another test on the same thread).
+#[cfg(test)]
+pub(crate) struct MarkerIoSeamGuard(Option<std::sync::Arc<dyn MarkerIoOps>>);
+
+#[cfg(test)]
+impl MarkerIoSeamGuard {
+    pub(crate) fn install(ops: std::sync::Arc<dyn MarkerIoOps>) -> Self {
+        // `Option::replace` swaps the value in place and returns the
+        // previous one (the seam the guard restores on drop).
+        let previous = MARKER_IO_OPS.with(|s| s.borrow_mut().replace(ops));
+        MarkerIoSeamGuard(previous)
+    }
+}
+
+#[cfg(test)]
+impl Drop for MarkerIoSeamGuard {
+    fn drop(&mut self) {
+        MARKER_IO_OPS.with(|s| *s.borrow_mut() = self.0.take());
+    }
+}
+
+/// The I/O outcome a test forces at one marker-discovery site: the ONE
+/// `NotFound` outcome may be absence; `Eacc` (EACCES) and `Eio` (EIO) are
+/// the filesystem failures that must surface as [`Error::store`] — never a
+/// silent None/empty. `Genuine` is a generator-side value meaning "do NOT
+/// force — perform the real filesystem operation" (it is never stored in
+/// the force map).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IoOutcome {
+    /// The operation reports genuine absence (`ENOENT`).
+    NotFound,
+    /// The operation fails with a permission error (`EACCES`).
+    Eacc,
+    /// The operation fails with an I/O error (`EIO`).
+    Eio,
+    /// Perform the REAL filesystem operation (no forcing).
+    Genuine,
+}
+
+#[cfg(test)]
+fn forced_io_err(o: IoOutcome) -> std::io::Error {
+    // Raw errnos keep the injected kinds REAL (`e.kind()` reports NotFound
+    // for ENOENT, PermissionDenied for EACCES, Uncategorized for EIO).
+    match o {
+        IoOutcome::NotFound => std::io::Error::from_raw_os_error(2), // ENOENT
+        IoOutcome::Eacc => std::io::Error::from_raw_os_error(13),    // EACCES
+        IoOutcome::Eio => std::io::Error::from_raw_os_error(5),      // EIO
+        IoOutcome::Genuine => unreachable!("Genuine is never a forced error"),
+    }
+}
+
+/// Test impl of [`MarkerIoOps`]: performs the REAL filesystem calls for
+/// paths without a forced outcome, and returns the forced error otherwise.
+/// Per-path and STATELESS — the same forced outcome repeats on every call,
+/// so the property can drive the same read through several APIs.
+#[cfg(test)]
+pub(crate) struct TestMarkerIoOps {
+    forced: std::sync::Mutex<std::collections::BTreeMap<PathBuf, IoOutcome>>,
+}
+
+#[cfg(test)]
+impl TestMarkerIoOps {
+    pub(crate) fn new() -> Self {
+        TestMarkerIoOps {
+            forced: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    /// Replace the per-path force map: every `path` present in `forced`
+    /// reports `outcome` on the matching operation; every other path
+    /// performs the REAL filesystem call (genuine behavior).
+    pub(crate) fn force(&self, forced: std::collections::BTreeMap<PathBuf, IoOutcome>) {
+        *self.forced.lock().unwrap() = forced;
+    }
+}
+
+#[cfg(test)]
+impl MarkerIoOps for TestMarkerIoOps {
+    fn exists(&self, path: &Path) -> std::io::Result<bool> {
+        match self.forced.lock().unwrap().get(path).copied() {
+            Some(IoOutcome::Genuine) | None => std::fs::symlink_metadata(path).map(|_| true),
+            Some(o) => Err(forced_io_err(o)),
+        }
+    }
+
+    fn read_dir(&self, path: &Path) -> std::io::Result<Vec<PathBuf>> {
+        match self.forced.lock().unwrap().get(path).copied() {
+            Some(IoOutcome::Genuine) | None => std::fs::read_dir(path)?
+                .map(|e| e.map(|e| e.path()))
+                .collect(),
+            Some(o) => Err(forced_io_err(o)),
+        }
+    }
+
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        match self.forced.lock().unwrap().get(path).copied() {
+            Some(IoOutcome::Genuine) | None => std::fs::read(path),
+            Some(o) => Err(forced_io_err(o)),
+        }
+    }
+}
+
 pub(crate) fn set_private(path: &Path) -> Result<()> {
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(path, perms)

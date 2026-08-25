@@ -147,8 +147,8 @@ use crate::error::{Error, Result};
 use crate::model::{CLEANUP_PENDING_SCHEMA_VERSION, SCHEMA_VERSION};
 use crate::records::{CleanupPending, DeploymentSnapshot, HistoryFloor};
 use crate::store::atomic::{
-    read_json_marker, set_private, sync_parent_dir, temp_name_for, write_atomic_replace,
-    write_jsonl_atomic,
+    path_state, read_json_marker, routed_read_bytes, routed_read_dir, set_private, sync_parent_dir,
+    temp_name_for, write_atomic_replace, write_jsonl_atomic,
 };
 use crate::store::local::LocalStore;
 use std::io::Write;
@@ -193,29 +193,46 @@ fn floor_backup_path(path: &Path, tag: &str) -> PathBuf {
 /// ([`LocalStore::read_history_floor`]) treats ANY of them alongside a
 /// missing marker as a torn advance (never "no floor", which would expose
 /// the below-floor prefix). The staged temp files carry the `.tmp.` infix,
-/// so they never match the `.prev` prefix. The list is empty when the
-/// parent directory is missing or unreadable (the reader then simply sees
-/// no marker and no backup).
-fn floor_backup_siblings(path: &Path) -> Vec<PathBuf> {
+/// so they never match the `.prev` prefix.
+///
+/// FAIL-CLOSED ENUMERATION (the fix for the error-swallowing
+/// `read_dir(...).unwrap_or_default()`): the list is empty ONLY when the
+/// parent directory is GENUINELY MISSING ([`std::io::ErrorKind::NotFound`] —
+/// the reader then simply sees no marker and no backup) or when the parent
+/// is not a child-bearing path at all; ANY other enumeration error (EACCES,
+/// EIO, ENOTDIR, ...) — the `read_dir` open itself or an entry error —
+/// PROPAGATES as a [`Error::store`] error, never a silently-shorter (empty)
+/// list: an unreadable marker directory must not read as "no backups"
+/// (which would read a torn advance as "no floor").
+fn floor_backup_siblings(path: &Path) -> Result<Vec<PathBuf>> {
     let parent = match path.parent() {
         Some(p) => p,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let prefix = format!("{name}.prev");
-    let mut out: Vec<PathBuf> = std::fs::read_dir(parent)
-        .map(|rd| {
-            rd.flatten()
-                .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
-                .map(|e| e.path())
-                .collect()
+    // Route through the injectable [`MarkerIoOps`] seam when a test
+    // installed one; production performs the REAL read_dir with per-entry
+    // errors propagated. NotFound (no refs dir yet) → no marker, no
+    // backup; ANY other enumeration error → Store.
+    let entries = match routed_read_dir(parent) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Error::store(format!("read_dir {}: {e}", parent.display()))),
+    };
+    let mut out: Vec<PathBuf> = entries
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().starts_with(&prefix))
+                .unwrap_or(false)
         })
-        .unwrap_or_default();
+        .collect();
     out.sort();
-    out
+    Ok(out)
 }
 
 /// INJECTABLE FILESYSTEM-OPERATION BOUNDARY for the floor transaction
@@ -497,7 +514,12 @@ impl LocalStore {
         // to THIS transaction — a stale backup from another transaction is
         // a DIFFERENT file and can never be consulted or restored here.
         let backup = floor_backup_path(&path, floor.deployment_id.as_str());
-        let had_floor = path.exists();
+        // TRI-STATE existence: a filesystem ERROR on the marker stat is a
+        // [`Error::store`] failure — never "no floor" (which would treat a
+        // torn-advance state as a first-ever checkpoint and erase the
+        // previous floor's transactional guarantee). Only a genuine
+        // NotFound (no previous checkpoint) reads as no floor.
+        let had_floor = path_state(&path)?;
         // PRE-ADVANCE FLOOR (the restore-verification anchor): the floor
         // this advance moves aside. The RESTORE only ever restores a
         // backup whose content parses and EQUALS this floor — a backup
@@ -587,9 +609,11 @@ impl LocalStore {
             // a test can fail the ACTUAL call BEFORE A moves. A real
             // failure leaves A at the marker name (rename is atomic — the
             // backup does not exist): the cleanup-and-restore handler's
-            // `path` guard (`backup.exists() || !had_floor`) keeps A at the
-            // marker name and drops only B's staged temp — a failed backup
-            // can never erase the previous floor.
+            // TRI-STATE `path` guard (`path_state(backup)` — only a genuine
+            // NotFound means "no backup", and a stat failure stops the
+            // cleanup with A untouched) keeps A at the marker name and drops
+            // only B's staged temp — a failed backup can never erase the
+            // previous floor.
             floor_fs_rename(&path, &backup).map_err(|e| {
                 self.cleanup_and_restore(
                     &path,
@@ -767,7 +791,7 @@ impl LocalStore {
         // is left over and FAILS CLOSED when leftovers exist but none
         // validates — an unvalidatable backup is never deleted while the
         // marker is absent.
-        if !path.exists() {
+        if !path_state(path)? {
             self.recover_history_floor_backup(target)?;
         }
         // Marker EXISTS (restored by the guard above, or never torn):
@@ -775,7 +799,7 @@ impl LocalStore {
         // PROPAGATE (fail-closed: an advance must not proceed while a
         // leftover backup that a later failure could mistake for its own
         // still sits in the directory).
-        for leftover in floor_backup_siblings(path) {
+        for leftover in floor_backup_siblings(path)? {
             std::fs::remove_file(&leftover).map_err(|e| {
                 Error::store(format!(
                     "reconcile stale history-floor backup {}: {e}",
@@ -834,9 +858,32 @@ impl LocalStore {
         //    rename succeeded — the temp no longer exists).
         let _ = std::fs::remove_file(tmp);
         // 2. B's marker-name artifact — never A (see the doc above for the
-        //    guard: the failed-backup-rename case keeps A at `path`).
-        if backup.exists() || !had_floor {
-            let _ = std::fs::remove_file(path);
+        //    guard: the failed-backup-rename case keeps A at `path`). The
+        //    guard is TRI-STATE ([`path_state`]): a filesystem ERROR on the
+        //    backup stat is NEVER read as "no backup" (which would remove A
+        //    at `path` when the backup actually exists — a failed advance
+        //    could then erase the previously durable floor) and NEVER read
+        //    as "backup exists" (which would remove A when the stat failed
+        //    and A still occupies the marker name). Fail-closed: on an
+        //    unreadable backup state the handler STOPS — A is left exactly
+        //    where it is and the original error is wrapped with the stat
+        //    failure (the restore below would fail on the same stat anyway;
+        //    every read then fails closed on the torn state).
+        match path_state(backup) {
+            Ok(true) => {
+                let _ = std::fs::remove_file(path);
+            }
+            Ok(false) => {
+                if !had_floor {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+            Err(e) => {
+                return Error::store(format!(
+                    "{original}; cannot stat the floor backup {} ({e}) during cleanup — the marker-name file is left in place and every read fails closed",
+                    backup.display()
+                ));
+            }
         }
         // 3. + 4. Restore A (tag- and content-verified) and propagate the
         //    original error (wrapped only when the restore itself failed).
@@ -899,11 +946,14 @@ impl LocalStore {
                 "test fault: history-floor restore forced to fail once",
             ));
         }
-        if !backup.exists() {
-            // The advance failed before the current floor was moved aside:
-            // the floor is still the durable marker — nothing to restore. A
-            // stale backup from ANOTHER transaction is a DIFFERENT tagged
-            // file and is never considered here.
+        // TRI-STATE backup existence: only a genuine NotFound (the advance
+        // failed before the current floor was moved aside — the floor is
+        // still the durable marker) is "nothing to restore"; ANY other
+        // stat failure propagates (an unreadable backup must not read as
+        // "no backup", which would abandon A and leave a torn advance). A
+        // stale backup from ANOTHER transaction is a DIFFERENT tagged file
+        // and is never considered here.
+        if !path_state(backup)? {
             return Ok(());
         }
         // NEVER RESTORE A FOREIGN BACKUP (name check): the backup must be
@@ -955,15 +1005,45 @@ impl LocalStore {
     /// source — when it validates; a backup that fails validation is NEVER
     /// treated as the floor and NEVER restored (an unvalidatable backup is
     /// not "no floor" either — the callers fail closed).
-    fn validated_backup(&self, target: &str, path: &Path) -> Option<(PathBuf, HistoryFloor)> {
-        floor_backup_siblings(path)
-            .into_iter()
-            .rev()
-            .find_map(|backup| {
-                let floor = read_json_marker(&backup).ok()?;
-                self.validate_history_floor(target, &backup, &floor).ok()?;
-                Some((backup, floor))
-            })
+    ///
+    /// FAIL-CLOSED CLASS SPLIT: a per-backup PARSE/INTEGRITY failure (or a
+    /// genuine NotFound — the backup vanished after enumeration) means that
+    /// backup does not VALIDATE — try the next; ANY mechanical I/O failure
+    /// (EACCES, EIO, ...) on the enumeration or the read PROPAGATES as
+    /// [`Error::store`] — a backup that cannot be READ is a disk failure,
+    /// never a silent "this backup doesn't validate" (which would read a
+    /// torn advance with an unreadable backup as "no floor").
+    fn validated_backup(
+        &self,
+        target: &str,
+        path: &Path,
+    ) -> Result<Option<(PathBuf, HistoryFloor)>> {
+        for backup in floor_backup_siblings(path)?.into_iter().rev() {
+            // Read through the injectable [`MarkerIoOps`] seam when a test
+            // installed one; production performs the REAL read. A genuine
+            // NotFound (the backup vanished after enumeration) is absence —
+            // try the next; ANY other read failure propagates as Store.
+            let bytes = match routed_read_bytes(&backup) {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(Error::store(format!("read {}: {e}", backup.display()))),
+            };
+            // Parse-sensitive: malformed content is a per-backup VALIDATION
+            // failure (this backup does not validate — try the next).
+            let floor: HistoryFloor = match serde_json::from_slice(&bytes) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            // The integrity binding: violations are per-backup validation
+            // failures (try the next); mechanical I/O during validation
+            // (the snapshot/attempt log reads) propagates.
+            match self.validate_history_floor(target, &backup, &floor) {
+                Ok(()) => return Ok(Some((backup, floor))),
+                Err(Error::Integrity(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
     }
 
     /// RECOVER a torn floor ADVANCE ([`LocalStore::read_history_floor`]'s
@@ -994,13 +1074,16 @@ impl LocalStore {
     /// back) or when the restore cannot be made durable.
     pub(crate) fn recover_history_floor_backup(&self, target: &str) -> Result<()> {
         let p = self.history_floor_path(target);
-        if p.exists() {
+        // Tri-state: only a genuine NotFound (no marker) proceeds; any
+        // stat failure is a Store error (an unreadable marker must not read
+        // as "recoverable" or "nothing to do").
+        if path_state(&p)? {
             return Ok(());
         }
-        let Some((backup, _)) = self.validated_backup(target, &p) else {
+        let Some((backup, _)) = self.validated_backup(target, &p)? else {
             // No VALIDATED backup to restore: no-op when nothing is left
             // over; fail closed when leftovers exist but none validates.
-            let leftovers = floor_backup_siblings(&p);
+            let leftovers = floor_backup_siblings(&p)?;
             return if leftovers.is_empty() {
                 Ok(())
             } else {
@@ -1086,14 +1169,14 @@ impl LocalStore {
         // never "no floor" either). A marker PRESENT alongside a leftover
         // backup is fine: the success path removes the backup best-effort,
         // and reads prefer the marker, never the backup.
-        if !p.exists() {
+        if !path_state(&p)? {
             // The validated-backup fallback: a VALIDATED leftover backup IS
             // the active floor A — the torn state is read as the
             // pre-advance floor (never None, never an error).
-            if let Some((_, floor)) = self.validated_backup(target, &p) {
+            if let Some((_, floor)) = self.validated_backup(target, &p)? {
                 return Ok(Some(floor));
             }
-            let leftovers = floor_backup_siblings(&p);
+            let leftovers = floor_backup_siblings(&p)?;
             if !leftovers.is_empty() {
                 // Leftovers exist but NONE validates: fail closed (an
                 // unvalidatable backup is never "no floor" either).
@@ -1232,7 +1315,11 @@ impl LocalStore {
         floor: Option<&HistoryFloor>,
     ) -> Result<Option<CleanupPending>> {
         let p = self.cleanup_pending_path(target);
-        if !p.exists() {
+        // Tri-state: only a genuine NotFound is "no pending cleanup"; a
+        // stat failure (EACCES, EIO, ...) propagates as a Store error — a
+        // permission error on the marker directory must not read as "no
+        // pending cleanup" (the retry would treat a stuck debt as clean).
+        if !path_state(&p)? {
             return Ok(None);
         }
         // Parse-sensitive read: malformed CONTENT is Integrity, filesystem
@@ -1316,7 +1403,10 @@ impl LocalStore {
     /// marker.
     pub fn clear_cleanup_pending(&self, target: &str) -> Result<()> {
         let p = self.cleanup_pending_path(target);
-        if p.exists() {
+        // Tri-state: only a genuine absence is "nothing to clear"; a stat
+        // failure propagates (an unreadable marker must not silently stay
+        // as a stale-but-claimed-cleared marker).
+        if path_state(&p)? {
             // Fault hook (keyed by TARGET — the marker lives under
             // `targets/<target>/refs/`, mirroring the rotation-debt kinds),
             // fired BEFORE any I/O: a failure here leaves the marker in
@@ -1427,7 +1517,11 @@ impl LocalStore {
     /// log rewrites keeps that derivation source intact, so an interruption
     /// at ANY point (and any subsequent retry) recomputes the same list from
     /// the still-intact — or already-rewritten — logs and converges:
-    /// already-removed dirs are skipped by `dir.exists()`, and the
+    /// already-removed dirs are skipped by the tri-state existence check
+    /// (a `NotFound` stat — the dir an interrupted pass removed — is a
+    /// skip; ANY other stat error PROPAGATES: an enumeration error
+    /// mid-delete must never silently end the pass early, leaving a
+    /// below-floor directory undeleted), and the
     /// temp+rename rewrites leave old-or-new logs. Reversing the order would
     /// lose the worklist permanently: once the logs are compacted the
     /// discarded ids are gone from them, so a retry could never re-enumerate
@@ -1462,8 +1556,11 @@ impl LocalStore {
         //    directory of another target, never releases/objects/servers,
         //    never a retained at/above-floor dir). First, while the logs
         //    still name every discarded id; a retry recomputes this same
-        //    worklist from the intact logs and `dir.exists()` skips the
-        //    dirs an interrupted pass removed. The delete set is exactly
+        //    worklist from the intact logs and the tri-state `path_state`
+        //    skips the dirs an interrupted pass removed (a `NotFound` stat
+        //    is a skip; ANY other stat error propagates — a deletion pass
+        //    that cannot stat a discard must fail rather than silently
+        //    leave the below-floor directory behind). The delete set is exactly
         //    the log-derived discard set — a corrupted cleanup marker must
         //    never widen it.
         let dirs_to_delete = discards.discarded_deployments.clone();
@@ -1478,7 +1575,15 @@ impl LocalStore {
         }
         for id in &dirs_to_delete {
             let dir = self.deployment_dir(id);
-            if dir.exists() {
+            // TRI-STATE delete-skip (DECIDED): deletion of an
+            // already-removed dir is fine — a genuine NotFound stat is a
+            // skip (the interrupted pass removed it); ANY other stat error
+            // (EACCES, EIO, ...) PROPAGATES — an enumeration error mid-
+            // delete must not silently end the pass early (a skipped dir
+            // would be a below-floor directory that never gets deleted, and
+            // the retry converges only because deletion runs while the logs
+            // still name the worklist).
+            if path_state(&dir)? {
                 std::fs::remove_dir_all(&dir).map_err(|e| {
                     Error::store(format!("remove deployment dir {}: {e}", dir.display()))
                 })?;
@@ -1541,6 +1646,7 @@ mod tests {
     use crate::history;
     use crate::model::{DeploymentId, TargetName};
     use crate::records::DeploymentAttempt;
+    use crate::store::atomic::{IoOutcome, MarkerIoSeamGuard, TestMarkerIoOps};
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
     use std::collections::BTreeMap;
@@ -1699,6 +1805,36 @@ mod tests {
             a_at in 0usize..8,
         ) {
             run_real_b_temp_rename_failure_case(&history, a_at);
+        }
+
+        // THE TRI-STATE MARKER-DISCOVERY PROPERTY: for every combination of
+        // an injected MARKER-METADATA outcome (a), DIRECTORY-ENUMERATION
+        // outcome (b), and BACKUP-READ outcome (c), the discovery readers
+        // classify the result EXACTLY like the oracle — ONLY a genuine
+        // NotFound may read as absence (None / an empty list); EVERY other
+        // I/O failure (EACCES, EIO) returns Error::Store, never a silent
+        // None/empty.
+        #[test]
+        fn only_genuine_not_found_is_absence_every_other_io_failure_is_store(
+            a in prop_oneof![
+                Just(IoOutcome::NotFound),
+                Just(IoOutcome::Eacc),
+                Just(IoOutcome::Eio),
+            ],
+            b in prop_oneof![
+                Just(IoOutcome::Genuine),
+                Just(IoOutcome::NotFound),
+                Just(IoOutcome::Eacc),
+                Just(IoOutcome::Eio),
+            ],
+            c in prop_oneof![
+                Just(IoOutcome::Genuine),
+                Just(IoOutcome::NotFound),
+                Just(IoOutcome::Eacc),
+                Just(IoOutcome::Eio),
+            ],
+        ) {
+            run_marker_discovery_case(a, b, c);
         }
     }
 
@@ -1946,5 +2082,226 @@ mod tests {
         );
         // The handler still dropped B's staged temp.
         assert_no_transaction_artifacts(&store);
+    }
+
+    // ---- the tri-state marker-discovery property --------------------------
+
+    /// The CLASS of a discovery read: `Absent` (Ok(None) / an empty list),
+    /// `Present` (Ok(Some(...)) / a non-empty list), a [`Error::Store`]
+    /// error, or an [`Error::Integrity`] error. The property asserts the
+    /// CLASS — the fail-closed contract, not message text.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ReadClass {
+        Absent,
+        Present,
+        Store,
+        Integrity,
+    }
+
+    fn optional_read_class<T>(r: Result<Option<T>>) -> ReadClass {
+        match r {
+            Ok(None) => ReadClass::Absent,
+            Ok(Some(_)) => ReadClass::Present,
+            Err(Error::Store(_)) => ReadClass::Store,
+            Err(Error::Integrity(_)) => ReadClass::Integrity,
+            Err(e) => panic!("unexpected error class: {e}"),
+        }
+    }
+
+    fn list_read_class(r: Result<Vec<PathBuf>>) -> ReadClass {
+        match r {
+            Ok(v) if v.is_empty() => ReadClass::Absent,
+            Ok(_) => ReadClass::Present,
+            Err(Error::Store(_)) => ReadClass::Store,
+            Err(Error::Integrity(_)) => ReadClass::Integrity,
+            Err(e) => panic!("unexpected error class: {e}"),
+        }
+    }
+
+    /// TORN-ADVANCE FIXTURE: seed a small history, establish floor A, then
+    /// remove the marker and rename it to the durable tagged backup — the
+    /// marker is ABSENT while one VALID backup (holding A) sits in `refs/`:
+    /// the exact state the readers must read as A (validated-backup
+    /// fallback) and fail closed on when the backup is unreadable.
+    fn torn_fixture(tmp: &Path) -> (LocalStore, PathBuf, PathBuf, PathBuf) {
+        let store = LocalStore::with_base(tmp.join("store")).unwrap();
+        seed_history(&store, TARGET, "deploy", &[true, false]);
+        let floor_a = floor_for(TARGET, "deploy-0000", 0);
+        store.write_history_floor(TARGET, &floor_a).unwrap();
+        let marker = store.history_floor_path(TARGET);
+        let backup = floor_backup_path(&marker, "a-tag");
+        std::fs::rename(&marker, &backup).unwrap();
+        let refs = store.refs_dir(TARGET);
+        (store, marker, backup, refs)
+    }
+
+    /// THE ORACLE for [`LocalStore::read_history_floor`] on the torn
+    /// fixture under the injected (a) marker-metadata, (b) refs-dir
+    /// enumeration, and (c) backup-read outcomes:
+    ///
+    /// * (a) EACCES/EIO → `Store` (the marker cannot even be stat'ed — a
+    ///   permission/I/O error is never "no floor");
+    /// * (a) NotFound → the torn-advance fallback:
+    ///   * (b) EACCES/EIO → `Store` (an unreadable refs dir is never "no
+    ///     backups");
+    ///   * (b) NotFound → `Absent` (genuine absence: no marker, no
+    ///     backups);
+    ///   * (b) genuine (the backup IS enumerated):
+    ///     * (c) genuine → `Present` (the validated backup IS the floor A);
+    ///     * (c) EACCES/EIO → `Store` (a torn advance with an UNREADABLE
+    ///       backup fails closed — never "no floor");
+    ///     * (c) NotFound → `Integrity` (an enumerated backup that cannot
+    ///       be read does not validate, and a leftover that does not
+    ///       validate is never "no floor" either).
+    fn expected_floor_read(a: IoOutcome, b: IoOutcome, c: IoOutcome) -> ReadClass {
+        match a {
+            IoOutcome::Eacc | IoOutcome::Eio => ReadClass::Store,
+            IoOutcome::NotFound => match b {
+                IoOutcome::Eacc | IoOutcome::Eio => ReadClass::Store,
+                IoOutcome::NotFound => ReadClass::Absent,
+                IoOutcome::Genuine => match c {
+                    IoOutcome::Genuine => ReadClass::Present,
+                    IoOutcome::NotFound => ReadClass::Integrity,
+                    IoOutcome::Eacc | IoOutcome::Eio => ReadClass::Store,
+                },
+            },
+            // (a) is never generated as genuine — the fixture's marker is
+            // genuinely absent, so genuine == NotFound at this coordinate.
+            IoOutcome::Genuine => unreachable!("(a) is never generated as Genuine"),
+        }
+    }
+
+    /// One TRI-STATE MARKER-DISCOVERY case: build the torn fixture, force
+    /// (a)/(b)/(c) at their exact paths through the injectable
+    /// [`MarkerIoOps`] seam, drive every discovery reader, and assert each
+    /// result class equals the oracle — `read_history_floor` and
+    /// `read_cleanup_pending` under (a), `floor_backup_siblings` under (b),
+    /// `validated_backup` under (b) × (c).
+    fn run_marker_discovery_case(a: IoOutcome, b: IoOutcome, c: IoOutcome) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, marker, backup, refs) = torn_fixture(tmp.path());
+        let cleanup = store.cleanup_pending_path(TARGET);
+
+        // (a) forces the MARKER metadata (and, being the marker-metadata
+        // coordinate, the cleanup-pending marker's metadata too); (b) the
+        // refs-dir enumeration; (c) the backup read. Genuine coordinates
+        // are simply not forced — the seam performs the real fs call.
+        let seam = Arc::new(TestMarkerIoOps::new());
+        let mut forced = BTreeMap::new();
+        forced.insert(marker.clone(), a);
+        forced.insert(cleanup, a);
+        if b != IoOutcome::Genuine {
+            forced.insert(refs, b);
+        }
+        if c != IoOutcome::Genuine {
+            forced.insert(backup, c);
+        }
+        seam.force(forced);
+        let _guard = MarkerIoSeamGuard::install(seam);
+
+        // READ_HISTORY_FLOOR: the torn-advance read under (a) × (b) × (c).
+        let got = optional_read_class(store.read_history_floor(TARGET));
+        assert_eq!(
+            got,
+            expected_floor_read(a, b, c),
+            "read_history_floor under (a={a:?}, b={b:?}, c={c:?})"
+        );
+
+        // READ_CLEANUP_PENDING: its own marker's metadata outcome is the
+        // same (a) (the fixture has no cleanup marker — genuine ==
+        // NotFound); only a genuine NotFound may read "no pending cleanup".
+        let got = optional_read_class(store.read_cleanup_pending(TARGET, None));
+        let want = match a {
+            IoOutcome::NotFound => ReadClass::Absent,
+            IoOutcome::Eacc | IoOutcome::Eio => ReadClass::Store,
+            IoOutcome::Genuine => unreachable!("(a) is never generated as Genuine"),
+        };
+        assert_eq!(
+            got, want,
+            "read_cleanup_pending under (a={a:?}, b={b:?}, c={c:?})"
+        );
+
+        // FLOOR_BACKUP_SIBLINGS: the enumeration outcome (b) directly.
+        let got = list_read_class(floor_backup_siblings(&marker));
+        let want = match b {
+            IoOutcome::NotFound => ReadClass::Absent,
+            IoOutcome::Eacc | IoOutcome::Eio => ReadClass::Store,
+            IoOutcome::Genuine => ReadClass::Present, // the torn fixture genuinely lists the backup
+        };
+        assert_eq!(
+            got, want,
+            "floor_backup_siblings under (a={a:?}, b={b:?}, c={c:?})"
+        );
+
+        // VALIDATED_BACKUP: enumeration (b) × backup read (c).
+        let got = optional_read_class(store.validated_backup(TARGET, &marker));
+        let want = match b {
+            IoOutcome::NotFound => ReadClass::Absent,
+            IoOutcome::Eacc | IoOutcome::Eio => ReadClass::Store,
+            IoOutcome::Genuine => match c {
+                IoOutcome::Genuine => ReadClass::Present,
+                IoOutcome::NotFound => ReadClass::Absent, // the vanished backup is absence at THIS level
+                IoOutcome::Eacc | IoOutcome::Eio => ReadClass::Store,
+            },
+        };
+        assert_eq!(
+            got, want,
+            "validated_backup under (a={a:?}, b={b:?}, c={c:?})"
+        );
+    }
+
+    /// CONTROL (the user's requirement): genuine absence on a fixture that
+    /// never had a checkpoint — the ONE `NotFound` outcome — reads as
+    /// `None` / an empty list on every discovery read (never an error).
+    #[test]
+    fn genuine_absence_reads_as_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        let marker = store.history_floor_path(TARGET);
+        assert_eq!(
+            store.read_history_floor(TARGET).unwrap(),
+            None,
+            "genuine absence is no floor"
+        );
+        assert_eq!(
+            store.read_cleanup_pending(TARGET, None).unwrap(),
+            None,
+            "genuine absence is no pending cleanup"
+        );
+        assert_eq!(
+            store.validated_backup(TARGET, &marker).unwrap(),
+            None,
+            "genuine absence is no backup"
+        );
+        assert!(
+            floor_backup_siblings(&marker).unwrap().is_empty(),
+            "genuine absence is an empty backup list"
+        );
+    }
+
+    /// CONTROL (the user's requirement): a TORN ADVANCE (marker absent,
+    /// the durable tagged backup holding A present) with an UNREADABLE
+    /// backup — the backup read faults EACCES through the injectable seam
+    /// while the marker stat and the refs-dir enumeration run genuinely —
+    /// FAILS CLOSED with a [`Error::Store`] error: the unreadable backup is
+    /// never "no backup" (which would read the torn state as "no floor",
+    /// re-exposing the below-floor history).
+    #[test]
+    fn torn_advance_with_unreadable_backup_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, _marker, backup, _refs) = torn_fixture(tmp.path());
+        let seam = Arc::new(TestMarkerIoOps::new());
+        let mut forced = BTreeMap::new();
+        forced.insert(backup, IoOutcome::Eacc);
+        seam.force(forced);
+        let _guard = MarkerIoSeamGuard::install(seam);
+
+        let err = store
+            .read_history_floor(TARGET)
+            .expect_err("an unreadable backup in a torn advance must fail closed");
+        assert!(
+            matches!(err, Error::Store(_)),
+            "the class is Store (a read failure), never None and never Integrity, got: {err}"
+        );
     }
 }
