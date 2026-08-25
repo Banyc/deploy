@@ -5,8 +5,8 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::history::{PushRef, resolve_snapshot};
 use crate::model::{
-    ArtifactRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, ServerId, TreeDigest,
-    VariantName,
+    ArtifactRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, ReleaseRecord, ServerId,
+    TreeDigest, VariantName,
 };
 use crate::records::{PhysicalBinding, PlanSource};
 use crate::store::local::LocalStore;
@@ -15,6 +15,57 @@ use std::collections::{BTreeMap, BTreeSet};
 /// The plan for one placement slot: exactly the canonical slot→artifact
 /// assignment ([`PlacementSlotAssignment`]), reused rather than re-declared.
 pub type PlannedAssignment = PlacementSlotAssignment;
+
+/// DIRECT-RELEASE MEMBERSHIP VALIDATION (before any remote access): a
+/// `release:<id>` push deploys onto the CURRENT target's slots, so the
+/// release's OWN canonical slot snapshot must freeze EXACTLY the slot-id set
+/// the target currently has.
+///
+/// The expected set is the union over every variant in the record's snapshot
+/// of the slots whose `targets` list contains the destination target
+/// (variants share slots, so the union is deduplicated by slot id; the
+/// membership is a set). The comparison is LOGICAL membership only: physical
+/// bindings (server / deploy_dir) are intentionally allowed to differ —
+/// unlike the exact-rollback `Snapshot` branch, which also demands identical
+/// physical bindings. A target whose membership DRIFTED since the release
+/// was built — a slot added, removed, or renamed — is refused, before any
+/// assignment is built and before any remote access, rather than deploying
+/// to the wrong slot set.
+///
+/// Runs at TWO sites: the engine's early gate in `push()` — immediately
+/// after the ref is parsed/resolved, BEFORE any lock and BEFORE the remote
+/// factory is invoked, in both real and dry-run modes — and here, in the
+/// `PushRef::Release` plan branch (the second line of defense protecting the
+/// direct-`push_inner` test entry points). `current_slot_ids` is the target's
+/// CURRENT member slot-id set, derived from the caller's config exactly as
+/// [`plan_assignments`] derives it (`config.target_slots`, in deterministic
+/// order), so both gates compare the SAME sets.
+pub(crate) fn validate_direct_release_membership(
+    target_name: &str,
+    release: &ReleaseId,
+    rec: &ReleaseRecord,
+    current_slot_ids: &[PlacementSlotId],
+) -> Result<()> {
+    let expected: BTreeSet<String> = rec
+        .slots
+        .values()
+        .flat_map(|cs| cs.slots.iter())
+        .filter(|s| s.targets.iter().any(|t| t == target_name))
+        .map(|s| s.id.clone())
+        .collect();
+    let current: BTreeSet<String> = current_slot_ids
+        .iter()
+        .map(|s| s.as_str().to_string())
+        .collect();
+    if expected != current {
+        return Err(Error::rollback(format!(
+            "release {release} targets slots [{}] but target '{target_name}' currently has [{}]; direct release membership drift is rejected before remote access",
+            expected.iter().cloned().collect::<Vec<_>>().join(", "),
+            current.iter().cloned().collect::<Vec<_>>().join(", "),
+        )));
+    }
+    Ok(())
+}
 
 /// Resolve the desired assignment for each slot of `target_name` given the
 /// push reference. Returns the assignments, the release the attempt is bound
@@ -126,39 +177,12 @@ pub fn plan_assignments(
             let rec = store
                 .read_release(release)
                 .map_err(|_| Error::rollback(format!("release {release} not available locally")))?;
-            // DIRECT-RELEASE MEMBERSHIP CHECK (before any remote access):
-            // the release's OWN canonical slot snapshot freezes the slot
-            // membership every target was materialized from. A direct release
-            // deploys onto the CURRENT target's slots, so the destination
-            // target's CURRENT slot-id set must EXACTLY equal the slot-id set
-            // the release record froze for that target — the union over every
-            // variant in the record's snapshot of the slots whose `targets`
-            // list contains the destination target (variants share slots, so
-            // the union is deduplicated by slot id; the membership is a set).
-            // The comparison is LOGICAL membership only: physical bindings
-            // (server / deploy_dir) are intentionally allowed to differ —
-            // unlike the exact-rollback `Snapshot` branch, which also demands
-            // identical physical bindings. A target whose membership DRIFTED
-            // since the release was built — a slot added, removed, or renamed
-            // — is refused at PLAN time, before any assignment is built and
-            // before any remote access, rather than deploying to the wrong
-            // slot set.
-            let expected: BTreeSet<String> = rec
-                .slots
-                .values()
-                .flat_map(|cs| cs.slots.iter())
-                .filter(|s| s.targets.iter().any(|t| t == target_name))
-                .map(|s| s.id.clone())
-                .collect();
-            let current: BTreeSet<String> =
-                slot_ids.iter().map(|s| s.as_str().to_string()).collect();
-            if expected != current {
-                return Err(Error::rollback(format!(
-                    "release {release} targets slots [{}] but target '{target_name}' currently has [{}]; direct release membership drift is rejected before remote access",
-                    expected.iter().cloned().collect::<Vec<_>>().join(", "),
-                    current.iter().cloned().collect::<Vec<_>>().join(", "),
-                )));
-            }
+            // DIRECT-RELEASE MEMBERSHIP CHECK (before any remote access) — see
+            // [`validate_direct_release_membership`]. The engine's `push()`
+            // ALSO runs this gate before the remote factory is ever invoked
+            // (real AND dry-run modes); this plan-time call is the second line
+            // of defense, protecting the direct-`push_inner` test entry points.
+            validate_direct_release_membership(target_name, release, &rec, &slot_ids)?;
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
                 let slot_id = PlacementSlotId::new(slot.id.clone());

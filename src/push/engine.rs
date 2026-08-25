@@ -163,6 +163,38 @@ pub fn push(
         None
     };
 
+    // 1c. DIRECT-RELEASE MEMBERSHIP GATE — BOTH modes, immediately after the
+    // ref is parsed/resolved and BEFORE any lock, any factory invocation: a
+    // `release:<id>` push deploys onto the CURRENT target's slots, so the
+    // release's OWN frozen slot set must EXACTLY equal the target's current
+    // membership. The check reads only the release record (immutable store
+    // data) and the config — no lock, no remote — so a drifting membership
+    // refuses HERE, before the remote factory inside `push_inner` is ever
+    // touched (previously the check ran at PLAN time inside `push_inner`,
+    // AFTER the read-only remote status and reconciliation, so a mismatched
+    // push contacted every remote first). For a dry run the ref is already
+    // resolved above; for a real push the direct form's resolution
+    // (`RefExpr::Release` -> `PushRef::Release`) is store-free and never
+    // touches the snapshot chain (see `resolve_ref_expr`), so gating on the
+    // parsed form is exactly equivalent to gating on the resolved ref — no
+    // post-reconcile resolution is needed for the direct form.
+    if let RefExpr::Release(release) = &ref_expr {
+        let rec = store
+            .read_release(release)
+            .map_err(|_| Error::rollback(format!("release {release} not available locally")))?;
+        let members = config.target_slots(target_name)?;
+        let slot_ids: Vec<PlacementSlotId> = members
+            .iter()
+            .map(|(slot, _)| PlacementSlotId::new(slot.id.clone()))
+            .collect();
+        crate::push::plan::validate_direct_release_membership(
+            target_name,
+            release,
+            &rec,
+            &slot_ids,
+        )?;
+    }
+
     // 2. Acquire local application-store lock then target lock (in that order),
     //    held as advisory (flock) locks on open file descriptors. An advisory
     //    lock is released by the kernel when the owning process dies, so a
@@ -2019,7 +2051,9 @@ impl std::ops::Drop for FileLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::RELEASE_RECORD_SCHEMA_VERSION;
+    use crate::model::{
+        CanonicalSlot, CanonicalSlots, Provenance, RELEASE_RECORD_SCHEMA_VERSION, ReleaseRecord,
+    };
     use crate::remote::transport::{FsBytes, LocalTransport};
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -7289,6 +7323,361 @@ interval_seconds = 0
                  (zero factory invocations), got {}",
                 calls.load(Ordering::SeqCst)
             );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // DIRECT-RELEASE MEMBERSHIP DRIFT: `release:<id>` must be rejected BEFORE
+    // the remote factory is invoked (zero remote contact) in BOTH real and
+    // dry-run modes, and must plan when the membership matches (control).
+    // ---------------------------------------------------------------------
+
+    /// The slot universe + fixed members the generated memberships draw from,
+    /// mirroring the plan.rs property: `p1`/`p2`/`p3` are the generated
+    /// COMMON members (declared for BOTH targets), `iso` is a `t2`-ONLY
+    /// member, and `phys` is a constant member whose PHYSICAL binding
+    /// (server) the fixture may drift while its id stays (logical-only
+    /// comparison). Each slot owns a distinct server so the per-target
+    /// server-uniqueness validation passes for every generated membership.
+    const MEMBERSHIP_UNIVERSE: [&str; 3] = ["p1", "p2", "p3"];
+
+    /// Build the membership-drift fixture: a project with targets `t1`/`t2`
+    /// whose CURRENT variant declares the generated membership (plus the
+    /// constants `phys`, `iso`), and a release record whose OWN frozen
+    /// canonical slot snapshot declares the RELEASE-VERSIONED membership
+    /// (plus the same constants). The variant is MATERIALIZED and the real
+    /// tree object stored, and the release record carries a REAL behavior
+    /// snapshot (verified against the record's provenance digest), so a
+    /// MATCHING-membership real push can complete the whole deployment (the
+    /// property's control branch). `physical_drift` rebinds `phys` to a
+    /// different server in the config only (its id stays — the membership
+    /// comparison is logical only). Returns the fixture's tempdir, config
+    /// path, config, store, and the written release id.
+    fn membership_drift_fixture(
+        release_inc: [bool; 3],
+        current_inc: [bool; 3],
+        physical_drift: bool,
+    ) -> (tempfile::TempDir, PathBuf, Config, LocalStore, ReleaseId) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+
+        // Current variant file: one slot entry per generated current member,
+        // plus the constant `iso` (t2-only) and `phys` (rebound when
+        // `physical_drift`). The mappings + activation/verification mirror the
+        // harness `NONE_VARIANT` so a real push completes.
+        let mut variant = String::new();
+        let add_slot = |variant: &mut String, id: &str, server: &str, targets: &str, dir: &str| {
+            variant.push_str(&format!(
+                "[[slots]]\nid = \"{id}\"\nserver = \"{server}\"\ntargets = [{targets}]\ndeploy_dir = \"{dir}\"\n\n"
+            ));
+        };
+        for (i, inc) in current_inc.iter().enumerate() {
+            if *inc {
+                let id = MEMBERSHIP_UNIVERSE[i];
+                add_slot(
+                    &mut variant,
+                    id,
+                    &format!("s{}", i + 1),
+                    "\"t1\", \"t2\"",
+                    &format!("/srv/{id}"),
+                );
+            }
+        }
+        add_slot(&mut variant, "iso", "s4", "\"t2\"", "/srv/iso");
+        add_slot(
+            &mut variant,
+            "phys",
+            if physical_drift { "s6" } else { "s5" },
+            "\"t1\", \"t2\"",
+            "/srv/phys",
+        );
+        variant.push_str(
+            "[[artifact.mappings]]\nfrom = \"artifacts/build/output/\"\nto = \"app/\"\nrecursive = true\n\n\
+             [[artifact.mappings]]\nfrom = \"artifacts/deployment/common/\"\nto = \"app/\"\nrecursive = true\n\n\
+             [activation]\nadapter = \"none\"\n\n\
+             [verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
+        );
+        std::fs::write(release_dir.join("standard.toml"), variant).unwrap();
+
+        let mut servers = String::new();
+        for i in 1..=6 {
+            servers.push_str(&format!(
+                "[[servers]]\nid = \"s{i}\"\naddress = \"a{i}\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n"
+            ));
+        }
+        let cfg_path = project.join("deploy.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "schema_version = 1\napplication = \"eng\"\nrelease = \"v1\"\n\n\
+                 [targets.t1.rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n\
+                 [targets.t1.rotation.deployment]\nprotect_deployments = 1\n\n\
+                 [targets.t2.rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n\
+                 [targets.t2.rotation.deployment]\nprotect_deployments = 1\n\n\
+                 {servers}\
+                 [targets.t1]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n\n\
+                 [targets.t2]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n"
+            ),
+        )
+        .unwrap();
+        // The artifact files the mappings reference (and the real tree
+        // materialized from them).
+        let artifacts_dir = release_dir.join("artifacts");
+        for (p, c) in [
+            ("build/output/app/server", "v1\n"),
+            ("deployment/common/README", "common\n"),
+        ] {
+            let fp = artifacts_dir.join(p);
+            std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
+            std::fs::write(&fp, c).unwrap();
+        }
+        let config = Config::load(&cfg_path).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let remotes_base = dir.path().join("remotes");
+        std::fs::create_dir_all(&remotes_base).unwrap();
+
+        // Materialize the variant and store the REAL tree object, exactly as a
+        // HEAD push would, so the matching-membership control can run a FULL
+        // real push (staging reads the local object).
+        let staging = store.staging_dir().join("membership-fixture");
+        crate::mapper::materialize_variant(
+            &release_dir,
+            &config.variant("standard").unwrap().artifact.mappings,
+            &crate::template::TemplateVars::mapping(
+                &config.application,
+                config.release.as_str(),
+                "standard",
+            ),
+            &staging,
+        )
+        .unwrap();
+        let meta = crate::tree::canonicalize_tree(&staging).unwrap();
+        let tree = meta.tree_sha256;
+        store
+            .store_object(&TreeDigest::new(tree.clone()), &staging)
+            .unwrap();
+
+        // The release's OWN frozen canonical snapshot: the generated
+        // membership (targets t1+t2) plus the constant phys (t1+t2, at its
+        // ORIGINAL server s5) and iso (t2-only), exactly mirroring the
+        // current config's targets lists.
+        let mut canonical: Vec<CanonicalSlot> = Vec::new();
+        for (i, id) in MEMBERSHIP_UNIVERSE.iter().enumerate() {
+            if release_inc[i] {
+                canonical.push(CanonicalSlot {
+                    id: id.to_string(),
+                    server: format!("s{}", i + 1),
+                    deploy_dir: format!("/srv/{id}"),
+                    targets: vec!["t1".to_string(), "t2".to_string()],
+                });
+            }
+        }
+        canonical.push(CanonicalSlot {
+            id: "phys".to_string(),
+            server: "s5".to_string(),
+            deploy_dir: "/srv/phys".to_string(),
+            targets: vec!["t1".to_string(), "t2".to_string()],
+        });
+        canonical.push(CanonicalSlot {
+            id: "iso".to_string(),
+            server: "s4".to_string(),
+            deploy_dir: "/srv/iso".to_string(),
+            targets: vec!["t2".to_string()],
+        });
+        canonical.sort_by(|a, b| a.id.cmp(&b.id));
+
+        // The behavior snapshot the real push's `read_release_behaviors`
+        // verifies against the record's provenance digest, plus the mapping
+        // aux file — mirroring what a HEAD push's `write_release_aux` stores.
+        let vcfg = config.variant("standard").unwrap();
+        let variant_behaviors: BTreeMap<String, BehaviorContract> = BTreeMap::from([(
+            "standard".to_string(),
+            BehaviorContract {
+                activation: vcfg.activation.clone(),
+                verification: vcfg.verification.clone(),
+            },
+        )]);
+        let behavior_sha = crate::release::variant_behaviors_digest(&variant_behaviors);
+        let behavior_json = serde_json::to_value(&variant_behaviors).unwrap();
+        let mut variant_mappings: BTreeMap<String, Vec<Mapping>> = BTreeMap::new();
+        variant_mappings.insert("standard".to_string(), vcfg.artifact.mappings.clone());
+        let mapping_sha = crate::release::variant_mappings_digest(&variant_mappings);
+
+        // Assemble the record with the REAL provenance digests, then recompute
+        // its identity from its own content (the digest folds the slot
+        // snapshot, variant bindings, and provenance in), so `write_release`'s
+        // recompute-and-verify passes.
+        let mut rec = ReleaseRecord {
+            release_schema_version: RELEASE_RECORD_SCHEMA_VERSION,
+            release_id: "unused".to_string(),
+            release_sha256: String::new(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            provenance: Provenance {
+                git_revision: None,
+                mapping_sha256: mapping_sha,
+                behavior_sha256: behavior_sha,
+            },
+            variants: BTreeMap::from([("standard".to_string(), tree.clone())]),
+            slots: BTreeMap::from([("standard".to_string(), CanonicalSlots { slots: canonical })]),
+        };
+        let release = crate::release::recompute_release_digest(&rec)
+            .expect("the fixture record carries its slot snapshot");
+        rec.release_sha256 = release.as_str().to_string();
+        rec.release_id = crate::model::ReleaseId::from_digest(&release)
+            .as_str()
+            .to_string();
+        let rid = ReleaseId::new(rec.release_id.clone());
+        store.write_release(&rec).unwrap();
+        let mapping_toml = toml::to_string_pretty(&variant_mappings).unwrap();
+        store
+            .write_release_aux(&rid, &mapping_toml, &behavior_json)
+            .unwrap();
+
+        (dir, cfg_path, config, store, rid)
+    }
+
+    // THE REQUIRED DIRECT-RELEASE MEMBERSHIP PROPERTY: for generated
+    // RELEASE-VERSIONED vs CURRENT membership sets, a direct `release:<id>`
+    // push invokes the COMPLETE push path (`push(...)`) in BOTH modes — real
+    // (`dry_run: false`) and dry-run (`dry_run: true`) — with a RECORDING
+    // factory (construction AND every remote method call tick a shared
+    // counter). Every MISMATCHED membership is rejected with the
+    // membership-drift error BEFORE the remote factory is invoked: ZERO
+    // factory invocations and ZERO remote calls, in both modes — the drift
+    // gate lives in `push()` right after the ref is parsed/resolved, ahead of
+    // any lock and any factory contact (previously the check ran at plan time
+    // inside `push_inner`, after the read-only remote status had already
+    // contacted every remote).
+    //
+    // CONTROL (matching membership): both modes PLAN — the dry run returns a
+    // dry-run plan and the real push completes a FULL deployment — and the
+    // recording factory IS invoked (a valid push legitimately contacts
+    // remotes to inspect status / to deploy): the property's zero-contact
+    // assertion applies ONLY to the mismatch path, and the control's
+    // `calls > 0` checks prove the recording seam would catch a regression
+    // that re-introduced remote contact before the membership gate (a
+    // counter that could never move would make the zero-invocation assertion
+    // vacuous).
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            // Bounded + fixed seed: deterministic floor, fast.
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn direct_release_membership_drift_rejected_before_remote_factory(
+            release_inc in prop::array::uniform3(prop::bool::ANY),
+            current_inc in prop::array::uniform3(prop::bool::ANY),
+            physical_drift in prop::bool::ANY,
+        ) {
+            let (_dir, cfg_path, config, store, release) =
+                membership_drift_fixture(release_inc, current_inc, physical_drift);
+            let remotes_base = _dir.path().join("remotes");
+            let token = format!("release:{release}");
+            // The membership on the destination `t1` reduces to exactly the
+            // generated universe members plus the constant `phys` (iso is
+            // t2-only), so the sets match iff the two generated arrays match
+            // element-wise.
+            let mismatch = release_inc != current_inc;
+
+            if mismatch {
+                // MISMATCH: rejected BEFORE any remote construction or method
+                // call, in BOTH modes.
+                for dry in [false, true] {
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let factory = recording_factory(remotes_base.clone(), calls.clone());
+                    let err = push(
+                        &cfg_path,
+                        &store,
+                        &factory,
+                        "t1",
+                        &config,
+                        &PushOptions {
+                            dry_run: dry,
+                            ref_token: Some(token.clone()),
+                        },
+                    )
+                    .expect_err(&format!(
+                        "a membership mismatch must reject the push (dry_run={dry})"
+                    ));
+                    let msg = err.to_string();
+                    assert!(
+                        msg.contains("release")
+                            && msg.contains("drift")
+                            && msg.contains("before remote access"),
+                        "refusal must be the membership-drift error (dry_run={dry}), got: {msg}"
+                    );
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        0,
+                        "a membership mismatch must fail BEFORE any remote construction or method \
+                         call (dry_run={dry}): zero factory invocations, got {}",
+                        calls.load(Ordering::SeqCst)
+                    );
+                }
+            } else {
+                // CONTROL — matching membership: both modes PLAN (dry run
+                // returns a dry-run plan; the real push completes a full
+                // deployment), and the recording factory IS invoked: a valid
+                // push legitimately contacts remotes. The zero-contact
+                // assertion applies ONLY to the mismatch path; the `calls > 0`
+                // checks prove the recording seam counts real work.
+                let calls = Arc::new(AtomicUsize::new(0));
+                let factory = recording_factory(remotes_base.clone(), calls.clone());
+                let r = push(
+                    &cfg_path,
+                    &store,
+                    &factory,
+                    "t1",
+                    &config,
+                    &PushOptions {
+                        dry_run: true,
+                        ref_token: Some(token.clone()),
+                    },
+                )
+                .unwrap_or_else(|e| panic!("a matching membership must dry-run-plan: {e}"));
+                assert!(r.dry_run);
+                assert!(
+                    r.message.contains("dry-run plan"),
+                    "control dry run must plan, got: {}",
+                    r.message
+                );
+                assert!(
+                    calls.load(Ordering::SeqCst) > 0,
+                    "the control dry run contacts remotes for status; the recording factory must \
+                     count it"
+                );
+
+                let calls = Arc::new(AtomicUsize::new(0));
+                let factory = recording_factory(remotes_base.clone(), calls.clone());
+                let r = push(
+                    &cfg_path,
+                    &store,
+                    &factory,
+                    "t1",
+                    &config,
+                    &PushOptions {
+                        dry_run: false,
+                        ref_token: Some(token.clone()),
+                    },
+                )
+                .unwrap_or_else(|e| panic!("a matching membership must deploy for real: {e}"));
+                assert_eq!(
+                    r.status,
+                    Some(DeploymentStatus::Successful),
+                    "control real push must complete a full deployment"
+                );
+                assert!(
+                    calls.load(Ordering::SeqCst) > 0,
+                    "the control real push contacts remotes; the recording factory must count it"
+                );
+            }
         }
     }
 }
