@@ -11,7 +11,22 @@
 //!
 //! The push reference is jj-style: the TARGET IS NEVER REPEATED in the
 //! reference, and the `@`-relative forms resolve against the separately-given
-//! target argument (see [`resolve_push_ref`]). The accepted forms are:
+//! target argument. Resolution is a TWO-PHASE process:
+//!
+//! * [`parse_ref_expr`] turns the token into a structured [`RefExpr`] with NO
+//!   store access — pure syntax. The engine parses the token BEFORE it
+//!   acquires locks or persists anything, so a malformed token fails before
+//!   any side effect and the deployment id/plan are never serialized against
+//!   a half-parsed reference.
+//! * [`resolve_ref_expr`] turns the parsed expression into a concrete
+//!   [`PushRef`] against the target's snapshot chain in the store. The engine
+//!   calls it AFTER reconciliation
+//!   ([`crate::push::reconcile::reconcile_pending_commits`]) has appended any
+//!   recovered snapshots, so a relative ref is computed against the
+//!   POST-reconciliation chain: `@-` means one before the latest INCLUDING
+//!   this push's reconciled append, never a stale pre-recovery snapshot.
+//!
+//! The accepted forms are:
 //!
 //! * `` (empty), `HEAD`, `@` — the current local files (the default).
 //! * `@-`, `@--` — the snapshot BEFORE the latest, the grandparent.
@@ -62,8 +77,8 @@ pub enum PushRef {
 /// A parsed push reference BEFORE store/target resolution.
 ///
 /// The relative forms cannot be turned into a concrete [`PushRef`] without the
-/// target's snapshot chain, so [`parse_push_ref`] stops at this parsed form
-/// and [`resolve_push_ref`] finishes the job against the store.
+/// target's snapshot chain, so [`parse_ref_expr`] stops at this parsed form
+/// and [`resolve_ref_expr`] finishes the job against the store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RefExpr {
     /// `""`, `HEAD`, `@`: materialize the currently mapped local files.
@@ -75,6 +90,21 @@ pub enum RefExpr {
     Release(ReleaseId),
     /// A jj-style relative reference needing the store + target.
     Relative(RelativeRef),
+}
+
+impl RefExpr {
+    /// Whether this ref materializes the CURRENT local files (a HEAD push):
+    /// the `HEAD`/`@` form directly, or `parent(@, 0)` — the base itself,
+    /// which [`resolve_ref_expr`] folds to `PushRef::Head` the same way.
+    ///
+    /// The engine needs this BEFORE resolution (materialization only runs for
+    /// HEAD pushes, and it happens before the post-reconciliation resolution
+    /// point), so the `parent(@, 0)` special case is mirrored here; the two
+    /// sites MUST stay in agreement.
+    pub fn is_head_push(&self) -> bool {
+        matches!(self, RefExpr::Head)
+            || matches!(self, RefExpr::Relative(rel) if rel.base == RelBase::At && rel.steps == 0)
+    }
 }
 
 /// A jj-style relative push reference: `@-`, `@--`, `parent(@, N)`,
@@ -109,8 +139,42 @@ pub enum RefId {
     Release(String),
 }
 
+impl std::fmt::Display for RefId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefId::SnapshotIndex(k) => write!(f, "s{k}"),
+            RefId::Deployment(s) | RefId::Release(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+impl std::fmt::Display for RelativeRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let id = match &self.base {
+            RelBase::At => "@".to_string(),
+            RelBase::Refid(rid) => rid.to_string(),
+        };
+        match self.steps {
+            0 => write!(f, "{id}"),
+            1 => write!(f, "{id}-"),
+            2 => write!(f, "{id}--"),
+            n => write!(f, "parent({id}, {n})"),
+        }
+    }
+}
+
+impl std::fmt::Display for RefExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefExpr::Head => write!(f, "@"),
+            RefExpr::Relative(rel) => write!(f, "{rel}"),
+            RefExpr::Release(rid) => write!(f, "release:{rid}"),
+        }
+    }
+}
+
 /// Parse a push source reference token (the part after the target name),
-/// WITHOUT touching the store.
+/// WITHOUT touching the store: pure syntax, no `LocalStore` in scope.
 ///
 /// The target is never part of the token: every relative form resolves
 /// against the separately-given target argument at [`resolve_push_ref`] time.
@@ -118,7 +182,7 @@ pub enum RefId {
 /// index, `release/<id>`, bare release-id, and the old `fN` index prefix —
 /// are NOT accepted (they predate the jj-style grammar); they fail with an
 /// explicit migration hint.
-pub fn parse_push_ref(token: &str) -> Result<RefExpr> {
+pub fn parse_ref_expr(token: &str) -> Result<RefExpr> {
     let t = token.trim();
     // HEAD / the default / `@` all mean the current state.
     if t.is_empty() || t == "HEAD" || t == "@" {
@@ -305,33 +369,39 @@ fn parse_ref_id(s: &str) -> Result<Option<RefId>> {
     Ok(None)
 }
 
-/// Parse AND resolve a push source reference token against the separately-
-/// given `target` and the target's snapshot chain in `store`.
+/// Resolve a parsed [`RefExpr`] to a concrete [`PushRef`] against the
+/// separately-given `target` and the target's snapshot chain in `store`.
 ///
+/// Store-DEPENDENT (unlike [`parse_ref_expr`]): reads the target's snapshot
+/// chain, so the caller must invoke it AFTER reconciliation has appended any
+/// recovered snapshots — the engine parses the token up front but resolves
+/// only once the chain is stable, so relative refs see the reconciled append.
 /// The target is passed ONCE (the push argument); the relative forms never
 /// repeat it. Failures are ref errors: an empty chain, an unresolvable
 /// refid, and walking past the start of the chain all fail closed rather
 /// than guessing.
-pub fn resolve_push_ref(token: &str, target: &str, store: &LocalStore) -> Result<PushRef> {
-    let expr = parse_push_ref(token)?;
+pub fn resolve_ref_expr(expr: &RefExpr, target: &str, store: &LocalStore) -> Result<PushRef> {
     match expr {
+        // `@` / `HEAD` / the default push: the current local files.
         RefExpr::Head => Ok(PushRef::Head),
         // The DIRECT release form: `release:<id>` maps straight to a
         // `PushRef::Release` — no snapshot-chain stepping, no target history
         // required (cross-target capable by design; the release's own stored
         // slot snapshot and the CURRENT target's slots are what the plan
         // resolves against).
-        RefExpr::Release(release) => Ok(PushRef::Release { release }),
+        RefExpr::Release(release) => Ok(PushRef::Release {
+            release: release.clone(),
+        }),
         RefExpr::Relative(rel) => {
             // `parent(@, 0)` is the same as `@` itself: the current state.
             if rel.base == RelBase::At && rel.steps == 0 {
                 return Ok(PushRef::Head);
             }
             let entries = store.read_snapshots(target)?;
-            let base_index = resolve_base_index(&rel.base, target, &entries, token)?;
+            let base_index = resolve_base_index(&rel.base, target, &entries, expr)?;
             let index = base_index.checked_sub(rel.steps).ok_or_else(|| {
                 Error::r#ref(format!(
-                    "'{token}' walks {} step(s) back from snapshot s{base_index} on target '{target}', \
+                    "'{expr}' walks {} step(s) back from snapshot s{base_index} on target '{target}', \
                     before the start of the snapshot chain",
                     rel.steps
                 ))
@@ -345,17 +415,19 @@ pub fn resolve_push_ref(token: &str, target: &str, store: &LocalStore) -> Result
 }
 
 /// Resolve a relative reference's base to a snapshot index in the chain.
+/// `expr` renders the reference for error messages (the parsed form has no
+/// raw token anymore).
 fn resolve_base_index(
     base: &RelBase,
     target: &str,
     entries: &[DeploymentSnapshot],
-    token: &str,
+    expr: &RefExpr,
 ) -> Result<u64> {
     let latest = entries.iter().map(|e| e.index).max();
     match base {
         RelBase::At => latest.ok_or_else(|| {
             Error::r#ref(format!(
-                "no successful snapshots for target '{target}'; cannot resolve '{token}'"
+                "no successful snapshots for target '{target}'; cannot resolve '{expr}'"
             ))
         }),
         RelBase::Refid(RefId::SnapshotIndex(k)) => {
@@ -684,10 +756,11 @@ mod tests {
     #[test]
     fn parse_ref_head_forms() {
         // The empty form, `HEAD`, and `@` all mean the current local files
-        // (the default push).
+        // (the default push). Parsing is STORE-FREE: no `LocalStore` exists
+        // in this test, so a parse cannot touch the store by construction.
         for token in ["", "HEAD", "@"] {
             assert_eq!(
-                parse_push_ref(token).unwrap(),
+                parse_ref_expr(token).unwrap(),
                 RefExpr::Head,
                 "{token:?} must parse to Head"
             );
@@ -700,7 +773,7 @@ mod tests {
     /// itself walk back from a snapshot index, deployment id, or release id.
     #[test]
     fn parse_ref_relative_forms() {
-        let rel = |token: &str| parse_push_ref(token).unwrap();
+        let rel = |token: &str| parse_ref_expr(token).unwrap();
         assert_eq!(
             rel("@-"),
             RefExpr::Relative(RelativeRef {
@@ -782,21 +855,21 @@ mod tests {
     #[test]
     fn parse_ref_direct_release_form() {
         assert_eq!(
-            parse_push_ref("release:rel-sha256-deadbeef").unwrap(),
+            parse_ref_expr("release:rel-sha256-deadbeef").unwrap(),
             RefExpr::Release(ReleaseId::new("rel-sha256-deadbeef".to_string()))
         );
         // A bare digest is normalized to the full `rel-sha256-` id.
         assert_eq!(
-            parse_push_ref("release:deadbeef").unwrap(),
+            parse_ref_expr("release:deadbeef").unwrap(),
             RefExpr::Release(ReleaseId::new("rel-sha256-deadbeef".to_string()))
         );
         // The refid forms STILL parse as snapshot ancestry.
         assert!(matches!(
-            parse_push_ref("rel-sha256-deadbeef--").unwrap(),
+            parse_ref_expr("rel-sha256-deadbeef--").unwrap(),
             RefExpr::Relative(_)
         ));
         assert!(matches!(
-            parse_push_ref("parent(rel-sha256-deadbeef, 1)").unwrap(),
+            parse_ref_expr("parent(rel-sha256-deadbeef, 1)").unwrap(),
             RefExpr::Relative(_)
         ));
     }
@@ -830,7 +903,7 @@ mod tests {
             "s3---",
             "--",
         ] {
-            let err = parse_push_ref(token).expect_err(&format!("{token:?} must be rejected"));
+            let err = parse_ref_expr(token).expect_err(&format!("{token:?} must be rejected"));
             assert!(
                 err.to_string().contains("reference"),
                 "error for {token:?} must be a ref error, got: {err}"
@@ -894,13 +967,19 @@ mod tests {
         }
     }
 
+    /// Parse-then-resolve a token against the store, mirroring the engine's
+    /// two-phase flow (parse first, resolve later).
+    fn resolve(token: &str, store: &LocalStore) -> Result<PushRef> {
+        resolve_ref_expr(&parse_ref_expr(token)?, "production", store)
+    }
+
     /// `@` / `HEAD` / `` / `parent(@, 0)` resolve to the default HEAD push.
     #[test]
     fn resolve_ref_head_forms() {
         let (_tmp, store) = chain();
         for token in ["", "HEAD", "@", "parent(@, 0)"] {
             assert_eq!(
-                resolve_push_ref(token, "production", &store).unwrap(),
+                resolve(token, &store).unwrap(),
                 PushRef::Head,
                 "{token:?} must resolve to Head"
             );
@@ -927,7 +1006,7 @@ mod tests {
             ("parent(s2, 1)", 1),
         ] {
             assert_eq!(
-                resolve_push_ref(token, "production", &store).unwrap(),
+                resolve(token, &store).unwrap(),
                 snap(&target, want),
                 "{token} must resolve to index {want}"
             );
@@ -942,35 +1021,32 @@ mod tests {
         let (_tmp, store) = chain();
         let target = TargetName::new("production".to_string());
         // deploy-b deployed s1.
+        assert_eq!(resolve("deploy-b-", &store).unwrap(), snap(&target, 0));
         assert_eq!(
-            resolve_push_ref("deploy-b-", "production", &store).unwrap(),
+            resolve("parent(deploy-b, 1)", &store).unwrap(),
             snap(&target, 0)
         );
         assert_eq!(
-            resolve_push_ref("parent(deploy-b, 1)", "production", &store).unwrap(),
-            snap(&target, 0)
-        );
-        assert_eq!(
-            resolve_push_ref("parent(deploy-c, 0)", "production", &store).unwrap(),
+            resolve("parent(deploy-c, 0)", &store).unwrap(),
             snap(&target, 2)
         );
         // rel-sha256-cccc is referenced by BOTH s2 and s3; the most recent
         // (s3) wins, then the ancestor steps apply.
         assert_eq!(
-            resolve_push_ref("parent(rel-sha256-cccc, 0)", "production", &store).unwrap(),
+            resolve("parent(rel-sha256-cccc, 0)", &store).unwrap(),
             snap(&target, 3)
         );
         assert_eq!(
-            resolve_push_ref("rel-sha256-cccc-", "production", &store).unwrap(),
+            resolve("rel-sha256-cccc-", &store).unwrap(),
             snap(&target, 2)
         );
         assert_eq!(
-            resolve_push_ref("parent(rel-sha256-cccc, 2)", "production", &store).unwrap(),
+            resolve("parent(rel-sha256-cccc, 2)", &store).unwrap(),
             snap(&target, 1)
         );
         // Abbreviated digest form resolves the same release.
         assert_eq!(
-            resolve_push_ref("parent(cccc, 0)", "production", &store).unwrap(),
+            resolve("parent(cccc, 0)", &store).unwrap(),
             snap(&target, 3)
         );
     }
@@ -1033,8 +1109,7 @@ mod tests {
             "parent(deploy-missing, 1)",
             "parent(rel-sha256-zzzz, 0)",
         ] {
-            let err = resolve_push_ref(token, "production", &store)
-                .expect_err(&format!("{token} must fail closed"));
+            let err = resolve(token, &store).expect_err(&format!("{token} must fail closed"));
             assert!(
                 err.to_string().contains("reference") || err.to_string().contains("step(s) back"),
                 "{token} error must be a ref error, got: {err}"
@@ -1045,13 +1120,9 @@ mod tests {
         // form fails.
         let tmp = tempfile::tempdir().unwrap();
         let empty = LocalStore::with_base(tmp.path().join("store")).unwrap();
-        assert_eq!(
-            resolve_push_ref("@", "production", &empty).unwrap(),
-            PushRef::Head
-        );
+        assert_eq!(resolve("@", &empty).unwrap(), PushRef::Head);
         for token in ["@-", "parent(@, 2)", "s0", "deploy-x-"] {
-            resolve_push_ref(token, "production", &empty)
-                .expect_err(&format!("{token} on an empty chain must fail"));
+            resolve(token, &empty).expect_err(&format!("{token} on an empty chain must fail"));
         }
     }
 
@@ -1184,10 +1255,10 @@ mod tests {
     /// Run the parser under `catch_unwind`: a panicking parse turns into a
     /// test failure at the `.expect`, so the property can assert BOTH that
     /// no input ever panics AND that the result has the expected shape.
-    /// `parse_push_ref` is a plain fn with no interior mutability, so the
+    /// `parse_ref_expr` is a plain fn with no interior mutability, so the
     /// closure is `UnwindSafe` (it captures only a `&str`).
     fn parse_no_panic(token: &str) -> Result<RefExpr> {
-        std::panic::catch_unwind(|| parse_push_ref(token)).expect("parse_push_ref must never panic")
+        std::panic::catch_unwind(|| parse_ref_expr(token)).expect("parse_ref_expr must never panic")
     }
 
     // PROPERTY: no reference token, however huge its snapshot index or

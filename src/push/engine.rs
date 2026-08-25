@@ -10,7 +10,7 @@
 use crate::adapter::verify::run_verification;
 use crate::config::{Config, Mapping, SlotDef};
 use crate::error::{Error, Result};
-use crate::history::{self, PushRef};
+use crate::history::{self, PushRef, RefExpr};
 use crate::layout;
 use crate::model::{
     ArtifactRef, BehaviorContract, DeploymentId, GenerationId, GenerationRef, OperationId,
@@ -131,13 +131,18 @@ pub fn push(
         .ok_or_else(|| Error::not_found(format!("target '{target_name}'")))?;
     let project_root = config.project_root(config_path);
 
-    // 1. Validate configuration (already validated at load) and resolve ref.
-    // The target is passed ONCE: `resolve_push_ref` resolves the token's
-    // relative forms (`@-`, `parent(@, N)`, `<refid>--`, ...) against this
-    // target's snapshot chain.
-    let pref = match &opts.ref_token {
-        Some(t) => history::resolve_push_ref(t, target_name, store)?,
-        None => PushRef::Head,
+    // 1. Validate configuration (already validated at load) and PARSE the
+    // push ref — syntax only, NO store access. The relative forms (`@-`,
+    // `parent(@, N)`, `<refid>--`, ...) are held as a structured [`RefExpr`]
+    // and resolved LATER, inside `push_inner`, AFTER reconciliation has
+    // appended any recovered snapshots: a relative ref must be computed
+    // against the POST-reconciliation chain (see the resolution point in
+    // `push_inner`), so the target's snapshot chain is read at resolution
+    // time — post-lock, post-reconcile — never here, before the push even
+    // holds the target lock.
+    let ref_expr = match &opts.ref_token {
+        Some(t) => history::parse_ref_expr(t)?,
+        None => RefExpr::Head,
     };
 
     // 2. Acquire local application-store lock then target lock (in that order),
@@ -169,7 +174,7 @@ pub fn push(
         store,
         factory,
         target_name,
-        &pref,
+        &ref_expr,
         &deployment_id,
         &op_id,
         config,
@@ -211,7 +216,7 @@ pub(crate) fn push_with_id(
         store,
         factory,
         target_name,
-        &PushRef::Head,
+        &RefExpr::Head,
         deployment_id,
         &op_id,
         config,
@@ -242,16 +247,18 @@ pub(crate) fn push_ref_with_id(
         .get(target_name)
         .ok_or_else(|| Error::not_found(format!("target '{target_name}'")))?;
     let project_root = config.project_root(config_path);
-    let pref = match &opts.ref_token {
-        Some(t) => history::resolve_push_ref(t, target_name, store)?,
-        None => PushRef::Head,
+    // Parse the ref token EARLY (syntax only, store-free — mirroring
+    // [`push`]); `push_inner` resolves it after reconciliation.
+    let ref_expr = match &opts.ref_token {
+        Some(t) => history::parse_ref_expr(t)?,
+        None => RefExpr::Head,
     };
     push_inner(
         &project_root,
         store,
         factory,
         target_name,
-        &pref,
+        &ref_expr,
         deployment_id,
         &op_id,
         config,
@@ -261,20 +268,20 @@ pub(crate) fn push_ref_with_id(
 }
 
 // The 10 parameters are the full push operation (data: project_root, store,
-// factory, target_name, pref, deployment_id, op_id; policy: config, target,
-// opts). The `config` + `opts` pair is already the settings half, and
-// `target`/`project_root` are derived views of it. Bundling all three policy
-// args into one settings struct is a dedicated refactor (deferred: it would
-// touch every internal `config`/`target`/`opts` reference in this ~1200-line
-// body with no behavioral gain), so the allow documents the deliberate
-// choice rather than a band-aid.
+// factory, target_name, ref_expr, deployment_id, op_id; policy: config,
+// target, opts). The `config` + `opts` pair is already the settings half,
+// and `target`/`project_root` are derived views of it. Bundling all three
+// policy args into one settings struct is a dedicated refactor (deferred: it
+// would touch every internal `config`/`target`/`opts` reference in this
+// ~1200-line body with no behavioral gain), so the allow documents the
+// deliberate choice rather than a band-aid.
 #[allow(clippy::too_many_arguments)]
 fn push_inner(
     project_root: &Path,
     store: &LocalStore,
     factory: &RemoteFactory,
     target_name: &str,
-    pref: &PushRef,
+    ref_expr: &RefExpr,
     deployment_id: &DeploymentId,
     op_id: &OperationId,
     config: &Config,
@@ -295,7 +302,7 @@ fn push_inner(
     // silently swallowing them) and empties the guard first, keeping the Drop
     // as a fallback only. A non-dry-run push stages into the persistent
     // per-variant staging dirs and stores objects, so no guard.
-    let mut staging_guard = if opts.dry_run && matches!(pref, PushRef::Head) {
+    let mut staging_guard = if opts.dry_run && ref_expr.is_head_push() {
         Some(StagingCleanup(Some(
             store
                 .staging_dir()
@@ -304,7 +311,7 @@ fn push_inner(
     } else {
         None
     };
-    if matches!(pref, PushRef::Head) {
+    if ref_expr.is_head_push() {
         for v in config.variant_names() {
             let staging = if opts.dry_run {
                 store
@@ -364,10 +371,66 @@ fn push_inner(
     let mapping_toml = toml::to_string_pretty(&variant_mappings)
         .map_err(|e| Error::store(format!("serialize mappings: {e}")))?;
 
+    // Open a remote handle per slot: the READ-ONLY half of the remote phase
+    // (construct + host-identity prep + a status inspection). No remote bytes
+    // are written here — `prepare_identity` pins only a LOCAL cache and
+    // `status` is a read — so a later plan rejection (ref failure,
+    // membership, behavior) still fails before any remote mutation. It must
+    // run BEFORE reconciliation (which needs live helpers to verify
+    // generations and write markers) and before resolution (which must see
+    // the post-reconciliation chain).
+    let members = config.target_slots(target_name)?;
+    let mut remotes: HashMap<PlacementSlotId, Box<dyn Remote>> = HashMap::new();
+    let mut helpers: HashMap<PlacementSlotId, RemoteHelper> = HashMap::new();
+    let mut statuses: HashMap<PlacementSlotId, crate::remote::helper::RemoteStatus> =
+        HashMap::new();
+    for (slot, s) in &members {
+        let slot_id = PlacementSlotId::new(slot.id.clone());
+        let remote = factory(s, slot)?;
+        remotes.insert(slot_id, remote);
+    }
+    for (slot, _s) in &members {
+        let slot_id = PlacementSlotId::new(slot.id.clone());
+        let r = remotes.get(&slot_id).unwrap();
+        let helper = RemoteHelper::new(r.as_ref());
+        // Prepare the host identity (verify/pin the host key) BEFORE any status
+        // request: a fingerprint-only configuration cannot connect at all
+        // without the pinned key, and a dry run still connects to inspect
+        // status. Pinning writes only to a LOCAL cache, never the remote
+        // layout, so the dry-run "mutates nothing remotely" guarantee holds.
+        r.prepare_identity()?;
+        let status = helper.status()?;
+        helpers.insert(slot_id.clone(), helper);
+        statuses.insert(slot_id.clone(), status);
+    }
+
+    // Reconcile `PendingCommit` attempts left by earlier pushes BEFORE the
+    // ref is resolved and BEFORE the early no-op check: an up-to-date push
+    // must complete the missing commit markers (and advance the snapshot log)
+    // rather than returning "Everything up to date" with the metadata still
+    // absent. Runs under the local target lock already held by this push;
+    // never reactivates or restarts services (markers/transition/snapshot
+    // only). A recovered attempt finalizes through the SHARED finalizer
+    // (`history::finalize_successful_attempt`), which APPENDS its snapshot
+    // entry to the target's chain — the very append the relative refs below
+    // must see. Dry-run never reconciles (it touches nothing).
+    if !opts.dry_run {
+        reconcile_pending_commits(store, config, target_name, op_id, &helpers)?;
+    }
+
+    // RESOLUTION POINT — the parsed ref is resolved ONLY NOW: AFTER
+    // reconciliation appended any recovered snapshot entries (a relative ref
+    // must see the post-recovery chain: `@-` means one before the latest
+    // INCLUDING this push's reconciled append, so `parent(@, d)` selects
+    // post-reconciliation latest - d) and AFTER the locks were acquired.
+    // Parsing happened up front (store-free, before serialization); every
+    // step from here down consumes the RESOLVED form.
+    let pref = history::resolve_ref_expr(ref_expr, target_name, store)?;
+
     // Historical and rollback pushes carry the bound release's own per-variant
     // behavior contracts; they never fall back to the caller's current config.
     let (local_release_id, desired_behaviors): (ReleaseId, BTreeMap<String, BehaviorContract>) = if matches!(
-        pref,
+        &pref,
         PushRef::Head
     ) {
         let bindings: BTreeMap<VariantName, TreeDigest> = variant_trees
@@ -396,7 +459,7 @@ fn push_inner(
         (rid, variant_behaviors)
     } else {
         // Historical ref: resolve the bound release.
-        let rid = match pref {
+        let rid = match &pref {
             PushRef::Snapshot {
                 target: ft, index, ..
             } => {
@@ -441,11 +504,10 @@ fn push_inner(
     // and rollback pushes use the historical release's own contracts.
     let desired_behavior_sha = crate::release::variant_behaviors_digest(&desired_behaviors);
 
-    // 5 & 7. Reconcile each server and build the plan, recovering missing local
-    // objects from servers that retain them.
+    // 5 & 7. Build the plan from the RESOLVED ref (post-reconciliation).
     let (assignments, desired_release, source) = crate::push::plan::plan_assignments(
         target_name,
-        pref,
+        &pref,
         &local_release_id,
         &variant_trees,
         store,
@@ -461,34 +523,19 @@ fn push_inner(
     // preflight with context instead.
     validate_behavior_coverage(&desired_behaviors, &assignments, &desired_release)?;
 
-    // Open a remote handle per slot and run reconciliation / recovery.
-    let members = config.target_slots(target_name)?;
-    let mut remotes: HashMap<PlacementSlotId, Box<dyn Remote>> = HashMap::new();
-    let mut helpers: HashMap<PlacementSlotId, RemoteHelper> = HashMap::new();
-    let mut statuses: HashMap<PlacementSlotId, crate::remote::helper::RemoteStatus> =
-        HashMap::new();
-    for (slot, s) in &members {
-        let slot_id = PlacementSlotId::new(slot.id.clone());
-        let remote = factory(s, slot)?;
-        remotes.insert(slot_id, remote);
-    }
-    for (slot, _s) in &members {
-        let slot_id = PlacementSlotId::new(slot.id.clone());
-        let r = remotes.get(&slot_id).unwrap();
-        let helper = RemoteHelper::new(r.as_ref());
-        // Prepare the host identity (verify/pin the host key) BEFORE any status
-        // request: a fingerprint-only configuration cannot connect at all
-        // without the pinned key, and a dry run still connects to inspect
-        // status. Pinning writes only to a LOCAL cache, never the remote
-        // layout, so the dry-run "mutates nothing remotely" guarantee holds.
-        r.prepare_identity()?;
-        let status = helper.status()?;
-        if !opts.dry_run {
-            // Production path: protocol handshake FIRST, then create the remote
-            // layout, clear abandoned incoming, check lock, recover missing
-            // local objects. The handshake records `control/protocol.json`
-            // before any other remote layout mutation; a dry run never reaches
-            // this, so an unprovisioned remote stays untouched.
+    // Mutating remote phase (phase B), only behind the non-dry-run gate:
+    // protocol handshake FIRST, then create the remote layout, clear
+    // abandoned incoming, check lock, recover missing local objects. The
+    // handshake records `control/protocol.json` before any other remote
+    // layout mutation; a dry run never reaches this, so an unprovisioned
+    // remote stays untouched. Deliberately AFTER planning: a plan rejection
+    // (ref failure, membership, behavior) fails before any remote byte is
+    // written.
+    if !opts.dry_run {
+        for (slot, _s) in &members {
+            let slot_id = PlacementSlotId::new(slot.id.clone());
+            let helper = &helpers[&slot_id];
+            let status = &statuses[&slot_id];
             helper.handshake()?;
             remotes.get(&slot_id).unwrap().provision_layout()?;
             for pend in &status.pending_incoming {
@@ -509,8 +556,6 @@ fn push_inner(
                 }
             }
         }
-        helpers.insert(slot_id.clone(), helper);
-        statuses.insert(slot_id.clone(), status);
     }
 
     // Build the per-slot plan with expected (pre-push) generation.
@@ -626,18 +671,10 @@ fn push_inner(
         });
     }
 
-    // Reconcile `PendingCommit` attempts left by earlier pushes BEFORE the
-    // early no-op check: an up-to-date push must complete the missing
-    // commit markers (and advance the snapshot log) rather than
-    // returning "Everything up to date" with the metadata still absent. Runs
-    // under the local target lock already held by this push; never reactivates
-    // or restarts services (markers/transition/snapshot only).
-    reconcile_pending_commits(store, config, target_name, op_id, &helpers)?;
-
     // Early "Everything up to date" check for HEAD pushes. Run BEFORE persisting
     // any plan/status record so an up-to-date no-op leaves no dangling
     // `in_progress` deployment behind.
-    if matches!(pref, PushRef::Head) {
+    if matches!(&pref, PushRef::Head) {
         // Retain the CURRENT generation assignment for every matching slot: the
         // no-op verification below renders the EXISTING generation's identities
         // (deployment_id/generation_id/artifact) — the running service was
@@ -1936,6 +1973,8 @@ mod tests {
     use super::*;
     use crate::model::RELEASE_RECORD_SCHEMA_VERSION;
     use crate::remote::transport::{FsBytes, LocalTransport};
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2814,7 +2853,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.store,
             &factory,
             "t1",
-            &PushRef::Head,
+            &RefExpr::Head,
             deployment_id,
             &op_id,
             &h.config,
@@ -3599,7 +3638,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.store,
             &fault_factory,
             "t1",
-            &PushRef::Head,
+            &RefExpr::Head,
             &id,
             &op_id,
             &h.config,
@@ -4147,7 +4186,7 @@ interval_seconds = 0
             &h.store,
             &factory,
             "t1",
-            &PushRef::Head,
+            &RefExpr::Head,
             &id2,
             &op_id,
             &config2,
@@ -4401,7 +4440,7 @@ interval_seconds = 0
             &store,
             &factory,
             "t1",
-            &PushRef::Head,
+            &RefExpr::Head,
             &id,
             &op_id,
             &config,
@@ -4932,7 +4971,7 @@ interval_seconds = 0
                 &self.store,
                 &factory,
                 "t1",
-                &PushRef::Head,
+                &RefExpr::Head,
                 deployment_id,
                 &op_id,
                 &self.config,
@@ -5486,7 +5525,7 @@ interval_seconds = 0
             &h.store,
             &factory,
             "t1",
-            &PushRef::Head,
+            &RefExpr::Head,
             &id,
             &op_id,
             &config,
@@ -5581,7 +5620,7 @@ interval_seconds = 0
             &h.store,
             &factory,
             "t1",
-            &PushRef::Head,
+            &RefExpr::Head,
             &id,
             &op_id,
             &h.config,
@@ -5762,7 +5801,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &store,
             &factory,
             "t1",
-            &PushRef::Head,
+            &RefExpr::Head,
             &id,
             &op_id,
             &config,
@@ -5830,10 +5869,17 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     }
 
     /// A HISTORICAL push whose release's behavior snapshot is missing (or
-    /// corrupt) must fail in PREFLIGHT before any attempt, reflog, snapshot,
-    /// or remote connection — never silently substitute the caller's current
-    /// configuration (requirement.md: "a missing or corrupt historical
-    /// behavior snapshot aborts the attempt during preflight").
+    /// corrupt) must fail in PREFLIGHT before any attempt record, snapshot
+    /// append, reflog advance, or remote byte — never silently substitute the
+    /// caller's current configuration (requirement.md: "a missing or corrupt
+    /// historical behavior snapshot aborts the attempt during preflight").
+    ///
+    /// Resolution never produces a bare `PushRef::Release` (release refids
+    /// resolve to the most recent snapshot referencing the release), so the
+    /// release-identity path is driven through a REAL ref form: a snapshot
+    /// ref (`s0`) whose snapshot's release lacks the behavior snapshot. The
+    /// preflight fires in the release-identity block, before planning, so the
+    /// fixture snapshot is the only snapshot the store ever holds.
     #[test]
     fn historical_release_missing_behavior_snapshot_fails_preflight_untouched() {
         let h = RecoveryHarness::new();
@@ -5874,6 +5920,35 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .to_string();
         let release = crate::model::ReleaseId::new(rec.release_id.clone());
         h.store.write_release(&rec).unwrap();
+        // A snapshot at index 0 whose slots reference that release: the ref
+        // resolves to it, and the release-identity step then demands the
+        // release's behavior snapshot (which was never written).
+        h.store
+            .append_snapshot(
+                "t1",
+                &crate::records::DeploymentSnapshot {
+                    index: 0,
+                    deployment_id: DeploymentId::new("deploy-hist-behavior-fixture".to_string()),
+                    target: TargetName::new("t1".to_string()),
+                    behavior_sha256: "sha256-aa".to_string(),
+                    slots: BTreeMap::from([(
+                        PlacementSlotId::new("p1".to_string()),
+                        GenerationRef {
+                            generation: GenerationId::new("gen-hist".to_string()),
+                            assignment: crate::model::PlacementSlotAssignment {
+                                placement_slot: PlacementSlotId::new("p1".to_string()),
+                                artifact: ArtifactRef {
+                                    release: release.clone(),
+                                    variant: VariantName::new("standard".to_string()),
+                                    tree: TreeDigest::new("tree-x".to_string()),
+                                },
+                            },
+                        },
+                    )]),
+                    bindings: BTreeMap::new(),
+                },
+            )
+            .unwrap();
 
         let project_root = h.config.project_root(&h.cfg_path);
         let target = h.config.targets.get("t1").expect("harness target");
@@ -5890,9 +5965,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.store,
             &factory,
             "t1",
-            &PushRef::Release {
-                release: release.clone(),
-            },
+            &history::parse_ref_expr("s0").unwrap(),
             &id,
             &op_id,
             &h.config,
@@ -5909,11 +5982,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "expected a historical-behavior preflight error, got: {err}"
         );
 
-        // Nothing recorded and nothing touched: no attempt, no snapshot/ref,
-        // and the remote directory was never even created (the failure fires
-        // before any remote connection).
+        // Nothing recorded and nothing touched: no NEW attempt, no NEW
+        // snapshot, no `refs/last-successful`, and the remote directory was
+        // never even created (the failure fires before the mutating remote
+        // phase — the earlier status inspection writes no remote bytes).
         assert!(h.store.read_attempts("t1").unwrap().is_empty());
-        assert!(h.store.read_snapshots("t1").unwrap().is_empty());
+        assert_eq!(
+            h.store.read_snapshots("t1").unwrap().len(),
+            1,
+            "the fixture snapshot is the only entry; the preflight failure must not append"
+        );
         assert!(h.store.read_last_successful("t1").is_none());
         assert!(
             !h.remotes_base.join("s1").exists(),
@@ -5931,9 +6009,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.store,
             &factory,
             "t1",
-            &PushRef::Release {
-                release: release.clone(),
-            },
+            &history::parse_ref_expr("s0").unwrap(),
             &id,
             &op_id2,
             &h.config,
@@ -5950,7 +6026,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "expected a historical-behavior preflight error, got: {err2}"
         );
         assert!(h.store.read_attempts("t1").unwrap().is_empty());
-        assert!(h.store.read_snapshots("t1").unwrap().is_empty());
+        assert_eq!(
+            h.store.read_snapshots("t1").unwrap().len(),
+            1,
+            "the preflight failure must not append a snapshot"
+        );
     }
 
     /// OBSERVED-REFRESH UNKNOWN-ASSIGNMENT FALLBACK: when a live generation's
@@ -6017,7 +6097,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.store,
             &fault_factory,
             "t1",
-            &PushRef::Head,
+            &RefExpr::Head,
             &id2,
             &op_id,
             &h.config,
@@ -6244,7 +6324,7 @@ interval_seconds = 0
             &store,
             &factory,
             "t1",
-            &PushRef::Head,
+            &RefExpr::Head,
             &id,
             &op_id,
             &config,
@@ -6652,5 +6732,237 @@ interval_seconds = 0
             2,
             "the no-op must not record a third attempt"
         );
+    }
+
+    // ---- Relative refs resolve AFTER reconciliation (property) ------------
+    //
+    // THE BUG THIS FIXES: the engine used to resolve the push ref — INCLUDING
+    // the relative forms (`@`, `@-`, `parent(@, N)`) — into a concrete
+    // snapshot index BEFORE it acquired locks and BEFORE
+    // `reconcile_pending_commits` appended the recovered attempt's snapshot.
+    // A relative ref computed against the PRE-reconciliation chain therefore
+    // selected a stale index: `@-` should mean "one before the latest
+    // INCLUDING this push's reconciled append", but early resolution gave
+    // "one before the pre-recovery latest". The fix parses the token to a
+    // store-free [`RefExpr`] FIRST and resolves it only after reconciliation
+    // (see the resolution point in `push_inner`).
+    //
+    // THE PROPERTY: for an initial chain whose latest index is `L`
+    // (snapshots 0..=L, i.e. L+1 snapshots), a pending-commit attempt whose
+    // reconciliation appends EXACTLY ONE snapshot (index L+1) during the ref
+    // push, and a relative ref with ancestor depth d (1..=L; `@-` for d=1,
+    // `parent(@, d)` otherwise), the SELECTED index in the plan equals
+    // POST-RECONCILIATION latest - depth = (L + 1) - d. The pre-fix behavior
+    // selected L - d (stale, off by exactly the reconciled append) or failed
+    // outright on a chain too short for the walk. Depth 0 is the `@` HEAD
+    // form — the current-files push, chain-independent and covered by the
+    // pure-parse unit tests in `history.rs` — so the ancestor range starts
+    // at 1.
+    //
+    // COST CONTROL: the initial chain is FIXTURED at the store level (a real
+    // pending push writes the release + tree + remote state, then synthetic
+    // snapshot entries 0..=L reference that release), and the ref push is
+    // faulted at its FIRST transition — after `plan.json` is durable but
+    // before staging/deployment — so the plan's resolved index is observable
+    // without running the full mutation loop.
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 32,
+            rng_seed: RngSeed::Fixed(0x0EA5_0E11_0BEA),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn relative_ref_resolves_post_reconciliation_latest_minus_depth(
+            (latest, depth) in (0u64..=4).prop_flat_map(|latest| {
+                (Just(latest), 1u64..=latest.max(1))
+            }),
+        ) {
+            let h = RecoveryHarness::new();
+            let slot = PlacementSlotId::new("p1".to_string());
+
+            // (c) A concurrent/reconciled append: a pending-commit attempt
+            // whose reconciliation will append EXACTLY ONE snapshot during
+            // the ref push. The push itself is real (it deploys to the remote
+            // and records the attempt) but the commit marker write fails
+            // once, so no snapshot is appended yet. It also persists the
+            // release record + behavior snapshot + tree the synthetic chain
+            // below reuses.
+            let armed = Arc::new(AtomicBool::new(true));
+            let armed_for_factory = armed.clone();
+            let rf = h.remotes_base.clone();
+            let fault_factory = move |s: &crate::config::ServerDef,
+                                      _slot: &crate::config::SlotDef|
+                     -> Result<Box<dyn Remote>> {
+                FailOnceMarkerRemote::build(rf.join(&s.id), armed_for_factory.clone())
+            };
+            let rp = push(
+                &h.cfg_path,
+                &h.store,
+                &fault_factory,
+                "t1",
+                &h.config,
+                &PushOptions {
+                    dry_run: false,
+                    ref_token: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(rp.status, Some(DeploymentStatus::PendingCommit));
+            let pending = rp.attempt.as_ref().expect("the pending push records an attempt");
+            let pending_id = pending.deployment_id.clone();
+            let pending_artifact = pending.slots[&slot].artifact.clone();
+            assert!(
+                h.store.read_snapshots("t1").unwrap().is_empty(),
+                "the pending attempt appends no snapshot yet"
+            );
+
+            // (a) Initial chain: synthetic snapshots 0..=latest (length L+1),
+            // all referencing the pending push's REAL release + tree (which
+            // are durable in the store), each with the harness's exact
+            // physical binding so `plan_assignments` accepts the rollback.
+            let bindings = crate::records::PhysicalBinding {
+                server: crate::model::ServerId::new("s1".to_string()),
+                deploy_dir: "/srv/eng".to_string(),
+            };
+            for i in 0..=latest {
+                h.store
+                    .append_snapshot(
+                        "t1",
+                        &crate::records::DeploymentSnapshot {
+                            index: i,
+                            deployment_id: DeploymentId::new(format!(
+                                "deploy-relative-chain-{latest}-{i}"
+                            )),
+                            target: TargetName::new("t1".to_string()),
+                            behavior_sha256: pending.behavior_sha256.clone(),
+                            slots: BTreeMap::from([(
+                                slot.clone(),
+                                GenerationRef {
+                                    generation: GenerationId::new(format!(
+                                        "gen-relative-{latest}-{i}"
+                                    )),
+                                    assignment: crate::model::PlacementSlotAssignment {
+                                        placement_slot: slot.clone(),
+                                        artifact: pending_artifact.clone(),
+                                    },
+                                },
+                            )]),
+                            bindings: BTreeMap::from([(slot.clone(), bindings.clone())]),
+                        },
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                h.store.read_snapshots("t1").unwrap().len() as u64,
+                latest + 1,
+                "the initial chain holds latest + 1 snapshots"
+            );
+
+            // The ref is RELATIVE: `@-` for depth 1, `parent(@, d)` else.
+            let token = if depth == 1 {
+                "@-".to_string()
+            } else {
+                format!("parent(@, {depth})")
+            };
+            // The PRE-FIX behavior resolved BEFORE reconciliation: against the
+            // pre-append chain it selected latest - depth (stale) or failed
+            // outright when the chain was too short for the walk.
+            let pre_reconcile = history::resolve_ref_expr(
+                &history::parse_ref_expr(&token).unwrap(),
+                "t1",
+                &h.store,
+            );
+            let selected = (latest + 1) - depth;
+            match pre_reconcile {
+                Ok(PushRef::Snapshot { index, .. }) => {
+                    assert_ne!(
+                        index, selected,
+                        "pre-fix resolution must not see the reconciled append"
+                    );
+                    if latest > 0 {
+                        assert_eq!(index, latest - depth, "the stale pre-fix selection");
+                    }
+                }
+                Ok(_) => {
+                    panic!("a relative snapshot ref must not resolve to a non-snapshot pre-reconcile")
+                }
+                Err(_) => {
+                    assert_eq!(
+                        latest, 0,
+                        "pre-fix on a non-empty chain must resolve (stale), not fail"
+                    );
+                }
+            }
+
+            // The fixed flow: the engine reconciles FIRST (appending the
+            // pending attempt's snapshot at index latest + 1), THEN resolves
+            // the ref against the post-reconciliation chain, then plans. The
+            // push is faulted at its FIRST transition — AFTER `plan.json` is
+            // durable — so the plan's resolved source is observable without
+            // the (slow) mutation loop.
+            let rf2 = h.remotes_base.clone();
+            let clean_factory = move |s: &crate::config::ServerDef,
+                                      _slot: &crate::config::SlotDef|
+                     -> Result<Box<dyn Remote>> {
+                Ok(Box::new(LocalTransport::new(rf2.join(&s.id))?))
+            };
+            let ref_id = DeploymentId::new(format!("deploy-relative-ref-{latest}-{depth}"));
+            h.store
+                .fault_registry()
+                .arm_append_transition(ref_id.as_str());
+            let err = push_ref_with_id(
+                &h.cfg_path,
+                &h.store,
+                &clean_factory,
+                "t1",
+                &h.config,
+                &PushOptions {
+                    dry_run: false,
+                    ref_token: Some(token.clone()),
+                },
+                &ref_id,
+            )
+            .expect_err("the plan is durable before the first transition, so the faulted push must Err");
+            assert!(
+                err.to_string().contains("append_transition"),
+                "the injected transition fault must be the failure, got: {err}"
+            );
+
+            // (c) The reconciled append happened: index latest + 1 is the
+            // pending attempt's snapshot.
+            let snapshots = h.store.read_snapshots("t1").unwrap();
+            assert_eq!(
+                snapshots.len() as u64,
+                latest + 2,
+                "initial (latest+1) + reconciled (1); the faulted ref push appends nothing"
+            );
+            let reconciled = snapshots
+                .iter()
+                .find(|e| e.index == latest + 1)
+                .expect("the reconciled snapshot must exist");
+            assert_eq!(
+                reconciled.deployment_id.as_str(),
+                pending_id.as_str(),
+                "the reconciled append is the pending attempt's snapshot"
+            );
+
+            // THE ASSERTION: the SELECTED index recorded in the plan equals
+            // post-reconciliation latest - depth = (latest + 1) - depth.
+            let plan: DeploymentPlan = serde_json::from_str(
+                &std::fs::read_to_string(h.store.deployment_dir(ref_id.as_str()).join("plan.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                plan.source,
+                crate::records::PlanSource::SnapshotRef(selected),
+                "'{token}' must select s{selected} = s{}(latest + 1) - {depth} — the \
+                 POST-reconciliation selection, not the stale s{}(latest) - {depth}",
+                latest + 1,
+                latest
+            );
+        }
     }
 }

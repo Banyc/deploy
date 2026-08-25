@@ -3723,6 +3723,11 @@ impl Model {
     /// stays pending; under [`FailureClass::LockContention`] the reconcile's
     /// lock acquisition fails BEFORE any write, so the attempt stays pending
     /// and the fault is NOT consumed.
+    /// commit marker. The marker write is a commit-path write, so an
+    /// armed [`FailureClass::CommitMarker`] is consumed there and the attempt
+    /// stays pending; under [`FailureClass::LockContention`] the reconcile's
+    /// lock acquisition fails BEFORE any write, so the attempt stays pending
+    /// and the fault is NOT consumed.
     fn reconcile(&mut self, t: &'static str) {
         let Some((pv, pg, already_snapped)) = self.pending.remove(t) else {
             return;
@@ -3768,11 +3773,18 @@ impl Model {
         }
     }
 
-    /// A snapshot rollback to snapshot `i`. Out-of-range refs are rejected by
-    /// the engine's plan BEFORE reconcile or any mutation: the push returns
-    /// `Err` (nothing recorded — `NoAttempt`) and the crash-window state
-    /// stands.
+    /// A snapshot rollback to snapshot `i`. The engine reconciles pending
+    /// attempts BEFORE resolving the ref (the resolution point sits after
+    /// `reconcile_pending_commits`), so the range is evaluated against the
+    /// POST-reconciliation chain — the pending attempt's snapshot is appended
+    /// first, and a ref that only the recovery brought into range now
+    /// resolves. The reconciliation runs even when the ref still fails
+    /// closed after it; the push then returns `Err` (nothing recorded —
+    /// `NoAttempt`) BEFORE the observed refresh, so an open crash window
+    /// STAYS open (the fixture's invariant groups stay suspended until a
+    /// later successful push/no-op refreshes observed).
     fn rollback(&mut self, t: &'static str, i: u64) -> (OutcomeClass, bool) {
+        self.reconcile(t);
         let Some(v) = self
             .snapshots
             .get(t)
@@ -3795,17 +3807,18 @@ impl Model {
     /// under the step's failure class. Returns the expected outcome class and
     /// the NEW crash-window state.
     fn deploy(&mut self, t: &'static str, rollback_version: Option<u32>) -> (OutcomeClass, bool) {
-        // The engine's EARLY per-slot preflight checks the mutation lock
-        // BEFORE reconciliation, the early no-op check, or the intent persist:
-        // a contended push aborts with `Err` and records NOTHING — no attempt,
-        // no reconcile, no recovery, no observed refresh — so the expected
-        // class is `Err` + `NoAttempt` (CONFIRMED against the engine: the
-        // per-slot preflight lock check at `push_inner` runs before
-        // `reconcile_pending_commits`, `write_plan`, and `append_attempt`;
-        // the step-15 commit contention, by contrast, happens AFTER the
-        // intent and yields `Ok` + `Pending`). The crash-window state and the
-        // step's fault stand exactly as before (a pending attempt is left for
-        // a later push to reconcile).
+        // A contended push aborts with `Err` and records NOTHING — no attempt,
+        // no recovery, no observed refresh — so the expected class is `Err` +
+        // `NoAttempt`. The engine's mutation-lock preflight check now sits in
+        // the mutating remote phase (AFTER reconciliation, resolution, and
+        // planning — the resolution point moved behind
+        // `reconcile_pending_commits`), but the reconcile under contention
+        // never finalizes (its marker lock acquisition contends too), so the
+        // observable boundary and the crash-window state are identical to a
+        // check that ran earlier: nothing recorded, the pending attempt left
+        // for a later push, and the step's fault unconsumed. The step-15
+        // commit contention, by contrast, happens AFTER the intent and yields
+        // `Ok` + `Pending`.
         if matches!(self.armed_fault, Some(FailureClass::LockContention)) {
             return (
                 OutcomeClass::Push {
