@@ -103,6 +103,14 @@ pub(crate) enum RunError {
 /// is a no-op by construction, so a pid the OS recycled to an unrelated
 /// process can never be signalled.
 struct SpawnedChild {
+    /// The child's pid, known to the PARENT synchronously at spawn time: the
+    /// real seam reads it off the owned [`std::process::Child`] immediately
+    /// after spawn (the fake generates its own), and the runner surfaces it
+    /// through the test-only spawn observer — so a test asserts the pid is
+    /// gone after the deadline kill WITHOUT the child ever writing its own
+    /// pid to a file (a child-written pidfile races the kill: the child can
+    /// be killed before it writes).
+    pid: u32,
     /// Request the force-kill of the live child (SIGKILL on the owned
     /// handle). A no-op once the wait thread has reaped the child. The real
     /// seam locks the child slot shared with the wait thread and calls
@@ -154,6 +162,10 @@ impl SshRunnerSeam for RealRunner {
             cmd.stdin(Stdio::piped());
         }
         let child = cmd.spawn()?;
+        // The parent reads the pid synchronously at spawn time and surfaces it
+        // through the runner's spawn observer: the child never needs to write
+        // its own pid to a file.
+        let pid = child.id();
         // The child is shared EXCLUSIVELY between the runner's deadline path
         // and the wait thread through this slot: the wait thread polls the
         // child (`try_wait`) with the slot locked and CONSUMES it on exit
@@ -245,7 +257,7 @@ impl SshRunnerSeam for RealRunner {
                     Ok(()) => wait_res,
                 }
             });
-        Ok(SpawnedChild { kill, wait })
+        Ok(SpawnedChild { pid, kill, wait })
     }
 }
 
@@ -323,6 +335,15 @@ pub(crate) struct SshRunner {
     connect_deadline: Duration,
     /// Deadline for post-connect remote command/upload operations.
     command_deadline: Duration,
+    /// Test-only spawn observer: records each spawned child's pid in the
+    /// PARENT at spawn time (called synchronously right after a successful
+    /// spawn, before the deadline clock starts). Production installs nothing;
+    /// a test installs a recording closure via
+    /// [`SshRunner::with_spawn_observer`] and afterwards asserts the recorded
+    /// pid is gone — the parent-side replacement for a child-written pidfile,
+    /// which races the deadline kill (the child can be killed before it
+    /// writes its own pid).
+    spawn_observer: Option<Arc<dyn Fn(u32) + Send + Sync>>,
 }
 
 impl SshRunner {
@@ -331,6 +352,7 @@ impl SshRunner {
             seam: Arc::new(RealRunner),
             connect_deadline: Duration::from_secs(SSH_CONNECT_TIMEOUT_SECS),
             command_deadline: Duration::from_secs(SSH_COMMAND_TIMEOUT_SECS),
+            spawn_observer: None,
         }
     }
 
@@ -347,7 +369,18 @@ impl SshRunner {
             seam,
             connect_deadline,
             command_deadline,
+            spawn_observer: None,
         }
+    }
+
+    /// Test-only spawn observer: install a closure that records each spawned
+    /// child's pid in the PARENT at spawn time (synchronously, before the
+    /// deadline clock starts) — the parent-side replacement for a
+    /// child-written pidfile, which races the deadline kill.
+    #[cfg(test)]
+    fn with_spawn_observer(mut self, observer: Arc<dyn Fn(u32) + Send + Sync>) -> Self {
+        self.spawn_observer = Some(observer);
+        self
     }
 
     /// Run `op` with `argv`, bounding the whole wait by a hard deadline: the
@@ -377,7 +410,17 @@ impl SshRunner {
         // the child EXCLUSIVELY through the seam's handle, so the deadline
         // path can kill while the wait thread is mid-wait and a kill after
         // the wait has reaped the child is a no-op by construction.
-        let SpawnedChild { kill, wait } = child;
+        let SpawnedChild { pid, kill, wait } = child;
+        // The test-only spawn observer records the pid in the PARENT here,
+        // synchronously, immediately after spawn — before the deadline clock
+        // starts — so a test can assert the pid is gone after the deadline
+        // kill without the child ever writing its own pid to a file (a
+        // child-written pidfile races the kill: the child can be killed
+        // before it writes). Only tests install an observer; production runs
+        // with None, so this is a no-op.
+        if let Some(observer) = &self.spawn_observer {
+            observer(pid);
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
             let res = wait();
@@ -476,6 +519,61 @@ mod runner_property_tests {
         },
     }
 
+    /// Where an injected delay blocks inside the fake seam. The
+    /// scheduler-delay property generates these × a delay duration and asserts
+    /// the runner's invariants still hold under every interleaving: the
+    /// delays perturb the thread schedule around the spawn/deadline/kill/wait
+    /// lifecycle instead of delaying everything uniformly, so both the
+    /// kill-before-join and join-before-kill orderings are exercised (the
+    /// after-reap placement is the delay-driven mirror of the pid-reuse
+    /// barrier).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum DelayAt {
+        /// The fake's `spawn` blocks BEFORE returning the handle: the child is
+        /// conceptually live but the runner does not yet hold it.
+        Spawn,
+        /// The fake's kill closure blocks BEFORE recording the kill and
+        /// arming the killed flag: the runner has decided to kill but the
+        /// wait thread keeps polling — a kill-before-join with the kill held
+        /// open.
+        Kill,
+        /// The fake's wait closure blocks BEFORE its first wait: the wait
+        /// thread is a live waiter while the deadline races it.
+        Wait,
+        /// The fake's wait closure blocks AFTER recording its reap and BEFORE
+        /// returning the completion: a deadline kill in this window finds the
+        /// reaped handle consumed and is a no-op — join-before-kill, the
+        /// barrier property's window reached via delay injection.
+        AfterReap,
+    }
+
+    /// How long the injected delay blocks, relative to the runner's deadline:
+    /// Tiny stays well inside the deadline (the wait finishes first and the
+    /// runner joins without killing), Past crosses it (the deadline fires
+    /// while the wait is still blocked and the runner must kill-then-reap).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum DelaySize {
+        /// No delay: the case runs unperturbed.
+        None,
+        /// An order of magnitude under the deadline: a scheduling
+        /// perturbation, not a deadline crossing.
+        Tiny,
+        /// Past the deadline by a small margin: the wait is guaranteed to
+        /// outlive the deadline.
+        Past,
+    }
+
+    impl DelaySize {
+        /// The wall-clock delay for a runner deadline of `deadline`.
+        fn delay_for(self, deadline: Duration) -> Duration {
+            match self {
+                DelaySize::None => Duration::ZERO,
+                DelaySize::Tiny => deadline / 10,
+                DelaySize::Past => deadline + Duration::from_millis(3),
+            }
+        }
+    }
+
     #[derive(Default)]
     struct FakeState {
         log: Mutex<Vec<LogEntry>>,
@@ -553,6 +651,11 @@ mod runner_property_tests {
         /// reaped-but-not-yet-completed window in which a detached-pid kill
         /// would be catastrophic.
         after_reap_barrier: Option<Arc<std::sync::Barrier>>,
+        /// Injected scheduler delay (stage + duration) for this child: the
+        /// fake blocks for `delay` at `delay_at` — the delay-injection points
+        /// of the scheduler-delay property. `Duration::ZERO` disables it.
+        delay_at: DelayAt,
+        delay: Duration,
         state: Arc<FakeState>,
     }
 
@@ -563,6 +666,13 @@ mod runner_property_tests {
         /// records the single reap and returns the stubbed output or error.
         fn wait(&self) -> std::result::Result<std::process::Output, RunError> {
             self.state.live_waiters.fetch_add(1, Ordering::SeqCst);
+            // Injected scheduler delay at the WAIT stage: the wait thread is a
+            // live waiter while the deadline races it — a delay inside the
+            // deadline leaves the completion first (join-before-kill), a
+            // delay past it leaves the kill first (kill-before-join).
+            if self.delay_at == DelayAt::Wait {
+                std::thread::sleep(self.delay);
+            }
             let res = self.wait_inner();
             // The child is fully reaped now — and the reaped flag is armed
             // BEFORE the Reap becomes observable, so from the moment the log
@@ -572,6 +682,14 @@ mod runner_property_tests {
             // window the pid-reuse test exploits; only that test sets it.
             self.reaped.store(true, Ordering::SeqCst);
             self.state.push(LogEntry::Reap { pid: self.pid });
+            // Injected scheduler delay at the AFTER-REAP stage: the child is
+            // reaped but the completion has not been delivered — a deadline
+            // reached in this window makes the runner's kill a no-op on the
+            // consumed handle (join-before-kill), the delay-probe mirror of
+            // the pid-reuse barrier.
+            if self.delay_at == DelayAt::AfterReap {
+                std::thread::sleep(self.delay);
+            }
             self.state.live_waiters.fetch_sub(1, Ordering::SeqCst);
             if let Some(barrier) = &self.after_reap_barrier {
                 barrier.wait();
@@ -649,10 +767,29 @@ mod runner_property_tests {
         /// returning, exposing the reaped-but-not-yet-completed window in
         /// which a detached-pid kill would be catastrophic.
         after_reap_barrier: Option<Arc<std::sync::Barrier>>,
+        /// Injected scheduler delay (stage + duration) applied to this seam's
+        /// spawn/kill/wait closures: the delay-injection points of the
+        /// scheduler-delay property.
+        delay_at: DelayAt,
+        delay: Duration,
     }
 
     impl FakeSeam {
         fn new(stall: Stall, keyscan_line: Option<String>) -> (Arc<Self>, Arc<FakeState>) {
+            Self::with_delays(stall, keyscan_line, DelayAt::Wait, Duration::ZERO)
+        }
+
+        /// The fake seam with an injected scheduler delay: every spawned
+        /// child's spawn/kill/wait closures block for `delay` at the `at`
+        /// stage, deliberately perturbing the thread schedule so the
+        /// scheduler-delay property races the deadline around the
+        /// kill/wait boundary.
+        fn with_delays(
+            stall: Stall,
+            keyscan_line: Option<String>,
+            at: DelayAt,
+            delay: Duration,
+        ) -> (Arc<Self>, Arc<FakeState>) {
             let state = Arc::new(FakeState::default());
             let seam = FakeSeam {
                 state: state.clone(),
@@ -660,6 +797,8 @@ mod runner_property_tests {
                 next_pid: AtomicU32::new(1),
                 keyscan_line,
                 after_reap_barrier: None,
+                delay_at: at,
+                delay,
             };
             (Arc::new(seam), state)
         }
@@ -685,6 +824,8 @@ mod runner_property_tests {
                 has_stdin: false,
                 keyscan_line: None,
                 after_reap_barrier: None,
+                delay_at: DelayAt::Wait,
+                delay: Duration::ZERO,
                 state: self.state.clone(),
             })
         }
@@ -698,6 +839,12 @@ mod runner_property_tests {
             stdin: Option<Vec<u8>>,
         ) -> std::io::Result<SpawnedChild> {
             let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
+            // Injected scheduler delay at the SPAWN stage: the child is
+            // conceptually live but the runner does not yet hold the handle —
+            // the launch skew the scheduler-delay property perturbs.
+            if self.delay_at == DelayAt::Spawn {
+                std::thread::sleep(self.delay);
+            }
             self.state.push(LogEntry::Spawn {
                 op,
                 argv: argv.to_vec(),
@@ -714,6 +861,8 @@ mod runner_property_tests {
                 has_stdin: stdin.is_some(),
                 keyscan_line: self.keyscan_line.clone(),
                 after_reap_barrier: self.after_reap_barrier.clone(),
+                delay_at: self.delay_at,
+                delay: self.delay,
                 state: self.state.clone(),
             });
             // The kill handle: the runner's deadline path requests the kill
@@ -727,6 +876,12 @@ mod runner_property_tests {
                 if kill_ctl.reaped.load(Ordering::SeqCst) {
                     return Ok(());
                 }
+                // Injected scheduler delay at the KILL stage: the runner has
+                // decided to kill but the child has not been told — the wait
+                // thread keeps polling while the deadline path is held open.
+                if kill_ctl.delay_at == DelayAt::Kill {
+                    std::thread::sleep(kill_ctl.delay);
+                }
                 kill_ctl.state.push(LogEntry::Kill { pid: kill_ctl.pid });
                 kill_ctl.killed.store(true, Ordering::SeqCst);
                 Ok(())
@@ -735,7 +890,7 @@ mod runner_property_tests {
             let wait: Box<
                 dyn FnOnce() -> std::result::Result<std::process::Output, RunError> + Send,
             > = Box::new(move || wait_ctl.wait());
-            Ok(SpawnedChild { kill, wait })
+            Ok(SpawnedChild { pid, kill, wait })
         }
     }
 
@@ -1149,19 +1304,24 @@ mod runner_property_tests {
 
     /// Real-runner sanity check: a REAL subprocess that stalls must be killed
     /// at the deadline AND reaped — the pid must be gone afterwards, because an
-    /// un-reaped zombie would still answer `kill(pid, 0)` with success.
+    /// un-reaped zombie would still answer `kill(pid, 0)` with success. The
+    /// pid comes from the test-only spawn observer: the PARENT records it
+    /// synchronously at spawn time, so no child-written pidfile can race the
+    /// deadline kill.
     #[test]
     fn real_runner_kills_and_reaps_a_stalled_child() {
-        let dir = tempfile::tempdir().unwrap();
-        let pidfile = dir.path().join("child.pid");
-        // The child records its own pid to a file, then execs `sleep` (so the
-        // recorded pid IS the process the runner must kill and reap).
+        let spawned = Arc::new(Mutex::new(None));
+        let runner = SshRunner::new().with_spawn_observer({
+            let spawned = spawned.clone();
+            Arc::new(move |pid: u32| *spawned.lock().unwrap() = Some(pid))
+        });
+        // The child execs `sleep`, so the observed pid IS the process the
+        // runner must kill and reap.
         let argv = vec![
             "sh".to_string(),
             "-c".to_string(),
-            format!("echo $$ > {}; exec sleep 30", pidfile.display()),
+            "exec sleep 30".to_string(),
         ];
-        let runner = SshRunner::new();
         let deadline = Duration::from_millis(100);
         let start = Instant::now();
         let res = runner.run(OpKind::Exec, &argv, None, Some(deadline));
@@ -1170,11 +1330,13 @@ mod runner_property_tests {
             start.elapsed() < Duration::from_secs(5),
             "a stalled child must be killed at the deadline, not after it"
         );
-        let pid: i32 = std::fs::read_to_string(&pidfile)
-            .expect("child must have recorded its pid before stalling")
-            .trim()
-            .parse()
-            .unwrap();
+        // The observer recorded the pid before the deadline clock started, so
+        // it is always available after `run` returns — nothing to race.
+        let pid: i32 = spawned
+            .lock()
+            .unwrap()
+            .expect("the spawn observer must record the child pid in the parent at spawn time")
+            as i32;
         // SAFETY: `kill(pid, 0)` only probes existence; it sends no signal.
         let still_exists = unsafe { libc::kill(pid, 0) } == 0;
         assert!(
@@ -1183,29 +1345,36 @@ mod runner_property_tests {
         );
     }
 
-    /// THE timed-out-upload guarantee: a real child that RECORDS ITS PID but
-    /// NEVER reads stdin, with a payload larger than the pipe buffer (1 MiB » a
-    /// 16–64 KiB pipe), blocks the wait closure's stdin write until the tiny
-    /// deadline fires; the child is then KILLED — and the recorded PID must be
-    /// GONE afterwards, proving the timed-out upload was not only killed but
-    /// also REAPED (an uncollected zombie would still answer `kill(pid, 0)`).
+    /// THE timed-out-upload guarantee: a real child that NEVER reads stdin,
+    /// with a payload larger than the pipe buffer (1 MiB » a 16–64 KiB pipe),
+    /// blocks the wait closure's stdin write until the tiny deadline fires;
+    /// the child is then KILLED — and its pid must be GONE afterwards,
+    /// proving the timed-out upload was not only killed but also REAPED (an
+    /// uncollected zombie would still answer `kill(pid, 0)`). The pid is
+    /// recorded by the test-only spawn observer in the PARENT at spawn time:
+    /// the OLD form asked the child to write its own pid to a file, which
+    /// RACED the deadline kill (the child can be killed before it writes) —
+    /// that was the flaky-test bug.
     #[test]
     fn real_runner_kills_and_reaps_a_timed_out_upload() {
-        let dir = tempfile::tempdir().unwrap();
-        let pidfile = dir.path().join("child.pid");
-        // The child records its own pid, then execs `sleep` WITHOUT ever
-        // reading stdin: the piped payload fills the pipe buffer and the write
-        // blocks until the deadline kill closes the pipe.
-        let argv = vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            format!("echo $$ > {}; exec sleep 30", pidfile.display()),
-        ];
+        let spawned = Arc::new(Mutex::new(None));
         let runner = SshRunner::with_seam(
             Arc::new(RealRunner),
             Duration::from_millis(50),
             Duration::from_millis(50),
-        );
+        )
+        .with_spawn_observer({
+            let spawned = spawned.clone();
+            Arc::new(move |pid: u32| *spawned.lock().unwrap() = Some(pid))
+        });
+        // The child execs `sleep` WITHOUT ever reading stdin: the piped
+        // payload fills the pipe buffer and the write blocks until the
+        // deadline kill closes the pipe.
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "exec sleep 30".to_string(),
+        ];
         let payload: Vec<u8> = vec![0x5A; 1024 * 1024]; // 1 MiB » pipe buffer
         let start = Instant::now();
         let res = runner.run(OpKind::Upload, &argv, Some(&payload), None);
@@ -1216,11 +1385,13 @@ mod runner_property_tests {
             start.elapsed() < Duration::from_secs(5),
             "a timed-out upload must be killed at the deadline, not after it"
         );
-        let pid: i32 = std::fs::read_to_string(&pidfile)
-            .expect("child must have recorded its pid before stalling")
-            .trim()
-            .parse()
-            .unwrap();
+        // The observer recorded the pid before the deadline clock started, so
+        // it is always present after `run` returns.
+        let pid: i32 = spawned
+            .lock()
+            .unwrap()
+            .expect("the spawn observer must record the child pid in the parent at spawn time")
+            as i32;
         // SAFETY: `kill(pid, 0)` only probes existence; it sends no signal.
         let still_exists = unsafe { libc::kill(pid, 0) } == 0;
         assert!(
@@ -1256,27 +1427,24 @@ mod runner_property_tests {
 
     /// Real-runner check for the consumed-handle contract: a kill request on
     /// a child whose wait ALREADY reaped it must not raise an error and —
-    /// where observable from this side of the seam — must not signal
+    /// where observable from this side of the child — must not signal
     /// anything: the pid is gone (the process was collected), and because the
     /// kill goes through the OWNED handle (never a detached pid), it can
     /// never land on a process the OS recycled the pid to.
     #[test]
     fn kill_after_reap_does_not_raise_or_signal() {
-        let dir = tempfile::tempdir().unwrap();
-        let pidfile = dir.path().join("child.pid");
         let seam = Arc::new(RealRunner);
         let child = seam
             .spawn(
                 OpKind::Exec,
-                &[
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!("echo $$ > {}; exit 7", pidfile.display()),
-                ],
+                &["sh".to_string(), "-c".to_string(), "exit 7".to_string()],
                 None,
             )
             .expect("spawn must succeed");
-        let SpawnedChild { kill, wait } = child;
+        // The pid comes from the PARENT: the seam reads it synchronously at
+        // spawn time (`Child::id`) and returns it on the handle — no
+        // child-written pidfile.
+        let SpawnedChild { pid, kill, wait } = child;
         let out = std::thread::spawn(wait)
             .join()
             .unwrap()
@@ -1295,11 +1463,7 @@ mod runner_property_tests {
         );
         // Where observable: nothing was signalled — the pid is gone (reaped,
         // not a zombie), so the kill cannot land on an unrelated process.
-        let pid: i32 = std::fs::read_to_string(&pidfile)
-            .expect("the child must have recorded its pid before exiting")
-            .trim()
-            .parse()
-            .unwrap();
+        let pid: i32 = pid as i32;
         // SAFETY: `kill(pid, 0)` only probes existence; it sends no signal.
         let still_exists = unsafe { libc::kill(pid, 0) } == 0;
         assert!(!still_exists, "reaped child {pid} must be gone");
@@ -1314,6 +1478,111 @@ mod runner_property_tests {
             Just(Stall::StdinWriteError),
             Just(Stall::WaitError),
         ]
+    }
+
+    fn delay_at_strategy() -> impl Strategy<Value = DelayAt> {
+        prop_oneof![
+            Just(DelayAt::Spawn),
+            Just(DelayAt::Kill),
+            Just(DelayAt::Wait),
+            Just(DelayAt::AfterReap),
+        ]
+    }
+
+    fn delay_size_strategy() -> impl Strategy<Value = DelaySize> {
+        prop_oneof![
+            Just(DelaySize::None),
+            Just(DelaySize::Tiny),
+            Just(DelaySize::Past),
+        ]
+    }
+
+    /// Drive one generated (kind × stall × delay placement × delay size) case
+    /// through the runner's deadline logic against the fake seam with the
+    /// injected scheduler delay, then assert the invariants that must hold
+    /// for EVERY returned outcome.
+    fn run_one_delayed(kind: OpKind, stall: Stall, at: DelayAt, size: DelaySize) {
+        // A 2ms deadline keeps the injected delays (and therefore the whole
+        // property) sub-millisecond-ish: the delay buckets are fractions of
+        // it, so the suite stays fast while the cases still race the deadline
+        // around the kill/wait boundary.
+        let deadline = Duration::from_millis(2);
+        let delay = size.delay_for(deadline);
+        let (seam, state) = FakeSeam::with_delays(stall, None, at, delay);
+        let runner = SshRunner::with_seam(seam, deadline, deadline);
+        let argv = vec!["ssh".to_string(), "runner-delay.test".to_string()];
+        let stdin = (kind == OpKind::Upload).then(|| vec![0x5A; 4096]);
+        let timeout = (kind == OpKind::Exec).then_some(deadline);
+        let outcome = runner.run(kind, &argv, stdin.as_deref(), timeout);
+        assert_delayed_invariants(kind, stall, at, size, &state, outcome);
+    }
+
+    /// Whether a generated (stall × delay) pair actually CROSSES the past
+    /// deadline: a self-completing child whose wait is blocked past the
+    /// deadline cannot finish before the deadline fires, so the runner must
+    /// kill-then-reap a still-live wait — the race the delay is meant to
+    /// provoke. Pairs that do not cross (a tiny delay, a spawn-stage delay, a
+    /// hang that ends at the kill) exercise the opposite interleavings
+    /// instead, so both sides of the deadline are covered across the cases.
+    fn crosses_deadline(stall: Stall, at: DelayAt, size: DelaySize) -> bool {
+        size == DelaySize::Past
+            && matches!(at, DelayAt::Wait | DelayAt::AfterReap)
+            && matches!(
+                stall,
+                Stall::Complete | Stall::NonZero | Stall::StdinWriteError | Stall::WaitError
+            )
+    }
+
+    /// The scheduler-delay property's assertions: for EVERY returned outcome
+    /// (timeout, success, write error, wait error, spawn error) zero live
+    /// waiters must remain — the runner joined every wait thread before
+    /// returning — and the spawned child must have been reaped exactly once
+    /// (a failed spawn has no child: zero reaps).
+    fn assert_delayed_invariants(
+        kind: OpKind,
+        stall: Stall,
+        at: DelayAt,
+        size: DelaySize,
+        state: &FakeState,
+        outcome: std::result::Result<std::process::Output, RunError>,
+    ) {
+        let label = format!("{kind:?} × {stall:?} × {at:?} {size:?}");
+        assert_eq!(
+            state.live_waiters(),
+            0,
+            "every returned outcome must leave zero live waiters ({label}): {} waiters still live",
+            state.live_waiters()
+        );
+        if stall == Stall::SpawnError {
+            assert_eq!(
+                state.kill_pids(),
+                Vec::<u32>::new(),
+                "a failed spawn has nothing to kill ({label})"
+            );
+            assert_eq!(
+                state.reap_pids(),
+                Vec::<u32>::new(),
+                "a failed spawn has nothing to reap ({label})"
+            );
+            return;
+        }
+        let (_, _, pid) = state.spawn();
+        assert_eq!(
+            state.reap_pids(),
+            vec![pid],
+            "the spawned child must be reaped exactly once ({label})"
+        );
+        // The delay must actually CROSS the deadline, not merely delay
+        // everything: a self-completing child whose wait is blocked past the
+        // deadline must surface as a Timeout — the deadline fired while the
+        // wait thread was still live (the wait's own completion can only
+        // arrive after the delay, which is past the deadline).
+        if crosses_deadline(stall, at, size) {
+            assert!(
+                matches!(outcome, Err(RunError::Timeout { .. })),
+                "a past-deadline wait delay must let the deadline win ({label}), got: {outcome:?}"
+            );
+        }
     }
 
     /// The extended seam's new outcomes, driven deterministically: the property
@@ -1349,15 +1618,17 @@ mod runner_property_tests {
             next_pid: AtomicU32::new(1),
             keyscan_line: None,
             after_reap_barrier: Some(barrier.clone()),
+            delay_at: DelayAt::Wait,
+            delay: Duration::ZERO,
         });
         let argv = vec!["ssh".to_string(), "true".to_string()];
         let child = seam
             .spawn(OpKind::Exec, &argv, None)
             .expect("the fake must spawn the stalling child");
-        let (_, _, pid) = state.spawn();
         // Split the handle exactly as the runner does: the kill request (the
-        // deadline path) and the wait closure (the wait thread).
-        let SpawnedChild { kill, wait } = child;
+        // deadline path) and the wait closure (the wait thread). The pid is
+        // the parent's own, read synchronously at spawn.
+        let SpawnedChild { pid, kill, wait } = child;
 
         // The runner's deadline path: request the kill through the OWNED
         // handle.
@@ -1441,7 +1712,11 @@ mod runner_property_tests {
         // reap count per pid is 1 for EVERY outcome, so no path ever returns
         // before reaping. FIXED SEED 0x5EED_5EED (repo style) + bounded cases
         // keep the suite deterministic and fast: the fake blocks only until the
-        // tiny injected deadline, so no case ever sleeps more than ~25ms.
+        // tiny injected deadline, so no case ever sleeps more than ~25ms. The
+        // scheduler-delay test below injects delays (spawn/kill/wait stages ×
+        // sub-deadline/past-deadline durations) and asserts EVERY outcome —
+        // Timeout, success, write error, wait error, spawn error — leaves
+        // zero live waiters and the spawned child reaped exactly once.
         #![proptest_config(ProptestConfig {
             cases: 16,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
@@ -1455,6 +1730,37 @@ mod runner_property_tests {
         ) {
             for (kind, stall) in pairs {
                 run_one_pair(kind, stall);
+            }
+        }
+
+        // The scheduler-delay property: the fake seam's spawn/kill/wait
+        // closures inject a controllable delay (placement × duration, both
+        // relative to the tiny injected deadline) so the deadline races the
+        // kill and wait paths — a self-completing child delayed past the
+        // deadline must still be killed and reaped, a delayed kill must not
+        // lose the reap, and a reap that lands before the kill must make the
+        // kill a no-op. EVERY returned outcome must leave ZERO live waiters
+        // and the spawned child reaped exactly once.
+        #[test]
+        fn every_outcome_leaves_zero_live_waiters_and_a_reaped_child(
+            random_cases in prop::collection::vec(
+                (op_strategy(), stall_strategy(), delay_at_strategy(), delay_size_strategy()),
+                1..=5,
+            )
+        ) {
+            // Every generated vector PREPENDS one guaranteed deadline-crossing
+            // pair (a self-completing child whose wait is delayed past the
+            // deadline): the property therefore provokes a kill-before-join
+            // race in every single run — the injected delays cannot degenerate
+            // into merely delaying everything — while the random legs cover
+            // the complementary inside-the-deadline and kill-stage
+            // interleavings (the join-before-kill reap side is also exercised
+            // directly by the pid-reuse barrier test).
+            let mut cases =
+                vec![(OpKind::Upload, Stall::Complete, DelayAt::Wait, DelaySize::Past)];
+            cases.extend(random_cases);
+            for (kind, stall, at, size) in cases {
+                run_one_delayed(kind, stall, at, size);
             }
         }
     }
