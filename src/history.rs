@@ -147,7 +147,7 @@ pub fn parse_push_ref(token: &str) -> Result<RefExpr> {
                 "legacy 'f{digits}' snapshot-index form is no longer accepted; use 's{digits}'"
             )));
         } else {
-            RelBase::Refid(parse_ref_id(base_tok).ok_or_else(|| {
+            RelBase::Refid(parse_ref_id(base_tok)?.ok_or_else(|| {
                 Error::r#ref(format!(
                     "unrecognized reference id '{base_tok}' in '{token}'"
                 ))
@@ -198,7 +198,7 @@ pub fn parse_push_ref(token: &str) -> Result<RefExpr> {
             "legacy 'f{digits}' snapshot-index form is no longer accepted; use 's{digits}'"
         )));
     }
-    if let Some(rid) = parse_ref_id(id) {
+    if let Some(rid) = parse_ref_id(id)? {
         if dashes > 0 || matches!(rid, RefId::SnapshotIndex(_) | RefId::Deployment(_)) {
             return Ok(RefExpr::Relative(RelativeRef {
                 base: RelBase::Refid(rid),
@@ -231,31 +231,40 @@ fn f_index_digits(s: &str) -> Option<&str> {
 /// snapshot-index prefix is REJECTED (never misread as a bare-hex release
 /// digest — `f3` is hex); callers surface the specific "use sN" hint before
 /// reaching here.
-fn parse_ref_id(s: &str) -> Option<RefId> {
+///
+/// Returns `Ok(Some(rid))` for a recognized refid, `Ok(None)` for a shape
+/// that is not a refid at all, and `Err` when an `s<digits>` index does not
+/// fit a `u64` (e.g. `s999...` at magnitude 10^100). Overflow is a parse
+/// error (`Error::r#ref`), NEVER a panic: the numeric conversion is mapped
+/// to the error rather than unwrapped.
+fn parse_ref_id(s: &str) -> Result<Option<RefId>> {
     // Legacy `f<digits>` snapshot-index prefix: never a release digest.
     if f_index_digits(s).is_some() {
-        return None;
+        return Ok(None);
     }
     if let Some(digits) = s.strip_prefix('s')
         && !digits.is_empty()
         && digits.chars().all(|c| c.is_ascii_digit())
     {
-        return Some(RefId::SnapshotIndex(digits.parse().unwrap()));
+        let index = digits
+            .parse::<u64>()
+            .map_err(|_| Error::r#ref(format!("snapshot index 's{digits}' out of range")))?;
+        return Ok(Some(RefId::SnapshotIndex(index)));
     }
     if let Some(rest) = s.strip_prefix("deploy-")
         && !rest.is_empty()
     {
-        return Some(RefId::Deployment(s.to_string()));
+        return Ok(Some(RefId::Deployment(s.to_string())));
     }
     if let Some(rest) = s.strip_prefix("rel-sha256-")
         && !rest.is_empty()
     {
-        return Some(RefId::Release(s.to_string()));
+        return Ok(Some(RefId::Release(s.to_string())));
     }
     if !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Some(RefId::Release(s.to_string()));
+        return Ok(Some(RefId::Release(s.to_string())));
     }
-    None
+    Ok(None)
 }
 
 /// Parse AND resolve a push source reference token against the separately-
@@ -622,6 +631,8 @@ mod tests {
         ArtifactRef, DeploymentId, GenerationId, PlacementSlotId, ReleaseId, SCHEMA_VERSION,
         ServerId, TreeDigest, VariantName,
     };
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
     use std::collections::BTreeMap;
 
     #[test]
@@ -1052,5 +1063,96 @@ mod tests {
             snapshot.bindings.is_empty(),
             "old `servers`-keyed line yields an empty bindings map"
         );
+    }
+
+    /// Run the parser under `catch_unwind`: a panicking parse turns into a
+    /// test failure at the `.expect`, so the property can assert BOTH that
+    /// no input ever panics AND that the result has the expected shape.
+    /// `parse_push_ref` is a plain fn with no interior mutability, so the
+    /// closure is `UnwindSafe` (it captures only a `&str`).
+    fn parse_no_panic(token: &str) -> Result<RefExpr> {
+        std::panic::catch_unwind(|| parse_push_ref(token)).expect("parse_push_ref must never panic")
+    }
+
+    // PROPERTY: no reference token, however huge its snapshot index or
+    // ancestor count, may panic the parser, and any index/count that does
+    // not fit a `u64` must be a ref error — never a silently valid parse.
+    //
+    // The generated digits are 100 chars with a nonzero lead (magnitude
+    // >= 10^99, far beyond `u64::MAX` ~ 1.8*10^19), covering `sN`, the
+    // dash forms `sN-` / `sN--`, and `parent(sN, M)` with a huge `N`, a
+    // huge `M`, and both. Boundary cases pin `u64::MAX` exactly (the
+    // largest VALID index) against `u64::MAX + 1` (the smallest overflow).
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            rng_seed: RngSeed::Fixed(0x0F10_0F10),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn oversized_snapshot_indices_are_errors_never_panics(huge in "[1-9][0-9]{99}") {
+            // `sN`, `sN-`, `sN--`: the index itself overflows. The error must
+            // be the snapshot-index out-of-range ref error, not a panic and
+            // not a silently valid parse.
+            for token in [
+                format!("s{huge}"),
+                format!("s{huge}-"),
+                format!("s{huge}--"),
+            ] {
+                let err = parse_no_panic(&token)
+                    .expect_err(&format!("oversized index '{token}' must be a ref error"));
+                assert!(
+                    err.to_string().contains("out of range"),
+                    "error for '{token}' must report the out-of-range index, got: {err}"
+                );
+            }
+
+            // `parent(sN, M)` with a huge N (M itself small and valid).
+            for m in ["0", "1", "2"] {
+                let token = format!("parent(s{huge}, {m})");
+                let err = parse_no_panic(&token)
+                    .expect_err(&format!("oversized base index '{token}' must be a ref error"));
+                assert!(
+                    err.to_string().contains("out of range"),
+                    "error for '{token}' must report the out-of-range index, got: {err}"
+                );
+            }
+
+            // `parent(sN, M)` with a huge M (and huge M AND huge N: M is
+            // parsed first, so it reports the ancestor-count error).
+            for token in [
+                format!("parent(s1, {huge})"),
+                format!("parent(s{huge}, {huge})"),
+            ] {
+                let err = parse_no_panic(&token)
+                    .expect_err(&format!("oversized ancestor count '{token}' must be a ref error"));
+                assert!(
+                    err.to_string().contains("invalid ancestor step count"),
+                    "error for '{token}' must report the bad ancestor count, got: {err}"
+                );
+            }
+
+            // Boundary: `u64::MAX` exactly is the largest VALID snapshot
+            // index; `u64::MAX + 1` overflows and is a ref error.
+            let max = u64::MAX.to_string();
+            assert_eq!(
+                parse_no_panic(&format!("s{max}")).unwrap(),
+                RefExpr::Relative(RelativeRef {
+                    base: RelBase::Refid(RefId::SnapshotIndex(u64::MAX)),
+                    steps: 0,
+                }),
+            );
+            let over = (u64::MAX as u128 + 1).to_string();
+            for token in [format!("s{over}"), format!("parent(s{over}, 1)")] {
+                let err = parse_no_panic(&token)
+                    .expect_err(&format!("u64::MAX + 1 index '{token}' must be a ref error"));
+                assert!(
+                    err.to_string().contains("out of range"),
+                    "error for '{token}' must report the out-of-range index, got: {err}"
+                );
+            }
+        }
     }
 }
