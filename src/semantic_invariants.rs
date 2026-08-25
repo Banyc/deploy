@@ -129,35 +129,44 @@ attempts = 1
 interval_seconds = 0
 "#;
 
-/// TWO shared physical slots, each on its OWN server (`s1` / `s2`): `p1` and
-/// `p2` are BOTH members of BOTH targets, so a `t1`/`t2` push plans TWO
-/// slots and a pre-swap failure of the first (under `stop_on_failure`)
-/// SKIPS the second — the skipped-slot observed-refresh scenario the
-/// one-slot fixture could never reach. Each slot binds a distinct server so
-/// the remote generation state (current pointer, generations, trees) stays
-/// independent per slot. Plus the single-member slot `pdx` (target
-/// `debtfx`) used ONLY by the rotation-debt fault-matrix test.
-/// `debtfx`'s name is unique to that test (no other test pushes it), so the
-/// TARGET-keyed debt fault arms (`arm_read_rotation_debt` /
-/// `arm_write_rotation_debt`) cannot be consumed by a concurrent test's
-/// push — the fixture's `t1`/`t2` pushes stay untouched.
+/// TWO physical slots owned by `t1` (`p1` on server `s1`, `p2` on server
+/// `s2`): a `t1` push plans TWO slots and a pre-swap failure of the first
+/// (under `stop_on_failure`) SKIPS the second — the skipped-slot
+/// observed-refresh scenario the one-slot fixture could never reach. Each
+/// slot binds a distinct server so the remote generation state (current
+/// pointer, generations, trees) stays independent per slot. `t2` owns its
+/// OWN single slot `p3` (server `s3`): a slot has EXACTLY ONE owning
+/// target, so `t2`'s records and observed state are never touched by a
+/// `t1` push (and vice versa) — the cross-target isolation the new model
+/// guarantees. Plus the single-member slot `pdx` (target `debtfx`) used
+/// ONLY by the rotation-debt fault-matrix test. `debtfx`'s name is unique
+/// to that test (no other test pushes it), so the TARGET-keyed debt fault
+/// arms (`arm_read_rotation_debt` / `arm_write_rotation_debt`) cannot be
+/// consumed by a concurrent test's push — the fixture's `t1`/`t2` pushes
+/// stay untouched.
 const SLOT_BODY: &str = r#"
 [[slots]]
 id = "p1"
 server = "s1"
-targets = ["t1", "t2"]
+target = "t1"
 deploy_dir = "/srv/si"
 
 [[slots]]
 id = "p2"
 server = "s2"
-targets = ["t1", "t2"]
+target = "t1"
 deploy_dir = "/srv/si2"
+
+[[slots]]
+id = "p3"
+server = "s3"
+target = "t2"
+deploy_dir = "/srv/si3"
 
 [[slots]]
 id = "pdx"
 server = "s1"
-targets = ["debtfx"]
+target = "debtfx"
 deploy_dir = "/srv/si-debt"
 "#;
 
@@ -179,12 +188,13 @@ protect_deployments = 2
 
 /// Targets own ROLLOUT behavior only: retention is slot-owned (the slot's
 /// OWNING VARIANT file declares the single policy for every slot it
-/// declares; see [`ROTATION_BODY`]). A shared slot (`p1`, `p2` — members of
-/// BOTH `t1` and `t2`) rotates under that ONE policy regardless of which
-/// target pushes it: neither `t1` nor `t2` — nor the `debtfx` single-member
-/// target — carries a rotation surface here.
+/// declares; see [`ROTATION_BODY`]). Each slot has EXACTLY ONE owning
+/// target (`t1` owns `p1`/`p2`, `t2` owns `p3`, `debtfx` owns `pdx`) and
+/// rotates under that ONE policy regardless of which target pushes it:
+/// neither `t1` nor `t2` — nor the `debtfx` single-member target — carries
+/// a rotation surface here.
 const DEPLOY_TOML: &str = r#"
-schema_version = 1
+schema_version = 2
 application = "si"
 release = "v1"
 
@@ -196,6 +206,12 @@ host_key_fingerprint = "SHA256:test"
 
 [[servers]]
 id = "s2"
+address = "a"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s3"
 address = "a"
 user = "u"
 host_key_fingerprint = "SHA256:test"
@@ -909,14 +925,16 @@ impl Fixture {
     }
 
     /// The server a placement slot binds to in the multi-slot fixture: each
-    /// shared slot owns a DISTINCT server (`p1` -> `s1`, `p2` -> `s2`) so
-    /// the remote generation state stays independent per slot (two slots on
-    /// one server would share the single `current` pointer). `pdx` shares
-    /// `s1` but is a single-member slot the debt-matrix test pushes alone.
+    /// slot owns a DISTINCT server (`p1` -> `s1`, `p2` -> `s2`, `p3` ->
+    /// `s3`) so the remote generation state stays independent per slot (two
+    /// slots on one server would share the single `current` pointer). `pdx`
+    /// shares `s1` but is a single-member slot the debt-matrix test pushes
+    /// alone.
     fn server_for_slot(&self, slot: &str) -> &'static str {
         match slot {
             "p1" => "s1",
             "p2" => "s2",
+            "p3" => "s3",
             "pdx" => "s1",
             other => panic!("unknown fixture slot {other}"),
         }
@@ -961,14 +979,15 @@ impl Fixture {
         })
     }
 
-    /// The LIVE remote assignments for the shared placement slots (`p1` on
-    /// `s1`, `p2` on `s2`), keyed by placement slot: the ground truth the
-    /// observed projections must equal (generation + artifact + the
-    /// assignment's OWN minting deployment id). A slot whose server has no
-    /// current generation, or whose assignment cannot be read, is absent.
+    /// The LIVE remote assignments for the fixture's placement slots (`p1`
+    /// on `s1`, `p2` on `s2`, `p3` on `s3`), keyed by placement slot: the
+    /// ground truth the observed projections must equal (generation +
+    /// artifact + the assignment's OWN minting deployment id). A slot whose
+    /// server has no current generation, or whose assignment cannot be read,
+    /// is absent.
     fn current_assignments(&self) -> BTreeMap<PlacementSlotId, GenerationAssignment> {
         let mut out = BTreeMap::new();
-        for slot in ["p1", "p2"] {
+        for slot in ["p1", "p2", "p3"] {
             let asn = self.with_slot_helper(slot, |helper| {
                 let status = helper.status().ok()?;
                 let g = status.current_generation?;
@@ -991,6 +1010,7 @@ impl Fixture {
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
     }
@@ -1007,6 +1027,7 @@ impl Fixture {
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
             id,
         )
@@ -1036,6 +1057,7 @@ impl Fixture {
             &PushOptions {
                 dry_run: false,
                 ref_token: Some(ref_token.to_string()),
+                group: None,
             },
         )
     }
@@ -1130,22 +1152,29 @@ impl Fixture {
     }
 
     /// Acquire the slot's mutation lock via a SECOND `RemoteHelper` (its own
-    /// operation id) and return that id; [`Fixture::release_contention_lock`]
-    /// must be called when the contended action is done. The lock is a
-    /// single advisory file per server, so while it is held the push's own
-    /// preflight lock check fails.
-    fn hold_contention_lock(&self) -> String {
-        let remote = self.remote();
+    /// operation id) and return that id plus the server it was acquired on;
+    /// [`Fixture::release_contention_lock`] must be called with the same
+    /// server when the contended action is done. The lock is a single
+    /// advisory file per server, so while it is held the push's own preflight
+    /// lock check fails. The lock is held on the PUSHED target's FIRST
+    /// slot's server (a slot has exactly one owning target, so a `t1` push
+    /// contends on `s1` and a `t2` push on `s3`) — the engine's mutation-lock
+    /// preflight checks each selected slot's server in order, so the first
+    /// slot's server is the one that must be held for the contention to fire.
+    fn hold_contention_lock(&self, t: &str) -> (String, String) {
+        let first_slot = Model::target_slots(t)[0].clone();
+        let server = self.server_for_slot(first_slot.as_str()).to_string();
+        let remote = self.remote_for(&server);
         let helper = RemoteHelper::new(remote.as_ref());
         let op = format!("si-contend-{}", OperationId::generate().as_str());
         helper
             .acquire_lock(&op, false)
             .expect("the contention lock must be free at the start of the step");
-        op
+        (op, server)
     }
 
-    fn release_contention_lock(&self, op: &str) {
-        let remote = self.remote();
+    fn release_contention_lock(&self, op: &str, server: &str) {
+        let remote = self.remote_for(server);
         let helper = RemoteHelper::new(remote.as_ref());
         let _ = helper.release_lock(op);
     }
@@ -1256,7 +1285,7 @@ impl Fixture {
             return Outcome::Push(Box::new(res));
         }
         let contend = if class == FailureClass::LockContention {
-            Some(self.hold_contention_lock())
+            Some(self.hold_contention_lock(t))
         } else {
             None
         };
@@ -1270,13 +1299,14 @@ impl Fixture {
                 &PushOptions {
                     dry_run: false,
                     ref_token: Some(rt.to_string()),
+                    group: None,
                 },
                 &id,
             ),
             None => self.push_with_id(t, &id),
         };
-        if let Some(op) = contend {
-            self.release_contention_lock(&op);
+        if let Some((op, server)) = contend {
+            self.release_contention_lock(&op, &server);
         }
         self.disarm_prop_faults();
         Outcome::Push(Box::new(res))
@@ -1343,28 +1373,36 @@ impl Fixture {
         class: FailureClass,
     ) -> Result<PushReport> {
         let hook = step17_hook::Step17Hook::arm(self.store.step17_hook(), id.as_str());
+        // The guard is held on the PUSHED target's FIRST slot's server (a
+        // slot has exactly one owning target, so a t1 push contends on s1 and
+        // a t2 push on s3). Computed before the scoped thread so the borrow
+        // does not escape.
+        let first_slot = Model::target_slots(t)[0].clone();
+        let guard_server = self.server_for_slot(first_slot.as_str()).to_string();
+        let t_owned = t.to_string();
         std::thread::scope(|s| {
             let push = s.spawn(|| match ref_token {
                 Some(rt) => crate::push::engine::push_ref_with_id(
                     &self.cfg_path,
                     &self.store,
                     &self.remote_factory(),
-                    t,
+                    &t_owned,
                     &self.config,
                     &PushOptions {
                         dry_run: false,
                         ref_token: Some(rt.to_string()),
+                        group: None,
                     },
                     id,
                 ),
-                None => self.push_with_id(t, id),
+                None => self.push_with_id(&t_owned, id),
             });
             // The competing guard, held until AFTER the push returns — the
             // engine must find the lock held when it wakes from EVERY park.
             // The remote / helper are declared here so the guard's borrow
             // outlives the loop (an uncontended step just drops an unused
             // helper).
-            let remote = self.remote();
+            let remote = self.remote_for(&guard_server);
             let helper = RemoteHelper::new(remote.as_ref());
             let mut guard: Option<crate::remote::helper::LockGuard<'_>> = None;
             // Service EVERY park, not just the first: with prior debt the
@@ -1499,40 +1537,54 @@ impl Fixture {
         f.lock_written = false;
     }
 
+    /// The ONE owning target of a fixture slot: a slot has exactly one
+    /// target, so its observed record serves exactly that target's view —
+    /// there is no cross-target propagation anymore.
+    fn owning_target(slot: &str) -> &'static str {
+        match slot {
+            "p1" | "p2" => "t1",
+            "p3" => "t2",
+            "pdx" => "debtfx",
+            other => panic!("unknown fixture slot {other}"),
+        }
+    }
+
     /// The observed-scope property, asserted explicitly by the property
-    /// sequences: every member target's observed slot for EACH shared
-    /// placement (`p1`, `p2`) equals the CURRENT remote assignment
-    /// (generation + artifact + the assignment's OWN minting deployment) —
-    /// no absent, stale, partial, or re-stamped entries. Requires a remote
-    /// assignment to exist (call after the first completed push).
+    /// sequences: each slot's OWNING target's observed view equals the
+    /// CURRENT remote assignment (generation + artifact + the assignment's
+    /// OWN minting deployment) — no absent, stale, partial, or re-stamped
+    /// entries. A slot has exactly one owning target, so only that target's
+    /// view is checked (a push to another target never touches this slot's
+    /// records). Requires a remote assignment to exist (call after the
+    /// first completed push).
     fn assert_observed_scope_property(&self) {
         for (slot_id, asn) in self.current_assignments() {
-            for target in ["t1", "t2"] {
-                let observed = self
-                    .store
-                    .read_observed(target, &self.config)
-                    .expect("observed reads");
-                let slot = observed.slots.get(&slot_id).unwrap_or_else(|| {
-                    panic!("{target}: observed {slot_id} entry must be present")
-                });
-                assert_eq!(
-                    slot.generation.as_ref(),
-                    Some(&asn.generation_id),
-                    "{target}: observed generation must equal the remote generation"
-                );
-                assert_eq!(
-                    slot.artifact.as_ref(),
-                    Some(&asn.artifact),
-                    "{target}: observed artifact must equal the remote assignment"
-                );
-                assert_eq!(
-                    slot.last_deployment.as_ref(),
-                    Some(&asn.deployment_id),
-                    "{target}: observed last_deployment must equal the LIVE assignment's OWN \
-                     minting deployment — a skipped/unreachable slot's prior record is never \
-                     re-stamped"
-                );
-            }
+            let target = Self::owning_target(slot_id.as_str());
+            let observed = self
+                .store
+                .read_observed(target, &self.config)
+                .expect("observed reads");
+            let slot = observed
+                .slots
+                .get(&slot_id)
+                .unwrap_or_else(|| panic!("{target}: observed {slot_id} entry must be present"));
+            assert_eq!(
+                slot.generation.as_ref(),
+                Some(&asn.generation_id),
+                "{target}: observed generation must equal the remote generation"
+            );
+            assert_eq!(
+                slot.artifact.as_ref(),
+                Some(&asn.artifact),
+                "{target}: observed artifact must equal the remote assignment"
+            );
+            assert_eq!(
+                slot.last_deployment.as_ref(),
+                Some(&asn.deployment_id),
+                "{target}: observed last_deployment must equal the LIVE assignment's OWN \
+                 minting deployment — a skipped/unreachable slot's prior record is never \
+                 re-stamped"
+            );
         }
     }
 
@@ -1582,18 +1634,19 @@ impl Fixture {
             &PushOptions {
                 dry_run: false,
                 ref_token: Some(ref_token.to_string()),
+                group: None,
             },
         )
     }
 
-    /// Standalone rotation under each shared slot's ONE policy — the policy
-    /// of the slot's OWNING VARIANT (`standard` declares `p1`/`p2`; retention
+    /// Standalone rotation under each slot's ONE policy — the policy of the
+    /// slot's OWNING VARIANT (`standard` declares `p1`/`p2`/`p3`; retention
     /// is slot-owned, never a member-target union), exactly as step 17 runs
     /// it (mutation lock + the single policy's retained set), for EVERY
-    /// shared slot's server.
+    /// slot's server.
     fn rotate_slot_policy(&self) -> Result<()> {
         let rotation = &self.config.variant("standard").unwrap().rotation;
-        for server in ["s1", "s2"] {
+        for server in ["s1", "s2", "s3"] {
             self.with_helper_for(server, |helper| {
                 let op = OperationId::generate();
                 let _guard = helper.acquire_lock_guard(op.as_str())?;
@@ -1710,6 +1763,16 @@ impl Fixture {
         self.check_bounds();
     }
 
+    /// Evaluate all five invariant groups against the fixture state, with a
+    /// context label (the failing action index) for diagnostics.
+    fn check_invariants_ctx(&self, ctx: &str) {
+        self.check_identity();
+        self.check_scope_ctx(ctx);
+        self.check_lifecycle();
+        self.check_integrity();
+        self.check_bounds();
+    }
+
     /// Identity: every stored release record's identity is recomputed and
     /// consistent; the live generation's assignment artifact references a
     /// locally stored, verified release.
@@ -1759,41 +1822,44 @@ impl Fixture {
     /// union); (3) every tree that policy retains actually survives the
     /// post-push rotation.
     fn check_scope(&self) {
+        self.check_scope_ctx("")
+    }
+
+    fn check_scope_ctx(&self, ctx: &str) {
         for (slot_id, asn) in self.current_assignments() {
-            for target in ["t1", "t2"] {
-                let observed = self
-                    .store
-                    .read_observed(target, &self.config)
-                    .expect("observed reads");
-                let slot = match observed.slots.get(&slot_id) {
-                    Some(slot) => slot,
-                    None => panic!(
-                        "{target}: observed projection for {slot_id} must be present after any \
-                         completed/recovered mutation (a no-op retry refreshes observed; the \
-                         crash window is entered only mid-sequence via push_with_id, never \
-                         evaluated by check_invariants)"
-                    ),
-                };
-                assert_eq!(
-                    slot.artifact.as_ref(),
-                    Some(&asn.artifact),
-                    "{target}: observed projection must equal the remote assignment"
-                );
-                assert_eq!(
-                    slot.generation.as_ref(),
-                    Some(&asn.generation_id),
-                    "{target}: observed generation must equal the remote generation"
-                );
-                assert_eq!(
-                    slot.last_deployment.as_ref(),
-                    Some(&asn.deployment_id),
-                    "{target}: observed last_deployment must equal the LIVE assignment's OWN \
-                     minting deployment — a skipped/unreachable slot's prior record is never \
-                     re-stamped by a deployment that did not touch it"
-                );
-            }
+            let target = Self::owning_target(slot_id.as_str());
+            let observed = self
+                .store
+                .read_observed(target, &self.config)
+                .expect("observed reads");
+            let slot = match observed.slots.get(&slot_id) {
+                Some(slot) => slot,
+                None => panic!(
+                    "{ctx} {target}: observed projection for {slot_id} must be present after any \
+                     completed/recovered mutation (a no-op retry refreshes observed; the \
+                     crash window is entered only mid-sequence via push_with_id, never \
+                     evaluated by check_invariants)"
+                ),
+            };
+            assert_eq!(
+                slot.artifact.as_ref(),
+                Some(&asn.artifact),
+                "{target}: observed projection must equal the remote assignment"
+            );
+            assert_eq!(
+                slot.generation.as_ref(),
+                Some(&asn.generation_id),
+                "{target}: observed generation must equal the remote generation"
+            );
+            assert_eq!(
+                slot.last_deployment.as_ref(),
+                Some(&asn.deployment_id),
+                "{target}: observed last_deployment must equal the LIVE assignment's OWN \
+                 minting deployment — a skipped/unreachable slot's prior record is never \
+                 re-stamped by a deployment that did not touch it"
+            );
         }
-        for server in ["s1", "s2"] {
+        for server in ["s1", "s2", "s3"] {
             let retained = self.with_helper_for(server, |helper| {
                 // The slot's ONE policy, resolved from its OWNING VARIANT
                 // (`standard` declares the shared slots) — never a union of
@@ -1818,13 +1884,23 @@ impl Fixture {
     /// durable artifacts; no snapshot is ever duplicated; no locks linger.
     fn check_lifecycle(&self) {
         // Commit markers and mutation locks live PER SERVER: a deployment of
-        // the shared slots writes a marker on every slot's server (`s1` for
-        // `p1`, `s2` for `p2`), and no stale lock may remain on either.
-        let remotes = ["s1", "s2"]
+        // a target writes a marker on every server of its OWN slots (`s1`
+        // for `p1`, `s2` for `p2` — `t1`'s slots; `s3` for `p3` — `t2`'s
+        // slot), and no stale lock may remain on any of them. A slot has
+        // exactly one owning target, so a `t1` attempt never writes a
+        // marker on `s3` (and vice versa).
+        let remotes = ["s1", "s2", "s3"]
             .iter()
             .map(|s| (*s, self.remote_for(s)))
             .collect::<Vec<_>>();
         for target in ["t1", "t2"] {
+            // The servers of the target's OWN slots: the only servers its
+            // attempts can have written commit markers on.
+            let target_servers: Vec<&str> = match target {
+                "t1" => vec!["s1", "s2"],
+                "t2" => vec!["s3"],
+                _ => unreachable!(),
+            };
             let attempts = self.store.read_attempts(target).unwrap_or_default();
             let snapshots = self.store.read_snapshots(target).unwrap_or_default();
             let last_ok = self.store.read_last_successful(target);
@@ -1850,7 +1926,8 @@ impl Fixture {
                             snapshot_exists,
                             "Successful attempt {id} must have a snapshot entry"
                         );
-                        for (server, remote) in &remotes {
+                        for server in &target_servers {
+                            let remote = self.remote_for(server);
                             assert!(
                                 remote.exists(&layout::commit_marker(id)),
                                 "Successful attempt {id} must have a durable commit marker on \
@@ -2679,7 +2756,7 @@ fn observed_scope_preflight_failure_leaves_observed_equal() {
 fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     let f = Fixture::new();
 
-    // t1 deploys tree v1 on the shared slot.
+    // t1 deploys tree v1 on its OWN slots (p1, p2).
     f.apply(Action::Build(1));
     let r = f.apply(Action::Push("t1"));
     let Outcome::Push(res) = r else {
@@ -2691,8 +2768,20 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     );
     f.assert_observed_scope_property();
 
-    // t2 deploys tree v2 on the shared slot.
+    // t1 deploys tree v2 (a real push — p1/p2 advance together).
     f.apply(Action::Build(2));
+    let r = f.apply(Action::Push("t1"));
+    let Outcome::Push(res) = r else {
+        panic!("expected a push outcome");
+    };
+    assert_eq!(
+        res.expect("push t1 succeeds").status,
+        Some(DeploymentStatus::Successful)
+    );
+    f.assert_observed_scope_property();
+
+    // t2 deploys tree v2 on its OWN slot (p3). A slot has exactly one
+    // owning target, so this never touches p1/p2.
     let r = f.apply(Action::Push("t2"));
     let Outcome::Push(res) = r else {
         panic!("expected a push outcome");
@@ -2705,7 +2794,7 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
 
     // (c) Preflight failure on t2: HEAD advances to v3 so the t2 push is a
     // real one; it fails at the intent persist BEFORE any remote mutation, so
-    // the observed projections stay equal to the unchanged v2 assignment.
+    // t2's observed projection stays equal to the unchanged v2 assignment.
     f.apply(Action::Build(3));
     let id_p = DeploymentId::new("si-obs-seq-preflight");
     let err = {
@@ -2717,7 +2806,7 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     f.assert_observed_scope_property();
 
     // (b) Rollback t1 to its own `s0` (tree v1): a real push whose refresh
-    // propagates the restored assignment to BOTH member targets.
+    // lands the restored assignment in t1's OWN projection.
     let r = f.apply(Action::Rollback("t1", 0));
     let Outcome::Push(res) = r else {
         panic!("expected a push outcome");
@@ -2726,9 +2815,9 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     assert_eq!(report.status, Some(DeploymentStatus::Successful));
     f.assert_observed_scope_property();
 
-    // (a) Crash mid-flight on t1: the remote advances to v3 but the observed
-    // refresh never runs — both member projections go stale (they still show
-    // the rolled-back v1 assignment).
+    // (a) Crash mid-flight on t1: the remote advances p1/p2 to v3 but the
+    // observed refresh never runs — t1's projections go stale (they still
+    // show the rolled-back v1 assignment).
     let stale = f
         .store
         .read_observed("t1", &f.config)
@@ -2745,14 +2834,19 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
             .expect_err("the crash aborts before the observed refresh")
     };
     assert!(err.to_string().contains("test fault"), "{err}");
-    let after_crash = f.current_assignment().expect("remote advanced");
+    let after_crash = f
+        .current_assignments()
+        .get(&PlacementSlotId::new("p1"))
+        .expect("remote advanced")
+        .generation_id
+        .clone();
     assert_ne!(
         stale.as_ref(),
-        Some(&after_crash.generation_id),
+        Some(&after_crash),
         "the crash window must leave the projection stale"
     );
 
-    // Recovery: the no-op retry reconciles and refreshes BOTH member
+    // Recovery: the no-op retry reconciles and refreshes t1's OWN
     // projections to the v3 assignment. No further t1 push runs after this
     // (the fixed `si-obs-seq-crash` id is then the lexicographically newest).
     let r = f.apply(Action::Retry("t1"));
@@ -2763,8 +2857,18 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     assert_eq!(report.message, "Everything up to date");
     f.assert_observed_scope_property();
 
-    // A no-op retry on t2 (remote already at v3): the shared projection
-    // refreshes again.
+    // t2 advances its OWN slot to v3 (a real push — p3 is at v2).
+    let r = f.apply(Action::Push("t2"));
+    let Outcome::Push(res) = r else {
+        panic!("expected a push outcome");
+    };
+    assert_eq!(
+        res.expect("push t2 succeeds").status,
+        Some(DeploymentStatus::Successful)
+    );
+    f.assert_observed_scope_property();
+
+    // A no-op retry on t2 (p3 already at v3): the projection refreshes again.
     let r = f.apply(Action::Retry("t2"));
     let Outcome::Push(res) = r else {
         panic!("expected a push outcome");
@@ -2798,33 +2902,31 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     );
     f.assert_observed_scope_property();
 
-    // Wrap up with a standalone rotation under the full member union.
+    // Wrap up with a standalone rotation under each slot's ONE policy.
     f.apply(Action::Rotate);
     f.check_invariants();
 }
 
-/// (e) PRE-SWAP REMOTE FAILURE on a shared slot with a PRIOR live
-/// generation: the remote is reachable for planning/status but its
-/// `current`-link read fails EXACTLY ONCE at the pre-swap moment — the
-/// status read inside `process_server`, right after the slot's
-/// mutation-lock write (the planning and reconcile reads pass). The first
-/// slot aborts `Ok(Failed)` BEFORE the swap and the second is SKIPPED
-/// under `stop_on_failure`: NOTHING advanced, the attempt is recorded
-/// `FailedRolledBack` (nothing to compensate), and the observed
-/// projections in EVERY member target must stay UNTOUCHED — the same
-/// generation, artifact, and `last_deployment` (the live assignment's OWN
-/// minting deployment, never re-stamped with the failed deployment's id,
-/// never fabricated from the desired artifact). This is the exact
-/// regression the randomized property finds
-/// (`[(Push("t2"), None), (Rollback("t2", 0), RemoteStatusPreSwap)]`,
+/// (e) PRE-SWAP REMOTE FAILURE on a slot with a PRIOR live generation: the
+/// remote is reachable for planning/status but its `current`-link read
+/// fails EXACTLY ONCE at the pre-swap moment — the status read inside
+/// `process_server`, right after the slot's mutation-lock write (the
+/// planning and reconcile reads pass). The slot aborts `Ok(Failed)` BEFORE
+/// the swap: NOTHING advanced, the attempt is recorded `FailedRolledBack`
+/// (nothing to compensate), and the observed projection of the slot's ONE
+/// owning target must stay UNTOUCHED — the same generation, artifact, and
+/// `last_deployment` (the live assignment's OWN minting deployment, never
+/// re-stamped with the failed deployment's id, never fabricated from the
+/// desired artifact). This is the exact regression the randomized property
+/// finds (`[(Push("t2"), None), (Rollback("t2", 0), RemoteStatusPreSwap)]`,
 /// pinned deterministically here).
 #[test]
 fn observed_scope_pre_swap_failure_keeps_prior_record_untouched() {
     let f = Fixture::new();
-    // Seed a prior live generation on BOTH shared slots (a deployment of
-    // either member target advances every slot of the target).
+    // Seed a prior live generation on t2's OWN slot `p3` (a slot has
+    // exactly one owning target, so only a t2 push advances it).
     f.apply(Action::Build(1));
-    let r = f.apply(Action::Push("t1"));
+    let r = f.apply(Action::Push("t2"));
     let Outcome::Push(res) = r else {
         panic!("expected a push outcome");
     };
@@ -2833,7 +2935,6 @@ fn observed_scope_pre_swap_failure_keeps_prior_record_untouched() {
         Some(DeploymentStatus::Successful)
     );
     f.assert_observed_scope_property();
-    let t1_before = f.store.read_observed("t1", &f.config).unwrap();
     let t2_before = f.store.read_observed("t2", &f.config).unwrap();
 
     // HEAD advances so the t2 push is a REAL push (never an up-to-date
@@ -2856,20 +2957,15 @@ fn observed_scope_pre_swap_failure_keeps_prior_record_untouched() {
         report.attempt.is_some(),
         "the intent was durable before the mutation loop, so the attempt is recorded"
     );
-    // NOTHING advanced: both shared slots still run the seed generation.
+    // NOTHING advanced: t2's slot still runs the seed generation.
     let live = f.current_assignments();
     assert_eq!(
         live.len(),
-        2,
-        "both shared slots keep their live generations"
+        1,
+        "t2's slot keeps its live generation (p1/p2 were never touched by a t2 push)"
     );
-    // The observed projections are UNTOUCHED — byte-for-byte the prior
-    // records in every member target (never fabricated, never re-stamped).
-    assert_eq!(
-        f.store.read_observed("t1", &f.config).unwrap(),
-        t1_before,
-        "t1's observed records must be untouched by a push that advanced nothing"
-    );
+    // The observed projection is UNTOUCHED — byte-for-byte the prior record
+    // in the slot's OWNING target (never fabricated, never re-stamped).
     assert_eq!(
         f.store.read_observed("t2", &f.config).unwrap(),
         t2_before,
@@ -2885,12 +2981,13 @@ fn observed_scope_pre_swap_failure_keeps_prior_record_untouched() {
 // Property tests — Identity
 // ===========================================================================
 
-fn sdef(id: &str, server: &str, dir: &str, targets: &[&str]) -> SlotDef {
+fn sdef(id: &str, server: &str, dir: &str, target: &str) -> SlotDef {
     SlotDef {
         id: id.to_string(),
         server: server.to_string(),
         deploy_dir: PathBuf::from(dir),
-        targets: targets.iter().map(|t| t.to_string()).collect(),
+        target: target.to_string(),
+        groups: Vec::new(),
     }
 }
 
@@ -2901,13 +2998,13 @@ fn identity_reordering_preserves_digest() {
     a.insert(
         "standard".to_string(),
         vec![
-            sdef("p2", "s2", "/srv/p2", &["t1", "t2"]),
-            sdef("p1", "s1", "/srv/p1", &["t2", "t1"]),
+            sdef("p2", "s2", "/srv/p2", "t1"),
+            sdef("p1", "s1", "/srv/p1", "t2"),
         ],
     );
     a.insert(
         "canary".to_string(),
-        vec![sdef("c1", "s3", "/srv/c1", &["t3"])],
+        vec![sdef("c1", "s3", "/srv/c1", "t3")],
     );
 
     // Same declarations: slots in the opposite file order, targets lists in
@@ -2915,13 +3012,13 @@ fn identity_reordering_preserves_digest() {
     let mut b: BTreeMap<String, Vec<SlotDef>> = BTreeMap::new();
     b.insert(
         "canary".to_string(),
-        vec![sdef("c1", "s3", "/srv/c1", &["t3"])],
+        vec![sdef("c1", "s3", "/srv/c1", "t3")],
     );
     b.insert(
         "standard".to_string(),
         vec![
-            sdef("p1", "s1", "/srv/p1", &["t2", "t1"]),
-            sdef("p2", "s2", "/srv/p2", &["t1", "t2"]),
+            sdef("p1", "s1", "/srv/p1", "t2"),
+            sdef("p2", "s2", "/srv/p2", "t1"),
         ],
     );
     assert_eq!(
@@ -2941,46 +3038,66 @@ fn identity_reordering_preserves_digest() {
     );
 }
 
-/// Duplicate targets in a slot's declaration are rejected at config load, and
-/// a list carrying a duplicate canonicalizes to the same identity as the
-/// deduplicated list.
+/// Duplicate group names in a slot's declaration are rejected at config
+/// load, and a list carrying a duplicate canonicalizes to the same identity
+/// as the deduplicated list.
 #[test]
 fn identity_duplicates_are_rejected_and_canonicalize_identically() {
-    // Config-level rejection.
+    // Config-level rejection: a slot with a duplicated GROUP name in its
+    // `groups` list is rejected (a duplicate adds no membership yet would
+    // change the release identity).
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("proj");
     let release_dir = project.join("releases").join("v1");
     std::fs::create_dir_all(&release_dir).unwrap();
     let dup_variant = format!(
-        "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntargets = [\"t1\", \"t1\"]\ndeploy_dir = \"/srv/si\"\n"
+        "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntarget = \"t1\"\ngroups = [\"canary\", \"canary\"]\ndeploy_dir = \"/srv/si\"\n"
     );
     std::fs::write(release_dir.join("standard.toml"), dup_variant).unwrap();
     std::fs::write(project.join("deploy.toml"), DEPLOY_TOML).unwrap();
     assert!(
         Config::load(&project.join("deploy.toml")).is_err(),
-        "a slot with a duplicated target name must be rejected"
+        "a slot with a duplicated group name must be rejected"
     );
 
-    // Digest-level: duplicate target names in the list canonicalize to the
-    // same identity as the deduplicated list.
+    // Digest-level: duplicate group names in the list canonicalize to the
+    // same identity as the deduplicated list (the canonical form sorts and
+    // dedups defensively).
     let mut dedup: BTreeMap<String, Vec<SlotDef>> = BTreeMap::new();
     dedup.insert(
         "standard".to_string(),
-        vec![sdef("p1", "s1", "/srv/si", &["t1", "t2"])],
+        vec![SlotDef {
+            id: "p1".to_string(),
+            server: "s1".to_string(),
+            deploy_dir: PathBuf::from("/srv/si"),
+            target: "t1".to_string(),
+            groups: vec!["canary".to_string(), "wave-1".to_string()],
+        }],
     );
     let mut dup: BTreeMap<String, Vec<SlotDef>> = BTreeMap::new();
     dup.insert(
         "standard".to_string(),
-        vec![sdef("p1", "s1", "/srv/si", &["t1", "t2", "t1"])],
+        vec![SlotDef {
+            id: "p1".to_string(),
+            server: "s1".to_string(),
+            deploy_dir: PathBuf::from("/srv/si"),
+            target: "t1".to_string(),
+            groups: vec![
+                "wave-1".to_string(),
+                "canary".to_string(),
+                "canary".to_string(),
+            ],
+        }],
     );
     assert_eq!(
         variant_slots_digest(&dedup),
         variant_slots_digest(&dup),
-        "duplicate target names must canonicalize identically"
+        "duplicate group names must canonicalize identically"
     );
     assert_eq!(
-        canonicalize_slots(&dup["standard"]).slots[0].targets,
-        vec!["t1".to_string(), "t2".to_string()]
+        canonicalize_slots(&dup["standard"]).slots[0].groups,
+        vec!["canary".to_string(), "wave-1".to_string()],
+        "the canonical form sorts and deduplicates the groups list"
     );
 }
 
@@ -3125,7 +3242,7 @@ fn scope_strengthening_policy_never_reduces_retained() {
         .iter_mut()
         .for_each(|s| {
             if s.id == "p1" {
-                s.targets = vec!["t1".to_string(), "t2".to_string(), "t3".to_string()]
+                s.groups = vec!["t1".to_string(), "t2".to_string(), "t3".to_string()]
             }
         });
     let _ = baseline(&edited);
@@ -4148,18 +4265,20 @@ struct Model {
     /// sibling feature): the cross-system equality assertions are suspended.
     unknown: bool,
     /// The remote `current` generation's expected (artifact content version,
-    /// minting deployment id): the deployment that actually advanced the
-    /// slot. The model knows WHICH deployment minted the live generation, so
-    /// the observed projections' `last_deployment` can be asserted equal to
-    /// the live assignment's OWN deployment — never a deployment that did not
-    /// touch the slot. The fixture's shared slots advance TOGETHER (every
-    /// push/rollback of either member target plans BOTH slots; a pre-swap
-    /// failure advances neither), so one (version, deployment) pair
-    /// describes the whole remote.
-    current: Option<(u32, String)>,
+    /// minting deployment id) PER SLOT: the deployment that actually
+    /// advanced each slot. The model knows WHICH deployment minted each live
+    /// generation, so the observed projections' `last_deployment` can be
+    /// asserted equal to the live assignment's OWN deployment — never a
+    /// deployment that did not touch the slot. A target's slots advance
+    /// TOGETHER (every push/rollback of the target plans ALL of its slots; a
+    /// pre-swap failure advances none), so one (version, deployment) pair
+    /// describes each slot; slots of DIFFERENT targets advance independently
+    /// (a slot has exactly one owning target).
+    current: BTreeMap<PlacementSlotId, (u32, String)>,
     /// A [`Action::Tamper`] edited the live assignment: the current's
     /// identity is deliberately inconsistent and the identity comparison
-    /// defers until the next real push replaces the record.
+    /// defers until the next real push replaces the record. The tamper
+    /// always targets the `s1` slot (`p1`), so a single flag suffices.
     current_tampered: bool,
     /// Expected observed projection, PER MEMBER TARGET AND PER SLOT: the
     /// (content version, minting deployment id) each target's view shows for
@@ -4210,21 +4329,29 @@ struct Model {
     /// against it. `None` when the step was not a checkpoint (or the visible
     /// chain was empty, so the step no-opped).
     last_checkpoint: Option<CheckpointExpectation>,
-    /// Monotone counter of deployed generations: every real deployment
-    /// (push, rollback, or faulted push) mints exactly one new generation,
-    /// and a pending attempt finalizes only while its OWN generation is
-    /// still the remote current (the engine compares generation IDs, not
-    /// versions — a same-version redeploy diverges the pending attempt).
-    current_gen: u64,
+    /// Monotone counter of deployed generations PER TARGET: every real
+    /// deployment of a target (push, rollback, or faulted push) mints
+    /// exactly one new generation for each of its slots, and a pending
+    /// attempt finalizes only while its OWN generation is still the remote
+    /// current (the engine compares generation IDs, not versions — a
+    /// same-version redeploy diverges the pending attempt). Per-target
+    /// because a slot has exactly one owning target: a `t1` deployment never
+    /// advances `t2`'s slots, so it must not invalidate a `t2` pending
+    /// attempt.
+    current_gen: BTreeMap<&'static str, u64>,
     /// Expected rotation-debt marker presence per target.
     debt: BTreeMap<&'static str, bool>,
-    /// The crash window: an open post-mutation fault state where the observed
-    /// projections legitimately disagree with the remote current, or where a
-    /// crash-recovery attempt (PendingCommit with a durable snapshot) has not
-    /// been finalized yet — both states the fixture's invariant groups cannot
-    /// evaluate (see [`Model::lingering_crash`]). The five invariant groups
-    /// and the model-vs-system comparisons are suspended while it is open.
-    crash_window: bool,
+    /// The crash window PER TARGET: an open post-mutation fault state where
+    /// the observed projections legitimately disagree with the remote
+    /// current, or where a crash-recovery attempt (PendingCommit with a
+    /// durable snapshot) has not been finalized yet — both states the
+    /// fixture's invariant groups cannot evaluate (see
+    /// [`Model::lingering_crash`]). A slot has EXACTLY ONE owning target, so
+    /// a crash on `t1` never affects `t2`'s observed projections: the
+    /// window is per-target, and the five invariant groups and the
+    /// model-vs-system comparisons are suspended while ANY target's window
+    /// is open.
+    crash_window: BTreeMap<&'static str, bool>,
     /// The warning the CURRENT step's push report must contain: one
     /// substring per entry, EVERY one asserted against the actual report's
     /// `warning`. Set ONLY by the step-17 contention classes (see
@@ -4235,7 +4362,7 @@ struct Model {
     /// ..." notice that says the marker was NOT persisted (no automatic
     /// retryability). `None` for every other class (their warnings are not
     /// cross-checked).
-    expected_warning: Option<&'static [&'static str]>,
+    expected_warning: Option<Vec<String>>,
     /// True when the previous action was a deliberate tamper (the system's
     /// own invariant checks are skipped for that step too).
     last_was_tamper: bool,
@@ -4249,7 +4376,7 @@ impl Model {
             head_version: 1,
             armed_fault: None,
             unknown: false,
-            current: None,
+            current: BTreeMap::new(),
             current_tampered: false,
             observed: BTreeMap::from([
                 (
@@ -4261,10 +4388,7 @@ impl Model {
                 ),
                 (
                     "t2",
-                    BTreeMap::from([
-                        (PlacementSlotId::new("p1".to_string()), None),
-                        (PlacementSlotId::new("p2".to_string()), None),
-                    ]),
+                    BTreeMap::from([(PlacementSlotId::new("p3".to_string()), None)]),
                 ),
             ]),
             raw_snapshots: BTreeMap::from([("t1", Vec::new()), ("t2", Vec::new())]),
@@ -4274,9 +4398,9 @@ impl Model {
             prop_ids: 0,
             prop_tag: tag.to_string(),
             last_checkpoint: None,
-            current_gen: 0,
+            current_gen: BTreeMap::new(),
             debt: BTreeMap::from([("t1", false), ("t2", false)]),
-            crash_window: false,
+            crash_window: BTreeMap::new(),
             expected_warning: None,
             last_was_tamper: false,
             index: 0,
@@ -4290,6 +4414,21 @@ impl Model {
         let i = self.prop_ids;
         self.prop_ids += 1;
         format!("deploy-si-{}-{i:04}", self.prop_tag)
+    }
+
+    /// The placement slots a target OWNS (a slot has exactly one owning
+    /// target): `t1` owns `p1`/`p2` (two slots — the pre-swap skip
+    /// scenario), `t2` owns `p3`. A target's slots advance together on its
+    /// pushes and are never touched by another target's.
+    fn target_slots(t: &str) -> Vec<PlacementSlotId> {
+        match t {
+            "t1" => vec![
+                PlacementSlotId::new("p1".to_string()),
+                PlacementSlotId::new("p2".to_string()),
+            ],
+            "t2" => vec![PlacementSlotId::new("p3".to_string())],
+            other => panic!("unknown fixture target {other}"),
+        }
     }
 
     /// The target's VISIBLE successful chain: the RAW ledger's successful
@@ -4342,26 +4481,31 @@ impl Model {
         self.last_was_tamper = false;
         self.expected_warning = None;
         self.armed_fault = Some(fault);
-        let (class, window) = match action {
+        let class = match action {
             Action::Build(v) => {
                 self.head_version = *v;
-                (
-                    OutcomeClass::Push {
-                        boundary: ReturnBoundary::Ok,
-                        disposition: Disposition::NoAttempt,
-                    },
-                    self.crash_window,
-                )
-            }
-            Action::Push(t) | Action::Retry(t) => self.deploy(t),
-            Action::Rollback(t, i) => self.rollback(t, *i),
-            Action::Rotate => (
                 OutcomeClass::Push {
                     boundary: ReturnBoundary::Ok,
                     disposition: Disposition::NoAttempt,
-                },
-                self.crash_window,
-            ),
+                }
+            }
+            Action::Push(t) | Action::Retry(t) => {
+                // The push's returned window is the pushed target's NEW
+                // crash-window state (a slot has exactly one owning target, so
+                // a push only ever opens/closes its own target's window).
+                let (class, window) = self.deploy(t);
+                self.crash_window.insert(t, window);
+                class
+            }
+            Action::Rollback(t, i) => {
+                let (class, window) = self.rollback(t, *i);
+                self.crash_window.insert(t, window);
+                class
+            }
+            Action::Rotate => OutcomeClass::Push {
+                boundary: ReturnBoundary::Ok,
+                disposition: Disposition::NoAttempt,
+            },
             Action::Checkpoint(t, k) => {
                 // The fixture resolves the deployment id from the target's
                 // VISIBLE snapshots; the model resolves the SAME id from its
@@ -4374,49 +4518,39 @@ impl Model {
                 let visible = self.visible_snapshots(t);
                 if visible.is_empty() {
                     self.last_checkpoint = None;
-                    (
-                        OutcomeClass::Push {
-                            boundary: ReturnBoundary::Ok,
-                            disposition: Disposition::NoAttempt,
-                        },
-                        self.crash_window,
-                    )
                 } else {
                     let pos = *k as usize % visible.len();
                     let (_, cid, _) = visible[pos].clone();
                     self.checkpoint(t, cid, pos as u64);
-                    (
-                        OutcomeClass::Push {
-                            boundary: ReturnBoundary::Ok,
-                            disposition: Disposition::NoAttempt,
-                        },
-                        self.crash_window,
-                    )
+                }
+                OutcomeClass::Push {
+                    boundary: ReturnBoundary::Ok,
+                    disposition: Disposition::NoAttempt,
                 }
             }
             Action::InjectFailure(_) => {
                 // The property injects faults per step (never via this action);
                 // a stray sticky arm cannot be cross-checked.
                 self.unknown = true;
-                (
-                    OutcomeClass::Push {
-                        boundary: ReturnBoundary::Ok,
-                        disposition: Disposition::NoAttempt,
-                    },
-                    self.crash_window,
-                )
+                OutcomeClass::Push {
+                    boundary: ReturnBoundary::Ok,
+                    disposition: Disposition::NoAttempt,
+                }
             }
             Action::Tamper(_) => {
-                if self.current.is_some() {
+                if self
+                    .current
+                    .contains_key(&PlacementSlotId::new("p1".to_string()))
+                {
                     // The fixture requires a live generation to tamper; with
-                    // none, the property test skips the action entirely.
+                    // none, the property test skips the action entirely. The
+                    // tamper always targets the `s1` slot (`p1`).
                     self.current_tampered = true;
                     self.last_was_tamper = true;
                 }
-                (OutcomeClass::Tampered, self.crash_window)
+                OutcomeClass::Tampered
             }
         };
-        self.crash_window = window;
         // Step-scoped faults: whatever the action did not consume is dropped.
         self.armed_fault = None;
         class
@@ -4493,8 +4627,11 @@ impl Model {
         // The engine's reconciliation FIRST verifies the pending attempt's
         // generation against the remote current (before any marker write): a
         // diverged generation degrades the attempt with NO marker write, so
-        // an armed fault is NOT consumed.
-        if self.current_gen != pg {
+        // an armed fault is NOT consumed. The generation counter is
+        // PER-TARGET: a slot has exactly one owning target, so only a later
+        // deployment of the SAME target can diverge the pending attempt's
+        // generation.
+        if self.current_gen.get(t) != Some(&pg) {
             return;
         }
         match self.armed_fault {
@@ -4573,7 +4710,7 @@ impl Model {
                     boundary: ReturnBoundary::Err,
                     disposition: Disposition::NoAttempt,
                 },
-                self.crash_window,
+                self.crash_window.get(t).copied().unwrap_or(false),
             );
         };
         self.deploy_resolved(t, Some(v), id)
@@ -4586,11 +4723,15 @@ impl Model {
     fn deploy(&mut self, t: &'static str) -> (OutcomeClass, bool) {
         let id = self.mint_id();
         self.reconcile(t);
-        // HEAD push: deploy exactly when the remote current no longer
-        // equals the materialized head (the engine's complete
-        // ArtifactRef equality — a tampered current forces a fresh push).
+        // HEAD push: deploy exactly when ANY of the target's OWN slots is no
+        // longer at the materialized head (the engine's complete ArtifactRef
+        // equality — a tampered current forces a fresh push). Slots of other
+        // targets are irrelevant: a slot has exactly one owning target, so a
+        // `t1` push never redeploys `t2`'s slots.
         let version = if self.current_tampered
-            || self.current.as_ref().map(|(v, _)| *v) != Some(self.head_version)
+            || Self::target_slots(t)
+                .iter()
+                .any(|s| self.current.get(s).map(|(v, _)| *v) != Some(self.head_version))
         {
             Some(self.head_version)
         } else {
@@ -4630,29 +4771,22 @@ impl Model {
                     boundary: ReturnBoundary::Err,
                     disposition: Disposition::NoAttempt,
                 },
-                self.crash_window,
+                self.crash_window.get(t).copied().unwrap_or(false),
             );
         }
         let Some(v) = version else {
             // Up-to-date no-op: no records. The deferred-maintenance hook
             // services rotation debt, and the no-op path refreshes observed
-            // from the EXISTING generation into EVERY member target (the
+            // from the EXISTING generation into the target's OWN slots (the
             // crash-window recovery path), closing any open window. The
             // no-op re-projects each slot's ONE physical record from the
-            // EXISTING generation, so every member target's view converges
-            // too.
+            // EXISTING generation, so the owning target's view converges
+            // too. A slot has exactly one owning target, so only that
+            // target's view is refreshed.
             self.noop_maintenance(t);
-            if let Some(c) = self.current.clone() {
-                for tgt in ["t1", "t2"] {
-                    for slot in [
-                        PlacementSlotId::new("p1".to_string()),
-                        PlacementSlotId::new("p2".to_string()),
-                    ] {
-                        self.observed
-                            .get_mut(tgt)
-                            .unwrap()
-                            .insert(slot, Some(c.clone()));
-                    }
+            for slot in Self::target_slots(t) {
+                if let Some(c) = self.current.get(&slot).cloned() {
+                    self.observed.get_mut(t).unwrap().insert(slot, Some(c));
                 }
             }
             return (
@@ -4676,7 +4810,7 @@ impl Model {
                     boundary: ReturnBoundary::Err,
                     disposition: Disposition::NoAttempt,
                 },
-                self.crash_window,
+                self.crash_window.get(t).copied().unwrap_or(false),
             );
         }
         // PRE-SWAP REMOTE STATUS FAILURE: the first planned slot's `current`
@@ -4690,9 +4824,15 @@ impl Model {
         // UNTOUCHED — a skipped/unreachable slot keeps its prior record
         // (same generation, artifact, last_deployment), never fabricated and
         // never re-stamped. The arm is inert on a remote with no live
-        // current (no `current` link exists to read), so a first-deployment
-        // push proceeds as a clean deployment.
-        if matches!(fault, Some(FailureClass::RemoteStatusPreSwap)) && self.current.is_some() {
+        // `current` for the PUSHED target's first slot (no `current` link
+        // exists to read on that server), so a first-deployment push
+        // proceeds as a clean deployment — a slot has exactly one owning
+        // target, so only the pushed target's own slots matter.
+        if matches!(fault, Some(FailureClass::RemoteStatusPreSwap))
+            && Self::target_slots(t)
+                .iter()
+                .any(|s| self.current.contains_key(s))
+        {
             self.raw_attempts
                 .entry(t)
                 .or_default()
@@ -4705,7 +4845,7 @@ impl Model {
                     boundary: ReturnBoundary::Ok,
                     disposition: Disposition::FailedRolledBack,
                 },
-                self.crash_window,
+                self.crash_window.get(t).copied().unwrap_or(false),
             );
         }
         // A REAL deployment: the remote advances, the attempt is recorded,
@@ -4723,16 +4863,25 @@ impl Model {
         );
         // The slot-write staleness flags: `primary_stale` means the FIRST
         // advanced slot's physical record write faulted (`p1`), `other_stale`
-        // the SECOND's (`p2`). A faulted slot write leaves that slot's ONE
-        // record stale in every member target's view; the other slot's
-        // record (and both views of it) advance.
-        let primary_stale = matches!(fault, Some(FailureClass::ObservedPrimaryWrite));
-        let other_stale = matches!(fault, Some(FailureClass::ObservedOtherWrite));
-        self.current_gen += 1;
+        // the SECOND's (`p2`). The fault arms are keyed by SLOT ID (`p1`/
+        // `p2` — `t1`'s slots), so they are INERT on a `t2` push (which
+        // advances only `p3`): the engine's `write_slot_observed` for `p3`
+        // never matches the `p1`/`p2` arms, so a `t2` push with these
+        // classes commits cleanly and refreshes observed. A faulted slot
+        // write leaves that slot's ONE record stale in its owning target's
+        // view; the other slot's record advances.
+        let primary_stale = matches!(fault, Some(FailureClass::ObservedPrimaryWrite)) && t == "t1";
+        let other_stale = matches!(fault, Some(FailureClass::ObservedOtherWrite)) && t == "t1";
+        let gen_counter = self.current_gen.entry(t).or_insert(0);
+        *gen_counter += 1;
+        let gen_val = *gen_counter;
         // The deployment that advanced the slots is THIS step's deployment id:
         // the minting deployment of the new live generations, which the
-        // observed projections' `last_deployment` must equal.
-        self.current = Some((v, id.clone()));
+        // observed projections' `last_deployment` must equal. Each of the
+        // target's OWN slots advances to the same (version, deployment).
+        for slot in Self::target_slots(t) {
+            self.current.insert(slot, (v, id.clone()));
+        }
         self.current_tampered = false;
         self.raw_attempts
             .entry(t)
@@ -4753,8 +4902,7 @@ impl Model {
                 // (recoverable), the attempt is recorded, and the observed
                 // refresh re-projects the NEW live state (truthful: this
                 // push DID advance the slots). Identical to CommitMarker.
-                self.pending
-                    .insert(t, (id.clone(), v, self.current_gen, false));
+                self.pending.insert(t, (id.clone(), v, gen_val, false));
                 self.debt.insert(t, false);
             }
             Some(FailureClass::CommitMarker) => {
@@ -4763,8 +4911,7 @@ impl Model {
                 // the snapshot/ref finalization defers to the next push of
                 // this target. Step-17 rotation still succeeds (the fault is
                 // spent), so no debt.
-                self.pending
-                    .insert(t, (id.clone(), v, self.current_gen, false));
+                self.pending.insert(t, (id.clone(), v, gen_val, false));
                 self.debt.insert(t, false);
             }
             Some(FailureClass::RotationInventory) => {
@@ -4790,7 +4937,13 @@ impl Model {
                 // marker.
                 self.append_snapshot(t, &id, v);
                 self.debt.insert(t, true);
-                self.expected_warning = Some(&[STEP17_CONTENTION_WARNING]);
+                // The warning names the pushed target's FIRST slot (a slot
+                // has exactly one owning target, so a t1 push defers 'p1'
+                // and a t2 push defers 'p3').
+                self.expected_warning = Some(vec![format!(
+                    "rotation deferred for slot '{}': slot lock held by another operation",
+                    Self::target_slots(t)[0]
+                )]);
             }
             Some(FailureClass::ObservedWriteServer) => {
                 // The per-server projection write fails (warning-only); the
@@ -4830,8 +4983,7 @@ impl Model {
                 // persisted — the expected class is `Err` + `Pending` (the
                 // attempt stays recoverable-pending; recovery finalizes it
                 // from the verified desired state).
-                self.pending
-                    .insert(t, (id.clone(), v, self.current_gen, false));
+                self.pending.insert(t, (id.clone(), v, gen_val, false));
             }
             Some(FailureClass::IntentPersist) | Some(FailureClass::LockContention) => {
                 unreachable!("handled before the real-deployment mutation")
@@ -4860,8 +5012,13 @@ impl Model {
                         // a preexisting marker is PRESERVED untouched, and a
                         // fresh push with no marker creates NONE.
                         self.debt.insert(t, had_debt);
-                        self.expected_warning =
-                            Some(&[STEP17_CONTENTION_WARNING, DEBT_READ_WARNING]);
+                        self.expected_warning = Some(vec![
+                            format!(
+                                "rotation deferred for slot '{}': slot lock held by another operation",
+                                Self::target_slots(t)[0]
+                            ),
+                            DEBT_READ_WARNING.to_string(),
+                        ]);
                     }
                     Some(FailureClass::Step17ContentionDebtWrite) => {
                         // The debt WRITE arm is armed ONLY at the fresh
@@ -4874,8 +5031,13 @@ impl Model {
                         // (the failed write leaves the file untouched). The
                         // model must NOT claim automatic retryability.
                         self.debt.insert(t, had_debt);
-                        self.expected_warning =
-                            Some(&[STEP17_CONTENTION_WARNING, DEBT_WRITE_WARNING]);
+                        self.expected_warning = Some(vec![
+                            format!(
+                                "rotation deferred for slot '{}': slot lock held by another operation",
+                                Self::target_slots(t)[0]
+                            ),
+                            DEBT_WRITE_WARNING.to_string(),
+                        ]);
                     }
                     _ => unreachable!("step-17 classes handled above"),
                 }
@@ -4884,24 +5046,22 @@ impl Model {
         // The post-finalize observed refresh: each advanced slot's ONE
         // physical record is rewritten unless the step faulted inside the
         // refresh (that slot's record stays stale) or crashed before it (all
-        // records stay stale). Every member target's VIEW of a refreshed slot
-        // equals the physical record; a stale slot is stale in every member's
-        // view alike (the views filter the single physical map).
+        // records stay stale). A slot has EXACTLY ONE owning target, so only
+        // that target's VIEW of a refreshed slot is updated — there is no
+        // cross-target propagation anymore. The `primary`/`other` staleness
+        // flags name the FIRST (`p1`) and SECOND (`p2`) advanced slot of a
+        // `t1` push (the only target with two slots).
         if !crash {
-            let other = if t == "t1" { "t2" } else { "t1" };
-            for (slot, stale) in [
-                (PlacementSlotId::new("p1".to_string()), primary_stale),
-                (PlacementSlotId::new("p2".to_string()), other_stale),
-            ] {
+            let slots = Self::target_slots(t);
+            for (i, slot) in slots.iter().enumerate() {
+                let stale = if i == 0 { primary_stale } else { other_stale };
                 if stale {
                     continue;
                 }
-                for tgt in [t, other] {
-                    self.observed
-                        .get_mut(tgt)
-                        .unwrap()
-                        .insert(slot.clone(), Some((v, id.clone())));
-                }
+                self.observed
+                    .get_mut(t)
+                    .unwrap()
+                    .insert(slot.clone(), Some((v, id.clone())));
             }
         }
         let window = crash || primary_stale || other_stale;
@@ -5044,22 +5204,25 @@ impl Model {
     }
 
     /// Whether `action` would replace the tampered current record with a new
-    /// pristine generation. Only a REAL deployment does: a HEAD push/retry
-    /// always deploys after a tamper (the tampered artifact never equals the
-    /// materialized head), while a snapshot rollback repairs only when its ref
-    /// resolves — an out-of-range index (including a below-floor one, which
-    /// fails closed) errors before any mutation, leaving the tampered record
-    /// in place.
+    /// pristine generation. Only a REAL deployment of the tampered slot's
+    /// OWNING target does: the tamper always targets the `s1` slot (`p1`),
+    /// which `t1` owns, so a HEAD push/retry of `t1` always deploys after a
+    /// tamper (the tampered artifact never equals the materialized head),
+    /// while a `t2` push would be an up-to-date no-op (its own slot `p3` is
+    /// untouched) and must NOT be applied. A `t1` snapshot rollback repairs
+    /// only when its ref resolves — an out-of-range index (including a
+    /// below-floor one, which fails closed) errors before any mutation,
+    /// leaving the tampered record in place.
     fn repairs_tamper(&self, action: &Action) -> bool {
         match action {
-            Action::Push(_) | Action::Retry(_) => true,
+            Action::Push(t) | Action::Retry(t) => *t == "t1",
             Action::Rollback(t, i) => {
                 // The rollback REPAIRS the tamper only when the strategy's
                 // POSITION names a real deployment in the visible chain (the
                 // fixture's rollback_token resolves it; an out-of-range
                 // position names a nonexistent deployment and fails closed —
                 // the tamper is left unrepaired, so the action is skipped).
-                self.visible_snapshots(t).len() as u64 > *i
+                *t == "t1" && self.visible_snapshots("t1").len() as u64 > *i
             }
             _ => false,
         }
@@ -5229,7 +5392,7 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
     if model.last_was_tamper
         || model.current_tampered
         || model.unknown
-        || model.crash_window
+        || model.crash_window.values().any(|w| *w)
         || model.lingering_crash()
     {
         // A tamper deliberately broke identity (the fixture's apply skipped
@@ -5250,9 +5413,8 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
         return;
     }
     // (a) The five invariant groups (the system's own ground truth).
-    system.check_invariants();
+    system.check_invariants_ctx(&ctx);
 
-    let pid = PlacementSlotId::new("p1");
     let mut learned: BTreeMap<u32, ArtifactRef> = BTreeMap::new();
 
     // Snapshot logs: count + per-deployment artifact/version join, over the
@@ -5289,6 +5451,9 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
                 .as_ref()
                 .and_then(|x| x.rollback.as_ref())
                 .expect("a successful entry carries a rollback state");
+            // The snapshot's OWN first slot (a slot has exactly one owning
+            // target, so a t1 snapshot carries p1/p2 and a t2 snapshot p3).
+            let pid = Model::target_slots(t)[0].clone();
             let art = rollback.slots[&pid].assignment.artifact.clone();
             learn_artifact(
                 &mut learned,
@@ -5315,46 +5480,51 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
                 wid,
                 "{ctx}: attempt id order for {t}"
             );
+            let pid = Model::target_slots(t)[0].clone();
             let art = sa.intent.desired[&pid].assignment.artifact.clone();
             learn_artifact(&mut learned, &ctx, *mv, art, "attempt {t}");
         }
     }
 
-    // Remote current generation: existence + artifact identity, per shared
-    // slot (the model's single (version, minting-deployment) pair describes
-    // both slots, which advance together). The identity check is skipped
-    // while the live record was tampered.
+    // Remote current generation: existence + artifact identity, per slot
+    // (the model's per-slot (version, minting-deployment) pairs describe
+    // each slot; a target's slots advance together, slots of different
+    // targets independently). The identity check is skipped while the live
+    // record was tampered.
     let sys_currents = system.current_assignments();
     let model_current = model.current.clone();
-    match (model_current, sys_currents.is_empty()) {
-        (None, true) => {}
-        (None, false) => panic!(
+    match (model_current.is_empty(), sys_currents.is_empty()) {
+        (true, true) => {}
+        (true, false) => panic!(
             "{ctx}: unexpected remote current generation(s): {:?}",
             sys_currents
                 .values()
                 .map(|a| &a.generation_id)
                 .collect::<Vec<_>>()
         ),
-        (Some(_), true) => {
-            panic!("{ctx}: model expects a remote current generation, none present")
+        (false, true) => {
+            panic!("{ctx}: model expects remote current generations, none present")
         }
-        (Some((v, dep)), false) => {
-            for asn in sys_currents.values() {
+        (false, false) => {
+            for (slot_id, (v, dep)) in &model_current {
+                let asn = sys_currents.get(slot_id).unwrap_or_else(|| {
+                    panic!("{ctx}: model expects a current generation for {slot_id}, none present")
+                });
                 assert_eq!(
                     asn.deployment_id.as_str(),
                     dep,
                     "{ctx}: the live assignment's OWN minting deployment must be the model's \
-                     tracked deployment for the current generation"
+                     tracked deployment for the current generation of {slot_id}"
                 );
-                if !model.current_tampered {
-                    let want = learned.get(&v).cloned().unwrap_or_else(|| {
+                if !model.current_tampered || slot_id.as_str() != "p1" {
+                    let want = learned.get(v).cloned().unwrap_or_else(|| {
                         panic!(
                             "{ctx}: current generation version {v} has no recorded attempt/snapshot in the system"
                         )
                     });
                     assert_eq!(
                         asn.artifact, want,
-                        "{ctx}: the remote current generation must deploy the model's expected artifact for version {v}"
+                        "{ctx}: the remote current generation of {slot_id} must deploy the model's expected artifact for version {v}"
                     );
                 }
                 // The current generation is the freshest identity source (e.g. a
@@ -5362,7 +5532,7 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
                 learn_artifact(
                     &mut learned,
                     &ctx,
-                    v,
+                    *v,
                     asn.artifact.clone(),
                     "remote current",
                 );
@@ -5370,22 +5540,22 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
         }
     }
 
-    // Observed projections: EVERY member target's VIEW of EVERY shared slot
-    // must equal the model's expectation — the (version, minting deployment)
-    // of the live remote assignment — and, because targets are SELECTION
-    // VIEWS over the ONE physical slot map, each target's view of a slot
-    // equals the slot's single physical record by construction (the same
-    // assertion the property test hammers with overlapping targets). A slot
-    // the last push did NOT advance (skipped / unreachable pre-swap) keeps
-    // its PRIOR record: same generation, artifact, and last_deployment —
-    // never fabricated, never re-stamped by a deployment that did not touch
-    // it.
+    // Observed projections: each slot's OWNING target's VIEW must equal the
+    // model's expectation — the (version, minting deployment) of the live
+    // remote assignment — and, because targets are SELECTION VIEWS over the
+    // ONE physical slot map, the target's view of a slot equals the slot's
+    // single physical record by construction. A slot has EXACTLY ONE owning
+    // target, so only that target's view is compared (a push to another
+    // target never touches this slot's records). A slot the last push did
+    // NOT advance (skipped / unreachable pre-swap) keeps its PRIOR record:
+    // same generation, artifact, and last_deployment — never fabricated,
+    // never re-stamped by a deployment that did not touch it.
     for t in ["t1", "t2"] {
         let obs = system
             .store
             .read_observed(t, &system.config)
             .unwrap_or_default();
-        for slot_id in [PlacementSlotId::new("p1"), PlacementSlotId::new("p2")] {
+        for slot_id in Model::target_slots(t) {
             let want_observed = model
                 .observed
                 .get(t)
@@ -5712,7 +5882,7 @@ fn run_semantic_state_case(steps: Vec<(Action, FailureClass)>) {
         // `Successful` (never `Err`) — the boundary/disposition asserts above
         // already bind that — so a missing warning is the ONLY way a silent
         // skip could slip through.
-        if let Some(wants) = model.expected_warning {
+        if let Some(wants) = model.expected_warning.as_ref() {
             let actual_warning = match &outcome {
                 Outcome::Push(result) => match &**result {
                     Ok(report) => report.warning.as_deref().unwrap_or(""),
@@ -5722,7 +5892,7 @@ fn run_semantic_state_case(steps: Vec<(Action, FailureClass)>) {
             };
             for w in wants {
                 assert!(
-                    actual_warning.contains(w),
+                    actual_warning.contains(w.as_str()),
                     "after action {}: the report must warn with {w:?}, got: {actual_warning:?}",
                     model.index
                 );
@@ -6091,29 +6261,38 @@ proptest! {
 const VIEW_TARGETS: [&str; 3] = ["t1", "t2", "t3"];
 
 fn run_slot_view_property(members: Vec<Vec<bool>>, pushes: Vec<usize>) {
-    // Every slot must belong to at least one target, and every target must
-    // own at least one slot: fix the generated membership deterministically.
-    let mut member: Vec<Vec<&str>> = members
+    // A slot has EXACTLY ONE owning target: derive each slot's owner
+    // deterministically from the generated membership row (the first true
+    // target, or a round-robin fallback), then ensure every target owns at
+    // least one slot by assigning any left-out target to slot 0.
+    let mut owner: Vec<&str> = members
         .iter()
         .enumerate()
         .map(|(si, m)| {
-            let mut t = VIEW_TARGETS
+            VIEW_TARGETS
                 .iter()
                 .enumerate()
-                .filter(|(ti, _)| m.get(*ti) == Some(&true) || *ti == si)
+                .find(|(ti, _)| m.get(*ti) == Some(&true))
                 .map(|(_, t)| *t)
-                .collect::<Vec<_>>();
-            t.sort_unstable();
-            t.dedup();
-            t
+                .unwrap_or(VIEW_TARGETS[si % 3])
         })
         .collect();
-    // Slot 0 also carries any target the generated memberships left out.
     for t in VIEW_TARGETS {
-        if !member.iter().any(|m| m.contains(&t)) {
-            member[0].push(t);
-            member[0].sort_unstable();
-            member[0].dedup();
+        if !owner.contains(&t) {
+            // Reassign a slot whose owner is DUPLICATED to the left-out
+            // target (a slot has exactly one owner, so one slot cannot carry
+            // two targets; with 3 slots and 3 targets a duplicated owner
+            // always exists when a target is left out).
+            let mut dup = 0usize;
+            'find_dup: for i in 0..owner.len() {
+                for j in 0..owner.len() {
+                    if i != j && owner[i] == owner[j] {
+                        dup = i;
+                        break 'find_dup;
+                    }
+                }
+            }
+            owner[dup] = t;
         }
     }
 
@@ -6125,17 +6304,17 @@ fn run_slot_view_property(members: Vec<Vec<bool>>, pushes: Vec<usize>) {
 
     // The ONE owning variant: declares every slot (each on its OWN server, so
     // the remote generation state stays independent per slot) and carries the
-    // slot-owned retention policy (targets own rollout only).
+    // slot-owned retention policy (targets own rollout only). Each slot
+    // declares its ONE owning target and an empty `groups` list (rollout
+    // groups are selection-only; the membership-edit helper below edits the
+    // `groups` list to prove membership never changes retention).
     let mut variant = String::new();
-    for (si, m) in member.iter().enumerate() {
+    for (si, t) in owner.iter().enumerate() {
         variant.push_str(&format!(
-            "[[slots]]\nid = \"s{}\"\nserver = \"h{}\"\ntargets = [{}]\ndeploy_dir = \"/srv/s{}-{}\"\n\n",
+            "[[slots]]\nid = \"s{}\"\nserver = \"h{}\"\ntarget = \"{}\"\ngroups = []\ndeploy_dir = \"/srv/s{}-{}\"\n\n",
             si + 1,
             si + 1,
-            m.iter()
-                .map(|t| format!("\"{t}\""))
-                .collect::<Vec<_>>()
-                .join(", "),
+            t,
             si + 1,
             si + 1,
         ));
@@ -6151,8 +6330,8 @@ fn run_slot_view_property(members: Vec<Vec<bool>>, pushes: Vec<usize>) {
 
     // THREE targets with DIFFERENT rollout configs — the only target surface.
     let mut deploy_toml =
-        String::from("schema_version = 1\napplication = \"views\"\nrelease = \"v1\"\n\n");
-    for si in 0..member.len() {
+        String::from("schema_version = 2\napplication = \"views\"\nrelease = \"v1\"\n\n");
+    for si in 0..owner.len() {
         deploy_toml.push_str(&format!(
             "[[servers]]\nid = \"h{}\"\naddress = \"a\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n",
             si + 1
@@ -6203,6 +6382,7 @@ fn run_slot_view_property(members: Vec<Vec<bool>>, pushes: Vec<usize>) {
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
         .unwrap_or_else(|e| panic!("push {step} to {t} failed: {e}"));
@@ -6237,7 +6417,7 @@ fn assert_views_match_physical(store: &LocalStore, config: &Config) {
         let members: std::collections::HashSet<&str> = config
             .slot_defs()
             .iter()
-            .filter(|s| s.targets.iter().any(|x| x == t))
+            .filter(|s| s.target == *t)
             .map(|s| s.id.as_str())
             .collect();
         let want: BTreeMap<_, _> = physical
@@ -6256,8 +6436,10 @@ fn assert_views_match_physical(store: &LocalStore, config: &Config) {
 /// (2) MEMBERSHIP NEVER CHANGES RETENTION: the retained digest set is
 /// computed under the slot's OWNING VARIANT policy (the single source; see
 /// `Config::slot_rotation`), so a config-level membership edit — adding or
-/// removing a target in a slot's `targets` list, reloaded through
-/// `Config::load` — leaves the retained set IDENTICAL.
+/// removing a rollout GROUP in a slot's `groups` list, reloaded through
+/// `Config::load` — leaves the retained set IDENTICAL. Groups are
+/// selection-only (they never own state, policy, history, or checkpoints),
+/// so a membership change cannot move retention.
 fn assert_membership_never_changes_retention(
     store: &LocalStore,
     cfg_path: &std::path::Path,
@@ -6265,12 +6447,13 @@ fn assert_membership_never_changes_retention(
     release_dir: &std::path::Path,
     remotes_base: &std::path::Path,
 ) {
-    // Pick the FIRST slot: a slot with >1 members gets one member removed; a
-    // single-member slot gets a NEW member added (both are membership
-    // changes; the owning variant — and its policy — is untouched either way).
+    // Pick the FIRST slot: a slot with >1 groups gets one group removed; a
+    // slot with no groups gets a NEW group added (both are membership
+    // changes; the owning variant — and its policy — is untouched either
+    // way).
     let slot_def = config.slot_defs()[0];
     let slot_id = &slot_def.id;
-    let members0 = &slot_def.targets;
+    let groups0 = &slot_def.groups;
     let retained = |cfg: &Config| -> HashSet<String> {
         let remote = LocalTransport::new(remotes_base.join("h1")).unwrap();
         let helper = RemoteHelper::new(&remote);
@@ -6286,29 +6469,33 @@ fn assert_membership_never_changes_retention(
 
     let variant_path = release_dir.join("standard.toml");
     let variant2 = std::fs::read_to_string(&variant_path).unwrap();
-    let slot_header = format!("[[slots]]\nid = \"{slot_id}\"\nserver = \"h1\"\ntargets = [");
-    let start = variant2
-        .find(&slot_header)
+    // Locate the first slot's declaration by id, then its `groups = [...]`
+    // list (the slot's owning target is whatever the generation assigned —
+    // the search must not assume a name).
+    let slot_start = variant2
+        .find(&format!("[[slots]]\nid = \"{slot_id}\""))
         .expect("the first slot's declaration");
-    let head = &variant2[..start];
-    let tail = &variant2[start..];
-    let list_end = tail.find(']').expect("targets list end");
-    let list = &tail[..list_end + 1];
-    let rest = &tail[list_end + 1..];
-    let edited_list = if members0.len() > 1 {
-        // Drop the LAST member (keep at least one; the target keeps its
-        // other slots, so the config stays valid).
-        let drop = members0.last().unwrap();
+    let groups_start = variant2[slot_start..]
+        .find("groups = [")
+        .expect("the slot's groups list")
+        + slot_start;
+    let list_end = variant2[groups_start..].find(']').expect("groups list end") + groups_start;
+    let head = &variant2[..groups_start];
+    let list = &variant2[groups_start..list_end + 1];
+    let rest = &variant2[list_end + 1..];
+    let edited_list = if groups0.len() > 1 {
+        // Drop the LAST group (keep at least one).
+        let drop = groups0.last().unwrap();
         list.replace(&format!(", \"{drop}\""), "")
             .replace(&format!("\"{drop}\", "), "")
     } else {
-        // Add a new member target.
+        // Add a new group.
         let added = VIEW_TARGETS
             .iter()
             .copied()
-            .find(|t| !members0.iter().any(|x| x.as_str() == *t))
-            .expect("a target not already a member exists");
-        list.replacen("targets = [", &format!("targets = [\"{added}\", "), 1)
+            .find(|t| !groups0.iter().any(|x| x.as_str() == *t))
+            .expect("a group not already a member exists");
+        list.replacen("groups = [", &format!("groups = [\"{added}\", "), 1)
     };
     let variant2 = format!("{head}{edited_list}{rest}");
     std::fs::write(&variant_path, variant2).unwrap();
@@ -6322,7 +6509,7 @@ fn assert_membership_never_changes_retention(
     let after = retained(&config2);
     assert_eq!(
         before, after,
-        "changing a slot's target membership must never change its retained set"
+        "changing a slot's group membership must never change its retained set"
     );
 }
 

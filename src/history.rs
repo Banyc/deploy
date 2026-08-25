@@ -233,6 +233,15 @@ pub fn ref_name(target: &TargetName, deployment_id: &DeploymentId) -> String {
 /// verified desired state during recovery), never from the intent record
 /// itself (the persisted intent is the immutable intent; its `slots` map is
 /// empty).
+///
+/// PARTIAL-ROLLOUT SNAPSHOT SEMANTICS: every successful deployment —
+/// including a group deployment — produces a COMPLETE snapshot of the
+/// target's resulting state. The base is the latest successful snapshot
+/// BEFORE this attempt; the SELECTED slots (the attempt's `slot_ids`) are
+/// replaced with their actual successful assignments and current physical
+/// bindings, unselected slots are carried forward unchanged, and slots
+/// removed from the current target configuration (`current_slot_ids`) are
+/// omitted.
 pub fn finalize_successful_attempt(
     store: &LocalStore,
     attempt: &LedgerIntent,
@@ -240,6 +249,7 @@ pub fn finalize_successful_attempt(
     actuals: &BTreeMap<PlacementSlotId, AttemptServer>,
     reason: &str,
     bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
+    current_slot_ids: &[PlacementSlotId],
 ) -> Result<()> {
     let entries = store.read_ledger(attempt.target.as_str())?;
     if let Some(e) = entries
@@ -249,7 +259,10 @@ pub fn finalize_successful_attempt(
     {
         return Ok(());
     }
-    let rollback = build_rollback(attempt, actuals, bindings);
+    // The base for the complete snapshot: the latest successful snapshot
+    // BEFORE this attempt (this attempt's terminal is not yet appended).
+    let base = crate::push::plan::latest_successful_rollback(store, attempt.target.as_str())?;
+    let rollback = build_rollback(attempt, actuals, bindings, base.as_ref(), current_slot_ids);
     let terminal = LedgerTerminal {
         deployment_id: attempt.deployment_id.clone(),
         target: attempt.target.clone(),
@@ -269,36 +282,62 @@ pub fn finalize_successful_attempt(
 /// and are dropped. `bindings` records the COMPLETE physical binding
 /// (`{server, deploy_dir}`) each slot had when the deployment ran; a missing
 /// entry is "unverifiable" and makes exact rollback refuse the slot.
+///
+/// PARTIAL-ROLLOUT OVERLAY: the result is the COMPLETE target snapshot — the
+/// latest successful snapshot (`base`) with the SELECTED slots (the attempt's
+/// `slot_ids`) replaced by their actual assignments and current bindings,
+/// unselected slots carried forward unchanged, and slots absent from
+/// `current_slot_ids` (removed from the current target configuration)
+/// omitted. A full-target attempt replaces every slot, so the base is
+/// irrelevant. The recorded `release` is the release this attempt deployed
+/// (the selected slots' release), falling back to the base's release.
 pub fn build_rollback(
     attempt: &LedgerIntent,
     actuals: &BTreeMap<PlacementSlotId, AttemptServer>,
     bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
+    base: Option<&LedgerRollback>,
+    current_slot_ids: &[PlacementSlotId],
 ) -> LedgerRollback {
+    // Start from the base (or empty): unselected slots are carried forward
+    // unchanged.
+    let mut slots: BTreeMap<PlacementSlotId, GenerationRef> =
+        base.map(|b| b.slots.clone()).unwrap_or_default();
+    let mut out_bindings: BTreeMap<PlacementSlotId, PhysicalBinding> =
+        base.map(|b| b.bindings.clone()).unwrap_or_default();
+    // Replace the SELECTED slots with their actual successful assignments
+    // and current physical bindings.
+    for (slot, s) in actuals {
+        if let Some(generation) = s.generation.clone() {
+            slots.insert(
+                slot.clone(),
+                GenerationRef {
+                    generation,
+                    assignment: PlacementSlotAssignment {
+                        placement_slot: slot.clone(),
+                        artifact: s.artifact.clone(),
+                    },
+                },
+            );
+        }
+        if let Some(b) = bindings.get(slot) {
+            out_bindings.insert(slot.clone(), b.clone());
+        }
+    }
+    // Omit slots removed from the current target configuration.
+    let current: std::collections::HashSet<&str> =
+        current_slot_ids.iter().map(|s| s.as_str()).collect();
+    slots.retain(|k, _| current.contains(k.as_str()));
+    out_bindings.retain(|k, _| current.contains(k.as_str()));
     LedgerRollback {
         behavior_sha256: attempt.behavior_sha256.clone(),
         release: actuals
             .values()
             .next()
             .map(|s| s.artifact.release.clone())
+            .or_else(|| base.map(|b| b.release.clone()))
             .unwrap_or_default(),
-        slots: actuals
-            .iter()
-            .filter_map(|(slot, s)| {
-                s.generation.clone().map(|generation| {
-                    (
-                        slot.clone(),
-                        GenerationRef {
-                            generation,
-                            assignment: PlacementSlotAssignment {
-                                placement_slot: slot.clone(),
-                                artifact: s.artifact.clone(),
-                            },
-                        },
-                    )
-                })
-            })
-            .collect(),
-        bindings: bindings.clone(),
+        slots,
+        bindings: out_bindings,
     }
 }
 
@@ -456,6 +495,7 @@ mod tests {
             deployment_schema_version: SCHEMA_VERSION,
             deployment_id: DeploymentId::new(dep.to_string()),
             target: TargetName::new("production".to_string()),
+            group: None,
             slot_ids: vec![PlacementSlotId::new("p1".to_string())],
             behavior_sha256: "sha256-aa".to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
@@ -773,6 +813,7 @@ mod tests {
             &actuals,
             "push completed",
             &bindings,
+            &[PlacementSlotId::new("p1".to_string())],
         )
         .unwrap();
         let entries = store.read_ledger(target.as_str()).unwrap();
@@ -792,6 +833,7 @@ mod tests {
             &actuals,
             "push completed",
             &bindings,
+            &[PlacementSlotId::new("p1".to_string())],
         )
         .unwrap();
         let entries = store.read_ledger(target.as_str()).unwrap();
@@ -818,7 +860,7 @@ mod tests {
             },
         )]);
 
-        let rollback = build_rollback(&attempt, &actuals, &bindings);
+        let rollback = build_rollback(&attempt, &actuals, &bindings, None, std::slice::from_ref(&slot));
         assert_eq!(
             rollback.bindings.get(&slot),
             Some(&PhysicalBinding {

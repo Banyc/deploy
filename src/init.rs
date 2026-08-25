@@ -353,9 +353,9 @@ fn build_docs(
 /// The `standard` variant: a pure file push (`adapter = "none"`), the
 /// zero-infrastructure default. It also declares the project's deployment
 /// slot: the `[[slots]]` entry binds `app-1` to server-01 under the
-/// scaffold's `deploy_dir` and to the `production` target (a target's
-/// members are derived from the slots' `targets` lists). The unit artifact
-/// and systemd activation live in the sibling `systemd` variant.
+/// scaffold's `deploy_dir` and to its ONE owning target `production` (a
+/// target's members are derived from the slots' `target` fields). The unit
+/// artifact and systemd activation live in the sibling `systemd` variant.
 fn standard_variant(deploy_dir: &Path) -> VariantConfig {
     VariantConfig {
         description: Some("Standard deployment".to_string()),
@@ -373,7 +373,8 @@ fn standard_variant(deploy_dir: &Path) -> VariantConfig {
             id: "app-1".to_string(),
             server: "server-01".to_string(),
             deploy_dir: deploy_dir.to_path_buf(),
-            targets: vec!["production".to_string()],
+            target: "production".to_string(),
+            groups: Vec::new(),
         }],
         // The slot's ONE retention policy: the standard variant file owns the
         // policy of the slot it declares (app-1). A slot's owning variant is
@@ -394,7 +395,7 @@ fn standard_variant(deploy_dir: &Path) -> VariantConfig {
 /// The `systemd` example variant: ships the real user unit shipped as an
 /// artifact (`releases/v1/artifacts/systemd/example.service`) mapped to
 /// `app/`. It declares NO slots: it is an example you bind by adding a
-/// `[[slots]]` entry (with a `targets` list) to this file.
+/// `[[slots]]` entry (with a `target` field) to this file.
 ///
 /// STRICT MAPPING SEMANTICS: destinations must not overlap, so this variant
 /// maps only its own unit tree — the `standard` variant's `app/` destination
@@ -462,7 +463,7 @@ const MANIFEST_DOC: &str = "\
 #
 # Servers and targets are declared here; slots are declared inside the
 # variant files (releases/v1/standard.toml declares the project's one slot,
-# bound to target `production` by its `targets` list).
+# bound to its ONE owning target `production` by its `target` field).
 #
 # LOCAL-FIRST: `address` is a local:// filesystem endpoint (.deploy-remote/
 # in this project) so `deploy push production` runs with zero SSH. To deploy
@@ -478,8 +479,10 @@ const STANDARD_DOC: &str = "\
 # directory is a variant, named by its file stem: add a file to add a variant.
 # Each variant declares its own deployment slots: the [[slots]] entry below
 # binds slot `app-1` to server-01 (declared in deploy.toml) under this
-# project's deploy_dir, and its `targets` list binds it to the `production`
-# target (a target's members are derived from the slots' `targets` lists).
+# project's deploy_dir, and its `target` field binds it to its ONE owning
+# target `production` (a target's members are derived from the slots'
+# `target` fields; `groups` may add rollout-group membership for
+# `deploy push production --group <name>`).
 # `adapter = \"none\"` is a pure file push: the mapped artifacts land under
 # `current/` and nothing else runs. For per-deployment service management,
 # switch the activation adapter to \"systemd\" with [[activation.units]]

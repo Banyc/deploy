@@ -244,7 +244,7 @@ mappings = []
 [[slots]]
 id = "p1"
 server = "s1"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv"
 
 [rotation.per_server]
@@ -267,7 +267,7 @@ interval_seconds = 0
 "#;
         std::fs::write(release_dir.join("standard.toml"), variant_toml).unwrap();
         let deploy_toml = r#"
-schema_version = 1
+schema_version = 2
 application = "rot"
 release = "v1"
 
@@ -278,68 +278,6 @@ user = "u"
 host_key_fingerprint = "SHA256:test"
 
 [targets.t1]
-rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-"#;
-        let p = project.join("deploy.toml");
-        std::fs::write(&p, deploy_toml).unwrap();
-        Config::load(&p).unwrap()
-    }
-
-    /// A slot shared between `production` and `staging` — ONE owning variant
-    /// (`standard`) carries the slot's single retention policy (CONSERVATIVE:
-    /// 5 distinct artifacts, 14 days of age, the protected previous, and 2
-    /// snapshot deployments). Both member targets own ONLY rollout behavior;
-    /// neither may change the slot's retention.
-    fn cfg_shared() -> Config {
-        let dir = tempfile::tempdir().unwrap();
-        let project = dir.path().join("proj");
-        std::fs::create_dir_all(&project).unwrap();
-        let release_dir = project.join("releases").join("v1");
-        std::fs::create_dir_all(&release_dir).unwrap();
-        let variant_toml = r#"
-[artifact]
-mappings = []
-
-[[slots]]
-id = "p1"
-server = "s1"
-targets = ["production", "staging"]
-deploy_dir = "/srv"
-
-[rotation.per_server]
-keep_distinct_artifacts = 5
-keep_days = 14
-protect_previous = true
-
-[rotation.deployment]
-protect_deployments = 2
-
-[activation]
-adapter = "none"
-
-[verification]
-adapter = "command"
-argv = ["true"]
-timeout_seconds = 5
-attempts = 1
-interval_seconds = 0
-"#;
-        std::fs::write(release_dir.join("standard.toml"), variant_toml).unwrap();
-        let deploy_toml = r#"
-schema_version = 1
-application = "rot"
-release = "v1"
-
-[[servers]]
-id = "s1"
-address = "a"
-user = "u"
-host_key_fingerprint = "SHA256:test"
-
-[targets.production]
-rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-
-[targets.staging]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 "#;
         let p = project.join("deploy.toml");
@@ -445,7 +383,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                         id: "p1".to_string(),
                         server: "s1".to_string(),
                         deploy_dir: "/srv/pin".to_string(),
-                        targets: vec!["t1".to_string()],
+                        target: "t1".to_string(),
+                        groups: Vec::new(),
                     }],
                 },
             )]),
@@ -849,149 +788,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
     }
 
-    /// A slot shared across TWO targets (`production`, `staging`) has exactly
-    /// ONE retention policy — the policy of its OWNING VARIANT (`standard`
-    /// declares the slot) — never a union of the member targets' policies
-    /// (targets carry rollout only). Interleaved deployments from BOTH member
-    /// targets create generations carrying their originating target; the
-    /// single variant policy is applied to ALL of them, so the retained set
-    /// is IDENTICAL whether the caller thinks of the slot as a `production`
-    /// slot or a `staging` slot — membership never enters the computation.
-    /// The generation records still carry their originating target on the
-    /// remote (the helper writes attribution; rotation no longer consults
-    /// it).
+    /// GROUP MEMBERSHIP NEVER CHANGES RETENTION: the slot's retained set is
+    /// computed from its OWNING VARIANT's single policy, so adding or
+    /// removing a rollout group in the slot's `groups` list (a config-level
+    /// membership change — groups only SELECT slots, they never own policy)
+    /// leaves the retained digest set IDENTICAL. The policy is resolved
+    /// through the same `Config::slot_rotation` path the engine uses, and the
+    /// second config is a REAL reload of an edited slot declaration.
     #[test]
-    fn shared_slot_rotates_under_its_owning_variants_single_policy() {
-        let dir = tempfile::tempdir().unwrap();
-        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
-        let helper = RemoteHelper::new(&remote);
-        // Interleaved deployments: production pushes g1,g3,g4,g6,g7,g9
-        // (distinct trees t1,t3,t4,t6,t7,t9); staging pushes g2,g5,g8,g10
-        // (t2,t5,t8,t10). `current` = g10 = a STAGING generation.
-        for (d, g, t, target) in [
-            ("d1", "g1", "t1", "production"),
-            ("d2", "g2", "t2", "staging"),
-            ("d3", "g3", "t3", "production"),
-            ("d4", "g4", "t4", "production"),
-            ("d5", "g5", "t5", "staging"),
-            ("d6", "g6", "t6", "production"),
-            ("d7", "g7", "t7", "production"),
-            ("d8", "g8", "t8", "staging"),
-            ("d9", "g9", "t9", "production"),
-            ("d10", "g10", "t10", "staging"),
-        ] {
-            let day = match g {
-                "g1" => 1,
-                "g2" => 2,
-                "g3" => 3,
-                "g4" => 4,
-                "g5" => 5,
-                "g6" => 6,
-                "g7" => 7,
-                "g8" => 8,
-                "g9" => 9,
-                _ => 10,
-            };
-            // The prior generation of every record after the first; owned by
-            // the immediately preceding generation in the chain.
-            let prior: Option<String> = if g == "g1" {
-                None
-            } else {
-                Some(format!("g{}", g[1..].parse::<u32>().unwrap() - 1))
-            };
-            make_gen(
-                &helper,
-                d,
-                g,
-                t,
-                &format!("2020-01-{day:02}T00:00:00Z"),
-                prior.as_deref(),
-                Some(target),
-            );
-        }
-        helper.swap_current(None, "g10", "op").unwrap();
-        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let c = cfg_shared();
-
-        // The slot's ONE policy, resolved from its OWNING VARIANT (never a
-        // member-target union): keep 5 distinct, 14 days, protect previous,
-        // 2 deployments.
-        let retained = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap();
-        // `current`'s live tree is ALWAYS retained.
-        assert!(
-            retained.contains("t10"),
-            "current live tree always retained"
-        );
-        // The single policy's `protect_previous` retains the previous
-        // generation of `current` (g9 -> t9) even though `current` itself is a
-        // STAGING push — one policy, no member-target caveats.
-        assert!(
-            retained.contains("t9"),
-            "the single policy's protect_previous must retain the previous generation's tree"
-        );
-        // The policy's keep_distinct=5 window retains the newest 5 distinct
-        // bindings (t10,t9,t8,t7,t6).
-        for t in ["t6", "t7", "t8"] {
-            assert!(
-                retained.contains(t),
-                "the single policy's distinct window must retain {t}"
-            );
-        }
-        // Only objects OUTSIDE the single policy's windows are swept: the
-        // oldest distinct bindings (t1..t5).
-        for t in ["t1", "t2", "t3", "t4", "t5"] {
-            assert!(
-                !retained.contains(t),
-                "an object the single policy does not retain must be swept: {t}"
-            );
-        }
-        helper.rotate(&retained, &HashSet::new()).unwrap();
-        for t in ["t6", "t7", "t8", "t9", "t10"] {
-            assert!(
-                helper.remote().exists(&crate::layout::tree_root(t)),
-                "tree {t} must remain after rotation"
-            );
-        }
-        for t in ["t1", "t2", "t3", "t4", "t5"] {
-            assert!(
-                !helper.remote().exists(&crate::layout::tree_root(t)),
-                "tree {t} must be swept"
-            );
-        }
-
-        // The generation records still carry their originating target (the
-        // remote helper writes attribution; the slot's policy ignores it).
-        assert_eq!(
-            helper
-                .read_assignment("g1")
-                .unwrap()
-                .target
-                .as_ref()
-                .map(|t| t.as_str()),
-            Some("production"),
-            "production record must carry its originating target"
-        );
-        assert_eq!(
-            helper
-                .read_assignment("g10")
-                .unwrap()
-                .target
-                .as_ref()
-                .map(|t| t.as_str()),
-            Some("staging"),
-            "staging record must carry its originating target"
-        );
-    }
-
-    /// MEMBERSHIP NEVER CHANGES RETENTION: the slot's retained set is computed
-    /// from its OWNING VARIANT's single policy, so adding or removing a
-    /// member target in the slot's `targets` list (a config-level membership
-    /// change) leaves the retained digest set IDENTICAL. The policy is
-    /// resolved through the same `Config::slot_rotation` path the engine
-    /// uses, and the second config is a REAL reload of an edited slot
-    /// declaration.
-    #[test]
-    fn membership_changes_never_change_retention() {
+    fn group_membership_never_changes_retention() {
         let dir = tempfile::tempdir().unwrap();
         let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
         let helper = RemoteHelper::new(&remote);
@@ -1011,7 +816,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t2",
             "2020-01-02T00:00:00Z",
             Some("g1"),
-            Some("staging"),
+            Some("production"),
         );
         make_gen(
             &helper,
@@ -1025,10 +830,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         helper.swap_current(None, "g3", "op").unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
-        // Config-level membership change: rewrite `standard.toml` so slot `p1`
-        // belongs to ONLY `production` (staging removed), then reload the
-        // project. The owning variant — and therefore the slot's ONE policy —
-        // is unchanged.
+        // Config-level group change: rewrite `standard.toml` so slot `p1`
+        // belongs to the `canary` group, then reload the project. The owning
+        // variant — and therefore the slot's ONE policy — is unchanged.
         let project = tempfile::tempdir().unwrap();
         let proj = project.path().join("proj");
         std::fs::create_dir_all(&proj).unwrap();
@@ -1041,7 +845,8 @@ mappings = []
 [[slots]]
 id = "p1"
 server = "s1"
-targets = ["production", "staging"]
+target = "production"
+groups = ["canary"]
 deploy_dir = "/srv"
 
 [rotation.per_server]
@@ -1064,7 +869,7 @@ interval_seconds = 0
 "#;
         std::fs::write(release_dir.join("standard.toml"), variant_toml).unwrap();
         let deploy_toml = r#"
-schema_version = 1
+schema_version = 2
 application = "rot"
 release = "v1"
 
@@ -1076,42 +881,33 @@ host_key_fingerprint = "SHA256:test"
 
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
-
-[targets.staging]
-rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 "#;
         std::fs::write(proj.join("deploy.toml"), deploy_toml).unwrap();
         let c = Config::load(&proj.join("deploy.toml")).unwrap();
         let before = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap();
 
-        // The config-level membership change: ADD a new member target
-        // (`canary`) to slot `p1`'s `targets` list AND declare the target in
-        // deploy.toml, then reload. (Removing a member would orphan the
-        // two-target fixture's other target — validation rejects a target
-        // with no slots — so membership is GROWN instead; adding is equally
-        // a membership change, and retention must not move.)
+        // The config-level group change: ADD a new rollout group (`wave-1`)
+        // to slot `p1`'s `groups` list, then reload. Groups are selection-only
+        // (they never own state, policy, history, or checkpoints), so
+        // retention must not move.
         let variant_path = release_dir.join("standard.toml");
-        let edited = std::fs::read_to_string(&variant_path).unwrap().replace(
-            "targets = [\"production\", \"staging\"]",
-            "targets = [\"production\", \"staging\", \"canary\"]",
-        );
+        let edited = std::fs::read_to_string(&variant_path)
+            .unwrap()
+            .replace("groups = [\"canary\"]", "groups = [\"canary\", \"wave-1\"]");
         std::fs::write(&variant_path, edited).unwrap();
-        let deploy_toml = std::fs::read_to_string(proj.join("deploy.toml")).unwrap()
-            + "\n[targets.canary]\nrollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }\n";
-        std::fs::write(proj.join("deploy.toml"), deploy_toml).unwrap();
         let c2 = Config::load(&proj.join("deploy.toml")).unwrap();
         assert_eq!(
             c2.slot_variant("p1").unwrap(),
             "standard",
-            "the owning variant is unchanged by membership edits"
+            "the owning variant is unchanged by group edits"
         );
         let after = compute_retained(&helper, &c2.pins, &store, rot(&c2)).unwrap();
         assert_eq!(
             before, after,
-            "changing a slot's target membership must never change its retained set"
+            "changing a slot's group membership must never change its retained set"
         );
-        // And membership cannot even influence the API: the policy argument is
-        // the slot's single owning-variant policy.
+        // And group membership cannot even influence the API: the policy
+        // argument is the slot's single owning-variant policy.
         assert_eq!(rot(&c), rot(&c2), "the slot's policy is unchanged");
     }
 

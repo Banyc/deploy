@@ -138,6 +138,16 @@ Then, from inside the project:\n\
 variants (or restore a historical deployment) to every server in the target,\n\
 in rollout batches.\n\
 \n\
+SELECTION: by default every slot owned by the target is selected. Pass\n\
+--group <name> to select exactly the target's slots whose `groups` list\n\
+contains the name (an unknown group, or a group selecting zero slots, is a\n\
+configuration error). A group push produces a COMPLETE target snapshot: the\n\
+selected slots are replaced with their new assignments while unselected\n\
+slots are carried forward unchanged, so a partial rollout stays fully\n\
+rollback-capable. On a target's first deployment a group must cover every\n\
+target slot; after membership changes every unselected slot must have a\n\
+prior assignment with a matching physical binding.\n\
+\n\
 REFERENCE (optional second argument, jj-style — the target is NEVER repeated\n\
 in the reference; every relative form resolves against the target argument):\n\n\
   (none), HEAD, @      the current local files (default)\n\
@@ -170,6 +180,7 @@ roll back by default (failure_policy: rollback_changed). The final status is\n\
 reported explicitly, including partial states like `degraded`.",
         after_help = "Examples:\n\
   deploy push production               # deploy local files\n\
+  deploy push production --group canary  # deploy only the canary group\n\
   deploy push production --dry-run     # preview the plan, touch nothing\n\
   deploy push production @-            # roll back to the previous deployment\n\
   deploy push production 'parent(@, 3)'  # roll back 3 deployments\n\
@@ -185,6 +196,12 @@ reported explicitly, including partial states like `degraded`.",
         /// release:<id> (direct release deploy) — never repeats the target.
         /// The `sN` snapshot-index forms are removed.
         reference: Option<String>,
+        /// Select a rollout group: deploy exactly the target's slots whose
+        /// `groups` list contains this name (an unknown group, or a group
+        /// selecting zero slots, is a configuration error). Omitting the
+        /// flag selects every slot owned by the target.
+        #[arg(long, value_name = "NAME")]
+        group: Option<String>,
         #[arg(long)]
         dry_run: bool,
     },
@@ -203,9 +220,17 @@ produce snapshots (see `deploy help push` for the reference syntax)."
     #[command(
         long_about = "Inspect the real generation on every server of the target: generation\n\
 id, release id, variant, and tree digest, as observed on the servers themselves\n\
-(right now — not from local history)."
+(right now — not from local history). Pass --group <name> to show only the\n\
+target's slots whose `groups` list contains the name (an unknown group, or a\n\
+group selecting zero slots, is a configuration error)."
     )]
-    Status { target: String },
+    Status {
+        target: String,
+        /// Show only the slots of this rollout group (an unknown group, or a
+        /// group selecting zero slots, is a configuration error).
+        #[arg(long, value_name = "NAME")]
+        group: Option<String>,
+    },
     /// Retain a target's history suffix (checkpoint) and sweep the rest.
     #[command(
         long_about = "Checkpoint the target's ONE history ledger\n\
@@ -329,6 +354,7 @@ where
         Command::Push {
             target,
             reference,
+            group,
             dry_run,
         } => {
             let report = push(
@@ -340,6 +366,7 @@ where
                 &PushOptions {
                     dry_run,
                     ref_token: reference,
+                    group,
                 },
             )?;
             print_report(&report);
@@ -353,11 +380,30 @@ where
                 println!("{line}");
             }
         }
-        Command::Status { target } => {
+        Command::Status { target, group } => {
             // The target view over the single physical slot state: the global
             // slot map (`slots/<slot-id>/observed.json`) filtered to this
-            // target's member slots.
+            // target's member slots, then (with --group) to the group's
+            // current membership.
             let observed = store.read_observed(&target, &config)?;
+            let observed = match &group {
+                Some(g) => {
+                    let selected: std::collections::HashSet<&str> = config
+                        .target_group_slots(&target, g)?
+                        .iter()
+                        .map(|(s, _)| s.id.as_str())
+                        .collect();
+                    crate::records::ObservedTarget {
+                        target: observed.target,
+                        slots: observed
+                            .slots
+                            .into_iter()
+                            .filter(|(id, _)| selected.contains(id.as_str()))
+                            .collect(),
+                    }
+                }
+                None => observed,
+            };
             for line in render_status(&observed) {
                 println!("{line}");
             }
@@ -469,13 +515,22 @@ pub fn render_log(
         } else {
             "-".to_string()
         };
+        // The optional rollout group the attempt selected (`--group <name>`),
+        // displayed when one was used. The group name is descriptive; the
+        // exact selected slot IDs are the authoritative historical evidence.
+        let group_note = e
+            .intent
+            .group
+            .as_ref()
+            .map(|g| format!(" group={g}"))
+            .unwrap_or_default();
         out.push(match reason {
             Some(r) => format!(
-                "{prefix}  {}  {status:?}  {}  ({r})",
+                "{prefix}  {}  {status:?}  {}{group_note}  ({r})",
                 e.deployment_id, e.intent.attempted_at
             ),
             None => format!(
-                "{prefix}  {}  {status:?}  {}",
+                "{prefix}  {}  {status:?}  {}{group_note}",
                 e.deployment_id, e.intent.attempted_at
             ),
         });
@@ -528,6 +583,7 @@ mod tests {
             deployment_schema_version: SCHEMA_VERSION,
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new("production".to_string()),
+            group: None,
             slot_ids: vec![PlacementSlotId::new("p1".to_string())],
             behavior_sha256: "sha256-aa".to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
@@ -681,19 +737,19 @@ mod tests {
             r#"[[slots]]
 id = "p1"
 server = "s1"
-targets = ["production"]
+target = "production"
 deploy_dir = "/srv/status"
 
 [[slots]]
 id = "p2"
 server = "s2"
-targets = ["production"]
+target = "production"
 deploy_dir = "/srv/status2"
 
 [[slots]]
 id = "p3"
 server = "s3"
-targets = ["production"]
+target = "production"
 deploy_dir = "/srv/status3"
 
 [[artifact.mappings]]
@@ -723,7 +779,7 @@ interval_seconds = 0
         .unwrap();
         std::fs::write(
             project.join("deploy.toml"),
-            r#"schema_version = 1
+            r#"schema_version = 2
 application = "status-cli"
 release = "v1"
 
@@ -944,7 +1000,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             r#"[[slots]]
 id = "p1"
 server = "s1"
-targets = ["production"]
+target = "production"
 deploy_dir = "/srv/ckpt"
 
 [[artifact.mappings]]
@@ -966,7 +1022,7 @@ interval_seconds = 0
         .unwrap();
         std::fs::write(
             project.join("deploy.toml"),
-            r#"schema_version = 1
+            r#"schema_version = 2
 application = "checkpoint-cli"
 release = "v1"
 

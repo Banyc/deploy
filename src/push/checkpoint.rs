@@ -266,6 +266,7 @@ mod tests {
             deployment_schema_version: SCHEMA_VERSION,
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new(target.to_string()),
+            group: None,
             slot_ids: vec![PlacementSlotId::new("p1".to_string())],
             behavior_sha256: "sha256-aa".to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
@@ -361,7 +362,7 @@ mod tests {
 [[slots]]
 id = "p1"
 server = "s1"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/eng"
 
 [[artifact.mappings]]
@@ -391,7 +392,7 @@ interval_seconds = 0
         std::fs::write(
             project.join("deploy.toml"),
             format!(
-                "schema_version = 1\napplication = \"cp\"\nrelease = \"v1\"\n\n\
+                "schema_version = 2\napplication = \"cp\"\nrelease = \"v1\"\n\n\
                  [[servers]]\nid = \"s1\"\naddress = \"a\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n\
                  [targets.{TARGET}]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n"
             ),
@@ -432,7 +433,8 @@ interval_seconds = 0
                     id: "p1".to_string(),
                     server: "s1".to_string(),
                     deploy_dir: std::path::PathBuf::from("/srv/deploy/p1"),
-                    targets: vec![TARGET.to_string()],
+                    target: TARGET.to_string(),
+                    groups: Vec::new(),
                 }],
             )]),
             std::path::Path::new("."),
@@ -523,7 +525,7 @@ interval_seconds = 0
         std::fs::write(
             project.join("deploy.toml"),
             format!(
-                "schema_version = 1\napplication = \"cp\"\nrelease = \"v1\"\n\n\
+                "schema_version = 2\napplication = \"cp\"\nrelease = \"v1\"\n\n\
                  [[servers]]\nid = \"s1\"\naddress = \"a\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n\
                  [[pins]]\nrelease = \"{pinned}\"\nreason = \"keep\"\n\n\
                  [targets.{TARGET}]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n"
@@ -627,7 +629,7 @@ interval_seconds = 0
         std::fs::write(
             project.join("deploy.toml"),
             format!(
-                "schema_version = 1\napplication = \"cp\"\nrelease = \"v1\"\n\n\
+                "schema_version = 2\napplication = \"cp\"\nrelease = \"v1\"\n\n\
                  [[servers]]\nid = \"s1\"\naddress = \"a\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n\
                  [[pins]]\nrelease = \"{pinned}\"\nreason = \"keep\"\n\n\
                  [targets.{TARGET}]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n"

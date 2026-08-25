@@ -6,15 +6,191 @@ use crate::error::{Error, Result};
 use crate::history::{PushRef, resolve_deployment};
 use crate::model::{
     ArtifactRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, ReleaseRecord, ServerId,
-    TreeDigest, VariantName,
+    TargetName, TreeDigest, VariantName,
 };
-use crate::records::{PhysicalBinding, PlanSource};
+use crate::records::{LedgerRollback, PhysicalBinding, PlanSource};
 use crate::store::local::LocalStore;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// The plan for one placement slot: exactly the canonical slot→artifact
 /// assignment ([`PlacementSlotAssignment`]), reused rather than re-declared.
 pub type PlannedAssignment = PlacementSlotAssignment;
+
+/// The NORMALIZED selection of one push/status invocation: the owning target,
+/// the optional rollout group, and the EXACT selected slot IDs. Normalized
+/// once near command entry (from the caller's current configuration — the
+/// selection source, including for historical references); planning,
+/// execution, reporting, and persistence consume this instead of
+/// independently filtering slots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotSelection {
+    pub target: TargetName,
+    /// The optional rollout group (`deploy push <target> --group <name>`).
+    /// `None` selects every slot owned by the target.
+    pub group: Option<String>,
+    /// The exact selected slot IDs, in deterministic order (variants in name
+    /// order, then each variant's slots in file order).
+    pub slot_ids: Vec<PlacementSlotId>,
+}
+
+impl SlotSelection {
+    /// Normalize a target + optional group into the exact selected slot set
+    /// from the caller's current configuration. Omitting the group selects
+    /// every slot owned by the target; a group selects exactly the target's
+    /// slots whose `groups` list contains it (an unknown group, or a group
+    /// selecting zero slots, is a configuration error).
+    pub fn normalize(config: &Config, target: &str, group: Option<&str>) -> Result<Self> {
+        let members = match group {
+            Some(g) => config.target_group_slots(target, g)?,
+            None => config.target_slots(target)?,
+        };
+        let slot_ids = members
+            .iter()
+            .map(|(s, _)| PlacementSlotId::new(s.id.clone()))
+            .collect();
+        Ok(SlotSelection {
+            target: TargetName::new(target.to_string()),
+            group: group.map(str::to_string),
+            slot_ids,
+        })
+    }
+
+    /// The selected (slot, server) pairs from the caller's current
+    /// configuration, in the same deterministic order as the selection's
+    /// `slot_ids` (derived by filtering the target's members to the
+    /// selection).
+    pub fn members<'a>(
+        &self,
+        config: &'a Config,
+    ) -> Result<Vec<(&'a crate::config::SlotDef, &'a crate::config::ServerDef)>> {
+        let all = config.target_slots(self.target.as_str())?;
+        Ok(all
+            .into_iter()
+            .filter(|(s, _)| self.slot_ids.iter().any(|id| id.as_str() == s.id))
+            .collect())
+    }
+
+    /// True when the selection covers every slot owned by the target.
+    pub fn is_full(&self, config: &Config) -> Result<bool> {
+        let all = config.target_slots(self.target.as_str())?;
+        Ok(all.len() == self.slot_ids.len())
+    }
+}
+
+/// The latest successful rollback state of a target (the base for a partial
+/// rollout's complete snapshot), or `None` when the target has no successful
+/// deployment yet.
+pub(crate) fn latest_successful_rollback(
+    store: &LocalStore,
+    target: &str,
+) -> Result<Option<LedgerRollback>> {
+    for entry in store.read_ledger(target)?.into_iter().rev() {
+        if let Some(t) = entry.terminal
+            && t.status == crate::records::DeploymentStatus::Successful
+            && let Some(rb) = t.rollback
+        {
+            return Ok(Some(rb));
+        }
+    }
+    Ok(None)
+}
+
+/// PARTIAL-ROLLOUT GUARDS, validated BEFORE any remote mutation: a group push
+/// derives its complete snapshot by overlaying the selected slots onto the
+/// latest successful target snapshot, so the base must be able to carry every
+/// unselected slot forward.
+///
+/// * On a target's FIRST deployment (no base snapshot), a partial group push
+///   is allowed only if the selected group covers every target slot.
+/// * After target membership changes, a partial push is allowed only when
+///   every current UNSELECTED slot has a prior assignment in the base AND its
+///   physical binding still matches (a slot added to the target after the
+///   base, or rebound/moved since, would otherwise be silently dropped from
+///   the new snapshot).
+///
+/// A full-target push (no group) is always allowed: it establishes a new
+/// complete snapshot from its own actuals.
+pub(crate) fn validate_partial_rollout(
+    selection: &SlotSelection,
+    config: &Config,
+    store: &LocalStore,
+) -> Result<()> {
+    if selection.group.is_none() {
+        return Ok(());
+    }
+    let current = config.target_slots(selection.target.as_str())?;
+    let selected: HashSet<&str> = selection.slot_ids.iter().map(|s| s.as_str()).collect();
+    let unselected: Vec<(&crate::config::SlotDef, &crate::config::ServerDef)> = current
+        .iter()
+        .filter(|(s, _)| !selected.contains(s.id.as_str()))
+        .copied()
+        .collect();
+    let base = latest_successful_rollback(store, selection.target.as_str())?;
+    match base {
+        None => {
+            // First deployment: the group must cover every target slot.
+            if !unselected.is_empty() {
+                return Err(Error::preflight(format!(
+                    "partial rollout of target '{}' with group '{}' on its first deployment is refused: \
+                     the group must cover every target slot (unselected: {})",
+                    selection.target,
+                    selection.group.as_deref().unwrap_or(""),
+                    unselected
+                        .iter()
+                        .map(|(s, _)| s.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
+        Some(base) => {
+            // Membership drift: every unselected slot must have a prior
+            // assignment in the base and its physical binding must still
+            // match.
+            for (slot, sdef) in &unselected {
+                let slot_id = PlacementSlotId::new(slot.id.clone());
+                let current_binding = PhysicalBinding {
+                    server: ServerId::new(sdef.id.clone()),
+                    deploy_dir: slot.deploy_dir.to_string_lossy().into_owned(),
+                };
+                if !base.slots.contains_key(&slot_id) {
+                    return Err(Error::preflight(format!(
+                        "partial rollout of target '{}' with group '{}' is refused: unselected slot \
+                         '{}' has no prior assignment in the latest successful snapshot (it was \
+                         added to the target after that deployment)",
+                        selection.target,
+                        selection.group.as_deref().unwrap_or(""),
+                        slot_id
+                    )));
+                }
+                let recorded = base.bindings.get(&slot_id).ok_or_else(|| {
+                    Error::preflight(format!(
+                        "partial rollout of target '{}' with group '{}' is refused: unselected slot \
+                         '{}' has no recorded physical binding in the latest successful snapshot",
+                        selection.target,
+                        selection.group.as_deref().unwrap_or(""),
+                        slot_id
+                    ))
+                })?;
+                if recorded != &current_binding {
+                    return Err(Error::preflight(format!(
+                        "partial rollout of target '{}' with group '{}' is refused: unselected slot \
+                         '{}' was bound to server '{}' at '{}' in the latest successful snapshot, \
+                         now bound to '{}' at '{}'; the new snapshot could not carry it forward",
+                        selection.target,
+                        selection.group.as_deref().unwrap_or(""),
+                        slot_id,
+                        recorded.server,
+                        recorded.deploy_dir,
+                        current_binding.server,
+                        current_binding.deploy_dir
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// DIRECT-RELEASE MEMBERSHIP VALIDATION (before any remote access): a
 /// `release:<id>` push deploys onto the CURRENT target's slots, so the
@@ -22,15 +198,15 @@ pub type PlannedAssignment = PlacementSlotAssignment;
 /// the target currently has.
 ///
 /// The expected set is the union over every variant in the record's snapshot
-/// of the slots whose `targets` list contains the destination target
-/// (variants share slots, so the union is deduplicated by slot id; the
-/// membership is a set). The comparison is LOGICAL membership only: physical
-/// bindings (server / deploy_dir) are intentionally allowed to differ —
-/// unlike the exact-rollback `Snapshot` branch, which also demands identical
-/// physical bindings. A target whose membership DRIFTED since the release
-/// was built — a slot added, removed, or renamed — is refused, before any
-/// assignment is built and before any remote access, rather than deploying
-/// to the wrong slot set.
+/// of the slots whose ONE owning `target` equals the destination target
+/// (each slot has exactly one target, so the union is deduplicated by slot
+/// id; the membership is a set). The comparison is LOGICAL membership only:
+/// physical bindings (server / deploy_dir) are intentionally allowed to
+/// differ — unlike the exact-rollback `Snapshot` branch, which also demands
+/// identical physical bindings. A target whose membership DRIFTED since the
+/// release was built — a slot added, removed, or renamed — is refused, before
+/// any assignment is built and before any remote access, rather than
+/// deploying to the wrong slot set.
 ///
 /// Runs at TWO sites: the engine's early gate in `push()` — immediately
 /// after the ref is parsed/resolved, BEFORE any lock and BEFORE the remote
@@ -50,7 +226,7 @@ pub(crate) fn validate_direct_release_membership(
         .slots
         .values()
         .flat_map(|cs| cs.slots.iter())
-        .filter(|s| s.targets.iter().any(|t| t == target_name))
+        .filter(|s| s.target == target_name)
         .map(|s| s.id.clone())
         .collect();
     let current: BTreeSet<String> = current_slot_ids
@@ -67,21 +243,23 @@ pub(crate) fn validate_direct_release_membership(
     Ok(())
 }
 
-/// Resolve the desired assignment for each slot of `target_name` given the
-/// push reference. Returns the assignments, the release the attempt is bound
-/// to, and the plan source.
+/// Resolve the desired assignment for each SELECTED slot given the push
+/// reference. The selection (target + optional group + exact slot IDs) is
+/// normalized once near command entry; planning consumes it instead of
+/// independently filtering slots. Returns the assignments, the release the
+/// attempt is bound to, and the plan source.
 pub fn plan_assignments(
-    target_name: &str,
+    selection: &SlotSelection,
     pref: &PushRef,
     local_release_id: &ReleaseId,
     variant_trees: &BTreeMap<String, TreeDigest>,
     store: &LocalStore,
     config: &Config,
 ) -> Result<(Vec<PlannedAssignment>, ReleaseId, PlanSource)> {
-    if !config.targets.contains_key(target_name) {
-        return Err(Error::not_found(format!("target '{target_name}'")));
+    if !config.targets.contains_key(selection.target.as_str()) {
+        return Err(Error::not_found(format!("target '{}'", selection.target)));
     }
-    let members = config.target_slots(target_name)?;
+    let members = selection.members(config)?;
     let slot_ids: Vec<PlacementSlotId> = members
         .iter()
         .map(|(slot, _)| PlacementSlotId::new(slot.id.clone()))
@@ -120,19 +298,25 @@ pub fn plan_assignments(
                 entry.slots.keys().map(|s| s.as_str().to_string()).collect();
             let current: BTreeSet<String> =
                 slot_ids.iter().map(|s| s.as_str().to_string()).collect();
-            if recorded != current {
+            // A FULL rollback (no group) restores every current slot, so the
+            // snapshot's slot set must equal the target's current set. A GROUP
+            // rollback restores only the selected slots: the snapshot must
+            // contain every selected slot (checked per slot below), while
+            // unselected slots remain at the latest current state.
+            if selection.group.is_none() && recorded != current {
                 return Err(Error::rollback(
                     "target membership changed; exact rollback requires identical stable placement-slot set",
                 ));
             }
-            // Every member's COMPLETE physical binding — the server AND the
-            // on-server deploy_dir — must match the one recorded in the
-            // snapshot: the generation is mapped to a slot by SLOT ID, so a
+            // Every SELECTED member's COMPLETE physical binding — the server
+            // AND the on-server deploy_dir — must match the one recorded in
+            // the snapshot: the generation is mapped to a slot by SLOT ID, so a
             // slot rebound to a different server, or moved to a different
             // deploy_dir on the SAME server, would otherwise silently roll
             // the historical assignment onto the wrong host/location. A
             // missing recorded binding (legacy pre-feature snapshot) is
-            // unverifiable and refuses for the same reason.
+            // unverifiable and refuses for the same reason. Unselected slots
+            // are not planned (they remain at the latest current state).
             for (slot, sdef) in &members {
                 let slot_id = PlacementSlotId::new(slot.id.clone());
                 let current_binding = PhysicalBinding {
@@ -192,7 +376,12 @@ pub fn plan_assignments(
             // ALSO runs this gate before the remote factory is ever invoked
             // (real AND dry-run modes); this plan-time call is the second line
             // of defense, protecting the direct-`push_inner` test entry points.
-            validate_direct_release_membership(target_name, release, &rec, &slot_ids)?;
+            validate_direct_release_membership(
+                selection.target.as_str(),
+                release,
+                &rec,
+                &slot_ids,
+            )?;
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
                 let slot_id = PlacementSlotId::new(slot.id.clone());
@@ -264,7 +453,7 @@ mod tests {
     use proptest::test_runner::RngSeed;
 
     const DEPLOY_TOML: &str = r#"
-schema_version = 1
+schema_version = 2
 application = "plan"
 release = "v1"
 
@@ -283,12 +472,18 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// binding), `t2` the DESTINATION with NO snapshot history (the release
     /// was built/pushed elsewhere). Both declare the same slot `p1`.
     const DEPLOY_TOML_TWO: &str = r#"
-schema_version = 1
+schema_version = 2
 application = "plan"
 release = "v1"
 
 [[servers]]
 id = "s1"
+address = "a"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s2"
 address = "a"
 user = "u"
 host_key_fingerprint = "SHA256:test"
@@ -307,7 +502,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 [[slots]]
 id = "p1"
 server = "s1"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/plan"
 
 [[artifact.mappings]]
@@ -341,8 +536,14 @@ interval_seconds = 0
 [[slots]]
 id = "p1"
 server = "s1"
-targets = ["t1", "t2"]
+target = "t1"
 deploy_dir = "/srv/plan"
+
+[[slots]]
+id = "p2"
+server = "s2"
+target = "t2"
+deploy_dir = "/srv/plan-2"
 
 [[artifact.mappings]]
 from = "artifacts/build/output/"
@@ -408,6 +609,7 @@ interval_seconds = 0
                     deployment_schema_version: SCHEMA_VERSION,
                     deployment_id: id.clone(),
                     target: target.clone(),
+                    group: None,
                     slot_ids: slots.keys().cloned().collect(),
                     behavior_sha256: behavior_sha256.to_string(),
                     attempted_at: "2026-01-01T00:00:00Z".to_string(),
@@ -500,7 +702,8 @@ interval_seconds = 0
                     id: "p1".to_string(),
                     server: "s1".to_string(),
                     deploy_dir: "/srv/plan".to_string(),
-                    targets: vec!["t1".to_string()],
+                    target: "t1".to_string(),
+                    groups: Vec::new(),
                 }],
             },
         )]);
@@ -510,7 +713,7 @@ interval_seconds = 0
         assert_eq!(config.slot_variant("p1").unwrap(), "standard");
 
         let (assignments, desired, source) = plan_assignments(
-            "t1",
+            &SlotSelection::normalize(&config, "t1", None).unwrap(),
             &PushRef::Release {
                 release: release.clone(),
             },
@@ -563,7 +766,7 @@ interval_seconds = 0
         .unwrap();
 
         let err = plan_assignments(
-            "t1",
+            &SlotSelection::normalize(&config, "t1", None).unwrap(),
             &PushRef::Release {
                 release: release.clone(),
             },
@@ -599,7 +802,8 @@ interval_seconds = 0
                     id: "pX".to_string(),
                     server: "s1".to_string(),
                     deploy_dir: "/srv/other".to_string(),
-                    targets: vec!["t1".to_string()],
+                    target: "t1".to_string(),
+                    groups: Vec::new(),
                 }],
             },
         )]);
@@ -607,7 +811,7 @@ interval_seconds = 0
         store.write_release(&rec).unwrap();
 
         let err = plan_assignments(
-            "t1",
+            &SlotSelection::normalize(&config, "t1", None).unwrap(),
             &PushRef::Release {
                 release: release.clone(),
             },
@@ -649,13 +853,13 @@ interval_seconds = 0
 [[slots]]
 id = "p1"
 server = "s1"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/plan"
 
 [[slots]]
 id = "p2"
 server = "s2"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/plan-2"
 
 [[artifact.mappings]]
@@ -699,7 +903,8 @@ interval_seconds = 0
                     id: "p1".to_string(),
                     server: "s1".to_string(),
                     deploy_dir: "/srv/plan".to_string(),
-                    targets: vec!["t1".to_string()],
+                    target: "t1".to_string(),
+                    groups: Vec::new(),
                 }],
             },
         )]);
@@ -707,7 +912,7 @@ interval_seconds = 0
         store.write_release(&rec).unwrap();
 
         let err = plan_assignments(
-            "t1",
+            &SlotSelection::normalize(&config, "t1", None).unwrap(),
             &PushRef::Release {
                 release: release.clone(),
             },
@@ -741,13 +946,15 @@ interval_seconds = 0
                         id: "p1".to_string(),
                         server: "s1".to_string(),
                         deploy_dir: "/srv/plan".to_string(),
-                        targets: vec!["t1".to_string()],
+                        target: "t1".to_string(),
+                        groups: Vec::new(),
                     },
                     CanonicalSlot {
                         id: "p2".to_string(),
                         server: "s2".to_string(),
                         deploy_dir: "/srv/plan-2".to_string(),
-                        targets: vec!["t1".to_string()],
+                        target: "t1".to_string(),
+                        groups: Vec::new(),
                     },
                 ],
             },
@@ -756,7 +963,7 @@ interval_seconds = 0
         store.write_release(&rec).unwrap();
 
         let err = plan_assignments(
-            "t1",
+            &SlotSelection::normalize(&config, "t1", None).unwrap(),
             &PushRef::Release {
                 release: release.clone(),
             },
@@ -791,7 +998,7 @@ interval_seconds = 0
 [[slots]]
 id = "p1"
 server = "s2"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/moved"
 
 [[artifact.mappings]]
@@ -834,7 +1041,8 @@ interval_seconds = 0
                     id: "p1".to_string(),
                     server: "s1".to_string(),
                     deploy_dir: "/srv/plan".to_string(),
-                    targets: vec!["t1".to_string()],
+                    target: "t1".to_string(),
+                    groups: Vec::new(),
                 }],
             },
         )]);
@@ -842,7 +1050,7 @@ interval_seconds = 0
         store.write_release(&rec).unwrap();
 
         let (assignments, desired, source) = plan_assignments(
-            "t1",
+            &SlotSelection::normalize(&config, "t1", None).unwrap(),
             &PushRef::Release {
                 release: release.clone(),
             },
@@ -873,7 +1081,8 @@ interval_seconds = 0
                     id: "p1".to_string(),
                     server: "s1".to_string(),
                     deploy_dir: "/srv/plan".to_string(),
-                    targets: vec!["t1".to_string()],
+                    target: "t1".to_string(),
+                    groups: Vec::new(),
                 }],
             },
         )]);
@@ -884,7 +1093,7 @@ interval_seconds = 0
         store.write_release(&rec).unwrap();
 
         let err = plan_assignments(
-            "t1",
+            &SlotSelection::normalize(&config, "t1", None).unwrap(),
             &PushRef::Release {
                 release: release.clone(),
             },
@@ -918,7 +1127,8 @@ interval_seconds = 0
                     id: "p1".to_string(),
                     server: "s1".to_string(),
                     deploy_dir: "/srv/plan".to_string(),
-                    targets: vec!["t1".to_string()],
+                    target: "t1".to_string(),
+                    groups: Vec::new(),
                 }],
             },
         )]);
@@ -930,7 +1140,7 @@ interval_seconds = 0
         store.write_release(&rec).unwrap();
 
         let (assignments, _, _) = plan_assignments(
-            "t1",
+            &SlotSelection::normalize(&config, "t1", None).unwrap(),
             &PushRef::Release {
                 release: release.clone(),
             },
@@ -987,7 +1197,8 @@ interval_seconds = 0
                     id: "p1".to_string(),
                     server: "s1".to_string(),
                     deploy_dir: "/srv/plan".to_string(),
-                    targets: vec!["t1".to_string()],
+                    target: "t1".to_string(),
+                    groups: Vec::new(),
                 }],
             },
         )]);
@@ -1024,7 +1235,7 @@ interval_seconds = 0
         // tree-old together) even though the current config declares p1 in
         // `new` and the release also ships it.
         let (assignments, desired, source) = plan_assignments(
-            "t1",
+            &SlotSelection::normalize(&config, "t1", None).unwrap(),
             &PushRef::Deployment {
                 target: TargetName::new("t1".to_string()),
                 deployment_id: DeploymentId::new("deploy-snapshot-histvar".to_string()),
@@ -1089,7 +1300,7 @@ interval_seconds = 0
         );
 
         let err = plan_assignments(
-            "t1",
+            &SlotSelection::normalize(&config, "t1", None).unwrap(),
             &PushRef::Deployment {
                 target: TargetName::new("t1".to_string()),
                 deployment_id: DeploymentId::new("deploy-legacy-snapshot".to_string()),
@@ -1165,17 +1376,29 @@ interval_seconds = 0
         let config = Config::load(&cfg_path).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
-        // The release's OWN stored slot-variant snapshot: p1 -> `standard`.
+        // The release's OWN stored slot-variant snapshot: p1 -> `standard`
+        // (t1's slot) and p2 -> `standard` (t2's slot). A slot has exactly
+        // one owning target, so the snapshot declares each target's own slot.
         let mut rec = legacy_record("unused", "tree-direct");
         rec.slots = BTreeMap::from([(
             "standard".to_string(),
             CanonicalSlots {
-                slots: vec![CanonicalSlot {
-                    id: "p1".to_string(),
-                    server: "s1".to_string(),
-                    deploy_dir: "/srv/plan".to_string(),
-                    targets: vec!["t1".to_string(), "t2".to_string()],
-                }],
+                slots: vec![
+                    CanonicalSlot {
+                        id: "p1".to_string(),
+                        server: "s1".to_string(),
+                        deploy_dir: "/srv/plan".to_string(),
+                        target: "t1".to_string(),
+                        groups: Vec::new(),
+                    },
+                    CanonicalSlot {
+                        id: "p2".to_string(),
+                        server: "s2".to_string(),
+                        deploy_dir: "/srv/plan-2".to_string(),
+                        target: "t2".to_string(),
+                        groups: Vec::new(),
+                    },
+                ],
             },
         )]);
         let release = consistent(&mut rec);
@@ -1248,10 +1471,11 @@ interval_seconds = 0
             // source `t1` AND the no-history destination `t2` alike), the
             // variant per slot from the release's OWN stored snapshot and the
             // tree from its own bindings — never the caller's config, never
-            // any snapshot chain, regardless of the changed binding.
+            // any snapshot chain, regardless of the changed binding. Each
+            // target owns its own slot (t1 -> p1, t2 -> p2).
             for dest in ["t1", "t2"] {
                 let (assignments, desired, source) = plan_assignments(
-                    dest,
+                    &SlotSelection::normalize(&config, dest, None).unwrap(),
                     &release_ref,
                     &ReleaseId::new("unused-local".to_string()),
                     &BTreeMap::new(),
@@ -1261,7 +1485,8 @@ interval_seconds = 0
                 .unwrap_or_else(|e| panic!("release:<id> must plan on target {dest}: {e}"));
                 assert_eq!(assignments.len(), 1, "one slot per target");
                 let a = &assignments[0];
-                assert_eq!(a.placement_slot, PlacementSlotId::new("p1"));
+                let want_slot = if dest == "t1" { "p1" } else { "p2" };
+                assert_eq!(a.placement_slot, PlacementSlotId::new(want_slot));
                 assert_eq!(
                     a.artifact.variant.as_str(),
                     "standard",
@@ -1283,7 +1508,7 @@ interval_seconds = 0
             // config, so rollback refuses with the exact-rollback error — the
             // same refusal as before this feature.
             let err = plan_assignments(
-                "t1",
+                &SlotSelection::normalize(&config, "t1", None).unwrap(),
                 &PushRef::Deployment {
                     target: TargetName::new("t1".to_string()),
                     deployment_id: DeploymentId::new("deploy-source".to_string()),
@@ -1371,9 +1596,9 @@ interval_seconds = 0
         // plus the constant `iso` (t2-only) and `phys` (rebound when
         // `physical_drift`).
         let mut variant = String::new();
-        let add_slot = |variant: &mut String, id: &str, server: &str, targets: &str, dir: &str| {
+        let add_slot = |variant: &mut String, id: &str, server: &str, target: &str, dir: &str| {
             variant.push_str(&format!(
-                "[[slots]]\nid = \"{id}\"\nserver = \"{server}\"\ntargets = [{targets}]\ndeploy_dir = \"{dir}\"\n\n"
+                "[[slots]]\nid = \"{id}\"\nserver = \"{server}\"\ntarget = \"{target}\"\ndeploy_dir = \"{dir}\"\n\n"
             ));
         };
         for (i, inc) in current_inc.iter().enumerate() {
@@ -1383,17 +1608,17 @@ interval_seconds = 0
                     &mut variant,
                     id,
                     &format!("s{}", i + 1),
-                    "\"t1\", \"t2\"",
+                    "t1",
                     &format!("/srv/{id}"),
                 );
             }
         }
-        add_slot(&mut variant, "iso", "s4", "\"t2\"", "/srv/iso");
+        add_slot(&mut variant, "iso", "s4", "t2", "/srv/iso");
         add_slot(
             &mut variant,
             "phys",
             if physical_drift { "s6" } else { "s5" },
-            "\"t1\", \"t2\"",
+            "t1",
             "/srv/phys",
         );
         variant.push_str(
@@ -1411,7 +1636,7 @@ interval_seconds = 0
         std::fs::write(
             &cfg_path,
             format!(
-                "schema_version = 1\napplication = \"plan\"\nrelease = \"v1\"\n\n\
+                "schema_version = 2\napplication = \"plan\"\nrelease = \"v1\"\n\n\
                  {servers}\
                  [targets.t1]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n\n\
                  [targets.t2]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n"
@@ -1433,7 +1658,8 @@ interval_seconds = 0
                     id: id.to_string(),
                     server: format!("s{}", i + 1),
                     deploy_dir: format!("/srv/{id}"),
-                    targets: vec!["t1".to_string(), "t2".to_string()],
+                    target: "t1".to_string(),
+                    groups: Vec::new(),
                 });
             }
         }
@@ -1441,13 +1667,15 @@ interval_seconds = 0
             id: "phys".to_string(),
             server: "s5".to_string(),
             deploy_dir: "/srv/phys".to_string(),
-            targets: vec!["t1".to_string(), "t2".to_string()],
+            target: "t1".to_string(),
+            groups: Vec::new(),
         });
         canonical.push(CanonicalSlot {
             id: "iso".to_string(),
             server: "s4".to_string(),
             deploy_dir: "/srv/iso".to_string(),
-            targets: vec!["t2".to_string()],
+            target: "t2".to_string(),
+            groups: Vec::new(),
         });
         canonical.sort_by(|a, b| a.id.cmp(&b.id));
         rec.slots = BTreeMap::from([("standard".to_string(), CanonicalSlots { slots: canonical })]);
@@ -1505,7 +1733,7 @@ interval_seconds = 0
                 // t1's derived membership — t1 plans exactly its own set.
                 for dest in ["t1", "t2"] {
                     let (assignments, desired, source) = plan_assignments(
-                        dest,
+                        &SlotSelection::normalize(&config, dest, None).unwrap(),
                         &release_ref,
                         &ReleaseId::new("unused-local".to_string()),
                         &BTreeMap::new(),
@@ -1515,11 +1743,15 @@ interval_seconds = 0
                     .unwrap_or_else(|e| {
                         panic!("release:<id> must plan on target {dest} when the membership matches: {e}")
                     });
-                    let mut want: Vec<String> = expected.iter().cloned().collect();
-                    want.push("phys".to_string());
-                    if dest == "t2" {
-                        want.push("iso".to_string());
-                    }
+                    // The universe slots and `phys` are t1's; `iso` is
+                    // t2's (a slot has exactly one owning target).
+                    let mut want: Vec<String> = if dest == "t1" {
+                        let mut w: Vec<String> = expected.iter().cloned().collect();
+                        w.push("phys".to_string());
+                        w
+                    } else {
+                        vec!["iso".to_string()]
+                    };
                     want.sort();
                     let mut got: Vec<String> = assignments
                         .iter()
@@ -1568,27 +1800,41 @@ interval_seconds = 0
                 }
             } else {
                 // Membership drift (missing / extra / renamed slots): REFUSED
-                // at plan time, on every target, with the drift error naming
-                // the release, the expected vs current slot sets, and the
-                // before-remote-access clause.
-                for dest in ["t1", "t2"] {
-                    let err = plan_assignments(
-                        dest,
-                        &release_ref,
-                        &ReleaseId::new("unused-local".to_string()),
-                        &BTreeMap::new(),
-                        &store,
-                        &config,
-                    )
-                    .expect_err("membership drift must refuse direct release planning");
-                    let msg = err.to_string();
-                    assert!(
-                        msg.contains("release")
-                            && msg.contains("drift")
-                            && msg.contains("before remote access"),
-                        "refusal must be the membership-drift error, got: {msg}"
-                    );
-                }
+                // at plan time on the DRIFTED target (`t1` — the universe
+                // slots are t1's), with the drift error naming the release,
+                // the expected vs current slot sets, and the
+                // before-remote-access clause. `t2`'s membership is
+                // unchanged ({iso} in both the record and the config), so it
+                // still plans — a slot has exactly one owning target, so a
+                // drift on t1 never disturbs t2.
+                let err = plan_assignments(
+                    &SlotSelection::normalize(&config, "t1", None).unwrap(),
+                    &release_ref,
+                    &ReleaseId::new("unused-local".to_string()),
+                    &BTreeMap::new(),
+                    &store,
+                    &config,
+                )
+                .expect_err("membership drift must refuse direct release planning");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("release")
+                        && msg.contains("drift")
+                        && msg.contains("before remote access"),
+                    "refusal must be the membership-drift error, got: {msg}"
+                );
+                // t2's membership is unchanged: it plans its own slot.
+                let (assignments, _, _) = plan_assignments(
+                    &SlotSelection::normalize(&config, "t2", None).unwrap(),
+                    &release_ref,
+                    &ReleaseId::new("unused-local".to_string()),
+                    &BTreeMap::new(),
+                    &store,
+                    &config,
+                )
+                .expect("t2's membership is unchanged, so it still plans");
+                assert_eq!(assignments.len(), 1);
+                assert_eq!(assignments[0].placement_slot, PlacementSlotId::new("iso"));
             }
         }
     }
@@ -1658,7 +1904,7 @@ interval_seconds = 0
             );
 
             let (assignments, desired, source) = plan_assignments(
-                "t1",
+                &SlotSelection::normalize(&config, "t1", None).unwrap(),
                 &PushRef::Deployment {
                     target: TargetName::new("t1".to_string()),
                     deployment_id: deployment_id.clone(),
@@ -1689,7 +1935,7 @@ interval_seconds = 0
             // ids fail closed at the plan boundary too).
             let missing = DeploymentId::new("deploy-prop-missing".to_string());
             let err = plan_assignments(
-                "t1",
+                &SlotSelection::normalize(&config, "t1", None).unwrap(),
                 &PushRef::Deployment {
                     target: TargetName::new("t1".to_string()),
                     deployment_id: missing.clone(),

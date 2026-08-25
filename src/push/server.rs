@@ -492,7 +492,7 @@ mod tests {
 [[slots]]
 id = "p1"
 server = "s1"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/eng"
 
 [[artifact.mappings]]
@@ -525,7 +525,7 @@ interval_seconds = 0
 "#;
 
     const NONE_TOML: &str = r#"
-schema_version = 1
+schema_version = 2
 application = "eng"
 release = "v1"
 
@@ -543,7 +543,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 [[slots]]
 id = "p1"
 server = "s1"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/eng"
 
 [[artifact.mappings]]
@@ -588,7 +588,7 @@ interval_seconds = 0
 "#;
 
     const SYSTEMD_TOML: &str = r#"
-schema_version = 1
+schema_version = 2
 application = "eng"
 release = "v1"
 
@@ -632,7 +632,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                         id: "p1".to_string(),
                         server: "s1".to_string(),
                         deploy_dir: "/srv/eng".to_string(),
-                        targets: vec!["t1".to_string()],
+                        target: "t1".to_string(),
+                        groups: Vec::new(),
                     }],
                 },
             )]),

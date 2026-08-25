@@ -790,7 +790,8 @@ mod tests {
                     id: "p1".to_string(),
                     server: "s1".to_string(),
                     deploy_dir: std::path::PathBuf::from("/srv/deploy/p1"),
-                    targets: vec!["t1".to_string()],
+                    target: "t1".to_string(),
+                    groups: Vec::new(),
                 }],
             )]);
         let rec = crate::release::build_release(
@@ -919,11 +920,8 @@ mod tests {
                 v["slots"]["standard"]["slots"][0]["deploy_dir"] =
                     serde_json::json!("/srv/elsewhere");
             }),
-            ("slot targets membership", |v: &mut serde_json::Value| {
-                v["slots"]["standard"]["slots"][0]["targets"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(serde_json::json!("tampered-target"));
+            ("slot owning target", |v: &mut serde_json::Value| {
+                v["slots"]["standard"]["slots"][0]["target"] = serde_json::json!("tampered-target");
             }),
             ("variant->tree binding", |v: &mut serde_json::Value| {
                 v["variants"]["standard"] = serde_json::json!("tree-tampered");

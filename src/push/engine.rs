@@ -40,6 +40,10 @@ use std::path::Path;
 pub struct PushOptions {
     pub dry_run: bool,
     pub ref_token: Option<String>,
+    /// The optional rollout group (`deploy push <target> --group <name>`):
+    /// selects a subset of the target's slots. `None` selects every slot
+    /// owned by the target.
+    pub group: Option<String>,
 }
 
 #[derive(Debug)]
@@ -131,6 +135,16 @@ pub fn push(
         .ok_or_else(|| Error::not_found(format!("target '{target_name}'")))?;
     let project_root = config.project_root(config_path);
 
+    // 0. NORMALIZE THE SELECTION once near command entry: the owning target,
+    // the optional rollout group, and the EXACT selected slot IDs from the
+    // caller's current configuration (the selection source, including for
+    // historical references). Planning, execution, reporting, and persistence
+    // consume this normalized selection instead of independently filtering
+    // slots. An unknown group, or a group selecting zero slots, is a
+    // configuration error and fails here, before any lock or remote access.
+    let selection =
+        crate::push::plan::SlotSelection::normalize(config, target_name, opts.group.as_deref())?;
+
     // 1. Validate configuration (already validated at load) and PARSE the
     // push ref — syntax only, NO store access. The relative forms (`@-`,
     // `parent(@, N)`, `<refid>--`, ...) are held as a structured [`RefExpr`]
@@ -182,16 +196,11 @@ pub fn push(
         let rec = store
             .read_release(release)
             .map_err(|_| Error::rollback(format!("release {release} not available locally")))?;
-        let members = config.target_slots(target_name)?;
-        let slot_ids: Vec<PlacementSlotId> = members
-            .iter()
-            .map(|(slot, _)| PlacementSlotId::new(slot.id.clone()))
-            .collect();
         crate::push::plan::validate_direct_release_membership(
             target_name,
             release,
             &rec,
-            &slot_ids,
+            &selection.slot_ids,
         )?;
     }
 
@@ -224,6 +233,7 @@ pub fn push(
         store,
         factory,
         target_name,
+        &selection,
         &ref_expr,
         resolved,
         &deployment_id,
@@ -262,11 +272,14 @@ pub(crate) fn push_with_id(
         .get(target_name)
         .ok_or_else(|| Error::not_found(format!("target '{target_name}'")))?;
     let project_root = config.project_root(config_path);
+    let selection =
+        crate::push::plan::SlotSelection::normalize(config, target_name, opts.group.as_deref())?;
     push_inner(
         &project_root,
         store,
         factory,
         target_name,
+        &selection,
         &RefExpr::Head,
         // Real push (the fault-matrix entry points always push for real):
         // resolution stays inside `push_inner`, post-reconciliation.
@@ -307,11 +320,14 @@ pub(crate) fn push_ref_with_id(
         Some(t) => history::parse_ref_expr(t)?,
         None => RefExpr::Head,
     };
+    let selection =
+        crate::push::plan::SlotSelection::normalize(config, target_name, opts.group.as_deref())?;
     push_inner(
         &project_root,
         store,
         factory,
         target_name,
+        &selection,
         &ref_expr,
         // Real push (the state-machine fixture never dry-runs): resolution
         // stays inside `push_inner` after reconciliation.
@@ -338,6 +354,7 @@ fn push_inner(
     store: &LocalStore,
     factory: &RemoteFactory,
     target_name: &str,
+    selection: &crate::push::plan::SlotSelection,
     ref_expr: &RefExpr,
     // The PRE-RESOLVED ref: `Some` for a dry run (resolved by [`push`]
     // BEFORE any lock or remote factory invocation, against the pre-reconcile
@@ -442,17 +459,23 @@ fn push_inner(
     // run BEFORE reconciliation (which needs live helpers to verify
     // generations and write markers) and before resolution (which must see
     // the post-reconciliation chain).
-    let members = config.target_slots(target_name)?;
+    //
+    // The helpers/statuses cover ALL of the target's member slots (a pending
+    // attempt may involve any of them, and deferred-rotation debt for any of
+    // them is serviced from here); the SELECTED slots (the normalized
+    // selection) are the ones this push plans, mutates, and refreshes.
+    let all_members = config.target_slots(target_name)?;
+    let members = selection.members(config)?;
     let mut remotes: HashMap<PlacementSlotId, Box<dyn Remote>> = HashMap::new();
     let mut helpers: HashMap<PlacementSlotId, RemoteHelper> = HashMap::new();
     let mut statuses: HashMap<PlacementSlotId, crate::remote::helper::RemoteStatus> =
         HashMap::new();
-    for (slot, s) in &members {
+    for (slot, s) in &all_members {
         let slot_id = PlacementSlotId::new(slot.id.clone());
         let remote = factory(s, slot)?;
         remotes.insert(slot_id, remote);
     }
-    for (slot, _s) in &members {
+    for (slot, _s) in &all_members {
         let slot_id = PlacementSlotId::new(slot.id.clone());
         let r = remotes.get(&slot_id).unwrap();
         let helper = RemoteHelper::new(r.as_ref());
@@ -568,14 +591,24 @@ fn push_inner(
     let desired_behavior_sha = crate::release::variant_behaviors_digest(&desired_behaviors);
 
     // 5 & 7. Build the plan from the RESOLVED ref (post-reconciliation).
+    // The plan covers exactly the SELECTED slots (the normalized selection).
     let (assignments, desired_release, source) = crate::push::plan::plan_assignments(
-        target_name,
+        selection,
         &pref,
         &local_release_id,
         &variant_trees,
         store,
         config,
     )?;
+
+    // PARTIAL-ROLLOUT GUARDS (before any remote mutation): a group push
+    // derives its complete snapshot by overlaying the selected slots onto the
+    // latest successful target snapshot, so the base must be able to carry
+    // every unselected slot forward — on a target's first deployment the
+    // group must cover every target slot, and after membership changes every
+    // current unselected slot must have a prior assignment with a matching
+    // physical binding. A full-target push (no group) is always allowed.
+    crate::push::plan::validate_partial_rollout(selection, config, store)?;
 
     // Behavior coverage gate: every planned assignment's variant must have a
     // frozen behavior contract BEFORE any remote state is touched (handshake,
@@ -924,6 +957,7 @@ fn push_inner(
         deployment_schema_version: SCHEMA_VERSION,
         deployment_id: deployment_id.clone(),
         target: TargetName::new(target_name.to_string()),
+        group: selection.group.clone(),
         slot_ids,
         behavior_sha256: desired_behavior_sha.clone(),
         attempted_at: crate::remote::helper::now_rfc3339(),
@@ -1356,6 +1390,13 @@ fn push_inner(
         // the CURRENT configuration: it is the live placement this attempt
         // actually used.
         let slot_bindings = config.target_slot_bindings(target_name)?;
+        // The CURRENT target slot set: the complete snapshot omits slots
+        // removed from the current configuration and carries every current
+        // unselected slot forward from the base.
+        let current_slot_ids: Vec<PlacementSlotId> = all_members
+            .iter()
+            .map(|(slot, _)| PlacementSlotId::new(slot.id.clone()))
+            .collect();
         history::finalize_successful_attempt(
             store,
             &attempt_intent,
@@ -1363,6 +1404,7 @@ fn push_inner(
             &actual_servers,
             "push completed",
             &slot_bindings,
+            &current_slot_ids,
         )?;
         // The new successful deployment is keyed by its deployment id (the
         // public grammar is deployment-keyed — successful positions are
@@ -2019,7 +2061,7 @@ mod tests {
 [[slots]]
 id = "p1"
 server = "s1"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/eng"
 
 [[artifact.mappings]]
@@ -2052,7 +2094,7 @@ interval_seconds = 0
 "#;
 
     const NONE_TOML: &str = r#"
-schema_version = 1
+schema_version = 2
 application = "eng"
 release = "v1"
 
@@ -2125,6 +2167,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &PushOptions {
                 dry_run: true,
                 ref_token: None,
+                group: None,
             },
         )
         .unwrap();
@@ -2200,6 +2243,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
         .unwrap();
@@ -2262,6 +2306,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &PushOptions {
                 dry_run: false,
                 ref_token: Some(baseline_dep.as_str().to_string()),
+                group: None,
             },
         )
         .unwrap();
@@ -2461,6 +2506,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     deployment_schema_version: SCHEMA_VERSION,
                     deployment_id: DeploymentId::new(deployment_id.to_string()),
                     target: TargetName::new(target.to_string()),
+                    group: None,
                     slot_ids: slots.keys().cloned().collect(),
                     behavior_sha256: behavior_sha256.to_string(),
                     attempted_at: "2026-01-01T00:00:00Z".to_string(),
@@ -2509,6 +2555,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
         .unwrap();
@@ -2630,6 +2677,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
     }
@@ -2878,6 +2926,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.store,
             &factory,
             "t1",
+            &crate::push::plan::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
             &RefExpr::Head,
             None,
             deployment_id,
@@ -2887,6 +2936,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
     }
@@ -2996,6 +3046,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
         .unwrap();
@@ -3300,6 +3351,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             deployment_schema_version: SCHEMA_VERSION,
             deployment_id: id_a.clone(),
             target: TargetName::new("t1".to_string()),
+            group: None,
             slot_ids: vec![PlacementSlotId::new("p1".to_string())],
             behavior_sha256: baseline.behavior_sha256.clone(),
             attempted_at: crate::remote::helper::now_rfc3339(),
@@ -3448,6 +3500,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.store,
             &fault_factory,
             "t1",
+            &crate::push::plan::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
             &RefExpr::Head,
             None,
             &id,
@@ -3457,6 +3510,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
         .unwrap();
@@ -3563,7 +3617,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 [[slots]]
 id = "p1"
 server = "s1"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/eng"
 
 [[artifact.mappings]]
@@ -3622,6 +3676,7 @@ interval_seconds = 0
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
         .unwrap();
@@ -3668,6 +3723,7 @@ interval_seconds = 0
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
         .unwrap();
@@ -3762,6 +3818,7 @@ interval_seconds = 0
             deployment_schema_version: SCHEMA_VERSION,
             deployment_id: id_a.clone(),
             target: TargetName::new("t1".to_string()),
+            group: None,
             slot_ids: vec![PlacementSlotId::new("p1".to_string())],
             behavior_sha256: baseline.behavior_sha256.clone(),
             attempted_at: crate::remote::helper::now_rfc3339(),
@@ -3823,6 +3880,7 @@ interval_seconds = 0
             deployment_schema_version: SCHEMA_VERSION,
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new("t1".to_string()),
+            group: None,
             slot_ids: vec![PlacementSlotId::new("p1".to_string())],
             behavior_sha256: baseline.behavior_sha256.clone(),
             attempted_at: crate::remote::helper::now_rfc3339(),
@@ -3954,6 +4012,7 @@ interval_seconds = 0
             &h.store,
             &factory,
             "t1",
+            &crate::push::plan::SlotSelection::normalize(&config2, "t1", None).unwrap(),
             &RefExpr::Head,
             None,
             &id2,
@@ -3963,6 +4022,7 @@ interval_seconds = 0
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
         .unwrap();
@@ -4085,7 +4145,7 @@ interval_seconds = 0
     #[test]
     fn batched_stop_on_failure_stops_after_failing_batch() {
         const BATCHED_TOML: &str = r#"
-schema_version = 1
+schema_version = 2
 application = "batched"
 release = "v1"
 
@@ -4130,13 +4190,13 @@ rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "rollback_c
 [[slots]]
 id = "p1"
 server = "s1"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/p1"
 
 [[slots]]
 id = "p2"
 server = "s2"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/p2"
 
 [[artifact.mappings]]
@@ -4166,13 +4226,13 @@ interval_seconds = 0
 [[slots]]
 id = "p3"
 server = "s3"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/p3"
 
 [[slots]]
 id = "p4"
 server = "s4"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/p4"
 
 [[artifact.mappings]]
@@ -4226,6 +4286,7 @@ interval_seconds = 0
             &store,
             &factory,
             "t1",
+            &crate::push::plan::SlotSelection::normalize(&config, "t1", None).unwrap(),
             &RefExpr::Head,
             None,
             &id,
@@ -4235,6 +4296,7 @@ interval_seconds = 0
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
         .unwrap();
@@ -4391,6 +4453,7 @@ interval_seconds = 0
             &PushOptions {
                 dry_run: false,
                 ref_token: Some("deploy-membership-baseline".to_string()),
+                group: None,
             },
         )
         .expect_err("membership change must refuse exact rollback");
@@ -4462,6 +4525,7 @@ interval_seconds = 0
             &PushOptions {
                 dry_run: true,
                 ref_token: Some("deploy-hist-dry-s0".to_string()),
+                group: None,
             },
         )
         .unwrap();
@@ -4535,6 +4599,7 @@ interval_seconds = 0
             &PushOptions {
                 dry_run: true,
                 ref_token: Some(id1.as_str().to_string()),
+                group: None,
             },
         )
         .unwrap();
@@ -4585,7 +4650,7 @@ interval_seconds = 0
 [[slots]]
 id = "p1"
 server = "s1"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/sysd"
 
 [[artifact.mappings]]
@@ -4745,6 +4810,7 @@ interval_seconds = 0
                 &self.store,
                 &factory,
                 "t1",
+                &crate::push::plan::SlotSelection::normalize(&self.config, "t1", None).unwrap(),
                 &RefExpr::Head,
                 None,
                 deployment_id,
@@ -4754,6 +4820,7 @@ interval_seconds = 0
                 &PushOptions {
                     dry_run: false,
                     ref_token: None,
+                    group: None,
                 },
             )
         }
@@ -5210,6 +5277,7 @@ interval_seconds = 0
             &h.store,
             &factory,
             "t1",
+            &crate::push::plan::SlotSelection::normalize(&config, "t1", None).unwrap(),
             &RefExpr::Head,
             None,
             &id,
@@ -5219,6 +5287,7 @@ interval_seconds = 0
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
         .expect_err("capacity preflight must fail the push");
@@ -5303,6 +5372,7 @@ interval_seconds = 0
             &h.store,
             &factory,
             "t1",
+            &crate::push::plan::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
             &RefExpr::Head,
             None,
             &id,
@@ -5312,6 +5382,7 @@ interval_seconds = 0
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
         .expect_err("staging failure must fail the push");
@@ -5389,13 +5460,13 @@ interval_seconds = 0
 [[slots]]
 id = "p1"
 server = "s1"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/p1"
 
 [[slots]]
 id = "p2"
 server = "s2"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/p2"
 
 [[artifact.mappings]]
@@ -5424,7 +5495,7 @@ interval_seconds = 0
             std::fs::write(&fp, c).unwrap();
         }
         let two_slot_toml = r#"
-schema_version = 1
+schema_version = 2
 application = "two-slot"
 release = "v1"
 
@@ -5474,6 +5545,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &store,
             &factory,
             "t1",
+            &crate::push::plan::SlotSelection::normalize(&config, "t1", None).unwrap(),
             &RefExpr::Head,
             None,
             &id,
@@ -5483,6 +5555,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
         .expect_err("the later staging failure must fail the push");
@@ -5578,7 +5651,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                         id: "p1".to_string(),
                         server: "s1".to_string(),
                         deploy_dir: "/srv/eng".to_string(),
-                        targets: vec!["t1".to_string()],
+                        target: "t1".to_string(),
+                        groups: Vec::new(),
                     }],
                 },
             )]),
@@ -5632,6 +5706,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.store,
             &factory,
             "t1",
+            &crate::push::plan::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
             &history::parse_ref_expr("deploy-hist-behavior-fixture").unwrap(),
             None,
             &id,
@@ -5641,6 +5716,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
         .expect_err("a release without its behavior snapshot must fail preflight");
@@ -5685,6 +5761,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.store,
             &factory,
             "t1",
+            &crate::push::plan::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
             &history::parse_ref_expr("deploy-hist-behavior-fixture").unwrap(),
             None,
             &id,
@@ -5694,6 +5771,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
         .expect_err("a corrupt behavior snapshot must also fail preflight");
@@ -5785,6 +5863,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.store,
             &fault_factory,
             "t1",
+            &crate::push::plan::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
             &RefExpr::Head,
             None,
             &id2,
@@ -5794,6 +5873,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
         .unwrap();
@@ -5888,7 +5968,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn leave_changed_policy_retains_advances_and_reports_degraded() {
         const LEAVE_TOML: &str = r#"
-schema_version = 1
+schema_version = 2
 application = "leave"
 release = "v1"
 
@@ -5932,13 +6012,13 @@ rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "leave_chan
 [[slots]]
 id = "p1"
 server = "s1"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/p1"
 
 [[slots]]
 id = "p2"
 server = "s2"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/p2"
 
 [[artifact.mappings]]
@@ -5968,13 +6048,13 @@ interval_seconds = 0
 [[slots]]
 id = "p3"
 server = "s3"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/p3"
 
 [[slots]]
 id = "p4"
 server = "s4"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/p4"
 
 [[artifact.mappings]]
@@ -6028,6 +6108,7 @@ interval_seconds = 0
             &store,
             &factory,
             "t1",
+            &crate::push::plan::SlotSelection::normalize(&config, "t1", None).unwrap(),
             &RefExpr::Head,
             None,
             &id,
@@ -6037,6 +6118,7 @@ interval_seconds = 0
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
         .unwrap();
@@ -6136,6 +6218,7 @@ interval_seconds = 0
             &PushOptions {
                 dry_run: true,
                 ref_token: Some(id1.as_str().to_string()),
+                group: None,
             },
         )
         .unwrap();
@@ -6171,7 +6254,7 @@ interval_seconds = 0
 [[slots]]
 id = "p1"
 server = "s1"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/eng"
 
 [[artifact.mappings]]
@@ -6219,7 +6302,7 @@ interval_seconds = 0
 [[slots]]
 id = "p1"
 server = "s1"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv/eng"
 
 [[artifact.mappings]]
@@ -6311,6 +6394,7 @@ interval_seconds = 0
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
         .unwrap();
@@ -6356,6 +6440,7 @@ interval_seconds = 0
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
         .unwrap();
@@ -6431,6 +6516,7 @@ interval_seconds = 0
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )
         .unwrap();
@@ -6500,6 +6586,7 @@ interval_seconds = 0
             &PushOptions {
                 dry_run: true,
                 ref_token: None,
+                group: None,
             },
         )
         .unwrap();
@@ -6557,6 +6644,7 @@ interval_seconds = 0
                 &PushOptions {
                     dry_run: false,
                     ref_token: None,
+                group: None,
                 },
             )
             .unwrap();
@@ -6690,6 +6778,7 @@ interval_seconds = 0
                 &PushOptions {
                     dry_run: false,
                     ref_token: Some(token.clone()),
+                group: None,
                 },
                 &ref_id,
             )
@@ -6834,6 +6923,7 @@ interval_seconds = 0
                 &PushOptions {
                     dry_run: true,
                     ref_token: Some(token.clone()),
+                group: None,
                 },
             )
             .expect_err("a dry run with an invalid ref must fail with a ref error");
@@ -6894,9 +6984,9 @@ interval_seconds = 0
         // `physical_drift`). The mappings + activation/verification mirror the
         // harness `NONE_VARIANT` so a real push completes.
         let mut variant = String::new();
-        let add_slot = |variant: &mut String, id: &str, server: &str, targets: &str, dir: &str| {
+        let add_slot = |variant: &mut String, id: &str, server: &str, target: &str, dir: &str| {
             variant.push_str(&format!(
-                "[[slots]]\nid = \"{id}\"\nserver = \"{server}\"\ntargets = [{targets}]\ndeploy_dir = \"{dir}\"\n\n"
+                "[[slots]]\nid = \"{id}\"\nserver = \"{server}\"\ntarget = \"{target}\"\ndeploy_dir = \"{dir}\"\n\n"
             ));
         };
         for (i, inc) in current_inc.iter().enumerate() {
@@ -6906,17 +6996,17 @@ interval_seconds = 0
                     &mut variant,
                     id,
                     &format!("s{}", i + 1),
-                    "\"t1\", \"t2\"",
+                    "t1",
                     &format!("/srv/{id}"),
                 );
             }
         }
-        add_slot(&mut variant, "iso", "s4", "\"t2\"", "/srv/iso");
+        add_slot(&mut variant, "iso", "s4", "t2", "/srv/iso");
         add_slot(
             &mut variant,
             "phys",
             if physical_drift { "s6" } else { "s5" },
-            "\"t1\", \"t2\"",
+            "t1",
             "/srv/phys",
         );
         variant.push_str(
@@ -6939,7 +7029,7 @@ interval_seconds = 0
         std::fs::write(
             &cfg_path,
             format!(
-                "schema_version = 1\napplication = \"eng\"\nrelease = \"v1\"\n\n\
+                "schema_version = 2\napplication = \"eng\"\nrelease = \"v1\"\n\n\
                  {servers}\
                  [targets.t1]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n\n\
                  [targets.t2]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n"
@@ -6994,7 +7084,8 @@ interval_seconds = 0
                     id: id.to_string(),
                     server: format!("s{}", i + 1),
                     deploy_dir: format!("/srv/{id}"),
-                    targets: vec!["t1".to_string(), "t2".to_string()],
+                    target: "t1".to_string(),
+                    groups: Vec::new(),
                 });
             }
         }
@@ -7002,13 +7093,15 @@ interval_seconds = 0
             id: "phys".to_string(),
             server: "s5".to_string(),
             deploy_dir: "/srv/phys".to_string(),
-            targets: vec!["t1".to_string(), "t2".to_string()],
+            target: "t1".to_string(),
+            groups: Vec::new(),
         });
         canonical.push(CanonicalSlot {
             id: "iso".to_string(),
             server: "s4".to_string(),
             deploy_dir: "/srv/iso".to_string(),
-            targets: vec!["t2".to_string()],
+            target: "t2".to_string(),
+            groups: Vec::new(),
         });
         canonical.sort_by(|a, b| a.id.cmp(&b.id));
 
@@ -7124,6 +7217,7 @@ interval_seconds = 0
                         &PushOptions {
                             dry_run: dry,
                             ref_token: Some(token.clone()),
+                        group: None,
                         },
                     )
                     .expect_err(&format!(
@@ -7162,6 +7256,7 @@ interval_seconds = 0
                     &PushOptions {
                         dry_run: true,
                         ref_token: Some(token.clone()),
+                    group: None,
                     },
                 )
                 .unwrap_or_else(|e| panic!("a matching membership must dry-run-plan: {e}"));
@@ -7188,6 +7283,7 @@ interval_seconds = 0
                     &PushOptions {
                         dry_run: false,
                         ref_token: Some(token.clone()),
+                    group: None,
                     },
                 )
                 .unwrap_or_else(|e| panic!("a matching membership must deploy for real: {e}"));

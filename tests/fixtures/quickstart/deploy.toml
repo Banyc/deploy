@@ -1,4 +1,4 @@
-schema_version = 1
+schema_version = 2
 application = "example"
 
 # The active release. The project structure is forced: the release directory
@@ -7,10 +7,10 @@ application = "example"
 release = "v1"
 
 # Servers are declared once; slots are declared inside the variant files and
-# bind themselves to targets with their `targets` lists (a target's members
-# are derived from the slots). Capacity is a per-server policy (shared by
-# every deployment slot on the server), resolved from the caller's current
-# configuration — never part of the release identity.
+# bind themselves to their ONE owning target with their `target` field (a
+# target's members are derived from the slots). Capacity is a per-server
+# policy (shared by every deployment slot on the server), resolved from the
+# caller's current configuration — never part of the release identity.
 #
 # An SSH address requires EXACTLY ONE host-identity source (trust-on-first-use
 # is disabled): a dedicated `known_hosts` file, or a pre-verified
@@ -32,8 +32,9 @@ host_key_fingerprint = "SHA256:quickstart-placeholder"
 capacity = { reserve_bytes = 1073741824, reserve_percent = 0 }  # keep at least 1 GiB free
 
 # Targets declare ROLLOUT policy only: their member slots are derived from
-# the slots' `targets` lists, and retention (rotation) belongs to the SLOT —
+# the slots' `target` fields, and retention (rotation) belongs to the SLOT —
 # declared in the variant file that owns the slot (see
-# releases/v1/standard.toml), so a slot shared across targets has ONE policy.
+# releases/v1/standard.toml). A slot has EXACTLY ONE owning target; `groups`
+# add rollout-group membership for `deploy push production --group <name>`.
 [targets.production]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }

@@ -202,6 +202,13 @@ pub(crate) fn reconcile_pending_commits(
         //    remaining steps; once the terminal exists, every earlier step is
         //    already durable.
         let (outcomes, actuals) = history::recovery_outcomes(&attempt);
+        // The CURRENT target slot set: the complete snapshot omits slots
+        // removed from the current configuration and carries every current
+        // unselected slot forward from the base.
+        let current_slot_ids: Vec<PlacementSlotId> = members
+            .iter()
+            .map(|m| PlacementSlotId::new(m.clone()))
+            .collect();
         history::finalize_successful_attempt(
             store,
             &attempt,
@@ -209,6 +216,7 @@ pub(crate) fn reconcile_pending_commits(
             &actuals,
             "recovery finalized",
             &slot_bindings,
+            &current_slot_ids,
         )?;
     }
     Ok(())

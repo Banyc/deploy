@@ -242,7 +242,7 @@ mappings = []
 [[slots]]
 id = "p1"
 server = "s1"
-targets = ["t1"]
+target = "t1"
 deploy_dir = "/srv"
 
 [rotation.per_server]
@@ -265,7 +265,7 @@ interval_seconds = 0
 "#;
         std::fs::write(release_dir.join("standard.toml"), variant_toml).unwrap();
         let deploy_toml = r#"
-schema_version = 1
+schema_version = 2
 application = "cap"
 release = "v1"
 

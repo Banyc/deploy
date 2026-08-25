@@ -286,7 +286,7 @@ interval_seconds = 0
 fn single_target_toml(address: &str) -> String {
     format!(
         r#"
-schema_version = 1
+schema_version = 2
 application = "example"
 release = "v1"
 
@@ -313,7 +313,7 @@ fn setup_project(proj: &Path, address: &str, deploy_dir: &str) -> (Config, PathB
     write_file(&proj.join("deploy.toml"), &single_target_toml(address));
     let release_dir = proj.join("releases").join("v1");
     let slot_toml = format!(
-        "\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntargets = [\"production\"]\ndeploy_dir = \"{deploy_dir}\"\n"
+        "\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntarget = \"production\"\ndeploy_dir = \"{deploy_dir}\"\n"
     );
     write_file(
         &release_dir.join("standard.toml"),
@@ -405,6 +405,7 @@ fn fingerprint_only_dry_run_leaves_remote_untouched() -> Result<()> {
                 &PushOptions {
                     dry_run: true,
                     ref_token: None,
+                    group: None,
                 },
             )?;
             assert!(r.dry_run, "report must be a dry run");
@@ -466,6 +467,7 @@ fn fingerprint_only_first_push_succeeds() -> Result<()> {
                 &PushOptions {
                     dry_run: false,
                     ref_token: None,
+                    group: None,
                 },
             )?;
             assert_eq!(
@@ -548,6 +550,7 @@ fn fingerprint_only_repeat_push_is_idempotent() -> Result<()> {
                 &PushOptions {
                     dry_run: false,
                     ref_token: None,
+                    group: None,
                 },
             )?;
             assert_eq!(
@@ -566,6 +569,7 @@ fn fingerprint_only_repeat_push_is_idempotent() -> Result<()> {
                 &PushOptions {
                     dry_run: false,
                     ref_token: None,
+                    group: None,
                 },
             )?;
             assert!(r2.status.is_none(), "re-push with no change is a no-op");

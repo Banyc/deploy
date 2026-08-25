@@ -139,6 +139,13 @@ pub struct LedgerIntent {
     pub deployment_schema_version: u32,
     pub deployment_id: DeploymentId,
     pub target: TargetName,
+    /// The optional rollout group this attempt selected (`deploy push
+    /// <target> --group <name>`). `None` means the attempt selected every
+    /// slot owned by the target. The group name is DESCRIPTIVE (later
+    /// releases may change group membership); the exact selected slot IDs in
+    /// `slot_ids` are the authoritative historical evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     /// The placement slots participating in this deployment, in deployment
     /// order (the same set the commit marker `slots` payload records).
     pub slot_ids: Vec<PlacementSlotId>,

@@ -76,7 +76,7 @@ interval_seconds = 0
 "#;
 
 const CONFIG: &str = r#"
-schema_version = 1
+schema_version = 2
 application = "example"
 release = "v1"
 
@@ -109,13 +109,13 @@ const STANDARD_SLOTS: &str = r#"
 [[slots]]
 id = "p1"
 server = "server-01"
-targets = ["production"]
+target = "production"
 deploy_dir = "/srv/deploy/example"
 
 [[slots]]
 id = "p2"
 server = "server-02"
-targets = ["production"]
+target = "production"
 deploy_dir = "/srv/deploy/example"
 "#;
 
@@ -125,7 +125,7 @@ const HC_SLOTS: &str = r#"
 [[slots]]
 id = "p3"
 server = "server-03"
-targets = ["production"]
+target = "production"
 deploy_dir = "/srv/deploy/example"
 "#;
 
@@ -137,7 +137,7 @@ const SLOT_MOVED_BODY: &str = r#"
 [[slots]]
 id = "p1"
 server = "server-01"
-targets = ["production"]
+target = "production"
 deploy_dir = "/srv/deploy/example"
 "#;
 
@@ -219,6 +219,7 @@ fn end_to_end_push_rollback() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(
@@ -247,6 +248,7 @@ fn end_to_end_push_rollback() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert!(r_up.status.is_none(), "re-push with no change is a no-op");
@@ -271,6 +273,7 @@ fn end_to_end_push_rollback() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
@@ -296,6 +299,7 @@ fn end_to_end_push_rollback() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: Some("@-".to_string()),
+            group: None,
         },
     )?;
     assert_eq!(
@@ -363,6 +367,7 @@ fn snapshot_records_each_slots_physical_binding() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
@@ -416,7 +421,7 @@ fn rollback_refuses_rebound_slot() -> Result<()> {
     // Two physical servers; the slot starts bound to server-01. `local://`
     // addresses need no host identity.
     let config_toml = r#"
-schema_version = 1
+schema_version = 2
 application = "rebind"
 release = "v1"
 
@@ -439,7 +444,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &proj,
         "standard",
         &format!(
-            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntargets = [\"production\"]\ndeploy_dir = \"/srv/deploy/rebind\"\n"
+            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntarget = \"production\"\ndeploy_dir = \"/srv/deploy/rebind\"\n"
         ),
     );
     let artifacts = proj.join("releases").join("v1").join("artifacts");
@@ -469,6 +474,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
@@ -497,7 +503,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // deploy_dir, different physical server. The config stays valid (exactly
     // one slot, one server per target).
     let rebound_variant = format!(
-        "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-02\"\ntargets = [\"production\"]\ndeploy_dir = \"/srv/deploy/rebind\"\n"
+        "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-02\"\ntarget = \"production\"\ndeploy_dir = \"/srv/deploy/rebind\"\n"
     );
     write_variant_file(&proj, "standard", &rebound_variant);
     let config2 = Config::load(&config_path)?;
@@ -515,6 +521,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: Some(dep0.clone()),
+            group: None,
         },
     )
     .expect_err("rebound slot must refuse exact rollback");
@@ -557,6 +564,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(
@@ -589,7 +597,7 @@ fn rollback_refuses_moved_deploy_dir() -> Result<()> {
 
     // One physical server; the slot starts bound to it at deploy_dir A.
     let config_toml = r#"
-schema_version = 1
+schema_version = 2
 application = "movedir"
 release = "v1"
 
@@ -607,7 +615,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &proj,
         "standard",
         &format!(
-            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntargets = [\"production\"]\ndeploy_dir = \"/srv/move/movedir-a\"\n"
+            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntarget = \"production\"\ndeploy_dir = \"/srv/move/movedir-a\"\n"
         ),
     );
     let artifacts = proj.join("releases").join("v1").join("artifacts");
@@ -637,6 +645,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
@@ -661,7 +670,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // physical server, different on-server location. The config stays valid
     // (exactly one slot, one server per target).
     let moved_variant = format!(
-        "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntargets = [\"production\"]\ndeploy_dir = \"/srv/move/movedir-b\"\n"
+        "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntarget = \"production\"\ndeploy_dir = \"/srv/move/movedir-b\"\n"
     );
     write_variant_file(&proj, "standard", &moved_variant);
     let config2 = Config::load(&config_path)?;
@@ -696,6 +705,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: Some(dep0.clone()),
+            group: None,
         },
     )
     .expect_err("moved deploy_dir must refuse exact rollback");
@@ -744,6 +754,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(
@@ -783,7 +794,7 @@ fn snapshot_rollback_after_variant_rename_succeeds() -> Result<()> {
 
     fn config_toml() -> String {
         r#"
-schema_version = 1
+schema_version = 2
 application = "example"
 release = "v1"
 
@@ -807,7 +818,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &proj,
         "old",
         &format!(
-            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntargets = [\"production\"]\ndeploy_dir = \"/srv/deploy/example\"\n"
+            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntarget = \"production\"\ndeploy_dir = \"/srv/deploy/example\"\n"
         ),
     );
     let artifacts = proj.join("releases").join("v1").join("artifacts");
@@ -833,6 +844,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
@@ -850,7 +862,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &proj,
         "new",
         &format!(
-            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntargets = [\"production\"]\ndeploy_dir = \"/srv/deploy/example\"\n"
+            "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntarget = \"production\"\ndeploy_dir = \"/srv/deploy/example\"\n"
         ),
     );
     write_file(&artifacts.join("deployment/variants/new/extra"), "new\n");
@@ -871,6 +883,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
@@ -894,6 +907,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: Some("@-".to_string()),
+            group: None,
         },
     )?;
     assert_eq!(
@@ -946,6 +960,7 @@ fn dry_run_reports_plan() -> Result<()> {
         &PushOptions {
             dry_run: true,
             ref_token: None,
+            group: None,
         },
     )?;
     assert!(r.dry_run);
@@ -1557,7 +1572,7 @@ fn single_variant_body(verify_argv: &str) -> String {
 [[slots]]
 id = "p1"
 server = "server-01"
-targets = ["production"]
+target = "production"
 deploy_dir = "/srv/deploy/example"
 
 [[artifact.mappings]]
@@ -1598,7 +1613,7 @@ interval_seconds = 0
 fn single_target_toml(stop_on_failure: bool, batch_size: u32) -> String {
     format!(
         r#"
-schema_version = 1
+schema_version = 2
 application = "example"
 release = "v1"
 
@@ -1645,7 +1660,7 @@ fn cli_reaches_configured_endpoint() -> Result<()> {
     // application store's `remotes/` directory. Rotation is a top-level setting
     // of `deploy.toml`.
     let config_toml = r#"
-schema_version = 1
+schema_version = 2
 application = "example"
 release = "v1"
 
@@ -1661,7 +1676,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 [[slots]]
 id = "p1"
 server = "server-01"
-targets = ["production"]
+target = "production"
 deploy_dir = "/srv/deploy/example"
 
 [[artifact.mappings]]
@@ -1719,6 +1734,7 @@ interval_seconds = 0
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r.status, Some(DeploymentStatus::Successful));
@@ -1767,6 +1783,7 @@ fn dry_run_does_not_mutate() -> Result<()> {
         &PushOptions {
             dry_run: true,
             ref_token: None,
+            group: None,
         },
     )?;
     assert!(r.dry_run);
@@ -1844,6 +1861,7 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
@@ -1861,6 +1879,7 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: Some(dep0),
+            group: None,
         },
     )?;
     assert_eq!(rrb.status, Some(DeploymentStatus::Successful));
@@ -1956,6 +1975,7 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
@@ -1999,6 +2019,7 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: Some(dep0),
+            group: None,
         },
     );
     assert!(
@@ -2079,6 +2100,7 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
@@ -2126,6 +2148,7 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
         &PushOptions {
             dry_run: false,
             ref_token: Some(dep0),
+            group: None,
         },
     );
     let err = match rrb {
@@ -2172,7 +2195,7 @@ fn stop_on_failure_records_all_servers() -> Result<()> {
 
     // Three servers; verification always fails so the first server fails.
     let deploy_toml = r#"
-schema_version = 1
+schema_version = 2
 application = "example"
 release = "v1"
 
@@ -2201,19 +2224,19 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 [[slots]]
 id = "p1"
 server = "server-01"
-targets = ["production"]
+target = "production"
 deploy_dir = "/srv/deploy/example"
 
 [[slots]]
 id = "p2"
 server = "server-02"
-targets = ["production"]
+target = "production"
 deploy_dir = "/srv/deploy/example"
 
 [[slots]]
 id = "p3"
 server = "server-03"
-targets = ["production"]
+target = "production"
 deploy_dir = "/srv/deploy/example"
 
 [[artifact.mappings]]
@@ -2262,6 +2285,7 @@ interval_seconds = 0
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
 
@@ -2355,6 +2379,7 @@ fn post_lock_failure_releases_lock_and_records() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert!(
@@ -2445,6 +2470,7 @@ fn capacity_rotation_compute_retained_failure_releases_lock() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )
     .expect_err("the injected compute_retained failure must fail the push");
@@ -2529,6 +2555,7 @@ fn step17_rotation_failure_defers_maintenance_until_noop_retry() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(
@@ -2601,6 +2628,7 @@ fn step17_rotation_failure_defers_maintenance_until_noop_retry() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r2.message, "Everything up to date");
@@ -2665,6 +2693,7 @@ fn noop_retry_keeps_marker_until_rotation_succeeds() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
@@ -2690,6 +2719,7 @@ fn noop_retry_keeps_marker_until_rotation_succeeds() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r2.message, "Everything up to date");
@@ -2718,6 +2748,7 @@ fn noop_retry_keeps_marker_until_rotation_succeeds() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r3.message, "Everything up to date");
@@ -2767,6 +2798,7 @@ fn committed_txn_write_failure_pends_commit() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert!(
@@ -2827,6 +2859,7 @@ fn commit_marker_write_failure_pends_commit() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
 
@@ -2884,6 +2917,7 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(
@@ -2927,6 +2961,7 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(
@@ -2987,6 +3022,7 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r3.status, None);
@@ -3047,6 +3083,7 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::PendingCommit));
@@ -3091,6 +3128,7 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     let attempt2 = r2.attempt.expect("new attempt recorded");
@@ -3165,6 +3203,7 @@ fn conflicting_marker_on_main_push_is_degraded_not_pending() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
 
@@ -3230,6 +3269,7 @@ fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(
@@ -3273,6 +3313,7 @@ fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(
@@ -3313,6 +3354,7 @@ fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r3.status, None, "push 3 is still an up-to-date no-op");
@@ -3385,6 +3427,7 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
@@ -3411,6 +3454,7 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert!(
@@ -3454,6 +3498,7 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r2.status, Some(DeploymentStatus::Successful));
@@ -3475,7 +3520,7 @@ fn slot_only_variant_body(server: &str) -> String {
 [[slots]]
 id = "p1"
 server = "{server}"
-targets = ["production"]
+target = "production"
 deploy_dir = "/srv/deploy/example"
 
 [[artifact.mappings]]
@@ -3526,7 +3571,7 @@ fn slot_only_change_creates_new_release_id() -> Result<()> {
     // Two servers; the slot starts on server-01 and is later rebound to
     // server-02.
     let deploy_toml = r#"
-schema_version = 1
+schema_version = 2
 application = "example"
 release = "v1"
 
@@ -3571,6 +3616,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
@@ -3591,6 +3637,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
@@ -3637,7 +3684,7 @@ fn historical_release_resolves_slots_from_stored_snapshot() -> Result<()> {
     std::fs::create_dir_all(&remotes_base).unwrap();
 
     let deploy_toml = r#"
-schema_version = 1
+schema_version = 2
 application = "example"
 release = "v1"
 
@@ -3675,6 +3722,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
@@ -3713,6 +3761,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
@@ -3732,6 +3781,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: Some(dep0),
+            group: None,
         },
     )?;
     assert_eq!(rh.status, Some(DeploymentStatus::Successful));
@@ -3766,7 +3816,7 @@ fn rollback_preflight_uses_current_server_capacity() -> Result<()> {
     // The policy is the slot's OWNING VARIANT's (rotation lives in the
     // variant file, never on the target).
     let deploy_toml = r#"
-schema_version = 1
+schema_version = 2
 application = "example"
 release = "v1"
 
@@ -3811,6 +3861,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
@@ -3838,6 +3889,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
@@ -3870,6 +3922,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: Some("@-".to_string()),
+            group: None,
         },
     )
     .expect_err("huge current reserve must fail the historical rollback");
@@ -3900,6 +3953,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: Some("@-".to_string()),
+            group: None,
         },
     )?;
     assert_eq!(
@@ -3952,6 +4006,7 @@ fn dry_run_leaves_no_trace_fingerprint() -> Result<()> {
         &PushOptions {
             dry_run: true,
             ref_token: None,
+            group: None,
         },
     )?;
     assert!(r.dry_run && r.attempt.is_none());
@@ -3981,6 +4036,7 @@ fn dry_run_leaves_no_trace_fingerprint() -> Result<()> {
         &PushOptions {
             dry_run: true,
             ref_token: None,
+            group: None,
         },
     );
     assert!(
@@ -4033,6 +4089,7 @@ fn dry_run_factory_failure_mutates_nothing() -> Result<()> {
         &PushOptions {
             dry_run: true,
             ref_token: None,
+            group: None,
         },
     );
     assert!(r.is_err(), "push with a failing factory must return Err");
@@ -4079,6 +4136,7 @@ fn server_policy_change_does_not_change_release_identity() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
@@ -4106,6 +4164,7 @@ fn server_policy_change_does_not_change_release_identity() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert!(
@@ -4195,6 +4254,7 @@ interval_seconds = 0
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r.status, Some(DeploymentStatus::Successful));
@@ -4232,14 +4292,21 @@ fn slot_in_two_targets_deploys_per_target_and_rolls_back_each() -> Result<()> {
     let remotes_base = tmp.path().join("remotes");
     std::fs::create_dir_all(&remotes_base).unwrap();
 
-    // One slot p1 on server-01, declared in the `standard` variant, belonging
-    // to BOTH `production` and `staging`.
+    // Two slots, each with EXACTLY ONE owning target: `p1` on server-01 for
+    // `production`, `p2` on server-02 for `staging`. A slot has one owner,
+    // so a push to one target never touches the other's slot or records.
     let variant = r#"
 [[slots]]
 id = "p1"
 server = "server-01"
-targets = ["production", "staging"]
+target = "production"
 deploy_dir = "/srv/deploy/example"
+
+[[slots]]
+id = "p2"
+server = "server-02"
+target = "staging"
+deploy_dir = "/srv/deploy/example-2"
 
 [[artifact.mappings]]
 from = "artifacts/build/output/"
@@ -4267,13 +4334,19 @@ interval_seconds = 0
     .to_string();
     write_variant_file(&proj, "standard", &variant);
     let manifest = r#"
-schema_version = 1
+schema_version = 2
 application = "example"
 release = "v1"
 
 [[servers]]
 id = "server-01"
 address = "server-01.example.com"
+user = "deploy"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "server-02"
+address = "server-02.example.com"
 user = "deploy"
 host_key_fingerprint = "SHA256:test"
 
@@ -4289,9 +4362,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     write_file(&artifacts.join("build/output/app/server"), "server-v1\n");
 
     let config = Config::load(&proj.join("deploy.toml"))?;
-    // The slot is a member of BOTH targets.
+    // Each target owns exactly its own slot.
     assert_eq!(config.target_slot_ids("production")?, vec!["p1"]);
-    assert_eq!(config.target_slot_ids("staging")?, vec!["p1"]);
+    assert_eq!(config.target_slot_ids("staging")?, vec!["p2"]);
 
     let store = LocalStore::with_base(store_base.clone())?;
     let rf = remotes_base.clone();
@@ -4303,6 +4376,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let push_opt = |_target: &str| PushOptions {
         dry_run: false,
         ref_token: None,
+        group: None,
     };
 
     // Push `production` (content v1): deploys p1, records production's s0.
@@ -4322,26 +4396,28 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         .clone()
         .expect("production advanced a generation");
 
-    // A shared slot's observed state is refreshed in EVERY member target on a
-    // push: staging (never pushed) already carries the ACTUAL tree/generation
-    // the production push deployed, not merely a present-but-stale entry.
-    for tname in ["production", "staging"] {
-        let observed = store.read_observed(tname, &config)?;
-        let os = &observed.slots[&PlacementSlotId::new("p1")];
-        assert_eq!(
-            os.artifact.as_ref().expect("observed artifact").tree,
-            prod_v1,
-            "{tname} observed must carry the actual tree deployed by the production push"
-        );
-        assert_eq!(
-            os.generation.as_ref().expect("observed generation"),
-            &prod_gen,
-            "{tname} observed must carry the actual generation deployed by the production push"
-        );
-    }
+    // A slot has exactly one owning target: production's observed state
+    // carries p1's actual assignment, and staging's view is EMPTY (its own
+    // slot p2 was never pushed — no cross-target propagation exists).
+    let obs_prod = store.read_observed("production", &config)?;
+    let os = &obs_prod.slots[&PlacementSlotId::new("p1")];
+    assert_eq!(
+        os.artifact.as_ref().expect("observed artifact").tree,
+        prod_v1,
+        "production observed must carry the actual tree deployed by the production push"
+    );
+    assert_eq!(
+        os.generation.as_ref().expect("observed generation"),
+        &prod_gen,
+        "production observed must carry the actual generation deployed by the production push"
+    );
+    assert!(
+        store.read_observed("staging", &config)?.slots.is_empty(),
+        "staging's view is empty: a production push never touches staging's slots"
+    );
 
-    // Change content, then push `staging` (content v2): the SAME slot deploys
-    // independently for staging, with its own per-target attempt/snapshot.
+    // Change content, then push `staging` (content v2): its OWN slot p2
+    // deploys independently, with its own per-target attempt/snapshot.
     write_file(&artifacts.join("build/output/app/server"), "server-v2\n");
     let rs = push(
         &proj.join("deploy.toml"),
@@ -4352,7 +4428,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &push_opt("staging"),
     )?;
     assert_eq!(rs.status, Some(DeploymentStatus::Successful));
-    let staging_slot = &rs.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")];
+    let staging_slot = &rs.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p2")];
     let staging_v2 = staging_slot.artifact.tree.clone();
     let staging_gen = staging_slot
         .generation
@@ -4365,24 +4441,28 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     assert_eq!(store.read_ledger("production")?.len(), 1);
     assert_eq!(store.read_ledger("staging")?.len(), 1);
 
-    // The shared slot's observed value CHANGES when the OTHER target pushes
-    // (stale -> fresh): production's observed is refreshed to staging's actual
-    // assignment even though production itself was not pushed, and staging's
-    // own record carries its fresh actual too.
-    for tname in ["production", "staging"] {
-        let obs = store.read_observed(tname, &config)?;
-        let os = &obs.slots[&PlacementSlotId::new("p1")];
-        assert_eq!(
-            os.artifact.as_ref().expect("observed artifact").tree,
-            staging_v2,
-            "{tname} observed must be refreshed from the actual tree deployed by the staging push"
-        );
-        assert_eq!(
-            os.generation.as_ref().expect("observed generation"),
-            &staging_gen,
-            "{tname} observed must be refreshed from the actual generation deployed by the staging push"
-        );
-    }
+    // The staging push does NOT touch production's observed state (a slot
+    // has one owner): production's p1 still carries its own v1 assignment,
+    // and staging's p2 carries its fresh v2 actual.
+    let obs_prod = store.read_observed("production", &config)?;
+    let os = &obs_prod.slots[&PlacementSlotId::new("p1")];
+    assert_eq!(
+        os.artifact.as_ref().expect("observed artifact").tree,
+        prod_v1,
+        "production observed must be untouched by the staging push"
+    );
+    let obs_staging = store.read_observed("staging", &config)?;
+    let os = &obs_staging.slots[&PlacementSlotId::new("p2")];
+    assert_eq!(
+        os.artifact.as_ref().expect("observed artifact").tree,
+        staging_v2,
+        "staging observed must carry the actual tree deployed by the staging push"
+    );
+    assert_eq!(
+        os.generation.as_ref().expect("observed generation"),
+        &staging_gen,
+        "staging observed must carry the actual generation deployed by the staging push"
+    );
 
     // Rollback on EACH target (keyed by that target's own first deployment
     // id) restores that target's stored state.
@@ -4397,6 +4477,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: Some(dep0_prod),
+            group: None,
         },
     )?;
     assert_eq!(rrb_prod.status, Some(DeploymentStatus::Successful));
@@ -4417,17 +4498,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         restored_prod_slot.generation,
         "production's observed generation is the actual restored generation"
     );
-    // The rollback refreshed the shared slot in staging too: staging's
-    // observed now carries production's restored s0 tree (fresh, not stale).
-    let restored_staging = store.read_observed("staging", &config)?;
+    // The production rollback does NOT touch staging's observed state.
+    let obs_staging = store.read_observed("staging", &config)?;
     assert_eq!(
-        restored_staging.slots[&PlacementSlotId::new("p1")]
+        obs_staging.slots[&PlacementSlotId::new("p2")]
             .artifact
             .as_ref()
             .unwrap()
             .tree,
-        prod_v1,
-        "the production rollback refreshes the shared slot's observed state in staging"
+        staging_v2,
+        "staging's observed state is untouched by the production rollback"
     );
 
     let rrb_staging = push(
@@ -4439,12 +4519,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &PushOptions {
             dry_run: false,
             ref_token: Some(dep0_staging),
+            group: None,
         },
     )?;
     assert_eq!(rrb_staging.status, Some(DeploymentStatus::Successful));
     let restored_staging = store.read_observed("staging", &config)?;
     assert_eq!(
-        restored_staging.slots[&PlacementSlotId::new("p1")]
+        restored_staging.slots[&PlacementSlotId::new("p2")]
             .artifact
             .as_ref()
             .unwrap()
@@ -4504,6 +4585,7 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
             &PushOptions {
                 dry_run: false,
                 ref_token: Some(bad.to_string()),
+                group: None,
             },
         )
         .expect_err(&format!("{bad:?} on an empty chain must fail closed"));
@@ -4537,6 +4619,7 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
+                group: None,
             },
         )?;
         assert_eq!(r.status, Some(DeploymentStatus::Successful));
@@ -4567,6 +4650,7 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: Some("@".to_string()),
+            group: None,
         },
     )?;
     assert!(r_at.status.is_none());
@@ -4582,6 +4666,7 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: Some("parent(@, 2)".to_string()),
+            group: None,
         },
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
@@ -4601,6 +4686,7 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: Some("@-".to_string()),
+            group: None,
         },
     )?;
     assert_eq!(r2.status, Some(DeploymentStatus::Successful));
@@ -4630,6 +4716,7 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
             &PushOptions {
                 dry_run: false,
                 ref_token: Some(token.clone()),
+                group: None,
             },
         )?;
         assert_eq!(
@@ -4661,6 +4748,7 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
             &PushOptions {
                 dry_run: false,
                 ref_token: Some(bad.to_string()),
+                group: None,
             },
         )
         .expect_err(&format!("{bad:?} must fail closed"));

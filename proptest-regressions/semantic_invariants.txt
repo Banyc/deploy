@@ -11,3 +11,5 @@ cc b20d4ef3a96ebee120e52a580d28ad8f84837b4d1b43d805c2f84ba5c73dab26 # shrinks to
 cc c1acb94e891ac6b318004932176e53efaf6fc84ed51717f4c13c7ccbbb904528 # shrinks to steps = [(Push("t2"), LastSuccessfulWrite), (Rollback("t2", 0), CommitMarker)]
 cc 139ae93a8ef8ea650727c2deb9488e5fc2f1621287c1cd9db8fd7f542e48e8c5 # shrinks to steps = [(Push("t2"), None), (Rollback("t2", 0), RemoteStatusPreSwap)]
 cc fd0ccabeba5cff50d9f237a94ec40a7065f7fb3029520f4633afeed894e05629 # shrinks to steps = [(Push("t1"), Step17Contended), (Retry("t1"), RemoteStatusPreSwap)]
+cc 7d0996baffb059295e1c832d7cae75fcd9a1d9620e2f3029da546986b2fce3d9 # shrinks to steps = [(Push("t2"), ObservedWriteServer), (Rollback("t2", 0), Step17Contended)]
+cc 5197a478842917f89ce00558a40995fcc8a33fb8bc918b31ce8ef1b51b6b908a # shrinks to steps = [(Push("t2"), LockContention)]

@@ -566,12 +566,12 @@ impl LocalStore {
     /// The TARGET VIEW over the single physical slot state: the global slot
     /// map ([`LocalStore::read_global_observed`]) filtered to the target's
     /// member slots. Membership is DERIVED from the config's slot-declaration
-    /// `targets` lists (as everywhere in the codebase): `deploy status
+    /// `target` field (as everywhere in the codebase): `deploy status
     /// <target>` and every other consumer see exactly the physical records of
-    /// the target's member slots — never a replicated per-target copy, so
-    /// every member target's view of a shared slot agrees with the ONE
-    /// physical record (generation, artifact, last_deployment). A member
-    /// slot with no physical record yet is simply absent from the view.
+    /// the target's member slots — never a replicated per-target copy. A
+    /// slot has EXACTLY ONE owning target, so its single physical record
+    /// serves exactly that target's view. A member slot with no physical
+    /// record yet is simply absent from the view.
     pub fn read_observed(
         &self,
         target: &str,
@@ -580,7 +580,7 @@ impl LocalStore {
         let members: std::collections::HashSet<&str> = config
             .slot_defs()
             .iter()
-            .filter(|s| s.targets.iter().any(|t| t == target))
+            .filter(|s| s.target == target)
             .map(|s| s.id.as_str())
             .collect();
         let slots = self
@@ -1082,6 +1082,7 @@ mod tests {
             deployment_schema_version: SCHEMA_VERSION,
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new(target.to_string()),
+            group: None,
             slot_ids: vec![PlacementSlotId::new("p1".to_string())],
             behavior_sha256: "sha256-aa".to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
@@ -1412,7 +1413,8 @@ mod tests {
                 id: "p1".to_string(),
                 server: "s1".to_string(),
                 deploy_dir: std::path::PathBuf::from("/srv/deploy/p1"),
-                targets: vec!["t1".to_string()],
+                target: "t1".to_string(),
+                groups: Vec::new(),
             }],
         )]);
         let rec =

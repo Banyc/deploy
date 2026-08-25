@@ -121,6 +121,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         &PushOptions {
             dry_run: true,
             ref_token: None,
+            group: None,
         },
     )?;
     assert!(r_dry.dry_run);
@@ -146,6 +147,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(
@@ -253,6 +255,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         &PushOptions {
             dry_run: false,
             ref_token: None,
+            group: None,
         },
     )?;
     assert_eq!(r2.message, "Everything up to date");

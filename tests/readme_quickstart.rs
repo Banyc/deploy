@@ -50,7 +50,7 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
     let std_slots = &config.variant("standard")?.slots;
     assert_eq!(std_slots.len(), 2, "standard.toml declares app-1 and app-2");
     assert!(
-        std_slots.iter().all(|s| s.targets == ["production"]),
+        std_slots.iter().all(|s| s.target == "production"),
         "both slots bind to target `production`"
     );
     let variant = config.variant("standard")?;
@@ -113,6 +113,7 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
         &PushOptions {
             dry_run: true,
             ref_token: None,
+            group: None,
         },
     )?;
     assert!(r.dry_run);

@@ -131,24 +131,25 @@ pub fn normalize_deploy_dir(path: &Path) -> String {
 }
 
 /// Canonicalize a variant's declared `[[slots]]` into the sorted, normalized
-/// identity form: exactly the four identity-bearing fields of [`SlotDef`]
-/// (`id`, `server`, `deploy_dir` as a lexically-normalized absolute path
-/// string, `targets` SORTED and DEDUPLICATED), sorted by slot id. The
-/// `targets` dedup is defensive: a duplicate name adds no membership, so a
-/// record that slipped past validation (or predates it) must still
-/// canonicalize to the same identity as the deduplicated list — duplicate
-/// noise never shifts the digest. Server-level policy (user, address, port,
-/// capacity) is deliberately absent — it is not release identity.
+/// identity form: the identity-bearing fields of [`SlotDef`] (`id`, `server`,
+/// `deploy_dir` as a lexically-normalized absolute path string, the ONE
+/// owning `target` verbatim, `groups` SORTED and DEDUPLICATED), sorted by
+/// slot id. The `groups` dedup is defensive: a duplicate name adds no
+/// membership, so a record that slipped past validation (or predates it)
+/// must still canonicalize to the same identity as the deduplicated list —
+/// duplicate noise never shifts the digest. Server-level policy (user,
+/// address, port, capacity) is deliberately absent — it is not release
+/// identity.
 ///
-/// The sort is a TOTAL ORDER over the four identity fields (id, then server,
-/// then deploy_dir, then targets), not a stable id-only sort: a STABLE sort
-/// over the id alone would let the DECLARATION ORDER of duplicate-id slots
-/// leak into the canonical form, making the digest asymmetric for two
-/// logically-identical declaration orders (the identity-gap class of bug). A
-/// total order makes the canonical form a pure function of the declared slot
-/// set — the same slots written in any order canonicalize identically, even
-/// for the degenerate duplicate-id declarations a record that slipped past
-/// validation can carry.
+/// The sort is a TOTAL ORDER over the identity fields (id, then server,
+/// then deploy_dir, then target, then groups), not a stable id-only sort: a
+/// STABLE sort over the id alone would let the DECLARATION ORDER of
+/// duplicate-id slots leak into the canonical form, making the digest
+/// asymmetric for two logically-identical declaration orders (the
+/// identity-gap class of bug). A total order makes the canonical form a pure
+/// function of the declared slot set — the same slots written in any order
+/// canonicalize identically, even for the degenerate duplicate-id
+/// declarations a record that slipped past validation can carry.
 pub fn canonicalize_slots(slots: &[SlotDef]) -> CanonicalSlots {
     let mut out: Vec<CanonicalSlot> = slots
         .iter()
@@ -156,11 +157,12 @@ pub fn canonicalize_slots(slots: &[SlotDef]) -> CanonicalSlots {
             id: s.id.clone(),
             server: s.server.clone(),
             deploy_dir: normalize_deploy_dir(&s.deploy_dir),
-            targets: {
-                let mut t = s.targets.clone();
-                t.sort();
-                t.dedup();
-                t
+            target: s.target.clone(),
+            groups: {
+                let mut g = s.groups.clone();
+                g.sort();
+                g.dedup();
+                g
             },
         })
         .collect();
@@ -168,23 +170,25 @@ pub fn canonicalize_slots(slots: &[SlotDef]) -> CanonicalSlots {
         a.id.cmp(&b.id)
             .then_with(|| a.server.cmp(&b.server))
             .then_with(|| a.deploy_dir.cmp(&b.deploy_dir))
-            .then_with(|| a.targets.cmp(&b.targets))
+            .then_with(|| a.target.cmp(&b.target))
+            .then_with(|| a.groups.cmp(&b.groups))
     });
     CanonicalSlots { slots: out }
 }
 
 /// Canonical digest over name-sorted per-variant slot declarations. Each
-/// variant's slots are canonicalized (the four identity fields, `deploy_dir`
-/// lexically normalized, `targets` sorted and deduplicated) and sorted by
-/// the total order over those four fields (id, server, deploy_dir, targets —
-/// the content tie-break keeps the canonical form order-independent even for
-/// duplicate-id declarations); the variants are name-sorted by the
+/// variant's slots are canonicalized (the identity fields, `deploy_dir`
+/// lexically normalized, `groups` sorted and deduplicated) and sorted by
+/// the total order over those fields (id, server, deploy_dir, target,
+/// groups — the content tie-break keeps the canonical form order-independent
+/// even for duplicate-id declarations); the variants are name-sorted by the
 /// `BTreeMap`. Two releases
 /// share this digest only when every declared variant declares the same
-/// slots — a rebind, `deploy_dir` move, or target-membership change alters
-/// it, while a reordering of slot declarations (or of variants, or of a
-/// slot's `targets` list, or duplicate names in it — deduplicated away) does
-/// not. Server-level policy (user/address/port/capacity) is not part of it.
+/// slots — a rebind, `deploy_dir` move, owning-target change, or group
+/// membership change alters it, while a reordering of slot declarations (or
+/// of variants, or of a slot's `groups` list, or duplicate names in it —
+/// deduplicated away) does not. Server-level policy (user/address/port/
+/// capacity) is not part of it.
 pub fn variant_slots_digest(slots: &BTreeMap<String, Vec<SlotDef>>) -> String {
     let canonical: BTreeMap<String, CanonicalSlots> = slots
         .iter()
@@ -293,7 +297,8 @@ pub fn recompute_release_digest(rec: &ReleaseRecord) -> Option<ReleaseDigest> {
                         id: s.id.clone(),
                         server: s.server.clone(),
                         deploy_dir: PathBuf::from(&s.deploy_dir),
-                        targets: s.targets.clone(),
+                        target: s.target.clone(),
+                        groups: s.groups.clone(),
                     })
                     .collect(),
             )
@@ -372,7 +377,8 @@ mod tests {
             id: id.to_string(),
             server: server.to_string(),
             deploy_dir: PathBuf::from(deploy_dir),
-            targets: vec![target.to_string()],
+            target: target.to_string(),
+            groups: Vec::new(),
         }
     }
 
@@ -469,25 +475,27 @@ mod tests {
                 id: "p1".to_string(),
                 server: "server-01".to_string(),
                 deploy_dir: PathBuf::from("/srv/deploy/example"),
-                targets: vec!["production".to_string()],
+                target: "production".to_string(),
+                groups: Vec::new(),
             }],
         )]);
         let base_sha = variant_slots_digest(&base);
 
-        // Adding a second target to the list changes the digest.
-        let added: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+        // Changing the slot's ONE owning target changes the digest.
+        let retargeted: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
             "standard".to_string(),
             vec![SlotDef {
                 id: "p1".to_string(),
                 server: "server-01".to_string(),
                 deploy_dir: PathBuf::from("/srv/deploy/example"),
-                targets: vec!["production".to_string(), "staging".to_string()],
+                target: "staging".to_string(),
+                groups: Vec::new(),
             }],
         )]);
         assert_ne!(
-            variant_slots_digest(&added),
+            variant_slots_digest(&retargeted),
             base_sha,
-            "a target-membership change must alter the digest"
+            "an owning-target change must alter the digest"
         );
 
         // Reordering the same list canonicalizes identically.
@@ -497,30 +505,33 @@ mod tests {
                 id: "p1".to_string(),
                 server: "server-01".to_string(),
                 deploy_dir: PathBuf::from("/srv/deploy/example"),
-                targets: vec!["staging".to_string(), "production".to_string()],
+                target: "staging".to_string(),
+                groups: Vec::new(),
             }],
         )]);
         assert_eq!(
             variant_slots_digest(&reordered),
-            variant_slots_digest(&added),
-            "targets list order must not affect the digest"
+            variant_slots_digest(&retargeted),
+            "the owning target must not affect the digest when unchanged"
         );
     }
 
-    /// Duplicate names in a slot's `targets` list add no membership, so the
-    /// canonical form DEDUPS them: `["t1","t1"]` and `["t1"]` produce the
-    /// SAME digest (a record that slipped past validation, or predates it,
-    /// must not shift release identity), while a change that DOES alter
-    /// membership (adding a distinct target) still changes the digest.
+    /// Duplicate names in a slot's `groups` list add no membership, so the
+    /// canonical form DEDUPS them: `["canary","canary"]` and `["canary"]`
+    /// produce the SAME digest (a record that slipped past validation, or
+    /// predates it, must not shift release identity), while a change that
+    /// DOES alter membership (changing the owning target) still changes the
+    /// digest.
     #[test]
-    fn variant_slots_digest_dedups_duplicate_targets() {
+    fn variant_slots_digest_dedups_duplicate_groups() {
         let single: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
             "standard".to_string(),
             vec![SlotDef {
                 id: "p1".to_string(),
                 server: "server-01".to_string(),
                 deploy_dir: PathBuf::from("/srv/deploy/example"),
-                targets: vec!["t1".to_string()],
+                target: "t1".to_string(),
+                groups: vec!["canary".to_string()],
             }],
         )]);
         let duplicated: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
@@ -529,29 +540,31 @@ mod tests {
                 id: "p1".to_string(),
                 server: "server-01".to_string(),
                 deploy_dir: PathBuf::from("/srv/deploy/example"),
-                targets: vec!["t1".to_string(), "t1".to_string()],
+                target: "t1".to_string(),
+                groups: vec!["canary".to_string(), "canary".to_string()],
             }],
         )]);
         assert_eq!(
             variant_slots_digest(&single),
             variant_slots_digest(&duplicated),
-            "a duplicated target name must not change the digest (membership is unchanged)"
+            "a duplicated group name must not change the digest (membership is unchanged)"
         );
 
         // A change that DOES alter membership still changes the digest.
-        let added: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+        let retargeted: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
             "standard".to_string(),
             vec![SlotDef {
                 id: "p1".to_string(),
                 server: "server-01".to_string(),
                 deploy_dir: PathBuf::from("/srv/deploy/example"),
-                targets: vec!["t1".to_string(), "t2".to_string()],
+                target: "t2".to_string(),
+                groups: vec!["canary".to_string()],
             }],
         )]);
         assert_ne!(
             variant_slots_digest(&single),
-            variant_slots_digest(&added),
-            "a target-membership change must still alter the digest"
+            variant_slots_digest(&retargeted),
+            "an owning-target change must still alter the digest"
         );
     }
 
@@ -701,15 +714,16 @@ mod tests {
             "canonical-slot change must re-digest"
         );
 
-        // Target-membership change -> new digest: a slot-only change to the
-        // `targets` list creates a new ReleaseId.
+        // Owning-target change -> new digest: a slot-only change to the
+        // `target` field creates a new ReleaseId.
         let s3: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
             "standard".to_string(),
             vec![SlotDef {
                 id: "p1".to_string(),
                 server: "server-01".to_string(),
                 deploy_dir: PathBuf::from("/srv/deploy/example"),
-                targets: vec!["production".to_string(), "staging".to_string()],
+                target: "staging".to_string(),
+                groups: Vec::new(),
             }],
         )]);
         let st = release_digest(
@@ -721,7 +735,7 @@ mod tests {
         assert_ne!(
             base.as_str(),
             st.as_str(),
-            "a targets-list change must re-digest"
+            "an owning-target change must re-digest"
         );
 
         // The built release record follows the digest: identical inputs build
@@ -1127,18 +1141,28 @@ mod tests {
         ])
     }
 
+    fn group_strategy() -> impl Strategy<Value = String> {
+        prop::sample::select(vec![
+            "canary".to_string(),
+            "wave-1".to_string(),
+            "wave-2".to_string(),
+        ])
+    }
+
     fn slot_strategy() -> impl Strategy<Value = SlotDef> {
         (
             slot_id_strategy(),
             server_strategy(),
             deploy_dir_strategy(),
-            prop::collection::vec(target_strategy(), 1..4),
+            target_strategy(),
+            prop::collection::vec(group_strategy(), 0..3),
         )
-            .prop_map(|(id, server, deploy_dir, targets)| SlotDef {
+            .prop_map(|(id, server, deploy_dir, target, groups)| SlotDef {
                 id,
                 server,
                 deploy_dir: PathBuf::from(deploy_dir),
-                targets,
+                target,
+                groups,
             })
     }
 
@@ -1344,10 +1368,10 @@ mod tests {
                 assert_content_mutation(&rec, &r, "slot deploy_dir");
 
                 let mut r = rec.clone();
-                let mut targets = slot.targets.clone();
-                targets.push("tampered".to_string());
-                r.slots.get_mut(variant).unwrap().slots[i].targets = targets;
-                assert_content_mutation(&rec, &r, "slot targets");
+                let mut groups = slot.groups.clone();
+                groups.push("tampered".to_string());
+                r.slots.get_mut(variant).unwrap().slots[i].groups = groups;
+                assert_content_mutation(&rec, &r, "slot groups");
             }
         }
         // Removing a slot changes the digest; clearing a variant's slots does
@@ -1402,7 +1426,8 @@ mod tests {
                             id: s.id.clone(),
                             server: s.server.clone(),
                             deploy_dir: PathBuf::from(&s.deploy_dir),
-                            targets: s.targets.clone(),
+                            target: s.target.clone(),
+                            groups: s.groups.clone(),
                         })
                         .collect(),
                 )
@@ -1455,7 +1480,7 @@ mod tests {
             .map(|(v, defs)| {
                 let mut out: Vec<SlotDef> = defs.iter().rev().cloned().collect();
                 for (i, s) in out.iter_mut().enumerate() {
-                    s.targets.reverse();
+                    s.groups.reverse();
                     let n = normalize_deploy_dir(&s.deploy_dir);
                     s.deploy_dir = PathBuf::from(equivalent_dir_spellings(&n)[i % 3].clone());
                 }
@@ -1470,8 +1495,8 @@ mod tests {
                     .iter()
                     .map(|s| {
                         let mut dup = s.clone();
-                        if let Some(first) = dup.targets.first().cloned() {
-                            dup.targets.push(first);
+                        if let Some(first) = dup.groups.first().cloned() {
+                            dup.groups.push(first);
                         }
                         dup
                     })

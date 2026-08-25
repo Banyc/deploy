@@ -43,30 +43,37 @@ use uuid::Uuid;
 /// emits exactly `SCHEMA_VERSION`; every reader refuses any other version
 /// (fail closed — a mismatched record is never silently interpreted).
 ///
-/// The current format is version 1: deployment records use the canonical
+/// The current format is version 2: deployment records use the canonical
 /// placement-slot-keyed shape (`BTreeMap<PlacementSlotId, _>` maps, nested
-/// artifact/generation refs). A hypothetical pre-rekeying shape that keyed
+/// artifact/generation refs) and carry the exclusive owning target + the
+/// optional rollout group of the attempt. Version 1 records (the
+/// multi-target `targets` membership shape) are REJECTED on read — no
+/// compatibility fallback. A hypothetical pre-rekeying shape that keyed
 /// these maps by server ID with flat artifact fields is NOT the current
 /// schema and never loads.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The canonical release identity PAYLOAD version
 /// (`CanonicalReleasePayload.schema_version`), FROZEN INTO the release
 /// digest: the field is part of the hashed identity payload, so its value
-/// can never change without producing a new release ID. Version 2 is the
-/// slots-into-identity payload: it adds the per-variant canonical slot
-/// declaration digest (`slots_digest`) alongside the mapping and behavior
-/// digests. Read-side enforcement is implicit and fail-closed:
+/// can never change without producing a new release ID. Version 3 is the
+/// exclusive-ownership payload: the per-variant canonical slot declaration
+/// digest (`slots_digest`) now carries each slot's ONE owning target and
+/// its rollout groups (replacing the multi-target `targets` membership
+/// list). Read-side enforcement is implicit and fail-closed:
 /// `verify_release_identity` recomputes the digest using exactly this
 /// version, so a release whose identity was derived from any other payload
 /// version fails the recompute-and-verify check.
-pub const RELEASE_PAYLOAD_SCHEMA_VERSION: u32 = 2;
+pub const RELEASE_PAYLOAD_SCHEMA_VERSION: u32 = 3;
 
 /// The `release.json` record format version
 /// (`ReleaseRecord.release_schema_version`). `build_release` emits exactly
 /// this value and [`crate::release::verify_release_identity`] refuses any
-/// other version (fail closed) on every write and read path.
-pub const RELEASE_RECORD_SCHEMA_VERSION: u32 = 1;
+/// other version (fail closed) on every write and read path. Version 2
+/// records the exclusive-ownership canonical slot snapshot (each slot's one
+/// `target` + `groups`); version 1 records (the multi-target `targets`
+/// shape) are rejected on read — no compatibility fallback.
+pub const RELEASE_RECORD_SCHEMA_VERSION: u32 = 2;
 
 /// The `tree.json` metadata format version (`TreeMetadata.tree_schema_version`).
 /// [`crate::tree::canonicalize_tree`] emits exactly this value and
@@ -178,6 +185,7 @@ id_newtype!(OperationId);
 id_newtype!(ServerId);
 id_newtype!(PlacementSlotId);
 id_newtype!(TargetName);
+id_newtype!(GroupName);
 id_newtype!(VariantName);
 id_newtype!(TreeDigest);
 
@@ -240,34 +248,39 @@ pub struct CanonicalBehavior {
     pub verification: serde_json::Value,
 }
 
-/// One canonical slot declaration: the four identity-bearing fields of a
+/// One canonical slot declaration: the identity-bearing fields of a
 /// [`crate::config::SlotDef`], with `deploy_dir` reduced to a lexically
-/// normalized absolute path string and `targets` SORTED (the canonical form —
-/// and therefore the release identity digest — must be order-independent).
-/// Server-level policy (user, address, port, capacity) is deliberately
-/// absent: it is a per-server policy resolved from the caller's current
-/// configuration, never part of a release identity.
+/// normalized absolute path string, the ONE owning `target` kept verbatim,
+/// and `groups` SORTED and DEDUPLICATED (the canonical form — and therefore
+/// the release identity digest — must be order-independent). Server-level
+/// policy (user, address, port, capacity) is deliberately absent: it is a
+/// per-server policy resolved from the caller's current configuration, never
+/// part of a release identity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalSlot {
     pub id: String,
     pub server: String,
     pub deploy_dir: String,
-    /// The slot's target membership list, sorted so the canonical form is
-    /// order-independent: `["staging", "production"]` and
-    /// `["production", "staging"]` canonicalize identically.
-    pub targets: Vec<String>,
+    /// The slot's EXACTLY ONE owning target. Changing it changes the release
+    /// identity.
+    pub target: String,
+    /// The slot's rollout groups, scoped to its owning target, sorted and
+    /// deduplicated so the canonical form is order-independent:
+    /// `["wave-1", "canary"]` and `["canary", "wave-1"]` canonicalize
+    /// identically.
+    pub groups: Vec<String>,
 }
 
 /// The canonicalized slot declaration set of one variant: its slots sorted by
 /// slot id, with ties broken deterministically by the remaining identity
-/// fields (server, deploy_dir, targets) so the canonical form is a pure
+/// fields (server, deploy_dir, target, groups) so the canonical form is a pure
 /// function of the declared slot set — order-independent even for the
 /// degenerate duplicate-id declarations a record that slipped past validation
 /// can carry. A variant's slot declarations ARE release identity — rebinding a
-/// slot to another server, moving its `deploy_dir`, or changing its target
-/// membership changes the release — so this snapshot is frozen into the
-/// release record and digest. It carries exactly the four [`CanonicalSlot`]
-/// fields and no derived state.
+/// slot to another server, moving its `deploy_dir`, changing its owning
+/// target, or changing its group membership changes the release — so this
+/// snapshot is frozen into the release record and digest. It carries exactly
+/// the [`CanonicalSlot`] fields and no derived state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalSlots {
     pub slots: Vec<CanonicalSlot>,
