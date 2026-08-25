@@ -24,8 +24,8 @@ use crate::push::server::{
 };
 use crate::push::staging::{StagingCleanup, cleanup_dry_run_staging, remove_tree_restoring_write};
 use crate::records::{
-    AttemptServer, DeploymentAttempt, DeploymentPlan, DeploymentResults, DeploymentStatus,
-    ObservedServer, ServerOutcomeKind, ServerPlan, ServerResult,
+    AttemptServer, DeploymentPlan, DeploymentStatus, LedgerIntent, LedgerTerminal, ObservedServer,
+    ServerOutcomeKind, ServerPlan, ServerResult,
 };
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::transport::Remote;
@@ -46,7 +46,7 @@ pub struct PushOptions {
 pub struct PushReport {
     /// `None` means no attempt was created (dry-run or already up to date).
     pub status: Option<DeploymentStatus>,
-    pub attempt: Option<DeploymentAttempt>,
+    pub attempt: Option<LedgerIntent>,
     pub message: String,
     /// Warning about post-commit maintenance deferred on this push (e.g. a
     /// per-slot rotation that failed after the deployment already committed).
@@ -533,15 +533,7 @@ fn push_inner(
             PushRef::Deployment {
                 target: ft,
                 deployment_id,
-            } => {
-                let entry = history::resolve_deployment(store, ft, deployment_id)?;
-                entry
-                    .slots
-                    .values()
-                    .next()
-                    .map(|g| g.assignment.artifact.release.clone())
-                    .unwrap_or_else(|| ReleaseId::new(String::new()))
-            }
+            } => history::resolve_deployment(store, ft, deployment_id)?.release,
             PushRef::Release { release, .. } => release.clone(),
             PushRef::Head => unreachable!(),
         };
@@ -892,30 +884,26 @@ fn push_inner(
         }
     }
 
-    // Persist the plan before any server mutation (finding 6), then record the
-    // INITIAL status transition: the attempt is `InProgress`. The per-deployment
-    // transition stream is append-only; later transitions (the final status, or
-    // reconciliation finalization) overlay it, and the LATEST transition is the
-    // deployment's current status.
+    // Persist the plan before any server mutation (finding 6), then persist
+    // the attempt INTENT: the ledger's `{"kind":"intent"}` line. The intent
+    // is the deployment's durable key — it is appended BEFORE any server
+    // mutation, and its TERMINAL EVENT (appended after the mutation loop)
+    // carries the status, outcomes, and rollback state. There is no separate
+    // `InProgress` transition: an intent-only ledger entry IS the
+    // in-progress/pending state.
     store.write_plan(deployment_id.as_str(), &plan)?;
-    store.append_transition(
-        deployment_id.as_str(),
-        &DeploymentStatus::InProgress,
-        Some("attempt started"),
-    )?;
 
-    // PERSIST THE ATTEMPT INTENT BEFORE ANY REMOTE MUTATION. The attempt
+    // PERSIST THE ATTEMPT INTENT BEFORE ANY REMOTE MUTATION. The intent
     // record is the IMMUTABLE INTENT of the deployment: deployment_id, target,
     // membership, behavior digest, attempted_at, the planned (`desired`)
     // generations, and the observed pre-push state. It must be durable BEFORE
     // any server's `current`/generation changes, so a crash can never lose a
     // deployment whose servers already advanced: without the record the next
     // push would see every server at the desired generation and report
-    // "Everything up to date" with no attempt/snapshot/ref ever recorded.
+    // "Everything up to date" with no attempt/rollback ever recorded.
     // The record carries NO outcomes — the `slots` (actual) map is persisted
-    // empty; the actual per-slot outcomes are recorded separately in
-    // `deployments/<id>/results.json` after the mutation loop, and the status
-    // lifecycle lives in the per-deployment transition stream.
+    // empty; the actual per-slot outcomes and the status live in the
+    // deployment's TERMINAL EVENT (appended after the mutation loop).
     let slot_ids: Vec<PlacementSlotId> = assignments
         .iter()
         .map(|a| a.placement_slot.clone())
@@ -932,7 +920,7 @@ fn push_inner(
             )
         })
         .collect();
-    let attempt_intent = DeploymentAttempt {
+    let attempt_intent = LedgerIntent {
         deployment_schema_version: SCHEMA_VERSION,
         deployment_id: deployment_id.clone(),
         target: TargetName::new(target_name.to_string()),
@@ -943,7 +931,7 @@ fn push_inner(
         pre_push,
         slots: BTreeMap::new(),
     };
-    store.append_attempt(target_name, &attempt_intent)?;
+    store.append_intent(target_name, &attempt_intent)?;
 
     // 8 & 9. Capacity preflight and staging. Capacity is a per-server policy
     // read from the caller's CURRENT `deploy.toml` (`ServerDef.capacity`), not
@@ -988,10 +976,21 @@ fn push_inner(
         Ok(())
     })();
     if let Err(e) = preflight {
-        let _ = store.append_transition(
-            deployment_id.as_str(),
-            &DeploymentStatus::FailedPreflight,
-            Some(preflight_reason),
+        // The preflight failure is the attempt's TERMINAL EVENT (status
+        // `FailedPreflight`, empty outcomes — no slot was touched): appended to
+        // the ledger like every other terminal. Incoming staging dirs created
+        // by the failed phase are removed best-effort.
+        let _ = store.append_terminal(
+            target_name,
+            &LedgerTerminal {
+                deployment_id: deployment_id.clone(),
+                target: TargetName::new(target_name.to_string()),
+                status: DeploymentStatus::FailedPreflight,
+                recorded_at: crate::remote::helper::now_rfc3339(),
+                outcomes: BTreeMap::new(),
+                rollback: None,
+                reason: Some(preflight_reason.to_string()),
+            },
         );
         for a in &assignments {
             helpers[&a.placement_slot]
@@ -1323,62 +1322,72 @@ fn push_inner(
     // persisted as part of the immutable intent (`attempt_intent`); it is not
     // recomputed here.
 
-    // 16 & 17. Record outcomes, finalize, history, rotation. The append-only
-    // attempts.jsonl record (persisted BEFORE the mutation loop) keeps only
-    // the immutable intent; the ACTUAL per-slot outcomes are recorded
-    // separately in `deployments/<id>/results.json` — the outcomes store the
-    // snapshot and observed state are built from. The REPORT's attempt also
-    // carries the actuals (for display / rollback); the persisted record does
-    // not.
-    let attempt = DeploymentAttempt {
+    // 16 & 17. Record outcomes, finalize, history, rotation. The ledger's
+    // intent line (persisted BEFORE the mutation loop) keeps only the
+    // immutable intent; the ACTUAL per-slot outcomes and the terminal status
+    // are appended as the deployment's TERMINAL EVENT (the ledger's
+    // `{"kind":"terminal"}` line) — the outcomes store the rollback state is
+    // built from. The REPORT's attempt also carries the actuals (for display);
+    // the persisted intent does not.
+    let attempt = LedgerIntent {
         slots: actual_servers.clone(),
         ..attempt_intent.clone()
     };
-    store.write_results(
-        deployment_id.as_str(),
-        &DeploymentResults {
-            deployment_id: deployment_id.clone(),
-            target: TargetName::new(target_name.to_string()),
-            slots: results.clone(),
-        },
-    )?;
+    let outcomes_map: BTreeMap<PlacementSlotId, ServerResult> = results.clone();
 
-    // Finalize the attempt's terminal status REPLAY-SAFELY. A SUCCESSFUL
-    // attempt goes through the SAME shared finalizer as recovery
-    // ([`history::finalize_successful_attempt`]): first the
-    // recoverable `PendingCommit` marker is persisted (so a crash
-    // mid-finalization leaves the attempt re-eligible — its latest
-    // transition is `PendingCommit`, never a prematurely-written
-    // `Successful`), then the idempotent snapshot append and
-    // `refs/last-successful`, and the terminal `Successful` transition is
-    // written LAST. The snapshot is built from the actual per-slot OUTCOMES
-    // (`actual_servers`), not from the intent record. A non-successful final
-    // status (`Degraded` / `PendingCommit` demoted by the commit step)
-    // is a plain transition append; it produces no snapshot entry.
+    // Finalize the attempt's terminal event. A SUCCESSFUL attempt goes
+    // through the SAME shared finalizer as recovery
+    // ([`history::finalize_successful_attempt`]): ONE atomic terminal append
+    // carrying the `Successful` status, the per-slot outcomes, and the
+    // ROLLBACK STATE (built from the actual per-slot OUTCOMES
+    // (`actual_servers`), never from the intent record). A non-successful
+    // final status (`Degraded` / `FailedRolledBack`) is a plain terminal
+    // append carrying the status and outcomes, no rollback. A demoted
+    // `PendingCommit` status (the commit markers are not all durable) is NOT
+    // terminal at all: the entry stays intent-only — the recoverable pending
+    // state a later push reconciles before its own no-op check.
     let mut message = format!("push status: {commit_status:?}");
     if commit_status == DeploymentStatus::Successful {
-        // The snapshot records each slot's COMPLETE physical binding
+        // The rollback state records each slot's COMPLETE physical binding
         // (`{server, deploy_dir}`) so an exact rollback can verify a slot
         // still lives at the exact on-host location it was deployed onto (a
         // rebound slot OR a slot whose deploy_dir moved must refuse rather
         // than deploy to the wrong host/location). The binding comes from
         // the CURRENT configuration: it is the live placement this attempt
-        // actually used. The snapshot itself is built from the actual
-        // per-slot OUTCOMES (`actual_servers`), never from the intent
-        // record.
+        // actually used.
         let slot_bindings = config.target_slot_bindings(target_name)?;
-        let dep = history::finalize_successful_attempt(
+        history::finalize_successful_attempt(
             store,
             &attempt_intent,
+            &outcomes_map,
             &actual_servers,
             "push completed",
             &slot_bindings,
         )?;
+        // The new successful deployment is keyed by its deployment id (the
+        // public grammar is deployment-keyed — successful positions are
+        // derived internally, never exposed as sN).
         message = format!(
-            "push successful; rollback payload keyed by deployment {dep} of target {target_name}"
+            "push successful; rollback payload keyed by deployment {deployment_id} of target {target_name}"
         );
-    } else {
-        store.append_transition(deployment_id.as_str(), &commit_status, commit_reason)?;
+    } else if commit_status != DeploymentStatus::PendingCommit {
+        // A demoted `PendingCommit` status is NOT terminal: the entry stays
+        // intent-only (the recoverable pending state a later push reconciles
+        // before its own no-op check) — appending a PendingCommit terminal
+        // would strand the attempt forever (reconciliation only picks up
+        // entries WITHOUT a terminal).
+        store.append_terminal(
+            target_name,
+            &LedgerTerminal {
+                deployment_id: deployment_id.clone(),
+                target: TargetName::new(target_name.to_string()),
+                status: commit_status.clone(),
+                recorded_at: crate::remote::helper::now_rfc3339(),
+                outcomes: outcomes_map,
+                rollback: None,
+                reason: commit_reason.map(str::to_string),
+            },
+        )?;
     }
 
     // Refresh observed state — the shared [`refresh_observed`] helper, also
@@ -1993,6 +2002,7 @@ mod tests {
     use crate::model::{
         CanonicalSlot, CanonicalSlots, Provenance, RELEASE_RECORD_SCHEMA_VERSION, ReleaseRecord,
     };
+    use crate::records::LedgerEntry;
     use crate::remote::transport::{FsBytes, LocalTransport};
     use crate::testutil::test_remotes::{
         FailOnceGenerationRemote, FailOnceMarkerRemote, FailOnceStagingRemote, recording_factory,
@@ -2431,7 +2441,57 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// once, so the attempt is recorded `PendingCommit` (activation already
     /// happened; the latest transition says `PendingCommit`, no snapshot
     /// entry, no `refs/last-successful`).
-    fn push_pending_attempt(h: &RecoveryHarness) -> DeploymentAttempt {
+    /// Seed the target's ledger with ONE successful deployment carrying the
+    /// given rollback payload (intent + `Successful` terminal). The entry's
+    /// position in the successful chain is its `sN` — there are no explicit
+    /// snapshot indices in the ledger.
+    fn seed_snapshot(
+        store: &LocalStore,
+        target: &str,
+        deployment_id: &str,
+        behavior_sha256: &str,
+        release: &ReleaseId,
+        slots: BTreeMap<PlacementSlotId, GenerationRef>,
+        bindings: BTreeMap<PlacementSlotId, crate::records::PhysicalBinding>,
+    ) {
+        store
+            .append_intent(
+                target,
+                &LedgerIntent {
+                    deployment_schema_version: SCHEMA_VERSION,
+                    deployment_id: DeploymentId::new(deployment_id.to_string()),
+                    target: TargetName::new(target.to_string()),
+                    slot_ids: slots.keys().cloned().collect(),
+                    behavior_sha256: behavior_sha256.to_string(),
+                    attempted_at: "2026-01-01T00:00:00Z".to_string(),
+                    desired: BTreeMap::new(),
+                    pre_push: BTreeMap::new(),
+                    slots: BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        store
+            .append_terminal(
+                target,
+                &LedgerTerminal {
+                    deployment_id: DeploymentId::new(deployment_id.to_string()),
+                    target: TargetName::new(target.to_string()),
+                    status: DeploymentStatus::Successful,
+                    recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                    outcomes: BTreeMap::new(),
+                    rollback: Some(crate::records::LedgerRollback {
+                        behavior_sha256: behavior_sha256.to_string(),
+                        release: release.clone(),
+                        slots,
+                        bindings,
+                    }),
+                    reason: None,
+                },
+            )
+            .unwrap();
+    }
+
+    fn push_pending_attempt(h: &RecoveryHarness) -> LedgerIntent {
         let armed = Arc::new(AtomicBool::new(true));
         let armed_for_factory = armed.clone();
         let rf = h.remotes_base.clone();
@@ -2586,7 +2646,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// one snapshot entry at index 0 for the attempt, `refs/last-successful`
     /// pointing at it, latest transition `Successful`, and the commit
     /// marker present on the remote.
-    fn assert_finalized(h: &RecoveryHarness, attempt: &DeploymentAttempt) {
+    fn assert_finalized(h: &RecoveryHarness, attempt: &LedgerIntent) {
         let snapshots = h.store.read_snapshots("t1").unwrap();
         assert_eq!(
             snapshots.len(),
@@ -2594,7 +2654,17 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "exactly one successful snapshot, got {}",
             snapshots.len()
         );
-        assert_eq!(snapshots[0].deployment_id, attempt.deployment_id);
+        assert_eq!(
+            snapshots[0].deployment_id, attempt.deployment_id,
+            "exactly one successful entry, and it is the recovered attempt"
+        );
+        assert_eq!(
+            history::successful_index(&h.store, "t1", &attempt.deployment_id)
+                .unwrap()
+                .unwrap(),
+            0,
+            "the recovered attempt is the successful chain position s0"
+        );
         assert_eq!(
             h.store.read_last_successful("t1").as_deref(),
             Some(attempt.deployment_id.as_str()),
@@ -2615,31 +2685,38 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
     }
 
+    /// The TERMINAL EVENT append (the deployment's ONE atomic finalize write)
+    /// fails once on the replaying push: `Err`, no rollback state exists
+    /// (the entry stays intent-only = recoverable-pending), and the next
+    /// clean push replays and completes finalization exactly once. There is
+    /// no separate snapshot/last-successful/transition sequence anymore —
+    /// the terminal carries status + outcomes + rollback in one write.
     #[test]
-    fn recovery_replays_after_snapshot_append_failure() {
+    fn recovery_replays_after_terminal_append_failure() {
         let h = RecoveryHarness::new();
         let attempt = push_pending_attempt(&h);
 
-        // Push 2: the snapshot append (first persistence step of finalization)
-        // fails once -> the push aborts with Err and nothing is durable yet.
+        // Push 2: the terminal append fails once -> the push aborts with Err
+        // and nothing is durable yet (no rollback state).
         let err = {
             h.store
                 .fault_registry()
-                .arm_append_snapshot(attempt.deployment_id.as_str());
-            push_clean(&h).expect_err("push must abort when the snapshot append fails")
+                .arm_append_terminal(attempt.deployment_id.as_str());
+            push_clean(&h).expect_err("push must abort when the terminal append fails")
         };
         assert!(
-            err.to_string().contains("append_snapshot"),
+            err.to_string().contains("append_terminal"),
             "error must name the injected fault, got: {err}"
         );
         assert!(
             h.store.read_snapshots("t1").unwrap().is_empty(),
-            "no snapshot after the failed append"
+            "no rollback state after the failed append"
         );
         assert!(h.store.read_last_successful("t1").is_none());
         assert_eq!(
             latest_status(&h, attempt.deployment_id.as_str()),
-            DeploymentStatus::PendingCommit
+            DeploymentStatus::PendingCommit,
+            "the intent-only entry stays recoverable-pending"
         );
 
         // Push 3: a clean push replays and completes finalization exactly once.
@@ -2648,73 +2725,87 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_finalized(&h, &attempt);
     }
 
+    /// The SAME atomic terminal append, faulted on the MAIN path (the push
+    /// itself): `Err`, the entry stays intent-only (recoverable-pending), and
+    /// the next push reconciles it to exactly-once success.
     #[test]
-    fn recovery_replays_after_last_successful_failure() {
+    fn main_path_replays_after_terminal_append_failure() {
         let h = RecoveryHarness::new();
-        let attempt = push_pending_attempt(&h);
+        let id = DeploymentId::new("deploy-main-terminal-fault".to_string());
 
-        // Push 2: the snapshot append succeeds but `refs/last-successful` (the
-        // second persistence step) fails once -> Err; the snapshot exists
-        // but the ref is stale and the attempt stays `PendingCommit`.
         let err = {
-            h.store
-                .fault_registry()
-                .arm_write_last_successful(attempt.deployment_id.as_str());
-            push_clean(&h).expect_err("push must abort when the last-successful write fails")
+            h.store.fault_registry().arm_append_terminal(id.as_str());
+            push_main_with_id(&h, &id).expect_err("push must abort when the terminal append fails")
         };
         assert!(
-            err.to_string().contains("write_last_successful"),
+            err.to_string().contains("append_terminal"),
             "error must name the injected fault, got: {err}"
         );
-        let snapshots = h.store.read_snapshots("t1").unwrap();
-        assert_eq!(snapshots.len(), 1, "snapshot was appended before the crash");
-        assert_eq!(snapshots[0].deployment_id, attempt.deployment_id);
+        assert!(
+            h.store.read_snapshots("t1").unwrap().is_empty(),
+            "no rollback state after the failed append"
+        );
         assert!(h.store.read_last_successful("t1").is_none());
         assert_eq!(
-            latest_status(&h, attempt.deployment_id.as_str()),
-            DeploymentStatus::PendingCommit
+            latest_status(&h, id.as_str()),
+            DeploymentStatus::PendingCommit,
+            "crash window must leave the attempt PendingCommit, not Successful"
         );
 
-        // Push 3: the idempotent ensure must NOT append a second entry; it
-        // repairs last-successful and finishes. Exactly one entry remains.
-        let r3 = push_clean(&h).unwrap();
-        assert_eq!(r3.status, None, "the replaying push is an up-to-date no-op");
-        assert_finalized(&h, &attempt);
+        // Push 2: a clean push reconciles the pending attempt (servers are
+        // already at the desired generation) and completes finalization
+        // exactly once.
+        let r2 = push_clean(&h).unwrap();
+        assert_eq!(r2.status, None, "the replaying push is an up-to-date no-op");
+        assert_eq!(r2.message, "Everything up to date");
+        assert_eq!(
+            h.store.read_attempts("t1").unwrap().len(),
+            1,
+            "the replay must not record a new attempt"
+        );
+        assert_finalized(&h, &single_attempt(&h));
     }
 
+    /// A SECOND faulted replay still converges exactly once: the terminal
+    /// append is faulted on two consecutive pushes, and the THIRD push
+    /// finalizes the attempt exactly once.
     #[test]
-    fn recovery_replays_after_transition_append_failure() {
+    fn second_faulted_replay_still_converges_exactly_once() {
         let h = RecoveryHarness::new();
         let attempt = push_pending_attempt(&h);
 
-        // Push 2: the snapshot and last-successful are durable but the
-        // final `Successful` transition append fails -> Err; the attempt
-        // stays `PendingCommit`, so it is still eligible for the next push.
-        let err = {
+        // Push 2: terminal append faulted -> Err.
+        let r2 = {
             h.store
                 .fault_registry()
-                .arm_append_transition(attempt.deployment_id.as_str());
-            push_clean(&h).expect_err("push must abort when the final transition append fails")
+                .arm_append_terminal(attempt.deployment_id.as_str());
+            push_clean(&h).expect_err("push 2 must abort when the terminal append fails")
         };
         assert!(
-            err.to_string().contains("append_transition"),
-            "error must name the injected fault, got: {err}"
-        );
-        let snapshots = h.store.read_snapshots("t1").unwrap();
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(
-            h.store.read_last_successful("t1").as_deref(),
-            Some(attempt.deployment_id.as_str())
-        );
-        assert_eq!(
-            latest_status(&h, attempt.deployment_id.as_str()),
-            DeploymentStatus::PendingCommit
+            r2.to_string().contains("append_terminal"),
+            "error must name the injected fault, got: {r2}"
         );
 
-        // Push 3: the replay completes the final transition append; the ensure
-        // is a no-op and no duplicate entry is created.
-        let r3 = push_clean(&h).unwrap();
-        assert_eq!(r3.status, None, "the replaying push is an up-to-date no-op");
+        // Push 3: terminal append faulted again -> Err; the entry is still
+        // intent-only (no rollback state, nothing duplicated).
+        let r3 = {
+            h.store
+                .fault_registry()
+                .arm_append_terminal(attempt.deployment_id.as_str());
+            push_clean(&h).expect_err("push 3 must abort when the terminal append fails again")
+        };
+        assert!(
+            r3.to_string().contains("append_terminal"),
+            "error must name the injected fault, got: {r3}"
+        );
+        assert!(
+            h.store.read_snapshots("t1").unwrap().is_empty(),
+            "a second faulted replay must still leave no rollback state"
+        );
+
+        // Push 4: clean -> finalizes exactly once.
+        let r4 = push_clean(&h).unwrap();
+        assert_eq!(r4.status, None, "the replaying push is an up-to-date no-op");
         assert_finalized(&h, &attempt);
     }
 
@@ -2801,134 +2892,21 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     }
 
     /// The single attempt recorded for target `t1`.
-    fn single_attempt(h: &RecoveryHarness) -> DeploymentAttempt {
+    fn single_attempt(h: &RecoveryHarness) -> LedgerIntent {
         let mut attempts = h.store.read_attempts("t1").unwrap();
         assert_eq!(attempts.len(), 1, "exactly one attempt recorded");
-        attempts.remove(0)
+        attempts.remove(0).intent
     }
 
-    #[test]
-    fn main_path_replays_after_snapshot_append_failure() {
-        let h = RecoveryHarness::new();
-        let id = DeploymentId::new("deploy-main-snapshot-fault".to_string());
-
-        // Push 1: a NORMAL push whose finalization is faulted at its first
-        // persistence step — the snapshot append fails once. The finalizer
-        // already persisted the recoverable `PendingCommit` marker, so the
-        // attempt is left in the crash window: latest transition
-        // `PendingCommit` (never `Successful`), no snapshot entry, no
-        // `refs/last-successful`.
-        let err = {
-            h.store.fault_registry().arm_append_snapshot(id.as_str());
-            push_main_with_id(&h, &id).expect_err("push must abort when the snapshot append fails")
-        };
-        assert!(
-            err.to_string().contains("append_snapshot"),
-            "error must name the injected fault, got: {err}"
-        );
-        assert!(
-            h.store.read_snapshots("t1").unwrap().is_empty(),
-            "no snapshot after the failed snapshot append"
-        );
-        assert!(h.store.read_last_successful("t1").is_none());
-        assert_eq!(
-            latest_status(&h, id.as_str()),
-            DeploymentStatus::PendingCommit,
-            "crash window must leave the attempt PendingCommit, not Successful"
-        );
-
-        // Push 2: a clean push reconciles the pending attempt (servers are
-        // already at the desired generation) and completes finalization
-        // exactly once: one snapshot entry, `refs/last-successful` pointing
-        // at it, latest transition `Successful`, marker present.
-        let r2 = push_clean(&h).unwrap();
-        assert_eq!(r2.status, None, "the replaying push is an up-to-date no-op");
-        assert_eq!(r2.message, "Everything up to date");
-        assert_eq!(
-            h.store.read_attempts("t1").unwrap().len(),
-            1,
-            "the replay must not record a new attempt"
-        );
-        assert_finalized(&h, &single_attempt(&h));
-    }
-
-    #[test]
-    fn main_path_replays_after_last_successful_failure() {
-        let h = RecoveryHarness::new();
-        let id = DeploymentId::new("deploy-main-last-successful-fault".to_string());
-
-        // First: the snapshot append succeeds but `refs/last-successful`
-        // (the second persistence step) fails once -> Err; the snapshot
-        // entry exists but the ref is stale and the attempt stays
-        // `PendingCommit`.
-        let err = {
-            h.store
-                .fault_registry()
-                .arm_write_last_successful(id.as_str());
-            push_main_with_id(&h, &id)
-                .expect_err("push must abort when the last-successful write fails")
-        };
-        assert!(
-            err.to_string().contains("write_last_successful"),
-            "error must name the injected fault, got: {err}"
-        );
-        let snapshots = h.store.read_snapshots("t1").unwrap();
-        assert_eq!(snapshots.len(), 1, "snapshot was appended before the crash");
-        assert_eq!(snapshots[0].deployment_id, id);
-        assert!(h.store.read_last_successful("t1").is_none());
-        assert_eq!(
-            latest_status(&h, id.as_str()),
-            DeploymentStatus::PendingCommit,
-            "crash window must leave the attempt PendingCommit, not Successful"
-        );
-
-        // Push 2: the idempotent ensure must NOT append a second entry; it
-        // repairs `refs/last-successful` and finishes. Exactly one entry
-        // remains.
-        let r2 = push_clean(&h).unwrap();
-        assert_eq!(r2.status, None, "the replaying push is an up-to-date no-op");
-        assert_finalized(&h, &single_attempt(&h));
-    }
-
-    #[test]
-    fn main_path_replays_after_transition_append_failure() {
-        let h = RecoveryHarness::new();
-        let id = DeploymentId::from("deploy-main-transition-fault".to_string());
-
-        // First: the snapshot and `refs/last-successful` are durable but the
-        // final `Successful` transition append fails -> Err. The fault is
-        // armed for the TERMINAL transition only
-        // (`arm_append_transition_successful`), so the recoverable
-        // `PendingCommit` marker append passes through; the attempt stays
-        // `PendingCommit` and remains eligible.
-        let err = {
-            h.store
-                .fault_registry()
-                .arm_append_transition_successful(id.as_str());
-            push_main_with_id(&h, &id)
-                .expect_err("push must abort when the final transition append fails")
-        };
-        assert!(
-            err.to_string().contains("append_transition"),
-            "error must name the injected fault, got: {err}"
-        );
-        let snapshots = h.store.read_snapshots("t1").unwrap();
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(
-            h.store.read_last_successful("t1").as_deref(),
-            Some(id.as_str())
-        );
-        assert_eq!(
-            latest_status(&h, id.as_str()),
-            DeploymentStatus::PendingCommit,
-            "crash window must leave the attempt PendingCommit, not Successful"
-        );
-
-        // Push 2: the replay completes the final transition append; the
-        // ensure is a no-op and no duplicate entry is created.
-        let r2 = push_clean(&h).unwrap();
-        assert_eq!(r2.status, None, "the replaying push is an up-to-date no-op");
-        assert_finalized(&h, &single_attempt(&h));
+    /// The rollback payload of a successful ledger entry (the test view of
+    /// the old `DeploymentSnapshot` fields: `slots`, `bindings`,
+    /// `behavior_sha256`, `release`).
+    fn rollback_of(entry: &LedgerEntry) -> &crate::records::LedgerRollback {
+        entry
+            .terminal
+            .as_ref()
+            .and_then(|t| t.rollback.as_ref())
+            .expect("a successful snapshot entry carries a rollback state")
     }
 
     #[test]
@@ -3175,10 +3153,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let h = RecoveryHarness::new();
         let id = DeploymentId::new("deploy-inprogress-no-results".to_string());
         let err = {
-            h.store.fault_registry().arm_write_results(id.as_str());
+            h.store.fault_registry().arm_append_terminal(id.as_str());
             push_main_with_id(&h, &id).expect_err("push must abort when write_results fails")
         };
-        assert!(err.to_string().contains("write_results"));
+        assert!(err.to_string().contains("append_terminal"));
 
         // The intent record is durable even though a later step failed; it
         // carries the planned (desired) and observed (pre_push) maps but NO
@@ -3189,13 +3167,19 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let intent = &attempts[0];
         assert_eq!(intent.deployment_id, id);
         assert!(
-            intent.slots.is_empty(),
-            "persisted intent carries NO outcomes (they live in results.json)"
+            intent.intent.slots.is_empty(),
+            "persisted intent carries NO outcomes (they live in the terminal event)"
         );
         assert!(
-            intent.desired.contains_key(&PlacementSlotId::new("p1"))
-                && intent.pre_push.contains_key(&PlacementSlotId::new("p1")),
-            "intent carries the planned (desired) and observed (pre_push) maps"
+            intent
+                .intent
+                .desired
+                .contains_key(&PlacementSlotId::new("p1"))
+                && intent
+                    .intent
+                    .pre_push
+                    .contains_key(&PlacementSlotId::new("p1")),
+            "the intent carries the planned (desired) and observed (pre_push) maps"
         );
         assert!(
             h.store.read_results(id.as_str()).is_err(),
@@ -3203,8 +3187,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         assert_eq!(
             latest_status(&h, id.as_str()),
-            DeploymentStatus::InProgress,
-            "the crash window leaves the latest transition InProgress"
+            DeploymentStatus::PendingCommit,
+            "the crash window leaves the entry intent-only (recoverable-pending)"
         );
         assert!(h.store.read_snapshots("t1").unwrap().is_empty());
         assert!(h.store.read_last_successful("t1").is_none());
@@ -3222,7 +3206,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_finalized(&h, &intent);
         let snap = h.store.read_snapshots("t1").unwrap();
         assert_eq!(snap.len(), 1);
-        let g = &snap[0].slots[&PlacementSlotId::new("p1")];
+        let g = &rollback_of(&snap[0]).slots[&PlacementSlotId::new("p1")];
         let desired = &intent.desired[&PlacementSlotId::new("p1")];
         assert_eq!(
             g.generation.as_str(),
@@ -3233,44 +3217,37 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(h.store.read_attempts("t1").unwrap().len(), 1);
     }
 
-    /// Crash window (a)/(c): intent + outcomes durable, but the finalize
-    /// marker — the recoverable `PendingCommit` transition, first step of the
-    /// shared finalizer — is faulted by the status-qualified
-    /// `arm_append_transition_pending` (the earlier `InProgress` transition
-    /// passes through). The attempt's latest transition is `InProgress` —
+    /// Crash window: the intent is durable (outcomes live in the ONE
+    /// terminal event, which was NOT appended — the faulted write), so the
+    /// attempt is intent-only = the recoverable `PendingCommit` state —
     /// never `Successful` — and the NEXT push reconciles it to exactly-once
-    /// success: one snapshot, `refs/last-successful`, the marker, and the
-    /// terminal `Successful` transition.
+    /// success: one rollback state, derived last-successful, the marker, and
+    /// the terminal `Successful` event.
     #[test]
     fn inprogress_crash_window_reconciles_to_exactly_once_success() {
         let h = RecoveryHarness::new();
         let id = DeploymentId::new("deploy-inprogress-window".to_string());
         let err = {
-            h.store
-                .fault_registry()
-                .arm_append_transition_pending(id.as_str());
-            push_main_with_id(&h, &id)
-                .expect_err("push must abort when the finalize marker append fails")
+            h.store.fault_registry().arm_append_terminal(id.as_str());
+            push_main_with_id(&h, &id).expect_err("push must abort when the terminal append fails")
         };
         assert!(
-            err.to_string().contains("append_transition"),
+            err.to_string().contains("append_terminal"),
             "error must name the injected fault, got: {err}"
         );
-        let results = h.store.read_results(id.as_str()).unwrap();
-        assert_eq!(
-            results.slots[&PlacementSlotId::new("p1")].outcome,
-            ServerOutcomeKind::Activated,
-            "outcomes durable before the finalize marker"
+        assert!(
+            h.store.read_results(id.as_str()).is_err(),
+            "no outcomes store exists until the terminal event lands"
         );
         assert_eq!(
             h.store.read_transitions(id.as_str()).unwrap().len(),
-            1,
-            "only the in_progress transition exists before finalization"
+            0,
+            "no terminal event exists before finalization"
         );
         assert_eq!(
             latest_status(&h, id.as_str()),
-            DeploymentStatus::InProgress,
-            "crash window must leave the attempt InProgress, never Successful"
+            DeploymentStatus::PendingCommit,
+            "crash window must leave the attempt PendingCommit (intent-only), never Successful"
         );
         assert!(h.store.read_snapshots("t1").unwrap().is_empty());
         assert!(h.store.read_last_successful("t1").is_none());
@@ -3319,7 +3296,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let target_a = GenerationId::generate();
         let id_a = DeploymentId::new("deploy-inprogress-diverged".to_string());
         let desired_ref = baseline.desired[&PlacementSlotId::new("p1")].clone();
-        let intent = DeploymentAttempt {
+        let intent = LedgerIntent {
             deployment_schema_version: SCHEMA_VERSION,
             deployment_id: id_a.clone(),
             target: TargetName::new("t1".to_string()),
@@ -3337,16 +3314,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             slots: BTreeMap::new(),
         };
         h.store.append_attempt("t1", &intent).unwrap();
-        h.store
-            .append_transition(
-                id_a.as_str(),
-                &DeploymentStatus::InProgress,
-                Some("attempt started"),
-            )
-            .unwrap();
         assert_eq!(
             latest_status(&h, id_a.as_str()),
-            DeploymentStatus::InProgress
+            DeploymentStatus::PendingCommit,
+            "the intent-only entry is the recoverable pending state"
         );
 
         // Push 2: recovery verifies the InProgress attempt; the slot's current
@@ -3396,11 +3367,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         out
     }
 
-    /// A clean successful push records the EXACT latest-status evolution
-    /// `InProgress -> PendingCommit (finalize marker) -> Successful` (the
-    /// recoverable window is `PendingCommit`), writes `results.json` after the
-    /// mutation loop, and builds the snapshot from those OUTCOMES — the
-    /// persisted intent record itself carries an empty `slots` map.
+    /// A clean successful push records ONE TERMINAL EVENT (the ledger's
+    /// atomic finalize append) carrying the `Successful` status, the per-slot
+    /// outcomes, and the rollback state. The persisted intent record itself
+    /// carries an empty `slots` map (the outcomes live in the terminal).
     #[test]
     fn clean_push_transition_sequence_and_outcomes() {
         let h = RecoveryHarness::new();
@@ -3413,24 +3383,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             transitions.iter().map(|t| t.status.clone()).collect();
         assert_eq!(
             statuses,
-            vec![
-                DeploymentStatus::InProgress,
-                DeploymentStatus::PendingCommit,
-                DeploymentStatus::Successful,
-            ],
-            "a successful push must evolve InProgress -> PendingCommit -> Successful"
+            vec![DeploymentStatus::Successful],
+            "a successful push appends exactly ONE terminal event (Successful)"
         );
-        // The finalize marker carries the recoverable-window reason.
-        assert_eq!(
-            transitions[1].reason.as_deref(),
-            Some("finalization started")
-        );
+        assert_eq!(transitions[0].reason.as_deref(), Some("push completed"));
 
-        // Outcomes separation: results.json exists with the per-slot outcome
-        // and the persisted intent carries NO outcomes.
+        // Outcomes separation: the terminal event carries the per-slot
+        // outcome and the persisted intent carries NO outcomes.
         let results = h.store.read_results(id.as_str()).unwrap();
         assert_eq!(
-            results.slots[&PlacementSlotId::new("p1")].outcome,
+            results[&PlacementSlotId::new("p1")].outcome,
             ServerOutcomeKind::Activated
         );
         let attempt = single_attempt(&h);
@@ -3446,15 +3408,17 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(snapshots.len(), 1);
         let snap = &snapshots[0];
         assert_eq!(
-            snap.slots[&PlacementSlotId::new("p1")].generation,
-            results.slots[&PlacementSlotId::new("p1")]
+            rollback_of(snap).slots[&PlacementSlotId::new("p1")].generation,
+            results[&PlacementSlotId::new("p1")]
                 .generation
                 .clone()
                 .unwrap()
         );
         let actual = &r.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")];
         assert_eq!(
-            snap.slots[&PlacementSlotId::new("p1")].assignment.artifact,
+            rollback_of(snap).slots[&PlacementSlotId::new("p1")]
+                .assignment
+                .artifact,
             actual.artifact
         );
     }
@@ -3507,14 +3471,17 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // results.json, which records the per-slot failure).
         let attempts = h.store.read_attempts("t1").unwrap();
         assert_eq!(attempts.len(), 1, "intent must be recorded before mutation");
-        assert!(attempts[0].slots.is_empty(), "intent carries no outcomes");
+        assert!(
+            attempts[0].intent.slots.is_empty(),
+            "intent carries no outcomes"
+        );
         assert_eq!(
             latest_status(&h, id.as_str()),
             DeploymentStatus::FailedRolledBack
         );
         let results = h.store.read_results(id.as_str()).unwrap();
         assert_eq!(
-            results.slots[&PlacementSlotId::new("p1")].outcome,
+            results[&PlacementSlotId::new("p1")].outcome,
             ServerOutcomeKind::Failed
         );
 
@@ -3761,8 +3728,8 @@ interval_seconds = 0
                 .read_transitions(first_attempt.deployment_id.as_str())
                 .unwrap()
                 .len(),
-            3,
-            "no new transition may be appended to the first deployment"
+            1,
+            "no new terminal event may be appended to the first deployment"
         );
         let observed = h.store.read_observed("t1", &h.config).unwrap();
         assert_eq!(
@@ -3791,7 +3758,7 @@ interval_seconds = 0
         // absent status file as eligible (a just-recorded attempt).
         let id_a = DeploymentId::new("deploy-no-status".to_string());
         let desired_ref = baseline.desired[&PlacementSlotId::new("p1")].clone();
-        let intent = DeploymentAttempt {
+        let intent = LedgerIntent {
             deployment_schema_version: SCHEMA_VERSION,
             deployment_id: id_a.clone(),
             target: TargetName::new("t1".to_string()),
@@ -3805,8 +3772,8 @@ interval_seconds = 0
         h.store.append_attempt("t1", &intent).unwrap();
         assert_eq!(
             h.store.latest_status(id_a.as_str()).unwrap(),
-            None,
-            "no transition stream for the crafted attempt"
+            Some(DeploymentStatus::PendingCommit),
+            "an intent-only entry is the recoverable pending state"
         );
 
         // The next push reconciles the transition-less attempt (the remote is
@@ -3821,6 +3788,13 @@ interval_seconds = 0
         let snapshots = h.store.read_snapshots("t1").unwrap();
         assert_eq!(snapshots.len(), 2, "baseline + reconciled attempt");
         assert_eq!(snapshots[1].deployment_id, id_a);
+        assert_eq!(
+            history::successful_index(&h.store, "t1", &id_a)
+                .unwrap()
+                .unwrap(),
+            1,
+            "the reconciled attempt is successful-chain position s1"
+        );
         assert_eq!(
             h.store.read_last_successful("t1").as_deref(),
             Some(id_a.as_str())
@@ -3845,7 +3819,7 @@ interval_seconds = 0
         let baseline = r1.attempt.as_ref().expect("attempt recorded");
         let desired_ref = baseline.desired[&PlacementSlotId::new("p1")].clone();
 
-        let mk = |id: &str| DeploymentAttempt {
+        let mk = |id: &str| LedgerIntent {
             deployment_schema_version: SCHEMA_VERSION,
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new("t1".to_string()),
@@ -3861,22 +3835,9 @@ interval_seconds = 0
         };
         let a = mk("deploy-multi-a");
         let b = mk("deploy-multi-b");
+        // Two intent-only entries: eligible for reconciliation, oldest first.
         h.store.append_attempt("t1", &a).unwrap();
-        h.store
-            .append_transition(
-                a.deployment_id.as_str(),
-                &DeploymentStatus::InProgress,
-                Some("attempt started"),
-            )
-            .unwrap();
         h.store.append_attempt("t1", &b).unwrap();
-        h.store
-            .append_transition(
-                b.deployment_id.as_str(),
-                &DeploymentStatus::InProgress,
-                Some("attempt started"),
-            )
-            .unwrap();
 
         // One push reconciles BOTH, oldest first.
         let r2 = push_clean(&h).unwrap();
@@ -3885,6 +3846,19 @@ interval_seconds = 0
         assert_eq!(snapshots.len(), 3);
         assert_eq!(snapshots[1].deployment_id, a.deployment_id);
         assert_eq!(snapshots[2].deployment_id, b.deployment_id);
+        assert_eq!(
+            history::successful_index(&h.store, "t1", &a.deployment_id)
+                .unwrap()
+                .unwrap(),
+            1,
+            "successful-chain positions stay monotonic"
+        );
+        assert_eq!(
+            history::successful_index(&h.store, "t1", &b.deployment_id)
+                .unwrap()
+                .unwrap(),
+            2
+        );
         assert_eq!(
             latest_status(&h, a.deployment_id.as_str()),
             DeploymentStatus::Successful
@@ -3905,56 +3879,6 @@ interval_seconds = 0
                 .join(crate::layout::commit_marker(id));
             assert!(marker.exists(), "marker present for {id}");
         }
-    }
-
-    /// Replay-safe retry chain: faulting the SAME finalize step on the main
-    /// push AND on the first replay still converges on a later clean push with
-    /// exactly one snapshot entry and one attempt record (idempotent retries).
-    #[test]
-    fn second_faulted_replay_still_converges_exactly_once() {
-        let h = RecoveryHarness::new();
-        let id = DeploymentId::new("deploy-retry-chain".to_string());
-
-        // Push 1: the terminal Successful transition fails once -> PendingCommit.
-        let err = {
-            h.store
-                .fault_registry()
-                .arm_append_transition_successful(id.as_str());
-            push_main_with_id(&h, &id).expect_err("first faulted push must abort")
-        };
-        assert!(err.to_string().contains("append_transition"));
-        assert_eq!(
-            latest_status(&h, id.as_str()),
-            DeploymentStatus::PendingCommit
-        );
-        assert_eq!(h.store.read_snapshots("t1").unwrap().len(), 1);
-
-        // Push 2: the REPLAY faults the SAME step again -> still PendingCommit,
-        // still exactly one snapshot (idempotent ensure, no duplicate).
-        let err2 = {
-            h.store
-                .fault_registry()
-                .arm_append_transition_successful(id.as_str());
-            push_clean(&h).expect_err("second faulted replay must abort")
-        };
-        assert!(err2.to_string().contains("append_transition"));
-        assert_eq!(
-            latest_status(&h, id.as_str()),
-            DeploymentStatus::PendingCommit
-        );
-        assert_eq!(
-            h.store.read_snapshots("t1").unwrap().len(),
-            1,
-            "a second faulted replay must not duplicate the snapshot"
-        );
-
-        // Push 3: a clean replay converges to exactly-once success.
-        let r3 = push_clean(&h).unwrap();
-        assert_eq!(r3.status, None);
-        assert_eq!(r3.message, "Everything up to date");
-        assert_finalized(&h, &single_attempt(&h));
-        assert_eq!(h.store.read_attempts("t1").unwrap().len(), 1);
-        assert_eq!(h.store.read_snapshots("t1").unwrap().len(), 1);
     }
 
     // ---- Verification-failure rollback + observed refresh -----------------
@@ -4064,7 +3988,7 @@ interval_seconds = 0
         // with `compensated: true`, at the PRIOR generation. (`Restored` is
         // reserved for Activated slots compensated by the failure-policy pass.)
         let results = h.store.read_results(id2.as_str()).unwrap();
-        let res = &results.slots[&PlacementSlotId::new("p1")];
+        let res = &results[&PlacementSlotId::new("p1")];
         assert_eq!(res.outcome, ServerOutcomeKind::Failed);
         assert!(res.compensated);
         assert_eq!(res.generation, Some(prior_gen.clone()));
@@ -4331,26 +4255,26 @@ interval_seconds = 0
             );
         }
         let results = store.read_results(id.as_str()).unwrap();
-        assert_eq!(results.slots.len(), 4);
+        assert_eq!(results.len(), 4);
         // The first batch advanced, then compensated back (no prior state ->
         // `current` removed): Restored.
         assert_eq!(
-            results.slots[&PlacementSlotId::new("p1")].outcome,
+            results[&PlacementSlotId::new("p1")].outcome,
             ServerOutcomeKind::Restored
         );
         assert_eq!(
-            results.slots[&PlacementSlotId::new("p2")].outcome,
+            results[&PlacementSlotId::new("p2")].outcome,
             ServerOutcomeKind::Restored
         );
         // The failing slot of the second batch.
         assert_eq!(
-            results.slots[&PlacementSlotId::new("p3")].outcome,
+            results[&PlacementSlotId::new("p3")].outcome,
             ServerOutcomeKind::Failed
         );
         // The slot after the failing one in the same/later batch was never
         // started.
         assert_eq!(
-            results.slots[&PlacementSlotId::new("p4")].outcome,
+            results[&PlacementSlotId::new("p4")].outcome,
             ServerOutcomeKind::Skipped
         );
 
@@ -4914,7 +4838,7 @@ interval_seconds = 0
         // and was compensated inside the per-server pipeline at the PRIOR
         // generation.
         let results = h.store.read_results(id2.as_str()).unwrap();
-        let res = &results.slots[&PlacementSlotId::new("p1")];
+        let res = &results[&PlacementSlotId::new("p1")];
         assert_eq!(res.outcome, ServerOutcomeKind::Failed);
         assert!(res.compensated, "activation failure must be compensated");
         assert_eq!(res.generation, Some(prior_gen.clone()));
@@ -5048,7 +4972,7 @@ interval_seconds = 0
         // stayed on the DESIRED generation (the compensation swap-back could
         // not re-activate the prior service).
         let results = h.store.read_results(id2.as_str()).unwrap();
-        let res = &results.slots[&PlacementSlotId::new("p1")];
+        let res = &results[&PlacementSlotId::new("p1")];
         assert_eq!(res.outcome, ServerOutcomeKind::Failed);
         assert!(
             !res.compensated,
@@ -5231,7 +5155,7 @@ interval_seconds = 0
         // the compensation result are both recorded, step 11) at the advanced
         // (then removed) generation.
         let results = h.store.read_results(id.as_str()).unwrap();
-        let res = &results.slots[&PlacementSlotId::new("p1")];
+        let res = &results[&PlacementSlotId::new("p1")];
         assert_eq!(res.outcome, ServerOutcomeKind::Failed);
         assert!(
             res.compensated,
@@ -5321,11 +5245,8 @@ interval_seconds = 0
             transitions.iter().map(|t| t.status.clone()).collect();
         assert_eq!(
             statuses,
-            vec![
-                DeploymentStatus::InProgress,
-                DeploymentStatus::FailedPreflight,
-            ],
-            "the attempt must evolve InProgress -> FailedPreflight"
+            vec![DeploymentStatus::FailedPreflight],
+            "a preflight failure appends exactly ONE terminal event (FailedPreflight)"
         );
 
         // No op log/snapshot, and NO remote deployment mutation: no `current`,
@@ -5418,11 +5339,8 @@ interval_seconds = 0
             transitions.iter().map(|t| t.status.clone()).collect();
         assert_eq!(
             statuses,
-            vec![
-                DeploymentStatus::InProgress,
-                DeploymentStatus::FailedPreflight,
-            ],
-            "the attempt must evolve InProgress -> FailedPreflight"
+            vec![DeploymentStatus::FailedPreflight],
+            "a preflight failure appends exactly ONE terminal event (FailedPreflight)"
         );
 
         // No op log/snapshot, and NO remote deployment mutation: no `current`,
@@ -5590,11 +5508,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             transitions.iter().map(|t| t.status.clone()).collect();
         assert_eq!(
             statuses,
-            vec![
-                DeploymentStatus::InProgress,
-                DeploymentStatus::FailedPreflight,
-            ],
-            "the attempt must evolve InProgress -> FailedPreflight"
+            vec![DeploymentStatus::FailedPreflight],
+            "a preflight failure appends exactly ONE terminal event (FailedPreflight)"
         );
 
         // The FIRST assignment's already-staged incoming dir was cleaned
@@ -5679,31 +5594,28 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // A snapshot at index 0 whose slots reference that release: the ref
         // resolves to it, and the release-identity step then demands the
         // release's behavior snapshot (which was never written).
-        h.store
-            .append_snapshot(
-                "t1",
-                &crate::records::DeploymentSnapshot {
-                    deployment_id: DeploymentId::new("deploy-hist-behavior-fixture".to_string()),
-                    target: TargetName::new("t1".to_string()),
-                    behavior_sha256: "sha256-aa".to_string(),
-                    slots: BTreeMap::from([(
-                        PlacementSlotId::new("p1".to_string()),
-                        GenerationRef {
-                            generation: GenerationId::new("gen-hist".to_string()),
-                            assignment: crate::model::PlacementSlotAssignment {
-                                placement_slot: PlacementSlotId::new("p1".to_string()),
-                                artifact: ArtifactRef {
-                                    release: release.clone(),
-                                    variant: VariantName::new("standard".to_string()),
-                                    tree: TreeDigest::new("tree-x".to_string()),
-                                },
-                            },
+        seed_snapshot(
+            &h.store,
+            "t1",
+            "deploy-hist-behavior-fixture",
+            "sha256-aa",
+            &release,
+            BTreeMap::from([(
+                PlacementSlotId::new("p1".to_string()),
+                GenerationRef {
+                    generation: GenerationId::new("gen-hist".to_string()),
+                    assignment: crate::model::PlacementSlotAssignment {
+                        placement_slot: PlacementSlotId::new("p1".to_string()),
+                        artifact: ArtifactRef {
+                            release: release.clone(),
+                            variant: VariantName::new("standard".to_string()),
+                            tree: TreeDigest::new("tree-x".to_string()),
                         },
-                    )]),
-                    bindings: BTreeMap::new(),
+                    },
                 },
-            )
-            .unwrap();
+            )]),
+            BTreeMap::new(),
+        );
 
         let project_root = h.config.project_root(&h.cfg_path);
         let target = h.config.targets.get("t1").expect("harness target");
@@ -5742,13 +5654,21 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // snapshot, no `refs/last-successful`, and the remote directory was
         // never even created (the failure fires before the mutating remote
         // phase — the earlier status inspection writes no remote bytes).
-        assert!(h.store.read_attempts("t1").unwrap().is_empty());
+        assert_eq!(
+            h.store.read_ledger("t1").unwrap().len(),
+            1,
+            "only the fixture's seeded entry exists; the preflight failure appends nothing"
+        );
         assert_eq!(
             h.store.read_snapshots("t1").unwrap().len(),
             1,
             "the fixture snapshot is the only entry; the preflight failure must not append"
         );
-        assert!(h.store.read_last_successful("t1").is_none());
+        assert_eq!(
+            h.store.read_last_successful("t1").as_deref(),
+            Some("deploy-hist-behavior-fixture"),
+            "the derived last-successful still points at the fixture entry"
+        );
         assert!(
             !h.remotes_base.join("s1").exists(),
             "no remote layout may be created before the preflight failure"
@@ -5782,7 +5702,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 && err2.to_string().contains("unavailable"),
             "expected a historical-behavior preflight error, got: {err2}"
         );
-        assert!(h.store.read_attempts("t1").unwrap().is_empty());
+        assert_eq!(
+            h.store.read_ledger("t1").unwrap().len(),
+            1,
+            "only the fixture's seeded entry exists; the preflight failure appends nothing"
+        );
         assert_eq!(
             h.store.read_snapshots("t1").unwrap().len(),
             1,
@@ -5923,7 +5847,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(attempts.len(), 2);
         let intent2 = &attempts[1];
         assert_eq!(intent2.deployment_id, id2);
-        let pp = intent2.pre_push[&PlacementSlotId::new("p1")]
+        let pp = intent2.intent.pre_push[&PlacementSlotId::new("p1")]
             .as_ref()
             .expect("pre_push present");
         assert_eq!(pp.generation, Some(gen1.clone()));
@@ -5937,7 +5861,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // produced no snapshot/ref and the baseline ref is untouched.
         let results = h.store.read_results(id2.as_str()).unwrap();
         assert_eq!(
-            results.slots[&PlacementSlotId::new("p1")].outcome,
+            results[&PlacementSlotId::new("p1")].outcome,
             ServerOutcomeKind::Failed
         );
         assert_eq!(
@@ -6149,23 +6073,23 @@ interval_seconds = 0
         // Per-slot outcomes: advanced, failed(+compensated), skipped.
         let results = store.read_results(id.as_str()).unwrap();
         assert_eq!(
-            results.slots[&PlacementSlotId::new("p1")].outcome,
+            results[&PlacementSlotId::new("p1")].outcome,
             ServerOutcomeKind::Activated
         );
         assert_eq!(
-            results.slots[&PlacementSlotId::new("p2")].outcome,
+            results[&PlacementSlotId::new("p2")].outcome,
             ServerOutcomeKind::Activated
         );
         assert_eq!(
-            results.slots[&PlacementSlotId::new("p3")].outcome,
+            results[&PlacementSlotId::new("p3")].outcome,
             ServerOutcomeKind::Failed
         );
         assert!(
-            results.slots[&PlacementSlotId::new("p3")].compensated,
+            results[&PlacementSlotId::new("p3")].compensated,
             "the failing slot's in-process compensation is recorded"
         );
         assert_eq!(
-            results.slots[&PlacementSlotId::new("p4")].outcome,
+            results[&PlacementSlotId::new("p4")].outcome,
             ServerOutcomeKind::Skipped
         );
 
@@ -6550,8 +6474,274 @@ interval_seconds = 0
     // pending push writes the release + tree + remote state, then synthetic
     // snapshot entries 0..=L reference that release), and the ref push is
     // faulted at its FIRST transition — after `plan.json` is durable but
-    // before staging/deployment — so the plan's resolved source is
-    // observable without running the full mutation loop.
+    // before staging/deployment — so the plan's resolved index is observable
+    // without running the full mutation loop.
+
+    // ---- dry-run ref resolution: invalid refs never touch a remote -------
+
+    /// Control: a VALID ref (`@`) with the recording factory dry-runs
+    /// successfully — dry runs still contact remotes to inspect status, so
+    /// the zero-contact contract applies ONLY to the invalid-ref failure
+    /// path — and the counters DO move, proving the recording seam would
+    /// catch a regression that re-introduced remote contact before the ref
+    /// check (a counter that cannot move would make the zero-invocation
+    /// property below vacuous).
+    #[test]
+    fn dry_run_valid_ref_contacts_factory_and_plans() {
+        let h = RecoveryHarness::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory = recording_factory(h.remotes_base.clone(), calls.clone());
+        let r = push(
+            &h.cfg_path,
+            &h.store,
+            &factory,
+            "t1",
+            &h.config,
+            &PushOptions {
+                dry_run: true,
+                ref_token: None,
+            },
+        )
+        .unwrap();
+        assert!(r.dry_run);
+        assert!(
+            r.message.contains("dry-run plan"),
+            "valid dry run must plan, got: {}",
+            r.message
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) > 0,
+            "a valid dry run contacts remotes for status; the recording factory must have counted \
+              at least one invocation"
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 32,
+            rng_seed: RngSeed::Fixed(0x0EA5_0E11_0BEA),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn relative_ref_resolves_post_reconciliation_latest_minus_depth(
+            (latest, depth) in (0u64..=4).prop_flat_map(|latest| {
+                (Just(latest), 1u64..=latest.max(1))
+            }),
+        ) {
+            let h = RecoveryHarness::new();
+            let slot = PlacementSlotId::new("p1".to_string());
+
+            // (c) A concurrent/reconciled append: a pending-commit attempt
+            // whose reconciliation will append EXACTLY ONE snapshot during
+            // the ref push. The push itself is real (it deploys to the remote
+            // and records the attempt) but the commit marker write fails
+            // once, so no snapshot is appended yet. It also persists the
+            // release record + behavior snapshot + tree the synthetic chain
+            // below reuses.
+            let armed = Arc::new(AtomicBool::new(true));
+            let armed_for_factory = armed.clone();
+            let rf = h.remotes_base.clone();
+            let fault_factory = move |s: &crate::config::ServerDef,
+                                      _slot: &crate::config::SlotDef|
+                     -> Result<Box<dyn Remote>> {
+                FailOnceMarkerRemote::build(rf.join(&s.id), armed_for_factory.clone())
+            };
+            let rp = push(
+                &h.cfg_path,
+                &h.store,
+                &fault_factory,
+                "t1",
+                &h.config,
+                &PushOptions {
+                    dry_run: false,
+                    ref_token: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(rp.status, Some(DeploymentStatus::PendingCommit));
+            let pending = rp.attempt.as_ref().expect("the pending push records an attempt");
+            let pending_id = pending.deployment_id.clone();
+            let pending_artifact = pending.slots[&slot].artifact.clone();
+            assert!(
+                h.store.read_snapshots("t1").unwrap().is_empty(),
+                "the pending attempt appends no snapshot yet"
+            );
+
+            // (a) Initial chain: synthetic snapshots 0..=latest (length L+1),
+            // all referencing the pending push's REAL release + tree (which
+            // are durable in the store), each with the harness's exact
+            // physical binding so `plan_assignments` accepts the rollback.
+            let bindings = crate::records::PhysicalBinding {
+                server: crate::model::ServerId::new("s1".to_string()),
+                deploy_dir: "/srv/eng".to_string(),
+            };
+            for i in 0..=latest {
+               seed_snapshot(
+                   &h.store,
+                   "t1",
+                   &format!("deploy-relative-chain-{latest}-{i}"),
+                   pending.behavior_sha256.as_str(),
+                   &pending_artifact.release,
+                   BTreeMap::from([(
+                       slot.clone(),
+                       GenerationRef {
+                           generation: GenerationId::new(format!("gen-relative-{latest}-{i}")),
+                           assignment: crate::model::PlacementSlotAssignment {
+                               placement_slot: slot.clone(),
+                               artifact: pending_artifact.clone(),
+                           },
+                        },
+                   )]),
+                   BTreeMap::from([(slot.clone(), bindings.clone())]),
+               );
+            }
+            assert_eq!(
+                h.store.read_snapshots("t1").unwrap().len() as u64,
+                latest + 1,
+                "the initial chain holds latest + 1 snapshots"
+            );
+
+            // The ref is RELATIVE: `@-` for depth 1, `parent(@, d)` else.
+            let token = if depth == 1 {
+                "@-".to_string()
+            } else {
+                format!("parent(@, {depth})")
+            };
+            // The PRE-FIX behavior resolved BEFORE reconciliation: against the
+           // pre-append chain it selected position latest - depth (stale) or
+           // failed outright when the chain was too short for the walk.
+            let pre_reconcile = history::resolve_ref_expr(
+                &history::parse_ref_expr(&token).unwrap(),
+                "t1",
+                &h.store,
+            );
+           // The POST-reconciliation chain: the pending attempt's ENTRY sits
+           // at position 0 (its intent line was appended BEFORE the seeded
+           // chain — the ledger's append order IS the history order), and
+           // the seeded chain fills positions 1..=latest+1. The ref
+           // `parent(@, depth)` selects chain position (latest + 1) - depth:
+           // 0 -> the pending attempt, p>0 -> the chain entry at p - 1.
+            let selected = (latest + 1) - depth;
+           let selected_deployment: String = if selected == 0 {
+               pending_id.as_str().to_string()
+           } else {
+               format!("deploy-relative-chain-{latest}-{}", selected - 1)
+           };
+           // The PRE-reconcile resolution (against the seeded chain only):
+           // `parent(@, depth)` walks to position (latest - depth) — the
+           // stale selection — or fails outright when the chain is too short
+           // (latest == 0 with depth 1 underflows). The pending attempt is
+           // NOT yet a successful entry, so it cannot be selected.
+            match pre_reconcile {
+               Ok(PushRef::Deployment { deployment_id, .. }) => {
+                   assert!(
+                       latest > 0,
+                       "a non-empty chain must resolve pre-reconcile"
+                   );
+                   assert_eq!(
+                       deployment_id.as_str(),
+                       format!("deploy-relative-chain-{latest}-{}", latest - depth),
+                       "the stale pre-fix selection"
+                   );
+                }
+                Ok(_) => {
+                    panic!("a relative deployment ref must not resolve to a non-deployment pre-reconcile")
+                }
+                Err(_) => {
+                    assert_eq!(
+                        latest, 0,
+                        "pre-fix on a non-empty chain must resolve (stale), not fail"
+                    );
+                }
+            }
+           // The POST-reconcile chain keeps the pending entry at its INTENT
+           // position 0 (the ledger's append order is the history order), so
+           // for latest >= 1 the relative walk from `@` lands on the SAME
+           // chain entry pre- and post-reconcile; only the latest==0 case
+           // (depth 1 == latest + 1) selects the reconciled pending itself.
+           // The essential claim is unchanged: the ref is resolved against
+           // the POST-reconciliation chain, which INCLUDES the pending.
+
+            // The fixed flow: the engine reconciles FIRST (appending the
+           // pending attempt's TERMINAL EVENT — it becomes the successful
+           // entry at position latest + 1), THEN resolves the ref against the
+           // post-reconciliation chain, then plans. The push is faulted at
+           // its FIRST store write after `plan.json` — the INTENT append —
+           // so the plan's resolved source is observable without the (slow)
+           // mutation loop.
+            let rf2 = h.remotes_base.clone();
+            let clean_factory = move |s: &crate::config::ServerDef,
+                                      _slot: &crate::config::SlotDef|
+                     -> Result<Box<dyn Remote>> {
+                Ok(Box::new(LocalTransport::new(rf2.join(&s.id))?))
+            };
+            let ref_id = DeploymentId::new(format!("deploy-relative-ref-{latest}-{depth}"));
+            h.store
+                .fault_registry()
+               .arm_append_attempt(ref_id.as_str());
+            let err = push_ref_with_id(
+                &h.cfg_path,
+                &h.store,
+                &clean_factory,
+                "t1",
+                &h.config,
+                &PushOptions {
+                    dry_run: false,
+                    ref_token: Some(token.clone()),
+                },
+                &ref_id,
+            )
+           .expect_err("the plan is durable before the first intent write, so the faulted push must Err");
+            assert!(
+               err.to_string().contains("append_attempt"),
+               "the injected intent fault must be the failure, got: {err}"
+            );
+
+           // (c) The reconciled append happened: the pending attempt's entry
+           // (intent line at position 0) now carries its Successful terminal
+           // — it is the successful-chain entry at position 0, and the
+           // seeded chain fills positions 1..=latest+1.
+            let snapshots = h.store.read_snapshots("t1").unwrap();
+            assert_eq!(
+                snapshots.len() as u64,
+                latest + 2,
+               "seeded (latest+1) + reconciled (1); the faulted ref push appends nothing"
+            );
+           let reconciled = snapshots.first().expect("the reconciled entry must exist");
+            assert_eq!(
+                reconciled.deployment_id.as_str(),
+                pending_id.as_str(),
+               "the reconciled entry is the pending attempt (its intent line was first)"
+           );
+           assert_eq!(
+               history::successful_index(&h.store, "t1", &DeploymentId::new(pending_id.as_str()))
+                   .unwrap()
+                   .unwrap(),
+               0,
+               "the pending attempt's successful position is s0"
+            );
+
+           // THE ASSERTION: the SELECTED deployment recorded in the plan
+           // equals post-reconciliation position (latest + 1) - depth — the
+           // deployment id at that chain position.
+            let plan: DeploymentPlan = serde_json::from_str(
+                &std::fs::read_to_string(h.store.deployment_dir(ref_id.as_str()).join("plan.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                plan.source,
+               crate::records::PlanSource::DeploymentRef(DeploymentId::new(
+                   selected_deployment.clone()
+               )),
+               "'{token}' must select the entry at successful-chain position {selected} =                  s{}(latest + 1) - {depth} — the POST-reconciliation selection, not the                  pre-reconcile s{}(latest) - {depth}",
+                latest + 1,
+                latest
+            );
+        }
+    }
 
     // THE property: a dry run with a NONEXISTENT ref returns a REF error
     // and never contacts a remote — the recording factory reports ZERO
@@ -6592,27 +6782,24 @@ interval_seconds = 0
                 deploy_dir: "/srv/eng".to_string(),
             };
             for i in 0..=2u64 {
-                h.store
-                    .append_snapshot(
-                        "t1",
-                        &crate::records::DeploymentSnapshot {
-                            deployment_id: DeploymentId::new(format!("deploy-fixture-{i}")),
-                            target: TargetName::new("t1".to_string()),
-                            behavior_sha256: "bb".to_string(),
-                            slots: BTreeMap::from([(
-                                slot.clone(),
-                                GenerationRef {
-                                    generation: GenerationId::new(format!("gen-fixture-{i}")),
-                                    assignment: crate::model::PlacementSlotAssignment {
-                                        placement_slot: slot.clone(),
-                                        artifact: artifact.clone(),
-                                    },
-                                },
-                            )]),
-                            bindings: BTreeMap::from([(slot.clone(), bindings.clone())]),
+                seed_snapshot(
+                    &h.store,
+                    "t1",
+                    &format!("deploy-fixture-{i}"),
+                    "bb",
+                    &artifact.release,
+                    BTreeMap::from([(
+                        slot.clone(),
+                        GenerationRef {
+                            generation: GenerationId::new(format!("gen-fixture-{i}")),
+                            assignment: crate::model::PlacementSlotAssignment {
+                                placement_slot: slot.clone(),
+                                artifact: artifact.clone(),
+                            },
                         },
-                    )
-                    .unwrap();
+                    )]),
+                    BTreeMap::from([(slot.clone(), bindings.clone())]),
+                );
             }
 
             // Shape-valid but semantically unresolvable: derive the token

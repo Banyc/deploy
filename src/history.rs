@@ -1,48 +1,49 @@
-//! Deployment history, rollback snapshots, and rollback reference handling.
+//! Deployment history, rollback references, and finalization over the ONE
+//! per-target deployment ledger.
 //!
-//! Only fully successful deployments produce a snapshot
-//! (`refs/snapshots.jsonl`), and the SNAPSHOT LOG IS THE DEPLOYMENT HISTORY:
-//! each successful deployment IS a rollback payload KEYED BY ITS DEPLOYMENT
-//! ID (`deploy push <target> <deployment-id>` restores exactly that
-//! deployment's stored state). Failed and degraded attempts remain visible
-//! through `deploy log` and `attempts.jsonl` but are NOT valid rollback
-//! sources — a failed deployment id never resolves. The separate snapshot
-//! index (`sN`) has been REMOVED from the public surface: any internal
-//! position the floor/compaction needs is DERIVED from the LOG ORDER (the
-//! log is appended in deployment order), never stored as a public index.
+//! A target's deployment history is its ordered LEDGER
+//! (`targets/<target>/ledger.jsonl`, see [`crate::records`]): each entry
+//! starts as the durable INTENT (appended before any remote mutation) and its
+//! TERMINAL EVENT carries the status, the per-slot outcomes, and — when
+//! successful — the ROLLBACK STATE ([`crate::records::LedgerRollback`]:
+//! per-slot generation refs + behavior digest + physical bindings + the
+//! release the generations came from). The ledger's append order IS the
+//! history order; there is NO separate snapshot op log, NO floor marker, and
+//! NO `refs/last-successful` ref file — the latest successful entry is
+//! DERIVED from the ledger.
 //!
-//! # History floor
+//! Rollback references resolve against the ledger's SUCCESSFUL terminal
+//! events (each successful deployment IS a rollback payload KEYED BY ITS
+//! DEPLOYMENT ID): `deploy push <target> <deployment-id>` restores exactly
+//! that deployment's stored state, and the relative refs (`@-`, `@--`,
+//! `parent(@, N)`, `<deployment-id>-`, `<deployment-id>--`,
+//! `parent(<deployment-id>, N)`) walk the target's DEPLOYMENT HISTORY — the
+//! ledger's successful entries in order. Failed and degraded attempts remain
+//! visible through `deploy log` but are NOT valid rollback sources — a failed
+//! deployment id never resolves. The public grammar has NO snapshot index
+//! (`sN`): the merged [`crate::revset`] grammar is deployment-keyed
+//! (`RefExpr = Head | Release | Relative{base: At | Refid(DeploymentId)}`).
+//! Any internal position the checkpoint/compaction needs is DERIVED from the
+//! ledger order ([`successful_index`], internal only — never a public ref).
 //!
-//! A checkpoint (`deploy checkpoint <target> <deployment-id>`) establishes a
-//! monotonic history floor for the target, KEYED BY DEPLOYMENT ID: every
-//! read here resolves against the FLOORED chain — [`LocalStore::read_snapshots`]
-//! exposes only the suffix beginning at the checkpoint deployment's position
-//! in the log, so the checkpoint deployment itself stays resolvable while
-//! `@-` / `parent(...)` stepping below it (and any deployment id below it)
-//! fails closed with a "history floor" ref error. Appends after a checkpoint
-//! simply append (the log is deployment-keyed, so a new deployment id always
-//! mints a new line — compaction can never reuse an identity).
+//! A SUCCESSFUL deployment finalizes replay-safely through the ONE shared
+//! finalizer ([`finalize_successful_attempt`]), which APPENDS the terminal
+//! event (status `Successful` + outcomes + rollback state) to the ledger.
+//! The append is atomic (one line); a crash before it leaves the entry
+//! intent-only (recoverable-pending) and the next push reconciles it.
 //!
-//! # Reference syntax (jj-style)
+//! # Reference resolution (two-phase)
 //!
 //! The reference LANGUAGE is encapsulated in [`crate::revset`]: a pure,
 //! store-free grammar whose [`crate::revset::parse_ref_expr`] returns only
 //! the AST ([`RefExpr`] and friends, re-exported below) — no store access,
-//! no resolution. This module keeps only the store-dependent RESOLUTION that
-//! FOLLOWS the AST. Resolution is a TWO-PHASE process:
-//!
-//! * [`parse_ref_expr`] (in [`crate::revset`]) turns the token into a
-//!   structured [`RefExpr`] with NO store access — pure syntax. The engine
-//!   parses the token BEFORE it acquires locks or persists anything, so a
-//!   malformed token fails before any side effect and the deployment id/plan
-//!   are never serialized against a half-parsed reference.
-//! * [`resolve_ref_expr`] turns the parsed expression into a concrete
-//!   [`PushRef`] against the target's deployment history in the store. The
-//!   engine calls it AFTER reconciliation
-//!   ([`crate::push::reconcile::reconcile_pending_commits`]) has appended any
-//!   recovered snapshots, so a relative ref is computed against the
-//!   POST-reconciliation chain: `@-` means one before the latest INCLUDING
-//!   this push's reconciled append, never a stale pre-recovery snapshot.
+//! no resolution. This module keeps only the store-dependent RESOLUTION
+//! ([`resolve_ref_expr`]) that FOLLOWS the AST. The engine parses the token
+//! BEFORE it acquires locks or persists anything (a malformed token fails
+//! before any side effect) and resolves only once the ledger is stable
+//! (after reconciliation has appended any recovered terminal events), so a
+//! relative ref is computed against the POST-reconciliation chain: `@-`
+//! means one before the latest INCLUDING this push's reconciled append.
 //!
 //! The accepted forms — `` (empty)/`HEAD`/`@`, `@-`, `@--`, `parent(@, N)`,
 //! the bare `<deployment-id>` (EXACT rollback to that deployment's stored
@@ -55,17 +56,20 @@
 //! the reference, and the `@`-relative forms resolve against the
 //! separately-given target argument. A deployment id resolves to EXACTLY
 //! that deployment's stored state, and the ancestor steps walk the
-//! DEPLOYMENT HISTORY from a base POSITION (the log order — positions are
+//! DEPLOYMENT HISTORY from a base POSITION (the ledger order — positions are
 //! DERIVED, never stored); stepping past the start of the chain, an
 //! unresolvable deployment id, or an empty chain fail closed with a ref
-//! error — never underflow, never guess.
+//! error — never underflow, never guess. After a checkpoint the ledger IS
+//! the retained suffix (the floor is implicit), so a discarded deployment id
+//! is simply absent and refuses.
 
 use crate::error::{Error, Result};
 use crate::model::{
     DeploymentId, GenerationRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, TargetName,
 };
 use crate::records::{
-    AttemptServer, DeploymentAttempt, DeploymentSnapshot, DeploymentStatus, PhysicalBinding,
+    AttemptServer, DeploymentStatus, LedgerEntry, LedgerIntent, LedgerRollback, LedgerTerminal,
+    PhysicalBinding, ServerResult,
 };
 use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
@@ -83,9 +87,10 @@ pub(crate) use crate::revset::{RefExpr, RelBase, parse_ref_expr};
 pub enum PushRef {
     /// Materialize the currently mapped local files; assign configured variants.
     Head,
-    /// Restore the stored state of a historical successful deployment, KEYED
-    /// BY ITS DEPLOYMENT ID (`deploy push <target> <deployment-id>`, and the
-    /// `@` / `parent(...)` walk of the deployment history).
+    /// Restore the rollback state of a historical successful deployment,
+    /// KEYED BY ITS DEPLOYMENT ID (`deploy push <target> <deployment-id>`,
+    /// and the `@` / `parent(...)` walk of the deployment history). The
+    /// deployment's rollback payload is resolved from the target's ledger.
     Deployment {
         target: TargetName,
         deployment_id: DeploymentId,
@@ -98,17 +103,17 @@ pub enum PushRef {
 }
 
 /// Resolve a parsed [`RefExpr`] to a concrete [`PushRef`] against the
-/// separately-given `target` and the target's deployment history in `store`.
+/// separately-given `target` and the target's ledger in `store`.
 ///
-/// Store-DEPENDENT (unlike [`parse_ref_expr`]): reads the target's snapshot
-/// log (the DEPLOYMENT HISTORY — each successful deployment is a rollback
+/// Store-DEPENDENT (unlike [`parse_ref_expr`]): reads the target's ledger
+/// (the DEPLOYMENT HISTORY — each successful terminal event is a rollback
 /// payload keyed by its deployment id), so the caller must invoke it AFTER
-/// reconciliation has appended any recovered snapshots — the engine parses
-/// the token up front but resolves only once the chain is stable, so relative
-/// refs see the reconciled append. The target is passed ONCE (the push
-/// argument); the relative forms never repeat it. Failures are ref errors: an
-/// empty chain, an unresolvable deployment id, and walking past the start of
-/// the chain all fail closed rather than guessing.
+/// reconciliation has appended any recovered terminal events — the engine
+/// parses the token up front but resolves only once the ledger is stable, so
+/// relative refs see the reconciled append. The target is passed ONCE (the
+/// push argument); the relative forms never repeat it. Failures are ref
+/// errors: an empty chain, an unresolvable deployment id, and walking past
+/// the start of the chain all fail closed rather than guessing.
 pub(crate) fn resolve_ref_expr(
     expr: &RefExpr,
     target: &str,
@@ -131,14 +136,15 @@ pub(crate) fn resolve_ref_expr(
             if rel.base == RelBase::At && rel.steps == 0 {
                 return Ok(PushRef::Head);
             }
-            // The deployment history IS the snapshot log, ordered by appends
-            // (deployment order). POSITIONS are derived from that order —
-            // there is no stored index — so the chain is a contiguous
-            // position space and any position < len is a member.
-            let entries = store.read_snapshots(target)?;
-            let base_pos = resolve_base_pos(&rel.base, target, &entries, expr, store)?;
+            // The deployment history IS the ledger's successful entries,
+            // ordered by appends (deployment order). POSITIONS are derived
+            // from that order — there is no stored index — so the chain is a
+            // contiguous position space and any position < len is a member.
+            let entries = store.read_ledger(target)?;
+            let chain = successful_chain(&entries);
+            let base_pos = resolve_base_pos(&rel.base, target, &chain, expr)?;
             let base_id = match &rel.base {
-                RelBase::At => entries[base_pos].deployment_id.as_str(),
+                RelBase::At => chain[base_pos].deployment_id.as_str(),
                 RelBase::Refid(dep) => dep.as_str(),
             };
             let pos = base_pos.checked_sub(rel.steps as usize).ok_or_else(|| {
@@ -148,84 +154,54 @@ pub(crate) fn resolve_ref_expr(
                     rel.steps
                 ))
             })?;
-            // The history floor gates resolution: the chain the read exposed is
-            // already the suffix beginning at the checkpoint deployment
-            // (read_snapshots filters by the durable marker), so a
-            // below-floor position is structurally unreachable here — but the
-            // explicit check documents the guarantee and guards any future
-            // caller that resolves against a raw chain.
-            if let Some(floor) = store.read_history_floor(target)?
-                && let Some(fpos) = entries
-                    .iter()
-                    .position(|e| e.deployment_id == floor.deployment_id)
-                && pos < fpos
-            {
-                return Err(Error::r#ref(format!(
-                    "cannot roll back below the deployment floor (checkpoint {}) on target \
-                    '{target}': history before the checkpoint has been discarded",
-                    floor.deployment_id
-                )));
-            }
             Ok(PushRef::Deployment {
                 target: TargetName::new(target.to_string()),
-                deployment_id: entries[pos].deployment_id.clone(),
+                deployment_id: chain[pos].deployment_id.clone(),
             })
         }
     }
 }
 
-/// Resolve a relative reference's base to a POSITION in the floored
-/// deployment chain (the snapshot log in deployment order). `expr` renders
-/// the reference for error messages (the parsed form has no raw token
-/// anymore). The chain is the FLOORED read (the suffix beginning at the
-/// checkpoint deployment), so a deployment id below the floor is absent;
-/// when the target has a history floor, the absence is reported as a
-/// below-floor refusal naming the checkpoint rather than a plain "no
+/// The successful chain of a ledger: the entries whose terminal event is
+/// `Successful` (carrying a rollback state), in ledger order. The position
+/// in this chain is the internal snapshot position (0-based) — the ledger's
+/// append order is the history order, and after a checkpoint the first
+/// retained successful entry is position 0. Never exposed as a public ref.
+fn successful_chain(entries: &[LedgerEntry]) -> Vec<&LedgerEntry> {
+    entries
+        .iter()
+        .filter(|e| {
+            e.terminal
+                .as_ref()
+                .is_some_and(|t| t.status == DeploymentStatus::Successful && t.rollback.is_some())
+        })
+        .collect()
+}
+
+/// Resolve a relative reference's base to a POSITION in the successful chain
+/// (the ledger in deployment order). `expr` renders the reference for error
+/// messages. The chain is the CURRENT ledger (the retained suffix after a
+/// checkpoint — the floor is implicit), so a deployment id below the
+/// retained history is absent and refuses with a plain "no successful
 /// deployment" error.
 fn resolve_base_pos(
     base: &RelBase,
     target: &str,
-    entries: &[DeploymentSnapshot],
+    chain: &[&LedgerEntry],
     expr: &RefExpr,
-    store: &LocalStore,
 ) -> Result<usize> {
     match base {
-        RelBase::At => entries.len().checked_sub(1).ok_or_else(|| {
+        RelBase::At => chain.len().checked_sub(1).ok_or_else(|| {
             Error::r#ref(format!(
                 "no successful deployments for target '{target}'; cannot resolve '{expr}'"
             ))
         }),
-        RelBase::Refid(dep) => match entries.iter().position(|e| e.deployment_id == *dep) {
+        RelBase::Refid(dep) => match chain.iter().position(|e| e.deployment_id == *dep) {
             Some(pos) => Ok(pos),
-            None => {
-                // The history-floor hint: a deployment absent from the
-                // FLOORED chain with a floor established sits strictly
-                // before the checkpoint — either it is still in the RAW log
-                // (an interrupted compaction) or the checkpoint's physical
-                // compaction already discarded it. Both are "cannot roll
-                // back below the history floor" — report the floor naming
-                // it rather than a generic "no deployment" error (an id
-                // that never existed stays a plain error).
-                if let Some(floor) = store.read_history_floor(target)? {
-                    let below_raw = store
-                        .read_snapshots_raw(target)?
-                        .iter()
-                        .any(|e| e.deployment_id == *dep);
-                    return Err(Error::r#ref(format!(
-                        "cannot roll back below the history floor (checkpoint {}) on target \
-                        '{target}': history before the checkpoint has been discarded{}",
-                        floor.deployment_id,
-                        if below_raw {
-                            format!(" (deployment '{dep}' sits below it)")
-                        } else {
-                            format!(" (deployment '{dep}' was discarded with it)")
-                        }
-                    )));
-                }
-                Err(Error::r#ref(format!(
-                    "no successful deployment '{dep}' on target '{target}'"
-                )))
-            }
+            None => Err(Error::r#ref(format!(
+                "no successful deployment '{dep}' on target '{target}' (a failed, pending, or \
+                already-checkpointed deployment never resolves)"
+            ))),
         },
     }
 }
@@ -240,222 +216,72 @@ pub fn ref_name(target: &TargetName, deployment_id: &DeploymentId) -> String {
     )
 }
 
-/// Ensure the snapshot log contains exactly one successful snapshot for the
-/// attempt's deployment ID, and that `refs/last-successful` points at it.
-/// Returns the snapshot's deployment id (THE KEY — the log is deployment-
-/// keyed; positions are derived from the log order, never stored).
-///
-/// This is the single idempotent insert used by BOTH the main success path
-/// and recovery finalization, and it is replay-safe:
-///
-/// * If a snapshot with `deployment_id == attempt.deployment_id` already
-///   exists (a previous finalization crashed after appending the snapshot but
-///   before finishing), no second snapshot is appended: the existing
-///   snapshot's key is returned. The log never contains two snapshots for
-///   the same deployment ID.
-/// * `refs/last-successful` is (re)written to the attempt's deployment ID in
-///   both cases — idempotent, the same value on every replay — which also
-///   repairs the stale ref left by a crash between the snapshot append and
-///   the ref update.
-///
-/// The snapshot is built from the attempt's OUTCOMES (`outcomes`: the
-/// per-slot actual state the engine observed — results.json on the main path,
-/// or the verified desired state during recovery), NOT from the attempt
-/// record itself: the persisted attempt is the immutable intent and its
-/// `slots` map is empty.
-///
-/// # GC integration note (in-flight feature)
-///
-/// The snapshot payload (`slots`, `behavior_sha256`, `bindings`, and the
-/// release its generations came from) is the INTERNAL rollback payload and is
-/// kept INTACT here — keyed by deployment id. The GC retained-set rule
-/// ("every snapshot at or above every floor") keys off the same deployment
-/// identity: a retained set is every snapshot at or after the floor
-/// deployment's POSITION in the log (derived, never stored). Any GC work
-/// lands at that integration point; this function only guarantees the payload
-/// survives, keyed by its deployment id.
-pub fn ensure_snapshot(
-    store: &LocalStore,
-    target: &TargetName,
-    attempt: &DeploymentAttempt,
-    outcomes: &BTreeMap<PlacementSlotId, AttemptServer>,
-    bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
-) -> Result<DeploymentId> {
-    let target = target.as_str();
-    // RAW (floor-unfiltered) snapshot log: the key space is the deployment id
-    // space. A checkpoint compacts the log to a suffix (the below-floor
-    // deployments are discarded); a NEW deployment id always appends a NEW
-    // line — compaction can never reuse an identity.
-    let entries = store.read_snapshots_raw(target)?;
-    if let Some(existing) = entries
-        .iter()
-        .find(|e| e.deployment_id == attempt.deployment_id)
-    {
-        store.write_last_successful(target, attempt.deployment_id.as_str())?;
-        return Ok(existing.deployment_id.clone());
-    }
-    let entry = build_snapshot(attempt, outcomes, bindings);
-    store.append_snapshot(target, &entry)?;
-    store.write_last_successful(target, attempt.deployment_id.as_str())?;
-    Ok(attempt.deployment_id.clone())
-}
-
-/// Append a successful snapshot to the snapshot log and return its
-/// deployment id (the key).
-///
-/// Idempotent by deployment ID: delegates to
-/// [`ensure_snapshot`], so re-running finalization for the same
-/// attempt never duplicates the snapshot and always repairs
-/// `refs/last-successful`. Kept as the historical name; the main success
-/// path now finalizes through the shared
-/// [`finalize_successful_attempt`], which calls this. The snapshot is built
-/// from the attempt's OUTCOMES map, not the attempt record (see
-/// [`ensure_snapshot`]).
-pub fn append_snapshot(
-    store: &LocalStore,
-    target: &TargetName,
-    attempt: &DeploymentAttempt,
-    outcomes: &BTreeMap<PlacementSlotId, AttemptServer>,
-    bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
-) -> Result<DeploymentId> {
-    ensure_snapshot(store, target, attempt, outcomes, bindings)
-}
-
-/// Finalize a successful deployment attempt replay-safely: the single shared
+/// Finalize a successful deployment replay-safely: the SINGLE shared
 /// terminal path used by BOTH the normal push success path and recovery
-/// ([`crate::push::reconcile::reconcile_pending_commits`]).
+/// ([`crate::push::reconcile::reconcile_pending_commits`]). Appends the
+/// TERMINAL EVENT (status `Successful`, the per-slot `outcomes`, and the
+/// rollback state built from `actuals`) to the target's ledger — ONE atomic
+/// line append, the only commit of the finalize.
 ///
-/// The snapshot is built from the attempt's OUTCOMES (`outcomes`: per-slot
-/// actual state observed by the engine — live actuals on the main path,
-/// results.json or the verified desired state during recovery), never from
-/// the attempt record itself (the persisted attempt is the immutable intent;
-/// its `slots` map is empty).
+/// Replay idempotency: if the entry already carries a terminal event, every
+/// durable step already happened and this call is a no-op — a crash after
+/// the append can never duplicate the terminal ([`LocalStore::append_terminal`]
+/// refuses duplicates).
 ///
-/// Persistence order:
-/// 1. RECOVERABLE MARKER: ensure the attempt's LATEST transition is
-///    `PendingCommit`, appending a `PendingCommit` transition (reason
-///    "finalization started") only when the latest is not already
-///    `PendingCommit`. The latest transition is recovery's eligibility
-///    gate, so a crash at any later point leaves the attempt re-eligible and
-///    the next push replays exactly the remaining steps. On the main path the
-///    attempt's latest is `InProgress` here (this appends `PendingCommit`);
-///    in recovery it is already `PendingCommit` (a no-op).
-/// 2. SNAPSHOT + REF: [`ensure_snapshot`] — idempotent by deployment ID (a
-///    replay never appends a second entry) and (re)writes
-///    `refs/last-successful`, repairing a stale ref left by a crash between
-///    the snapshot append and the ref update.
-/// 3. STATUS LAST: append the terminal `Successful` transition with `reason`
-///    only after every durable step, so the attempt is never recorded
-///    `Successful` while its snapshot is missing.
-///
-/// Replay idempotency: step 1 is skipped when the latest transition is
-/// already `PendingCommit`; step 2 is a no-op (or ref repair) when the
-/// snapshot entry already exists; step 3 appends exactly once — a crash
-/// before it leaves the attempt eligible, and a crash after it means every
-/// earlier step is already durable (and the eligibility gate skips the
-/// attempt forever once the latest transition says `Successful`).
-///
-/// Returns the attempt's snapshot deployment id (the rollback key).
+/// The rollback is built from the attempt's OUTCOMES (`actuals`: per-slot
+/// actual state observed by the engine — live actuals on the main path, the
+/// verified desired state during recovery), never from the intent record
+/// itself (the persisted intent is the immutable intent; its `slots` map is
+/// empty).
 pub fn finalize_successful_attempt(
     store: &LocalStore,
-    attempt: &DeploymentAttempt,
-    outcomes: &BTreeMap<PlacementSlotId, AttemptServer>,
+    attempt: &LedgerIntent,
+    outcomes: &BTreeMap<PlacementSlotId, ServerResult>,
+    actuals: &BTreeMap<PlacementSlotId, AttemptServer>,
     reason: &str,
     bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
-) -> Result<DeploymentId> {
-    let id = attempt.deployment_id.as_str();
-    // Already fully finalized (the eligibility gate normally prevents this):
-    // every earlier step is durable by construction; only repair a stale
-    // `refs/last-successful` and stop without appending anything.
-    if store.latest_status(id)? == Some(DeploymentStatus::Successful) {
-        return ensure_snapshot(store, &attempt.target, attempt, outcomes, bindings);
+) -> Result<()> {
+    let entries = store.read_ledger(attempt.target.as_str())?;
+    if let Some(e) = entries
+        .iter()
+        .find(|e| e.deployment_id == attempt.deployment_id)
+        && e.terminal.is_some()
+    {
+        return Ok(());
     }
-    // 1. Recoverable marker: the attempt must be re-eligible if we crash
-    //    before the snapshot lands.
-    if store.latest_status(id)? != Some(DeploymentStatus::PendingCommit) {
-        store.append_transition(
-            id,
-            &DeploymentStatus::PendingCommit,
-            Some("finalization started"),
-        )?;
-    }
-    // 2. Snapshot entry + `refs/last-successful` (idempotent).
-    let dep = ensure_snapshot(store, &attempt.target, attempt, outcomes, bindings)?;
-    // 3. Terminal status LAST.
-    store.append_transition(id, &DeploymentStatus::Successful, Some(reason))?;
-    Ok(dep)
-}
-
-/// Resolve the per-slot outcomes used to build a successful snapshot
-/// when the engine no longer has the live outcomes at hand (recovery): the
-/// persisted results (`deployments/<id>/results.json`) when present — a
-/// crash after the mutation loop but before/within finalization — otherwise
-/// the attempt's verified desired state (a crash before outcomes were
-/// persisted, e.g. a faulted `write_results`).
-///
-/// The per-slot ARTIFACT always resolves from the attempt's desired
-/// assignment: results.json records outcomes (generation, status) but not
-/// artifacts, and recovery already verified each slot's current generation
-/// equals the desired generation. Slots without a recorded generation are
-/// not part of a coherent successful snapshot and are dropped by
-/// [`build_snapshot`].
-pub fn resolve_attempt_outcomes(
-    store: &LocalStore,
-    attempt: &DeploymentAttempt,
-) -> Result<BTreeMap<PlacementSlotId, AttemptServer>> {
-    // `read_results` fails when `results.json` is absent (crash before the
-    // outcomes were persisted); treat that as "verified desired state only".
-    let results = store.read_results(attempt.deployment_id.as_str()).ok();
-    let mut outcomes = BTreeMap::new();
-    for sid in &attempt.slot_ids {
-        let Some(desired) = attempt.desired.get(sid) else {
-            continue;
-        };
-        let generation = results
-            .as_ref()
-            .and_then(|r| r.slots.get(sid).and_then(|sr| sr.generation.clone()))
-            .or_else(|| Some(desired.generation.clone()));
-        outcomes.insert(
-            sid.clone(),
-            AttemptServer {
-                artifact: desired.assignment.artifact.clone(),
-                generation,
-            },
-        );
-    }
-    Ok(outcomes)
-}
-
-/// Build a snapshot entry from the attempt's OUTCOMES (per-slot actual
-/// state), not from the attempt record: the persisted attempt is the
-/// immutable intent (its `slots` map is empty), so the snapshot must be
-/// built from the outcomes the engine observed — live per-slot actuals on
-/// the main path, or results.json / the verified desired state during
-/// recovery ([`resolve_attempt_outcomes`]). A successful snapshot
-/// carries one complete [`GenerationRef`] per slot; slots without a
-/// recorded generation are not part of a coherent successful snapshot and
-/// are dropped.
-///
-/// The snapshot is KEYED BY THE ATTEMPT'S DEPLOYMENT ID (the old numeric
-/// `index`/`sN` identity is gone — the log is deployment-keyed and ordered
-/// by appends; positions are derived, never stored).
-///
-/// `bindings` records the COMPLETE physical binding (`{server, deploy_dir}`)
-/// each slot had when the deployment ran (the engine passes the target's
-/// current slot→binding map from `deploy.toml`). It is stored as a separate
-/// map so the `slots` map and its [`GenerationRef`]s stay intact; a legacy
-/// entry with no bindings map deserializes to an empty one (unverifiable,
-/// so rollback refuses rather than guessing the host/location).
-pub fn build_snapshot(
-    attempt: &DeploymentAttempt,
-    outcomes: &BTreeMap<PlacementSlotId, AttemptServer>,
-    bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
-) -> DeploymentSnapshot {
-    DeploymentSnapshot {
+    let rollback = build_rollback(attempt, actuals, bindings);
+    let terminal = LedgerTerminal {
         deployment_id: attempt.deployment_id.clone(),
         target: attempt.target.clone(),
+        status: DeploymentStatus::Successful,
+        recorded_at: crate::remote::helper::now_rfc3339(),
+        outcomes: outcomes.clone(),
+        rollback: Some(rollback),
+        reason: Some(reason.to_string()),
+    };
+    store.append_terminal(attempt.target.as_str(), &terminal)
+}
+
+/// Build the rollback state of a successful deployment from the attempt's
+/// OUTCOMES (`actuals`: per-slot actual state), never from the intent record.
+/// A successful deployment carries one complete [`GenerationRef`] per slot;
+/// slots without a recorded generation are not part of a coherent rollback
+/// and are dropped. `bindings` records the COMPLETE physical binding
+/// (`{server, deploy_dir}`) each slot had when the deployment ran; a missing
+/// entry is "unverifiable" and makes exact rollback refuse the slot.
+pub fn build_rollback(
+    attempt: &LedgerIntent,
+    actuals: &BTreeMap<PlacementSlotId, AttemptServer>,
+    bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
+) -> LedgerRollback {
+    LedgerRollback {
         behavior_sha256: attempt.behavior_sha256.clone(),
-        slots: outcomes
+        release: actuals
+            .values()
+            .next()
+            .map(|s| s.artifact.release.clone())
+            .unwrap_or_default(),
+        slots: actuals
             .iter()
             .filter_map(|(slot, s)| {
                 s.generation.clone().map(|generation| {
@@ -476,51 +302,134 @@ pub fn build_snapshot(
     }
 }
 
-/// Resolve a deployment id to its stored rollback payload (the snapshot the
-/// deployment produced). The id must be a SUCCESSFUL deployment of the
-/// target (it must own a snapshot in the floored log); failed and degraded
-/// attempts never resolve.
+/// Resolve the per-slot OUTCOMES used to finalize a pending deployment when
+/// the engine no longer has the live outcomes at hand (recovery): recovery
+/// already verified each slot's live generation equals the desired
+/// generation, so the outcomes ARE the desired assignments (the old
+/// `deployments/<id>/results.json` outcomes store is GONE — the ledger
+/// terminal carries outcomes, and a terminal-less entry has none by
+/// construction). Returns the per-slot `ServerResult` outcomes AND the
+/// per-slot actuals ([`AttemptServer`]) for the rollback, built from the
+/// attempt's desired assignments.
+pub fn recovery_outcomes(
+    attempt: &LedgerIntent,
+) -> (
+    BTreeMap<PlacementSlotId, ServerResult>,
+    BTreeMap<PlacementSlotId, AttemptServer>,
+) {
+    let mut outcomes = BTreeMap::new();
+    let mut actuals = BTreeMap::new();
+    for sid in &attempt.slot_ids {
+        let Some(desired) = attempt.desired.get(sid) else {
+            continue;
+        };
+        outcomes.insert(
+            sid.clone(),
+            ServerResult {
+                slot_id: sid.clone(),
+                outcome: crate::records::ServerOutcomeKind::Activated,
+                generation: Some(desired.generation.clone()),
+                compensated: false,
+                error: None,
+            },
+        );
+        actuals.insert(
+            sid.clone(),
+            AttemptServer {
+                artifact: desired.assignment.artifact.clone(),
+                generation: Some(desired.generation.clone()),
+            },
+        );
+    }
+    (outcomes, actuals)
+}
+
+/// Reconstruct the successful chain of a target from its ledger (the
+/// rollback states — used to rebuild the derived latest-successful view).
+pub fn successful_deployments(store: &LocalStore, target: &TargetName) -> Result<Vec<LedgerEntry>> {
+    let entries = store.read_ledger(target.as_str())?;
+    Ok(entries
+        .into_iter()
+        .filter(|e| {
+            e.terminal
+                .as_ref()
+                .is_some_and(|t| t.status == DeploymentStatus::Successful && t.rollback.is_some())
+        })
+        .collect())
+}
+
+/// Resolve a deployment id to its stored ROLLBACK PAYLOAD (the rollback
+/// state of the ledger's successful terminal event). The id must be a
+/// SUCCESSFUL deployment of the target (its ledger entry carries a
+/// `Successful` terminal with a rollback state); failed, degraded, pending,
+/// and already-checkpointed-away deployments never resolve.
 pub fn resolve_deployment(
     store: &LocalStore,
     target: &TargetName,
     deployment_id: &DeploymentId,
-) -> Result<DeploymentSnapshot> {
-    let target = target.as_str();
-    let entries = store.read_snapshots(target)?;
-    entries
-        .into_iter()
+) -> Result<LedgerRollback> {
+    let entries = store.read_ledger(target.as_str())?;
+    let entry = entries
+        .iter()
         .find(|e| e.deployment_id == *deployment_id)
         .ok_or_else(|| {
             Error::r#ref(format!(
                 "no successful deployment '{deployment_id}' for target '{target}'"
             ))
-        })
+        })?;
+    let terminal = entry.terminal.as_ref().ok_or_else(|| {
+        Error::r#ref(format!(
+            "deployment '{deployment_id}' on target '{target}' has no terminal event (the deployment did not complete)"
+        ))
+    })?;
+    if terminal.status != DeploymentStatus::Successful {
+        return Err(Error::r#ref(format!(
+            "deployment '{deployment_id}' on target '{target}' ended {status:?} — only successful deployments carry a rollback state",
+            status = terminal.status
+        )));
+    }
+    terminal.rollback.clone().ok_or_else(|| {
+        Error::r#ref(format!(
+            "deployment '{deployment_id}' on target '{target}' has no rollback state"
+        ))
+    })
 }
 
-/// Reconstruct the set of successful deployments for a target from the
-/// snapshot log (used to rebuild history from servers when the local ref is
-/// stale). The log order IS the deployment order.
-pub fn successful_snapshots(
+/// The INTERNAL snapshot position of a successful deployment: its position
+/// in the CURRENT ledger's successful chain, or `None` when it is not a
+/// successful entry. Internal only — positions are derived from the ledger
+/// order and never exposed through the public grammar (which is
+/// deployment-keyed).
+pub fn successful_index(
     store: &LocalStore,
-    target: &TargetName,
-) -> Result<Vec<DeploymentSnapshot>> {
-    store.read_snapshots(target.as_str())
+    target: &str,
+    deployment_id: &DeploymentId,
+) -> Result<Option<u64>> {
+    let entries = store.read_ledger(target)?;
+    let chain = successful_chain(&entries);
+    Ok(chain
+        .iter()
+        .position(|e| e.deployment_id == *deployment_id)
+        .map(|p| p as u64))
 }
 
-/// Collect the distinct placement slot IDs referenced across a set of attempts.
-pub fn attempt_slot_ids(attempt: &DeploymentAttempt) -> Vec<PlacementSlotId> {
+/// Collect the distinct placement slot IDs referenced across a set of
+/// intent entries.
+pub fn attempt_slot_ids(attempt: &LedgerIntent) -> Vec<PlacementSlotId> {
     attempt.slot_ids.clone()
 }
 
 /// Build a map of rollback display names (`deployment <deployment-id> of
-/// target <target>`) -> snapshot.
+/// target <target>`) -> rollback payload, for `deploy log`-style rendering.
 pub fn deployment_index(
     store: &LocalStore,
     target: &TargetName,
-) -> Result<BTreeMap<String, DeploymentSnapshot>> {
+) -> Result<BTreeMap<String, LedgerRollback>> {
     let mut out = BTreeMap::new();
-    for e in store.read_snapshots(target.as_str())? {
-        out.insert(ref_name(target, &e.deployment_id), e);
+    for e in successful_deployments(store, target)? {
+        if let Some(rollback) = e.terminal.as_ref().and_then(|t| t.rollback.clone()) {
+            out.insert(ref_name(target, &e.deployment_id), rollback);
+        }
     }
     Ok(out)
 }
@@ -529,14 +438,11 @@ pub fn deployment_index(
 mod tests {
     use super::*;
     use crate::model::{
-        ArtifactRef, DeploymentId, GenerationId, PlacementSlotId, ReleaseId, SCHEMA_VERSION,
-        ServerId, TreeDigest, VariantName,
+        ArtifactRef, GenerationId, ReleaseId, SCHEMA_VERSION, ServerId, TreeDigest, VariantName,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
     use std::collections::BTreeMap;
-
-    use crate::records::HistoryFloor;
 
     // The reference-language test helpers (grammar generators, the
     // canonical fold, and the panic-free parse runner) live with the
@@ -544,60 +450,76 @@ mod tests {
     // the parse/resolve contract stays pinned in ONE place.
     use crate::revset::tests::{fold, parse_no_panic, ref_token_strategy};
 
-    /// A `deploy-<id>` deployment-id refid parses to a deployment base.
-    /// deploy-a..deploy-f (every deployment SUCCESSFUL, so every one is a
-    /// rollback payload; the deploy-c and deploy-d snapshots BOTH carry
-    /// release rel-sha256-cccc — irrelevant now that release refids are
-    /// removed, but kept to pin the payload contents).
-    fn chain() -> (tempfile::TempDir, LocalStore) {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
-        for (n, (dep, rel)) in [
-            ("deploy-a", "aaaa"),
-            ("deploy-b", "bbbb"),
-            ("deploy-c", "cccc"),
-            ("deploy-d", "cccc"),
-            ("deploy-e", "eeee"),
-            ("deploy-f", "ffff"),
-        ]
-        .iter()
-        .enumerate()
-        {
-            store
-                .append_snapshot("production", &snapshot_entry(dep, rel))
-                .unwrap();
-            let _ = n;
+    /// A minimal but VALID intent for the target.
+    fn intent(dep: &str) -> LedgerIntent {
+        LedgerIntent {
+            deployment_schema_version: SCHEMA_VERSION,
+            deployment_id: DeploymentId::new(dep.to_string()),
+            target: TargetName::new("production".to_string()),
+            slot_ids: vec![PlacementSlotId::new("p1".to_string())],
+            behavior_sha256: "sha256-aa".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            desired: BTreeMap::new(),
+            pre_push: BTreeMap::new(),
+            slots: BTreeMap::new(),
         }
-        (tmp, store)
     }
 
-    fn snapshot_entry(deployment: &str, release: &str) -> DeploymentSnapshot {
-        DeploymentSnapshot {
-            deployment_id: DeploymentId::new(deployment.to_string()),
+    /// A SUCCESSFUL terminal for `deployment` carrying the given release in
+    /// its rollback (one slot `p1`, deterministic payload derived from the
+    /// deployment id so "exactly its stored state" is a meaningful equality).
+    fn successful_terminal(dep: &str, release: &str) -> LedgerTerminal {
+        LedgerTerminal {
+            deployment_id: DeploymentId::new(dep.to_string()),
             target: TargetName::new("production".to_string()),
-            behavior_sha256: "sha256-aa".to_string(),
-            slots: BTreeMap::from([(
-                PlacementSlotId::new("p1".to_string()),
-                GenerationRef {
-                    generation: GenerationId::new(format!("gen-{deployment}")),
-                    assignment: PlacementSlotAssignment {
-                        placement_slot: PlacementSlotId::new("p1".to_string()),
-                        artifact: ArtifactRef {
-                            release: ReleaseId::new(format!("rel-sha256-{release}")),
-                            variant: VariantName::new("standard".to_string()),
-                            tree: TreeDigest::new(format!("tree-{deployment}")),
+            status: DeploymentStatus::Successful,
+            recorded_at: "2026-01-01T00:00:00Z".to_string(),
+            outcomes: BTreeMap::new(),
+            rollback: Some(LedgerRollback {
+                behavior_sha256: "sha256-aa".to_string(),
+                release: ReleaseId::new(release.to_string()),
+                slots: BTreeMap::from([(
+                    PlacementSlotId::new("p1".to_string()),
+                    GenerationRef {
+                        generation: GenerationId::new(format!("gen-{dep}")),
+                        assignment: PlacementSlotAssignment {
+                            placement_slot: PlacementSlotId::new("p1".to_string()),
+                            artifact: ArtifactRef {
+                                release: ReleaseId::new(release.to_string()),
+                                variant: VariantName::new("standard".to_string()),
+                                tree: TreeDigest::new(format!("tree-{dep}")),
+                            },
                         },
                     },
-                },
-            )]),
-            bindings: BTreeMap::from([(
-                PlacementSlotId::new("p1".to_string()),
-                PhysicalBinding {
-                    server: ServerId::new("server-01".to_string()),
-                    deploy_dir: "/srv/deploy/p1".to_string(),
-                },
-            )]),
+                )]),
+                bindings: BTreeMap::from([(
+                    PlacementSlotId::new("p1".to_string()),
+                    PhysicalBinding {
+                        server: ServerId::new("server-01".to_string()),
+                        deploy_dir: "/srv/deploy/p1".to_string(),
+                    },
+                )]),
+            }),
+            reason: None,
         }
+    }
+
+    /// Seed `count` successful deployments (ids `deploy-0`..`deploy-{n-1}`,
+    /// releases derived from the ids) onto the target's ledger.
+    fn seed_chain(store: &LocalStore, count: usize) -> Vec<String> {
+        let mut ids = Vec::new();
+        for n in 0..count {
+            let id = format!("deploy-{n}");
+            store.append_intent("production", &intent(&id)).unwrap();
+            store
+                .append_terminal(
+                    "production",
+                    &successful_terminal(&id, &format!("rel-sha256-{id}")),
+                )
+                .unwrap();
+            ids.push(id);
+        }
+        ids
     }
 
     fn dep_ref(target: &TargetName, deployment_id: &str) -> PushRef {
@@ -616,7 +538,8 @@ mod tests {
     /// `@` / `HEAD` / `` / `parent(@, 0)` resolve to the default HEAD push.
     #[test]
     fn resolve_ref_head_forms() {
-        let (_tmp, store) = chain();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         for token in ["", "HEAD", "@", "parent(@, 0)"] {
             assert_eq!(
                 resolve(token, &store).unwrap(),
@@ -650,26 +573,28 @@ mod tests {
         );
     }
 
-    /// The ancestor steps on the deploy-a..deploy-f chain (latest =
-    /// deploy-f): `@-` = deploy-e, `@--` = deploy-d, `parent(@, 3)` =
-    /// deploy-c, `deploy-f--` = deploy-d, `parent(deploy-f, 2)` = deploy-d,
-    /// `deploy-b-` = deploy-a, and the bare `deploy-b` / `parent(deploy-b, 0)`
-    /// forms name deploy-b itself.
+    /// The ancestor steps on a 6-deployment chain (latest = deploy-5):
+    /// `@-` = deploy-4, `@--` = deploy-3, `parent(@, 3)` = deploy-2,
+    /// `deploy-5--` = deploy-3, `parent(deploy-5, 2)` = deploy-3,
+    /// `deploy-1-` = deploy-0, and the bare `deploy-1` /
+    /// `parent(deploy-1, 0)` forms name deploy-1 itself.
     #[test]
     fn resolve_ref_ancestor_steps() {
-        let (_tmp, store) = chain();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        let ids = seed_chain(&store, 6);
         let target = TargetName::new("production".to_string());
         for (token, want) in [
-            ("@-", "deploy-e"),
-            ("@--", "deploy-d"),
-            ("parent(@, 3)", "deploy-c"),
-            ("parent(@, 2)", "deploy-d"),
-            ("deploy-c--", "deploy-a"),
-            ("parent(deploy-f, 2)", "deploy-d"),
-            ("deploy-b-", "deploy-a"),
-            ("deploy-b", "deploy-b"),
-            ("parent(deploy-b, 0)", "deploy-b"),
-            ("parent(deploy-c, 1)", "deploy-b"),
+            ("@-", ids[4].as_str()),
+            ("@--", ids[3].as_str()),
+            ("parent(@, 3)", ids[2].as_str()),
+            ("parent(@, 2)", ids[3].as_str()),
+            ("deploy-4--", ids[2].as_str()),
+            ("parent(deploy-5, 2)", ids[3].as_str()),
+            ("deploy-1-", ids[0].as_str()),
+            ("deploy-1", ids[1].as_str()),
+            ("parent(deploy-1, 0)", ids[1].as_str()),
+            ("parent(deploy-2, 1)", ids[1].as_str()),
         ] {
             assert_eq!(
                 resolve(token, &store).unwrap(),
@@ -679,37 +604,37 @@ mod tests {
         }
     }
 
-    /// A deployment refid resolves to the snapshot that deployed it (its
+    /// A deployment refid resolves to the deployment that deployed it (its
     /// own stored state — exact rollback); the ancestor steps walk the
     /// deployment history back from there.
     #[test]
     fn resolve_ref_deployment_refids() {
-        let (_tmp, store) = chain();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        let ids = seed_chain(&store, 6);
         let target = TargetName::new("production".to_string());
+        assert_eq!(resolve(&ids[1], &store).unwrap(), dep_ref(&target, &ids[1]));
         assert_eq!(
-            resolve("deploy-b", &store).unwrap(),
-            dep_ref(&target, "deploy-b")
+            resolve(&format!("{}-", ids[1]), &store).unwrap(),
+            dep_ref(&target, &ids[0])
         );
         assert_eq!(
-            resolve("deploy-b-", &store).unwrap(),
-            dep_ref(&target, "deploy-a")
+            resolve(&format!("parent({}, 0)", ids[2]), &store).unwrap(),
+            dep_ref(&target, &ids[2])
         );
         assert_eq!(
-            resolve("parent(deploy-c, 0)", &store).unwrap(),
-            dep_ref(&target, "deploy-c")
-        );
-        assert_eq!(
-            resolve("parent(deploy-f, 4)", &store).unwrap(),
-            dep_ref(&target, "deploy-b")
+            resolve(&format!("parent({}, 4)", ids[5]), &store).unwrap(),
+            dep_ref(&target, &ids[1])
         );
         // The bare deployment id resolves to EXACTLY that deployment's stored
-        // payload (the snapshot keyed by the id), never "the most recent
-        // snapshot" of anything.
-        let entry = resolve_deployment(&store, &target, &DeploymentId::new("deploy-c")).unwrap();
-        assert_eq!(entry.deployment_id.as_str(), "deploy-c");
+        // payload (the rollback state keyed by the id), never "the most
+        // recent rollback" of anything.
+        let rollback = resolve_deployment(&store, &target, &DeploymentId::new(&ids[2])).unwrap();
         assert_eq!(
-            entry.slots[&PlacementSlotId::new("p1")].generation.as_str(),
-            "gen-deploy-c"
+            rollback.slots[&PlacementSlotId::new("p1")]
+                .generation
+                .as_str(),
+            "gen-deploy-2"
         );
     }
 
@@ -717,11 +642,12 @@ mod tests {
     /// store lookup and NO target history: the direct form never steps the
     /// deployment history, so a cross-target / fresh-target direct
     /// deployment is expressible even when the destination has zero
-    /// snapshots. This is the grammar's escape hatch for
-    /// direct/cross-target release deployment (UNCHANGED).
+    /// successful deployments. This is the grammar's escape hatch for
+    /// direct/cross-target release deployment.
     #[test]
     fn resolve_ref_direct_release_form_ignores_chain_and_store() {
-        let (_tmp, store) = chain();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         assert_eq!(
             resolve_ref_expr(
                 &parse_ref_expr("release:rel-sha256-cccc").expect("token must parse"),
@@ -744,11 +670,10 @@ mod tests {
                 release: ReleaseId::new("rel-sha256-cccc".to_string())
             }
         );
-        // A release that is not referenced by any snapshot — and a target
-        // with an EMPTY chain — resolve the same way: resolution never reads
-        // the store.
-        let tmp = tempfile::tempdir().unwrap();
-        let empty = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        // A release that is not referenced by any ledger — and a target with
+        // an EMPTY chain — resolve the same way: resolution never reads the
+        // store.
+        let empty = LocalStore::with_base(tmp.path().join("store2")).unwrap();
         assert_eq!(
             resolve_ref_expr(
                 &parse_ref_expr("release:rel-sha256-zzzz").expect("must parse"),
@@ -767,13 +692,15 @@ mod tests {
     /// an EMPTY chain. Never underflow, never guess.
     #[test]
     fn resolve_ref_failures_fail_closed() {
-        let (_tmp, store) = chain();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        seed_chain(&store, 4);
         for token in [
-            "parent(@, 6)", // len 6, so 6 steps back underflows
-            "deploy-a-",    // deploy-a is the first deployment
-            "deploy-a--",
-            "parent(deploy-b, 2)",
-            "parent(deploy-a, 1)",
+            "parent(@, 6)", // len 4, so 6 steps back underflows
+            "deploy-0-",    // deploy-0 is the first deployment
+            "deploy-0--",
+            "parent(deploy-1, 2)",
+            "parent(deploy-0, 1)",
             "deploy-missing",
             "deploy-missing-",
             "parent(deploy-missing, 1)",
@@ -787,8 +714,7 @@ mod tests {
 
         // An EMPTY target chain: `@` is still fine (HEAD), every relative
         // form fails.
-        let tmp = tempfile::tempdir().unwrap();
-        let empty = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        let empty = LocalStore::with_base(tmp.path().join("store3")).unwrap();
         assert_eq!(resolve("@", &empty).unwrap(), PushRef::Head);
         for token in ["@-", "parent(@, 2)", "deploy-x", "deploy-x-"] {
             resolve(token, &empty).expect_err(&format!("{token} on an empty chain must fail"));
@@ -806,8 +732,10 @@ mod tests {
         );
     }
 
+    /// Finalization appends the terminal event exactly once (replay-safe by
+    /// deployment id): a repeated finalize for the same attempt is a no-op.
     #[test]
-    fn append_snapshot_is_idempotent_by_deployment_id() {
+    fn finalize_is_idempotent_by_deployment_id() {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         let target = TargetName::new("production".to_string());
@@ -818,64 +746,70 @@ mod tests {
                 deploy_dir: "/srv/deploy/p1".to_string(),
             },
         )]);
-        let attempt = DeploymentAttempt {
-            deployment_schema_version: SCHEMA_VERSION,
-            deployment_id: DeploymentId::new("deploy-idempotent".to_string()),
-            target: target.clone(),
-            slot_ids: vec![PlacementSlotId::new("p1".to_string())],
-            behavior_sha256: "sha256-aa".to_string(),
-            attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            desired: BTreeMap::new(),
-            pre_push: BTreeMap::new(),
-            slots: BTreeMap::new(),
-        };
+        let attempt = intent("deploy-idempotent");
+        store.append_intent(target.as_str(), &attempt).unwrap();
+        let actuals = BTreeMap::from([(
+            PlacementSlotId::new("p1".to_string()),
+            AttemptServer {
+                artifact: ArtifactRef::default(),
+                generation: Some(GenerationId::new("gen-1".to_string())),
+            },
+        )]);
+        let outcomes = BTreeMap::from([(
+            PlacementSlotId::new("p1".to_string()),
+            ServerResult {
+                slot_id: PlacementSlotId::new("p1".to_string()),
+                outcome: crate::records::ServerOutcomeKind::Activated,
+                generation: Some(GenerationId::new("gen-1".to_string())),
+                compensated: false,
+                error: None,
+            },
+        )]);
 
-        // First call appends the snapshot and advances the ref. The snapshot
-        // is built from the attempt's OUTCOMES map (the attempt record
-        // itself carries only intent; its `slots` map is empty), and records
-        // the slot→{server, deploy_dir} binding from `bindings`.
-        let first = append_snapshot(&store, &target, &attempt, &attempt.slots, &bindings).unwrap();
-        assert_eq!(first, attempt.deployment_id);
-        let snapshots = store.read_snapshots(target.as_str()).unwrap();
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].deployment_id, attempt.deployment_id);
+        finalize_successful_attempt(
+            &store,
+            &attempt,
+            &outcomes,
+            &actuals,
+            "push completed",
+            &bindings,
+        )
+        .unwrap();
+        let entries = store.read_ledger(target.as_str()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].terminal.is_some());
         assert_eq!(
-            store.read_last_successful(target.as_str()).as_deref(),
-            Some("deploy-idempotent")
+            store.latest_status("deploy-idempotent").unwrap(),
+            Some(DeploymentStatus::Successful)
         );
 
-        // Second call with the same deployment ID is a no-op: same key, no
-        // duplicate entry, and `refs/last-successful` is untouched.
-        let second = append_snapshot(&store, &target, &attempt, &attempt.slots, &bindings).unwrap();
-        assert_eq!(second, first, "repeated append must return the same key");
-        let snapshots = store.read_snapshots(target.as_str()).unwrap();
-        assert_eq!(snapshots.len(), 1, "no duplicate snapshot entry");
-        assert_eq!(
-            store.read_last_successful(target.as_str()).as_deref(),
-            Some("deploy-idempotent")
-        );
+        // Repeated finalize with the same deployment ID is a no-op: same
+        // key, no duplicate terminal.
+        finalize_successful_attempt(
+            &store,
+            &attempt,
+            &outcomes,
+            &actuals,
+            "push completed",
+            &bindings,
+        )
+        .unwrap();
+        let entries = store.read_ledger(target.as_str()).unwrap();
+        assert_eq!(entries.len(), 1, "no duplicate terminal event");
     }
 
+    /// `build_rollback` records each slot's complete physical binding.
     #[test]
-    fn build_snapshot_records_each_slots_physical_binding() {
+    fn build_rollback_records_each_slots_physical_binding() {
         let slot = PlacementSlotId::new("p1".to_string());
-        let attempt = DeploymentAttempt {
-            deployment_schema_version: SCHEMA_VERSION,
-            deployment_id: DeploymentId::new("deploy-binding-map".to_string()),
-            target: TargetName::new("production".to_string()),
-            slot_ids: vec![slot.clone()],
-            behavior_sha256: "sha256-aa".to_string(),
-            attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            desired: BTreeMap::new(),
-            pre_push: BTreeMap::new(),
-            slots: BTreeMap::from([(
-                slot.clone(),
-                crate::records::AttemptServer {
-                    artifact: ArtifactRef::default(),
-                    generation: Some(GenerationId::new("gen-x".to_string())),
-                },
-            )]),
-        };
+        let attempt = intent("deploy-binding-map");
+        let actuals = BTreeMap::from([(
+            slot.clone(),
+            AttemptServer {
+                artifact: ArtifactRef::default(),
+                generation: Some(GenerationId::new("gen-x".to_string())),
+            },
+        )]);
         let bindings: BTreeMap<PlacementSlotId, PhysicalBinding> = BTreeMap::from([(
             slot.clone(),
             PhysicalBinding {
@@ -884,109 +818,70 @@ mod tests {
             },
         )]);
 
-        let snapshot = build_snapshot(&attempt, &attempt.slots, &bindings);
+        let rollback = build_rollback(&attempt, &actuals, &bindings);
         assert_eq!(
-            snapshot.bindings.get(&slot),
+            rollback.bindings.get(&slot),
             Some(&PhysicalBinding {
                 server: ServerId::new("server-01"),
                 deploy_dir: "/srv/deploy/p1".to_string(),
             }),
-            "the snapshot must record the slot's complete physical binding (server AND deploy_dir)"
+            "the rollback must record the slot's complete physical binding (server AND deploy_dir)"
         );
-        assert_eq!(snapshot.slots.len(), 1, "generation refs preserved intact");
-        assert_eq!(snapshot.bindings.len(), 1);
+        assert_eq!(rollback.slots.len(), 1, "generation refs preserved intact");
+        assert_eq!(rollback.bindings.len(), 1);
     }
 
-    /// A legacy pre-feature snapshot line (no `bindings` key — either the
-    /// oldest pre-binding shape or the intermediate shape that only recorded
-    /// a `servers` map) must still deserialize; its `bindings` map defaults
-    /// to empty, which rollback treats as unverifiable rather than guessing
-    /// the host/location. The removed `index` key is an unknown field now and
-    /// is IGNORED — legacy `sN`-era logs stay readable (the payload is what
-    /// matters; the deployment id is the key).
+    /// A legacy ledger line whose rollback has no `bindings` key must still
+    /// deserialize; its `bindings` map defaults to empty, which rollback
+    /// treats as unverifiable rather than guessing the host/location.
     #[test]
-    fn legacy_snapshot_without_bindings_deserializes_with_empty_map() {
-        // Oldest shape: no binding recorded at all (and the removed `index`
-        // key — ignored by the deployment-keyed record).
-        let bare = r#"{"index":0,"deployment_id":"deploy-old","target":"production","behavior_sha256":"sha256-aa","slots":{}}"#;
-        let snapshot: DeploymentSnapshot = serde_json::from_str(bare).unwrap();
+    fn legacy_rollback_without_bindings_deserializes_with_empty_map() {
+        let line = r#"{"kind":"terminal","deployment_id":"deploy-old","target":"production","status":"successful","recorded_at":"2026-01-01T00:00:00Z","outcomes":{},"rollback":{"behavior_sha256":"sha256-aa","release":"rel-sha256-old","slots":{}}}"#;
+        let terminal: LedgerTerminal = serde_json::from_str(line).unwrap();
+        let rollback = terminal.rollback.unwrap();
         assert!(
-            snapshot.bindings.is_empty(),
+            rollback.bindings.is_empty(),
             "legacy line without bindings yields an empty map"
-        );
-
-        // Intermediate server-only shape: the `servers` key is an unknown
-        // field now (the physical binding is richer than a bare ServerId),
-        // so it is ignored and `bindings` still defaults to empty →
-        // fail-closed refusal.
-        let with_servers = r#"{"index":1,"deployment_id":"deploy_servers","target":"production","behavior_sha256":"sha256-aa","slots":{},"servers":{"p1":"server-01"}}"#;
-        let snapshot: DeploymentSnapshot = serde_json::from_str(with_servers).unwrap();
-        assert!(
-            snapshot.bindings.is_empty(),
-            "old `servers`-keyed line yields an empty bindings map"
         );
     }
 
     /// A deployment-history shape: 0..=8 (deployment_id, successful?) pairs
-    /// (a FAILED deployment never gets a snapshot — the two-class history the
-    /// user's property needs). Deployment ids are DETERMINISTIC PER POSITION
-    /// (`deploy-{n:04}`), so each id is unique across the history and a
-    /// FAILED id can never double as a SUCCESSFUL one (which would make
-    /// "failed ids never resolve" vacuous). Plus an optional durable floor
-    /// at a SUCCESSFUL deployment (never None on an empty chain or when the
-    /// generated slot overruns the successes).
-    fn chain_strategy() -> impl Strategy<Value = (Vec<(String, bool)>, Option<String>)> {
-        (
-            prop::collection::vec(any::<bool>(), 0..=8),
-            prop::option::weighted(0.6, 0usize..8),
-        )
-            .prop_map(|(flags, floor_slot)| {
-                let history: Vec<(String, bool)> = flags
-                    .into_iter()
-                    .enumerate()
-                    .map(|(n, ok)| (format!("deploy-{n:04}"), ok))
-                    .collect();
-                let ok_ids: Vec<String> = history
-                    .iter()
-                    .filter(|(_, ok)| *ok)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                let floor = floor_slot.and_then(|i| ok_ids.get(i).cloned());
-                (history, floor)
-            })
+    /// (a FAILED deployment never gets a successful terminal — the
+    /// two-class history the user's property needs). Deployment ids are
+    /// DETERMINISTIC PER POSITION (`deploy-{n:04}`), so each id is unique
+    /// across the history and a FAILED id can never double as a SUCCESSFUL
+    /// one (which would make "failed ids never resolve" vacuous).
+    fn chain_strategy() -> impl Strategy<Value = Vec<(String, bool)>> {
+        prop::collection::vec(any::<bool>(), 0..=8).prop_map(|flags| {
+            flags
+                .into_iter()
+                .enumerate()
+                .map(|(n, ok)| (format!("deploy-{n:04}"), ok))
+                .collect()
+        })
     }
 
-    /// A minimal attempt record for the target, enough to bind a seeded
-    /// history floor (the floor's own deployment must exist in the target's
-    /// attempts log).
-    fn attempt_entry(dep: &str) -> DeploymentAttempt {
-        DeploymentAttempt {
-            deployment_schema_version: SCHEMA_VERSION,
-            deployment_id: DeploymentId::new(dep.to_string()),
-            target: TargetName::new("production".to_string()),
-            slot_ids: vec![PlacementSlotId::new("p1".to_string())],
-            behavior_sha256: "sha256-aa".to_string(),
-            attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            desired: BTreeMap::new(),
-            pre_push: BTreeMap::new(),
-            slots: BTreeMap::new(),
-        }
+    /// A minimal intent record for the target, enough to seed a ledger entry.
+    fn intent_entry(dep: &str) -> LedgerIntent {
+        intent(dep)
     }
 
     /// THE USER'S PROPERTY, per resolve-leg case: seed a REAL store with a
-    /// deployment history (successful + FAILED attempts interleaved — a
-    /// failed attempt records an attempt + a `deployments/<id>/` dir but NO
-    /// snapshot), optionally checkpoint it at a successful deployment, then
-    /// assert that EVERY successful deployment id resolves to EXACTLY its
-    /// stored state, every FAILED id never resolves (ref error), and the
-    /// floored chain is exactly the suffix beginning at the checkpoint.
+    /// deployment history (successful + FAILED entries interleaved — a
+    /// failed entry records an intent + a FAILED terminal and NO rollback),
+    /// then assert that EVERY successful deployment id resolves to EXACTLY
+    /// its stored rollback state and every FAILED id never resolves (ref
+    /// error).
     fn assert_deployment_id_resolution(store: &LocalStore, history: &[(String, bool)]) {
         let target = TargetName::new("production".to_string());
-        let stored: BTreeMap<String, DeploymentSnapshot> = store
-            .read_snapshots("production")
+        let stored: BTreeMap<String, LedgerRollback> = successful_deployments(store, &target)
             .unwrap()
             .into_iter()
-            .map(|e| (e.deployment_id.as_str().to_string(), e))
+            .filter_map(|e| {
+                e.terminal
+                    .and_then(|t| t.rollback)
+                    .map(|rb| (e.deployment_id.as_str().to_string(), rb))
+            })
             .collect();
         for (id, ok) in history {
             let expr = parse_ref_expr(id).expect("a seeded deployment id parses");
@@ -1001,13 +896,13 @@ mod tests {
                     );
                     assert_eq!(t.as_str(), "production");
                     assert_eq!(deployment_id.as_str(), *id);
-                    // EXACTLY its stored state: the resolved payload equals
-                    // the recorded snapshot (slots, behavior, bindings, and
+                    // EXACTLY its stored state: the resolved rollback equals
+                    // the recorded rollback (slots, behavior, bindings, and
                     // the release the generations came from), keyed by id.
                     let resolved = resolve_deployment(store, &target, &deployment_id).unwrap();
                     assert_eq!(
                         &resolved,
-                        stored.get(id).expect("the stored snapshot"),
+                        stored.get(id).expect("the stored rollback"),
                         "deployment '{id}' must resolve to EXACTLY its stored payload"
                     );
                 }
@@ -1015,9 +910,7 @@ mod tests {
                     panic!("deployment id '{id}' must not resolve to a non-deployment ref")
                 }
                 Err(Error::Ref(_)) => {
-                    // FAILED ids never resolve; a SUCCESSFUL id resolves only
-                    // when at/above the floor (a below-floor id fails closed
-                    // with the floor refusal — asserted by the floor checks).
+                    // FAILED ids never resolve.
                 }
                 Err(e) => panic!("unexpected error class for '{id}': {e}"),
             }
@@ -1025,56 +918,52 @@ mod tests {
     }
 
     /// One resolve-leg case: seed a REAL store with a deployment history
-    /// (successful + failed attempts), optionally floor it at a successful
-    /// deployment, parse a generated token, and resolve it via the engine's
-    /// two-phase flow. Asserts: no panic anywhere; every parse AND resolve
-    /// failure is a ref error; a rejected shape never resolves; a resolved
-    /// deployment is an actual member of the FLOORED chain at/after the
-    /// floor; the deployment-id resolution property (successful ids resolve
-    /// to exactly their stored state, failed ids never resolve) holds;
-    /// `@` / `release:<id>` never touch the chain (they resolve even on an
-    /// EMPTY store, while every relative form on an empty store fails closed
-    /// — except `parent(@, 0)`, which the oracle folds to `Head` FIRST so it
-    /// mirrors the engine's documented `Relative{At,0} ≡ Head` reduction).
-    fn ref_grammar_resolve_case(
-        history: Vec<(String, bool)>,
-        floor: Option<String>,
-        token: String,
-    ) {
+    /// (successful + failed entries), parse a generated token, and resolve
+    /// it via the engine's two-phase flow. Asserts: no panic anywhere; every
+    /// parse AND resolve failure is a ref error; a rejected shape never
+    /// resolves; a resolved deployment is an actual SUCCESSFUL member of the
+    /// ledger chain; the deployment-id resolution property (successful ids
+    /// resolve to exactly their stored state, failed ids never resolve)
+    /// holds; `@` / `release:<id>` never touch the chain (they resolve even
+    /// on an EMPTY store, while every relative form on an empty store fails
+    /// closed — except `parent(@, 0)`, which the oracle folds to `Head`
+    /// FIRST so it mirrors the engine's documented `Relative{At,0} ≡ Head`
+    /// reduction).
+    fn ref_grammar_resolve_case(history: Vec<(String, bool)>, token: String) {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         for (id, ok) in &history {
             store
-                .append_attempt("production", &attempt_entry(id))
+                .append_intent("production", &intent_entry(id))
                 .unwrap();
-            std::fs::create_dir_all(store.deployment_dir(id)).unwrap();
             if *ok {
                 // Each successful deployment is a rollback payload keyed by
                 // its id, with a deterministic payload derived from the id
                 // (so "exactly its stored state" is a meaningful equality).
                 let release = id.replace("deploy-", "rel-sha256-");
                 store
-                    .append_snapshot("production", &snapshot_entry(id, &release))
+                    .append_terminal("production", &successful_terminal(id, &release))
+                    .unwrap();
+            } else {
+                store
+                    .append_terminal(
+                        "production",
+                        &LedgerTerminal {
+                            deployment_id: DeploymentId::new(id.clone()),
+                            target: TargetName::new("production".to_string()),
+                            status: DeploymentStatus::FailedRolledBack,
+                            recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                            outcomes: BTreeMap::new(),
+                            rollback: None,
+                            reason: None,
+                        },
+                    )
                     .unwrap();
             }
         }
-        if let Some(fid) = &floor {
-            store
-                .write_history_floor(
-                    "production",
-                    &HistoryFloor {
-                        schema_version: SCHEMA_VERSION,
-                        target: TargetName::new("production".to_string()),
-                        deployment_id: DeploymentId::new(fid.clone()),
-                        established_at: "2026-01-01T00:00:00Z".to_string(),
-                    },
-                )
-                .unwrap();
-        }
 
         // THE USER'S PROPERTY (per case): successful ids resolve to exactly
-        // their stored state, failed ids never resolve, and the floored chain
-        // is exactly the suffix beginning at the floor deployment.
+        // their stored state, failed ids never resolve.
         assert_deployment_id_resolution(&store, &history);
 
         // Two-phase engine flow: parse first — a parse failure is a ref
@@ -1126,8 +1015,8 @@ mod tests {
             }
         }
 
-        // RESOLVE MEMBERSHIP: a resolved deployment is an actual member of
-        // the floored read chain, at/after the floor.
+        // RESOLVE MEMBERSHIP: a resolved deployment is an actual SUCCESSFUL
+        // member of the ledger chain.
         match result {
             Ok(PushRef::Deployment {
                 target,
@@ -1138,26 +1027,12 @@ mod tests {
                     "production",
                     "{token:?} must resolve against the passed target"
                 );
-                let floored = store.read_snapshots("production").unwrap();
+                let chain = successful_deployments(&store, &target).unwrap();
                 assert!(
-                    floored.iter().any(|e| e.deployment_id == deployment_id),
+                    chain.iter().any(|e| e.deployment_id == deployment_id),
                     "{token:?} resolved to deployment '{deployment_id}', which is not an actual \
-                     member of the floored chain {floored:?}"
+                     member of the successful chain"
                 );
-                if let Some(fid) = &floor {
-                    let fpos = floored
-                        .iter()
-                        .position(|e| e.deployment_id.as_str() == *fid)
-                        .expect("the floor deployment is in the floored chain");
-                    let pos = floored
-                        .iter()
-                        .position(|e| e.deployment_id == deployment_id)
-                        .unwrap();
-                    assert!(
-                        pos >= fpos,
-                        "{token:?} resolved below the deployment floor {fid}: {deployment_id}"
-                    );
-                }
             }
             Ok(PushRef::Head | PushRef::Release { .. }) => {}
             Err(_) => {}
@@ -1166,8 +1041,7 @@ mod tests {
 
     proptest! {
         // The RESOLVE leg — against a REAL seeded store per case (a
-        // successful + failed deployment history plus an optional durable
-        // floor at a successful deployment): the user's deployment-id
+        // successful + failed deployment history): the user's deployment-id
         // resolution property, resolve membership, and totality. Randomized
         // seeds + failure persistence, bounded at 96 cases (each case builds
         // a small tempdir store, so the bound keeps the suite fast).
@@ -1179,10 +1053,10 @@ mod tests {
 
         #[test]
         fn ref_grammar_resolve_contract(
-            (history, floor) in chain_strategy(),
+            history in chain_strategy(),
             token in ref_token_strategy(),
         ) {
-            ref_grammar_resolve_case(history, floor, token);
+            ref_grammar_resolve_case(history, token);
         }
     }
 
@@ -1200,10 +1074,10 @@ mod tests {
 
         #[test]
         fn ref_grammar_resolve_contract_fixed_seed(
-            (history, floor) in chain_strategy(),
+            history in chain_strategy(),
             token in ref_token_strategy(),
         ) {
-            ref_grammar_resolve_case(history, floor, token);
+            ref_grammar_resolve_case(history, token);
         }
     }
 }

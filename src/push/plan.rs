@@ -254,10 +254,12 @@ mod tests {
     use super::*;
     use crate::model::{
         ArtifactRef, CanonicalSlot, CanonicalSlots, DeploymentId, GenerationId, GenerationRef,
-        Provenance, RELEASE_RECORD_SCHEMA_VERSION, ReleaseRecord, ServerId, TargetName, TreeDigest,
-        VariantName,
+        Provenance, RELEASE_RECORD_SCHEMA_VERSION, ReleaseRecord, SCHEMA_VERSION, ServerId,
+        TargetName, TreeDigest, VariantName,
     };
-    use crate::records::{DeploymentSnapshot, PhysicalBinding};
+    use crate::records::{
+        DeploymentStatus, LedgerIntent, LedgerRollback, LedgerTerminal, PhysicalBinding,
+    };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
 
@@ -377,6 +379,63 @@ interval_seconds = 0
         std::fs::write(&p, DEPLOY_TOML).unwrap();
         let config = Config::load(&p).unwrap();
         (dir, config)
+    }
+
+    /// Seed a SUCCESSFUL ledger entry for `t1` (intent + `Successful`
+    /// terminal carrying the rollback payload), mirroring the old
+    /// `append_snapshot` test helper. The rollback payload carries the
+    /// snapshot's `slots`/`bindings`; the release is derived from the first
+    /// slot's artifact (a coherent deployment carries one release across its
+    /// slots).
+    fn append_successful_snapshot(
+        store: &LocalStore,
+        deployment_id: &str,
+        behavior_sha256: &str,
+        slots: BTreeMap<PlacementSlotId, GenerationRef>,
+        bindings: BTreeMap<PlacementSlotId, PhysicalBinding>,
+    ) {
+        let id = DeploymentId::new(deployment_id.to_string());
+        let target = TargetName::new("t1".to_string());
+        let release = slots
+            .values()
+            .next()
+            .map(|g| g.assignment.artifact.release.clone())
+            .expect("a snapshot records at least one slot");
+        store
+            .append_intent(
+                "t1",
+                &LedgerIntent {
+                    deployment_schema_version: SCHEMA_VERSION,
+                    deployment_id: id.clone(),
+                    target: target.clone(),
+                    slot_ids: slots.keys().cloned().collect(),
+                    behavior_sha256: behavior_sha256.to_string(),
+                    attempted_at: "2026-01-01T00:00:00Z".to_string(),
+                    desired: BTreeMap::new(),
+                    pre_push: BTreeMap::new(),
+                    slots: BTreeMap::new(),
+                },
+            )
+            .unwrap();
+        store
+            .append_terminal(
+                "t1",
+                &LedgerTerminal {
+                    deployment_id: id,
+                    target,
+                    status: DeploymentStatus::Successful,
+                    recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                    outcomes: BTreeMap::new(),
+                    rollback: Some(LedgerRollback {
+                        behavior_sha256: behavior_sha256.to_string(),
+                        release,
+                        slots,
+                        bindings,
+                    }),
+                    reason: None,
+                },
+            )
+            .unwrap();
     }
 
     /// A release record in the pre-snapshot SHAPE: an EMPTY `slots` map (the
@@ -934,11 +993,11 @@ interval_seconds = 0
         )]);
         let release = consistent(&mut rec);
         store.write_release(&rec).unwrap();
-        let snapshot = DeploymentSnapshot {
-            deployment_id: DeploymentId::new("deploy-snapshot-histvar".to_string()),
-            target: TargetName::new("t1".to_string()),
-            behavior_sha256: "sha256-aa".to_string(),
-            slots: BTreeMap::from([(
+        append_successful_snapshot(
+            &store,
+            "deploy-snapshot-histvar",
+            "sha256-aa",
+            BTreeMap::from([(
                 PlacementSlotId::new("p1".to_string()),
                 GenerationRef {
                     generation: GenerationId::new("gen-old".to_string()),
@@ -952,15 +1011,14 @@ interval_seconds = 0
                     },
                 },
             )]),
-            bindings: BTreeMap::from([(
+            BTreeMap::from([(
                 PlacementSlotId::new("p1".to_string()),
                 PhysicalBinding {
                     server: ServerId::new("s1".to_string()),
                     deploy_dir: "/srv/plan".to_string(),
                 },
             )]),
-        };
-        store.append_snapshot("t1", &snapshot).unwrap();
+        );
 
         // Exact rollback restores the historical artifact (variant `old` +
         // tree-old together) even though the current config declares p1 in
@@ -1009,11 +1067,11 @@ interval_seconds = 0
 
         // A snapshot whose `slots` record the generation but whose `bindings`
         // map is EMPTY (legacy pre-feature line).
-        let snapshot = DeploymentSnapshot {
-            deployment_id: DeploymentId::new("deploy-legacy-snapshot".to_string()),
-            target: TargetName::new("t1".to_string()),
-            behavior_sha256: "sha256-aa".to_string(),
-            slots: BTreeMap::from([(
+        append_successful_snapshot(
+            &store,
+            "deploy-legacy-snapshot",
+            "sha256-aa",
+            BTreeMap::from([(
                 PlacementSlotId::new("p1".to_string()),
                 GenerationRef {
                     generation: GenerationId::new("gen-legacy".to_string()),
@@ -1027,9 +1085,8 @@ interval_seconds = 0
                     },
                 },
             )]),
-            bindings: BTreeMap::new(),
-        };
-        store.append_snapshot("t1", &snapshot).unwrap();
+            BTreeMap::new(),
+        );
 
         let err = plan_assignments(
             "t1",
@@ -1125,11 +1182,11 @@ interval_seconds = 0
         store.write_release(&rec).unwrap();
 
         // The SOURCE deployment's snapshot records the OLD binding.
-        let snapshot = DeploymentSnapshot {
-            deployment_id: DeploymentId::new("deploy-source".to_string()),
-            target: TargetName::new("t1".to_string()),
-            behavior_sha256: "sha256-aa".to_string(),
-            slots: BTreeMap::from([(
+        append_successful_snapshot(
+            &store,
+            "deploy-source",
+            "sha256-aa",
+            BTreeMap::from([(
                 PlacementSlotId::new("p1".to_string()),
                 GenerationRef {
                     generation: GenerationId::new("gen-old".to_string()),
@@ -1143,15 +1200,14 @@ interval_seconds = 0
                     },
                 },
             )]),
-            bindings: BTreeMap::from([(
+            BTreeMap::from([(
                 PlacementSlotId::new("p1".to_string()),
                 PhysicalBinding {
                     server: ServerId::new(old_binding.0.clone()),
                     deploy_dir: old_binding.1.clone(),
                 },
             )]),
-        };
-        store.append_snapshot("t1", &snapshot).unwrap();
+        );
 
         (dir, config, store, release)
     }
@@ -1573,33 +1629,33 @@ interval_seconds = 0
             let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
             let deployment_id = DeploymentId::new("deploy-prop-plan".to_string());
             let snapshot_release = ReleaseId::new(format!("rel-sha256-{tree}"));
-            let snapshot = DeploymentSnapshot {
-                deployment_id: deployment_id.clone(),
-                target: TargetName::new("t1".to_string()),
-                behavior_sha256: format!("sha256-{behavior}"),
-                slots: BTreeMap::from([(
-                    PlacementSlotId::new("p1".to_string()),
-                    GenerationRef {
-                        generation: GenerationId::new(format!("gen-{generation}")),
-                        assignment: PlacementSlotAssignment {
-                            placement_slot: PlacementSlotId::new("p1".to_string()),
-                            artifact: ArtifactRef {
-                                release: snapshot_release.clone(),
-                                variant: VariantName::new("standard".to_string()),
-                                tree: TreeDigest::new(tree.clone()),
-                            },
+            let slots = BTreeMap::from([(
+                PlacementSlotId::new("p1".to_string()),
+                GenerationRef {
+                    generation: GenerationId::new(format!("gen-{generation}")),
+                    assignment: PlacementSlotAssignment {
+                        placement_slot: PlacementSlotId::new("p1".to_string()),
+                        artifact: ArtifactRef {
+                            release: snapshot_release.clone(),
+                            variant: VariantName::new("standard".to_string()),
+                            tree: TreeDigest::new(tree.clone()),
                         },
                     },
-                )]),
-                bindings: BTreeMap::from([(
+                },
+            )]);
+            append_successful_snapshot(
+                &store,
+                deployment_id.as_str(),
+                &format!("sha256-{behavior}"),
+                slots.clone(),
+                BTreeMap::from([(
                     PlacementSlotId::new("p1".to_string()),
                     PhysicalBinding {
                         server: ServerId::new("s1".to_string()),
                         deploy_dir: "/srv/plan".to_string(),
                     },
                 )]),
-            };
-            store.append_snapshot("t1", &snapshot).unwrap();
+            );
 
             let (assignments, desired, source) = plan_assignments(
                 "t1",
@@ -1619,7 +1675,7 @@ interval_seconds = 0
             // GenerationRef.
             assert_eq!(assignments.len(), 1, "one member slot");
             let a = &assignments[0];
-            let stored = &snapshot.slots[&PlacementSlotId::new("p1")];
+            let stored = &slots[&PlacementSlotId::new("p1")];
             assert_eq!(a.placement_slot, PlacementSlotId::new("p1"));
             assert_eq!(a.artifact, stored.assignment.artifact, "the planned artifact must equal the snapshot's stored artifact");
             assert_eq!(desired, snapshot_release, "the rollout release is the snapshot's release");

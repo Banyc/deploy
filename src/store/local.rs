@@ -1,22 +1,24 @@
 //! Filesystem-backed local store.
 //!
-//! Record contract: `targets/<target>/attempts.jsonl` holds the IMMUTABLE
-//! attempt INTENT (persisted before any remote mutation; no status, no
-//! outcomes); `deployments/<id>/results.json` holds the per-slot OUTCOMES
-//! (written once after the mutation loop); `deployments/<id>/transitions.jsonl`
-//! is the append-only STATUS lifecycle (the latest transition is the current
-//! status).
+//! Record contract: ONE ordered deployment ledger per target
+//! (`targets/<target>/ledger.jsonl`, append-only JSON lines). An entry starts
+//! as the DURABLE INTENT ([`crate::records::LedgerIntent`], appended BEFORE
+//! any remote mutation — the append-attempt contract) and its TERMINAL EVENT
+//! ([`crate::records::LedgerTerminal`], appended after the mutation loop)
+//! carries the status, the per-slot outcomes, and — when successful — the
+//! rollback state ([`crate::records::LedgerRollback`]). The append order IS
+//! the history order; the deployment id keys each entry. There is no
+//! separate floor marker, snapshot op log, per-deployment results/transition
+//! stream, or cleanup-debt flag: the ledger replaces all of them.
 //!
 //! ```text
 //! <base>/
 //!   objects/sha256/<digest>/root/ , tree.json
 //!   releases/<release-id>/mapping.toml, behavior.json, release.json
-//!   targets/<target>/rotation-debt.json, attempts.jsonl,
-//!     refs/last-successful, refs/snapshots.jsonl, refs/history-floor.json,
-//!     refs/cleanup-pending.json
+//!   targets/<target>/observed.json, rotation-debt.json, ledger.jsonl
 //!   slots/<slot-id>/observed.json   (the slot's ONE physical observed state)
 //!   servers/<server-id>.json
-//!   deployments/<deployment-id>/plan.json, results.json, transitions.jsonl
+//!   deployments/<deployment-id>/plan.json
 //!   pins.json (store-global artifact retention pins)
 //! ```
 //!
@@ -41,12 +43,15 @@
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::model::{
-    BehaviorContract, DeploymentId, PlacementSlotId, ReleaseId, ReleaseRecord, SCHEMA_VERSION,
+    BehaviorContract, PlacementSlotId, ReleaseId, ReleaseRecord, SCHEMA_VERSION,
     TREE_SCHEMA_VERSION, TreeDigest, TreeMetadata,
 };
+
+#[cfg(test)]
+use crate::model::DeploymentId;
 use crate::records::{
-    DeploymentAttempt, DeploymentPlan, DeploymentResults, DeploymentSnapshot, DeploymentStatus,
-    DeploymentTransition, ObservedServer, ObservedTarget, Pins, ServerState,
+    DeploymentStatus, LedgerEntry, LedgerIntent, LedgerLine, LedgerTerminal, ObservedServer,
+    ObservedTarget, Pins, ServerState,
 };
 use crate::store::atomic::{
     copy_dir_recursive, ensure_private_dir, path_state, read_json, set_private,
@@ -57,10 +62,6 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-#[cfg(test)]
-use crate::model::CLEANUP_PENDING_SCHEMA_VERSION;
-#[cfg(test)]
-use crate::records::{CleanupPending, HistoryFloor};
 #[cfg(test)]
 use crate::testutil::step17_hook::Step17Hook;
 #[cfg(test)]
@@ -666,209 +667,218 @@ impl LocalStore {
         write_json(&p, debt)
     }
 
-    pub fn append_attempt(&self, target: &str, attempt: &DeploymentAttempt) -> Result<()> {
+    // ---- the per-target deployment LEDGER --------------------------------
+
+    /// Path of the target's ONE ordered deployment ledger
+    /// (`targets/<target>/ledger.jsonl`). The ledger holds every deployment
+    /// event of the target: each entry starts as the DURABLE INTENT line
+    /// (written BEFORE any remote mutation) and its TERMINAL EVENT line
+    /// (appended after the mutation loop) carries the status, outcomes, and
+    /// — when successful — the rollback state. The append order IS the
+    /// history order; there is no separate floor marker, snapshot op log,
+    /// or per-deployment results/transition stream.
+    pub fn ledger_path(&self, target: &str) -> PathBuf {
+        self.target_dir(target).join("ledger.jsonl")
+    }
+
+    /// Append the DURABLE INTENT of one deployment to the target's ledger
+    /// (one `{"kind":"intent", ...}` JSON line), BEFORE any remote
+    /// mutation: a crash after servers advanced to new generations can never
+    /// lose the deployment (the intent is already durable and the next push
+    /// reconciles it). Fail-closed keying: the deployment id keys the entry,
+    /// so a second intent for the same id (a corrupted duplicate) is refused
+    /// rather than silently merged.
+    pub fn append_intent(&self, target: &str, intent: &LedgerIntent) -> Result<()> {
         #[cfg(test)]
         if self
             .fault_registry
-            .consume(FaultKind::AppendAttempt, attempt.deployment_id.as_str())
+            .consume(FaultKind::AppendAttempt, intent.deployment_id.as_str())
         {
             return Err(Error::store(
-                "test fault: append_attempt forced to fail once",
+                "test fault: append_attempt (ledger intent) forced to fail once",
             ));
         }
         let dir = self.target_dir(target);
         ensure_private_dir(&dir)?;
-        let p = dir.join("attempts.jsonl");
-        let mut f = if p.exists() {
-            std::fs::OpenOptions::new().append(true).open(&p)
-        } else {
-            std::fs::File::create(&p)
+        let p = self.ledger_path(target);
+        // The intent is the entry's durable key: a duplicate intent for the
+        // same deployment id is corruption (deployment ids are unique per
+        // push) and must fail closed rather than append a second entry.
+        if let Some(existing) = self.ledger_has_intent(&p)?
+            && existing == intent.deployment_id.as_str()
+        {
+            return Err(Error::store(format!(
+                "refusing to append a second intent for deployment '{}' (the ledger is keyed by deployment id)",
+                intent.deployment_id
+            )));
         }
-        .map_err(|e| Error::store(format!("open attempts: {e}")))?;
-        let line = serde_json::to_string(attempt)
-            .map_err(|e| Error::store(format!("serialize attempt: {e}")))?;
-        writeln!(f, "{line}").map_err(|e| Error::store(format!("write attempt: {e}")))?;
-        drop(f);
-        set_private(&p)
+        let line = serde_json::to_string(&LedgerLine::Intent(intent.clone()))
+            .map_err(|e| Error::store(format!("serialize ledger intent: {e}")))?;
+        append_ledger_line(&p, &line)
     }
 
-    /// Read the FULL attempt history UNFILTERED by any history floor. This is
-    /// the physical view of `attempts.jsonl` (never a below-floor escape
-    /// hatch for consumers: every public read goes through
-    /// [`LocalStore::read_attempts`]); the checkpoint compaction and the
-    /// discard preview use it to compute the exact suffix at/after a floor,
-    /// and index allocation must see the full log so compaction can never
-    /// reuse an index. Crate-private: non-crate consumers must use the
-    /// floor-gated [`LocalStore::read_attempts`].
-    pub(crate) fn read_attempts_raw(&self, target: &str) -> Result<Vec<DeploymentAttempt>> {
-        let p = self.target_dir(target).join("attempts.jsonl");
-        // Tri-state: only a genuine NotFound is "no attempts log" (the
-        // empty list); a stat failure propagates as a Store error (an
-        // unreadable log must not read as "no history" — the floor binding
-        // would then fail open below the floor).
+    /// Append the TERMINAL EVENT of one deployment to the target's ledger
+    /// ("`{"kind":"terminal", ...}`" JSON line), after the mutation loop.
+    /// The terminal carries the status, the per-slot outcomes, and — when
+    /// successful — the rollback state. Fail-closed key contract: the
+    /// deployment's intent must already exist in the ledger (a terminal for
+    /// an unknown deployment is corruption) and the entry must not already
+    /// have a terminal (the terminal event is written exactly once;
+    /// replay-safety is handled by the finalizer checking the entry first).
+    pub fn append_terminal(&self, target: &str, terminal: &LedgerTerminal) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fault_registry
+            .consume(FaultKind::AppendTerminal, terminal.deployment_id.as_str())
+        {
+            return Err(Error::store(
+                "test fault: append_terminal forced to fail once",
+            ));
+        }
+        let dir = self.target_dir(target);
+        ensure_private_dir(&dir)?;
+        let p = self.ledger_path(target);
+        let entries = self.read_ledger(target)?;
+        let entry = entries
+            .iter()
+            .find(|e| e.deployment_id == terminal.deployment_id)
+            .ok_or_else(|| {
+                Error::integrity(format!(
+                    "append_terminal for deployment '{}': no ledger intent exists for it — a terminal event requires its durable intent (a terminal without an intent is corruption)",
+                    terminal.deployment_id
+                ))
+            })?;
+        if entry.terminal.is_some() {
+            return Err(Error::integrity(format!(
+                "append_terminal for deployment '{}': the entry already carries a terminal event (a terminal is written exactly once)",
+                terminal.deployment_id
+            )));
+        }
+        let line = serde_json::to_string(&LedgerLine::Terminal(terminal.clone()))
+            .map_err(|e| Error::store(format!("serialize ledger terminal: {e}")))?;
+        append_ledger_line(&p, &line)
+    }
+
+    /// Read the FULL deployment ledger of a target: every merged
+    /// [`LedgerEntry`] (intent + optional terminal), in append order. This is
+    /// the SINGLE history read — it replaces the old `read_attempts` /
+    /// `read_snapshots` pair (and their raw variants): there is no floor to
+    /// gate (the checkpoint replaced the ledger with the retained suffix
+    /// atomically) and no separate snapshot log. Fail closed on malformed
+    /// lines, foreign `deployment_schema_version`, an intent-less terminal,
+    /// a duplicate intent, or a duplicate terminal.
+    pub fn read_ledger(&self, target: &str) -> Result<Vec<LedgerEntry>> {
+        let p = self.ledger_path(target);
+        // Tri-state: only a genuine NotFound is "no ledger" (the empty
+        // vector); a stat failure propagates as a Store error (an unreadable
+        // ledger must not read as "no history").
         if !path_state(&p)? {
             return Ok(vec![]);
         }
         let text =
-            std::fs::read_to_string(&p).map_err(|e| Error::store(format!("read attempts: {e}")))?;
-        let mut out = Vec::new();
-        for line in text.lines() {
+            std::fs::read_to_string(&p).map_err(|e| Error::store(format!("read ledger: {e}")))?;
+        let mut out: Vec<LedgerEntry> = Vec::new();
+        let mut index: BTreeMap<String, usize> = BTreeMap::new();
+        for (seq, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
-            let attempt: DeploymentAttempt = serde_json::from_str(line)
-                .map_err(|e| Error::store(format!("parse attempt: {e}")))?;
-            // Fail closed on the record schema version: only `SCHEMA_VERSION`
-            // is accepted, any other version is refused with an error naming
-            // the version (a record from a different schema is never
-            // silently interpreted).
-            if attempt.deployment_schema_version != SCHEMA_VERSION {
-                return Err(Error::store(format!(
-                    "attempt {} carries unsupported deployment_schema_version {} (expected {SCHEMA_VERSION}): only SCHEMA_VERSION is accepted",
-                    attempt.deployment_id, attempt.deployment_schema_version
-                )));
+            match serde_json::from_str::<LedgerLine>(line)
+                .map_err(|e| Error::store(format!("parse ledger line: {e}")))?
+            {
+                LedgerLine::Intent(intent) => {
+                    // Fail closed on the record schema version: only
+                    // `SCHEMA_VERSION` is accepted, any other version is
+                    // refused with an error naming the version (a record
+                    // from a different schema is never silently
+                    // interpreted).
+                    if intent.deployment_schema_version != SCHEMA_VERSION {
+                        return Err(Error::store(format!(
+                            "intent {} carries unsupported deployment_schema_version {} (expected {SCHEMA_VERSION}): only SCHEMA_VERSION is accepted",
+                            intent.deployment_id, intent.deployment_schema_version
+                        )));
+                    }
+                    let id = intent.deployment_id.as_str().to_string();
+                    if index.contains_key(&id) {
+                        return Err(Error::integrity(format!(
+                            "ledger for target '{target}' has two intent lines for deployment '{id}' — the ledger is keyed by deployment id (one intent per entry)"
+                        )));
+                    }
+                    index.insert(id.clone(), out.len());
+                    out.push(LedgerEntry {
+                        deployment_id: intent.deployment_id.clone(),
+                        target: intent.target.clone(),
+                        intent,
+                        terminal: None,
+                        seq: seq as u64,
+                    });
+                }
+                LedgerLine::Terminal(terminal) => {
+                    let id = terminal.deployment_id.as_str();
+                    let pos = index.get(id).copied().ok_or_else(|| {
+                        Error::integrity(format!(
+                            "ledger of target '{target}': a terminal event for deployment '{id}' has no intent line — a terminal event requires its durable intent (a closed-DB corruption)"
+                        ))
+                    })?;
+                    let entry = &mut out[pos];
+                    if entry.terminal.is_some() {
+                        return Err(Error::integrity(format!(
+                            "ledger of target '{target}': two terminal events for deployment '{id}' — a terminal event is written exactly once"
+                        )));
+                    }
+                    entry.terminal = Some(terminal);
+                }
             }
-            out.push(attempt);
         }
         Ok(out)
     }
 
-    /// Read the attempts log as the FLOOR-GATED history: only the suffix
-    /// beginning at the checkpoint's own attempt (everything before it —
-    /// failed attempts included — was discarded when the checkpoint was
-    /// established). No floor marker: the full log. The checkpoint's own
-    /// deployment is always retained, so its attempt is the first line the
-    /// readers expose; attempts AFTER it (including later failed attempts)
-    /// remain visible. The floor marker is integrity-bound
-    /// ([`LocalStore::read_history_floor`]): a corrupted/tampered marker
-    /// makes this read FAIL CLOSED with an integrity error — it is never
-    /// silently treated as "no floor" (which would expose the below-floor
-    /// prefix).
-    pub fn read_attempts(&self, target: &str) -> Result<Vec<DeploymentAttempt>> {
-        let mut out = self.read_attempts_raw(target)?;
-        if let Some(floor) = self.read_history_floor(target)?
-            && let Some(pos) = out
-                .iter()
-                .position(|a| a.deployment_id == floor.deployment_id)
-        {
-            out.drain(..pos);
-        }
-        Ok(out)
-    }
-
-    // ---- rollback snapshots (refs) --------------------------------------
-
-    pub(crate) fn refs_dir(&self, target: &str) -> PathBuf {
-        self.target_dir(target).join("refs")
-    }
-
-    pub fn write_last_successful(&self, target: &str, deployment_id: &str) -> Result<()> {
-        #[cfg(test)]
-        if self
-            .fault_registry
-            .consume(FaultKind::WriteLastSuccessful, deployment_id)
-        {
-            return Err(Error::store(
-                "test fault: write_last_successful forced to fail once",
-            ));
-        }
-        let dir = self.refs_dir(target);
-        ensure_private_dir(&dir)?;
-        let p = dir.join("last-successful");
-        std::fs::write(&p, deployment_id)
-            .map_err(|e| Error::store(format!("write last-successful: {e}")))?;
-        set_private(&p)
-    }
-
+    /// The target's LATEST SUCCESSFUL deployment id, derived from the ledger
+    /// (the newest entry whose terminal event is `Successful`). The old
+    /// `refs/last-successful` mutable ref file is GONE: the derived read is
+    /// exact by construction — no stale-ref crash corner exists anymore.
     pub fn read_last_successful(&self, target: &str) -> Option<String> {
-        let p = self.refs_dir(target).join("last-successful");
-        std::fs::read_to_string(p)
-            .ok()
-            .filter(|s| !s.trim().is_empty())
+        self.read_ledger(target)
+            .ok()?
+            .into_iter()
+            .rev()
+            .find_map(|e| {
+                (e.terminal.as_ref().map(|t| t.status.clone())
+                    == Some(DeploymentStatus::Successful))
+                .then(|| e.deployment_id.as_str().to_string())
+            })
     }
 
-    /// Append a terminal successful snapshot (`refs/snapshots.jsonl`),
-    /// one JSON line per entry. Snapshots are the immutable rollback source
-    /// (referenced as a snapshot index `sN`, e.g. `deploy push <target> sN`);
-    /// only successful deployments produce them.
-    pub fn append_snapshot(&self, target: &str, entry: &DeploymentSnapshot) -> Result<()> {
-        #[cfg(test)]
-        if self
-            .fault_registry
-            .consume(FaultKind::AppendSnapshot, entry.deployment_id.as_str())
+    /// The current status of a deployment: the status of its TERMINAL EVENT
+    /// in the target's ledger, or — when the entry exists but has no
+    /// terminal yet — `Some(PendingCommit)` (the recoverable in-progress /
+    /// pending-commit state: the intent is durable, the finalization never
+    /// completed). `None` when no ledger entry carries the deployment id at
+    /// all. Scans every target's ledger (the deployment id does not name its
+    /// target; the entry's own intent does).
+    pub fn latest_status(&self, id: &str) -> Result<Option<DeploymentStatus>> {
+        let targets_dir = self.base.join("targets");
+        if !path_state(&targets_dir)? {
+            return Ok(None);
+        }
+        for dir in std::fs::read_dir(&targets_dir)
+            .map_err(|e| Error::store(format!("read_dir targets: {e}")))?
         {
-            return Err(Error::store(
-                "test fault: append_snapshot forced to fail once",
-            ));
-        }
-        let dir = self.refs_dir(target);
-        ensure_private_dir(&dir)?;
-        let p = dir.join("snapshots.jsonl");
-        let mut f = if p.exists() {
-            std::fs::OpenOptions::new().append(true).open(&p)
-        } else {
-            std::fs::File::create(&p)
-        }
-        .map_err(|e| Error::store(format!("open snapshots: {e}")))?;
-        let line = serde_json::to_string(entry)
-            .map_err(|e| Error::store(format!("serialize snapshot: {e}")))?;
-        writeln!(f, "{line}").map_err(|e| Error::store(format!("write snapshot: {e}")))?;
-        drop(f);
-        set_private(&p)
-    }
-
-    /// Read the FULL snapshot log UNFILTERED by any checkpoint floor. This
-    /// is the physical view of `refs/snapshots.jsonl` (never a below-floor
-    /// escape hatch for consumers: [`LocalStore::read_snapshots`] is the
-    /// gated read). Index allocation and the compaction suffix use it, so
-    /// compacted logs never reuse an index. Crate-private: non-crate
-    /// consumers must use the floor-gated [`LocalStore::read_snapshots`].
-    pub(crate) fn read_snapshots_raw(&self, target: &str) -> Result<Vec<DeploymentSnapshot>> {
-        let p = self.refs_dir(target).join("snapshots.jsonl");
-        // Tri-state: only a genuine NotFound is "no snapshots log" (the
-        // empty vector); a stat failure propagates as a Store error (an
-        // unreadable log must not read as "no history" — a floor binding
-        // check would then fail open).
-        if !path_state(&p)? {
-            return Ok(vec![]);
-        }
-        let text = std::fs::read_to_string(&p)
-            .map_err(|e| Error::store(format!("read snapshots: {e}")))?;
-        let mut out = Vec::new();
-        for line in text.lines() {
-            if line.trim().is_empty() {
+            let dir = dir.map_err(|e| Error::store(format!("target entry: {e}")))?;
+            let name = dir.file_name().to_string_lossy().into_owned();
+            if !dir.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
-            out.push(
-                serde_json::from_str::<DeploymentSnapshot>(line)
-                    .map_err(|e| Error::store(format!("parse snapshot: {e}")))?,
-            );
+            for e in self.read_ledger(&name)? {
+                if e.deployment_id.as_str() == id {
+                    return Ok(e
+                        .terminal
+                        .map(|t| t.status)
+                        .or(Some(DeploymentStatus::PendingCommit)));
+                }
+            }
         }
-        Ok(out)
-    }
-
-    /// Read the snapshot log as the FLOORED history: only the suffix
-    /// beginning at the checkpoint deployment's POSITION in the log (the
-    /// deployment-keyed analog of the old `index >= floor.snapshot_index`
-    /// filter — positions are DERIVED from the log order, never stored). The
-    /// checkpoint deployment itself stays resolvable; everything before it
-    /// was discarded. The floor marker gates this read even when the
-    /// physical log has not been compacted yet (an interrupted compaction),
-    /// so history below the durable floor is never exposed. The marker is
-    /// verified ([`LocalStore::read_history_floor`]): a corrupted/tampered
-    /// marker makes this read fail closed with an integrity error — never a
-    /// silent downgrade to "no floor" (which would expose the below-floor
-    /// prefix).
-    pub fn read_snapshots(&self, target: &str) -> Result<Vec<DeploymentSnapshot>> {
-        let mut out = self.read_snapshots_raw(target)?;
-        if let Some(floor) = self.read_history_floor(target)?
-            && let Some(pos) = out
-                .iter()
-                .position(|s| s.deployment_id == floor.deployment_id)
-        {
-            out.drain(..pos);
-        }
-        Ok(out)
+        Ok(None)
     }
 
     // ---- servers ----------------------------------------------------------
@@ -918,141 +928,60 @@ impl LocalStore {
         self.base.join("deployments").join(sanitize(id))
     }
 
+    /// Write the recorded deployment plan (`deployments/<id>/plan.json`). The
+    /// plan is the deployment's immutable plan artifact (deployment IDs are
+    /// unique, so a conflicting same-ID rewrite is corruption and must fail
+    /// rather than silently rewrite history). The outcomes and status of a
+    /// deployment live in the LEDGER's terminal event, not here — this file
+    /// is purely the plan snapshot the deployment was planned from (the
+    /// checkpoint sweep deletes unreachable `deployments/<id>/` dirs).
     pub fn write_plan<T: Serialize>(&self, id: &str, plan: &T) -> Result<()> {
         let dir = self.deployment_dir(id);
         ensure_private_dir(&dir)?;
-        // The recorded plan of an attempt is immutable: deployment IDs are
-        // unique, so a conflicting same-ID rewrite is corruption and must fail
-        // rather than silently rewrite history.
         let bytes = serde_json::to_vec_pretty(plan)
             .map_err(|e| Error::store(format!("serialize plan: {e}")))?;
         write_atomic_cas(&dir.join("plan.json"), &bytes)
     }
-
-    pub fn write_results(&self, id: &str, results: &DeploymentResults) -> Result<()> {
-        #[cfg(test)]
-        if self.fault_registry.consume(FaultKind::WriteResults, id) {
-            return Err(Error::store(
-                "test fault: write_results forced to fail once",
-            ));
-        }
-        let dir = self.deployment_dir(id);
-        ensure_private_dir(&dir)?;
-        // Same immutability rule as the plan: recorded once per deployment ID.
-        let bytes = serde_json::to_vec_pretty(results)
-            .map_err(|e| Error::store(format!("serialize results: {e}")))?;
-        write_atomic_cas(&dir.join("results.json"), &bytes)
+}
+/// Append one JSON line to the target's ledger file (open-or-create,
+/// write, private perms). A crash mid-append leaves a possibly-partial
+/// trailing line; every read ([`LocalStore::read_ledger`]) fails closed on
+/// it rather than silently dropping history.
+fn append_ledger_line(path: &Path, line: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::store(format!("mkdir {}: {e}", parent.display())))?;
     }
-
-    pub fn read_results(&self, id: &str) -> Result<DeploymentResults> {
-        let p = self.deployment_dir(id).join("results.json");
-        read_json(&p)
+    let mut f = if path.exists() {
+        std::fs::OpenOptions::new().append(true).open(path)
+    } else {
+        std::fs::File::create(path)
     }
+    .map_err(|e| Error::store(format!("open ledger: {e}")))?;
+    writeln!(f, "{line}").map_err(|e| Error::store(format!("write ledger: {e}")))?;
+    drop(f);
+    set_private(path)
+}
 
-    /// Append one status event to the deployment's append-only transition
-    /// stream (`deployments/<id>/transitions.jsonl`). The current status of a
-    /// deployment is the LATEST transition; this replaces the old single
-    /// mutable `deployments/<id>/status` file. `reason` carries optional
-    /// human context (e.g. "recovery finalization", "metadata phase
-    /// interrupted").
-    pub fn append_transition(
-        &self,
-        id: &str,
-        status: &DeploymentStatus,
-        reason: Option<&str>,
-    ) -> Result<()> {
-        #[cfg(test)]
-        if self.fault_registry.consume(FaultKind::AppendTransition, id) {
-            return Err(Error::store(
-                "test fault: append_transition forced to fail once",
-            ));
+impl LocalStore {
+    /// Whether the ledger already contains an INTENT line (a cheap tri-state
+    /// existence probe for the append-intent duplicate guard; reads the file
+    /// only when it exists).
+    fn ledger_has_intent(&self, path: &Path) -> Result<Option<String>> {
+        if !path_state(path)? {
+            return Ok(None);
         }
-        #[cfg(test)]
-        if status == &DeploymentStatus::Successful
-            && self
-                .fault_registry
-                .consume(FaultKind::AppendTransitionSuccessful, id)
-        {
-            return Err(Error::store(
-                "test fault: append_transition(Successful) forced to fail once",
-            ));
-        }
-        #[cfg(test)]
-        if status == &DeploymentStatus::PendingCommit
-            && self
-                .fault_registry
-                .consume(FaultKind::AppendTransitionPending, id)
-        {
-            return Err(Error::store(
-                "test fault: append_transition(PendingCommit) forced to fail once",
-            ));
-        }
-        let dir = self.deployment_dir(id);
-        ensure_private_dir(&dir)?;
-        let p = dir.join("transitions.jsonl");
-        let transition = DeploymentTransition {
-            deployment_id: DeploymentId::new(id.to_string()),
-            status: status.clone(),
-            recorded_at: crate::remote::helper::now_rfc3339(),
-            reason: reason.map(str::to_string),
-        };
-        let mut f = if p.exists() {
-            std::fs::OpenOptions::new().append(true).open(&p)
-        } else {
-            std::fs::File::create(&p)
-        }
-        .map_err(|e| Error::store(format!("open transitions: {e}")))?;
-        let line = serde_json::to_string(&transition)
-            .map_err(|e| Error::store(format!("serialize transition: {e}")))?;
-        writeln!(f, "{line}").map_err(|e| Error::store(format!("write transition: {e}")))?;
-        drop(f);
-        set_private(&p)
-    }
-
-    /// Read the full append-only transition stream for a deployment.
-    pub fn read_transitions(&self, id: &str) -> Result<Vec<DeploymentTransition>> {
-        let p = self.deployment_dir(id).join("transitions.jsonl");
-        // Tri-state: only a genuine NotFound is "no transition stream" (the
-        // empty vector); a stat failure propagates as a Store error (an
-        // unreadable log must not read as "no history").
-        if !path_state(&p)? {
-            return Ok(vec![]);
-        }
-        let text = std::fs::read_to_string(&p)
-            .map_err(|e| Error::store(format!("read transitions: {e}")))?;
-        let mut out = Vec::new();
+        let text =
+            std::fs::read_to_string(path).map_err(|e| Error::store(format!("read ledger: {e}")))?;
         for line in text.lines() {
             if line.trim().is_empty() {
                 continue;
             }
-            out.push(
-                serde_json::from_str::<DeploymentTransition>(line)
-                    .map_err(|e| Error::store(format!("parse transition: {e}")))?,
-            );
+            if let Ok(LedgerLine::Intent(intent)) = serde_json::from_str::<LedgerLine>(line) {
+                return Ok(Some(intent.deployment_id.as_str().to_string()));
+            }
         }
-        Ok(out)
-    }
-
-    /// The latest transition of a deployment, or `None` when no transition
-    /// has been recorded yet.
-    pub fn latest_transition(&self, id: &str) -> Result<Option<DeploymentTransition>> {
-        Ok(self.read_transitions(id)?.pop())
-    }
-
-    /// The current status of a deployment: the status of its LATEST
-    /// transition, or `None` when no transition has been recorded yet.
-    pub fn latest_status(&self, id: &str) -> Result<Option<DeploymentStatus>> {
-        Ok(self.latest_transition(id)?.map(|t| t.status))
-    }
-
-    /// Read a deployment's recorded plan (`deployments/<id>/plan.json`),
-    /// the immutable intent record written BEFORE any server mutation. The
-    /// plan is the artifact-reference source the garbage collector reads for
-    /// every RETAINED deployment record (its per-slot [`ArtifactRef`]s,
-    /// `desired_release`, and plan source): a retained record's plan is
-    /// authoritative for what its deployment may still need locally.
-    pub(crate) fn read_plan(&self, id: &str) -> Result<DeploymentPlan> {
-        read_json(&self.deployment_dir(id).join("plan.json"))
+        Ok(None)
     }
 
     // ---- pins ------------------------------------------------------------
@@ -1137,9 +1066,82 @@ pub fn sanitize(name: &str) -> String {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DeploymentId, GenerationId, PlacementSlotId, TargetName};
+    use crate::model::{
+        ArtifactRef, GenerationId, GenerationRef, PlacementSlotAssignment, PlacementSlotId,
+        ReleaseId, TargetName, VariantName,
+    };
+    use crate::records::{
+        LedgerIntent, LedgerLine, LedgerRollback, LedgerTerminal, ServerOutcomeKind, ServerResult,
+    };
+
+    fn intent(id: &str, target: &str) -> LedgerIntent {
+        LedgerIntent {
+            deployment_schema_version: SCHEMA_VERSION,
+            deployment_id: DeploymentId::new(id.to_string()),
+            target: TargetName::new(target.to_string()),
+            slot_ids: vec![PlacementSlotId::new("p1".to_string())],
+            behavior_sha256: "sha256-aa".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            desired: BTreeMap::new(),
+            pre_push: BTreeMap::new(),
+            slots: BTreeMap::new(),
+        }
+    }
+
+    fn successful_terminal(id: &str, target: &str) -> LedgerTerminal {
+        LedgerTerminal {
+            deployment_id: DeploymentId::new(id.to_string()),
+            target: TargetName::new(target.to_string()),
+            status: DeploymentStatus::Successful,
+            recorded_at: "2026-01-01T00:00:00Z".to_string(),
+            outcomes: BTreeMap::from([(
+                PlacementSlotId::new("p1".to_string()),
+                ServerResult {
+                    slot_id: PlacementSlotId::new("p1".to_string()),
+                    outcome: ServerOutcomeKind::Activated,
+                    generation: Some(GenerationId::new("gen-1".to_string())),
+                    compensated: false,
+                    error: None,
+                },
+            )]),
+            rollback: Some(LedgerRollback {
+                behavior_sha256: "sha256-aa".to_string(),
+                release: ReleaseId::new("rel-sha256-a".to_string()),
+                slots: BTreeMap::from([(
+                    PlacementSlotId::new("p1".to_string()),
+                    GenerationRef {
+                        generation: GenerationId::new("gen-1".to_string()),
+                        assignment: PlacementSlotAssignment {
+                            placement_slot: PlacementSlotId::new("p1".to_string()),
+                            artifact: ArtifactRef {
+                                release: ReleaseId::new("rel-sha256-a".to_string()),
+                                variant: VariantName::new("standard".to_string()),
+                                tree: TreeDigest::new("t1".to_string()),
+                            },
+                        },
+                    },
+                )]),
+                bindings: BTreeMap::from([(
+                    PlacementSlotId::new("p1".to_string()),
+                    crate::records::PhysicalBinding {
+                        server: crate::model::ServerId::new("s1".to_string()),
+                        deploy_dir: "/srv/deploy/p1".to_string(),
+                    },
+                )]),
+            }),
+            reason: None,
+        }
+    }
+
+    fn seed_successful(store: &LocalStore, target: &str, id: &str) {
+        store.append_intent(target, &intent(id, target)).unwrap();
+        store
+            .append_terminal(target, &successful_terminal(id, target))
+            .unwrap();
+    }
 
     /// `sanitize` must neutralize path-traversal components. `.` and `..` are
     /// the one case the character filter lets through untouched (dots are
@@ -1201,6 +1203,167 @@ mod tests {
         );
     }
 
+    /// The ledger round-trips: intent + terminal merge into ONE entry per
+    /// deployment id, in append order, with the terminal carrying status,
+    /// outcomes, and the rollback state. A terminal without its intent, a
+    /// duplicate intent, or a duplicate terminal FAILS CLOSED (integrity).
+    #[test]
+    fn ledger_merges_intent_and_terminal_and_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let target = "t1";
+        seed_successful(&store, target, "deploy-a");
+        seed_successful(&store, target, "deploy-b");
+        let entries = store.read_ledger(target).unwrap();
+        assert_eq!(entries.len(), 2, "one merged entry per deployment");
+        assert_eq!(entries[0].deployment_id.as_str(), "deploy-a");
+        assert_eq!(entries[1].deployment_id.as_str(), "deploy-b");
+        assert!(entries[0].terminal.is_some());
+        assert_eq!(
+            entries[0].terminal.as_ref().unwrap().status,
+            DeploymentStatus::Successful
+        );
+        assert_eq!(
+            entries[0].terminal.as_ref().unwrap().outcomes[&PlacementSlotId::new("p1")].outcome,
+            ServerOutcomeKind::Activated
+        );
+        assert_eq!(
+            entries[0]
+                .terminal
+                .as_ref()
+                .unwrap()
+                .rollback
+                .as_ref()
+                .unwrap()
+                .release
+                .as_str(),
+            "rel-sha256-a"
+        );
+        // A terminal without its intent is refused (fail closed).
+        let err = store
+            .append_terminal(target, &successful_terminal("deploy-ghost", target))
+            .unwrap_err();
+        assert!(err.to_string().contains("no ledger intent"));
+        // A duplicate intent is refused (the deployment id keys the entry).
+        let err = store
+            .append_intent(target, &intent("deploy-a", target))
+            .unwrap_err();
+        assert!(err.to_string().contains("second intent"));
+        // A duplicate terminal is refused.
+        let err = store
+            .append_terminal(target, &successful_terminal("deploy-a", target))
+            .unwrap_err();
+        assert!(err.to_string().contains("already carries a terminal"));
+    }
+
+    /// A foreign `deployment_schema_version` on an intent line fails closed
+    /// (only `SCHEMA_VERSION` is accepted), and a malformed line is a store
+    /// error, never a silent drop.
+    #[test]
+    fn ledger_accepts_only_schema_version_and_rejects_malformed_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let target = "t1";
+        let mut foreign = intent("deploy-x", target);
+        foreign.deployment_schema_version = SCHEMA_VERSION + 1;
+        let line = serde_json::to_string(&LedgerLine::Intent(foreign)).unwrap();
+        let p = store.ledger_path(target);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, format!("{line}\n")).unwrap();
+        let err = store.read_ledger(target).unwrap_err();
+        assert!(
+            err.to_string().contains("schema_version"),
+            "a foreign schema version must fail closed, got: {err}"
+        );
+        // Malformed bytes are a store error, never silently dropped.
+        std::fs::write(&p, "{ not json !\n").unwrap();
+        assert!(store.read_ledger(target).is_err());
+    }
+
+    /// `latest_status` derives from the ledger: the terminal's status for a
+    /// settled entry, `PendingCommit` for an intent-only (recoverable) entry,
+    /// and `None` for an unknown deployment.
+    #[test]
+    fn latest_status_derives_from_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let target = "t1";
+        store
+            .append_intent(target, &intent("deploy-pending", target))
+            .unwrap();
+        seed_successful(&store, target, "deploy-ok");
+        store
+            .append_intent(target, &intent("deploy-deg", target))
+            .unwrap();
+        store
+            .append_terminal(
+                target,
+                &LedgerTerminal {
+                    deployment_id: DeploymentId::new("deploy-deg".to_string()),
+                    target: TargetName::new(target.to_string()),
+                    status: DeploymentStatus::Degraded,
+                    recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                    outcomes: BTreeMap::new(),
+                    rollback: None,
+                    reason: Some("boom".to_string()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.latest_status("deploy-pending").unwrap(),
+            Some(DeploymentStatus::PendingCommit),
+            "an intent-only entry is the recoverable pending state"
+        );
+        assert_eq!(
+            store.latest_status("deploy-ok").unwrap(),
+            Some(DeploymentStatus::Successful)
+        );
+        assert_eq!(
+            store.latest_status("deploy-deg").unwrap(),
+            Some(DeploymentStatus::Degraded)
+        );
+        assert_eq!(store.latest_status("deploy-nope").unwrap(), None);
+    }
+
+    /// `read_last_successful` is DERIVED from the ledger (the newest
+    /// `Successful` terminal) — no separate ref file exists anymore.
+    #[test]
+    fn last_successful_is_derived() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let target = "t1";
+        assert_eq!(store.read_last_successful(target), None);
+        seed_successful(&store, target, "deploy-a");
+        seed_successful(&store, target, "deploy-b");
+        assert_eq!(
+            store.read_last_successful(target).as_deref(),
+            Some("deploy-b"),
+            "the newest successful entry is the derived last-successful"
+        );
+        // A later failed deployment does not move the pointer.
+        store
+            .append_intent(target, &intent("deploy-fail", target))
+            .unwrap();
+        store
+            .append_terminal(
+                target,
+                &LedgerTerminal {
+                    deployment_id: DeploymentId::new("deploy-fail".to_string()),
+                    target: TargetName::new(target.to_string()),
+                    status: DeploymentStatus::FailedRolledBack,
+                    recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                    outcomes: BTreeMap::new(),
+                    rollback: None,
+                    reason: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.read_last_successful(target).as_deref(),
+            Some("deploy-b")
+        );
+    }
+
     /// A canonical behavior fixture: adapter `systemd` (a NON-default value,
     /// so deleting `activation.adapter` changes the contract), a system scope,
     /// one managed unit, and a command verification with a distinctive argv.
@@ -1239,21 +1402,21 @@ mod tests {
         store: &LocalStore,
     ) -> (ReleaseId, BTreeMap<String, BehaviorContract>, String) {
         let (contracts, sha) = behavior_fixture();
-        let variants: BTreeMap<crate::model::VariantName, crate::model::TreeDigest> =
-            BTreeMap::from([(
-                crate::model::VariantName::new("standard"),
-                crate::model::TreeDigest::new("t1"),
-            )]);
+        let variants: BTreeMap<crate::model::VariantName, TreeDigest> = BTreeMap::from([(
+            crate::model::VariantName::new("standard"),
+            TreeDigest::new("t1"),
+        )]);
         let slots: BTreeMap<String, Vec<crate::config::SlotDef>> = BTreeMap::from([(
             "standard".to_string(),
             vec![crate::config::SlotDef {
                 id: "p1".to_string(),
                 server: "s1".to_string(),
-                deploy_dir: PathBuf::from("/srv/deploy/p1"),
+                deploy_dir: std::path::PathBuf::from("/srv/deploy/p1"),
                 targets: vec!["t1".to_string()],
             }],
         )]);
-        let rec = crate::release::build_release("m", &sha, &variants, &slots, Path::new("."));
+        let rec =
+            crate::release::build_release("m", &sha, &variants, &slots, std::path::Path::new("."));
         let id = ReleaseId::new(rec.release_id.clone());
         store.write_release(&rec).unwrap();
         let behavior_json = serde_json::to_value(&contracts).unwrap();
@@ -1301,361 +1464,33 @@ mod tests {
         assert_eq!(read["standard"].activation.adapter, "systemd");
     }
 
-    /// Mutation matrix over a stored release's `behavior.json`: deleting each
-    /// required field, changing each identity-bearing field, or corrupting the
-    /// bytes must make the historical read FAIL CLOSED with an integrity error
-    /// (the canonical digest no longer matches the release's provenance
-    /// `behavior_sha256`), while a mutation that keeps the canonical contract
-    /// set equal (JSON key reordering) MUST PASS — that is the "unless the
-    /// canonical behavior digest remains equal" clause.
-    #[test]
-    fn read_release_behaviors_verifies_behavior_json_digest() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let (id, _contracts, _sha) = write_behavior_fixture(&store);
-        let path = store.release_dir(&id).join("behavior.json");
-
-        // Baseline: the pristine snapshot reads.
-        store.read_release_behaviors(&id).expect("pristine reads");
-
-        let write = |v: &serde_json::Value| {
-            std::fs::write(&path, serde_json::to_vec_pretty(v).unwrap()).unwrap()
-        };
-        let read = |label: &str| {
-            let err = store
-                .read_release_behaviors(&id)
-                .expect_err("a digest-changing mutation must fail closed");
-            let msg = err.to_string();
-            assert!(
-                msg.contains("digest mismatch") || msg.contains("malformed"),
-                "mutation '{label}' must fail with an integrity error, got: {msg}"
-            );
-        };
-
-        // Required-field deletions: activation.adapter (default "none" now
-        // differs from the stored "systemd"), verification.argv (missing
-        // required field -> unparseable).
-        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        let mut del = v.clone();
-        del["standard"]["activation"]
-            .as_object_mut()
-            .unwrap()
-            .remove("adapter");
-        write(&del);
-        read("delete activation.adapter");
-        let mut del = v.clone();
-        del["standard"]["verification"]
-            .as_object_mut()
-            .unwrap()
-            .remove("argv");
-        write(&del);
-        read("delete verification.argv");
-        let mut del = v.clone();
-        del.as_object_mut().unwrap().remove("standard");
-        write(&del);
-        read("delete a whole variant's contract");
-        let mut del = v.clone();
-        del.as_object_mut().unwrap().remove("standard");
-        write(&del);
-        read("delete the variant key itself");
-
-        // Identity-bearing field changes: adapter, argv element, timeout,
-        // scope, variant renamed.
-        let mut c = v.clone();
-        c["standard"]["activation"]["adapter"] = serde_json::json!("none");
-        write(&c);
-        read("change activation.adapter");
-        let mut c = v.clone();
-        c["standard"]["verification"]["argv"][0] = serde_json::json!("false");
-        write(&c);
-        read("change verification.argv element");
-        let mut c = v.clone();
-        c["standard"]["verification"]["timeout_seconds"] = serde_json::json!(31);
-        write(&c);
-        read("change verification.timeout_seconds");
-        let mut c = v.clone();
-        c["standard"]["activation"]["scope"] = serde_json::json!("user");
-        write(&c);
-        read("change activation.scope");
-        let mut c = v.clone();
-        let standard = v["standard"].clone();
-        c.as_object_mut().unwrap().remove("standard");
-        c["renamed"] = standard;
-        write(&c);
-        read("rename the variant");
-
-        // Corrupt bytes: unparseable -> fail closed.
-        std::fs::write(&path, b"{ not json !").unwrap();
-        let err = store
-            .read_release_behaviors(&id)
-            .expect_err("corrupt bytes must fail closed");
-        assert!(
-            err.to_string().contains("malformed"),
-            "error must name the malformed snapshot, got: {err}"
-        );
-
-        // Digest-equal mutation: reorder JSON keys so the bytes differ but the
-        // parsed contract set is identical. The canonical digest stays equal,
-        // so the read MUST PASS.
-        let reordered = br#"{"standard":{"verification":{"adapter":"command","argv":["true"],"timeout_seconds":30,"attempts":2,"interval_seconds":1},"activation":{"adapter":"systemd","scope":"system","reconcile_managed_units":true,"units":[{"name":"app.service","artifact_path":"integration/systemd/app.service","enable":true,"restart":true}]}}}"#;
-        std::fs::write(&path, reordered).unwrap();
-        let read = store
-            .read_release_behaviors(&id)
-            .expect("a digest-equal key reorder must pass");
-        assert_eq!(read["standard"].activation.adapter, "systemd");
-        assert_eq!(read["standard"].verification.timeout_seconds, 30);
-    }
-
     /// `read_release` recomputes the canonical digest from the record's own
-    /// content and verifies it against BOTH stored identity fields: a pristine
-    /// record reads fine, while a record whose slot declaration was edited with
-    /// the old `release_sha256`/`release_id` retained fails closed with an
-    /// integrity error naming the mismatch.
+    /// content and verifies it against the stored identity fields: a pristine
+    /// record reads fine, while an edited slot declaration fails closed.
     #[test]
     fn read_release_recomputes_and_verifies_identity() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let variants: BTreeMap<crate::model::VariantName, crate::model::TreeDigest> =
-            BTreeMap::from([(
-                crate::model::VariantName::new("standard"),
-                crate::model::TreeDigest::new("t1"),
-            )]);
-        let slots: BTreeMap<String, Vec<crate::config::SlotDef>> = BTreeMap::from([(
-            "standard".to_string(),
-            vec![crate::config::SlotDef {
-                id: "p1".to_string(),
-                server: "s1".to_string(),
-                deploy_dir: PathBuf::from("/srv/deploy/p1"),
-                targets: vec!["t1".to_string()],
-            }],
-        )]);
-        let rec = crate::release::build_release("m", "b", &variants, &slots, Path::new("."));
-        let id = ReleaseId::new(rec.release_id.clone());
-        store.write_release(&rec).unwrap();
-
-        // Positive case: the unmodified record reads fine.
+        let (id, _c, _sha) = write_behavior_fixture(&store);
         let read = store.read_release(&id).unwrap();
-        assert_eq!(read.release_sha256, rec.release_sha256);
-        assert_eq!(read.release_id, rec.release_id);
-
-        // Tamper: change a slot's deploy_dir in the STORED record while
-        // retaining the old digest fields (the bug: content edited, digest
-        // trusted). `write_release` now verifies the incoming record from its
-        // content before any write, so the tampered record must be installed
-        // by writing the file directly.
+        assert_eq!(read.release_id, id.as_str());
         let mut tampered = read.clone();
         tampered.slots.get_mut("standard").unwrap().slots[0].deploy_dir =
             "/srv/elsewhere".to_string();
-        assert_eq!(
-            tampered.release_sha256, rec.release_sha256,
-            "digest retained"
-        );
-        assert_eq!(tampered.release_id, rec.release_id, "release id retained");
         let path = store.release_dir(&id).join("release.json");
         std::fs::write(&path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
-
         let err = store
             .read_release(&id)
             .expect_err("tampered record must fail verification");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("identity mismatch"),
-            "error must name the mismatch, got: {msg}"
-        );
-        assert!(
-            msg.contains(&rec.release_sha256),
-            "error must name the stored digest, got: {msg}"
-        );
+        assert!(err.to_string().contains("identity mismatch"), "got: {err}");
     }
 
-    /// `write_release` verifies the INCOMING record from its OWN content
-    /// before any write: a record whose content was edited while the digest
-    /// fields were retained is refused with an integrity error, and NOTHING
-    /// is written — the release directory is never even created. An incoming
-    /// record with an EMPTY slot snapshot is refused the same way (fail
-    /// closed: a current-format record must persist its slot declarations).
+    /// A recorded plan is immutable: deployment IDs are unique, so a
+    /// same-ID rewrite with different content is corruption.
     #[test]
-    fn write_release_rejects_tampered_incoming_record_before_writing() {
+    fn recorded_plan_is_immutable() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let rec = crate::release::build_release(
-            "m",
-            "b",
-            &BTreeMap::from([(
-                crate::model::VariantName::new("standard"),
-                crate::model::TreeDigest::new("t1"),
-            )]),
-            &BTreeMap::from([(
-                "standard".to_string(),
-                vec![crate::config::SlotDef {
-                    id: "p1".to_string(),
-                    server: "s1".to_string(),
-                    deploy_dir: PathBuf::from("/srv/deploy/p1"),
-                    targets: vec!["t1".to_string()],
-                }],
-            )]),
-            Path::new("."),
-        );
-        let id = ReleaseId::new(rec.release_id.clone());
-
-        // Tampered incoming: content edited, digest fields retained.
-        let mut tampered = rec.clone();
-        tampered.slots.get_mut("standard").unwrap().slots[0].deploy_dir =
-            "/srv/elsewhere".to_string();
-        assert_eq!(
-            tampered.release_sha256, rec.release_sha256,
-            "digest retained"
-        );
-        let err = store
-            .write_release(&tampered)
-            .expect_err("a tampered incoming record must be refused before any write");
-        assert!(
-            err.to_string().contains("identity mismatch"),
-            "error must name the content-vs-digest mismatch, got: {err}"
-        );
-        assert!(
-            !store.release_dir(&id).exists(),
-            "nothing may be written for a tampered incoming record"
-        );
-
-        // Empty slot snapshot: rejected outright, nothing written.
-        let mut empty = rec.clone();
-        empty.slots.clear();
-        let err = store
-            .write_release(&empty)
-            .expect_err("an empty slot snapshot must be refused before any write");
-        assert!(
-            err.to_string().contains("fail closed"),
-            "error must explain the fail-closed rejection, got: {err}"
-        );
-        assert!(
-            !store.release_dir(&id).exists(),
-            "nothing may be written for an empty-slot-snapshot record"
-        );
-
-        // The pristine record still writes fine afterwards.
-        store.write_release(&rec).expect("pristine record writes");
-        assert!(store.release_dir(&id).exists());
-    }
-
-    /// `write_release` on an already-existing directory verifies the EXISTING
-    /// record from its content before comparing identities: an existing record
-    /// that was tampered (content edited, digest fields retained) fails with
-    /// an integrity error even when the incoming record is pristine — the
-    /// same-id comparison never trusts the stored digest fields.
-    #[test]
-    fn write_release_verifies_existing_record_before_comparing() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let rec = crate::release::build_release(
-            "m",
-            "b",
-            &BTreeMap::from([(
-                crate::model::VariantName::new("standard"),
-                crate::model::TreeDigest::new("t1"),
-            )]),
-            &BTreeMap::from([(
-                "standard".to_string(),
-                vec![crate::config::SlotDef {
-                    id: "p1".to_string(),
-                    server: "s1".to_string(),
-                    deploy_dir: PathBuf::from("/srv/deploy/p1"),
-                    targets: vec!["t1".to_string()],
-                }],
-            )]),
-            Path::new("."),
-        );
-        let id = ReleaseId::new(rec.release_id.clone());
-        store.write_release(&rec).expect("pristine record writes");
-
-        // Tamper the EXISTING record on disk: content edited, digests
-        // retained (written directly, since write_release refuses it now).
-        let mut tampered = rec.clone();
-        tampered.slots.get_mut("standard").unwrap().slots[0].deploy_dir =
-            "/srv/elsewhere".to_string();
-        let path = store.release_dir(&id).join("release.json");
-        std::fs::write(&path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
-
-        let err = store
-            .write_release(&rec)
-            .expect_err("a tampered existing record must fail content verification");
-        assert!(
-            err.to_string().contains("identity mismatch"),
-            "error must name the existing record's content-vs-digest mismatch, got: {err}"
-        );
-
-        // A genuinely different (but self-consistent) record with the same id
-        // is impossible under verification, so the same-id idempotent rewrite
-        // of the pristine record still passes after restoring it.
-        std::fs::write(&path, serde_json::to_vec_pretty(&rec).unwrap()).unwrap();
-        store
-            .write_release(&rec)
-            .expect("identical rewrite of the restored record is idempotent");
-    }
-
-    /// `read_release(id)` must verify that the STORED record's `release_id`
-    /// equals the `id` the caller asked for (the directory path): a record
-    /// relocated into (or swapped into) a different release directory passes
-    /// content verification but is refused with an integrity error naming
-    /// both ids instead of being returned as if it were `id`.
-    #[test]
-    fn read_release_binds_stored_release_id_to_the_read_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let rec = crate::release::build_release(
-            "m",
-            "b",
-            &BTreeMap::from([(
-                crate::model::VariantName::new("standard"),
-                crate::model::TreeDigest::new("t1"),
-            )]),
-            &BTreeMap::from([(
-                "standard".to_string(),
-                vec![crate::config::SlotDef {
-                    id: "p1".to_string(),
-                    server: "s1".to_string(),
-                    deploy_dir: PathBuf::from("/srv/deploy/p1"),
-                    targets: vec!["t1".to_string()],
-                }],
-            )]),
-            Path::new("."),
-        );
-        let id = ReleaseId::new(rec.release_id.clone());
-        store.write_release(&rec).expect("pristine record writes");
-        store
-            .read_release(&id)
-            .expect("the record reads fine from its own directory");
-
-        // Plant the same (content-verified) record under a DIFFERENT release
-        // directory: its release_id still names `id`, not the read path.
-        let other = ReleaseId::new("rel-sha256-swapped".to_string());
-        assert_ne!(other.as_str(), id.as_str());
-        let other_dir = store.release_dir(&other);
-        std::fs::create_dir_all(&other_dir).unwrap();
-        std::fs::write(
-            other_dir.join("release.json"),
-            serde_json::to_vec_pretty(&rec).unwrap(),
-        )
-        .unwrap();
-
-        let err = store
-            .read_release(&other)
-            .expect_err("a record whose release_id differs from the read path must be refused");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("rel-sha256-swapped") && msg.contains(&rec.release_id),
-            "error must name the requested id and the record's actual release_id, got: {msg}"
-        );
-    }
-
-    /// A recorded attempt's plan and results are immutable: deployment IDs are
-    /// unique, so a same-ID rewrite with different content is corruption and
-    /// must fail instead of silently rewriting history.
-    #[test]
-    fn recorded_plan_and_results_are_immutable() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-
         let plan = serde_json::json!({ "target": "t1" });
         store
             .write_plan("deploy-1", &plan)
@@ -1667,939 +1502,61 @@ mod tests {
             .write_plan("deploy-1", &serde_json::json!({ "target": "t2" }))
             .expect_err("conflicting plan rewrite must fail");
         assert!(err.to_string().contains("different content"));
-
-        let results = DeploymentResults {
-            deployment_id: DeploymentId::from("deploy-1".to_string()),
-            target: TargetName::from("t1".to_string()),
-            slots: Default::default(),
-        };
-        store
-            .write_results("deploy-1", &results)
-            .expect("first results");
-        let conflicting = DeploymentResults {
-            deployment_id: DeploymentId::from("deploy-1".to_string()),
-            target: TargetName::from("t2".to_string()),
-            slots: Default::default(),
-        };
-        assert!(store.write_results("deploy-1", &conflicting).is_err());
     }
 
-    /// The floor marker gates the READER reads even when the physical logs
-    /// are NOT yet compacted (an interrupted compaction): `read_attempts` /
-    /// `read_snapshots` expose only the suffix at/after the floor while the
-    /// raw readers still see the full physical log (never a below-floor
-    /// escape hatch). The marker also fails closed on a foreign
-    /// `schema_version`.
+    /// One-shot faults are status-qualified and consumed exactly once (the
+    /// terminal append fault fires on the matching deployment id only).
     #[test]
-    fn history_floor_gates_reads_before_compaction() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let target = "t-floor";
-        // deploy-a, deploy-b (both successful — rollback payloads), and
-        // deploy-c (failed — no snapshot).
-        let base_attempt = |id: &str| DeploymentAttempt {
-            deployment_schema_version: SCHEMA_VERSION,
-            deployment_id: DeploymentId::new(id.to_string()),
-            target: TargetName::new(target.to_string()),
-            slot_ids: vec![],
-            behavior_sha256: "sha256-aa".to_string(),
-            attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            desired: BTreeMap::new(),
-            pre_push: BTreeMap::new(),
-            slots: BTreeMap::new(),
-        };
-        for (n, id) in ["deploy-a", "deploy-b", "deploy-c"].iter().enumerate() {
-            store.append_attempt(target, &base_attempt(id)).unwrap();
-            if n < 2 {
-                store
-                    .append_snapshot(
-                        target,
-                        &DeploymentSnapshot {
-                            deployment_id: DeploymentId::new(id.to_string()),
-                            target: TargetName::new(target.to_string()),
-                            behavior_sha256: "sha256-aa".to_string(),
-                            slots: BTreeMap::new(),
-                            bindings: BTreeMap::new(),
-                        },
-                    )
-                    .unwrap();
-            }
-        }
-
-        // Write the floor marker WITHOUT compacting (durable-first ordering;
-        // the physical cleanup is still pending — the interrupted state).
-        let floor = HistoryFloor {
-            schema_version: SCHEMA_VERSION,
-            target: TargetName::new(target.to_string()),
-            deployment_id: DeploymentId::from("deploy-b".to_string()),
-            established_at: "2026-01-01T00:00:00Z".to_string(),
-        };
-        store.write_history_floor(target, &floor).unwrap();
-
-        // Readers gate on the durable floor: only the suffix is visible
-        // (deploy-b onward; deploy-c failed and carries no snapshot).
-        let snaps = store.read_snapshots(target).unwrap();
-        assert_eq!(snaps.len(), 1, "only deploy-b is visible");
-        assert_eq!(snaps[0].deployment_id.as_str(), "deploy-b");
-        let attempts = store.read_attempts(target).unwrap();
-        assert_eq!(attempts.len(), 2, "deploy-b and deploy-c are visible");
-        assert_eq!(attempts[0].deployment_id.as_str(), "deploy-b");
-        assert_eq!(attempts[1].deployment_id.as_str(), "deploy-c");
-
-        // The raw (physical) view still shows the full log: the key space is
-        // the deployment-id space, and no below-floor history is exposed to
-        // readers.
-        assert_eq!(store.read_snapshots_raw(target).unwrap().len(), 2);
-        assert_eq!(store.read_attempts_raw(target).unwrap().len(), 3);
-
-        // The floor round-trips and fails closed on a foreign schema version.
-        let read = store.read_history_floor(target).unwrap().unwrap();
-        assert_eq!(read, floor);
-        let mut foreign = floor.clone();
-        foreign.schema_version = SCHEMA_VERSION + 1;
-        write_json(&store.history_floor_path(target), &foreign).unwrap();
-        let err = store.read_history_floor(target).unwrap_err();
-        assert!(
-            err.to_string().contains("schema_version"),
-            "a foreign floor schema version must fail closed, got: {err}"
-        );
-    }
-
-    /// The cleanup-pending debt FLAG (the post-commit half of a
-    /// checkpoint) round-trips, clears, fails closed on a foreign
-    /// `schema_version` — including the legacy version-1 shape that carried
-    /// `pending_deployments` — and is INTEGRITY-BOUND like the history
-    /// floor: a marker with a foreign `target`, or (when a floor is given)
-    /// a `deployment_id` that does not EXACTLY match the floor's, fails
-    /// closed with an integrity error. The marker is a flag only: the
-    /// removed `pending_deployments` worklist is gone by construction (the
-    /// logs retain the worklist), so a corrupted marker can never name
-    /// retained or unrelated deployment dirs.
-    #[test]
-    fn cleanup_pending_marker_roundtrips_and_fails_closed() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let target = "t-pending";
-        let id = DeploymentId::new("deploy-1".to_string());
-        let floor = HistoryFloor {
-            schema_version: SCHEMA_VERSION,
-            target: TargetName::new(target.to_string()),
-            deployment_id: id.clone(),
-            established_at: "2026-01-01T00:00:00Z".to_string(),
-        };
-        assert!(
-            store
-                .read_cleanup_pending(target, Some(&floor))
-                .unwrap()
-                .is_none(),
-            "no marker before any pending cleanup"
-        );
-
-        let pending = CleanupPending {
-            schema_version: CLEANUP_PENDING_SCHEMA_VERSION,
-            target: TargetName::new(target.to_string()),
-            deployment_id: id.clone(),
-            established_at: "2026-01-01T00:00:00Z".to_string(),
-        };
-        store.write_cleanup_pending(target, &pending).unwrap();
-        let read = store
-            .read_cleanup_pending(target, Some(&floor))
-            .unwrap()
-            .unwrap();
-        assert_eq!(read, pending);
-        // The flag binds to the floor it accompanies: the same marker read
-        // WITHOUT a floor passes the target binding (no anchor to check);
-        // with a DIFFERENT floor it fails closed.
-        store
-            .read_cleanup_pending(target, None)
-            .unwrap()
-            .expect("the target binding alone holds without a floor");
-        let foreign_floor = HistoryFloor {
-            deployment_id: DeploymentId::new("deploy-other".to_string()),
-            ..floor.clone()
-        };
-        let err = store
-            .read_cleanup_pending(target, Some(&foreign_floor))
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("integrity"),
-            "a marker whose anchor does not match the floor must fail closed, got: {err}"
-        );
-
-        // Clear removes the marker entirely.
-        store.clear_cleanup_pending(target).unwrap();
-        assert!(
-            store
-                .read_cleanup_pending(target, Some(&floor))
-                .unwrap()
-                .is_none()
-        );
-        assert!(!store.cleanup_pending_path(target).exists());
-
-        // A foreign schema version fails closed naming it.
-        store.write_cleanup_pending(target, &pending).unwrap();
-        let mut foreign = pending.clone();
-        foreign.schema_version = CLEANUP_PENDING_SCHEMA_VERSION + 1;
-        write_json(&store.cleanup_pending_path(target), &foreign).unwrap();
-        let err = store
-            .read_cleanup_pending(target, Some(&floor))
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("schema_version"),
-            "a foreign cleanup-pending schema version must fail closed, got: {err}"
-        );
-
-        // The LEGACY version-1 shape (the removed `pending_deployments`
-        // field) must NOT silently parse as a valid flag-only marker:
-        // serde would ignore the extra field, so the version gate is what
-        // refuses it — a stale marker is then cleared by the converging
-        // retry, never trusted.
-        let legacy = serde_json::json!({
-            "schema_version": SCHEMA_VERSION,
-            "target": target,
-            "deployment_id": "deploy-1",
-            "established_at": "2026-01-01T00:00:00Z",
-            "snapshot_index": 1,
-            "pending_deployments": ["deploy-0", "deploy-foreign"],
-        });
-        write_json(&store.cleanup_pending_path(target), &legacy).unwrap();
-        let err = store
-            .read_cleanup_pending(target, Some(&floor))
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("schema_version"),
-            "a legacy v1 marker carrying pending_deployments must fail closed on the version, got: {err}"
-        );
-
-        // The TARGET binding: a marker naming another target fails closed
-        // even though its version is current.
-        let mut retargeted = pending.clone();
-        retargeted.target = TargetName::new("staging".to_string());
-        write_json(&store.cleanup_pending_path(target), &retargeted).unwrap();
-        let err = store
-            .read_cleanup_pending(target, Some(&floor))
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("integrity"),
-            "a cleanup marker naming a foreign target must fail closed, got: {err}"
-        );
-    }
-
-    /// Enumerate EVERY corruption mutation for a checkpoint marker's
-    /// serialized JSON. The mutation space is small and CLOSED, so the
-    /// property below runs it EXHAUSTIVELY (deterministic, no sampling):
-    ///
-    /// * TRUNCATION: cut the serialized bytes at several prefix lengths
-    ///   (0 = empty file, 1, mid, len-1);
-    /// * MISSING FIELDS: drop each field of the JSON object;
-    /// * WRONG TYPES: `schema_version` as a string, `deployment_id` as a
-    ///   number, `snapshot_index` as a bool (present but wrong type);
-    /// * EVERY NON-CURRENT SCHEMA VERSION: `0..SCHEMA_VERSION`,
-    ///   `SCHEMA_VERSION + 1`, and `u32::MAX` — the set is DERIVED from the
-    ///   CURRENT constant so it stays exhaustive if the schema version
-    ///   changes (a sibling cleanup-marker hardening may introduce a
-    ///   marker-specific constant at merge time; the keep-both resolution
-    ///   should point this at whichever constant the reader enforces).
-    ///
-    /// Every mutation must classify as `Error::Integrity` — NEVER
-    /// `Error::Store` (that class is reserved for filesystem I/O).
-    fn marker_corruption_mutations(valid: &serde_json::Value, current_schema: u32) -> Vec<Vec<u8>> {
-        let mut out: Vec<Vec<u8>> = Vec::new();
-        let bytes = serde_json::to_vec(valid).expect("a valid marker serializes");
-
-        // Truncations (deduped prefix lengths; all < bytes.len()).
-        let mut cuts = vec![0usize, 1, bytes.len() / 2, bytes.len().saturating_sub(1)];
-        cuts.sort_unstable();
-        cuts.dedup();
-        for cut in cuts {
-            out.push(bytes[..cut].to_vec());
-        }
-
-        let obj = match valid {
-            serde_json::Value::Object(o) => o,
-            _ => panic!("a marker must serialize as a JSON object"),
-        };
-
-        // Missing fields: drop each field in turn (serde fails on the
-        // absent field → Integrity via the parse-sensitive helper).
-        for field in obj.keys() {
-            let mut m = obj.clone();
-            m.remove(field);
-            out.push(serde_json::to_vec(&serde_json::Value::Object(m)).unwrap());
-        }
-
-        // Wrong types: the field is PRESENT but carries the wrong JSON
-        // type (both markers share these field names — `snapshot_index` is
-        // an ignored legacy key now, so the wrong-type pair uses the
-        // identity/age fields instead).
-        let mut as_string = obj.clone();
-        as_string.insert("schema_version".into(), serde_json::Value::from("1"));
-        out.push(serde_json::to_vec(&serde_json::Value::Object(as_string)).unwrap());
-
-        let mut as_number = obj.clone();
-        as_number.insert("deployment_id".into(), serde_json::Value::from(7));
-        out.push(serde_json::to_vec(&serde_json::Value::Object(as_number)).unwrap());
-
-        let mut as_bool = obj.clone();
-        as_bool.insert("established_at".into(), serde_json::Value::from(true));
-        out.push(serde_json::to_vec(&serde_json::Value::Object(as_bool)).unwrap());
-
-        // Every non-current schema version the current reader must refuse.
-        for v in non_current_schema_versions(current_schema) {
-            let mut m = obj.clone();
-            m.insert("schema_version".into(), serde_json::Value::from(v));
-            out.push(serde_json::to_vec(&serde_json::Value::Object(m)).unwrap());
-        }
-
-        out
-    }
-
-    /// Every `u32` schema version the current reader must refuse:
-    /// `0..SCHEMA_VERSION`, `SCHEMA_VERSION + 1`, `u32::MAX` (derived from
-    /// the CURRENT constant — see [`marker_corruption_mutations`]).
-    fn non_current_schema_versions(current: u32) -> Vec<u32> {
-        let mut v: Vec<u32> = (0..current).collect();
-        v.push(current.wrapping_add(1));
-        v.push(u32::MAX);
-        v.sort_unstable();
-        v
-    }
-
-    /// Run the corruption-classification property for one marker reader:
-    /// the INTACT marker reads as `Ok(Some(_))`; EVERY corruption mutation
-    /// fails with EXACTLY the `Error::Integrity` variant — asserted via
-    /// `matches!` on the ENUM, never message text; a genuine filesystem
-    /// I/O failure (the marker path is a DIRECTORY, so open/read fails at
-    /// the OS level) stays `Error::Store`; an absent marker is `Ok(None)`.
-    /// Both checkpoint markers go through the shared parse-sensitive
-    /// [`read_json_marker`] helper, so one generic property covers both.
-    fn assert_marker_corruption_classification<T: std::fmt::Debug>(
-        path: &Path,
-        valid: &serde_json::Value,
-        mutations: &[Vec<u8>],
-        read: impl Fn() -> Result<Option<T>>,
-    ) {
-        // Control: the intact marker parses AND passes the schema check.
-        std::fs::write(path, serde_json::to_vec(valid).unwrap()).unwrap();
-        assert!(
-            read().expect("the intact marker must read").is_some(),
-            "the intact marker must read as Ok(Some(_))"
-        );
-
-        // Every corruption mutation → Integrity (semantic corruption), never
-        // Store (mechanical I/O) — the class split this feature enforces.
-        for m in mutations {
-            std::fs::write(path, m).unwrap();
-            match read() {
-                Err(Error::Integrity(_)) => {}
-                other => panic!(
-                    "marker corruption must classify as Error::Integrity, got: {other:?}\n  bytes: {}",
-                    String::from_utf8_lossy(m)
-                ),
-            }
-        }
-
-        // Class split: a real filesystem I/O failure (marker path is a
-        // directory → EISDIR on open/read) stays Error::Store.
-        std::fs::remove_file(path).unwrap();
-        std::fs::create_dir(path).unwrap();
-        match read() {
-            Err(Error::Store(_)) => {}
-            other => {
-                panic!("a filesystem I/O failure must classify as Error::Store, got: {other:?}")
-            }
-        }
-        std::fs::remove_dir(path).unwrap();
-
-        // Absent marker → Ok(None), never an error.
-        assert!(
-            read().expect("an absent marker must be Ok(None)").is_none(),
-            "an absent marker must read as Ok(None)"
-        );
-    }
-
-    /// THE BYTE/JSON MUTATION PROPERTY: present-but-malformed marker
-    /// CONTENT (truncated JSON, wrong field types, missing fields) and
-    /// unsupported marker SCHEMAS classify as `Error::Integrity` for BOTH
-    /// checkpoint marker readers, while `Error::Store` stays reserved for
-    /// actual filesystem I/O. The mutation space is small and closed, so
-    /// the property enumerates it exhaustively over fresh fixtures
-    /// (deterministic — every mutation in the family runs every time).
-    #[test]
-    fn marker_corruption_is_integrity_and_io_is_store() {
-        // ---- history floor marker ----
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let target = "t-floor";
-        let floor_id = DeploymentId::new("deploy-floor".to_string());
-        // Seed the attempt + snapshot the intact marker binds to, so the
-        // control (`Ok(Some(_))`) passes the snapshot-pair and attempt
-        // binding checks in `read_history_floor` (those checks are ALREADY
-        // Integrity — this property exercises the parse/schema branch).
-        store
-            .append_attempt(
-                target,
-                &DeploymentAttempt {
-                    deployment_schema_version: SCHEMA_VERSION,
-                    deployment_id: floor_id.clone(),
-                    target: TargetName::new(target.to_string()),
-                    slot_ids: vec![],
-                    behavior_sha256: "sha256-aa".to_string(),
-                    attempted_at: "2026-01-01T00:00:00Z".to_string(),
-                    desired: BTreeMap::new(),
-                    pre_push: BTreeMap::new(),
-                    slots: BTreeMap::new(),
-                },
-            )
-            .unwrap();
-        store
-            .append_snapshot(
-                target,
-                &DeploymentSnapshot {
-                    deployment_id: floor_id.clone(),
-                    target: TargetName::new(target.to_string()),
-                    behavior_sha256: "sha256-aa".to_string(),
-                    slots: BTreeMap::new(),
-                    bindings: BTreeMap::new(),
-                },
-            )
-            .unwrap();
-        let floor = HistoryFloor {
-            schema_version: SCHEMA_VERSION,
-            target: TargetName::new(target.to_string()),
-            deployment_id: floor_id,
-            established_at: "2026-01-01T00:00:00Z".to_string(),
-        };
-        store.write_history_floor(target, &floor).unwrap();
-
-        let floor_valid = serde_json::to_value(&floor).unwrap();
-        let floor_mutations = marker_corruption_mutations(&floor_valid, SCHEMA_VERSION);
-        assert!(
-            !floor_mutations.is_empty(),
-            "the mutation family must be non-empty"
-        );
-        assert_marker_corruption_classification(
-            &store.history_floor_path(target),
-            &floor_valid,
-            &floor_mutations,
-            || store.read_history_floor(target),
-        );
-
-        // ---- cleanup-pending marker: the same property through the shared
-        // parse-sensitive helper (no binding checks to seed here).
-        let target2 = "t-pending";
-        let pending = CleanupPending {
-            schema_version: CLEANUP_PENDING_SCHEMA_VERSION,
-            target: TargetName::new(target2.to_string()),
-            deployment_id: DeploymentId::new("deploy-1".to_string()),
-            established_at: "2026-01-01T00:00:00Z".to_string(),
-        };
-        store.write_cleanup_pending(target2, &pending).unwrap();
-
-        let pending_valid = serde_json::to_value(&pending).unwrap();
-        let pending_mutations =
-            marker_corruption_mutations(&pending_valid, CLEANUP_PENDING_SCHEMA_VERSION);
-        assert_marker_corruption_classification(
-            &store.cleanup_pending_path(target2),
-            &pending_valid,
-            &pending_mutations,
-            || store.read_cleanup_pending(target2, None),
-        );
-    }
-
-    /// The one-shot intent/outcomes faults are deployment-id keyed and
-    /// status-qualified: `arm_append_attempt` fails the NEXT `append_attempt`
-    /// for that id exactly once; `arm_write_results` fails the next
-    /// `write_results`; `arm_append_transition_pending` fails ONLY the first
-    /// `PendingCommit` transition append (the recoverable finalize marker) —
-    /// an earlier `InProgress` (or any other status) append passes through.
-    ///
-    /// Faults are armed on THIS store's per-fixture registry
-    /// ([`LocalStore::fault_registry`]); no process-global slot is involved,
-    /// so no lock window is needed.
-    #[test]
-    fn new_fault_arms_are_one_shot_and_status_qualified() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let registry = store.fault_registry().clone();
-        let target = "t1";
-        let id = "deploy-fault-arms";
-        let attempt = DeploymentAttempt {
-            deployment_schema_version: SCHEMA_VERSION,
-            deployment_id: DeploymentId::new(id.to_string()),
-            target: TargetName::new(target.to_string()),
-            slot_ids: vec![],
-            behavior_sha256: "sha256-aa".to_string(),
-            attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            desired: BTreeMap::new(),
-            pre_push: BTreeMap::new(),
-            slots: BTreeMap::new(),
-        };
-
-        // arm_append_attempt: one-shot, fails once, then passes.
-        registry.arm_append_attempt(id);
-        let err = store.append_attempt(target, &attempt).unwrap_err();
-        assert!(err.to_string().contains("append_attempt"));
-        store.append_attempt(target, &attempt).expect("disarmed");
-
-        // arm_write_results: one-shot.
-        registry.arm_write_results(id);
-        let results = DeploymentResults {
-            deployment_id: DeploymentId::from(id.to_string()),
-            target: TargetName::from(target.to_string()),
-            slots: Default::default(),
-        };
-        let err = store.write_results(id, &results).unwrap_err();
-        assert!(err.to_string().contains("write_results"));
-        store.write_results(id, &results).expect("disarmed");
-
-        // arm_append_transition_pending: status-qualified — an InProgress
-        // append passes through; the first PendingCommit append fails once.
-        registry.arm_append_transition_pending(id);
-        store
-            .append_transition(id, &DeploymentStatus::InProgress, Some("attempt started"))
-            .expect("InProgress append passes through untouched");
-        let err = store
-            .append_transition(
-                id,
-                &DeploymentStatus::PendingCommit,
-                Some("finalization started"),
-            )
-            .unwrap_err();
-        assert!(err.to_string().contains("append_transition"));
-        store
-            .append_transition(id, &DeploymentStatus::PendingCommit, None)
-            .expect("disarmed");
-    }
-
-    /// The transition stream is append-only JSONL: every appended event is
-    /// preserved in order, the LATEST event is the deployment's current
-    /// status, and the `reason` is carried (or omitted) as recorded.
-    #[test]
-    fn transition_stream_is_append_only_and_latest_wins() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let id = "deploy-transitions";
-
-        assert_eq!(store.latest_status(id).unwrap(), None, "no transitions yet");
-        assert_eq!(store.read_transitions(id).unwrap().len(), 0);
-
-        store
-            .append_transition(id, &DeploymentStatus::InProgress, Some("attempt started"))
-            .unwrap();
-        store
-            .append_transition(id, &DeploymentStatus::Successful, None)
-            .unwrap();
-
-        // Append-only: both events survive, in order.
-        let transitions = store.read_transitions(id).unwrap();
-        assert_eq!(transitions.len(), 2);
-        assert_eq!(transitions[0].status, DeploymentStatus::InProgress);
-        assert_eq!(transitions[0].reason.as_deref(), Some("attempt started"));
-        assert_eq!(transitions[1].status, DeploymentStatus::Successful);
-        assert_eq!(transitions[1].reason, None);
-        assert_eq!(
-            transitions[0].deployment_id,
-            DeploymentId::new(id.to_string())
-        );
-        assert!(!transitions[1].recorded_at.is_empty());
-
-        // Latest transition wins: an append overlays, never rewrites history.
-        assert_eq!(
-            store.latest_status(id).unwrap(),
-            Some(DeploymentStatus::Successful)
-        );
-        store
-            .append_transition(
-                id,
-                &DeploymentStatus::Degraded,
-                Some("marker integrity conflict"),
-            )
-            .unwrap();
-        assert_eq!(
-            store.latest_status(id).unwrap(),
-            Some(DeploymentStatus::Degraded)
-        );
-        assert_eq!(store.read_transitions(id).unwrap().len(), 3);
-    }
-
-    /// The attempts stream is append-only: appending a SECOND record with the
-    /// SAME deployment id (the engine never does — ids are minted fresh)
-    /// appends rather than replacing, so the log always preserves every
-    /// recorded intent. Deployment IDs are unique by construction, so the
-    /// duplicate case exercises corruption-tolerant append semantics, not a
-    /// rewrite.
-    #[test]
-    fn attempts_stream_is_append_only_for_duplicate_ids() {
+    fn append_terminal_fault_is_one_shot_and_id_qualified() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
-        let attempt = DeploymentAttempt {
-            deployment_schema_version: SCHEMA_VERSION,
-            deployment_id: DeploymentId::new("deploy-dup".to_string()),
-            target: TargetName::new(target.to_string()),
-            slot_ids: vec![],
-            behavior_sha256: "sha256-aa".to_string(),
-            attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            desired: BTreeMap::new(),
-            pre_push: BTreeMap::new(),
-            slots: BTreeMap::new(),
-        };
-        store.append_attempt(target, &attempt).unwrap();
-        let second = DeploymentAttempt {
-            attempted_at: "2026-01-02T00:00:00Z".to_string(),
-            ..attempt.clone()
-        };
-        store.append_attempt(target, &second).unwrap();
-
-        let attempts = store.read_attempts(target).unwrap();
-        assert_eq!(
-            attempts.len(),
-            2,
-            "append-only: a duplicate id appends a second record, never replaces"
-        );
-        assert_eq!(attempts[0].deployment_id, attempts[1].deployment_id);
-        assert_eq!(attempts[0].attempted_at, "2026-01-01T00:00:00Z");
-        assert_eq!(attempts[1].attempted_at, "2026-01-02T00:00:00Z");
-    }
-
-    /// The schema-version property for DEPLOYMENT records: generate arbitrary
-    /// `u32` versions and write an `attempts.jsonl` line carrying each one
-    /// directly into the store. ONLY `SCHEMA_VERSION` loads; every other
-    /// version fails closed with a store error naming the version — never a
-    /// panic, never silent acceptance.
-    #[test]
-    fn read_attempts_accepts_only_schema_version() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let target = "t1";
-        let p = store.target_dir(target).join("attempts.jsonl");
-        let base = DeploymentAttempt {
-            deployment_schema_version: SCHEMA_VERSION,
-            deployment_id: DeploymentId::new("deploy-versions".to_string()),
-            target: TargetName::new(target.to_string()),
-            slot_ids: vec![],
-            behavior_sha256: "sha256-aa".to_string(),
-            attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            desired: BTreeMap::new(),
-            pre_push: BTreeMap::new(),
-            slots: BTreeMap::new(),
-        };
-        // Representative arbitrary-u32 set: 0, SCHEMA_VERSION - 1,
-        // SCHEMA_VERSION, SCHEMA_VERSION + 1, 3, u32::MAX (duplicates in the
-        // set are harmless).
-        let versions = [
-            0u32,
-            SCHEMA_VERSION.wrapping_sub(1),
-            SCHEMA_VERSION,
-            SCHEMA_VERSION.wrapping_add(1),
-            3,
-            u32::MAX,
-        ];
-        for v in versions {
-            // A fresh stream per version: one line carrying exactly `v`.
-            std::fs::remove_file(&p).ok();
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            let attempt = DeploymentAttempt {
-                deployment_schema_version: v,
-                ..base.clone()
-            };
-            std::fs::write(
-                &p,
-                format!("{}\n", serde_json::to_string(&attempt).unwrap()),
-            )
+        store
+            .append_intent(target, &intent("deploy-a", target))
             .unwrap();
-            if v == SCHEMA_VERSION {
-                let read = store.read_attempts(target).unwrap();
-                assert_eq!(read.len(), 1, "the canonical version loads");
-                assert_eq!(read[0].deployment_schema_version, SCHEMA_VERSION);
-            } else {
-                let err = store.read_attempts(target).unwrap_err();
-                let msg = err.to_string();
-                assert!(
-                    msg.contains("deployment_schema_version"),
-                    "error must name the version field, got: {msg}"
-                );
-                assert!(
-                    msg.contains(&format!("{v}")),
-                    "error must name the stored version {v}, got: {msg}"
-                );
-                assert!(
-                    msg.contains("SCHEMA_VERSION"),
-                    "error must name the accepted version, got: {msg}"
-                );
-            }
-        }
+        store
+            .append_intent(target, &intent("deploy-b", target))
+            .unwrap();
+        store.fault_registry().arm_append_terminal("deploy-a");
+        // The fault fires exactly once on the matching id...
+        store
+            .append_terminal(target, &successful_terminal("deploy-a", target))
+            .expect_err("the armed terminal fault fires");
+        // ...before any append (the entry is still intent-only) and is then
+        // disarmed: the retry succeeds.
+        store
+            .append_terminal(target, &successful_terminal("deploy-a", target))
+            .expect("the disarmed retry appends the terminal");
+        // A second terminal for the SAME deployment is refused (exactly-once).
+        store
+            .append_terminal(target, &successful_terminal("deploy-a", target))
+            .expect_err("a second terminal is refused (exactly-once contract)");
+        // A different deployment is never faulted.
+        store
+            .append_terminal(target, &successful_terminal("deploy-b", target))
+            .expect("a different deployment's terminal passes");
     }
 
-    /// The schema-version property for TREE metadata: generate arbitrary `u32`
-    /// `tree_schema_version` values in a stored `tree.json`; ONLY
-    /// `TREE_SCHEMA_VERSION` loads, every other version fails closed with an
-    /// integrity error naming the version.
-    #[test]
-    fn read_tree_meta_accepts_only_tree_schema_version() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let digest = TreeDigest::new("t-versions".to_string());
-        let p = store.object_tree_json(&digest);
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        let versions = [
-            0u32,
-            TREE_SCHEMA_VERSION.wrapping_sub(1),
-            TREE_SCHEMA_VERSION,
-            TREE_SCHEMA_VERSION.wrapping_add(1),
-            3,
-            u32::MAX,
-        ];
-        for v in versions {
-            let meta = TreeMetadata {
-                tree_schema_version: v,
-                hash_algorithm: "sha256".to_string(),
-                tree_sha256: "x".to_string(),
-                entries: vec![],
-            };
-            std::fs::write(&p, serde_json::to_vec(&meta).unwrap()).unwrap();
-            if v == TREE_SCHEMA_VERSION {
-                store
-                    .read_tree_meta(&digest)
-                    .expect("the canonical tree schema version reads");
-            } else {
-                let err = store.read_tree_meta(&digest).unwrap_err();
-                let msg = err.to_string();
-                assert!(
-                    msg.contains("tree_schema_version"),
-                    "error must name the version field, got: {msg}"
-                );
-                assert!(
-                    msg.contains(&format!("{v}")),
-                    "error must name the stored version {v}, got: {msg}"
-                );
-            }
-        }
-    }
-
-    /// `arm_append_transition_successful` is status-qualified and one-shot:
-    /// non-`Successful` appends (the recoverable `PendingCommit` marker, an
-    /// `InProgress` overlay) pass through untouched, the FIRST `Successful`
-    /// append fails, and a later `Successful` append passes. The arm lives on
-    /// this store's own per-fixture registry; no lock window is needed.
-    #[test]
-    fn transition_successful_fault_is_status_qualified_and_one_shot() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let registry = store.fault_registry().clone();
-        let id = "deploy-txn-success-fault";
-
-        registry.arm_append_transition_successful(id);
-        // The recoverable finalize marker passes through (status-qualified).
-        store
-            .append_transition(
-                id,
-                &DeploymentStatus::PendingCommit,
-                Some("finalization started"),
-            )
-            .expect("PendingCommit append passes through untouched");
-        // The FIRST Successful append fires the fault.
-        let err = store
-            .append_transition(id, &DeploymentStatus::Successful, None)
-            .unwrap_err();
-        assert!(err.to_string().contains("append_transition"));
-        // A later Successful append passes (one-shot, disarmed).
-        store
-            .append_transition(id, &DeploymentStatus::Successful, None)
-            .expect("disarmed");
-
-        // Re-arm: an InProgress overlay must not consume the arm.
-        registry.arm_append_transition_successful(id);
-        store
-            .append_transition(id, &DeploymentStatus::InProgress, None)
-            .expect("InProgress append does not consume the arm");
-        store
-            .append_transition(id, &DeploymentStatus::Successful, None)
-            .expect_err("first Successful append fires again");
-        store
-            .append_transition(id, &DeploymentStatus::Successful, None)
-            .expect("disarmed again");
-    }
-
-    /// Two DISTINCT fault keys (two deployment ids) armed on ONE fixture,
-    /// consumed in interleaved order through the real store methods. Oracle:
-    /// each fault fires EXACTLY ONCE and only for its own key; the other
-    /// operation passes through untouched (even when interleaved), and a
-    /// re-run of the same consume does NOT fire again (one-shot). The store
-    /// records exactly one attempt per id — the post-fault re-runs — so the
-    /// observable history also matches the oracle.
-    #[test]
-    fn two_key_interleaved_store_faults_fire_exactly_once_per_matching_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let registry = store.fault_registry();
-        let target = "t1";
-        let id_a = "deploy-key-a";
-        let id_b = "deploy-key-b";
-        let attempt = |id: &str| DeploymentAttempt {
-            deployment_schema_version: SCHEMA_VERSION,
-            deployment_id: DeploymentId::new(id.to_string()),
-            target: TargetName::new(target.to_string()),
-            slot_ids: vec![],
-            behavior_sha256: "sha256-aa".to_string(),
-            attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            desired: BTreeMap::new(),
-            pre_push: BTreeMap::new(),
-            slots: BTreeMap::new(),
-        };
-
-        // Arm TWO distinct keys on the same registry.
-        registry.arm_append_attempt(id_a);
-        registry.arm_append_attempt(id_b);
-        assert_eq!(registry.armed_len(), 2, "both faults armed");
-
-        // Interleaved consume, B FIRST: B's append fires B and must NOT fire
-        // (or disarm) A.
-        let err = store.append_attempt(target, &attempt(id_b)).unwrap_err();
-        assert!(err.to_string().contains("append_attempt"), "B fired");
-        assert!(
-            registry.is_armed(FaultKind::AppendAttempt, id_a),
-            "A stays armed"
-        );
-        assert!(
-            !registry.is_armed(FaultKind::AppendAttempt, id_b),
-            "B disarmed"
-        );
-
-        // Then A's append fires A exactly once.
-        let err = store.append_attempt(target, &attempt(id_a)).unwrap_err();
-        assert!(err.to_string().contains("append_attempt"), "A fired");
-        assert!(
-            !registry.is_armed(FaultKind::AppendAttempt, id_a),
-            "A disarmed"
-        );
-
-        // Re-running the same consumes does NOT fire again (one-shot), and a
-        // matching-store operation for a NEVER-armed third key passes through.
-        store
-            .append_attempt(target, &attempt(id_b))
-            .expect("B disarmed");
-        store
-            .append_attempt(target, &attempt(id_a))
-            .expect("A disarmed");
-        store
-            .append_attempt(target, &attempt("deploy-key-c"))
-            .expect("never-armed key passes through");
-
-        // Observable oracle: exactly one durable attempt per key (the post-
-        // fault re-runs), never a duplicate from the faulted calls.
-        let attempts = store.read_attempts(target).unwrap();
-        let mut ids: Vec<_> = attempts.iter().map(|a| a.deployment_id.as_str()).collect();
-        ids.sort_unstable();
-        assert_eq!(ids, vec!["deploy-key-a", "deploy-key-b", "deploy-key-c"]);
-        assert_eq!(registry.armed_len(), 0, "no arms left");
-    }
-
-    /// The structural isolation property: arming a fault on fixture 1's
-    /// registry cannot be consumed by fixture 2's store — even with the SAME
-    /// deployment id — and survives for fixture 1's own store to fire.
+    /// Two fixtures' fault registries are structurally isolated: an arm on
+    /// one store can never be consumed by another store.
     #[test]
     fn arming_one_fixture_cannot_be_consumed_by_another_fixtures_store() {
         let dir = tempfile::tempdir().unwrap();
-        let store_a = LocalStore::with_base(dir.path().join("a")).unwrap();
-        let store_b = LocalStore::with_base(dir.path().join("b")).unwrap();
-        let id = "deploy-cross-fixture";
-        let attempt = DeploymentAttempt {
-            deployment_schema_version: SCHEMA_VERSION,
-            deployment_id: DeploymentId::new(id.to_string()),
-            target: TargetName::new("t1".to_string()),
-            slot_ids: vec![],
-            behavior_sha256: "sha256-aa".to_string(),
-            attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            desired: BTreeMap::new(),
-            pre_push: BTreeMap::new(),
-            slots: BTreeMap::new(),
-        };
-
-        // Fixture A arms; fixture B's store is its OWN empty registry.
-        store_a.fault_registry().arm_append_attempt(id);
-        assert!(
-            !store_b
-                .fault_registry()
-                .is_armed(FaultKind::AppendAttempt, id),
-            "B's registry is disjoint from A's"
-        );
-
-        // B's identical append passes through untouched, and A's arm SURVIVES.
-        store_b
-            .append_attempt("t1", &attempt)
-            .expect("B passes through");
-        assert!(
-            store_a
-                .fault_registry()
-                .is_armed(FaultKind::AppendAttempt, id),
-            "A's arm must not have been consumed by B's push"
-        );
-        // A's OWN matching append fires exactly once.
-        store_a
-            .append_attempt("t1", &attempt)
-            .expect_err("A's own append fires the fault");
-        assert!(
-            !store_a
-                .fault_registry()
-                .is_armed(FaultKind::AppendAttempt, id)
-        );
-    }
-
-    /// Threaded interleaving across TWO fixtures: each thread arms its own
-    /// key on its OWN store's registry, then both consume through the real
-    /// store methods concurrently (a barrier maximizes overlap). Oracle: each
-    /// fault fires EXACTLY ONCE in its own fixture and NEVER in the other's;
-    /// each store ends with exactly one durable attempt for its own id.
-    #[test]
-    fn two_key_threaded_interleaving_isolation_between_fixtures() {
-        let dir = tempfile::tempdir().unwrap();
-        let store_a = LocalStore::with_base(dir.path().join("a")).unwrap();
-        let store_b = LocalStore::with_base(dir.path().join("b")).unwrap();
-        let (id_a, id_b) = ("deploy-thread-a", "deploy-thread-b");
-        let attempt = |id: &str| DeploymentAttempt {
-            deployment_schema_version: SCHEMA_VERSION,
-            deployment_id: DeploymentId::new(id.to_string()),
-            target: TargetName::new("t1".to_string()),
-            slot_ids: vec![],
-            behavior_sha256: "sha256-aa".to_string(),
-            attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            desired: BTreeMap::new(),
-            pre_push: BTreeMap::new(),
-            slots: BTreeMap::new(),
-        };
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
-        std::thread::scope(|s| {
-            for (store, id) in [(&store_a, id_a), (&store_b, id_b)] {
-                let barrier = barrier.clone();
-                s.spawn(move || {
-                    // Arm on THIS fixture's registry, then consume through
-                    // THIS fixture's store — the other thread is doing the
-                    // same concurrently, and the registries are disjoint.
-                    store.fault_registry().arm_append_attempt(id);
-                    barrier.wait();
-                    let err = store
-                        .append_attempt("t1", &attempt(id))
-                        .expect_err("the matching append fires exactly once");
-                    assert!(err.to_string().contains("append_attempt"));
-                    store
-                        .append_attempt("t1", &attempt(id))
-                        .expect("disarmed: the re-run passes");
-                });
+        let s1 = LocalStore::with_base(dir.path().join("s1")).unwrap();
+        let s2 = LocalStore::with_base(dir.path().join("s2")).unwrap();
+        s1.fault_registry().arm_append_terminal("deploy-a");
+        s2.fault_registry().arm_append_terminal("deploy-b");
+        for t in ["t1", "t2"] {
+            for s in [&s1, &s2] {
+                s.append_intent(t, &intent("deploy-a", t)).unwrap();
+                s.append_intent(t, &intent("deploy-b", t)).unwrap();
             }
-            barrier.wait();
-        });
-
-        // Both faults fired exactly once in their OWN fixture; the other
-        // fixture was never affected: each store holds exactly one attempt,
-        // its own id.
-        let only = |store: &LocalStore| {
-            let attempts = store.read_attempts("t1").unwrap();
-            assert_eq!(attempts.len(), 1, "exactly one durable attempt");
-            attempts[0].deployment_id.as_str().to_string()
-        };
-        assert_eq!(only(&store_a), id_a);
-        assert_eq!(only(&store_b), id_b);
+        }
+        // The s1 arm fires on s1's deploy-a terminal...
+        s1.append_terminal("t1", &successful_terminal("deploy-a", "t1"))
+            .expect_err("s1's own arm fires");
+        // ...and never leaks into s2 (its deploy-b arm is untouched).
+        s2.append_terminal("t1", &successful_terminal("deploy-b", "t1"))
+            .expect_err("s2's own arm fires");
     }
 }

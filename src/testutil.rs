@@ -65,33 +65,19 @@ pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// including identical methods for different deployment IDs from any other
 /// fixture, concurrently running — passes through untouched.
 ///
-/// Faults exist for the `IntentPersist` ([`FaultKind::AppendAttempt`]), the
-/// outcomes store ([`FaultKind::WriteResults`]), the snapshot append, the
-/// `refs/last-successful` write, and the status-qualified transition appends
-/// ([`FaultKind::AppendTransition`],
-/// [`FaultKind::AppendTransitionSuccessful`],
-/// [`FaultKind::AppendTransitionPending`]). The post-commit observed-refresh
-/// faults ([`FaultKind::WriteServer`], [`FaultKind::WriteObserved`]) are
-/// additionally keyed by TARGET, so a test can fault the primary target's
-/// `write_observed` (the push's own target) or an other member target's
-/// independently. The rotation-maintenance arms
-/// ([`FaultKind::ReadRotationDebt`], [`FaultKind::WriteRotationDebt`]) are
-/// keyed by TARGET (the debt file lives under `targets/<target>/`). The
-/// checkpoint floor's durability stages ([`FaultKind::SyncFloorTemp`],
-/// [`FaultKind::RenameFloor`], [`FaultKind::SyncFloorParent`], plus the
-/// entry-point [`FaultKind::WriteHistoryFloor`]) are keyed by the
-/// CHECKPOINT deployment id; a failure at ANY of them is returned from
-/// `write_history_floor` itself (PRE-marker), so no floor exists and no
-/// compaction can run. The cleanup-pending debt-marker kinds are keyed by
-/// the FLOOR'S DEPLOYMENT ID for the WRITE
-/// ([`FaultKind::WriteCleanupPending`] — the marker names it) and by
-/// TARGET for the CLEAR ([`FaultKind::ClearCleanupPending`] — the marker
-/// lives under `targets/<target>/refs/`, mirroring the rotation-debt
-/// kinds). Both fire AFTER the floor marker is durable (post-commit
-/// maintenance): a write failure means the debt could not be made durable
-/// (surfaced as `cleanup_persistence_failed`), a clear failure leaves a
-/// stale marker (surfaced as `cleanup_clear_failed`).
-///
+/// Faults exist for the INTENT persist ([`FaultKind::AppendAttempt`]), the
+/// TERMINAL EVENT append ([`FaultKind::AppendTerminal`] — the deployment's
+/// single finalize write; a one-shot failure leaves the entry intent-only and
+/// recoverable), the post-commit observed-refresh faults ([`FaultKind::WriteServer`],
+/// [`FaultKind::WriteObserved`], keyed additionally by TARGET), and the
+/// rotation-maintenance arms ([`FaultKind::ReadRotationDebt`],
+/// [`FaultKind::WriteRotationDebt`], keyed by TARGET). The CHECKPOINT kinds
+/// are keyed by TARGET: the ledger replacement's before/after slots
+/// ([`FaultKind::LedgerReplaceBefore`] / [`FaultKind::LedgerReplaceAfter`])
+/// and the three best-effort sweep stages ([`FaultKind::SweepDeployments`],
+/// [`FaultKind::SweepReleases`], [`FaultKind::SweepObjects`]). The old
+/// floor-marker/cleanup-debt kinds are GONE with the machinery that
+/// consumed them.
 /// ISOLATION IS STRUCTURAL: a [`FaultRegistry`] belongs to exactly one
 /// fixture (via its store); there are no process-global slots and no
 /// FAULT_LOCK-style lock to hold. Two fixtures' arms can never interact,
@@ -100,32 +86,18 @@ pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 pub(crate) mod test_faults {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
-
     /// The distinct store operations that can be faulted. Each kind is armed
     /// and consumed on a single [`FaultRegistry`], keyed by deployment id
-    /// (and, for the observed-refresh kinds, additionally by target).
+    /// (and, for the observed-refresh and checkpoint kinds, by target).
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub(crate) enum FaultKind {
-        /// `append_attempt` — the intent persist, the FIRST store I/O of a
+        /// `append_intent` — the intent persist, the FIRST store I/O of a
         /// push (before any remote mutation).
         AppendAttempt,
-        /// `write_results` — the outcomes store, written once after the
-        /// mutation loop.
-        WriteResults,
-        /// `append_snapshot` — the first persistence step of the shared
-        /// replay-safe finalizer.
-        AppendSnapshot,
-        /// `write_last_successful` — the second persistence step of the
-        /// shared finalizer.
-        WriteLastSuccessful,
-        /// `append_transition` — any transition append.
-        AppendTransition,
-        /// `append_transition` recording a `Successful` status (the terminal
-        /// finalizer step).
-        AppendTransitionSuccessful,
-        /// `append_transition` recording a `PendingCommit` status (the
-        /// recoverable finalize marker).
-        AppendTransitionPending,
+        /// `append_terminal` — the TERMINAL EVENT append, the deployment's
+        /// single finalize write (status + outcomes + rollback). A one-shot
+        /// failure here leaves the entry intent-only (recoverable-pending).
+        AppendTerminal,
         /// Post-commit observed-refresh per-server record write
         /// (`servers/<id>.json`), keyed by (deployment id, target).
         WriteServer,
@@ -140,100 +112,12 @@ pub(crate) mod test_faults {
         /// `write_rotation_debt` (rotation maintenance debt write), keyed by
         /// target.
         WriteRotationDebt,
-        /// The checkpoint floor marker write (`write_history_floor`) — the
-        /// FIRST durable step of a checkpoint; a failure here leaves no
-        /// floor (and therefore no compaction).
-        WriteHistoryFloor,
-        /// The checkpoint floor marker's TEMP-FILE FSYNC — the first
-        /// durability stage of `write_history_floor` (keyed by the
-        /// checkpoint deployment id), after the temp is chmodded private
-        /// and before the rename. A failure here returns `Err` from
-        /// `write_history_floor` itself (PRE-marker: no floor, no
-        /// compaction).
-        SyncFloorTemp,
-        /// The checkpoint floor marker's RENAME-into-place — the second
-        /// durability stage of `write_history_floor` (keyed by the
-        /// checkpoint deployment id). A failure here returns `Err` from
-        /// `write_history_floor` itself (PRE-marker: no floor, no
-        /// compaction).
-        RenameFloor,
-        /// The checkpoint floor marker's PARENT-DIRECTORY FSYNC — the third
-        /// durability stage of `write_history_floor` (keyed by the
-        /// checkpoint deployment id), the durability COMMIT POINT. A
-        /// failure (fault or real) is returned from `write_history_floor`
-        /// AFTER the already-renamed marker is unlinked; on an ADVANCE the
-        /// previous floor A is then restored from the backup, so no B
-        /// exists and A is durable again (a failed advancement never erases
-        /// the previously durable floor).
-        SyncFloorParent,
-        /// The checkpoint floor marker's BACKUP RENAME (`history-floor.json`
-        /// → `history-floor.json.prev.<id>`, the transaction-tagged backup
-        /// name) — the first stage of a TRANSACTIONAL floor ADVANCE (keyed
-        /// by the checkpoint deployment id), running BEFORE the new marker
-        /// can overwrite the old one. A fault here fires BEFORE the rename
-        /// (A still in place): the staged temp is dropped, A stands
-        /// untouched, and the advance fails with `Err`.
-        RenameFloorBackup,
-        /// The checkpoint floor marker's RESTORE (the tagged backup
-        /// `history-floor.json.prev.<id>` → `history-floor.json`) — the
-        /// fail-closed half of a TRANSACTIONAL floor ADVANCE (keyed by the
-        /// checkpoint deployment id), attempted whenever an advance fails
-        /// before B's durability commit point. The restore ONLY ever
-        /// renames the current transaction's tagged backup, verified to
-        /// carry the tag AND to parse and equal the pre-advance floor. A
-        /// fault here means the restore itself failed: the previous floor A
-        /// stays in the backup and the marker may be left ABSENT — every
-        /// read then fails closed with an integrity error (a leftover
-        /// backup with no marker is a torn advance, never "no floor",
-        /// which would expose the below-floor prefix).
-        RestoreFloor,
-        /// The checkpoint's success-path BACKUP REMOVAL — the best-effort
-        /// cleanup of THIS transaction's tagged backup
-        /// (`history-floor.json.prev.<id>`, holding the pre-advance floor)
-        /// after the floor committed (keyed by the checkpoint deployment
-        /// id). A fault here FORCES the removal to fail: the tagged backup
-        /// stays on disk — harmless by design (it is never restored by a
-        /// different transaction and the next advance reconciles it away),
-        /// but it is exactly the "stale backup left behind by a committed
-        /// advance" state the tagged scheme must make safe.
-        RemoveFloorBackup,
-        /// The checkpoint's attempts.jsonl suffix rewrite (a compaction
-        /// phase after the floor marker is already durable and the
-        /// below-floor deployment dirs are deleted).
-        CompactAttempts,
-        /// The checkpoint's snapshots.jsonl suffix rewrite (a compaction
-        /// phase after the floor marker is already durable and the
-        /// below-floor deployment dirs are deleted).
-        CompactSnapshots,
-        /// The checkpoint's `deployments/<id>/` directory deletion — the
-        /// FIRST compaction phase, running while the logs still name every
-        /// discarded id (the floor marker is already durable).
-        CompactDeployments,
-        /// The pending-checkpoint-cleanup FLAG marker WRITE
-        /// (`write_cleanup_pending`), keyed by the FLOOR'S DEPLOYMENT ID
-        /// (the marker names it). Post-commit maintenance: a failure here
-        /// means the cleanup debt could NOT be made durable — the report
-        /// must surface it explicitly
-        /// (`CheckpointReport::cleanup_persistence_failed`), never claim
-        /// durable debt that a crash/restart would lose (the retry
-        /// recomputes the worklist from the intact logs and converges
-        /// regardless).
-        WriteCleanupPending,
-        /// The pending-checkpoint-cleanup FLAG marker CLEAR
-        /// (`clear_cleanup_pending`), keyed by TARGET (the marker lives
-        /// under `targets/<target>/refs/`, mirroring the rotation-debt
-        /// kinds). Post-commit maintenance: a failure leaves a STALE
-        /// (harmless) marker that the next same-deployment checkpoint
-        /// re-clears; the report surfaces it truthfully as
-        /// `CheckpointReport::cleanup_clear_failed`.
-        ClearCleanupPending,
         /// The artifact garbage collection SCAN (the retained-set
         /// computation of [`crate::store::gc`]), keyed by the checkpoint
         /// deployment id. Post-commit maintenance: a failure aborts the
         /// pass BEFORE any deletion (fail closed — nothing is ever unlinked
-        /// against a partial retained set), the durable debt flag records
-        /// the pending cleanup, and the retry recomputes reachability
-        /// fresh.
+        /// against a partial retained set) and the sweep is reported
+        /// retry-required; the retry recomputes reachability fresh.
         GcScan,
         /// The artifact GC's RELEASE-RECORD deletion phase, keyed by the
         /// checkpoint deployment id. Fires before any release dir is
@@ -243,6 +127,27 @@ pub(crate) mod test_faults {
         /// The artifact GC's TREE-OBJECT deletion phase, keyed by the
         /// checkpoint deployment id. Fires before any tree dir is removed.
         GcDeleteTrees,
+        /// The checkpoint's ATOMIC LEDGER REPLACEMENT, fired BEFORE any I/O
+        /// (keyed by target): the checkpoint fails with `Err`, NO deletion
+        /// happens, and the visible ledger is wholly OLD.
+        LedgerReplaceBefore,
+        /// The checkpoint's ATOMIC LEDGER REPLACEMENT, fired AFTER the
+        /// replacement is durable (keyed by target): the visible ledger is
+        /// wholly NEW (the retained suffix), no sweep ran, and a retry
+        /// recomputes the suffix + reachability and converges.
+        LedgerReplaceAfter,
+        /// The checkpoint sweep's DEPLOYMENT-DIR stage (keyed by target),
+        /// fired at the stage's entry: no deployment dir is deleted and the
+        /// report says sweep retry-required.
+        SweepDeployments,
+        /// The checkpoint sweep's RELEASE-RECORD stage (keyed by target),
+        /// fired at the stage's entry: no release record is deleted and the
+        /// report says sweep retry-required.
+        SweepReleases,
+        /// The checkpoint sweep's TREE-OBJECT stage (keyed by target), fired
+        /// at the stage's entry: no object is deleted and the report says
+        /// sweep retry-required.
+        SweepObjects,
     }
 
     /// A per-fixture one-shot fault registry.
@@ -339,62 +244,21 @@ pub(crate) mod test_faults {
         // `store.fault_registry().arm_<kind>(id)` (only the receiver
         // changes).
 
-        /// Arm the next `append_snapshot` call for `deployment_id` to fail once.
-        pub(crate) fn arm_append_snapshot(&self, deployment_id: &str) {
-            self.arm(FaultKind::AppendSnapshot, deployment_id);
-        }
-
-        /// Arm the next `write_last_successful` call for `deployment_id` to
-        /// fail once.
-        pub(crate) fn arm_write_last_successful(&self, deployment_id: &str) {
-            self.arm(FaultKind::WriteLastSuccessful, deployment_id);
-        }
-
-        /// Arm the next `append_transition` call for `deployment_id` to fail
-        /// once.
-        pub(crate) fn arm_append_transition(&self, deployment_id: &str) {
-            self.arm(FaultKind::AppendTransition, deployment_id);
-        }
-
-        /// Arm the next `append_transition` call recording a `Successful`
-        /// status for `deployment_id` to fail once. The replay-safe
-        /// finalizer ([`crate::history::finalize_successful_attempt`]) writes
-        /// the recoverable `PendingCommit` marker FIRST and the terminal
-        /// `Successful` transition LAST, so faulting the terminal transition
-        /// (rather than the earlier marker) requires qualifying on the
-        /// recorded status: the `PendingCommit` marker append passes through
-        /// untouched.
-        pub(crate) fn arm_append_transition_successful(&self, deployment_id: &str) {
-            self.arm(FaultKind::AppendTransitionSuccessful, deployment_id);
-        }
-
-        /// Arm the next `append_attempt` call for `deployment_id` to fail
-        /// once. The attempt intent is persisted BEFORE any remote mutation,
-        /// so a one-shot failure here leaves the remote untouched (no
-        /// generation, no `current` change).
+        /// Arm the next `append_intent` (ledger intent) call for
+        /// `deployment_id` to fail once. The intent is persisted BEFORE any
+        /// remote mutation, so a one-shot failure here leaves the remote
+        /// untouched (no generation, no `current` change).
         pub(crate) fn arm_append_attempt(&self, deployment_id: &str) {
             self.arm(FaultKind::AppendAttempt, deployment_id);
         }
 
-        /// Arm the next `write_results` call for `deployment_id` to fail
-        /// once. The outcomes store (`deployments/<id>/results.json`) is then
-        /// absent; a later recovery finalizes from the verified desired state
-        /// instead.
-        pub(crate) fn arm_write_results(&self, deployment_id: &str) {
-            self.arm(FaultKind::WriteResults, deployment_id);
-        }
-
-        /// Arm the next `append_transition` call recording a `PendingCommit`
-        /// status for `deployment_id` to fail once. Qualifies on the recorded
-        /// status, mirroring [`FaultRegistry::arm_append_transition_successful`]:
-        /// the earlier `InProgress` transition (and every non-pending
-        /// transition) passes through untouched, and the one-shot fires ONLY
-        /// at the recoverable `PendingCommit` marker — the first step of the
-        /// shared finalizer ([`crate::history::finalize_successful_attempt`])
-        /// — leaving the attempt's latest transition `InProgress` with intent
-        /// + outcomes durable.
-        pub(crate) fn arm_append_transition_pending(&self, deployment_id: &str) {
-            self.arm(FaultKind::AppendTransitionPending, deployment_id);
+        /// Arm the next `append_terminal` (the deployment's TERMINAL EVENT
+        /// append — status + outcomes + rollback in ONE atomic line) for
+        /// `deployment_id` to fail once. A failure leaves the ledger entry
+        /// intent-only (recoverable-pending): the next push reconciles it
+        /// from the verified desired state.
+        pub(crate) fn arm_append_terminal(&self, deployment_id: &str) {
+            self.arm(FaultKind::AppendTerminal, deployment_id);
         }
 
         /// Arm the next `write_server` call that records `deployment_id`
@@ -432,204 +296,45 @@ pub(crate) mod test_faults {
             self.arm(FaultKind::WriteRotationDebt, target);
         }
 
-        /// Arm the next `write_history_floor` call for `deployment_id` (the
-        /// checkpoint deployment) to fail once. A failure here fires BEFORE
-        /// the floor marker is durable: no floor, no compaction — the
-        /// checkpoint fails cleanly with history fully intact.
-        pub(crate) fn arm_write_history_floor(&self, deployment_id: &str) {
-            self.arm(FaultKind::WriteHistoryFloor, deployment_id);
+        /// Arm the next checkpoint ATOMIC LEDGER REPLACEMENT for `target` to
+        /// fail BEFORE any I/O: the checkpoint fails with `Err`, no deletion
+        /// happens, and the visible ledger is wholly OLD (nothing was
+        /// discarded).
+        pub(crate) fn arm_ledger_replace_before(&self, target: &str) {
+            self.arm(FaultKind::LedgerReplaceBefore, target);
         }
 
-        /// Arm the next history-floor TEMP-FILE FSYNC (the first durability
-        /// stage of `write_history_floor`, keyed by the checkpoint
-        /// deployment id) to fail once. The failure is returned from
-        /// `write_history_floor` itself — a PRE-marker failure, so no floor
-        /// exists and no compaction can run.
-        pub(crate) fn arm_sync_floor_temp(&self, deployment_id: &str) {
-            self.arm(FaultKind::SyncFloorTemp, deployment_id);
+        /// Arm the next checkpoint ATOMIC LEDGER REPLACEMENT for `target` to
+        /// fail AFTER the replacement is durable: the visible ledger is
+        /// wholly NEW (the retained suffix), the sweep did not run, and a
+        /// re-run of the same checkpoint recomputes the suffix +
+        /// reachability and converges.
+        pub(crate) fn arm_ledger_replace_after(&self, target: &str) {
+            self.arm(FaultKind::LedgerReplaceAfter, target);
         }
 
-        /// Arm the next checkpoint floor marker RENAME-into-place (the
-        /// second durability stage of `write_history_floor`, keyed by the
-        /// checkpoint deployment id) to fail once. The failure is returned
-        /// from `write_history_floor` itself — a PRE-marker failure, so no
-        /// floor exists and no compaction can run.
-        pub(crate) fn arm_rename_floor(&self, deployment_id: &str) {
-            self.arm(FaultKind::RenameFloor, deployment_id);
+        /// Arm the checkpoint sweep's DEPLOYMENT-DIR stage for `target` to
+        /// fail once (at the stage's entry: no deployment dir is deleted and
+        /// the report says sweep retry-required).
+        pub(crate) fn arm_sweep_deployments(&self, target: &str) {
+            self.arm(FaultKind::SweepDeployments, target);
         }
 
-        /// Arm the next checkpoint floor marker PARENT-DIRECTORY FSYNC (the
-        /// third durability stage of `write_history_floor` — the durability
-        /// commit point, keyed by the checkpoint deployment id) to fail
-        /// once. The marker may already be renamed into place when this
-        /// fires; `write_history_floor` unlinks it (on an ADVANCE it then
-        /// restores the previous floor A from the backup, so a failed
-        /// advancement never erases the previously durable floor) and
-        /// returns the failure.
-        pub(crate) fn arm_sync_floor_parent(&self, deployment_id: &str) {
-            self.arm(FaultKind::SyncFloorParent, deployment_id);
+        /// Arm the checkpoint sweep's RELEASE-RECORD stage for `target` to
+        /// fail once (at the stage's entry: no release record is deleted and
+        /// the report says sweep retry-required).
+        pub(crate) fn arm_sweep_releases(&self, target: &str) {
+            self.arm(FaultKind::SweepReleases, target);
         }
 
-        /// Arm the next checkpoint floor-marker BACKUP RENAME (the first
-        /// stage of a TRANSACTIONAL ADVANCE — `history-floor.json` →
-        /// `history-floor.json.prev.<id>`, the transaction-tagged backup
-        /// name, keyed by the checkpoint deployment id) to fail once. The
-        /// fault fires BEFORE the rename, so the previous floor A never
-        /// moves: the staged temp is dropped and the failure is returned
-        /// from `write_history_floor` — the failed advance leaves A
-        /// durable.
-        pub(crate) fn arm_rename_floor_backup(&self, deployment_id: &str) {
-            self.arm(FaultKind::RenameFloorBackup, deployment_id);
-        }
-
-        /// Arm the next checkpoint floor-marker RESTORE (the fail-closed
-        /// half of a TRANSACTIONAL ADVANCE, keyed by the checkpoint
-        /// deployment id) to fail once. The restore is only attempted when
-        /// an EARLIER advance stage already failed; a fault here leaves the
-        /// previous floor A in the tagged backup and the marker absent —
-        /// every read then fails closed with an integrity error (a torn
-        /// advance is never "no floor").
-        pub(crate) fn arm_restore_floor(&self, deployment_id: &str) {
-            self.arm(FaultKind::RestoreFloor, deployment_id);
-        }
-
-        /// Arm the next checkpoint floor-marker success-path BACKUP REMOVAL
-        /// (the best-effort cleanup of THIS transaction's tagged backup
-        /// after the floor committed, keyed by the checkpoint deployment
-        /// id) to fail once — the tagged backup (holding the pre-advance
-        /// floor) stays on disk. Harmless by design: it is never restored
-        /// by a different transaction and the next advance's pre-start
-        /// reconciliation removes it durably.
-        pub(crate) fn arm_remove_floor_backup(&self, deployment_id: &str) {
-            self.arm(FaultKind::RemoveFloorBackup, deployment_id);
-        }
-
-        /// Arm the next checkpoint attempts.jsonl suffix rewrite for
-        /// `deployment_id` (the checkpoint deployment) to fail once. The
-        /// floor marker is ALREADY durable when this fires (the floor is
-        /// written first), so an interrupted compaction must never expose
-        /// history below the durable floor.
-        pub(crate) fn arm_compact_attempts(&self, deployment_id: &str) {
-            self.arm(FaultKind::CompactAttempts, deployment_id);
-        }
-
-        /// Arm the next checkpoint snapshots.jsonl suffix rewrite for
-        /// `deployment_id` (the checkpoint deployment) to fail once. The
-        /// floor marker is ALREADY durable when this fires.
-        pub(crate) fn arm_compact_snapshots(&self, deployment_id: &str) {
-            self.arm(FaultKind::CompactSnapshots, deployment_id);
-        }
-
-        /// Arm the next checkpoint `deployments/<id>/` directory deletion
-        /// pass for `deployment_id` (the checkpoint deployment) to fail
-        /// once. The floor marker is ALREADY durable when this fires, so
-        /// even a total deletion failure leaves the visible history bounded
-        /// below by the durable floor.
-        pub(crate) fn arm_compact_deployments(&self, deployment_id: &str) {
-            self.arm(FaultKind::CompactDeployments, deployment_id);
-        }
-
-        /// Arm the next cleanup-pending debt-marker WRITE for
-        /// `deployment_id` (the floor's deployment id the marker names) to
-        /// fail once. The write runs AFTER the floor marker is durable
-        /// (post-commit maintenance); a failure is surfaced in the report
-        /// as `cleanup_persistence_failed` — truthful reporting: the
-        /// report never claims durable debt that a crash/restart would
-        /// lose.
-        pub(crate) fn arm_write_cleanup_pending(&self, deployment_id: &str) {
-            self.arm(FaultKind::WriteCleanupPending, deployment_id);
-        }
-
-        /// Arm the next cleanup-pending debt-marker CLEAR for `target` to
-        /// fail once (keyed by target — the marker lives under
-        /// `targets/<target>/refs/`, mirroring the rotation-debt kinds).
-        /// The clear runs after the compaction completes; a failure leaves
-        /// a stale (harmless) marker that the retry re-clears, surfaced in
-        /// the report as `cleanup_clear_failed`.
-        pub(crate) fn arm_clear_cleanup_pending(&self, target: &str) {
-            self.arm(FaultKind::ClearCleanupPending, target);
-        }
-
-        /// Arm the next artifact-GC SCAN for `deployment_id` (the
-        /// checkpoint that triggers the GC) to fail once: the retained-set
-        /// computation aborts BEFORE any deletion (fail closed), the
-        /// checkpoint reports cleanup pending, and the retry recomputes
-        /// reachability fresh.
-        pub(crate) fn arm_gc_scan(&self, deployment_id: &str) {
-            self.arm(FaultKind::GcScan, deployment_id);
-        }
-
-        /// Arm the next artifact-GC RELEASE deletion phase to fail once
-        /// (keyed by the checkpoint deployment id): the unreachable release
-        /// records stay on disk (extra garbage, never less) and the retry
-        /// reclaims them.
-        pub(crate) fn arm_gc_delete_releases(&self, deployment_id: &str) {
-            self.arm(FaultKind::GcDeleteReleases, deployment_id);
-        }
-
-        /// Arm the next artifact-GC TREE deletion phase to fail once (keyed
-        /// by the checkpoint deployment id).
-        pub(crate) fn arm_gc_delete_trees(&self, deployment_id: &str) {
-            self.arm(FaultKind::GcDeleteTrees, deployment_id);
+        /// Arm the checkpoint sweep's TREE-OBJECT stage for `target` to fail
+        /// once (at the stage's entry: no object is deleted and the report
+        /// says sweep retry-required).
+        pub(crate) fn arm_sweep_objects(&self, target: &str) {
+            self.arm(FaultKind::SweepObjects, target);
         }
     }
 }
-
-/// Test-only step-17 phase hook: a per-fixture one-shot barrier that makes
-/// step-17 lock contention DETERMINISTIC, distinguished by PHASE.
-///
-/// The engine calls [`Step17Hook::barrier`] immediately BEFORE a
-/// step-17-equivalent lock acquisition — its per-slot rotation block in step
-/// 17, and the deferred-maintenance retry that shares the same RAII-guarded
-/// block — and passes the PHASE it is about to run
-/// ([`HookPhase::FreshStep17`] vs [`HookPhase::DeferredRetry`]). The signal
-/// the engine sends on the armed channel CARRIES that phase, so a test can
-/// tell WHICH park it is servicing: the fresh per-slot rotation of THIS
-/// push (where the contention else-branch defers the rotation as debt) or
-/// the deferred-maintenance retry (which reads the debt FIRST). When a test
-/// armed the hook for THIS deployment id, the engine (a) signals
-/// "at step-17 lock acquisition" with the phase on the armed channel, then
-/// (b) BLOCKS until the test releases it: while the engine is parked, the
-/// test acquires the slot's mutation lock via a SECOND helper (and may arm
-/// per-phase faults), then releases the engine — whose own acquisition
-/// afterwards deterministically contends (no thread ever races on the lock
-/// file). Unarmed stores and non-matching deployment ids pass through
-/// untouched, and the whole module is `#[cfg(test)]` (the engine call sites
-/// are `#[cfg(test)]` too), so this is a NO-OP in production builds.
-///
-/// The phase distinction exists so a test can arm a debt fault ONLY at the
-/// phase that must fault: the retry phase (which reads the debt marker
-/// FIRST, before any park) parks and releases WITHOUT the fault armed, and
-/// the fresh step-17 phase (whose contended deferral runs the debt
-/// read/write) arms it — the one-shot fault then fires at the INTENDED
-/// phase instead of being consumed by the retry's earlier I/O.
-///
-/// Like the fault registry, the hook is PER-FIXTURE — owned by each
-/// [`crate::store::local::LocalStore`], never a process-global slot: a hook
-/// armed by one test can never fire in another fixture's push, so the
-/// parallel `cargo test` threads stay structurally isolated. The
-/// deployment-id half of the arm keys the barrier to exactly one push
-/// (property cases and the contention test all use unique ids), so a hook
-/// cannot even fire for a DIFFERENT push of the same fixture.
-///
-/// CANCELLATION SAFETY: dropping the handle must NEVER deadlock a parked
-/// engine. A parked `barrier` holds the slot mutex while it waits, so the
-/// drop must wake the engine BEFORE it takes that mutex to disarm. The wake
-/// is by CHANNEL DISCONNECT, not by a token: the handle owns the ONLY sender
-/// of the release channel, and [`Drop for HookHandle`] closes the channel
-/// FIRST (`self.release.take()`, which needs no lock) so every parked
-/// `recv()` returns `Err(RecvError)` unconditionally — no dependence on
-/// which recv consumes a token. The token-based scheme deadlocked exactly
-/// there: with MULTIPLE phases (deferred-maintenance retry + fresh step-17
-/// rotation), a stale release token from a prior phase could be consumed by
-/// the WRONG recv, leaving a later park waiting forever while its `barrier`
-/// held the slot mutex — and the drop's own `inner.lock()` then blocked on
-/// that held mutex, so nothing could ever release the parked engine. Only
-/// AFTER the close does the drop take the slot mutex to disarm (the parked
-/// engine has been woken and released it), and a fresh `barrier` after that
-/// is a no-op. The [`step17_hook_property_tests`] matrix asserts the
-/// guarantee across 1-4 phases × arbitrary cancellation points.
-#[cfg(test)]
 pub(crate) mod step17_hook {
     use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
     use std::sync::{Arc, Mutex};
@@ -1294,7 +999,7 @@ mod registry_property_tests {
                 // The OTHER operation (write_results) on key A: never fires
                 // the AppendAttempt arm and never disarms it.
                 assert!(
-                    !reg.consume(FaultKind::WriteResults, ID_A),
+                    !reg.consume(FaultKind::AppendTerminal, ID_A),
                     "a different fault kind must never fire A's arm"
                 );
             }

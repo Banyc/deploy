@@ -81,6 +81,7 @@ use crate::push::capacity::capacity_fits;
 use crate::push::checkpoint::{CheckpointReport, run_checkpoint_unlocked};
 use crate::push::engine::{PushOptions, PushReport, push, push_with_id};
 use crate::records::DeploymentStatus;
+use crate::records::LedgerEntry;
 use crate::release::{
     canonicalize_slots, release_digest, variant_slots_digest, verify_release_identity,
 };
@@ -1076,11 +1077,11 @@ impl Fixture {
                 })
             }
             FailureClass::IntentPersist => reg.arm_append_attempt(id.as_str()),
-            FailureClass::ResultsWrite => reg.arm_write_results(id.as_str()),
-            FailureClass::SnapshotAppend => reg.arm_append_snapshot(id.as_str()),
-            FailureClass::LastSuccessfulWrite => reg.arm_write_last_successful(id.as_str()),
-            FailureClass::TransitionSuccessful => reg.arm_append_transition_successful(id.as_str()),
-            FailureClass::TransitionPending => reg.arm_append_transition_pending(id.as_str()),
+            FailureClass::ResultsWrite => reg.arm_append_terminal(id.as_str()),
+            FailureClass::SnapshotAppend => reg.arm_append_terminal(id.as_str()),
+            FailureClass::LastSuccessfulWrite => reg.arm_append_terminal(id.as_str()),
+            FailureClass::TransitionSuccessful => reg.arm_append_terminal(id.as_str()),
+            FailureClass::TransitionPending => reg.arm_append_terminal(id.as_str()),
             FailureClass::ObservedWriteServer => reg.arm_write_server(id.as_str(), pushed),
             // The observed-refresh SLOT-write faults are keyed by deployment
             // id AND SLOT: the engine writes each advanced slot's ONE
@@ -1183,7 +1184,20 @@ impl Fixture {
     /// classes are push-oriented and never armed for a checkpoint, so the
     /// step-scoped fault is dropped like any unconsumed arm).
     fn checkpoint_prop(&self, t: &str, k: u64) -> Outcome {
-        let snaps = self.store.read_snapshots(t).unwrap_or_default();
+        // The VISIBLE chain is the ledger's SUCCESSFUL entries (the rollback
+        // states) — the implicit floor: after a checkpoint the first retained
+        // entry is the oldest rollback state.
+        let snaps: Vec<LedgerEntry> = self
+            .store
+            .read_ledger(t)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| {
+                e.terminal.as_ref().is_some_and(|x| {
+                    x.status == DeploymentStatus::Successful && x.rollback.is_some()
+                })
+            })
+            .collect();
         if snaps.is_empty() {
             // No recorded successful deployment on the visible chain: the
             // model no-ops too (nothing to checkpoint, nothing changes).
@@ -1192,7 +1206,7 @@ impl Fixture {
         let id = snaps[(k % snaps.len() as u64) as usize]
             .deployment_id
             .clone();
-        let rep = run_checkpoint_unlocked(&self.store, t, &id)
+        let rep = run_checkpoint_unlocked(&self.store, &self.config, t, &id)
             .expect("a checkpoint at a recorded successful deployment succeeds");
         Outcome::Checkpoint(Box::new(rep))
     }
@@ -1437,11 +1451,11 @@ impl Fixture {
         let reg = self.store.fault_registry();
         match step {
             FailureStep::IntentPersist => reg.arm_append_attempt(id.as_str()),
-            FailureStep::ResultsWrite => reg.arm_write_results(id.as_str()),
-            FailureStep::SnapshotAppend => reg.arm_append_snapshot(id.as_str()),
-            FailureStep::LastSuccessfulWrite => reg.arm_write_last_successful(id.as_str()),
-            FailureStep::TransitionSuccessful => reg.arm_append_transition_successful(id.as_str()),
-            FailureStep::TransitionPending => reg.arm_append_transition_pending(id.as_str()),
+            FailureStep::ResultsWrite => reg.arm_append_terminal(id.as_str()),
+            FailureStep::SnapshotAppend => reg.arm_append_terminal(id.as_str()),
+            FailureStep::LastSuccessfulWrite => reg.arm_append_terminal(id.as_str()),
+            FailureStep::TransitionSuccessful => reg.arm_append_terminal(id.as_str()),
+            FailureStep::TransitionPending => reg.arm_append_terminal(id.as_str()),
             // The post-commit observed-refresh faults are keyed by deployment
             // id AND SLOT: the fixture's shared slots are `p1` (written first
             // in a t1/t2 push — the "primary" write) and `p2` (written second
@@ -1847,26 +1861,25 @@ impl Fixture {
                     DeploymentStatus::PendingCommit => {
                         assert!(
                             !snapshot_exists,
-                            "PendingCommit attempt {id} must NOT have a snapshot yet"
+                            "PendingCommit attempt {id} must NOT have a rollback state yet"
                         );
+                        // The intent-only entry is the recoverable pending
+                        // state: no terminal event exists (the ledger's ONE
+                        // atomic finalize write never landed), so recovery
+                        // rebuilds the outcomes from the VERIFIED DESIRED
+                        // state — never from a durable outcomes file.
                         assert!(
-                            self.store.read_results(id).is_ok(),
-                            "PendingCommit attempt {id} must be recoverable from durable outcomes"
+                            self.store.read_transitions(id).unwrap().is_empty(),
+                            "PendingCommit attempt {id} must be intent-only (no terminal event)"
                         );
                     }
                     _ => {}
                 }
             }
-            // `refs/last-successful` points at the NEWEST successful attempt
-            // (older successful attempts keep their own snapshot/marker) —
-            // with ONE documented crash-recovery corner: a mid-finalize crash
-            // wrote the ref BEFORE the terminal `Successful` transition
-            // landed (a faulted `append_transition(Successful)`), and if the
-            // slot's generation diverged before the pending attempt was
-            // reconciled, the recovery DEGRADES the attempt (terminal, never
-            // re-eligible) leaving the ref stale — it must then point at a
-            // `Degraded` attempt that still carries its snapshot, never at an
-            // arbitrary or successful record.
+            // `read_last_successful` is DERIVED from the ledger (the newest
+            // entry with a `Successful` terminal) — there is no separate ref
+            // file anymore, so no stale-ref crash corner can exist: the
+            // derived value ALWAYS equals the newest successful entry.
             let newest_successful = attempts
                 .iter()
                 .filter(|a| {
@@ -1879,35 +1892,18 @@ impl Fixture {
                 .map(|a| a.deployment_id.as_str())
                 .max_by_key(|a| *a);
             match (newest_successful, last_ok.as_deref()) {
-                (Some(newest), Some(ok)) if newest == ok => {}
-                (None, None) => {}
-                (_, Some(ok)) => {
-                    // The stale-ref crash corner: the ref must point at a
-                    // terminal-Degraded attempt carrying its snapshot (the
-                    // crashed finalize's), not at a successful or arbitrary
-                    // record.
-                    let ok_attempt = attempts
-                        .iter()
-                        .find(|a| a.deployment_id.as_str() == ok)
-                        .unwrap_or_else(|| {
-                            panic!("refs/last-successful points at {ok} but no attempt is recorded")
-                        });
+                (Some(newest), Some(ok)) => {
                     assert_eq!(
-                        self.store
-                            .latest_status(ok_attempt.deployment_id.as_str())
-                            .ok()
-                            .flatten(),
-                        Some(DeploymentStatus::Degraded),
-                        "a stale refs/last-successful must point at a Degraded crash-mid-finalize \
-                         attempt (its generation diverged before recovery), got {ok}"
-                    );
-                    assert!(
-                        snapshots.iter().any(|s| s.deployment_id.as_str() == ok),
-                        "the Degraded crash-mid-finalize attempt {ok} must still carry its snapshot"
+                        newest, ok,
+                        "the derived last-successful must equal the newest successful entry"
                     );
                 }
+                (None, None) => {}
                 (Some(_), None) => {
                     panic!("refs/last-successful is missing after a successful attempt")
+                }
+                (None, Some(ok)) => {
+                    panic!("derived last-successful points at {ok} but no attempt is successful")
                 }
             }
             assert!(
@@ -2337,10 +2333,12 @@ fn state_machine_lifecycle_pending_commit_recovery_no_duplicate_history() {
         f.store.latest_status(id.as_str()).unwrap(),
         Some(DeploymentStatus::PendingCommit)
     );
-    // Recoverable: intent and outcomes are durable.
+    // Recoverable: the intent is durable and the entry is intent-only (the
+    // ONE terminal event never landed — recovery rebuilds the outcomes from
+    // the verified desired state).
     assert!(
-        f.store.read_results(id.as_str()).is_ok(),
-        "outcomes durable"
+        f.store.read_transitions(id.as_str()).unwrap().is_empty(),
+        "a pending attempt must be intent-only (no terminal event)"
     );
     f.check_invariants();
 
@@ -2472,19 +2470,24 @@ fn state_machine_checkpoint_floor_discards_below_pending_keeps_above() {
         !system_has_pending(&f, "t1"),
         "the below-floor pending commit must never be resurrected"
     );
-    // The floor deployment's own attempt + snapshot survive (keyed by the
-    // checkpoint deployment id).
+    // The checkpoint deployment's own entry + rollback survive; the
+    // retained suffix is exactly it.
     let raw_snaps: Vec<String> = f
         .store
-        .read_snapshots_raw("t1")
+        .read_ledger("t1")
         .unwrap()
         .iter()
-        .map(|s| s.deployment_id.as_str().to_string())
+        .filter(|e| {
+            e.terminal
+                .as_ref()
+                .is_some_and(|x| x.status == DeploymentStatus::Successful && x.rollback.is_some())
+        })
+        .map(|e| e.deployment_id.as_str().to_string())
         .collect();
     assert_eq!(
-        raw_snaps,
-        vec![rep.deployment_id.as_str().to_string()],
-        "only the floor deployment's own snapshot survives"
+        raw_snaps.len(),
+        1,
+        "only the checkpoint entry's rollback survives"
     );
     f.check_invariants();
 
@@ -2523,7 +2526,7 @@ fn state_machine_checkpoint_floor_discards_below_pending_keeps_above() {
         !system_has_pending(&f, "t1"),
         "the next push finalizes the at/above-floor pending commit"
     );
-    let snaps = f.store.read_snapshots_raw("t1").unwrap();
+    let snaps = f.store.read_snapshots("t1").unwrap();
     let matches = snaps
         .iter()
         .filter(|s| s.deployment_id.as_str() == pending_id)
@@ -2531,12 +2534,14 @@ fn state_machine_checkpoint_floor_discards_below_pending_keeps_above() {
     assert_eq!(
         matches.len(),
         1,
-        "the finalized pending commit must produce exactly ONE snapshot"
+        "the finalized pending commit must produce exactly ONE rollback state"
     );
     assert_eq!(
-        matches[0].deployment_id.as_str(),
-        pending_id,
-        "the snapshot is keyed by the pending deployment id (no duplicate)"
+        history::successful_index(&f.store, "t1", &DeploymentId::new(pending_id))
+            .unwrap()
+            .unwrap(),
+        1,
+        "the rollback lands at the SAME unique position (s1)"
     );
     f.check_invariants();
 }
@@ -3280,8 +3285,8 @@ fn lifecycle_observed_refresh_faults_never_fail_after_commit() {
         );
         assert_eq!(
             f.store.read_transitions(id.as_str()).unwrap().len(),
-            3,
-            "{step:?}: exactly InProgress + PendingCommit + Successful — no duplicate transitions"
+            1,
+            "{step:?}: exactly ONE terminal event (Successful) — no duplicates"
         );
         assert_eq!(
             f.store.read_last_successful("t1").as_deref(),
@@ -3323,8 +3328,8 @@ fn lifecycle_observed_refresh_faults_never_fail_after_commit() {
         );
         assert_eq!(
             f.store.read_transitions(id.as_str()).unwrap().len(),
-            3,
-            "{step:?}: no duplicate transitions after the retry"
+            1,
+            "{step:?}: no duplicate terminal events after the retry"
         );
         // The no-op retry refreshed every member target's projection from the
         // EXISTING assignment (the fault is one-shot and consumed), so the full
@@ -3429,8 +3434,8 @@ fn lifecycle_debt_fault_matrix_never_fails_after_commit() {
                 );
                 assert_eq!(
                     f.store.read_transitions(id.as_str()).unwrap().len(),
-                    3,
-                    "{ctx}: exactly InProgress + PendingCommit + Successful — no duplicates"
+                    1,
+                    "{ctx}: exactly ONE terminal event (Successful) — no duplicates"
                 );
                 assert_eq!(
                     f.store.read_last_successful("debtfx").as_deref(),
@@ -3952,15 +3957,21 @@ fn integrity_stored_release_schema_version_tamper_fails_closed() {
     );
 }
 
-/// Incoming (not yet stored) attempt and transition records reject every
-/// required-field deletion: a torn record never deserializes into a usable
-/// fact.
+/// Incoming (not yet stored) ledger lines reject every required-field
+/// deletion: a torn record never deserializes into a usable fact. The
+/// intent line and the terminal line are the ledger's two record shapes.
 #[test]
 fn integrity_incoming_record_field_deletion_fails_closed() {
     let f = Fixture::new();
     f.apply(Action::Push("t1"));
-    let attempts_path = f.store.target_dir("t1").join("attempts.jsonl");
-    let line = std::fs::read_to_string(&attempts_path).unwrap();
+    let ledger_path = f.store.ledger_path("t1");
+    let lines: Vec<String> = std::fs::read_to_string(&ledger_path)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    // The INTENT line: every required field rejected individually.
+    let intent_line = lines[0].clone();
     for field in [
         "deployment_id",
         "target",
@@ -3970,34 +3981,33 @@ fn integrity_incoming_record_field_deletion_fails_closed() {
         "desired",
         "pre_push",
     ] {
-        let mut v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(intent_line.trim()).unwrap();
         v.as_object_mut().unwrap().remove(field);
         let tampered = serde_json::to_string(&v).unwrap();
-        let rec: std::result::Result<crate::records::DeploymentAttempt, _> =
+        let rec: std::result::Result<crate::records::LedgerLine, _> =
             serde_json::from_str(&tampered);
         assert!(
             rec.is_err(),
-            "deleting attempt field '{field}' must fail deserialization"
+            "deleting intent field '{field}' must fail deserialization"
         );
     }
-    // Transitions: every required field rejected individually.
-    let attempts = f.store.read_attempts("t1").unwrap();
-    let dep_id = attempts[0].deployment_id.as_str();
-    let transitions_path = f.store.deployment_dir(dep_id).join("transitions.jsonl");
-    let lines: Vec<String> = std::fs::read_to_string(&transitions_path)
-        .unwrap()
-        .lines()
-        .map(str::to_string)
-        .collect();
-    for field in ["deployment_id", "status", "recorded_at"] {
-        let mut v: serde_json::Value = serde_json::from_str(lines[0].trim()).unwrap();
+    // The TERMINAL line: every required field rejected individually.
+    let terminal_line = lines[1].clone();
+    for field in [
+        "deployment_id",
+        "target",
+        "status",
+        "recorded_at",
+        "outcomes",
+    ] {
+        let mut v: serde_json::Value = serde_json::from_str(terminal_line.trim()).unwrap();
         v.as_object_mut().unwrap().remove(field);
         let tampered = serde_json::to_string(&v).unwrap();
-        let rec: std::result::Result<crate::records::DeploymentTransition, _> =
+        let rec: std::result::Result<crate::records::LedgerLine, _> =
             serde_json::from_str(&tampered);
         assert!(
             rec.is_err(),
-            "deleting transition field '{field}' must fail deserialization"
+            "deleting terminal field '{field}' must fail deserialization"
         );
     }
 }
@@ -4110,14 +4120,13 @@ fn bounds_capacity_edge_corners_fail_safely() {
 struct CheckpointExpectation {
     target: &'static str,
     deployment_id: String,
-    /// True when the floor moved (first checkpoint, or an advance to a
-    /// DIFFERENT deployment); false for the idempotent re-checkpoint of the
-    /// SAME deployment (the visible chain can never offer a snapshot below
-    /// the floor, so the only equal-position case IS the same deployment).
+    /// True for every real checkpoint: the ATOMIC LEDGER REPLACEMENT (the
+    /// only logical commit) always runs — even a re-checkpoint of the same
+    /// deployment rewrites the (identical) suffix so the sweep can finish.
     established: bool,
-    discarded_attempts: Vec<String>,
-    discarded_snapshots: Vec<String>,
-    discarded_deployments: Vec<String>,
+    /// The ledger entries strictly before the checkpoint deployment's
+    /// position, dropped by the retained-suffix replacement.
+    discarded_entries: Vec<String>,
 }
 
 /// One target's expected observed VIEW over the shared placement slots: per
@@ -4160,23 +4169,24 @@ struct Model {
     /// stays stale in EVERY member target's view while the other slot's
     /// record (and both views of it) advance.
     observed: BTreeMap<&'static str, ObservedView>,
-    /// Per-target RAW snapshot log: (deployment id, content version) per
-    /// physically recorded snapshot, in LOG ORDER (the deployment order) —
+    /// Per-target RAW snapshot log: (index, deployment id, content version)
+    /// per physically recorded snapshot, in LOG ORDER (the deployment order) —
     /// the log the checkpoint compacts. The VISIBLE chain is the suffix
     /// beginning at the target's floor deployment's POSITION (see
     /// [`Model::visible_snapshots`]); positions are DERIVED from this order,
-    /// never stored (the old `sN` index is gone). The deployment id is
-    /// tracked so the floor's own deployment and the discard sets can be
-    /// pinned against the system's raw logs.
-    raw_snapshots: BTreeMap<&'static str, Vec<(String, u32)>>,
+    /// never stored (the old `sN` index is gone — the public grammar is
+    /// deployment-keyed). The deployment id is tracked so the floor's own
+    /// deployment and the discard sets can be pinned against the system's
+    /// raw logs.
+    raw_snapshots: BTreeMap<&'static str, Vec<(u64, String, u32)>>,
     /// Per-target RAW deployment-attempt log: (deployment id, content
     /// version) per physically recorded attempt. The VISIBLE chain starts at
     /// the floor's own attempt (see [`Model::visible_attempts`]).
     raw_attempts: BTreeMap<&'static str, Vec<(String, u32)>>,
-    /// Per-target durable history floor: (deployment id, its POSITION in
-    /// the raw snapshot log — derived, never stored) the checkpoint marker
-    /// sits at; `None` before the target's first checkpoint.
-    floor: BTreeMap<&'static str, Option<(String, usize)>>,
+    /// Per-target durable history floor: (deployment id, snapshot index)
+    /// the retained-suffix boundary sits at; `None` before the target's first
+    /// checkpoint.
+    floor: BTreeMap<&'static str, Option<(String, u64)>>,
     /// Un-finalized pending deployment per target: (deployment id, content
     /// version, the minted-generation counter, whether its snapshot is
     /// ALREADY durable). A `LastSuccessfulWrite` / `TransitionSuccessful`
@@ -4282,51 +4292,38 @@ impl Model {
         format!("deploy-si-{}-{i:04}", self.prop_tag)
     }
 
-    /// The target's VISIBLE snapshot chain: the raw log filtered to the
-    /// suffix beginning at the floor deployment's POSITION (mirrors
-    /// [`crate::store::local::LocalStore::read_snapshots`]; positions are
-    /// derived from the log order, never stored).
-    fn visible_snapshots(&self, t: &'static str) -> Vec<(String, u32)> {
-        let raw = self.raw_snapshots.get(t).cloned().unwrap_or_default();
-        match self.floor.get(t).cloned().flatten() {
-            // The suffix begins at the floor deployment's CURRENT position in
-            // the raw log (mirrors read_snapshots' position lookup; a
-            // compacted log's first entry IS the floor deployment).
-            Some((fid, _)) => raw
-                .iter()
-                .position(|(id, _)| *id == fid)
-                .map(|pos| raw[pos..].to_vec())
-                .unwrap_or(raw),
-            None => raw,
-        }
+    /// The target's VISIBLE successful chain: the RAW ledger's successful
+    /// entries (the ledger IS the retained suffix — the floor is implicit,
+    /// and positions are relative to the CURRENT ledger, so the visible
+    /// chain IS the raw chain).
+    fn visible_snapshots(&self, t: &'static str) -> Vec<(u64, String, u32)> {
+        self.raw_snapshots.get(t).cloned().unwrap_or_default()
     }
 
-    /// The target's VISIBLE attempt chain: the raw log from the floor's own
-    /// attempt onward (mirrors
-    /// [`crate::store::local::LocalStore::read_attempts`], including the
-    /// no-drain when the floor's own attempt is absent).
+    /// The target's VISIBLE entry chain: the RAW ledger (the retained suffix
+    /// after a checkpoint).
     fn visible_attempts(&self, t: &'static str) -> Vec<(String, u32)> {
-        let raw = self.raw_attempts.get(t).cloned().unwrap_or_default();
-        match self.floor.get(t).cloned().flatten() {
-            Some((fid, _)) => raw
-                .iter()
-                .position(|(id, _)| *id == fid)
-                .map(|pos| raw[pos..].to_vec())
-                .unwrap_or(raw),
-            None => raw,
-        }
+        self.raw_attempts.get(t).cloned().unwrap_or_default()
     }
 
-    /// Append a NEW successful snapshot for deployment `id` (content `v`):
-    /// the log is KEYED BY DEPLOYMENT ID and appended in deployment order —
-    /// positions are derived from that order, never stored (the old
-    /// index-minting is gone; a checkpoint compacts the log to a suffix and
-    /// a new deployment always appends a NEW line).
+    /// The next successful-chain position for `t`: the CURRENT ledger's
+    /// successful count (positions are contiguous 0-based — after a
+    /// checkpoint the first retained successful entry is position 0).
+    fn next_snapshot_index(&self, t: &'static str) -> u64 {
+        self.raw_snapshots
+            .get(t)
+            .map(|s| s.len() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Append a NEW successful entry for deployment `id` (content `v`) at
+    /// the next successful-chain position.
     fn append_snapshot(&mut self, t: &'static str, id: &str, v: u32) {
+        let idx = self.next_snapshot_index(t);
         self.raw_snapshots
             .entry(t)
             .or_default()
-            .push((id.to_string(), v));
+            .push((idx, id.to_string(), v));
     }
 
     /// Advance the oracle by ONE property step — the action AND its failure
@@ -4386,8 +4383,8 @@ impl Model {
                     )
                 } else {
                     let pos = *k as usize % visible.len();
-                    let (cid, _) = visible[pos].clone();
-                    self.checkpoint(t, cid, pos);
+                    let (_, cid, _) = visible[pos].clone();
+                    self.checkpoint(t, cid, pos as u64);
                     (
                         OutcomeClass::Push {
                             boundary: ReturnBoundary::Ok,
@@ -4425,70 +4422,54 @@ impl Model {
         class
     }
 
-    /// Establish (or re-affirm) the target's history floor at the deployment
-    /// `cid` (whose snapshot index is `idx`), mirroring `checkpoint_inner`:
-    /// raw attempts are trimmed to the floor's own attempt onward, raw
-    /// snapshots to `index >= idx`, and the discard set mirrors
-    /// [`crate::store::local::LocalStore::checkpoint_discards`] EXACTLY. A
-    /// pending commit whose attempt line was trimmed is DISCARDED: its line,
-    /// its snapshot entry (an already-snapped pending attempt below the
-    /// floor always has its index below the floor — the snapshot was minted
-    /// before the floor's own deployment's), and its deployment dir all
-    /// vanish from the raw state, so recovery can never re-append it. A
-    /// pending commit at/above the floor survives untouched.
-    fn checkpoint(&mut self, t: &'static str, cid: String, cpos: usize) {
+    /// Retain the target's ledger suffix at the deployment `cid`, mirroring
+    /// `checkpoint_inner`: the ledger is ATOMICALLY replaced with everything
+    /// at/after the checkpoint deployment's position (the floor is implicit
+    /// — the first retained entry is the oldest rollback state). The model
+    /// trims its raw ledger to the same suffix: raw attempts to the
+    /// checkpoint entry onward, raw successful entries to those at/after it
+    /// with positions RENUMBERED 0.. (the ledger's positions are relative to
+    /// the CURRENT ledger). A pending commit whose entry was trimmed is
+    /// DISCARDED (no resurrection on recovery); one at/after survives.
+    fn checkpoint(&mut self, t: &'static str, cid: String, _idx: u64) {
         let raw_att = self.raw_attempts.get(t).cloned().unwrap_or_default();
         let raw_snaps = self.raw_snapshots.get(t).cloned().unwrap_or_default();
         let keep_from = raw_att
             .iter()
             .position(|(id, _)| *id == cid)
             .expect("the checkpoint deployment is a recorded attempt");
-        // The checkpoint deployment's POSITION in the raw snapshot log
-        // (derived — never stored): everything strictly before it is
-        // discarded, exactly as the compaction computes it.
-        let snap_floor_pos = raw_snaps
-            .iter()
-            .position(|(id, _)| *id == cid)
-            .expect("a successful checkpoint deployment owns a snapshot");
-        let mut discarded_deployments: Vec<String> = Vec::new();
-        let mut discarded_snapshots: Vec<String> = Vec::new();
-        for (pos, (sid, _)) in raw_snaps.iter().enumerate() {
-            if pos < snap_floor_pos {
-                discarded_snapshots.push(sid.clone());
-                if !discarded_deployments.contains(sid) {
-                    discarded_deployments.push(sid.clone());
-                }
-            }
-        }
-        let discarded_attempts: Vec<String> = raw_att[..keep_from]
+        let discarded_entries: Vec<String> = raw_att[..keep_from]
             .iter()
             .map(|(id, _)| id.clone())
             .collect();
-        for (aid, _) in raw_att.iter().take(keep_from) {
-            if !discarded_deployments.contains(aid) {
-                discarded_deployments.push(aid.clone());
-            }
-        }
-        // A below-floor pending commit is discarded with the rest of the
-        // below-floor history.
+        // The retained suffix's SUCCESSFUL entries: those whose ENTRY
+        // position is at/after the checkpoint entry, renumbered 0..
+        let retained_snaps: Vec<(u64, String, u32)> = raw_snaps
+            .iter()
+            .filter(|(_, sid, _)| {
+                raw_att
+                    .iter()
+                    .position(|(id, _)| id == sid)
+                    .is_some_and(|pos| pos >= keep_from)
+            })
+            .enumerate()
+            .map(|(n, (_, sid, v))| (n as u64, sid.clone(), *v))
+            .collect();
+        // A below-checkpoint pending commit is discarded with the rest of
+        // the below-checkpoint history.
         if let Some((pid, _, _, _)) = self.pending.get(t)
-            && raw_att[..keep_from].iter().any(|(id, _)| id == pid)
+            && discarded_entries.iter().any(|id| id == pid)
         {
             self.pending.remove(t);
         }
         self.raw_attempts.insert(t, raw_att[keep_from..].to_vec());
-        self.raw_snapshots
-            .insert(t, raw_snaps[snap_floor_pos..].to_vec());
-        let prev = self.floor.get(t).cloned().flatten();
-        let established = !matches!(prev, Some((fid, _)) if fid == cid);
-        self.floor.insert(t, Some((cid.clone(), cpos)));
+        self.raw_snapshots.insert(t, retained_snaps);
+        self.floor.insert(t, Some((cid.clone(), 0)));
         self.last_checkpoint = Some(CheckpointExpectation {
             target: t,
             deployment_id: cid,
-            established,
-            discarded_attempts,
-            discarded_snapshots,
-            discarded_deployments,
+            established: true,
+            discarded_entries,
         });
     }
 
@@ -4576,7 +4557,10 @@ impl Model {
         // PRE-push visible chain (positions derived); the model resolves the
         // same position on its own chain. A position beyond the chain is
         // "no such deployment" — fails closed.
-        let v = self.visible_snapshots(t).get(i as usize).map(|(_, v)| *v);
+        let v = self
+            .visible_snapshots(t)
+            .get(i as usize)
+            .map(|(_, _, v)| *v);
         // The engine reconciles pending attempts ONCE per push, before the
         // ref is resolved, and the resolved deployment enters the shared
         // resolved-look stage with NO second reconciliation (a second
@@ -4835,23 +4819,19 @@ impl Model {
             }
             Some(FailureClass::ResultsWrite)
             | Some(FailureClass::SnapshotAppend)
+            | Some(FailureClass::LastSuccessfulWrite)
+            | Some(FailureClass::TransitionSuccessful)
             | Some(FailureClass::TransitionPending) => {
-                // Crash-window faults: the remote advanced and the attempt is
-                // recorded (InProgress / PendingCommit), but the snapshot was
-                // NOT written and the observed refresh never ran. The push
-                // returns `Err` but the intent WAS persisted — the expected
-                // class is `Err` + `Pending` (the attempt stays
-                // recoverable-pending).
+                // Crash-window faults: the remote advanced and the intent was
+                // recorded, but the deployment's ONE terminal append (the
+                // atomic finalize write carrying status + outcomes + rollback)
+                // failed, so NO rollback state exists and the observed refresh
+                // never ran. The push returns `Err` but the intent WAS
+                // persisted — the expected class is `Err` + `Pending` (the
+                // attempt stays recoverable-pending; recovery finalizes it
+                // from the verified desired state).
                 self.pending
                     .insert(t, (id.clone(), v, self.current_gen, false));
-            }
-            Some(FailureClass::LastSuccessfulWrite) | Some(FailureClass::TransitionSuccessful) => {
-                // The snapshot was already appended before the ref / terminal
-                // transition write failed; the attempt stays pending and the
-                // recovery must not duplicate the snapshot.
-                self.append_snapshot(t, &id, v);
-                self.pending
-                    .insert(t, (id.clone(), v, self.current_gen, true));
             }
             Some(FailureClass::IntentPersist) | Some(FailureClass::LockContention) => {
                 unreachable!("handled before the real-deployment mutation")
@@ -5008,6 +4988,19 @@ impl Model {
                 // no-op report is unchanged.
                 self.armed_fault = None;
             }
+            Some(FailureClass::RemoteStatusPreSwap) => {
+                // The pre-swap status-read arm is a READ fault: on the no-op
+                // path the deferred-maintenance retry is a REAL rotation
+                // (`rotate_slot_locked` under the maintenance mutation lock)
+                // whose first `current`-link read is exactly the
+                // pre-swap-moment read the arm targets — with no
+                // `process_server` on the no-op path, that read is the one
+                // that fires the one-shot: the rotation fails with the
+                // injected transport error and the debt marker STAYS
+                // (re-recorded with the error reason). The arm is consumed;
+                // the marker is not cleared.
+                self.armed_fault = None;
+            }
             Some(FailureClass::Step17ContentionDebtRead)
             | Some(FailureClass::Step17ContentionDebtWrite) => {
                 // The no-op path runs no FRESH step-17 rotation, so the
@@ -5018,17 +5011,6 @@ impl Model {
                 // the marker STAYS. No "failed to ... rotation debt" notice
                 // is expected (the debt I/O never faulted). The fault is
                 // dropped step-scoped.
-                self.armed_fault = None;
-            }
-            Some(FailureClass::RemoteStatusPreSwap) => {
-                // The no-op's deferred-maintenance retry is a REAL rotation
-                // (`rotate_slot_locked` under the maintenance mutation lock)
-                // whose first `current`-link read is exactly the
-                // pre-swap-moment read the arm targets — with no
-                // `process_server` on the no-op path, that read is the one
-                // that fires the one-shot: the rotation fails with the
-                // injected transport error and the marker STAYS (re-recorded
-                // with the error reason). The arm is consumed.
                 self.armed_fault = None;
             }
             Some(_) => {
@@ -5288,14 +5270,26 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
             sys = sys_snaps.len(),
             model = want.len(),
         );
-        for (ss, (wid, mv)) in sys_snaps.iter().zip(&want) {
+        for (ss, (wi, wid, mv)) in sys_snaps.iter().zip(&want) {
+            assert_eq!(
+                history::successful_index(&system.store, t, &ss.deployment_id)
+                    .unwrap()
+                    .unwrap(),
+                *wi,
+                "{ctx}: snapshot position for {t}"
+            );
             assert_eq!(
                 ss.deployment_id.as_str(),
                 wid,
-                "{ctx}: snapshot deployment id for {t} — the log order must match the model \
-                 (no duplicate, no re-append below the floor)"
+                "{ctx}: snapshot deployment id at position {wi} for {t} — the SAME position \
+                 must never resolve to a different deployment (no duplicate, no re-append)"
             );
-            let art = ss.slots[&pid].assignment.artifact.clone();
+            let rollback = ss
+                .terminal
+                .as_ref()
+                .and_then(|x| x.rollback.as_ref())
+                .expect("a successful entry carries a rollback state");
+            let art = rollback.slots[&pid].assignment.artifact.clone();
             learn_artifact(
                 &mut learned,
                 &ctx,
@@ -5321,7 +5315,7 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
                 wid,
                 "{ctx}: attempt id order for {t}"
             );
-            let art = sa.desired[&pid].assignment.artifact.clone();
+            let art = sa.intent.desired[&pid].assignment.artifact.clone();
             learn_artifact(&mut learned, &ctx, *mv, art, "attempt {t}");
         }
     }
@@ -5474,163 +5468,139 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
     }
 }
 
-/// The PENDING-COMMIT × CHECKPOINT-FLOOR invariant bundle, asserted after
-/// EVERY step and at the end of a state-machine run (alongside
-/// [`assert_semantic_invariants`]). Pins the documented contract
-/// ([`crate::push::checkpoint`]): a pending-commit attempt whose history lies
-/// BELOW the new floor is discarded with the rest of the below-floor history
-/// (its attempt line, its snapshot entry, and its deployment dir all vanish
-/// from the RAW logs — no resurrection on recovery); one at or above it
-/// stays and is finalized by the next push exactly as before.
+/// The PENDING-COMMIT × CHECKPOINT (retained-suffix) invariant bundle,
+/// asserted after EVERY step and at the end of a state-machine run
+/// (alongside [`assert_semantic_invariants`]). Pins the documented contract
+/// ([`crate::push::checkpoint`]): a pending-commit entry whose ledger line
+/// lies BELOW the checkpoint deployment's position is discarded with the
+/// rest of the below-checkpoint history (its intent line, its terminal (if
+/// any), and its deployment dir all vanish — no resurrection on recovery);
+/// one at/above it stays and is finalized by the next push exactly as
+/// before.
 ///
-/// (1) the RAW attempt/snapshot logs match the model EXACTLY (ids + indices
-///     + order) — a below-floor pending commit is gone from BOTH raw logs
-///     and its deployment dir is deleted, while an at/above-floor one
-///     survives;
-/// (2) the SAME-index binding — a snapshot index never resolves to a
-///     different deployment id, so the finalized pending attempt keeps its
-///     index (no duplicate snapshot, no re-append below the floor);
-/// (3) RAW snapshot indices are strictly increasing and unique (a
-///     compaction that reused an index would break this);
-/// (4) NO ref (sN, @-, parent(...)) resolves below the floor — below-floor
-///     refs fail closed;
-/// (5) the durable floor marker matches the model per target, and every
-///     comparison runs for BOTH targets — checkpointing t1 never changes
-///     t2's floor, logs, or pending state (cross-target isolation).
+/// (1) the RAW LEDGER matches the model EXACTLY (all entry ids in order +
+///     the successful entries' positions in order) — a below-checkpoint
+///     pending commit is gone and its deployment dir is deleted, while an
+///     at/above-checkpoint one survives;
+/// (2) the SAME-POSITION binding — a successful-chain position never
+///     resolves to a different deployment id (no duplicate, no re-append);
+/// (3) successful-chain positions are strictly increasing and unique
+///     (contiguous 0-based positions — the ledger's append order IS the
+///     history order);
+/// (4) every ref (sN, @-, parent(...)) resolves only within the retained
+///     suffix — a position beyond the chain fails closed;
+/// (5) checkpointing t1 never changes t2's ledger, or pending state
+///     (cross-target isolation).
 ///
-/// The deployment-dir bijection is asserted per retained attempt (its dir
-/// exists) and per retained snapshot (its dir exists exactly when its
-/// attempt line is retained — the documented position-based discard can
-/// leave an at/above-floor snapshot of a below-floor attempt without a dir;
-/// the snapshot stays a valid rollback state, its deployment dir is gone).
+/// The deployment-dir bijection is asserted per retained entry (its dir
+/// exists). The entries the checkpoint discarded (the model's raw ledger is
+/// already trimmed) are asserted GONE: their deployment dirs were swept
+/// (unreachable — not in any retained ledger, not observed, not pending).
 fn assert_checkpoint_invariants(model: &Model, system: &Fixture) {
     let ctx = format!("after action {}", model.index);
     for t in ["t1", "t2"] {
-        // (5) the durable floor marker matches the model.
-        let sys_floor = system.store.read_history_floor(t).unwrap_or_default();
-        match (model.floor.get(t).cloned().flatten(), sys_floor) {
-            (None, None) => {}
-            (None, Some(f)) => panic!("{ctx}: unexpected history floor on {t}: {f:?}"),
-            (Some(_), None) => {
-                panic!("{ctx}: model expects a history floor on {t}, none present")
-            }
-            (Some((mid, _)), Some(f)) => {
-                assert_eq!(
-                    f.deployment_id.as_str(),
-                    mid,
-                    "{ctx}: floor deployment id for {t}"
-                );
-            }
-        }
-        // (1) + (3): RAW logs match the model exactly; snapshot indices are
-        // strictly increasing and unique (never reused after compaction).
-        let sys_raw_att = system.store.read_attempts_raw(t).unwrap_or_default();
+        // (1) + (3): the RAW LEDGER matches the model exactly; successful
+        // positions are strictly increasing and unique (contiguous 0-based
+        // positions — never reused, never gapped).
+        let sys_entries = system.store.read_ledger(t).unwrap_or_default();
         let want_att = model.raw_attempts.get(t).cloned().unwrap_or_default();
         assert_eq!(
-            sys_raw_att.len(),
+            sys_entries.len(),
             want_att.len(),
-            "{ctx}: raw attempt count for {t} must match the model"
+            "{ctx}: raw ledger count for {t} must match the model"
         );
-        for (sa, (wid, _)) in sys_raw_att.iter().zip(&want_att) {
+        let mut prev: Option<u64> = None;
+        let mut successful_positions: Vec<(u64, String)> = Vec::new();
+        for (se, (wid, _)) in sys_entries.iter().zip(&want_att) {
             assert_eq!(
-                sa.deployment_id.as_str(),
+                se.deployment_id.as_str(),
                 wid,
-                "{ctx}: raw attempt id order for {t}"
+                "{ctx}: raw ledger id order for {t}"
             );
+            if let Some(t) = &se.terminal
+                && t.status == DeploymentStatus::Successful
+                && t.rollback.is_some()
+            {
+                successful_positions.push((successful_positions.len() as u64, wid.clone()));
+            }
         }
-        let sys_raw_snaps = system.store.read_snapshots_raw(t).unwrap_or_default();
         let want_snaps = model.raw_snapshots.get(t).cloned().unwrap_or_default();
         assert_eq!(
-            sys_raw_snaps.len(),
+            successful_positions.len(),
             want_snaps.len(),
-            "{ctx}: raw snapshot count for {t} must match the model"
+            "{ctx}: successful-chain count for {t} must match the model"
         );
-        for (ss, (wid, _)) in sys_raw_snaps.iter().zip(&want_snaps) {
-            assert_eq!(
-                ss.deployment_id.as_str(),
-                wid,
-                "{ctx}: raw snapshot id order for {t}"
-            );
+        for ((pos, sid), (wi, wid, _)) in successful_positions.iter().zip(&want_snaps) {
+            assert_eq!(pos, wi, "{ctx}: successful position for {t}");
+            assert_eq!(sid, wid, "{ctx}: successful id at position {wi} for {t}");
+            if let Some(p) = prev {
+                assert!(
+                    p < *pos,
+                    "{ctx}: successful positions on {t} must be strictly increasing (contiguous)"
+                );
+            }
+            prev = Some(*pos);
         }
-        // The deployment-keyed identity space: no DUPLICATE deployment id in
-        // the raw log (a compaction that reused an identity would break
-        // this).
-        {
-            let mut ids: Vec<&str> = sys_raw_snaps
-                .iter()
-                .map(|s| s.deployment_id.as_str())
-                .collect();
-            ids.sort_unstable();
-            ids.dedup();
-            assert_eq!(
-                ids.len(),
-                sys_raw_snaps.len(),
-                "{ctx}: raw snapshot deployment ids on {t} must be unique"
-            );
-        }
-        // (1) the deployment-dir bijection: every retained attempt owns its
-        // dir; a below-floor attempt's dir is gone (deleted with the rest of
-        // the below-floor history). A retained snapshot's dir exists exactly
-        // when its attempt line is retained.
-        let mut retained_attempt_ids: HashSet<&str> = HashSet::new();
+        // (1) the deployment-dir bijection: every retained entry owns its
+        // dir (the sweep keeps every reachable deployment dir).
+        let mut retained_ids: HashSet<&str> = HashSet::new();
         for (id, _) in &want_att {
             assert!(
                 system.store.deployment_dir(id).exists(),
-                "{ctx}: the deployment dir of retained attempt {id} on {t} must exist"
+                "{ctx}: the deployment dir of retained entry {id} on {t} must exist"
             );
             assert!(
-                retained_attempt_ids.insert(id.as_str()),
-                "{ctx}: duplicate raw attempt id {id} on {t}"
+                retained_ids.insert(id.as_str()),
+                "{ctx}: duplicate raw entry id {id} on {t}"
             );
         }
-        for (wid, _) in &want_snaps {
-            if retained_attempt_ids.contains(wid.as_str()) {
-                assert!(
-                    system.store.deployment_dir(wid).exists(),
-                    "{ctx}: the deployment dir of retained snapshot {wid} on {t} must exist"
-                );
-            }
-        }
-        // (4) below-floor refs fail closed: the deployment id directly
-        // before the floor (in the raw log) AND a relative parent() walk
-        // landing below the floor.
-        if let Some((fid, _)) = model.floor.get(t).cloned().flatten() {
-            let raw = model.raw_snapshots.get(t).cloned().unwrap_or_default();
-            let below_id = raw
-                .iter()
-                .position(|(id, _)| *id == fid)
-                .and_then(|pos| (pos > 0).then(|| raw[pos - 1].0.clone()));
-            if let Some(below) = below_id {
-                let err = history::resolve_ref_expr(
-                    &history::parse_ref_expr(&below).unwrap(),
-                    t,
-                    &system.store,
-                )
-                .unwrap_err();
-                let msg = err.to_string();
-                assert!(
-                    msg.contains("history floor") || msg.contains("no successful deployment"),
-                    "{ctx}: below-floor deployment '{below}' on {t} must fail closed, got: {msg}"
-                );
-                // A parent() walk from the LATEST deployment stepping past
-                // the floor fails closed too.
-                let visible = model.visible_snapshots(t);
-                if let Some((latest_id, _)) = visible.last() {
-                    let steps = visible.len() as u64;
-                    let err = history::resolve_ref_expr(
-                        &history::parse_ref_expr(&format!("parent({latest_id}, {steps})")).unwrap(),
-                        t,
-                        &system.store,
-                    )
-                    .unwrap_err();
-                    let msg = err.to_string();
-                    assert!(
-                        msg.contains("history floor") || msg.contains("no successful deployment"),
-                        "{ctx}: parent() walking past the floor on {t} must fail closed, got: {msg}"
+        // (4) refs resolve only within the retained suffix: every successful
+        // deployment id resolves to EXACTLY IT, and a deployment the
+        // checkpoint discarded fails closed (the below-suffix ids no longer
+        // exist).
+        for (_, wid) in &successful_positions {
+            let resolved = history::resolve_ref_expr(
+                &history::parse_ref_expr(wid).expect("a deployment id parses"),
+                t,
+                &system.store,
+            )
+            .unwrap_or_else(|e| panic!("{ctx}: deployment {wid} on {t} must resolve: {e}"));
+            match resolved {
+                history::PushRef::Deployment { deployment_id, .. } => {
+                    assert_eq!(
+                        deployment_id.as_str(),
+                        wid,
+                        "{ctx}: deployment {wid} on {t} must resolve to the SAME deployment (no re-append below the retained suffix)"
                     );
                 }
+                other => panic!(
+                    "{ctx}: deployment {wid} on {t} must resolve to a deployment ref, got {other:?}"
+                ),
             }
         }
+        // A ref BEYOND the retained suffix fails closed: `parent(@, N)` with
+        // N = the chain length walks one past the start (on an empty chain
+        // any relative walk fails — there is no head to walk from). The old
+        // `sN` snapshot-index form is gone; the deployment-keyed grammar
+        // fails the same way.
+        let beyond = successful_positions.len() as u64;
+        let token = if beyond == 0 {
+            "parent(@, 1)".to_string()
+        } else {
+            format!("parent(@, {beyond})")
+        };
+        let err =
+            history::resolve_ref_expr(&history::parse_ref_expr(&token).unwrap(), t, &system.store)
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("before the start of the deployment history")
+                || msg.contains("no successful deployments"),
+            "{ctx}: {token} (beyond the retained suffix) on {t} must fail closed, got: {msg}"
+        );
+        // (5) cross-target isolation: the OTHER target's ledger is untouched
+        // by this target's checkpoint (both ledgers were compared against the
+        // model above, and the model trims only `t`).
     }
 }
 
@@ -5807,30 +5777,18 @@ fn run_semantic_state_case(steps: Vec<(Action, FailureClass)>) {
             );
             assert_eq!(
                 rep.established, want.established,
-                "after action {}: checkpoint established flag (first/advance vs \
-                 idempotent re-checkpoint)",
+                "after action {}: checkpoint established flag (the logical commit ran)",
                 model.index
             );
             assert!(
-                !rep.cleanup_pending
-                    && !rep.cleanup_persistence_failed
-                    && !rep.cleanup_clear_failed,
-                "after action {}: a clean checkpoint must report no cleanup debt",
+                rep.sweep_completed,
+                "after action {}: a clean checkpoint's best-effort sweep must complete",
                 model.index
             );
             assert_eq!(
-                rep.discards.discarded_attempts, want.discarded_attempts,
-                "after action {}: checkpoint discard set (attempts below the floor)",
-                model.index
-            );
-            assert_eq!(
-                rep.discards.discarded_snapshots, want.discarded_snapshots,
-                "after action {}: checkpoint discard set (snapshots below the floor)",
-                model.index
-            );
-            assert_eq!(
-                rep.discards.discarded_deployments, want.discarded_deployments,
-                "after action {}: checkpoint discard set (deployment dirs)",
+                rep.discards.discarded_entries, want.discarded_entries,
+                "after action {}: checkpoint discard set (entries below the checkpoint \
+                 position)",
                 model.index
             );
         }

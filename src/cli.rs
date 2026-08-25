@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::init::{InitOptions, init_project};
 use crate::model::DeploymentId;
 use crate::push::engine::{PushOptions, PushReport, push};
-use crate::records::{DeploymentAttempt, DeploymentStatus, ObservedTarget};
+use crate::records::{DeploymentStatus, LedgerEntry, ObservedTarget};
 use crate::remote::create_remote;
 use crate::remote::transport::Remote;
 use crate::store::local::LocalStore;
@@ -150,7 +150,7 @@ in the reference; every relative form resolves against the target argument):\n\n
   parent(<deployment-id>, N)   N steps back from that deployment\n\
   release:<id>         deploy the named release DIRECTLY to the current\n\
                        target's slots, from the release's own stored slot\n\
-                       snapshot — no snapshot history needed (cross-target)\n\
+                        snapshot — no snapshot history needed (cross-target)\n\
 \n\
 NOTE: every parent(...) form contains a comma, so the shell splits the\n\
 reference at the space after the comma. shell-quote parent(...) forms —\n\
@@ -206,51 +206,35 @@ id, release id, variant, and tree digest, as observed on the servers themselves\
 (right now — not from local history)."
     )]
     Status { target: String },
-    /// Establish a checkpoint (monotonic history floor) on a target.
+    /// Retain a target's history suffix (checkpoint) and sweep the rest.
     #[command(
-        long_about = "Model a checkpoint as a monotonic HISTORY FLOOR: once you checkpoint a\n\
-deployment, the retained history starts from that attempt and the OLDEST\n\
-rollback is that attempt — everything before it is discarded permanently.\n\
-The checkpoint deployment must be a SUCCESSFUL deployment of the target\n\
-(it must have produced a snapshot keyed by its deployment id); its\n\
-rollback payload becomes the OLDEST rollback state, and the snapshots,\n\
-attempts, and deployment directories strictly before it (in the log\n\
-order — positions are derived, never stored) are deleted. The checkpoint\n\
-deployment and everything after it are kept.\n\n\
-The operation is IRREVERSIBLE, so the deployment id is an explicit,\n\
-required positional argument and the real operation requires --yes.\n\
---dry-run prints exactly what would be discarded and touches NOTHING (no\n\
-locks, no writes, no remote contact); --yes performs the compaction.\n\n\
-Checkpointing the deployment the floor already sits at is a no-op\n\
-(idempotent); an EARLIER deployment than the current floor is refused (a\n\
-checkpoint can never move backward after older history has been\n\
-discarded).\n\n\
-The floor is stored as a small marker at\n\
-targets/<target>/refs/history-floor.json (durable BEFORE the physical\n\
-compaction rewrites the logs and deletes the below-floor deployment\n\
-directories), so even an interrupted cleanup never exposes history below\n\
-the durable floor. After the history compaction, the checkpoint also runs\n\
-LOCAL ARTIFACT GARBAGE COLLECTION: a best-effort, global pass that unlinks\n\
-release records (releases/<release-id>/) and tree objects\n\
-(objects/sha256/<digest>/) no longer reachable from any target's retained\n\
-history, observed state, or configured pins. Reachability is recomputed on\n\
-every run (no persisted deletion worklist); a failure never moves the\n\
-floor or deletes reachable content — the report says \"cleanup incomplete\"\n\
-and re-running the same checkpoint converges. Pins (pins.json) retain\n\
-artifact content ONLY: a pinned release/tree is never reclaimed, but a pin\n\
-never keeps an old deployment, attempt, or snapshot in history.\n\
-\"Disk cleanup\" means unlinking files and syncing directories — not secure\n\
-physical erasure (SSD firmware, copy-on-write filesystems, snapshots,\n\
-journals, and backups may retain old blocks). Remote artifact cleanup\n\
-remains rotation's responsibility: the checkpoint never contacts servers.\n\
+        long_about = "Checkpoint the target's ONE history ledger\n\
+(targets/<target>/ledger.jsonl) at a successful deployment: the ledger is\n\
+ATOMICALLY replaced with the retained suffix at that deployment — the floor\n\
+is implicit, the first retained entry is the oldest rollback state — and\n\
+the unreachable deployment directories, release records, and tree objects\n\
+are swept best-effort. The checkpoint deployment must be a SUCCESSFUL\n\
+deployment of the target (its ledger entry carries a rollback state);\n\
+everything strictly before it is discarded permanently.\n\
 \n\
-A checkpoint does not deploy anything, contact remote servers, or create\n\
-another snapshot.",
+The operation is IRREVERSIBLE, so the deployment id is an explicit,\n\
+required positional and the real operation requires --yes. --dry-run\n\
+prints exactly what would be discarded and touches NOTHING (no locks, no\n\
+writes, no remote contact); --yes performs the replacement + sweep.\n\
+Repeating the same checkpoint is idempotent (the ledger is already the\n\
+suffix) and finishes an interrupted sweep by recomputing reachability.\n\
+\n\
+The atomic ledger replacement is the checkpoint's ONLY logical commit: a\n\
+failed replacement deletes nothing, and a failed sweep is retried by\n\
+recomputing reachability — no floor marker, no backup, no debt flag. The\n\
+sweep keeps everything reachable from another target's ledger, the current\n\
+observed state, or a pin. Sweeps are best-effort, not secure erasure.\n\
+A checkpoint does not deploy anything or contact remote servers.",
         after_help = "Examples:\n\
   deploy checkpoint production deploy-004 --dry-run   # preview what would be discarded\n\
-  deploy checkpoint production deploy-004 --yes       # establish the floor (irreversible)\n\
-  deploy log production                               # now shows only the retained suffix\n\
-  deploy push production deploy-20260821T102000Z   # the checkpoint deployment stays the oldest rollback"
+         deploy checkpoint production deploy-004 --yes       # retain the suffix + sweep (irreversible)\n\
+          deploy log production                               # now shows only the retained suffix\n\
+          deploy push production deploy-004   # the checkpoint entry stays the oldest rollback"
     )]
     Checkpoint {
         target: String,
@@ -361,11 +345,11 @@ where
             print_report(&report);
         }
         Command::Log { target } => {
-            let attempts = store.read_attempts(&target)?;
-            if attempts.is_empty() {
+            let entries = store.read_ledger(&target)?;
+            if entries.is_empty() {
                 println!("no deployments for target '{target}'");
             }
-            for line in render_log(&store, &target, &attempts)? {
+            for line in render_log(&store, &target, &entries)? {
                 println!("{line}");
             }
         }
@@ -388,12 +372,17 @@ where
             // a --dry-run preview) it is refused up front.
             if !dry_run && !yes {
                 return Err(Error::preflight(
-                    "checkpoint is irreversible: pass --yes to establish the history floor \
+                    "checkpoint is irreversible: pass --yes to retain the history suffix \
                      (or --dry-run to preview exactly what would be discarded)",
                 ));
             }
-            let report =
-                crate::push::checkpoint::run_checkpoint(&store, &target, &deployment_id, dry_run)?;
+            let report = crate::push::checkpoint::run_checkpoint(
+                &store,
+                &config,
+                &target,
+                &deployment_id,
+                dry_run,
+            )?;
             for line in crate::push::checkpoint::render_checkpoint_report(&report) {
                 println!("{line}");
             }
@@ -434,54 +423,60 @@ fn render_status(observed: &ObservedTarget) -> Vec<String> {
 /// so the effective status is the LATEST transition (plus its reason, if
 /// any). When no transition has been recorded yet, the attempt is treated as
 /// still pending.
-fn effective_status(
-    store: &LocalStore,
-    attempt: &DeploymentAttempt,
-) -> Result<(DeploymentStatus, Option<String>)> {
-    match store.latest_transition(attempt.deployment_id.as_str())? {
-        Some(t) => Ok((t.status, t.reason)),
-        None => Ok((DeploymentStatus::PendingCommit, None)),
+/// The effective status + reason of a ledger entry for `deploy log`: the
+/// entry's TERMINAL EVENT carries the status and reason; an intent-only
+/// entry (in flight or recoverable-pending) renders `PendingCommit`.
+fn effective_status(entry: &LedgerEntry) -> (DeploymentStatus, Option<String>) {
+    match entry.terminal.as_ref() {
+        Some(t) => (t.status.clone(), t.reason.clone()),
+        None => (DeploymentStatus::PendingCommit, None),
     }
 }
 
-/// Render `deploy log <target>` output: one line per recorded attempt,
-/// newest last, each PREFIXED with the DEPLOYMENT ID of the snapshot that
-/// attempt produced — the exact rollback key the push reference grammar
-/// accepts (`deploy push <target> <deployment-id>`) — or `-` for attempts
-/// that produced no snapshot (failed/degraded attempts are visible here but
-/// are NOT valid rollback refs; a failed deployment id never resolves). The
-/// snapshot log IS the deployment history: each successful deployment owns
-/// a snapshot keyed by its deployment id (the old `sN` index prefix is
-/// gone — rollback payloads are keyed by deployment id). The CLI prints
-/// exactly these lines; the unit test asserts on them directly because lib
-/// unit tests cannot capture the harness-owned stdout sink.
+/// Render `deploy log <target>` output: one line per recorded ledger entry,
+/// newest last, each PREFIXED with the DEPLOYMENT ID of the successful
+/// deployment that produced it — the exact rollback key the push reference
+/// grammar accepts (`deploy push <target> <deployment-id>`) — or `-` for
+/// entries that produced no rollback state (failed/degraded entries are
+/// visible here but are NOT valid rollback refs; a failed deployment id
+/// never resolves). The ledger IS the deployment history: a successful
+/// terminal event carries the rollback payload keyed by its deployment id
+/// (the old `sN` index prefix is gone — rollback payloads are keyed by
+/// deployment id). The CLI prints exactly these lines; the unit test
+/// asserts on them directly because lib unit tests cannot capture the
+/// harness-owned stdout sink.
 pub fn render_log(
-    store: &LocalStore,
-    target: &str,
-    attempts: &[DeploymentAttempt],
+    _store: &LocalStore,
+    _target: &str,
+    entries: &[LedgerEntry],
 ) -> Result<Vec<String>> {
-    let snapshots = store.read_snapshots(target)?;
-    let rolled_back_by_deployment: std::collections::HashMap<&str, &str> = snapshots
-        .iter()
-        .map(|s| (s.deployment_id.as_str(), s.deployment_id.as_str()))
-        .collect();
-    let mut out = Vec::with_capacity(attempts.len());
-    for a in attempts {
-        let (status, reason) = effective_status(store, a)?;
-        // The prefix is the deployment id of the snapshot that attempt
-        // produced (the rollback key) or `-` for attempts without one.
-        let prefix = match rolled_back_by_deployment.get(a.deployment_id.as_str()) {
-            Some(_) => a.deployment_id.as_str().to_string(),
-            None => "-".to_string(),
+    // A successful entry's DEPLOYMENT ID is its rollback key — the prefix
+    // `deploy push <target> <deployment-id>` accepts. The public grammar is
+    // deployment-keyed (no sN).
+    let mut rolled_back: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for e in entries.iter().filter(|e| {
+        e.terminal
+            .as_ref()
+            .is_some_and(|t| t.status == DeploymentStatus::Successful && t.rollback.is_some())
+    }) {
+        rolled_back.insert(e.deployment_id.as_str());
+    }
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
+        let (status, reason) = effective_status(e);
+        let prefix = if rolled_back.contains(e.deployment_id.as_str()) {
+            e.deployment_id.as_str().to_string()
+        } else {
+            "-".to_string()
         };
         out.push(match reason {
             Some(r) => format!(
                 "{prefix}  {}  {status:?}  {}  ({r})",
-                a.deployment_id, a.attempted_at
+                e.deployment_id, e.intent.attempted_at
             ),
             None => format!(
                 "{prefix}  {}  {status:?}  {}",
-                a.deployment_id, a.attempted_at
+                e.deployment_id, e.intent.attempted_at
             ),
         });
     }
@@ -525,11 +520,11 @@ mod tests {
         DeploymentId, GenerationId, PlacementSlotId, ReleaseId, SCHEMA_VERSION, TargetName,
         TreeDigest, VariantName,
     };
-    use crate::records::{DeploymentSnapshot, ObservedServer};
+    use crate::records::{LedgerIntent, LedgerRollback, LedgerTerminal, ObservedServer};
     use std::collections::BTreeMap;
 
-    fn pending_attempt(id: &str) -> DeploymentAttempt {
-        DeploymentAttempt {
+    fn pending_attempt(id: &str) -> LedgerIntent {
+        LedgerIntent {
             deployment_schema_version: SCHEMA_VERSION,
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new("production".to_string()),
@@ -542,36 +537,49 @@ mod tests {
         }
     }
 
+    /// Seed the ledger with a successful deployment (intent + `Successful`
+    /// terminal carrying a rollback state, so `sN`/log prefixes apply).
+    fn seed_successful(store: &LocalStore, id: &str, attempted_at: &str, release: &str) {
+        let mut it = pending_attempt(id);
+        it.attempted_at = attempted_at.to_string();
+        store.append_intent("production", &it).unwrap();
+        store
+            .append_terminal(
+                "production",
+                &LedgerTerminal {
+                    deployment_id: DeploymentId::new(id.to_string()),
+                    target: TargetName::new("production".to_string()),
+                    status: DeploymentStatus::Successful,
+                    recorded_at: attempted_at.to_string(),
+                    outcomes: BTreeMap::new(),
+                    rollback: Some(LedgerRollback {
+                        behavior_sha256: "sha256-aa".to_string(),
+                        release: ReleaseId::new(release.to_string()),
+                        slots: BTreeMap::new(),
+                        bindings: BTreeMap::new(),
+                    }),
+                    reason: Some("deployed".to_string()),
+                },
+            )
+            .unwrap();
+    }
+
     #[test]
-    fn log_status_overlays_latest_transition() {
+    fn log_status_overlays_terminal_event() {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         let a = pending_attempt("deploy-overlay");
 
-        // No transition recorded yet: the attempt is treated as still pending.
+        // No terminal event yet: an intent-only entry is treated as the
+        // recoverable pending state.
+        store.append_intent("production", &a).unwrap();
+        let entries = store.read_ledger("production").unwrap();
         assert_eq!(
-            effective_status(&store, &a).unwrap(),
+            effective_status(&entries[0]),
             (DeploymentStatus::PendingCommit, None)
         );
 
-        // An initial transition records `InProgress`.
-        store
-            .append_transition(
-                a.deployment_id.as_str(),
-                &DeploymentStatus::InProgress,
-                Some("attempt started"),
-            )
-            .unwrap();
-        assert_eq!(
-            effective_status(&store, &a).unwrap(),
-            (
-                DeploymentStatus::InProgress,
-                Some("attempt started".to_string())
-            )
-        );
-
-        // Reconciliation finalizes with a Successful transition: the log
-        // overlays Successful over the earlier InProgress transition.
+        // A terminal event carries the status + reason.
         store
             .append_transition(
                 a.deployment_id.as_str(),
@@ -579,21 +587,13 @@ mod tests {
                 Some("recovery finalization"),
             )
             .unwrap();
+        let entries = store.read_ledger("production").unwrap();
         assert_eq!(
-            effective_status(&store, &a).unwrap(),
+            effective_status(&entries[0]),
             (
                 DeploymentStatus::Successful,
                 Some("recovery finalization".to_string())
             )
-        );
-
-        // Degraded likewise overlays; the latest transition wins.
-        store
-            .append_transition(a.deployment_id.as_str(), &DeploymentStatus::Degraded, None)
-            .unwrap();
-        assert_eq!(
-            effective_status(&store, &a).unwrap(),
-            (DeploymentStatus::Degraded, None)
         );
     }
 
@@ -607,42 +607,33 @@ mod tests {
     /// and asserts the rendered lines through the helper — lib unit tests
     /// cannot capture the harness-owned stdout sink.
     #[test]
-    fn log_prefixes_lines_with_snapshot_id() {
+    fn log_prefixes_lines_with_rollback_ref() {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
 
-        // Two attempts: the first succeeds (producing snapshot s0); the
-        // second fails in preflight (producing NO snapshot).
-        let mut a_ok = pending_attempt("deploy-log-ok");
-        a_ok.attempted_at = "2026-01-01T00:00:00Z".to_string();
+        // Two deployments: the first succeeds (producing rollback ref s0);
+        // the second fails in preflight (producing NO rollback state).
+        seed_successful(
+            &store,
+            "deploy-log-ok",
+            "2026-01-01T00:00:00Z",
+            "rel-sha256-ok",
+        );
         let mut a_failed = pending_attempt("deploy-log-failed");
         a_failed.attempted_at = "2026-01-02T00:00:00Z".to_string();
-        store.append_attempt("production", &a_ok).unwrap();
-        store.append_attempt("production", &a_failed).unwrap();
+        store.append_intent("production", &a_failed).unwrap();
         store
-            .append_snapshot(
+            .append_terminal(
                 "production",
-                &DeploymentSnapshot {
-                    deployment_id: a_ok.deployment_id.clone(),
+                &LedgerTerminal {
+                    deployment_id: a_failed.deployment_id.clone(),
                     target: TargetName::new("production".to_string()),
-                    behavior_sha256: "sha256-aa".to_string(),
-                    slots: BTreeMap::new(),
-                    bindings: BTreeMap::new(),
+                    status: DeploymentStatus::FailedPreflight,
+                    recorded_at: "2026-01-02T00:00:00Z".to_string(),
+                    outcomes: BTreeMap::new(),
+                    rollback: None,
+                    reason: Some("preflight failed".to_string()),
                 },
-            )
-            .unwrap();
-        store
-            .append_transition(
-                a_ok.deployment_id.as_str(),
-                &DeploymentStatus::Successful,
-                Some("deployed"),
-            )
-            .unwrap();
-        store
-            .append_transition(
-                a_failed.deployment_id.as_str(),
-                &DeploymentStatus::FailedPreflight,
-                Some("preflight failed"),
             )
             .unwrap();
 
@@ -655,7 +646,7 @@ mod tests {
             lines[0],
             "deploy-log-ok  deploy-log-ok  Successful  2026-01-01T00:00:00Z  (deployed)"
         );
-        // An attempt with no snapshot keeps the columns aligned via `-`.
+        // An entry without a rollback state keeps the columns aligned via `-`.
         assert_eq!(
             lines[1],
             "-  deploy-log-failed  FailedPreflight  2026-01-02T00:00:00Z  (preflight failed)"
@@ -998,38 +989,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let store =
             LocalStore::with_base(data_home.join("simple-deploy").join("checkpoint-cli")).unwrap();
 
-        // Seed a small history: deploy-0, deploy-1, deploy-2 (all
-        // successful — each owns a snapshot keyed by its deployment id).
+        // Seed a small history: deploy-0 (s0), deploy-1 (s1), deploy-2 (s2).
         for id in ["deploy-0", "deploy-1", "deploy-2"] {
-            store
-                .append_attempt(
-                    "production",
-                    &crate::records::DeploymentAttempt {
-                        deployment_schema_version: SCHEMA_VERSION,
-                        deployment_id: DeploymentId::new(id.to_string()),
-                        target: TargetName::new("production".to_string()),
-                        slot_ids: vec![],
-                        behavior_sha256: "sha256-aa".to_string(),
-                        attempted_at: "2026-01-01T00:00:00Z".to_string(),
-                        desired: BTreeMap::new(),
-                        pre_push: BTreeMap::new(),
-                        slots: BTreeMap::new(),
-                    },
-                )
-                .unwrap();
+            seed_successful(
+                &store,
+                id,
+                "2026-01-01T00:00:00Z",
+                &format!("rel-sha256-{id}"),
+            );
             std::fs::create_dir_all(store.deployment_dir(id)).unwrap();
-            store
-                .append_snapshot(
-                    "production",
-                    &crate::records::DeploymentSnapshot {
-                        deployment_id: DeploymentId::new(id.to_string()),
-                        target: TargetName::new("production".to_string()),
-                        behavior_sha256: "sha256-aa".to_string(),
-                        slots: BTreeMap::new(),
-                        bindings: BTreeMap::new(),
-                    },
-                )
-                .unwrap();
         }
 
         // Bare checkpoint (no --yes, no --dry-run): refused as irreversible
@@ -1047,7 +1015,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             err.to_string().contains("irreversible"),
             "must explain the confirmation requirement, got: {err}"
         );
-        assert!(store.read_history_floor("production").unwrap().is_none());
+        assert_eq!(store.read_ledger("production").unwrap().len(), 3);
 
         // --dry-run: succeeds, enumerates the discards, writes NOTHING.
         run_with([
@@ -1060,14 +1028,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "--dry-run",
         ])
         .expect("dry-run checkpoint succeeds");
-        assert!(
-            store.read_history_floor("production").unwrap().is_none(),
-            "dry-run must not write the floor marker"
+        assert_eq!(
+            store.read_ledger("production").unwrap().len(),
+            3,
+            "dry-run must not replace the ledger"
         );
-        assert_eq!(store.read_snapshots_raw("production").unwrap().len(), 3);
-        assert_eq!(store.read_attempts_raw("production").unwrap().len(), 3);
 
-        // --yes: establishes the durable floor and compacts.
+        // --yes: atomically replaces the ledger with the retained suffix at
+        // deploy-1 and sweeps the unreachable content.
         run_with([
             "deploy",
             "--config",
@@ -1077,16 +1045,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "deploy-1",
             "--yes",
         ])
-        .expect("the confirmed checkpoint establishes the floor");
-        let floor = store.read_history_floor("production").unwrap().unwrap();
-        assert_eq!(floor.deployment_id.as_str(), "deploy-1");
-        assert_eq!(store.read_snapshots("production").unwrap().len(), 2);
-        assert_eq!(store.read_attempts("production").unwrap().len(), 2);
+        .expect("the confirmed checkpoint establishes the retained suffix");
+        let entries = store.read_ledger("production").unwrap();
+        assert_eq!(entries.len(), 2, "deploy-1 and deploy-2 are retained");
+        assert_eq!(entries[0].deployment_id.as_str(), "deploy-1");
         assert!(!store.deployment_dir("deploy-0").exists());
         assert!(store.deployment_dir("deploy-1").exists());
         assert!(store.deployment_dir("deploy-2").exists());
 
-        // Repeating the same checkpoint: idempotent no-op.
+        // Repeating the same checkpoint: the suffix is identical (the ledger
+        // already IS it) and the sweep finishes.
         run_with([
             "deploy",
             "--config",
@@ -1097,8 +1065,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "--yes",
         ])
         .expect("a repeated checkpoint is idempotent");
-        let floor2 = store.read_history_floor("production").unwrap().unwrap();
-        assert_eq!(floor2, floor);
+        let entries2 = store.read_ledger("production").unwrap();
+        assert_eq!(entries2, entries, "the retained suffix is unchanged");
 
         unsafe { std::env::remove_var("XDG_DATA_HOME") };
         drop(_lock);

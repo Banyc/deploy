@@ -73,8 +73,7 @@ deploy log production              # deployment history (each line prefixed with
 ```
 
 To retain a bounded history, establish a checkpoint once the rollout is
-confirmed — see [Checkpoints (history floors)](#checkpoints-history-floors)
-below.
+confirmed — see [Checkpoints](#checkpoints) below.
 
 To deploy to a real server instead of the local endpoint, either pass flags at
 scaffold time:
@@ -100,7 +99,7 @@ addresses need neither.
 | `deploy push <target> [ref]` | Deploy local files (or restore a ref) to every server in the target, in rollout batches. |
 | `deploy log <target>` | Deployment history — successful *and* failed attempts, each line prefixed with the rollback deployment id it produced (`-` for attempts with no snapshot). The visible history is the retained suffix when a checkpoint has been established. |
 | `deploy status <target>` | What is actually running on each server right now (generation, release, variant, tree). |
-| `deploy checkpoint <target> <deployment-id>` | Establish a monotonic HISTORY FLOOR at a successful deployment, then compact the history and run best-effort local artifact garbage collection (irreversible — requires `--yes`; `--dry-run` previews the discard list). |
+| `deploy checkpoint <target> <deployment-id>` | Atomically retain the target's history suffix at a successful deployment and sweep the unreachable content (irreversible — requires `--yes`; `--dry-run` previews the discard list). |
 
 Global flag: `--config <path>` selects a different `deploy.toml` than
 `./deploy.toml` (usable anywhere on the command line).
@@ -167,22 +166,36 @@ release only via `release:<id>`.
   batches roll back by default (`failure_policy: rollback_changed`). The final
   status is reported explicitly, including partial states like `degraded`.
 
-## Checkpoints (history floors)
+## Checkpoints
 
-A checkpoint models the target's retained history as a monotonic FLOOR, not
-another deployment or snapshot. Once you checkpoint a successful deployment,
-the retained history starts at that attempt, the checkpoint deployment's
-snapshot becomes the OLDEST rollback state, and everything strictly before
-it — older snapshots, older attempts (failed attempts included), and their
-`deployments/<id>/` directories — is discarded. The checkpoint deployment
-and everything after it is kept.
+A checkpoint (`deploy checkpoint <target> <deployment-id>`) retains the
+target's history suffix at a SUCCESSFUL deployment and sweeps the
+unreachable rest:
+
+1. **Calculate the retained suffix** — everything at/after the checkpoint
+   deployment's position in the target's ONE history ledger
+   (`targets/<target>/ledger.jsonl`). The floor is implicit: the ledger's
+   first entry is the oldest retained rollback state.
+2. **Atomically replace the ledger** with that suffix (temp + fsync + rename
+   + directory fsync). This is the checkpoint's ONLY logical commit — a
+   reader sees a wholly old or wholly new ledger, never a torn one; if the
+   replacement fails, nothing is deleted.
+3. **Best-effort global sweep** of the unreachable deployment directories,
+   release records, and tree objects — keeping everything reachable from
+   another target's ledger, the current/incomplete state, or a pin. A failed
+   sweep is retried by recomputing reachability (re-run the same checkpoint);
+   sweeps are best-effort, not secure erasure.
+
+The old floor-marker / transactional-backup / cleanup-debt machinery is
+gone. The CLI requires `--yes` for the real operation; `--dry-run` previews
+exactly what would be discarded and touches nothing.
 
 ```sh
 deploy checkpoint production deploy-20260821T102000Z --dry-run   # preview the discard list; touches nothing
 # would discard 3 snapshots: deploy-... (the deployments before the checkpoint)
 # would discard 4 attempts: deploy-...
 # would delete 4 deployment directories: ...
-deploy checkpoint production deploy-20260821T102000Z --yes       # establish the floor (IRREVERSIBLE)
+deploy checkpoint production deploy-20260821T102000Z --yes       # retain the suffix + sweep (IRREVERSIBLE)
 deploy log production       # now shows only the retained suffix
 deploy push production deploy-20260821T102000Z   # the checkpoint deployment stays the oldest rollback
 ```
@@ -190,68 +203,51 @@ deploy push production deploy-20260821T102000Z   # the checkpoint deployment sta
 - The deployment id is an explicit, REQUIRED argument (the operation is
   irreversible) and `--yes` is required for the real operation; without
   `--yes` and without `--dry-run` the command is refused up front.
-- The deployment must be a SUCCESSFUL deployment of the target (it must have
-  produced a snapshot); otherwise the checkpoint fails with
-  `checkpoint requires a successful deployment`.
-- A checkpoint does NOT deploy anything, does NOT contact remote servers, and
-  does NOT create another snapshot. The checkpoint deployment's existing
-  snapshot remains the actual rollback state.
-- The floor is stored as a small marker at
-  `targets/<target>/refs/history-floor.json` (not another state snapshot),
-  written durably BEFORE the physical compaction rewrites the logs and
-  deletes the below-floor deployment directories. Because every read path is
-  gated by the marker, an interrupted cleanup can never expose history below
-  the durable floor.
-- Repeating the same checkpoint is idempotent (a no-op); advancing it to a
-  LATER deployment updates the floor; a checkpoint can NEVER move backward —
-  an earlier deployment than the current floor is refused.
-- Advancing the floor is TRANSACTIONAL: the current floor is moved aside to
-  a durable, transaction-tagged backup
-  (`targets/<target>/refs/history-floor.json.prev.<target-id>`), and any
-  failure before the replacement's commit point restores the previous floor
-  (rename back + parent fsync) — a failed advance can never erase the
-  previously durable floor. If the restore itself ALSO fails (a torn
-  advance: the marker absent, the validated backup still holding the
-  previous floor), every read returns the backup's floor — never "no
-  floor" — and the NEXT checkpoint repairs the torn state AUTOMATICALLY by
-  restoring the validated backup (rename + parent fsync): recovery
-  restores, never deletes, the only valid floor.
-- The checkpoint ALSO runs LOCAL HISTORY COMPACTION + ARTIFACT GARBAGE
-  COLLECTION as its post-commit best-effort maintenance, reported as four
-  distinguishable outcomes: (a) the logical checkpoint is established
-  (the durable floor); (b) the history files are compacted (the below-floor
-  `deployments/<id>/` directories deleted and `attempts.jsonl` /
-  `snapshots.jsonl` rewritten to the retained suffix); (c) artifact garbage
-  collection completed — a GLOBAL, reachability-based pass that unlinks the
-  release records (`releases/<release-id>/`) and tree objects
-  (`objects/sha256/<digest>/`) no longer reachable from any target's
-  retained history, any retained deployment record (unfinished operations
-  included), any target's current observed artifact, or any configured pin;
-  (d) cleanup incomplete and retry required — a post-commit maintenance
-  failure never moves or removes the established floor and never deletes
-  anything in the retained set, the report says so explicitly, and
-  re-running the same checkpoint converges. Reachability is recomputed from
-  the whole store on every run: there is no persisted deletion worklist.
-- PINS (`<store>/pins.json`) retain ARTIFACT CONTENT ONLY. A pin — by
-  release id (marks every variant/tree in that release record) or by exact
-  binding `(release, variant, tree)` — protects the release record and tree
-  object from the garbage collector, but it NEVER keeps an old deployment,
-  attempt, or snapshot in history: the floor-gated reads stay keyed on the
-  history floor, so a pinned pre-floor artifact's bytes survive while its
-  history stays discarded. These store-level pins are the checkpoint GC's
-  anchors, distinct from the rotation subsystem's project-file `[[pins]]`
-  (which protect the remote rotation retained set; the checkpoint flow is
-  store-only and never loads `deploy.toml`).
+- The deployment must be a SUCCESSFUL deployment of the target (its ledger
+  entry carries a `Successful` terminal event with a rollback state);
+  otherwise the checkpoint fails with `checkpoint requires a successful
+  deployment`.
+- A checkpoint does NOT deploy anything and does NOT contact remote servers.
+  The checkpoint deployment's existing rollback state remains the OLDEST
+  retained rollback payload.
+- The checkpoint's ONLY logical commit is the ATOMIC REPLACEMENT of the
+  target's ONE ledger with the retained suffix at the checkpoint deployment
+  (temp + fsync + chmod-private + rename + parent-directory fsync). The floor
+  is IMPLICIT — the ledger's first entry is the oldest retained rollback
+  state; there is NO separate floor marker, NO backup, and no cleanup debt
+  flag. A reader never observes a torn ledger (wholly old or wholly new); if
+  the replacement fails, NO deletion happens and the full history stands.
+- Repeating the same checkpoint is idempotent (the ledger already IS the
+  retained suffix — the replacement rewrites it identically) and finishes an
+  interrupted sweep by recomputing reachability. A checkpoint can NEVER move
+  backward — a deployment discarded by an earlier checkpoint is simply gone
+  and cannot be re-established.
+- After the commit, the checkpoint runs a BEST-EFFORT GLOBAL SWEEP of the
+  unreachable `deployments/<id>/` directories, release records
+  (`releases/<release-id>/`), and tree objects
+  (`objects/sha256/<digest>/`): reachability is recomputed from the WHOLE
+  store on every run — every target's ledger (the retained suffix after a
+  checkpoint), every pending / terminal-less ledger entry, every target's
+  observed state, and every pin. A failed sweep NEVER deletes anything in
+  the retained set — the report says "sweep retry-required" and re-running
+  the same checkpoint converges (no persisted deletion worklist, no debt
+  flag, no backup).
+- PINS retain ARTIFACT CONTENT ONLY. A pin — by a release id (marks every
+  variant/tree in that release record) or by exact binding
+  `(release, variant, tree)` — protects the release record and tree object
+  from the sweep, but it NEVER keeps an old deployment in history: the
+  retained history is the ledger suffix alone, so a pinned pre-retention
+  artifact's bytes survive while its history stays discarded. Both the
+  store-level pins (`<store>/pins.json`) and the project-file `[[pins]]`
+  entries are retention anchors.
 - "Disk cleanup" means unlinking unreachable files/directories and syncing
   the affected directories so filesystem space can be reclaimed — NOT secure
   physical erasure: SSD firmware, copy-on-write filesystems, snapshots,
-  journals, and backups may retain old blocks. The checkpoint never contacts
+  journals, and backups may retain old blocks. The sweep never contacts
   servers; remote artifact cleanup remains rotation's responsibility.
 - Checkpointing one target never changes another target's history: the
-  floor, compaction, and cleanup are per-target for history and global only
-  for the shared artifact store (where another target's references protect
-  shared content).
-
+  retention is per-target for history and global only for the shared artifact
+  store (where another target's ledger references protect shared content).
 ## Project structure (forced)
 
 ```text

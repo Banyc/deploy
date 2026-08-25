@@ -38,8 +38,8 @@ use uuid::Uuid;
 /// versioned record family that uses it: the user-facing `deploy.toml`
 /// configuration (`Config.schema_version`, validated in
 /// [`crate::config::Config::validate`]) AND the deployment records
-/// (`DeploymentAttempt.deployment_schema_version`, validated on every read
-/// in [`crate::store::local::LocalStore::read_attempts`]). Every writer
+/// (`LedgerIntent.deployment_schema_version`, validated on every read
+/// in [`crate::store::local::LocalStore::read_ledger`]). Every writer
 /// emits exactly `SCHEMA_VERSION`; every reader refuses any other version
 /// (fail closed — a mismatched record is never silently interpreted).
 ///
@@ -74,28 +74,13 @@ pub const RELEASE_RECORD_SCHEMA_VERSION: u32 = 1;
 /// version (fail closed).
 pub const TREE_SCHEMA_VERSION: u32 = 1;
 
-/// The `cleanup-pending.json` marker format version
-/// (`CleanupPending.schema_version`). The marker is a DURABLE FLAG ONLY — it
-/// records that a checkpoint's post-commit cleanup is outstanding, never a
-/// worklist (the deletion worklist lives in the raw logs, which the
-/// delete-before-rewrite compaction order keeps intact until deletion
-/// completes). Version 2 is the flag-only shape: the marker carries
-/// `target` / `deployment_id` / `snapshot_index` / `established_at` for
-/// integrity binding only. Version 1 was the pre-change shape that also
-/// carried `pending_deployments: Vec<String>`; a v1 marker is REFUSED
-/// (fail closed) rather than silently reinterpreted — the retry treats the
-/// failed read as debt outstanding and re-runs the compaction from the
-/// intact logs, which converges and clears the stale marker.
-pub const CLEANUP_PENDING_SCHEMA_VERSION: u32 = 2;
-
 /// The `pins.json` record format version (`Pins.schema_version`). Pins are
 /// durable, store-global retention anchors for artifact CONTENT ONLY (see
-/// [`crate::records::Pins`]): a pin never retains or reinserts an old
+/// `crate::records::Pins`): a pin never retains or reinserts an old
 /// deployment, attempt, or snapshot in history. Readers refuse any other
 /// version (fail closed — a pins file from a different schema is never
 /// silently interpreted).
 pub const PINS_SCHEMA_VERSION: u32 = 1;
-
 fn new_uuid_v7() -> String {
     Uuid::now_v7().to_string()
 }

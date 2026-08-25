@@ -134,7 +134,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         !proj.join(".deploy-remote/current").exists(),
         "dry-run leaves the endpoint untouched"
     );
-    assert_eq!(store.read_attempts("production")?.len(), 0);
+    assert_eq!(store.read_ledger("production")?.len(), 0);
 
     // 5. Real push: successful deployment end-to-end.
     let r = push(
@@ -182,8 +182,8 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
 
     // 7. History, snapshot log, and observed state back `deploy log` /
     // `deploy status`.
-    let attempts = store.read_attempts("production")?;
-    assert_eq!(attempts.len(), 1, "one attempt in `deploy log production`");
+    let attempts = store.read_ledger("production")?;
+    assert_eq!(attempts.len(), 1, "one entry in `deploy log production`");
     assert_eq!(
         attempts[0].deployment_id, attempt.deployment_id,
         "attempt is durable"
@@ -195,7 +195,17 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         Some(DeploymentStatus::Successful),
         "latest transition must be Successful"
     );
-    let snapshots = store.read_snapshots("production")?;
+    // The successful entries (the old snapshot log) are the ledger entries
+    // whose terminal is Successful with a rollback payload.
+    let snapshots: Vec<_> = store
+        .read_ledger("production")?
+        .into_iter()
+        .filter(|e| {
+            e.terminal
+                .as_ref()
+                .is_some_and(|t| t.status == DeploymentStatus::Successful && t.rollback.is_some())
+        })
+        .collect();
     assert_eq!(
         snapshots.len(),
         1,
@@ -246,7 +256,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         },
     )?;
     assert_eq!(r2.message, "Everything up to date");
-    assert_eq!(store.read_attempts("production")?.len(), 1);
+    assert_eq!(store.read_ledger("production")?.len(), 1);
 
     // 8. Fail closed: a second `deploy init` refuses to clobber.
     let err = cli::run_with(["deploy", "init", proj.to_str().unwrap()]).unwrap_err();

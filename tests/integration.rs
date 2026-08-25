@@ -5,10 +5,34 @@ use deploy::config::Config;
 use deploy::error::Result;
 use deploy::model::{PlacementSlotId, ServerId, TreeDigest};
 use deploy::push::engine::{PushOptions, push};
-use deploy::records::{DeploymentStatus, PhysicalBinding};
+use deploy::records::{DeploymentStatus, LedgerEntry, LedgerRollback, PhysicalBinding};
 use deploy::remote::transport::{FsBytes, LocalTransport, Remote};
 use deploy::store::local::LocalStore;
 use std::path::Path;
+
+/// The successful ledger entries of `target` (the old snapshot log): each
+/// entry's position in this slice is its `sN` (the ledger's append order IS
+/// the history order).
+fn successful_entries(store: &LocalStore, target: &str) -> Result<Vec<LedgerEntry>> {
+    Ok(store
+        .read_ledger(target)?
+        .into_iter()
+        .filter(|e| {
+            e.terminal
+                .as_ref()
+                .is_some_and(|t| t.status == DeploymentStatus::Successful && t.rollback.is_some())
+        })
+        .collect())
+}
+
+/// The rollback payload of a successful entry (the old snapshot fields:
+/// `slots`, `bindings`, `behavior_sha256`, `release`).
+fn rollback_of(e: &LedgerEntry) -> &LedgerRollback {
+    e.terminal
+        .as_ref()
+        .and_then(|t| t.rollback.as_ref())
+        .expect("a successful entry carries a rollback state")
+}
 
 /// Shared per-variant policy body. Its mappings use only `{{ variant }}` — the
 /// only variable the template module exposes at materialization (trees are
@@ -121,8 +145,7 @@ deploy_dir = "/srv/deploy/example"
 /// deployment-keyed rollback ref (rollback payloads are keyed by deployment
 /// id; the old `sN` index is gone).
 fn latest_deployment_id(store: &deploy::store::local::LocalStore, target: &str) -> String {
-    store
-        .read_snapshots(target)
+    successful_entries(store, target)
         .expect("snapshots readable")
         .last()
         .expect("a deployment has been pushed to the target")
@@ -298,13 +321,13 @@ fn end_to_end_push_rollback() -> Result<()> {
     );
 
     // History should contain all three attempts.
-    let attempts = store.read_attempts("production")?;
+    let attempts = store.read_ledger("production")?;
     assert_eq!(attempts.len(), 3, "three deployment attempts recorded");
 
     // Snapshot log should contain the two successful deployments (s0,
     // s1); the rollback is also successful and appended, but only successful
     // ones count.
-    let snapshots = store.read_snapshots("production")?;
+    let snapshots = successful_entries(&store, "production")?;
     assert_eq!(snapshots.len(), 3, "three successful snapshots");
 
     Ok(())
@@ -344,7 +367,7 @@ fn snapshot_records_each_slots_physical_binding() -> Result<()> {
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
 
-    let snapshots = store.read_snapshots("production")?;
+    let snapshots = successful_entries(&store, "production")?;
     assert_eq!(snapshots.len(), 1);
     // p1 -> (server-01, /srv/deploy/example), p2 -> (server-02,
     // /srv/deploy/example), p3 -> (server-03, /srv/deploy/example) per the
@@ -354,18 +377,24 @@ fn snapshot_records_each_slots_physical_binding() -> Result<()> {
         deploy_dir: "/srv/deploy/example".to_string(),
     };
     assert_eq!(
-        snapshots[0].bindings.get(&PlacementSlotId::new("p1")),
+        rollback_of(&snapshots[0])
+            .bindings
+            .get(&PlacementSlotId::new("p1")),
         Some(&binding("server-01"))
     );
     assert_eq!(
-        snapshots[0].bindings.get(&PlacementSlotId::new("p2")),
+        rollback_of(&snapshots[0])
+            .bindings
+            .get(&PlacementSlotId::new("p2")),
         Some(&binding("server-02"))
     );
     assert_eq!(
-        snapshots[0].bindings.get(&PlacementSlotId::new("p3")),
+        rollback_of(&snapshots[0])
+            .bindings
+            .get(&PlacementSlotId::new("p3")),
         Some(&binding("server-03"))
     );
-    assert_eq!(snapshots[0].bindings.len(), 3);
+    assert_eq!(rollback_of(&snapshots[0]).bindings.len(), 3);
 
     Ok(())
 }
@@ -443,12 +472,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
-    let snapshots = store.read_snapshots("production")?;
+    let snapshots = successful_entries(&store, "production")?;
     assert_eq!(snapshots.len(), 1);
     // The rollback ref is the deployment id (the snapshot's key).
     let dep0 = latest_deployment_id(&store, "production");
     assert_eq!(
-        snapshots[0].bindings.get(&PlacementSlotId::new("p1")),
+        rollback_of(&snapshots[0])
+            .bindings
+            .get(&PlacementSlotId::new("p1")),
         Some(&PhysicalBinding {
             server: ServerId::new("server-01"),
             deploy_dir: "/srv/deploy/rebind".to_string(),
@@ -609,10 +640,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
-    let snapshots = store.read_snapshots("production")?;
+    let snapshots = successful_entries(&store, "production")?;
     assert_eq!(snapshots.len(), 1);
     assert_eq!(
-        snapshots[0].bindings.get(&PlacementSlotId::new("p1")),
+        rollback_of(&snapshots[0])
+            .bindings
+            .get(&PlacementSlotId::new("p1")),
         Some(&PhysicalBinding {
             server: ServerId::new("server-01"),
             deploy_dir: "/srv/move/movedir-a".to_string(),
@@ -2077,7 +2110,7 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
 
     // Fingerprint every server remote before the rollback attempt.
     let before = remote_fingerprint(&remotes_base);
-    let attempts_before = store.read_attempts("production")?.len();
+    let attempts_before = store.read_ledger("production")?.len();
 
     // Roll back to the first deployment (keyed by its deployment id) under a
     // DIFFERENT current configuration (behavior B). The push must fail
@@ -2119,7 +2152,7 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
     );
     // And no deployment attempt was recorded.
     assert_eq!(
-        store.read_attempts("production")?.len(),
+        store.read_ledger("production")?.len(),
         attempts_before,
         "preflight failure must not record an attempt"
     );
@@ -2233,7 +2266,19 @@ interval_seconds = 0
     )?;
 
     let attempt = r.attempt.expect("attempt must be recorded even on failure");
-    let results = store.read_results(attempt.deployment_id.as_str())?;
+    // The per-slot outcomes live in the deployment's TERMINAL EVENT in the
+    // ledger (the old `deployments/<id>/results.json` is gone).
+    let entry = store
+        .read_ledger("production")?
+        .into_iter()
+        .find(|e| e.deployment_id == attempt.deployment_id)
+        .expect("the deployment's ledger entry exists");
+    let results = entry
+        .terminal
+        .as_ref()
+        .expect("the deployment has a terminal event")
+        .outcomes
+        .clone();
     // All three slots appear in the attempt.
     assert_eq!(attempt.slot_ids.len(), 3);
     for sid in ["p1", "p2", "p3"] {
@@ -2244,15 +2289,15 @@ interval_seconds = 0
     }
     // First slot failed; later slots were never started (Skipped).
     assert_eq!(
-        results.slots[&PlacementSlotId::new("p1")].outcome,
+        results[&PlacementSlotId::new("p1")].outcome,
         ServerOutcomeKind::Failed
     );
     assert_eq!(
-        results.slots[&PlacementSlotId::new("p2")].outcome,
+        results[&PlacementSlotId::new("p2")].outcome,
         ServerOutcomeKind::Skipped
     );
     assert_eq!(
-        results.slots[&PlacementSlotId::new("p3")].outcome,
+        results[&PlacementSlotId::new("p3")].outcome,
         ServerOutcomeKind::Skipped
     );
     // Later servers were left untouched (no `current` pointer was ever created).
@@ -2318,7 +2363,7 @@ fn post_lock_failure_releases_lock_and_records() -> Result<()> {
     );
 
     // The attempt was still recorded (the error did not bypass it).
-    let attempts = store.read_attempts("production")?;
+    let attempts = store.read_ledger("production")?;
     assert_eq!(attempts.len(), 1, "attempt must be recorded");
     assert!(
         matches!(
@@ -2739,7 +2784,7 @@ fn committed_txn_write_failure_pends_commit() -> Result<()> {
     );
 
     // The attempt is still recorded (the error did not bypass it).
-    let attempts = store.read_attempts("production")?;
+    let attempts = store.read_ledger("production")?;
     assert_eq!(attempts.len(), 1, "attempt must be recorded");
 
     // Remote mutation lock released despite the bookkeeping failure.
@@ -2794,7 +2839,7 @@ fn commit_marker_write_failure_pends_commit() -> Result<()> {
         r.status
     );
 
-    let attempts = store.read_attempts("production")?;
+    let attempts = store.read_ledger("production")?;
     assert_eq!(attempts.len(), 1, "attempt must be recorded");
     assert!(
         !remotes_base.join("server-01/state/operation.lock").exists(),
@@ -2856,7 +2901,7 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
         "marker must be absent after the failed commit-marker push"
     );
     assert!(
-        store.read_snapshots("production")?.is_empty(),
+        successful_entries(&store, "production")?.is_empty(),
         "no snapshot for a pending attempt"
     );
     assert!(
@@ -2915,14 +2960,14 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
         Some(DeploymentStatus::Successful),
         "latest transition must be finalized"
     );
-    let snapshots = store.read_snapshots("production")?;
+    let snapshots = successful_entries(&store, "production")?;
     assert_eq!(snapshots.len(), 1, "exactly one successful snapshot");
     assert_eq!(snapshots[0].deployment_id, attempt1.deployment_id);
     assert_eq!(
         store.read_last_successful("production").as_deref(),
         Some(attempt1.deployment_id.as_str())
     );
-    let attempts = store.read_attempts("production")?;
+    let attempts = store.read_ledger("production")?;
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].deployment_id, attempt1.deployment_id);
 
@@ -2946,7 +2991,7 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
     )?;
     assert_eq!(r3.status, None);
     assert_eq!(r3.message, "Everything up to date");
-    let snapshots = store.read_snapshots("production")?;
+    let snapshots = successful_entries(&store, "production")?;
     assert_eq!(
         snapshots.len(),
         1,
@@ -2968,7 +3013,7 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
         Some(DeploymentStatus::Successful),
         "latest transition must remain Successful after the redundant push"
     );
-    let attempts = store.read_attempts("production")?;
+    let attempts = store.read_ledger("production")?;
     assert_eq!(attempts.len(), 1, "no new attempt on a redundant push");
     Ok(())
 }
@@ -3064,7 +3109,7 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
         !marker.exists(),
         "no markers may be written for a degraded attempt"
     );
-    let snapshots = store.read_snapshots("production")?;
+    let snapshots = successful_entries(&store, "production")?;
     assert_eq!(
         snapshots.len(),
         1,
@@ -3136,7 +3181,7 @@ fn conflicting_marker_on_main_push_is_degraded_not_pending() -> Result<()> {
         "latest transition must be Degraded"
     );
     assert_eq!(
-        store.read_snapshots("production")?.len(),
+        successful_entries(&store, "production")?.len(),
         0,
         "no snapshot for a conflicted attempt"
     );
@@ -3197,7 +3242,7 @@ fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result
         .join("server-01/state/commits")
         .join(format!("{}.json", attempt1.deployment_id.as_str()));
     assert!(!marker.exists(), "marker must be absent after push 1");
-    assert_eq!(store.read_snapshots("production")?.len(), 0);
+    assert_eq!(successful_entries(&store, "production")?.len(), 0);
 
     // Before push 2, install a CONFLICTING marker for attempt 1's deployment
     // id: a concurrent controller recorded a different fact (foreign
@@ -3246,7 +3291,7 @@ fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result
         "the conflicting marker must be left untouched"
     );
     assert_eq!(
-        store.read_snapshots("production")?.len(),
+        successful_entries(&store, "production")?.len(),
         0,
         "a degraded attempt never enters the snapshot log"
     );
@@ -3282,7 +3327,7 @@ fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result
         "the conflicting marker stays untouched"
     );
     assert_eq!(
-        store.read_snapshots("production")?.len(),
+        successful_entries(&store, "production")?.len(),
         0,
         "snapshot log never grows for a conflicted attempt"
     );
@@ -4317,8 +4362,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     // Per-target records are separate: each target has its own attempt and
     // its own observed state.
-    assert_eq!(store.read_attempts("production")?.len(), 1);
-    assert_eq!(store.read_attempts("staging")?.len(), 1);
+    assert_eq!(store.read_ledger("production")?.len(), 1);
+    assert_eq!(store.read_ledger("staging")?.len(), 1);
 
     // The shared slot's observed value CHANGES when the OTHER target pushes
     // (stale -> fresh): production's observed is refreshed to staging's actual
@@ -4470,7 +4515,7 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
         );
     }
     assert!(
-        store.read_attempts("production")?.is_empty(),
+        store.read_ledger("production")?.is_empty(),
         "no attempt may be recorded by a refused reference"
     );
 

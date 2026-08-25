@@ -348,11 +348,9 @@ The local store contains the exact immutable trees sent to servers, immutable re
       release.json
   targets/
     production/
-      attempts.jsonl
-      refs/
-        last-successful
-        snapshots.jsonl
-        history-floor.json   # optional checkpoint marker (monotonic history floor)
+      observed.json
+      rotation-debt.json
+      ledger.jsonl              # ONE ordered history ledger (see below)
   slots/
     app-1/
       observed.json        # the slot's ONE physical observed state (targets are selection views)
@@ -363,130 +361,73 @@ The local store contains the exact immutable trees sent to servers, immutable re
   deployments/
     <deployment-id>/
       plan.json
-      results.json
-      transitions.jsonl
   pins.json                  # optional store-global artifact retention pins
 ```
 
-The records model splits deployment identity from mutable status:
-`attempts.jsonl` records the immutable attempt (intent + assignments, no
-status); each deployment's status is an append-only transition stream
-(`deployments/<id>/transitions.jsonl`) whose LATEST entry is the deployment's
-current status; and successful deployments additionally produce a rollback
-snapshot (`refs/snapshots.jsonl` + `refs/last-successful`) KEYED BY THEIR
-DEPLOYMENT ID — `deploy push <target> <deployment-id>` restores exactly that
-deployment's stored state, and the `@` / `parent(...)` relative forms walk
-the target's DEPLOYMENT HISTORY (the snapshot log IS the deployment history;
-each successful deployment is a rollback payload keyed by its id). The
-SEPARATE SNAPSHOT INDEX (`sN`) HAS BEEN REMOVED from the public surface:
-any internal position the floor/compaction needs is DERIVED from the LOG
-ORDER (the op log is appended in deployment order), never stored as a public
-index. The rollback history is the append-only OP LOG — the term is "op
-log", never "reflog".
+### ONE history ledger per target
 
-### History floor (checkpoints)
+A target's ENTIRE deployment history lives in ONE ordered, append-only JSONL
+file: `targets/<target>/ledger.jsonl`. Each line is either the DURABLE
+INTENT of a deployment (a `{"kind":"intent", ...}` record: deployment_id,
+target, membership, behavior digest, `desired` / `pre_push` per-slot maps —
+appended BEFORE any remote mutation, the append-attempt contract) or its
+TERMINAL EVENT (a `{"kind":"terminal", ...}` record: the status, the
+per-slot outcomes, and — when the deployment was SUCCESSFUL — the ROLLBACK
+STATE: the snapshot payload of per-slot generation refs, the behavior
+digest, the physical bindings (`{server, deploy_dir}`), and the release the
+generations came from). A merged entry (intent + optional terminal) is the
+deployment's full record, keyed by its deployment_id; the ledger's append
+order IS the history order, and a successful entry's position in the
+successful chain is its `sN`. An entry WITHOUT a terminal event is the
+CURRENT/INCOMPLETE state — the recoverable pending (in-flight) deployment
+that the next push reconciles.
 
-A checkpoint (`deploy checkpoint <target> <deployment-id>`) models the
-target's retained history as a monotonic floor — a small DURABLE MARKER at
-`targets/<target>/refs/history-floor.json`, deliberately NOT another
-snapshot or deployment, and KEYED BY THE CHECKPOINT DEPLOYMENT ID:
+The old multi-file model — `attempts.jsonl` intents + the
+`refs/snapshots.jsonl` op log with explicit indices +
+`refs/last-successful` + per-deployment `results.json` / `transitions.jsonl`
++ the `history-floor.json` marker + the `cleanup-pending.json` debt flag —
+is GONE: the ledger replaces all of it. `deploy log` renders the ledger;
+`deploy push <target> <deployment-id>` resolves the ledger entry; `@-`,
+`parent(...)` walk the ledger's successful entries.
 
-```json
-{
-  "schema_version": 1,
-  "target": "production",
-  "deployment_id": "deploy-20260821T102000Z",
-  "established_at": "2026-08-25T14:00:00Z"
-}
-```
+### Checkpoints (retained-suffix replacement + global sweep)
 
-The deployment referenced by `deployment_id` must be a SUCCESSFUL deployment
-for that target (it must have produced a snapshot keyed by its id); that
-deployment's stored rollback payload becomes the OLDEST ROLLBACK STATE. The
-retained history is exactly the suffix beginning at the checkpoint
-deployment's POSITION in the log (positions are DERIVED from the log order,
-never stored): older snapshots, older attempts (failed attempts included),
-and their `deployments/<id>/` directories strictly before the floor are
-discarded; the checkpoint deployment and everything after it is kept. A
-checkpoint does not deploy anything, does not contact remote servers, and
-does not create another snapshot. MIGRATION: `deploy push <target> sN` (the
-old snapshot-index reference) is gone — use the deployment id of that
-snapshot's deployment (`deploy log <target>` shows it), or `@-` /
-`parent(@, N)` to walk the deployment history.
+A checkpoint (`deploy checkpoint <target> <deployment-id>`) retains the
+target's history suffix at the checkpoint deployment and sweeps the
+unreachable rest. It is exactly three steps:
 
-Durability ordering: the floor marker is written FIRST (atomic temp+rename +
-directory fsync — durable before anything is deleted), then the physical
-compaction rewrites `attempts.jsonl` and `snapshots.jsonl` to the suffix
-(atomic temp+rename per file) and deletes the below-floor deployment
-directories. Because EVERY read path — `read_attempts`, `read_snapshots`,
-and ref resolution (`<deployment-id>`, `parent(...)`, `@-`) — is gated by the
-marker, an interrupted cleanup leaves either the old physical files or the
-compacted files, so either way nothing below the durable floor is ever
-visible. The checkpoint deployment itself stays resolvable; stepping below
-it (a deployment id below the floor, or `@-` / `parent(...)` walking past
-it) fails closed with a history-floor ref error. Repeated checkpointing of
-the same deployment is idempotent (a no-op, or a repair that finishes an
-interrupted compaction); advancing to a later deployment updates the floor
-TRANSACTIONALLY (below); an EARLIER deployment than the current floor is
-refused (a checkpoint can never move backward after older history has been
-discarded). The CLI requires an explicit deployment id and `--yes` for the
+1. CALCULATE THE RETAINED SUFFIX — everything at/after the checkpoint
+   deployment's position in the ledger. The floor is IMPLICIT: the ledger's
+   first entry is the oldest retained rollback state; there is NO separate
+   floor marker. The checkpoint deployment must be a SUCCESSFUL deployment
+   of the target (its entry carries a rollback state).
+2. ATOMICALLY REPLACE the ledger with that suffix — temp + fsync +
+   chmod-private + rename + parent-directory fsync. THIS is the checkpoint's
+   ONLY LOGICAL COMMIT: a reader never observes a torn ledger (wholly old
+   or wholly new). IF THE REPLACEMENT FAILS, NO DELETION HAPPENS — the
+   checkpoint is a plain error and the full history stands untouched.
+3. BEST-EFFORT GLOBAL SWEEP of the unreachable deployment directories
+   (`deployments/<id>/`), release records (`releases/<release-id>/`), and
+   tree objects (`objects/sha256/<digest>/`). The reachability scan is
+   recomputed FRESH on every retry and keeps everything reachable from
+   ANOTHER target's ledger, the current/incomplete state (observed
+   artifacts, pending intent-only entries, in-flight deployment dirs), or a
+   PIN (a release pin marks every variant/tree of its release). A failed
+   sweep is retried by RECOMPUTING reachability — no persisted deletion
+   worklist, no cleanup-pending debt flag, no backup. Sweeps are
+   best-effort and are NOT secure erasure.
+
+Because the atomic replacement is the only logical commit, a failed
+checkpoint leaves EXACTLY the pre-call state; a failed sweep leaves the
+ledger compacted (the commit stands) with the sweep retry-required, and the
+next same-deployment checkpoint recomputes the same suffix (the ledger
+already IS it) and re-runs the sweep to convergence. The report carries at
+most: the logical commit status + sweep completed / retry-required. The
+old floor-marker/backup/restore/torn-advance machinery and the
+cleanup-pending debt flag with its three report flags are UNNECESSARY and
+were REMOVED. The CLI requires an explicit deployment id and `--yes` for the
 real operation; `--dry-run` enumerates exactly what would be discarded and
-touches nothing. The checkpoint's post-commit maintenance then runs in two
-best-effort passes — LOCAL HISTORY COMPACTION (delete the below-floor
-`deployments/<id>/` dirs, atomically rewrite the logs to the retained
-suffix) followed by GLOBAL ARTIFACT GARBAGE COLLECTION (see below) — and
-the report distinguishes four outcomes: (a) the LOGICAL CHECKPOINT is
-established (the durable floor); (b) the HISTORY FILES are compacted;
-(c) ARTIFACT GARBAGE COLLECTION completed; (d) CLEANUP INCOMPLETE and
-retry required. A failure in either post-commit phase NEVER changes the
-established floor and NEVER deletes anything in the retained set: it
-records the durable `targets/<target>/refs/cleanup-pending.json` debt flag
-and the report warns explicitly, and re-running the SAME checkpoint
-converges. Reachability is recomputed fresh on every run — no persisted
-deletion worklist. Only `deployments/<id>/` dirs strictly before the floor
-are ever deleted: release records, tree objects, remote generations, and
-pinned artifacts are never removed, and checkpointing one target never
-changes another target's history. The raw (unfiltered) readers are the
-internal position-deriving view: the log is KEYED BY DEPLOYMENT ID and
-appended in deployment order, so compaction rewrites it to the suffix
-beginning at the floor deployment and a new deployment always appends a
-NEW line — the identity space can never be reused.
-
-Advancing the floor is TRANSACTIONAL — replacing the marker must never
-erase the previously durable floor. `write_history_floor` stages B's marker
-(private temp + fsync), moves the current floor A aside to a durable,
-TRANSACTION-TAGGED backup (`history-floor.json.prev.<B-id>` — tagged by the
-advance target, so a stale backup from another transaction is a different
-file; renamed + parent-dir fsynced BEFORE B can overwrite the marker name),
-renames B into place, and fsyncs the parent directory — B's durability
-commit point. A failure at ANY stage before that
-commit point RESTORES the previous floor A from the backup (rename back +
-parent fsync — the restore is tag- and content-verified, so a stale backup
-from another transaction can never roll the floor backward): a failed
-advancement leaves the pre-advance state — floor A durable, the same
-visible suffix, no compaction side effects — so advancing a checkpoint can
-never erase the previously durable floor. If the restore of A itself ALSO
-fails, the marker may be left absent while the tagged backup still holds A
-— a TORN ADVANCE. The readers NEVER treat this as "no floor" (which would
-expose the below-floor prefix): they VALIDATE the durable backup against the
-SAME integrity binding as the marker (schema version, target binding, exact
-snapshot pair, matching attempt) and, when valid, treat it as the ACTIVE
-floor — reads return A (never None, never an error); they fail closed only
-when the backup itself fails validation. RECOVERY RESTORES — NEVER DELETES
-— the validated backup (rename the tagged backup back over the marker name
-+ parent fsync): the backup is the ONLY valid floor in a torn state, and
-deleting it would erase the floor and re-expose the below-floor history. The
-next CHECKPOINT repairs the torn state AUTOMATICALLY: it restores the
-validated backup (rename + parent fsync) before proceeding, so the target
-self-heals through the production path — a re-checkpoint of the original
-floor A restores the marker and finishes; an advance to a later floor B
-restores the marker and advances normally. The advance's pre-start
-reconciliation composes with that: it removes leftover backups ONLY when
-the floor marker exists — a marker absent alongside a validated backup is
-the torn state (the backup is the ONLY valid floor) and is restored, never
-deleted. After B commits, the backup is removed best-effort and the parent
-is re-synced; a stale leftover backup is harmless (reads are keyed on the
-marker, never the backup).
+touches nothing.
 
 Tree metadata is identity-neutral. For example,
 
@@ -825,14 +766,12 @@ The target snapshot log contains only fully successful snapshots, KEYED BY THE D
 
 A commit is authoritative only when the same deployment ID and placement-slot set are committed on every member. This lets a fresh or repaired local store reconstruct successful snapshot history from the servers instead of trusting a stale local ref.
 
-When a checkpoint has been established on the target, ALL reference resolution
-resolves against the FLOORED chain (the suffix beginning at the checkpoint
-deployment's POSITION in the log — positions are DERIVED, never stored):
-the checkpoint deployment itself stays resolvable, and anything below it —
-a deployment id below the floor, or `parent(...)` / `@-` walking past it —
-fails closed with a history-floor ref error (e.g.
-`cannot roll back below the history floor (checkpoint deploy-…)`) instead of
-resolving to a discarded state.
+The target's successful chain is derived from its ONE ledger (the retained
+suffix after a checkpoint). ALL reference resolution resolves against that
+chain: after a checkpoint the first retained successful entry is the oldest
+rollback, and a reference beyond the chain — a deployment id discarded by
+the checkpoint, or `parent(...)` / `@-` walking past the start — fails
+closed with a ref error instead of resolving to a discarded state.
 
 Pushing an older successful reference restores its complete assignment, including the historical behavior contract and different variants on different servers. References are jj-style: the target is passed ONCE (the push argument) and is never repeated in the reference; the `@`-relative forms resolve against that target's snapshot chain.
 

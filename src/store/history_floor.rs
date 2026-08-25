@@ -1,2332 +1,584 @@
-//! Checkpoint persistence: the store side of the history floor.
+//! Checkpoint persistence: the store side of the ONE per-target ledger.
 //!
-//! The rollback history is the append-only OP LOG (`refs/snapshots.jsonl` +
-//! `refs/last-successful`) — the term is "op log", never "reflog". A
-//! checkpoint (`deploy checkpoint <target> <deployment-id>`) establishes a
-//! monotonic HISTORY FLOOR (`refs/history-floor.json`, see
-//! [`crate::records::HistoryFloor`]) for a target: the floor marker is
-//! written FIRST, durably and FAIL-CLOSED (private temp → fsync → rename →
-//! parent-dir fsync with errors propagated — any stage failure leaves NO
-//! floor on a first-ever checkpoint; ADVANCING an existing floor A to a
-//! later deployment B is TRANSACTIONAL — A is moved aside to a durable
-//! backup (`history-floor.json.prev.<B-id>`, TAGGED by the advance target,
-//! so a stale backup from another transaction is a different file) and
-//! restored if B fails before its
-//! commit point, so a failed advancement never erases the previously
-//! durable floor, see [`LocalStore::write_history_floor`]), then physical
-//! compaction rewrites the jsonl logs to the suffix at/after the floor and
-//! deletes `deployments/<id>/` dirs strictly before it. EVERY read path in
-//! this module is gated by the floor ([`LocalStore::read_attempts`],
-//! [`LocalStore::read_snapshots`]), so an interrupted compaction never
-//! exposes history below the durable floor;
-//! the raw readers ([`LocalStore::read_attempts_raw`],
-//! [`LocalStore::read_snapshots_raw`]) are the internal index-minting view
-//! (never a below-floor escape hatch — index allocation uses them so
-//! compaction can never reuse an index).
+//! A target's entire deployment history is ONE ordered, append-only JSONL
+//! ledger (`targets/<target>/ledger.jsonl`, see [`crate::records`]): each
+//! entry starts as the DURABLE INTENT (written BEFORE any remote mutation)
+//! and its TERMINAL EVENT carries the status, the per-slot outcomes, and —
+//! when successful — the rollback state ([`crate::records::LedgerRollback`]).
+//! There is NO history-floor marker, NO snapshot op log, NO per-deployment
+//! results/transition stream, and NO cleanup-pending debt flag: the old
+//! multi-file model (and with it the transactional floor-advance backup
+//! machinery — `history-floor.json.prev.*` backups, restore/recovery, the
+//! torn-advance guard and the tri-state marker discovery) is GONE.
 //!
-//! The floor marker is the checkpoint's COMMIT POINT: once it is durable
-//! the checkpoint took effect, so a failure of any LATER phase is
-//! post-commit maintenance — it records the durable
-//! `refs/cleanup-pending.json` debt FLAG
-//! ([`crate::records::CleanupPending`], via
-//! [`LocalStore::write_cleanup_pending`]) and the command reports SUCCESS
-//! with a warning instead of an `Err`; the next same-deployment checkpoint
-//! retries the cleanup until it completes (then clears the marker). The
-//! marker is a flag ONLY — it never records a deletion worklist: the
-//! delete-before-rewrite compaction order keeps the below-floor worklist in
-//! the raw logs until deletion finishes, so a retry recomputes the exact
-//! delete set from the logs via
-//! [`LocalStore::checkpoint_discards`] and converges regardless of the
-//! marker.
+//! A checkpoint (`deploy checkpoint <target> <deployment-id>`) is exactly
+//! three steps:
 //!
-//! The marker is INTEGRITY-BOUND at read time ([`LocalStore::read_history_floor`]):
-//! it must name the target it was read from AND an exact snapshot-pair
-//! target's logs — any violation fails closed with an integrity error, so a
-//! corrupted or tampered marker is never silently treated as "no floor"
-//! (which would expose the below-floor prefix).
+//! 1. CALCULATE THE RETAINED SUFFIX — everything at/after the checkpoint
+//!    deployment's position in the target's ledger ([`LocalStore::ledger_suffix`]).
+//!    The floor is IMPLICIT: the ledger's first entry is the oldest retained
+//!    rollback state; no separate floor marker exists.
+//! 2. ATOMICALLY REPLACE the ledger with that suffix ([`LocalStore::write_ledger_suffix`]
+//!    — temp + fsync + chmod-private + rename + parent-directory fsync). This
+//!    is the checkpoint's ONLY logical commit; a reader never observes a torn
+//!    ledger (wholly old or wholly new). IF THE REPLACEMENT FAILS, NO
+//!    DELETION HAPPENS: the checkpoint is a plain `Err` and the full history
+//!    stands untouched.
+//! 3. BEST-EFFORT GLOBAL SWEEP of unreachable deployment directories
+//!    (`deployments/<id>/`), release records (`releases/<release-id>/`), and
+//!    tree objects (`objects/sha256/<digest>/`). The reachability scan
+//!    ([`LocalStore::sweep_discards`]) is recomputed FRESH on every retry:
+//!    everything reachable from ANOTHER target's ledger, the CURRENT /
+//!    INCOMPLETE state (observed artifacts, pending intent-only entries,
+//!    in-flight deployment dirs), or a PIN is kept; everything else is
+//!    unreachable and swept. A failed sweep is retried by RECOMPUTING
+//!    reachability — no persisted deletion worklist, no debt marker, no
+//!    backup. The report carries at most: the logical commit status + sweep
+//!    completed / retry-required.
 //!
-//! # Durability ordering (the crash-safety crux)
-//!
-//! 1. The floor marker is written FIRST, durably (atomic temp+rename +
-//!    directory fsync in [`LocalStore::write_history_floor`]). THIS is the
-//!    COMMIT POINT: the instant it is durable the checkpoint took effect.
-//! 2. THEN the physical compaction runs ([`LocalStore::checkpoint_compact`]):
-//!    delete the `deployments/<id>/` dirs strictly before the floor, then
-//!    atomically rewrite `attempts.jsonl` and `snapshots.jsonl` to the
-//!    suffix at/after the floor.
-//!
-//! Because the floor is durable-before-delete and EVERY read path is gated
-//! by it ([`LocalStore::read_attempts`], [`LocalStore::read_snapshots`],
-//! and ref resolution in [`crate::history::resolve_ref_expr`]), an
-//! interrupted compaction leaves either the old physical files or the
-//! compacted files — never visible history below the durable floor. The
-//! floor is the ENFORCEMENT point; the physical cleanup is best-effort.
-//! The deletion runs BEFORE the log rewrites so its worklist stays
-//! re-derivable from the logs: a retry after an interruption recomputes
-//! the same discard set from the still-intact (or already-rewritten) logs
-//! and converges — the deletion worklist is never lost to an interrupted
-//! rewrite.
-//!
-//! # The failure model: the floor write is the commit point
-//!
-//! A failure propagates as `Err` ONLY from the floor-marker write (the
-//! commit point): a failed marker write leaves the PREVIOUS state — no
-//! floor on a first-ever checkpoint; on an ADVANCE the replacement is
-//! TRANSACTIONAL ([`LocalStore::write_history_floor`]): the backup slot is
-//! RECONCILED first (leftover `history-floor.json.prev*` backups of other
-//! transactions are durably removed), B's marker is staged, the current
-//! floor A is moved aside to a durable backup
-//! (`history-floor.json.prev.<B-id>`, tagged by the advance target), B is
-//! renamed into place, and the parent-directory fsync is B's durability
-//! commit point. A failure at ANY stage after A was moved aside — an
-//! injected fault or a REAL filesystem error alike, INCLUDING a real
-//! B-temp→marker rename failure — routes through ONE cleanup-and-restore
-//! handler ([`LocalStore::cleanup_and_restore`]): A is renamed back from
-//! THIS transaction's tagged backup — verified to carry the tag AND to
-//! parse and equal the pre-advance floor A, so a stale backup from another
-//! transaction can never roll the floor backward — B's temp artifact is
-//! removed, and the ORIGINAL error propagates, so a failed advancement
-//! leaves EXACTLY the pre-advance state (floor A durable, the same visible
-//! suffix, no compaction side effects, no temporary transaction files) —
-//! advancing a checkpoint can never erase the previously durable floor, not
-//! even when the actual temp→marker rename fails after A was backed up. If
-//! the restore of A itself ALSO fails, the marker may be left absent while
-//! the tagged backup (`history-floor.json.prev.<B-id>`) holds A — a TORN
-//! ADVANCE. The reader NEVER treats this as "no floor" (which would expose
-//! the below-floor prefix): it VALIDATES the durable backup against the
-//! SAME integrity binding as the marker and treats a valid backup as the
-//! ACTIVE floor (reads see A), failing closed only when the backup itself
-//! fails validation. RECOVERY is the ATOMIC RESTORE of the backup — rename
-//! the tagged backup back over the marker name + parent-dir fsync
-//! ([`LocalStore::recover_history_floor_backup`]): the backup is the ONLY
-//! valid floor in a torn state and is NEVER deleted (deleting it would
-//! erase the floor and re-expose discarded history). The NEXT CHECKPOINT
-//! repairs the torn state AUTOMATICALLY: the checkpoint entry restores the
-//! validated backup (rename + parent-dir fsync — the PRODUCTION repair
-//! path, [`LocalStore::recover_history_floor_backup`]) before it proceeds,
-//! so a torn advance is self-healing and the target never needs a manual
-//! intervention. Every advance's pre-start reconciliation composes with
-//! that: it removes leftover backups ONLY when the floor marker EXISTS — a
-//! marker ABSENT alongside a VALIDATED backup is the torn state (the
-//! backup is the ONLY valid floor) and is RESTORED, never deleted.
-//!
-//! EVERY failure AFTER the marker write — enumerating the discards or any
-//! compaction phase — is POST-COMMIT MAINTENANCE: the checkpoint already
-//! took effect, so the durable [`crate::records::CleanupPending`] debt
-//! flag (`targets/<target>/refs/cleanup-pending.json`,
-//! [`LocalStore::write_cleanup_pending`]) records the pending cleanup and
-//! the command reports SUCCESS with a warning, NEVER an `Err`. The marker
-//! is a flag ONLY — it never carries a deletion worklist: the compaction
-//! deletes below-floor dirs BEFORE rewriting the logs, so the raw logs
-//! retain the worklist whenever a deletion fails and the retry recomputes
-//! the exact delete set from them via [`LocalStore::checkpoint_discards`].
-//! The next checkpoint of the SAME deployment retries the cleanup; once it
-//! completes, the debt marker clears ([`LocalStore::clear_cleanup_pending`]).
-//!
-//! TRUTHFUL REPORTING: the debt marker's OWN persistence is the last
-//! post-commit failure surface. When [`LocalStore::write_cleanup_pending`]
-//! fails, the cleanup debt could NOT be made durable — the checkpoint flow
-//! must not claim durable debt that a crash/restart would lose, so it sets
-//! `CheckpointReport::cleanup_persistence_failed` while keeping the
-//! in-memory warning; the retry recomputes the worklist from the intact
-//! logs and converges regardless. The clear
-//! ([`LocalStore::clear_cleanup_pending`]) is DURABLE (remove +
-//! parent-directory fsync, so a crash can never resurrect the marker), and
-//! a clear failure is surfaced as `CheckpointReport::cleanup_clear_failed`:
-//! the stale marker stays on disk — harmless, since every read is keyed on
-//! the history floor, never this flag — and the next same-deployment
-//! checkpoint re-clears it.
-//!
-//! The durability primitives (temp naming, the fail-closed parent-dir
-//! fsync, atomic marker/JSONL replacement, parse-sensitive marker reads)
-//! live in [`crate::store::atomic`]; this module implements the
-//! checkpoint-specific sequence on top of them, plus the integrity-bound
-//! readers and the compaction.
+//! Because the atomic replacement is the only logical commit, a failed
+//! checkpoint leaves EXACTLY the pre-call state; a failed sweep leaves the
+//! ledger compacted (the commit stands) with the sweep retry-required, and
+//! the next same-deployment checkpoint recomputes the same suffix (identical
+//! — the ledger already IS the suffix) and re-runs the sweep to convergence.
+//! Sweeps are best-effort and are NOT secure erasure.
 
+use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::model::{CLEANUP_PENDING_SCHEMA_VERSION, SCHEMA_VERSION};
-use crate::records::{CleanupPending, DeploymentSnapshot, HistoryFloor};
-use crate::store::atomic::{
-    path_state, read_json_marker, routed_read_bytes, routed_read_dir, set_private, sync_parent_dir,
-    temp_name_for, write_atomic_replace, write_jsonl_atomic,
-};
+use crate::model::DeploymentId;
+use crate::records::DeploymentStatus;
+use crate::store::atomic::{path_state, write_atomic_replace};
 use crate::store::local::LocalStore;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::collections::BTreeSet;
 
+#[cfg(test)]
+use crate::model::{PlacementSlotId, TargetName};
+#[cfg(test)]
+use crate::records::{LedgerEntry, LedgerIntent};
+#[cfg(test)]
+use crate::records::{LedgerTerminal, ServerResult};
 #[cfg(test)]
 use crate::testutil::test_faults::FaultKind;
-
-/// The durable backup name of a history-floor marker under a TRANSACTIONAL
-/// floor ADVANCE: the marker name with a `.prev.<tag>` suffix, in the SAME
-/// directory, where `tag` is the ADVANCE TARGET's deployment id (the new
-/// floor B being installed). TAGGED BY TRANSACTION: during A→B the backup
-/// is `history-floor.json.prev.<B-id>` holding A; during a later B→C it is
-/// `history-floor.json.prev.<C-id>` holding B. A backup is therefore bound
-/// to the ONE transaction that created it — a stale `.prev.<B>` left by a
-/// committed A→B (whose success-path cleanup was faulted) is a DIFFERENT
-/// file from the next transaction's `.prev.<C>`, so a failure in B→C can
-/// never consult, let alone restore, another transaction's backup. The
-/// restore ([`LocalStore::restore_floor_backup`]) verifies the tag AND the
-/// content before it ever renames a backup over the marker; when the
-/// marker is ABSENT but this backup exists (a torn advance: A was moved
-/// aside, its restore failed), the reader
-/// ([`LocalStore::read_history_floor`]) VALIDATES the backup and treats it
-/// as the ACTIVE floor — never "no floor", which would expose the
-/// below-floor prefix — and recovery
-/// ([`LocalStore::recover_history_floor_backup`]) restores it atomically,
-/// never deleting it.
-fn floor_backup_path(path: &Path, tag: &str) -> PathBuf {
-    path.with_file_name(format!(
-        "{}.prev.{tag}",
-        path.file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default()
-    ))
-}
-
-/// Every leftover backup sibling of a history-floor marker in the same
-/// directory, sorted: the legacy untagged `history-floor.json.prev` and
-/// every tagged `history-floor.json.prev.<tag>` (the current scheme). An
-/// ADVANCE reconciles all of them durably before it starts (the backup slot
-/// starts clean), and the reader
-/// ([`LocalStore::read_history_floor`]) treats ANY of them alongside a
-/// missing marker as a torn advance (never "no floor", which would expose
-/// the below-floor prefix). The staged temp files carry the `.tmp.` infix,
-/// so they never match the `.prev` prefix.
-///
-/// FAIL-CLOSED ENUMERATION (the fix for the error-swallowing
-/// `read_dir(...).unwrap_or_default()`): the list is empty ONLY when the
-/// parent directory is GENUINELY MISSING ([`std::io::ErrorKind::NotFound`] —
-/// the reader then simply sees no marker and no backup) or when the parent
-/// is not a child-bearing path at all; ANY other enumeration error (EACCES,
-/// EIO, ENOTDIR, ...) — the `read_dir` open itself or an entry error —
-/// PROPAGATES as a [`Error::store`] error, never a silently-shorter (empty)
-/// list: an unreadable marker directory must not read as "no backups"
-/// (which would read a torn advance as "no floor").
-fn floor_backup_siblings(path: &Path) -> Result<Vec<PathBuf>> {
-    let parent = match path.parent() {
-        Some(p) => p,
-        None => return Ok(Vec::new()),
-    };
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let prefix = format!("{name}.prev");
-    // Route through the injectable [`MarkerIoOps`] seam when a test
-    // installed one; production performs the REAL read_dir with per-entry
-    // errors propagated. NotFound (no refs dir yet) → no marker, no
-    // backup; ANY other enumeration error → Store.
-    let entries = match routed_read_dir(parent) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(Error::store(format!("read_dir {}: {e}", parent.display()))),
-    };
-    let mut out: Vec<PathBuf> = entries
-        .into_iter()
-        .filter(|p| {
-            p.file_name()
-                .map(|n| n.to_string_lossy().starts_with(&prefix))
-                .unwrap_or(false)
-        })
-        .collect();
-    out.sort();
-    Ok(out)
-}
-
-/// INJECTABLE FILESYSTEM-OPERATION BOUNDARY for the floor transaction
-/// (test-only seam): the ACTUAL renames of the transactional advance route
-/// through [`floor_fs_rename`], which consults this per-thread slot when a
-/// test installed a seam. The point of the seam is to fail the REAL
-/// temp→marker rename AFTER A was backed up — a genuine `rename(2)` error
-/// on the actual call, the failure mode the injected
-/// [`FaultKind::RenameFloor`] fault (which fires BEFORE the rename I/O)
-/// cannot reproduce. Production never installs a seam: [`floor_fs_rename`]
-/// falls through to [`std::fs::rename`].
-///
-/// The seam is PER-THREAD (not per-store like the fault registry — the
-/// store struct lives in `src/store/local.rs`, which this module does not
-/// modify), so two fixtures in different test threads can never interfere;
-/// [`FloorFsSeamGuard`] scopes one installation to one test case.
 #[cfg(test)]
-pub(crate) trait FloorFsOps: Send + Sync {
-    /// The ACTUAL rename call. A test impl matches `(src, dst)` to fail
-    /// exactly the call it wants — e.g. src's filename starting with the
-    /// temp prefix AND dst == the marker path — while every other rename
-    /// (the A→backup rename, the restore's rename) passes through to the
-    /// real filesystem.
-    fn rename(&self, src: &Path, dst: &Path) -> std::io::Result<()>;
-}
+use std::collections::BTreeMap;
 
-// The installed seam for the current thread ([`FloorFsOps`]). `None` in
-// production and in tests that did not install one — the floor writes then
-// perform the REAL filesystem calls.
-#[cfg(test)]
-thread_local! {
-    static FLOOR_FS_OPS: std::cell::RefCell<Option<std::sync::Arc<dyn FloorFsOps>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Route a floor-transaction rename through the INJECTABLE filesystem
-/// boundary: production always performs the REAL [`std::fs::rename`]; a
-/// test that installed a seam (via [`FloorFsSeamGuard`]) performs the
-/// seam's rename instead — so a test can fail the ACTUAL temp→marker
-/// rename after A was backed up (a real fs error on the real call, not a
-/// pre-I/O fault).
-fn floor_fs_rename(src: &Path, dst: &Path) -> std::io::Result<()> {
-    #[cfg(test)]
-    if let Some(ops) = FLOOR_FS_OPS.with(|s| s.borrow().clone()) {
-        return ops.rename(src, dst);
-    }
-    std::fs::rename(src, dst)
-}
-
-/// Test-only RAII guard scoping a [`FloorFsOps`] seam to one floor
-/// transaction case: installs the seam for the CURRENT thread and restores
-/// the previous seam on drop, so a proptest case cannot leak its arming
-/// into the next case (or another test on the same thread).
-#[cfg(test)]
-pub(crate) struct FloorFsSeamGuard(Option<std::sync::Arc<dyn FloorFsOps>>);
-
-#[cfg(test)]
-impl FloorFsSeamGuard {
-    pub(crate) fn install(ops: std::sync::Arc<dyn FloorFsOps>) -> Self {
-        // `Option::replace` swaps the value in place and returns the
-        // previous one (the seam the guard restores on drop).
-        let previous = FLOOR_FS_OPS.with(|s| s.borrow_mut().replace(ops));
-        FloorFsSeamGuard(previous)
-    }
-}
-
-#[cfg(test)]
-impl Drop for FloorFsSeamGuard {
-    fn drop(&mut self) {
-        FLOOR_FS_OPS.with(|s| *s.borrow_mut() = self.0.take());
-    }
-}
-
-/// Test impl of [`FloorFsOps`]: performs the REAL filesystem calls while
-/// recording every rename it observed, and can be ARMED to fail ONE rename
-/// whose `(src, dst)` matches a predicate — the seam the real-B-temp-rename
-/// property uses to fail the ACTUAL temp→marker rename after A was backed
-/// up. One-shot: the first matching rename fails with a permission error
-/// and disarms, so the restore's rename (and any later transaction) passes
-/// through to the real filesystem.
-///
-/// The armed one-shot failure predicate decides, per `(src, dst)`, whether
-/// the rename must fail (factored into a `type` alias so the field type
-/// stays readable).
-#[cfg(test)]
-type FailRenamePred = dyn Fn(&Path, &Path) -> bool + Send + Sync;
-
-#[cfg(test)]
-pub(crate) struct TestFloorFsOps {
-    fail_rename: std::sync::Mutex<Option<std::sync::Arc<FailRenamePred>>>,
-    renames: std::sync::Mutex<Vec<(PathBuf, PathBuf)>>,
-}
-
-#[cfg(test)]
-impl TestFloorFsOps {
-    pub(crate) fn new() -> Self {
-        TestFloorFsOps {
-            fail_rename: std::sync::Mutex::new(None),
-            renames: std::sync::Mutex::new(Vec::new()), // rename log (call order)
-        }
-    }
-
-    /// Arm the seam: the NEXT rename whose `(src, dst)` satisfies `pred`
-    /// fails with `PermissionDenied` (one-shot).
-    pub(crate) fn fail_rename_once(
-        &self,
-        pred: impl Fn(&Path, &Path) -> bool + Send + Sync + 'static,
-    ) {
-        *self.fail_rename.lock().unwrap() = Some(std::sync::Arc::new(pred));
-    }
-
-    /// Every rename observed by the seam, in call order — a test asserts
-    /// the seam fired on the REAL temp→marker call AFTER the backup rename.
-    pub(crate) fn renames(&self) -> Vec<(PathBuf, PathBuf)> {
-        self.renames.lock().unwrap().clone()
-    }
-}
-
-#[cfg(test)]
-impl Default for TestFloorFsOps {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(test)]
-impl FloorFsOps for TestFloorFsOps {
-    fn rename(&self, src: &Path, dst: &Path) -> std::io::Result<()> {
-        self.renames
-            .lock()
-            .unwrap()
-            .push((src.to_path_buf(), dst.to_path_buf()));
-        // Check the armed predicate WITHOUT consuming it: the arming must
-        // survive every non-matching rename (e.g. the A→backup rename) and
-        // fire only on the exact call it was armed for (the temp→marker
-        // rename), then disarm.
-        let should_fail = self
-            .fail_rename
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|pred| pred(src, dst))
-            .unwrap_or(false);
-        if should_fail {
-            self.fail_rename.lock().unwrap().take();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "test fault: real floor rename forced to fail once",
-            ));
-        }
-        std::fs::rename(src, dst)
-    }
-}
-/// The exact set a checkpoint floor discards on one target (the dry-run
-/// preview enumerates precisely this; the compaction deletes precisely this).
-/// Everything is keyed by DEPLOYMENT ID — positions are DERIVED from the log
-/// order (the checkpoint deployment's position in the raw logs), never
-/// stored: the discard set is exactly the log prefix STRICTLY BEFORE the
-/// checkpoint deployment's position.
+/// The exact set a checkpoint discards on one target: the retained-suffix
+/// replacement's dropped entries plus the global sweep's would-be /
+/// performed deletions. The dry-run preview enumerates precisely this; the
+/// real checkpoint replaces the ledger with the retained suffix and then
+/// sweeps exactly the `sweep_*` sets.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct FloorDiscards {
-    /// Deployment ids of the attempts.jsonl lines removed (the checkpoint's
-    /// own attempt and everything after it stay).
-    pub discarded_attempts: Vec<String>,
-    /// Deployment ids of the snapshots removed from snapshots.jsonl
-    /// (everything strictly before the checkpoint deployment's position in
-    /// the log — the old `index < floor.snapshot_index` set, now expressed
-    /// by position over the deployment-keyed log).
-    pub discarded_snapshots: Vec<String>,
-    /// Deployment ids whose `deployments/<id>/` directories are deleted
-    /// (the union of the two sets above, deduplicated).
-    pub discarded_deployments: Vec<String>,
+pub struct LedgerDiscards {
+    /// Deployment ids whose entries were dropped from the ledger
+    /// (everything strictly BEFORE the checkpoint deployment's position).
+    pub discarded_entries: Vec<String>,
+    /// Deployment ids whose `deployments/<id>/` directories the sweep
+    /// deleted (unreachable: not in any retained ledger, not observed as
+    /// current, not an in-flight pending entry).
+    pub sweep_deployments: Vec<String>,
+    /// Release ids whose `releases/<id>/` directories the sweep deleted.
+    pub sweep_releases: Vec<String>,
+    /// Tree digests whose `objects/sha256/<digest>/` directories the sweep
+    /// deleted.
+    pub sweep_objects: Vec<String>,
 }
 
 impl LocalStore {
-    // ---- checkpoint history floor --------------------------------------
+    // ---- the retained-suffix computation (step 1) -------------------------
 
-    /// Path of the target's durable history-floor marker
-    /// (`refs/history-floor.json`). The marker is written FIRST (durable)
-    /// before the physical compaction, and every read path in this module is
-    /// gated by it — see [`LocalStore::read_attempts`] /
-    /// [`LocalStore::read_snapshots`]. Crate-private: the marker is an
-    /// internal enforcement point, never a public API.
-    pub(crate) fn history_floor_path(&self, target: &str) -> PathBuf {
-        self.refs_dir(target).join("history-floor.json")
+    /// Compute the target's RETAINED LEDGER SUFFIX at the checkpoint
+    /// deployment: every physical ledger line from the checkpoint entry's
+    /// intent line onward (the checkpoint's own intent + terminal and every
+    /// later entry — an in-flight pending entry at/after the checkpoint is
+    /// retained with it). Returns the raw suffix lines AND the ids of the
+    /// entries strictly before the checkpoint (the discards).
+    ///
+    /// FAIL CLOSED: the checkpoint deployment must be an entry of the
+    /// target's CURRENT ledger (a deployment discarded by an earlier
+    /// checkpoint is absent and cannot be re-established — the checkpoint
+    /// can never move backward because the history is gone) and must have
+    /// produced a SUCCESSFUL terminal event with a rollback state (the
+    /// ledger's first retained entry is the oldest rollback state).
+    pub(crate) fn ledger_suffix(
+        &self,
+        target: &str,
+        checkpoint_id: &DeploymentId,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let lines = self.read_ledger_lines(target)?;
+        let entries = self.read_ledger(target)?;
+        let pos = entries
+            .iter()
+            .position(|e| e.deployment_id == *checkpoint_id)
+            .ok_or_else(|| {
+                Error::r#ref(format!(
+                    "checkpoint requires a recorded deployment: deployment '{checkpoint_id}' is not in the ledger of target '{target}' (an earlier checkpoint may already have discarded it)"
+                ))
+            })?;
+        let entry = &entries[pos];
+        let terminal = entry.terminal.as_ref().ok_or_else(|| {
+            Error::r#ref(format!(
+                "checkpoint requires a SUCCESSFUL deployment: deployment '{checkpoint_id}' on target '{target}' has no terminal event (the deployment is still in flight or pending)"
+            ))
+        })?;
+        if terminal.status != DeploymentStatus::Successful || terminal.rollback.is_none() {
+            return Err(Error::r#ref(format!(
+                "checkpoint requires a successful deployment: deployment '{checkpoint_id}' on target '{target}' ended {status:?} — only successful deployments carry a rollback state",
+                status = terminal.status
+            )));
+        }
+        let keep_from = entry.seq as usize;
+        let discarded: Vec<String> = entries[..pos]
+            .iter()
+            .map(|e| e.deployment_id.as_str().to_string())
+            .collect();
+        Ok((lines[keep_from..].to_vec(), discarded))
     }
 
-    /// Write the target's history floor marker with the checkpoint's
-    /// FAIL-CLOSED durability protocol (its OWN sequence, not the shared
-    /// [`write_atomic_replace`](crate::store::atomic::write_atomic_replace) — the per-stage fault slots must fire
-    /// between the steps). The FIRST floor (no existing marker) follows the
-    /// original sequence:
+    /// Read the ledger's raw physical lines (one string per line, in file
+    /// order), tri-state absent — the empty vector for no ledger.
+    pub(crate) fn read_ledger_lines(&self, target: &str) -> Result<Vec<String>> {
+        let p = self.ledger_path(target);
+        if !path_state(&p)? {
+            return Ok(vec![]);
+        }
+        let text =
+            std::fs::read_to_string(&p).map_err(|e| Error::store(format!("read ledger: {e}")))?;
+        let mut out = Vec::new();
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            out.push(line.to_string());
+        }
+        Ok(out)
+    }
+
+    // ---- the atomic ledger replacement (step 2 — the ONLY logical commit) -
+
+    /// ATOMICALLY replace the target's ledger with the retained suffix (the
+    /// checkpoint's ONLY logical commit): write the suffix lines to a UNIQUE
+    /// temp file in the same directory, fsync, chmod private BEFORE it can
+    /// become visible, rename over the ledger (atomic on POSIX — a reader
+    /// sees wholly-old or wholly-new, never torn), then fsync the parent
+    /// directory WITH ERRORS PROPAGATED (the durability commit point).
     ///
-    /// 1. write the marker bytes to a UNIQUE temp file in the same
-    ///    directory,
-    /// 2. chmod the TEMP file private (0o600) — before it can ever become
-    ///    visible under its final name,
-    /// 3. fsync the temp file,
-    /// 4. rename it into place (atomic on POSIX),
-    /// 5. DURABLY fsync the parent directory, errors PROPAGATED.
-    ///
-    /// ADVANCING the floor (an existing marker A is replaced by a later
-    /// deployment B) is TRANSACTIONAL — a failed advancement must NEVER
-    /// erase the previously durable floor A, and must NEVER roll it
-    /// BACKWARD (a stale backup from an earlier transaction is never
-    /// restored over a newer floor):
-    ///
-    /// 0. RECONCILE the backup slot: durably remove every leftover
-    ///    `history-floor.json.prev*` sibling (tagged backups of OTHER
-    ///    transactions whose success-path cleanup was faulted, plus any
-    ///    legacy untagged `.prev`) and fsync the parent — the backup slot
-    ///    starts CLEAN, so this transaction's backup can never be confused
-    ///    with a stale one (a stale A can never be restored over B),
-    /// 1. entry fault → `Err`, A untouched,
-    /// 2. stage B's temp (write + chmod private + fsync); a fault → `Err`,
-    ///    A untouched (no rename has happened yet),
-    /// 3. move A aside to the durable, TRANSACTION-TAGGED backup
-    ///    `history-floor.json.prev.<B-id>` in the same directory, then
-    ///    fsync the parent so the BACKUP is durable BEFORE B can overwrite
-    ///    the marker name; a fault or a real
-    ///    backup-sync error → `Err` through the ONE cleanup-and-restore
-    ///    handler,
-    /// 4. rename B's temp into place (atomic); a fault OR a REAL rename
-    ///    failure (the actual `rename(2)` call, routed through the
-    ///    injectable filesystem boundary) → `Err` through the SAME
-    ///    handler,
-    /// 5. fsync the parent directory — B's DURABILITY COMMIT POINT — errors
-    ///    PROPAGATED; a fault or a real sync error (the marker may already
-    ///    be renamed into place) → `Err` through the SAME handler: B never
-    ///    committed, A is durable again,
-    /// 6. committed: remove THIS transaction's tagged backup (best-effort —
-    ///    a leftover is harmless: it carries B's tag, so no other
-    ///    transaction ever restores it, and the NEXT advance's step-0
-    ///    reconciliation removes it durably), then fsync the parent so the
-    ///    removal is durable.
-    ///
-    /// The RESTORE ([`LocalStore::restore_floor_backup`]) is the
-    /// fail-closed half, and it NEVER restores a backup it did not create
-    /// and verify: the backup must carry the CURRENT advance's tag AND its
-    /// content must parse and equal the pre-advance floor A (read at the
-    /// start of the transaction) — a stale or foreign backup is REFUSED,
-    /// never renamed over the marker. EVERY post-backup failure — injected
-    /// fault or real filesystem error alike, INCLUDING a real B-temp→marker
-    /// rename failure — routes through the ONE handler
-    /// ([`LocalStore::cleanup_and_restore`]): it best-effort removes B's
-    /// temp artifact, restores A from the backup via
-    /// [`LocalStore::restore_floor_backup`], and propagates the ORIGINAL
-    /// error. A restore failure leaves the marker
-    /// absent while the tagged backup still holds A — a TORN ADVANCE the
-    /// readers survive via the validated-backup fallback
-    /// ([`LocalStore::read_history_floor`]: a VALIDATED tagged backup with
-    /// no marker IS the active floor A, never "no floor", which would
-    /// expose the below-floor prefix) and that the NEXT CHECKPOINT repairs
-    /// by atomically restoring the backup
-    /// ([`LocalStore::recover_history_floor_backup`], invoked
-    /// automatically at the checkpoint entry — the PRODUCTION repair path;
-    /// the advance-start reconciliation composes with it and restores
-    /// rather than deletes whenever the marker is absent). Every stage error
-    /// is returned from THIS method (PRE-commit): B is never reported
-    /// established unless its parent-dir sync succeeded.
-    pub(crate) fn write_history_floor(&self, target: &str, floor: &HistoryFloor) -> Result<()> {
-        // Entry-point fault (existing): fired BEFORE any durability I/O, so
-        // a failure here leaves no marker, no temp, no backup, no
-        // compaction — the previous floor A (if any) is untouched.
+    /// FAILURE MODEL: a failure at ANY stage (the injected
+    /// [`FaultKind::LedgerReplaceBefore`] fault, a real temp/sync/rename
+    /// error, the parent-sync failure) returns `Err` and leaves the PREVIOUS
+    /// ledger durable — no deletion, no partial history. The
+    /// [`FaultKind::LedgerReplaceAfter`] fault fires AFTER the commit (the
+    /// new suffix IS durable) so a test can assert the visible ledger is
+    /// wholly new and the sweep is reported retry-required.
+    pub(crate) fn write_ledger_suffix(&self, target: &str, suffix_lines: &[String]) -> Result<()> {
         #[cfg(test)]
         if self
             .fault_registry()
-            .consume(FaultKind::WriteHistoryFloor, floor.deployment_id.as_str())
+            .consume(FaultKind::LedgerReplaceBefore, target)
         {
             return Err(Error::store(
-                "test fault: write_history_floor forced to fail once",
+                "test fault: ledger suffix replacement forced to fail before the replace",
             ));
         }
-        let bytes = serde_json::to_vec_pretty(floor)
-            .map_err(|e| Error::store(format!("serialize history floor: {e}")))?;
-        let path = self.history_floor_path(target);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::store(format!("mkdir {}: {e}", parent.display())))?;
+        let path = self.ledger_path(target);
+        let mut buf = String::new();
+        for line in suffix_lines {
+            buf.push_str(line);
+            buf.push('\n');
         }
-        // The durable backup of the CURRENT floor (if any), in the same
-        // directory, TAGGED BY THE ADVANCE TARGET: during A→B the backup
-        // is `history-floor.json.prev.<B-id>` holding A. An ADVANCE moves
-        // A here before B can overwrite the marker name, so a failed
-        // advancement can always rename A back; the tag binds the backup
-        // to THIS transaction — a stale backup from another transaction is
-        // a DIFFERENT file and can never be consulted or restored here.
-        let backup = floor_backup_path(&path, floor.deployment_id.as_str());
-        // TRI-STATE existence: a filesystem ERROR on the marker stat is a
-        // [`Error::store`] failure — never "no floor" (which would treat a
-        // torn-advance state as a first-ever checkpoint and erase the
-        // previous floor's transactional guarantee). Only a genuine
-        // NotFound (no previous checkpoint) reads as no floor.
-        let had_floor = path_state(&path)?;
-        // PRE-ADVANCE FLOOR (the restore-verification anchor): the floor
-        // this advance moves aside. The RESTORE only ever restores a
-        // backup whose content parses and EQUALS this floor — a backup
-        // holding anything else (a stale or foreign floor that somehow
-        // carried this transaction's tag, or a corrupted file) is REFUSED,
-        // never renamed over the marker. Parse-sensitive
-        // (read_json_marker): a malformed current marker is semantic
-        // corruption and the advance fails closed rather than guess.
-        let previous_floor: Option<HistoryFloor> = if had_floor {
-            Some(read_json_marker(&path)?)
-        } else {
-            None
-        };
-        let tmp = temp_name_for(&path);
-        {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)
-                .map_err(|e| Error::store(format!("create {}: {e}", tmp.display())))?;
-            f.write_all(&bytes)
-                .map_err(|e| Error::store(format!("write {}: {e}", tmp.display())))?;
-            // Private BEFORE visible: the temp carries 0o600 from this
-            // point, so the marker is never observed with default perms
-            // (the shared helper's old post-rename chmod opened a window).
-            set_private(&tmp)?;
-            // Stage fault: the temp-file fsync (B's temp — no rename has
-            // happened yet, so the existing floor A is untouched).
-            #[cfg(test)]
-            if self
-                .fault_registry()
-                .consume(FaultKind::SyncFloorTemp, floor.deployment_id.as_str())
-            {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(Error::store(
-                    "test fault: history-floor temp sync forced to fail once",
-                ));
-            }
-            f.sync_all()
-                .map_err(|e| Error::store(format!("fsync {}: {e}", tmp.display())))?;
-        }
-
-        if had_floor {
-            // ---- TRANSACTIONAL ADVANCE, stage 0: RECONCILE ----------------
-            // Durably remove every leftover `history-floor.json.prev*`
-            // sibling BEFORE this advance starts — the tagged backup of an EARLIER
-            // transaction (e.g. a `.prev.<B>` holding A left by a committed
-            // A→B whose success-path cleanup was faulted) plus any legacy
-            // untagged `.prev`. The backup slot starts CLEAN, so a stale
-            // backup from another transaction can never be confused with
-            // this transaction's backup (the fixed-name hazard: a failure
-            // in a later transaction consulting the shared `.prev` would
-            // find the STALE A and could restore it over a newer floor,
-            // rolling the floor BACKWARD). The removal is durable (parent
-            // fsync) BEFORE this transaction creates its own backup. The
-            // marker EXISTS here (the checkpoint entry repaired any torn
-            // state before calling the advance, and the guard inside
-            // [`LocalStore::reconcile_floor_backups`] restores — never
-            // deletes — a validated backup when the marker is absent), so
-            // this reconcile only ever removes genuine leftovers, never the
-            // only valid floor.
-            self.reconcile_floor_backups(&path, target)?;
-
-            // ---- TRANSACTIONAL ADVANCE, stage 1: BACKUP A ----------------
-            // Move the current floor A aside to the durable, tagged backup
-            // BEFORE B can overwrite the marker name, and make the backup
-            // durable (parent fsync) first: from here on, any failure can
-            // rename A back — the pre-advance state is never lost. The
-            // fault fires BEFORE the rename (A still in place); a real
-            // rename or sync failure restores A (only from THIS
-            // transaction's tagged backup) and fails the advance.
-            #[cfg(test)]
-            if self
-                .fault_registry()
-                .consume(FaultKind::RenameFloorBackup, floor.deployment_id.as_str())
-            {
-                // A never moved (the fault fires before the rename): there
-                // is nothing to restore — drop B's staged temp and fail.
-                // The previous floor A stands untouched.
-                let _ = std::fs::remove_file(&tmp);
-                return Err(Error::store(
-                    "test fault: history-floor backup rename forced to fail once",
-                ));
-            }
-            // The REAL backup rename (A → the durable, TRANSACTION-TAGGED
-            // backup), routed through the injectable filesystem boundary so
-            // a test can fail the ACTUAL call BEFORE A moves. A real
-            // failure leaves A at the marker name (rename is atomic — the
-            // backup does not exist): the cleanup-and-restore handler's
-            // TRI-STATE `path` guard (`path_state(backup)` — only a genuine
-            // NotFound means "no backup", and a stat failure stops the
-            // cleanup with A untouched) keeps A at the marker name and drops
-            // only B's staged temp — a failed backup can never erase the
-            // previous floor.
-            floor_fs_rename(&path, &backup).map_err(|e| {
-                self.cleanup_and_restore(
-                    &path,
-                    &backup,
-                    &tmp,
-                    true,
-                    previous_floor.as_ref(),
-                    floor.deployment_id.as_str(),
-                    Error::store(format!("rename floor {}: {e}", path.display())),
-                )
-            })?;
-            // The BACKUP must be durable before B can overwrite the marker
-            // name: without this sync, a later failure could leave the
-            // marker name empty with A only in a not-yet-durable backup. A
-            // real sync failure is POST-BACKUP (A already moved): the ONE
-            // cleanup-and-restore handler restores A and propagates the
-            // original error.
-            if let Err(e) = sync_parent_dir(&path) {
-                return Err(self.cleanup_and_restore(
-                    &path,
-                    &backup,
-                    &tmp,
-                    true,
-                    previous_floor.as_ref(),
-                    floor.deployment_id.as_str(),
-                    e,
-                ));
-            }
-        }
-
-        // ---- TRANSACTIONAL ADVANCE, stage 2: B's rename + commit point ----
-        // From here on EVERY failure is POST-BACKUP (A sits in the durable
-        // backup): the injected [`FaultKind::RenameFloor`] fault, a REAL
-        // temp→marker rename error (the ACTUAL fs call, routed through the
-        // injectable filesystem boundary [`floor_fs_rename`]), the injected
-        // [`FaultKind::SyncFloorParent`] fault, and a REAL parent-sync
-        // error ALL route through the ONE cleanup-and-restore handler
-        // ([`LocalStore::cleanup_and_restore`]) — restoring A from the
-        // backup, removing B's temp artifact, and propagating the ORIGINAL
-        // error. A real rename failure is NOT special-cased: without the
-        // handler it would leave the marker absent, B never installed, and
-        // A in the backup — NO floor (discarded history re-exposed).
+        write_atomic_replace(&path, buf.as_bytes())?;
         #[cfg(test)]
         if self
             .fault_registry()
-            .consume(FaultKind::RenameFloor, floor.deployment_id.as_str())
+            .consume(FaultKind::LedgerReplaceAfter, target)
         {
-            return Err(self.cleanup_and_restore(
-                &path,
-                &backup,
-                &tmp,
-                had_floor,
-                previous_floor.as_ref(),
-                floor.deployment_id.as_str(),
-                Error::store("test fault: history-floor rename forced to fail once"),
+            return Err(Error::store(
+                "test fault: ledger suffix replacement forced to fail after the replace",
             ));
-        }
-        // The REAL temp→marker rename, through the injectable filesystem
-        // boundary: a test seam fails the ACTUAL call — after A was backed
-        // up — and the REAL error routes through the SAME
-        // cleanup-and-restore handler as the injected faults.
-        floor_fs_rename(&tmp, &path).map_err(|e| {
-            self.cleanup_and_restore(
-                &path,
-                &backup,
-                &tmp,
-                had_floor,
-                previous_floor.as_ref(),
-                floor.deployment_id.as_str(),
-                Error::store(format!("rename {}: {e}", path.display())),
-            )
-        })?;
-
-        // Stage fault: B's commit-point parent fsync (the durability
-        // COMMIT POINT — B's marker may already be renamed into place when
-        // this fires). Fail-closed: B never committed — the ONE
-        // cleanup-and-restore handler removes B's artifact at the marker
-        // name and restores A from the backup, so the failed advancement
-        // leaves EXACTLY the pre-advance state (floor A durable, same
-        // visible suffix, no compaction side effects).
-        #[cfg(test)]
-        if self
-            .fault_registry()
-            .consume(FaultKind::SyncFloorParent, floor.deployment_id.as_str())
-        {
-            // B may already be renamed into place: the handler removes
-            // B's marker so no B exists, then restores A from the tagged
-            // backup (the marker name reverts to the pre-advance floor). If
-            // the restore ITSELF fails, the marker is left absent while the
-            // tagged backup holds A — a torn state every read fails closed
-            // on.
-            return Err(self.cleanup_and_restore(
-                &path,
-                &backup,
-                &tmp,
-                had_floor,
-                previous_floor.as_ref(),
-                floor.deployment_id.as_str(),
-                Error::store("test fault: history-floor parent sync forced to fail once"),
-            ));
-        }
-        // The parent-directory fsync is B's DURABILITY COMMIT POINT: it is
-        // what makes B's rename survive power loss. Fail-closed — a real
-        // sync failure means B never committed, so the ONE
-        // cleanup-and-restore handler removes B's marker and restores A
-        // from the backup (mirror the torn-record cleanup).
-        if let Err(e) = sync_parent_dir(&path) {
-            return Err(self.cleanup_and_restore(
-                &path,
-                &backup,
-                &tmp,
-                had_floor,
-                previous_floor.as_ref(),
-                floor.deployment_id.as_str(),
-                e,
-            ));
-        }
-        // COMMITTED: B is durable. Remove THIS transaction's tagged backup
-        // — best-effort (a leftover `.prev.<B>` holding A is harmless: it
-        // carries B's tag, so no OTHER transaction ever restores it, and
-        // every read is keyed on the marker, never the backup), then fsync
-        // the parent so the removal itself is durable. A removal failure is
-        // absorbed: the NEXT advance's pre-start reconciliation removes the
-        // leftover durably.
-        #[cfg(test)]
-        if self
-            .fault_registry()
-            .consume(FaultKind::RemoveFloorBackup, floor.deployment_id.as_str())
-        {
-            // Test fault: the success-path backup removal is FORCED to fail
-            // (the tagged backup — holding the PRE-advance floor A — stays
-            // on disk). Harmless by design: the next advance's pre-start
-            // reconciliation removes it durably, and no other transaction
-            // ever restores it.
-        } else if had_floor && std::fs::remove_file(&backup).is_ok() {
-            let _ = sync_parent_dir(&path);
         }
         Ok(())
     }
 
-    /// Durably remove every leftover backup sibling of the floor marker
-    /// (`history-floor.json.prev*` — the tagged backups of OTHER
-    /// transactions whose success-path cleanup was faulted, plus any legacy
-    /// untagged `.prev`), then fsync the parent so the removal is durable.
-    /// Runs at the START of an ADVANCE, BEFORE the current floor is moved
-    /// aside ([`LocalStore::write_history_floor`]): the backup slot starts
-    /// CLEAN, so a stale backup from another transaction can never be
-    /// confused with this transaction's backup — and can never be restored
-    /// over a newer floor (a stale A is never treated as the active floor).
-    /// Removal errors PROPAGATE (fail-closed: an advance must not proceed
-    /// while a leftover backup that a later failure could mistake for its
-    /// own still sits in the directory).
-    ///
-    /// TORN-ADVANCE GUARD (the composition with the checkpoint's automatic
-    /// repair): a leftover backup with the marker ABSENT is a TORN ADVANCE
-    /// — the backup may be the ONLY valid floor — NEVER a "leftover of
-    /// another transaction". Reconcile only REMOVES backups when the marker
-    /// EXISTS. When the marker is absent and a VALIDATED backup exists it
-    /// RESTORES the backup (rename + parent-dir fsync — the production
-    /// repair, [`LocalStore::recover_history_floor_backup`]) instead, then
-    /// removes any remaining siblings now that the marker exists again;
-    /// when the marker is absent and leftovers exist but NONE validates it
-    /// FAILS CLOSED (an unvalidatable backup is never deleted while the
-    /// marker is absent — it may be the only record of the floor — and
-    /// never restored). The checkpoint entry runs the same repair before
-    /// this advance ever starts, so this guard is defense-in-depth for any
-    /// caller that reaches an advance directly in the torn state.
-    fn reconcile_floor_backups(&self, path: &Path, target: &str) -> Result<()> {
-        // TORN-ADVANCE GUARD: when the marker is ABSENT, backup siblings
-        // are the torn state — the VALIDATED one is the ONLY valid floor
-        // and must be RESTORED, never deleted. (The checkpoint entry
-        // already repaired the torn state before calling the advance; this
-        // guard is defense-in-depth so a direct advance call can never
-        // delete the only valid floor.) The restore is a no-op when nothing
-        // is left over and FAILS CLOSED when leftovers exist but none
-        // validates — an unvalidatable backup is never deleted while the
-        // marker is absent.
-        if !path_state(path)? {
-            self.recover_history_floor_backup(target)?;
-        }
-        // Marker EXISTS (restored by the guard above, or never torn):
-        // durably remove every leftover backup sibling. Removal errors
-        // PROPAGATE (fail-closed: an advance must not proceed while a
-        // leftover backup that a later failure could mistake for its own
-        // still sits in the directory).
-        for leftover in floor_backup_siblings(path)? {
-            std::fs::remove_file(&leftover).map_err(|e| {
-                Error::store(format!(
-                    "reconcile stale history-floor backup {}: {e}",
-                    leftover.display()
-                ))
-            })?;
-        }
-        // Make the removal durable BEFORE this transaction creates its own
-        // backup (the parent fsync is what makes a removal/rename survive
-        // power loss).
-        sync_parent_dir(path)
-    }
+    // ---- the global reachability sweep (step 3 — best-effort) -------------
 
-    /// The ONE cleanup-and-restore handler for a failed transactional
-    /// ADVANCE (A → B). Runs on EVERY failure after the advance started
-    /// touching the marker — the REAL backup-rename error (A may or may not
-    /// have moved), the injected [`FaultKind::RenameFloor`] fault, a REAL
-    /// temp→marker rename error (the ACTUAL fs call, routed through the
-    /// injectable filesystem boundary [`floor_fs_rename`]), the injected
-    /// [`FaultKind::SyncFloorParent`] fault, and a REAL parent-sync error.
+    /// Compute the LOCAL store's reachable set for a sweep: everything the
+    /// sweep must keep —
     ///
-    /// The handler restores the pre-advance state and propagates the
-    /// ORIGINAL error:
+    /// * EVERY target's CURRENT ledger (after a checkpoint the retained
+    ///   suffix IS the ledger, so this is "or its retained suffix"): each
+    ///   entry's deployment id (its `deployments/<id>/` dir), the artifacts
+    ///   referenced by its intent (`desired` + `pre_push`), and its terminal
+    ///   rollback's release + per-slot trees,
+    /// * the CURRENT/INCOMPLETE state: every target's `observed.json`
+    ///   artifacts (release + tree) and `last_deployment` ids, plus
+    ///   in-flight pending entries (intent without a terminal — their
+    ///   `deployments/<id>/` dirs stay),
+    /// * every configured PIN: a release pin marks the WHOLE release (its
+    ///   record and every variant tree in it).
     ///
-    /// 1. best-effort remove B's STAGED TEMP (`tmp`) — it exists at the
-    ///    pre-rename stages (a fault, a failed temp→marker rename) and is
-    ///    gone once B's rename succeeded (a no-op then),
-    /// 2. best-effort remove B's artifact at the MARKER NAME (`path`) — the
-    ///    half-installed B marker after B's rename succeeded — but ONLY
-    ///    when removing it cannot erase the previous floor: after A moved
-    ///    aside (`backup` exists, so `path` is absent or B's marker), or on
-    ///    a first-ever write (`had_floor == false`; `path` is absent or B's
-    ///    marker — A never lived there). A failed BACKUP rename on an
-    ///    ADVANCE (`had_floor == true`, no `backup`) leaves A at `path` —
-    ///    that file is A and must NOT be removed,
-    /// 3. restore A from the tagged backup via
-    ///    [`LocalStore::restore_floor_backup`] (atomic rename over the
-    ///    marker name + parent fsync — a no-op when the advance failed
-    ///    before A moved; the restore is TAG- AND CONTENT-VERIFIED and
-    ///    FAIL-CLOSED when it itself fails),
-    /// 4. propagate the ORIGINAL error — wrapped ONLY when the restore also
-    ///    failed, naming it (a double failure leaves a torn state — marker
-    ///    absent, the tagged backup holds A — every read fails closed on).
-    #[allow(clippy::too_many_arguments)]
-    fn cleanup_and_restore(
-        &self,
-        path: &Path,
-        backup: &Path,
-        tmp: &Path,
-        had_floor: bool,
-        previous_floor: Option<&HistoryFloor>,
-        deployment_id: &str,
-        original: Error,
-    ) -> Error {
-        // 1. B's staged temp (pre-rename stages only; a no-op after B's
-        //    rename succeeded — the temp no longer exists).
-        let _ = std::fs::remove_file(tmp);
-        // 2. B's marker-name artifact — never A (see the doc above for the
-        //    guard: the failed-backup-rename case keeps A at `path`). The
-        //    guard is TRI-STATE ([`path_state`]): a filesystem ERROR on the
-        //    backup stat is NEVER read as "no backup" (which would remove A
-        //    at `path` when the backup actually exists — a failed advance
-        //    could then erase the previously durable floor) and NEVER read
-        //    as "backup exists" (which would remove A when the stat failed
-        //    and A still occupies the marker name). Fail-closed: on an
-        //    unreadable backup state the handler STOPS — A is left exactly
-        //    where it is and the original error is wrapped with the stat
-        //    failure (the restore below would fail on the same stat anyway;
-        //    every read then fails closed on the torn state).
-        match path_state(backup) {
-            Ok(true) => {
-                let _ = std::fs::remove_file(path);
-            }
-            Ok(false) => {
-                if !had_floor {
-                    let _ = std::fs::remove_file(path);
+    /// Bindings are `(release_id, variant, tree_digest)`; a pin marks every
+    /// variant/tree of its release. `deployments/<id>/` dirs of the
+    /// retained ledger entries AND observed `last_deployment`s are reachable.
+    pub(crate) fn reachable_set(&self, config: &Config) -> Result<ReachableSet> {
+        let mut out = ReachableSet::default();
+        let targets_dir = self.base().join("targets");
+        let mut target_names: Vec<String> = Vec::new();
+        if path_state(&targets_dir)? {
+            for dir in std::fs::read_dir(&targets_dir)
+                .map_err(|e| Error::store(format!("read_dir targets: {e}")))?
+            {
+                let dir = dir.map_err(|e| Error::store(format!("target entry: {e}")))?;
+                if dir.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    target_names.push(dir.file_name().to_string_lossy().into_owned());
                 }
             }
-            Err(e) => {
-                return Error::store(format!(
-                    "{original}; cannot stat the floor backup {} ({e}) during cleanup — the marker-name file is left in place and every read fails closed",
-                    backup.display()
-                ));
+        }
+        target_names.sort();
+        for name in &target_names {
+            for entry in self.read_ledger(name)? {
+                // The entry's deployment dir (an in-flight entry without a
+                // terminal is the CURRENT/INCOMPLETE state — its dir stays).
+                out.deployments
+                    .insert(entry.deployment_id.as_str().to_string());
+                // Intent-referenced artifacts (desired + pre-push).
+                for g in entry.intent.desired.values() {
+                    out.releases
+                        .insert(g.assignment.artifact.release.as_str().to_string());
+                    out.trees
+                        .insert(g.assignment.artifact.tree.as_str().to_string());
+                }
+                for s in entry.intent.pre_push.values().flatten() {
+                    out.releases.insert(s.artifact.release.as_str().to_string());
+                    out.trees.insert(s.artifact.tree.as_str().to_string());
+                }
+                // The terminal's rollback payload (release + per-slot trees).
+                if let Some(rollback) = entry.terminal.as_ref().and_then(|t| t.rollback.clone()) {
+                    out.releases.insert(rollback.release.as_str().to_string());
+                    for g in rollback.slots.values() {
+                        out.releases
+                            .insert(g.assignment.artifact.release.as_str().to_string());
+                        out.trees
+                            .insert(g.assignment.artifact.tree.as_str().to_string());
+                    }
+                }
+            }
+            // The current OBSERVED artifacts + last deployments.
+            if let Ok(observed) = self.read_global_observed() {
+                for slot in observed.values() {
+                    if let Some(d) = &slot.last_deployment {
+                        out.deployments.insert(d.as_str().to_string());
+                    }
+                    if let Some(a) = &slot.artifact {
+                        out.releases.insert(a.release.as_str().to_string());
+                        out.trees.insert(a.tree.as_str().to_string());
+                    }
+                }
             }
         }
-        // 3. + 4. Restore A (tag- and content-verified) and propagate the
-        //    original error (wrapped only when the restore itself failed).
-        match self.restore_floor_backup(path, backup, previous_floor, deployment_id) {
-            Ok(()) => original,
-            Err(re) => Error::store(format!(
-                "{original}; restore of the previous floor failed ({re}) — the marker is left in a torn state and every read fails closed"
-            )),
+        // Durable pins: a pin marks the WHOLE release — its record and every
+        // variant's tree. Config pins (`deploy.toml` `[[pins]]`) AND the
+        // store-level pins (`pins.json` — [`crate::records::Pins`]) are both
+        // retention anchors: the checkpoint is store-only by construction, but
+        // the CLI accepts both surfaces.
+        for pin in &config.pins {
+            let rid = crate::model::ReleaseId::parse(&pin.release);
+            if let Ok(rec) = self.read_release(&rid) {
+                out.releases.insert(rec.release_id.clone());
+                for tree in rec.variants.values() {
+                    out.trees.insert(tree.clone());
+                }
+            }
         }
+        if let Ok(pins) = self.read_pins() {
+            for rid in &pins.releases {
+                out.releases.insert(rid.as_str().to_string());
+                if let Ok(rec) = self.read_release(rid) {
+                    for tree in rec.variants.values() {
+                        out.trees.insert(tree.clone());
+                    }
+                }
+            }
+            for b in &pins.bindings {
+                out.releases.insert(b.release.as_str().to_string());
+                out.trees.insert(b.tree.as_str().to_string());
+            }
+        }
+        Ok(out)
     }
-    /// Restore the PRE-ADVANCE floor A after a failed ADVANCE (A → B):
-    /// rename the durable, TRANSACTION-TAGGED backup
-    /// `history-floor.json.prev.<B-id>` back over the marker name (atomic on
-    /// POSIX — it overwrites any half-installed B marker) and fsync the
-    /// parent so the restore is durable. A no-op when no backup exists (the
-    /// advance failed before A was ever moved aside — A is still the
-    /// durable marker). THE DOCUMENTED RECOVERY of a torn advance IS THIS
-    /// OPERATION — the backup is the only valid floor and is restored,
-    /// never deleted (see [`LocalStore::recover_history_floor_backup`]).
-    ///
-    /// NEVER RESTORES A FOREIGN BACKUP: the restore verifies the backup
-    /// name carries the CURRENT advance's tag (`deployment_id`) AND that
-    /// its content parses and equals `previous_floor` — the pre-advance
-    /// floor the transaction moved aside, read at the start of the
-    /// transaction ([`LocalStore::write_history_floor`]). A backup that
-    /// fails either check is REFUSED (integrity error) and NEVER renamed
-    /// over the marker: a stale backup from another transaction — which
-    /// could roll the durable floor BACKWARD and re-expose the discarded
-    /// below-floor history — can never be restored. (The caller always
-    /// passes this transaction's tagged path, so the name check is
-    /// defense-in-depth; the content check is the belt-and-braces against
-    /// any stale or foreign backup that somehow reached the tagged slot.)
-    ///
-    /// FAIL-CLOSED: the [`FaultKind::RestoreFloor`](crate::testutil::test_faults::FaultKind::RestoreFloor) fault (and any real
-    /// rename/sync error) makes the restore itself fail: A stays in the
-    /// backup and the marker keeps the failed stage's state — possibly
-    /// ABSENT. The readers ([`LocalStore::read_history_floor`]) then treat
-    /// a VALIDATED backup as the active floor A (a torn advance is never
-    /// "no floor" — which would expose the below-floor prefix) and fail
-    /// closed only when the backup itself fails validation, so a double
-    /// failure can never expose history below A.
-    fn restore_floor_backup(
+
+    /// Enumerate the unreachable deployment dirs, release dirs, and object
+    /// dirs a sweep would delete (or deleted): the difference between what
+    /// EXISTS under `deployments/`, `releases/`, `objects/sha256/` and the
+    /// reachable set. Pure read — the dry-run preview and the real sweep
+    /// share it, so the preview enumerates EXACTLY what the sweep removes.
+    pub(crate) fn sweep_discards(&self, config: &Config) -> Result<LedgerDiscards> {
+        let reachable = self.reachable_set(config)?;
+        let mut discards = LedgerDiscards::default();
+        let depl_root = self.base().join("deployments");
+        if path_state(&depl_root)? {
+            let mut names: Vec<String> = std::fs::read_dir(&depl_root)
+                .map_err(|e| Error::store(format!("read_dir deployments: {e}")))?
+                .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+                .collect::<std::io::Result<_>>()
+                .map_err(|e| Error::store(format!("deployments entry: {e}")))?;
+            names.sort();
+            for n in names {
+                if !reachable.deployments.contains(&n) {
+                    discards.sweep_deployments.push(n);
+                }
+            }
+        }
+        let rel_root = self.base().join(crate::layout::RELEASES);
+        if path_state(&rel_root)? {
+            let mut names: Vec<String> = std::fs::read_dir(&rel_root)
+                .map_err(|e| Error::store(format!("read_dir releases: {e}")))?
+                .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+                .collect::<std::io::Result<Vec<_>>>()
+                .map_err(|e| Error::store(format!("releases entry: {e}")))?;
+            names.sort();
+            for n in names {
+                if !reachable.releases.contains(&n) {
+                    discards.sweep_releases.push(n);
+                }
+            }
+        }
+        let obj_root = self.base().join(crate::layout::objects());
+        if path_state(&obj_root)? {
+            let mut names: Vec<String> = std::fs::read_dir(&obj_root)
+                .map_err(|e| Error::store(format!("read_dir objects: {e}")))?
+                .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+                .collect::<std::io::Result<Vec<_>>>()
+                .map_err(|e| Error::store(format!("objects entry: {e}")))?;
+            names.sort();
+            for n in names {
+                if !reachable.trees.contains(&n) {
+                    discards.sweep_objects.push(n);
+                }
+            }
+        }
+        Ok(discards)
+    }
+
+    /// Run the best-effort GLOBAL SWEEP: delete every unreachable deployment
+    /// directory, release record, and tree object. Each stage is
+    /// independently fault-injectable: the deployment stage
+    /// ([`FaultKind::SweepDeployments`]), the release stage
+    /// ([`FaultKind::SweepReleases`]) and the object stage
+    /// ([`FaultKind::SweepObjects`]) each fire at the stage's entry, so a
+    /// faulted stage deletes nothing and the report says sweep
+    /// retry-required. The release-record and tree-object stages are performed
+    /// by the GLOBAL ARTIFACT GC ([`crate::store::gc::LocalStore::gc_artifacts`])
+    /// — its own faults ([`FaultKind::GcScan`] / [`FaultKind::GcDeleteReleases`]
+    /// / [`FaultKind::GcDeleteTrees`]) fire inside the pass. Deletions are
+    /// tri-state (`path_state`): an already-removed target is skipped; ANY
+    /// other stat or removal error stops the stage. Returns the performed
+    /// deletions and whether EVERY stage ran clean.
+    pub(crate) fn run_sweep(
         &self,
-        path: &Path,
-        backup: &Path,
-        previous_floor: Option<&HistoryFloor>,
-        deployment_id: &str,
-    ) -> Result<()> {
-        // Stage fault: the RESTORE itself (keyed by the checkpoint
-        // deployment id, matching every other floor stage). Fires BEFORE
-        // any restore I/O — the restore could not even begin, so the tagged
-        // backup still holds A and the marker keeps whatever state the
-        // failed stage left.
+        config: &Config,
+        anchor: &str,
+    ) -> Result<(LedgerDiscards, bool)> {
+        let discards = self.sweep_discards(config)?;
+        let mut complete = true;
+        // Stage 1: deployment directories.
         #[cfg(test)]
         if self
             .fault_registry()
-            .consume(FaultKind::RestoreFloor, deployment_id)
+            .consume(FaultKind::SweepDeployments, "")
         {
-            return Err(Error::store(
-                "test fault: history-floor restore forced to fail once",
-            ));
+            complete = false;
+        } else if let Err(e) = self.delete_dirs(&discards.sweep_deployments, "deployment") {
+            complete = false;
+            let _ = e;
         }
-        // TRI-STATE backup existence: only a genuine NotFound (the advance
-        // failed before the current floor was moved aside — the floor is
-        // still the durable marker) is "nothing to restore"; ANY other
-        // stat failure propagates (an unreadable backup must not read as
-        // "no backup", which would abandon A and leave a torn advance). A
-        // stale backup from ANOTHER transaction is a DIFFERENT tagged file
-        // and is never considered here.
-        if !path_state(backup)? {
-            return Ok(());
+        #[cfg(not(test))]
+        if let Err(_e) = self.delete_dirs(&discards.sweep_deployments, "deployment") {
+            complete = false;
         }
-        // NEVER RESTORE A FOREIGN BACKUP (name check): the backup must be
-        // THIS advance's tagged backup. The caller always passes the tagged
-        // path, so this is defense-in-depth against a caller bug or a
-        // future code path pointing the restore at another transaction's
-        // backup.
-        if *backup != floor_backup_path(path, deployment_id) {
-            return Err(Error::integrity(format!(
-                "refusing to restore history-floor backup {}: the backup does not carry the current advance's tag '{deployment_id}' — only the backup created and verified by the CURRENT transaction may be restored",
-                backup.display()
-            )));
-        }
-        // BELT-AND-BRACES CONTENT VERIFICATION: the backup must parse and
-        // equal the floor this transaction moved aside (read at the start
-        // of the advance). A backup holding anything else — a stale A that
-        // somehow survived into this tagged slot, a corrupted file, a
-        // foreign floor — is REFUSED: restoring it could roll the durable
-        // floor BACKWARD (re-exposing the discarded below-floor history).
-        // The marker is left untouched (still the current floor), never
-        // overwritten by an unverified backup.
-        let content: HistoryFloor = read_json_marker(backup)?;
-        if previous_floor != Some(&content) {
-            return Err(Error::integrity(format!(
-                "refusing to restore history-floor backup {}: its content (deployment '{}') does not match the floor this advance moved aside (deployment '{}') — only the backup created and verified by the CURRENT transaction may be restored",
-                backup.display(),
-                content.deployment_id,
-                previous_floor
-                    .map(|f| f.deployment_id.as_str())
-                    .unwrap_or("<none>"),
-            )));
-        }
-        std::fs::rename(backup, path)
-            .map_err(|e| Error::store(format!("restore floor {}: {e}", path.display())))?;
-        sync_parent_dir(path)
-    }
-
-    /// The newest leftover backup sibling of the floor marker whose content
-    /// VALIDATES as the floor — parses AND passes the full integrity
-    /// binding of [`LocalStore::validate_history_floor`] (schema version,
-    /// target binding, exact snapshot pair, matching attempt), the SAME
-    /// binding the marker path enforces — or `None` when no backup
-    /// validates. The reader's torn-advance fallback
-    /// ([`LocalStore::read_history_floor`]) and the recovery
-    /// ([`LocalStore::recover_history_floor_backup`]) share it: a leftover
-    /// backup is only ever trusted — as the ACTIVE floor or as the restore
-    /// source — when it validates; a backup that fails validation is NEVER
-    /// treated as the floor and NEVER restored (an unvalidatable backup is
-    /// not "no floor" either — the callers fail closed).
-    ///
-    /// FAIL-CLOSED CLASS SPLIT: a per-backup PARSE/INTEGRITY failure (or a
-    /// genuine NotFound — the backup vanished after enumeration) means that
-    /// backup does not VALIDATE — try the next; ANY mechanical I/O failure
-    /// (EACCES, EIO, ...) on the enumeration or the read PROPAGATES as
-    /// [`Error::store`] — a backup that cannot be READ is a disk failure,
-    /// never a silent "this backup doesn't validate" (which would read a
-    /// torn advance with an unreadable backup as "no floor").
-    fn validated_backup(
-        &self,
-        target: &str,
-        path: &Path,
-    ) -> Result<Option<(PathBuf, HistoryFloor)>> {
-        for backup in floor_backup_siblings(path)?.into_iter().rev() {
-            // Read through the injectable [`MarkerIoOps`] seam when a test
-            // installed one; production performs the REAL read. A genuine
-            // NotFound (the backup vanished after enumeration) is absence —
-            // try the next; ANY other read failure propagates as Store.
-            let bytes = match routed_read_bytes(&backup) {
-                Ok(b) => b,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(Error::store(format!("read {}: {e}", backup.display()))),
-            };
-            // Parse-sensitive: malformed content is a per-backup VALIDATION
-            // failure (this backup does not validate — try the next).
-            let floor: HistoryFloor = match serde_json::from_slice(&bytes) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            // The integrity binding: violations are per-backup validation
-            // failures (try the next); mechanical I/O during validation
-            // (the snapshot/attempt log reads) propagates.
-            match self.validate_history_floor(target, &backup, &floor) {
-                Ok(()) => return Ok(Some((backup, floor))),
-                Err(Error::Integrity(_)) => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(None)
-    }
-
-    /// RECOVER a torn floor ADVANCE ([`LocalStore::read_history_floor`]'s
-    /// validated-backup fallback): atomically restore the durable,
-    /// VALIDATED tagged backup (`history-floor.json.prev.<tag>`) as the
-    /// marker (`history-floor.json`) — the SAME rename + parent-dir fsync
-    /// [`LocalStore::restore_floor_backup`] performs when a failed advance
-    /// restores the previous floor. In a torn state (the marker ABSENT, the
-    /// backup holding the pre-advance floor A) the backup is the ONLY valid
-    /// floor — deleting it would erase the floor and re-expose the
-    /// below-floor history — so the recovery restores it and NEVER deletes
-    /// it. THIS IS THE PRODUCTION REPAIR: the checkpoint entry
-    /// ([`crate::push::checkpoint::run_checkpoint`] → `checkpoint_inner`)
-    /// invokes it automatically at the start of every checkpoint — the next
-    /// checkpoint after a torn advance restores the validated backup
-    /// (rename + parent fsync) before it proceeds — and the advance-start
-    /// backup reconciliation ([`LocalStore::reconcile_floor_backups`])
-    /// invokes it as its marker-absent branch, so no manual repair exists
-    /// anywhere in the flow. The recovery has no transaction context, so it
-    /// restores A VALIDATED backup — any leftover `.prev*` sibling whose
-    /// content passes the full integrity binding, preferring the newest —
-    /// and NEVER an unvalidated one. A no-op when the marker already exists
-    /// (a present marker is authoritative: there is nothing to recover, and
-    /// restoring the backup over it could overwrite a NEWER committed
-    /// floor) or when no backup exists. Fails closed (`Err`) when leftover
-    /// backups exist but none validates (an unvalidatable backup is never
-    /// restored over the marker — and never deleted behind the repair's
-    /// back) or when the restore cannot be made durable.
-    pub(crate) fn recover_history_floor_backup(&self, target: &str) -> Result<()> {
-        let p = self.history_floor_path(target);
-        // Tri-state: only a genuine NotFound (no marker) proceeds; any
-        // stat failure is a Store error (an unreadable marker must not read
-        // as "recoverable" or "nothing to do").
-        if path_state(&p)? {
-            return Ok(());
-        }
-        let Some((backup, _)) = self.validated_backup(target, &p)? else {
-            // No VALIDATED backup to restore: no-op when nothing is left
-            // over; fail closed when leftovers exist but none validates.
-            let leftovers = floor_backup_siblings(&p)?;
-            return if leftovers.is_empty() {
-                Ok(())
-            } else {
-                Err(Error::integrity(format!(
-                    "recover history floor for target '{target}': the durable backup {} exists but does not pass the floor integrity binding — refusing to restore an unvalidated backup over the marker",
-                    leftovers[0].display()
-                )))
-            };
-        };
-        std::fs::rename(&backup, &p)
-            .map_err(|e| Error::store(format!("recover floor {}: {e}", backup.display())))?;
-        sync_parent_dir(&p)
-    }
-
-    /// Read the target's history-floor marker, or `None` when no checkpoint
-    /// has been established. FAILS CLOSED on every integrity violation:
-    ///
-    /// * `schema_version` must be exactly [`SCHEMA_VERSION`]; any other
-    ///   version fails with an error naming the version (a floor written by
-    ///   a different schema is never silently interpreted).
-    /// * a PRESENT but MALFORMED marker (truncated JSON, wrong field types,
-    ///   missing fields) is a parse failure — also [`Error::integrity`]
-    ///   via [`read_json_marker`]. [`Error::store`] is reserved for
-    ///   mechanical filesystem I/O (open/read failures) so a caller can
-    ///   always distinguish "this marker is corrupt" from "disk read
-    ///   failed".
-    /// * (a) the marker's `target` must match the path it was read from
-    ///   (`marker.target == target`): a marker is bound to the target
-    ///   directory it lives in, so a marker smuggled into another target's
-    ///   `refs/` can never gate (or leak into) that target's history.
-    /// * (b) a snapshot must exist with EXACTLY `index == snapshot_index`
-    ///   AND `deployment_id == marker.deployment_id` — the exact snapshot
-    ///   pair, never the index alone (a floor must name a real rollback
-    ///   state that still exists).
-    /// * (c) an attempt must exist with `deployment_id ==
-    ///   marker.deployment_id` (the floor's own deployment must be in the
-    ///   target's attempts log).
-    /// * (d) TORN ADVANCE (validated-backup fallback): when the marker is
-    ///   ABSENT but a leftover backup sibling (`history-floor.json.prev.<tag>`
-    ///   — the current, transaction-tagged scheme — or a legacy untagged
-    ///   `history-floor.json.prev`) exists, an ADVANCE was interrupted
-    ///   mid-flight and its restore of the previous floor A failed. This
-    ///   state is NEVER treated as "no floor" (which would expose the
-    ///   below-floor prefix): the backup is VALIDATED against the SAME
-    ///   integrity binding as the marker — schema version, target binding,
-    ///   the exact snapshot pair, and the matching attempt, checks (a)–(c)
-    ///   above — and, when valid, IS the ACTIVE floor: the read returns A,
-    ///   exactly as if A were still the marker (a reader during a torn
-    ///   state sees the pre-advance floor, never None, never an error). A
-    ///   backup that FAILS validation is NOT trusted: the read fails closed
-    ///   with an integrity error (an unvalidatable backup is never "no
-    ///   floor" either). Recovery of the torn state is
-    ///   [`LocalStore::recover_history_floor_backup`] — the ATOMIC RESTORE
-    ///   of the backup (rename + parent-dir fsync), never its deletion.
-    ///   (A marker PRESENT alongside a leftover backup is fine — the
-    ///   success path removes the backup best-effort, and reads prefer the
-    ///   marker, never the backup.)
-    ///
-    /// Each violation is an [`Error::integrity`] error, so a corrupted or
-    /// tampered marker is NEVER silently treated as "no floor" (which would
-    /// expose the below-floor prefix): the gated readers
-    /// ([`LocalStore::read_attempts`] / [`LocalStore::read_snapshots`])
-    /// propagate the error. Crate-private: non-crate consumers use the
-    /// gated readers, never the marker directly.
-    pub(crate) fn read_history_floor(&self, target: &str) -> Result<Option<HistoryFloor>> {
-        let p = self.history_floor_path(target);
-        // TORN-ADVANCE VALIDATED-BACKUP FALLBACK (the
-        // transactional-replacement counterpart): when an ADVANCE (A → B)
-        // failed before B's durability commit point AND the restore of A
-        // also failed, the marker may be left ABSENT while the pre-advance
-        // floor A still sits in a durable backup sibling (a tagged
-        // `history-floor.json.prev.<tag>` or a legacy untagged
-        // `history-floor.json.prev`). ANY leftover backup with no marker
-        // means an advance was interrupted mid-flight and its restore
-        // failed — this is NEVER "no floor" (which would expose the
-        // below-floor prefix): the backup is VALIDATED against the SAME
-        // integrity binding as the marker (schema version, target binding,
-        // exact snapshot pair, matching attempt) and, when valid, IS the
-        // active floor — the read returns A, so a reader during a torn
-        // state sees exactly the pre-advance floor (never None, never an
-        // error). A backup that FAILS validation is NOT trusted: the read
-        // fails closed with an integrity error (an unvalidatable backup is
-        // never "no floor" either). A marker PRESENT alongside a leftover
-        // backup is fine: the success path removes the backup best-effort,
-        // and reads prefer the marker, never the backup.
-        if !path_state(&p)? {
-            // The validated-backup fallback: a VALIDATED leftover backup IS
-            // the active floor A — the torn state is read as the
-            // pre-advance floor (never None, never an error).
-            if let Some((_, floor)) = self.validated_backup(target, &p)? {
-                return Ok(Some(floor));
-            }
-            let leftovers = floor_backup_siblings(&p)?;
-            if !leftovers.is_empty() {
-                // Leftovers exist but NONE validates: fail closed (an
-                // unvalidatable backup is never "no floor" either).
-                return Err(Error::integrity(format!(
-                    "history floor for target '{target}' is missing but its durable backup {} exists: a floor ADVANCE was interrupted and its restore failed — refusing to treat this as 'no floor' (which would expose the below-floor prefix)",
-                    leftovers[0].display()
-                )));
-            }
-            return Ok(None);
-        }
-        // Parse-sensitive read: a present-but-malformed marker (truncation,
-        // wrong types, missing fields) is semantic corruption → Integrity;
-        // only an actual filesystem read failure is Store.
-        let floor: HistoryFloor = read_json_marker(&p)?;
-        self.validate_history_floor(target, &p, &floor)?;
-        Ok(Some(floor))
-    }
-
-    /// The floor's INTEGRITY BINDING, shared by the marker
-    /// ([`LocalStore::read_history_floor`]'s present-marker path) and the
-    /// validated-backup fallback (a torn advance with the marker ABSENT):
-    /// `floor` read from `source` (the marker path or the durable backup)
-    /// must pass the same checks —
-    ///
-    /// * `schema_version` must be exactly [`SCHEMA_VERSION`]; any other
-    ///   version fails with an error naming the version (a floor written by
-    ///   a different schema is never silently interpreted).
-    /// * the floor's `target` must match the path it was read from
-    ///   (`floor.target == target`): a floor is bound to the target
-    ///   directory it lives in, so a floor smuggled into another target's
-    ///   `refs/` can never gate (or leak into) that target's history.
-    /// * a snapshot must exist with EXACTLY `index == snapshot_index` AND
-    ///   `deployment_id == floor.deployment_id` — the exact snapshot pair,
-    ///   never the index alone (a floor must name a real rollback state
-    ///   that still exists).
-    /// * an attempt must exist with `deployment_id == floor.deployment_id`
-    ///   (the floor's own deployment must be in the target's attempts
-    ///   log).
-    ///
-    /// Every violation is an [`Error::integrity`] error, so a corrupted or
-    /// tampered floor — marker OR backup — is NEVER silently treated as
-    /// "no floor" (which would expose the below-floor prefix).
-    fn validate_history_floor(
-        &self,
-        target: &str,
-        source: &Path,
-        floor: &HistoryFloor,
-    ) -> Result<()> {
-        if floor.schema_version != SCHEMA_VERSION {
-            return Err(Error::integrity(format!(
-                "history floor at {} carries unsupported schema_version {} (expected {SCHEMA_VERSION}): only SCHEMA_VERSION is accepted",
-                source.display(),
-                floor.schema_version
-            )));
-        }
-        // BINDING (a): the floor must name the target directory it lives
-        // in. A floor with a foreign `target` is a tampered/corrupted floor
-        // — it is refused, not interpreted as a floor for either the path
-        // target or the named target.
-        if floor.target.as_str() != target {
-            return Err(Error::integrity(format!(
-                "history floor at {} is not bound to its path: floor.target = '{}' but the floor was read for target '{target}' (a floor must name the target directory it lives in)",
-                source.display(),
-                floor.target
-            )));
-        }
-        // (b) SNAPSHOT-PAIR BINDING: a snapshot must exist with EXACTLY
-        // `deployment_id == floor.deployment_id` — the floor names the
-        // checkpoint deployment's rollback payload (a successful deployment
-        // always owns a snapshot keyed by its id; if it no longer exists the
-        // floor points at nothing). Positions are derived from the log
-        // order, never stored — there is no separate index to bind.
-        let snapshots = self.read_snapshots_raw(target)?;
-        let bound_snapshot = snapshots
-            .iter()
-            .any(|s| s.deployment_id == floor.deployment_id);
-        if !bound_snapshot {
-            return Err(Error::integrity(format!(
-                "history floor for target '{target}' is not bound to a snapshot: no snapshot with deployment '{}' exists in refs/snapshots.jsonl (the exact rollback payload the floor names does not exist)",
-                floor.deployment_id
-            )));
-        }
-        // (c) ATTEMPT BINDING: the floor's own deployment must exist in the
-        // target's attempts log (a floor whose attempt was deleted is
-        // refused, so the checkpoint's own attempt can never be discarded
-        // behind the readers' backs).
-        let attempts = self.read_attempts_raw(target)?;
-        let bound_attempt = attempts
-            .iter()
-            .any(|a| a.deployment_id == floor.deployment_id);
-        if !bound_attempt {
-            return Err(Error::integrity(format!(
-                "history floor for target '{target}' is not bound to an attempt: no attempt with deployment '{}' exists in targets/{target}/attempts.jsonl (the floor's own deployment must be in the target's attempts log)",
-                floor.deployment_id
-            )));
-        }
-        Ok(())
-    }
-
-    /// Path of the target's pending-checkpoint-cleanup marker
-    /// (`refs/cleanup-pending.json`). Written AFTER the history floor is
-    /// durable (the checkpoint's commit point) when the post-commit
-    /// compaction could not finish: the checkpoint took effect, the cleanup
-    /// is recorded as durable debt. Cleared once the cleanup completes.
-    pub fn cleanup_pending_path(&self, target: &str) -> PathBuf {
-        self.refs_dir(target).join("cleanup-pending.json")
-    }
-
-    /// Read the target's pending-checkpoint-cleanup FLAG marker, or `None`
-    /// when no cleanup is pending. FAILS CLOSED on every integrity
-    /// violation, mirroring [`LocalStore::read_history_floor`]:
-    ///
-    /// * `schema_version` must be exactly
-    ///   [`CLEANUP_PENDING_SCHEMA_VERSION`]; any other version fails with an
-    ///   error naming the version — including the legacy version-1 shape
-    ///   that carried `pending_deployments` (serde would otherwise silently
-    ///   drop the removed field, so the version gate is what refuses it).
-    /// * the marker's `target` must match the path it was read from
-    ///   (`marker.target == target`): a marker smuggled into another
-    ///   target's `refs/` can never gate (or leak into) that target's
-    ///   cleanup decision.
-    /// * when `floor` is present, the marker's `deployment_id` and
-    ///   `snapshot_index` must EXACTLY match the floor's — the marker is the
-    ///   pending-cleanup flag FOR THAT floor, and a corrupted/tampered
-    ///   marker (arbitrary target/anchor/deployment ids) must never be
-    ///   trusted for the pending/repair decision.
-    ///
-    /// Each violation is an [`Error::integrity`] error (a schema-version
-    /// violation is an [`Error::store`] error naming the version, mirroring
-    /// the floor), so a corrupted marker is NEVER silently treated as "no
-    /// pending cleanup". The checkpoint retry treats a failed read as debt
-    /// outstanding: it recomputes the discards from the intact logs and
-    /// converges regardless, so the worst case is a self-healing re-run.
-    pub fn read_cleanup_pending(
-        &self,
-        target: &str,
-        floor: Option<&HistoryFloor>,
-    ) -> Result<Option<CleanupPending>> {
-        let p = self.cleanup_pending_path(target);
-        // Tri-state: only a genuine NotFound is "no pending cleanup"; a
-        // stat failure (EACCES, EIO, ...) propagates as a Store error — a
-        // permission error on the marker directory must not read as "no
-        // pending cleanup" (the retry would treat a stuck debt as clean).
-        if !path_state(&p)? {
-            return Ok(None);
-        }
-        // Parse-sensitive read: malformed CONTENT is Integrity, filesystem
-        // I/O failure is Store (same class split as the history floor).
-        let pending: CleanupPending = read_json_marker(&p)?;
-        if pending.schema_version != CLEANUP_PENDING_SCHEMA_VERSION {
-            return Err(Error::integrity(format!(
-                "cleanup-pending marker for target '{target}' carries unsupported schema_version {} (expected {CLEANUP_PENDING_SCHEMA_VERSION}): only CLEANUP_PENDING_SCHEMA_VERSION is accepted (the legacy version-1 shape with pending_deployments is refused, never reinterpreted)",
-                pending.schema_version
-            )));
-        }
-        // BINDING (a): the marker must name the target directory it lives in
-        // — a marker with a foreign `target` is a tampered/corrupted marker
-        // and is refused, not interpreted for either path.
-        if pending.target.as_str() != target {
-            return Err(Error::integrity(format!(
-                "cleanup-pending marker at {} is not bound to its path: marker.target = '{}' but the marker was read for target '{target}' (a cleanup marker must name the target directory it lives in)",
-                p.display(),
-                pending.target
-            )));
-        }
-        // BINDING (b): when a floor is present, the marker must name
-        // EXACTLY that floor's deployment — the marker is the pending-
-        // cleanup flag for the floor it accompanies, and a corrupted anchor
-        // must never be trusted for the pending/repair decision.
-        if let Some(floor) = floor
-            && pending.deployment_id != floor.deployment_id
-        {
-            return Err(Error::integrity(format!(
-                "cleanup-pending marker for target '{target}' is not bound to the history floor: marker names deployment '{}' but the floor names deployment '{}' (a cleanup marker must name exactly the floor it accompanies)",
-                pending.deployment_id, floor.deployment_id
-            )));
-        }
-        Ok(Some(pending))
-    }
-
-    /// Record the target's pending-checkpoint-cleanup debt durably (atomic
-    /// temp+rename, mirroring [`LocalStore::write_history_floor`]). The
-    /// write is itself POST-COMMIT MAINTENANCE, so a failure must NEVER
-    /// turn the checkpoint into an `Err` — the caller decides how to
-    /// surface it (the checkpoint flow sets
-    /// `CheckpointReport::cleanup_persistence_failed`: the report must NOT
-    /// claim durable debt that a crash/restart would lose). The error is
-    /// PROPAGATED here so the caller can tell a durable debt from a lost
-    /// one.
-    pub fn write_cleanup_pending(&self, target: &str, pending: &CleanupPending) -> Result<()> {
-        // Fault hook (keyed by the floor's deployment id — the marker's
-        // own anchor), fired BEFORE any I/O: a failure here means the debt
-        // could not be made durable.
+        // Stages 2+3: unreachable release records and tree objects — the
+        // artifact GC recomputes the retained set from the ledgers (each
+        // target's ledger / retained suffix), the observed slot state, the
+        // pending entries, and the pins, then unlinks the unreachable
+        // releases and objects. The `SweepReleases` / `SweepObjects` stage
+        // faults each block the whole artifact pass BEFORE any deletion; the
+        // GC's own faults (`GcScan` / `GcDeleteReleases` / `GcDeleteTrees`)
+        // fire inside it.
         #[cfg(test)]
-        if self.fault_registry().consume(
-            FaultKind::WriteCleanupPending,
-            pending.deployment_id.as_str(),
-        ) {
-            return Err(Error::store(
-                "test fault: cleanup-pending marker write forced to fail once",
-            ));
-        }
-        let bytes = serde_json::to_vec_pretty(pending)
-            .map_err(|e| Error::store(format!("serialize cleanup-pending: {e}")))?;
-        write_atomic_replace(&self.cleanup_pending_path(target), &bytes)
-    }
-
-    /// Clear the target's pending-checkpoint-cleanup marker once the
-    /// physical compaction completed. DURABLE removal: the file is removed
-    /// AND the parent directory is fsynced ([`sync_parent_dir`]) — without
-    /// the directory fsync a crash can RESURRECT the marker (the removal
-    /// is not durable until the directory entry is synced). A no-op when
-    /// no marker exists.
-    ///
-    /// A clear failure is itself POST-COMMIT MAINTENANCE: the stale marker
-    /// stays on disk (harmless — every read is keyed on the history floor,
-    /// never this flag) and the next same-deployment checkpoint re-clears
-    /// it; the checkpoint flow surfaces the failure truthfully as
-    /// `CheckpointReport::cleanup_clear_failed`. The error is PROPAGATED
-    /// here so the caller can distinguish a converged clear from a stale
-    /// marker.
-    pub fn clear_cleanup_pending(&self, target: &str) -> Result<()> {
-        let p = self.cleanup_pending_path(target);
-        // Tri-state: only a genuine absence is "nothing to clear"; a stat
-        // failure propagates (an unreadable marker must not silently stay
-        // as a stale-but-claimed-cleared marker).
-        if path_state(&p)? {
-            // Fault hook (keyed by TARGET — the marker lives under
-            // `targets/<target>/refs/`, mirroring the rotation-debt kinds),
-            // fired BEFORE any I/O: a failure here leaves the marker in
-            // place (stale but harmless).
-            #[cfg(test)]
-            if self
-                .fault_registry()
-                .consume(FaultKind::ClearCleanupPending, target)
-            {
-                return Err(Error::store(
-                    "test fault: cleanup-pending marker clear forced to fail once",
-                ));
-            }
-            std::fs::remove_file(&p).map_err(|e| {
-                Error::store(format!(
-                    "remove cleanup-pending marker {}: {e}",
-                    p.display()
-                ))
-            })?;
-            // DURABLE removal: propagate the parent-dir sync error exactly
-            // like every other durability commit point in this module — a
-            // crash must never resurrect the marker.
-            sync_parent_dir(&p)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// The exact discard set a checkpoint floor applies on `target`: the
-    /// attempts strictly before the checkpoint's own attempt, the snapshots
-    /// STRICTLY BEFORE the checkpoint deployment's POSITION in the log
-    /// (the deployment-keyed analog of the old `index < floor.snapshot_index`
-    /// — positions are DERIVED from the log order, never stored), and the
-    /// union of their deployment ids (the `deployments/<id>/` directories
-    /// the compaction deletes). Pure read over the physical logs; the
-    /// dry-run preview and the compaction itself share it, so the preview
-    /// enumerates EXACTLY what the compaction removes. Crate-private: only
-    /// the checkpoint flow (and the in-crate integrity tests) computes
-    /// discards.
-    pub(crate) fn checkpoint_discards(
-        &self,
-        target: &str,
-        floor: &HistoryFloor,
-    ) -> Result<FloorDiscards> {
-        let attempts = self.read_attempts_raw(target)?;
-        let snapshots = self.read_snapshots_raw(target)?;
-        // FAIL CLOSED: the floor's deployment MUST be in the target's
-        // attempts log. The old `unwrap_or(0)` fallback silently discarded
-        // EVERYTHING before the checkpoint (including the checkpoint's own
-        // attempt) when the id was missing; with the read-time binding this
-        // is unreachable via the public flow, but the raw path must still
-        // refuse rather than guess.
-        let keep_from = attempts
-            .iter()
-            .position(|a| a.deployment_id == floor.deployment_id)
-            .ok_or_else(|| {
-                Error::integrity(format!(
-                    "checkpoint discard computation for target '{target}': the floor's deployment '{}' does not exist in the target's attempts log — refusing to enumerate discards for an unbound floor",
-                    floor.deployment_id
-                ))
-            })?;
-        let discarded_attempts: Vec<String> = attempts
-            .iter()
-            .take(keep_from)
-            .map(|a| a.deployment_id.as_str().to_string())
-            .collect();
-        // The snapshot discard set is the log prefix strictly before the
-        // floor deployment's position: every snapshot whose position in the
-        // RAW log precedes the checkpoint deployment's position (the
-        // deployment-keyed analog of `index < floor.snapshot_index` — the
-        // checkpoint deployment's OWN position is the floor, so its snapshot
-        // is never discarded).
-        let snap_floor_pos = snapshots
-            .iter()
-            .position(|s| s.deployment_id == floor.deployment_id);
-        let discarded_snapshots: Vec<String> = snapshots
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| snap_floor_pos.is_some_and(|f| *i < f))
-            .map(|(_, s)| s.deployment_id.as_str().to_string())
-            .collect();
-        // Deployment dirs strictly before the floor: every snapshot
-        // deployment before the floor plus every failed attempt before the
-        // checkpoint's own attempt (failed attempts carry no snapshot entry
-        // but still own a `deployments/<id>/` directory). Deduplicated in a
-        // deterministic order: snapshot-derived ids first (by log position),
-        // then attempt-derived ids not already listed.
-        let mut discarded_deployments: Vec<String> = Vec::new();
-        for (pos, s) in snapshots.iter().enumerate() {
-            if !snap_floor_pos.is_some_and(|f| pos < f) {
-                break;
-            }
-            let id = s.deployment_id.as_str().to_string();
-            if !discarded_deployments.contains(&id) {
-                discarded_deployments.push(id);
-            }
-        }
-        for a in attempts.iter().take(keep_from) {
-            let id = a.deployment_id.as_str().to_string();
-            if !discarded_deployments.contains(&id) {
-                discarded_deployments.push(id);
-            }
-        }
-        Ok(FloorDiscards {
-            discarded_attempts,
-            discarded_snapshots,
-            discarded_deployments,
-        })
-    }
-
-    /// Physically compact the target's history to the suffix beginning at
-    /// `floor` (the compaction half of a checkpoint; the floor marker must
-    /// already be durable — [`LocalStore::write_history_floor`] first):
-    ///
-    /// 1. Delete every `deployments/<id>/` directory strictly before the
-    ///    floor.
-    /// 2. Atomically rewrite `attempts.jsonl` to the checkpoint's own
-    ///    attempt and everything after it.
-    /// 3. Atomically rewrite `snapshots.jsonl` to the suffix beginning at
-    ///    the checkpoint deployment's position in the log (positions are
-    ///    DERIVED from the log order — never stored; the deployment-keyed
-    ///    analog of the old `index >= floor.snapshot_index`).
-    ///
-    /// The deletion runs FIRST because it is the only phase whose worklist
-    /// lives solely in memory: [`LocalStore::checkpoint_discards`] derives
-    /// it from the RAW logs at the start of THIS call. Deleting before the
-    /// log rewrites keeps that derivation source intact, so an interruption
-    /// at ANY point (and any subsequent retry) recomputes the same list from
-    /// the still-intact — or already-rewritten — logs and converges:
-    /// already-removed dirs are skipped by the tri-state existence check
-    /// (a `NotFound` stat — the dir an interrupted pass removed — is a
-    /// skip; ANY other stat error PROPAGATES: an enumeration error
-    /// mid-delete must never silently end the pass early, leaving a
-    /// below-floor directory undeleted), and the
-    /// temp+rename rewrites leave old-or-new logs. Reversing the order would
-    /// lose the worklist permanently: once the logs are compacted the
-    /// discarded ids are gone from them, so a retry could never re-enumerate
-    /// — let alone delete — the below-floor directories (failed attempts own
-    /// a `deployments/<id>/` dir but NO snapshot line, so nothing else names
-    /// them). Delete-first is safe because the durable floor already gates
-    /// every read path (`read_attempts`/`read_snapshots`/ref resolution),
-    /// so deleting first can never expose discarded history.
-    ///
-    /// Each rewrite is a temp+rename so a reader never sees a torn log, and
-    /// the floor marker already gates every read path — an interruption at
-    /// any point leaves the durable floor bounding the visible history (old
-    /// physical files remain but are invisible below the floor). The delete
-    /// set is EXACTLY [`LocalStore::checkpoint_discards`]'s
-    /// `discarded_deployments`, recomputed from the CURRENT logs on every
-    /// call — the cleanup-pending debt FLAG
-    /// ([`LocalStore::read_cleanup_pending`]) is never consulted for the
-    /// worklist (a corrupted/tampered marker could otherwise name retained
-    /// or unrelated deployment dirs): delete-first ordering guarantees the
-    /// logs still name the worklist whenever deletion runs, so a retry
-    /// recomputes the same list and converges (the marker only carries the
-    /// durable pending-flag / needs-repair signal, decided by
-    /// [`LocalStore::read_cleanup_pending`] in the checkpoint flow).
-    pub(crate) fn checkpoint_compact(&self, target: &str, floor: &HistoryFloor) -> Result<()> {
-        // Recomputed from the CURRENT (still-intact or already-rewritten)
-        // logs on every call — this is what makes an interrupted compaction
-        // converge on retry, so it must run BEFORE any log rewrite below.
-        let discards = self.checkpoint_discards(target, floor)?;
-
-        // 1. Delete deployment dirs strictly below the floor (ONLY the
-        //    deployment ids the target's own history names — never a
-        //    directory of another target, never releases/objects/servers,
-        //    never a retained at/above-floor dir). First, while the logs
-        //    still name every discarded id; a retry recomputes this same
-        //    worklist from the intact logs and the tri-state `path_state`
-        //    skips the dirs an interrupted pass removed (a `NotFound` stat
-        //    is a skip; ANY other stat error propagates — a deletion pass
-        //    that cannot stat a discard must fail rather than silently
-        //    leave the below-floor directory behind). The delete set is exactly
-        //    the log-derived discard set — a corrupted cleanup marker must
-        //    never widen it.
-        let dirs_to_delete = discards.discarded_deployments.clone();
-        #[cfg(test)]
-        if self
-            .fault_registry()
-            .consume(FaultKind::CompactDeployments, floor.deployment_id.as_str())
+        if self.fault_registry().consume(FaultKind::SweepReleases, "")
+            || self.fault_registry().consume(FaultKind::SweepObjects, "")
         {
-            return Err(Error::store(
-                "test fault: checkpoint deployment dir deletion forced to fail once",
-            ));
+            complete = false;
+        } else if let Err(e) = self.gc_artifacts(anchor, config) {
+            complete = false;
+            let _ = e;
         }
-        for id in &dirs_to_delete {
-            let dir = self.deployment_dir(id);
-            // TRI-STATE delete-skip (DECIDED): deletion of an
-            // already-removed dir is fine — a genuine NotFound stat is a
-            // skip (the interrupted pass removed it); ANY other stat error
-            // (EACCES, EIO, ...) PROPAGATES — an enumeration error mid-
-            // delete must not silently end the pass early (a skipped dir
-            // would be a below-floor directory that never gets deleted, and
-            // the retry converges only because deletion runs while the logs
-            // still name the worklist).
+        #[cfg(not(test))]
+        if let Err(_e) = self.gc_artifacts(anchor, config) {
+            complete = false;
+        }
+        Ok((discards, complete))
+    }
+
+    /// Remove one stage's directory set (all under the same root), tri-state
+    /// skip for already-removed dirs; any stat/removal failure aborts the
+    /// stage.
+    fn delete_dirs(&self, names: &[String], kind: &str) -> Result<()> {
+        for name in names {
+            let dir = match kind {
+                "deployment" => self.deployment_dir(name),
+                "release" => self.base().join(crate::layout::RELEASES).join(name),
+                _ => self.base().join(crate::layout::objects()).join(name),
+            };
             if path_state(&dir)? {
                 std::fs::remove_dir_all(&dir).map_err(|e| {
-                    Error::store(format!("remove deployment dir {}: {e}", dir.display()))
+                    Error::store(format!("sweep {} dir {}: {e}", kind, dir.display()))
                 })?;
             }
         }
-
-        // 2. attempts.jsonl → the suffix from the checkpoint's own attempt.
-        #[cfg(test)]
-        if self
-            .fault_registry()
-            .consume(FaultKind::CompactAttempts, floor.deployment_id.as_str())
-        {
-            return Err(Error::store(
-                "test fault: checkpoint attempts rewrite forced to fail once",
-            ));
-        }
-        let attempts = self.read_attempts_raw(target)?;
-        // FAIL CLOSED: the floor's deployment id must be in the target's
-        // attempts log. The old `unwrap_or(&attempts[..])` silently KEPT ALL
-        // attempts when the id was absent (the opposite of the discard
-        // fallback's silent discard-everything); both must be errors, and
-        // with the raw-time binding this is unreachable via the public flow.
-        let pos = attempts
-            .iter()
-            .position(|a| a.deployment_id == floor.deployment_id)
-            .ok_or_else(|| {
-                Error::integrity(format!(
-                    "checkpoint compaction for target '{target}': the floor's deployment '{}' does not exist in the target's attempts log — refusing to compact against an unbound floor",
-                    floor.deployment_id
-                ))
-            })?;
-        let keep = &attempts[pos..];
-        write_jsonl_atomic(&self.target_dir(target).join("attempts.jsonl"), keep)?;
-
-        // 3. snapshots.jsonl → the suffix beginning at the floor
-        //    deployment's position in the log (derived, never stored).
-        #[cfg(test)]
-        if self
-            .fault_registry()
-            .consume(FaultKind::CompactSnapshots, floor.deployment_id.as_str())
-        {
-            return Err(Error::store(
-                "test fault: checkpoint snapshots rewrite forced to fail once",
-            ));
-        }
-        let snapshots = self.read_snapshots_raw(target)?;
-        // FAIL CLOSED: the floor's deployment id must be in the target's
-        // snapshots log (a successful deployment always owns one). The
-        // suffix begins at the floor deployment's position.
-        let snap_pos = snapshots
-            .iter()
-            .position(|s| s.deployment_id == floor.deployment_id)
-            .ok_or_else(|| {
-                Error::integrity(format!(
-                    "checkpoint compaction for target '{target}': the floor's deployment '{}' does not exist in the target's snapshots log — refusing to compact against an unbound floor",
-                    floor.deployment_id
-                ))
-            })?;
-        let keep_snaps: Vec<DeploymentSnapshot> = snapshots[snap_pos..].to_vec();
-        write_jsonl_atomic(&self.refs_dir(target).join("snapshots.jsonl"), &keep_snaps)?;
-
         Ok(())
     }
 }
 
+// ---------------------------------------------------------------------------
+// TEST-ONLY LEDGER ADAPTERS
+//
+// The old multi-file model exposed `read_attempts` / `read_snapshots` /
+// `append_transition` / `read_results` / `read_transitions` and friends.
+// PRODUCTION now reads the ONE ledger via [`LocalStore::read_ledger`]; these
+// `#[cfg(test)]` adapters re-derive the OLD TEST-FACING SHAPES from the
+// ledger so the fixture and engine suites keep their structure (the
+// semantic oracle and the engine tests are driven by the API surface, and
+// the task forbids touching their logic beyond it). They are test-only by
+// construction and never part of the production surface.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::history;
-    use crate::model::{DeploymentId, TargetName};
-    use crate::records::DeploymentAttempt;
-    use crate::store::atomic::{IoOutcome, MarkerIoSeamGuard, TestMarkerIoOps};
-    use proptest::prelude::*;
-    use proptest::test_runner::RngSeed;
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-
-    const TARGET: &str = "production";
-
-    fn attempt(id: &str, target: &str) -> DeploymentAttempt {
-        DeploymentAttempt {
-            deployment_schema_version: SCHEMA_VERSION,
-            deployment_id: DeploymentId::new(id.to_string()),
-            target: TargetName::new(target.to_string()),
-            slot_ids: vec![],
-            behavior_sha256: "sha256-aa".to_string(),
-            attempted_at: format!("2026-01-01T00:00:00Z-{id}"),
-            desired: BTreeMap::new(),
-            pre_push: BTreeMap::new(),
-            slots: BTreeMap::new(),
-        }
+impl LocalStore {
+    /// TEST-ONLY: the ledger's SUCCESSFUL entries in order (the old
+    /// `read_snapshots`). The entry position in this slice IS the `sN`
+    /// snapshot index.
+    pub fn read_snapshots(&self, target: &str) -> Result<Vec<LedgerEntry>> {
+        Ok(self
+            .read_ledger(target)?
+            .into_iter()
+            .filter(|e| {
+                e.terminal.as_ref().is_some_and(|t| {
+                    t.status == DeploymentStatus::Successful && t.rollback.is_some()
+                })
+            })
+            .collect())
     }
 
-    fn snapshot_entry(id: &str, target: &str) -> DeploymentSnapshot {
-        DeploymentSnapshot {
-            deployment_id: DeploymentId::new(id.to_string()),
-            target: TargetName::new(target.to_string()),
-            behavior_sha256: "sha256-aa".to_string(),
-            slots: BTreeMap::new(),
-            bindings: BTreeMap::new(),
-        }
+    /// TEST-ONLY: the ledger's FULL entry list (the old `read_attempts`).
+    pub fn read_attempts(&self, target: &str) -> Result<Vec<LedgerEntry>> {
+        self.read_ledger(target)
     }
 
-    /// Seed a target with a history of `(attempt_ok, ...)` flags: every
-    /// attempt gets a `deployments/<id>/` directory; every successful
-    /// attempt appends a snapshot KEYED BY ITS DEPLOYMENT ID (the log order
-    /// IS the deployment order — positions are derived, never stored;
-    /// mirroring the checkpoint suite's seeding).
-    fn seed_history(store: &LocalStore, target: &str, prefix: &str, history: &[bool]) {
-        for (n, ok) in history.iter().enumerate() {
-            let id = format!("{prefix}-{n:04}");
-            store.append_attempt(target, &attempt(&id, target)).unwrap();
-            std::fs::create_dir_all(store.deployment_dir(&id)).unwrap();
-            if *ok {
-                store
-                    .append_snapshot(target, &snapshot_entry(&id, target))
-                    .unwrap();
+    /// TEST-ONLY: append the durable intent (the old `append_attempt`).
+    pub fn append_attempt(&self, target: &str, intent: &LedgerIntent) -> Result<()> {
+        self.append_intent(target, intent)
+    }
+
+    /// TEST-ONLY: the ledger's raw PHYSICAL lines (the old raw readers).
+    pub fn read_attempts_raw(&self, target: &str) -> Result<Vec<LedgerEntry>> {
+        self.read_ledger(target)
+    }
+
+    pub fn read_snapshots_raw(&self, target: &str) -> Result<Vec<LedgerEntry>> {
+        self.read_snapshots(target)
+    }
+
+    /// TEST-ONLY: the terminal events recorded for a deployment (the old
+    /// per-deployment transition stream — at most one today).
+    pub fn read_transitions(&self, id: &str) -> Result<Vec<LedgerTerminal>> {
+        for target in self.target_names()? {
+            for e in self.read_ledger(&target)? {
+                if e.deployment_id.as_str() == id {
+                    return Ok(e.terminal.into_iter().collect());
+                }
             }
         }
+        Ok(vec![])
     }
 
-    /// A floor marker naming `id` (the seeded history already carries the
-    /// bound attempt + snapshot, so the marker reads back bound to the exact
-    /// rollback payload).
-    fn floor_for(target: &str, id: &str) -> HistoryFloor {
-        HistoryFloor {
-            schema_version: SCHEMA_VERSION,
-            target: TargetName::new(target.to_string()),
-            deployment_id: DeploymentId::new(id.to_string()),
-            established_at: "2026-01-01T00:00:00Z".to_string(),
+    /// TEST-ONLY: the latest terminal of a deployment (the old
+    /// `latest_transition`).
+    pub fn latest_transition(&self, id: &str) -> Result<Option<LedgerTerminal>> {
+        Ok(self.read_transitions(id)?.pop())
+    }
+
+    /// TEST-ONLY: the per-slot outcomes of a deployment's terminal event (the
+    /// old `deployments/<id>/results.json`). An absent terminal is an error
+    /// (the outcomes store never existed for it), mirroring the old read.
+    pub fn read_results(&self, id: &str) -> Result<BTreeMap<PlacementSlotId, ServerResult>> {
+        self.latest_transition(id)?
+            .map(|t| t.outcomes)
+            .ok_or_else(|| Error::store(format!("no results for deployment '{id}'")))
+    }
+
+    /// TEST-ONLY: append a terminal event for a deployment (the old
+    /// `append_transition`). Outcomes are empty (status-only append).
+    pub fn append_transition(
+        &self,
+        id: &str,
+        status: &DeploymentStatus,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let target = self.target_for(id)?;
+        self.append_terminal(
+            &target,
+            &LedgerTerminal {
+                deployment_id: DeploymentId::new(id.to_string()),
+                target: TargetName::new(target.clone()),
+                status: status.clone(),
+                recorded_at: crate::remote::helper::now_rfc3339(),
+                outcomes: BTreeMap::new(),
+                rollback: None,
+                reason: reason.map(str::to_string),
+            },
+        )
+    }
+
+    /// TEST-ONLY: the target whose ledger holds a deployment id.
+    fn target_for(&self, id: &str) -> Result<String> {
+        for dir in self.target_names()? {
+            for e in self.read_ledger(&dir)? {
+                if e.deployment_id.as_str() == id {
+                    return Ok(dir);
+                }
+            }
         }
+        Err(Error::store(format!(
+            "no ledger entry for deployment '{id}'"
+        )))
     }
 
-    /// The ENTIRE visible state of `target` under `floor`: the gated
-    /// snapshot/attempt lists (deployment ids, in log order) and the
-    /// below-floor ref refusal. A failed ADVANCE must leave this EXACTLY
-    /// unchanged (identical lists, the same below-A refs refused).
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct VisibleState {
-        snapshots: Vec<String>,
-        attempts: Vec<String>,
-        below_floor_ref_err: Option<String>,
-    }
-
-    fn capture_visible(store: &LocalStore, floor: &HistoryFloor) -> VisibleState {
-        // The ref for the deployment immediately below the floor (in the
-        // RAW log — the floored read no longer exposes it) must be REFUSED
-        // (never a resolved below-floor snapshot); capture the exact refusal
-        // message so the post-advance state can be compared byte-for-byte.
-        let raw = store.read_snapshots_raw(TARGET).unwrap();
-        let below_floor_ref_err = match raw
-            .iter()
-            .position(|s| s.deployment_id == floor.deployment_id)
+    /// TEST-ONLY: every target directory name under `targets/`.
+    fn target_names(&self) -> Result<Vec<String>> {
+        let targets_dir = self.base().join("targets");
+        if !path_state(&targets_dir)? {
+            return Ok(vec![]);
+        }
+        let mut out = Vec::new();
+        for dir in std::fs::read_dir(&targets_dir)
+            .map_err(|e| Error::store(format!("read_dir targets: {e}")))?
         {
-            Some(pos) if pos > 0 => {
-                let below = raw[pos - 1].deployment_id.as_str().to_string();
-                let expr = history::parse_ref_expr(&below).unwrap();
-                Some(
-                    history::resolve_ref_expr(&expr, TARGET, store)
-                        .unwrap_err()
-                        .to_string(),
-                )
+            let dir = dir.map_err(|e| Error::store(format!("target entry: {e}")))?;
+            if dir.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                out.push(dir.file_name().to_string_lossy().into_owned());
             }
-            _ => None,
-        };
-        VisibleState {
-            snapshots: store
-                .read_snapshots(TARGET)
-                .unwrap()
-                .iter()
-                .map(|s| s.deployment_id.as_str().to_string())
-                .collect(),
-            attempts: store
-                .read_attempts(TARGET)
-                .unwrap()
-                .iter()
-                .map(|a| a.deployment_id.as_str().to_string())
-                .collect(),
-            below_floor_ref_err,
         }
+        out.sort();
+        Ok(out)
     }
+}
 
-    /// NO TEMPORARY TRANSACTION FILES may survive a failed advance: the
-    /// marker is the restored A, the ONLY file in `refs/` beyond the
-    /// durable op log (`snapshots.jsonl`) — no B temp
-    /// (`.history-floor.json.tmp.<pid>.<n>`), no leftover `.prev` backup.
-    /// (A tagged-backup sibling may rename the backup artifact at merge
-    /// time; this asserts the ABSENCE of any temp/backup, not a specific
-    /// backup name.)
-    fn assert_no_transaction_artifacts(store: &LocalStore) {
-        let refs = store.refs_dir(TARGET);
-        assert!(
-            refs.join("history-floor.json").exists(),
-            "the restored A marker is present"
-        );
-        let mut entries: Vec<String> = std::fs::read_dir(&refs)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        entries.sort();
-        let expected: Vec<String> = ["history-floor.json", "snapshots.jsonl"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(
-            entries, expected,
-            "refs/ holds EXACTLY the durable op log and the restored A marker — no temp file, no leftover backup, got: {entries:?}"
-        );
-    }
-
-    proptest! {
-        // THE REAL-B-TEMP-RENAME-FAILURE PROPERTY: a genuine filesystem
-        // error on the ACTUAL temp→marker rename — the seam fails the real
-        // rename(2) call AFTER A was backed up — routes through the SAME
-        // cleanup-and-restore handler as the injected faults: the advance
-        // returns `Err` and leaves EXACTLY the pre-advance state (floor A
-        // installed, the visible suffix unchanged, below-A refs still
-        // refused, no temporary transaction files). Deterministic: the SAME
-        // generator under the pinned 0x5EED_5EED seed runs identical
-        // vectors on every invocation (bounded cases keep the suite fast;
-        // each case drives a fresh fixture).
-        #![proptest_config(ProptestConfig {
-            cases: 16,
-            rng_seed: RngSeed::Fixed(0x5EED_5EED),
-            failure_persistence: None,
-            ..ProptestConfig::default()
-        })]
-
-        #[test]
-        fn real_b_temp_rename_failure_restores_a(
-            history in prop::collection::vec(any::<bool>(), 3..6),
-            a_at in 0usize..8,
-        ) {
-            run_real_b_temp_rename_failure_case(&history, a_at);
-        }
-
-        // THE TRI-STATE MARKER-DISCOVERY PROPERTY: for every combination of
-        // an injected MARKER-METADATA outcome (a), DIRECTORY-ENUMERATION
-        // outcome (b), and BACKUP-READ outcome (c), the discovery readers
-        // classify the result EXACTLY like the oracle — ONLY a genuine
-        // NotFound may read as absence (None / an empty list); EVERY other
-        // I/O failure (EACCES, EIO) returns Error::Store, never a silent
-        // None/empty.
-        #[test]
-        fn only_genuine_not_found_is_absence_every_other_io_failure_is_store(
-            a in prop_oneof![
-                Just(IoOutcome::NotFound),
-                Just(IoOutcome::Eacc),
-                Just(IoOutcome::Eio),
-            ],
-            b in prop_oneof![
-                Just(IoOutcome::Genuine),
-                Just(IoOutcome::NotFound),
-                Just(IoOutcome::Eacc),
-                Just(IoOutcome::Eio),
-            ],
-            c in prop_oneof![
-                Just(IoOutcome::Genuine),
-                Just(IoOutcome::NotFound),
-                Just(IoOutcome::Eacc),
-                Just(IoOutcome::Eio),
-            ],
-        ) {
-            run_marker_discovery_case(a, b, c);
-        }
-    }
-
-    /// One REAL-B-TEMP-RENAME-FAILURE case: establish floor A over a seeded
-    /// history, arm the injectable filesystem boundary ([`TestFloorFsOps`])
-    /// to fail the ACTUAL temp→marker rename (after A was backed up), drive
-    /// the advance A → B, and assert:
-    ///
-    /// * the advance returns `Err` (the REAL rename error, not the injected
-    ///   fault),
-    /// * A REMAINS INSTALLED — `read_history_floor(target)` == A (same
-    ///   deployment_id/snapshot_index, never None),
-    /// * the VISIBLE SUFFIX is exactly unchanged (read_snapshots/
-    ///   read_attempts identical to before the attempt; the below-A ref is
-    ///   still refused),
-    /// * NO TEMPORARY TRANSACTION FILES remain (no B temp, no leftover
-    ///   backup — refs/ holds exactly the restored A marker + the op log).
-    ///
-    /// Then the fault-free CONTROL: the same fixture advances to B and
-    /// reads back as B.
-    fn run_real_b_temp_rename_failure_case(history_in: &[bool], a_at: usize) {
-        // Seeding (mirroring the checkpoint suite): a guaranteed early
-        // success, a guaranteed FAILED attempt, the randomized history, and
-        // a guaranteed FINAL success so B is always a strictly-later
-        // successful deployment.
-        let mut history = vec![true, false];
-        history.extend_from_slice(history_in);
-        history.push(true);
-        let tmp = tempfile::tempdir().unwrap();
-        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
-        seed_history(&store, TARGET, "deploy", &history);
-        let ok_ids: Vec<String> = history
-            .iter()
-            .enumerate()
-            .filter(|(_, ok)| **ok)
-            .map(|(n, _)| format!("deploy-{n:04}"))
-            .collect();
-        assert!(
-            ok_ids.len() >= 2,
-            "A and B both need a successful deployment"
-        );
-
-        // A: the `a_at`-th successful deployment (never the last — B owns
-        // the last success). Its POSITION among the successes is the floor's
-        // derived log position (positions are DERIVED from the log order,
-        // never stored).
-        let a_id = ok_ids[a_at % (ok_ids.len() - 1)].clone();
-        let b_id = ok_ids.last().unwrap().clone();
-        assert_ne!(a_id, b_id, "B must be a later deployment than A");
-
-        // Establish floor A (direct marker write — the seeded history
-        // already carries A's attempt + snapshot, so the marker reads back
-        // bound to the exact snapshot pair).
-        let floor_a = floor_for(TARGET, &a_id);
-        store.write_history_floor(TARGET, &floor_a).unwrap();
-        let a_floor = store.read_history_floor(TARGET).unwrap().unwrap();
-        assert_eq!(a_floor.deployment_id.as_str(), a_id);
-
-        // PRE-ADVANCE visible state: floor A, the gated suffix, and the
-        // below-A ref refusal.
-        let pre = capture_visible(&store, &a_floor);
-
-        // ARM THE INJECTABLE FILESYSTEM BOUNDARY: fail the REAL
-        // temp→marker rename — the ACTUAL rename(2) call AFTER A was backed
-        // up — matched by (src = the staged temp name, dst = the marker
-        // path), so the A→backup rename and the restore's rename pass
-        // through to the real filesystem. The seam also RECORDS every
-        // rename, so the case can prove the failure fired after A moved.
-        let seam = Arc::new(TestFloorFsOps::new());
-        let marker = store.history_floor_path(TARGET);
-        let fail_marker = marker.clone();
-        let fail_prefix = format!(".{}.tmp.", marker.file_name().unwrap().to_string_lossy());
-        seam.fail_rename_once(move |src, dst| {
-            src.file_name()
-                .map(|n| n.to_string_lossy().starts_with(&fail_prefix))
-                .unwrap_or(false)
-                && dst == fail_marker.as_path()
-        });
-        let _guard = FloorFsSeamGuard::install(seam.clone());
-
-        // DRIVE THE ADVANCE A → B: the real temp→marker rename FAILS (a
-        // genuine fs error on the actual call, after A was moved aside to
-        // the durable backup).
-        let floor_b = floor_for(TARGET, &b_id);
-        let err = store
-            .write_history_floor(TARGET, &floor_b)
-            .expect_err("the real temp→marker rename failure must fail the advance");
-        assert!(
-            err.to_string()
-                .contains("test fault: real floor rename forced to fail once"),
-            "the REAL rename error (through the fs boundary) is the cause, got: {err}"
-        );
-        assert!(
-            !err.to_string()
-                .contains("test fault: history-floor rename forced to fail once"),
-            "the injected fault must NOT be the cause — the seam failed the actual fs call, got: {err}"
-        );
-        // The seam observed the REAL backup rename (A moved aside) BEFORE
-        // the failing temp→marker rename — the failure happened after A was
-        // backed up.
-        let renames = seam.renames();
-        assert!(
-            renames.len() >= 2
-                && renames[0] == (marker.clone(), floor_backup_path(&marker, &b_id))
-                && renames[1].1 == marker,
-            "the seam must observe the REAL backup rename followed by the failing temp→marker rename, got: {renames:?}"
-        );
-
-        // A REMAINS INSTALLED — the ORIGINAL floor, never None, never B.
-        let floor = store.read_history_floor(TARGET).unwrap();
-        let f = floor
-            .as_ref()
-            .expect("a real temp→marker rename failure must retain floor A — never None");
-        assert_eq!(
-            f.deployment_id.as_str(),
-            a_id,
-            "the ORIGINAL floor deployment A survives the real rename failure"
-        );
-
-        // THE VISIBLE SUFFIX IS EXACTLY UNCHANGED: identical gated
-        // snapshots/attempts, and the same below-A refs still refused.
-        let post = capture_visible(&store, f);
-        assert_eq!(
-            post.snapshots, pre.snapshots,
-            "the visible snapshot suffix is exactly unchanged"
-        );
-        assert_eq!(
-            post.attempts, pre.attempts,
-            "the visible attempts suffix is exactly unchanged"
-        );
-        assert_eq!(
-            post.below_floor_ref_err, pre.below_floor_ref_err,
-            "the same below-A refs stay refused"
-        );
-
-        // NO TEMPORARY TRANSACTION FILES remain: the marker is the restored
-        // A — no B temp file, no leftover backup (refs/ holds exactly the
-        // restored marker + the op log).
-        assert_no_transaction_artifacts(&store);
-
-        // CONTROL: the fault-free advance to B SUCCEEDS on the same fixture
-        // (the failed attempt left the store fully usable) and reads back
-        // as B.
-        store
-            .write_history_floor(TARGET, &floor_b)
-            .expect("the fault-free advance to B succeeds");
-        let b_floor = store.read_history_floor(TARGET).unwrap().unwrap();
-        assert_eq!(b_floor.deployment_id.as_str(), b_id);
-    }
-
-    /// CONTROL: the injected [`FaultKind::RenameFloor`] fault (fires BEFORE
-    /// the rename I/O) still routes through the SAME cleanup-and-restore
-    /// handler — A is restored, the visible suffix is unchanged, and no
-    /// transaction artifacts remain (regression guard for the unified
-    /// handler).
-    #[test]
-    fn rename_floor_fault_still_restores_a() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
-        seed_history(&store, TARGET, "deploy", &[true, true]);
-        let a_id = "deploy-0000".to_string();
-        let b_id = "deploy-0001".to_string();
-        let floor_a = floor_for(TARGET, &a_id);
-        store.write_history_floor(TARGET, &floor_a).unwrap();
-        let a_floor = store.read_history_floor(TARGET).unwrap().unwrap();
-        let pre = capture_visible(&store, &a_floor);
-
-        let floor_b = floor_for(TARGET, &b_id);
-        store.fault_registry().arm_rename_floor(&b_id);
-        let err = store
-            .write_history_floor(TARGET, &floor_b)
-            .expect_err("the RenameFloor fault fails the advance");
-        assert!(
-            err.to_string()
-                .contains("test fault: history-floor rename forced to fail once"),
-            "the injected fault is the cause, got: {err}"
-        );
-
-        // A remains installed (never None, never B) and the visible suffix
-        // is exactly unchanged.
-        let floor = store.read_history_floor(TARGET).unwrap();
-        let f = floor
-            .as_ref()
-            .expect("the injected RenameFloor fault must retain floor A — never None");
-        assert_eq!(f.deployment_id.as_str(), a_id);
-        let post = capture_visible(&store, f);
-        assert_eq!(post.snapshots, pre.snapshots);
-        assert_eq!(post.attempts, pre.attempts);
-        assert_eq!(post.below_floor_ref_err, pre.below_floor_ref_err);
-        assert_no_transaction_artifacts(&store);
-    }
-
-    /// CONTROL: a REAL rename failure BEFORE A was backed up (the actual
-    /// A→backup rename errors through the seam) leaves A untouched at the
-    /// marker name — the cleanup-and-restore handler's `path` guard keeps
-    /// the previous floor when no backup exists (`had_floor == true`, no
-    /// `.prev`), and drops only B's staged temp.
-    #[test]
-    fn real_rename_failure_before_backup_leaves_a_untouched() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
-        seed_history(&store, TARGET, "deploy", &[true, true]);
-        let a_id = "deploy-0000".to_string();
-        let b_id = "deploy-0001".to_string();
-        let floor_a = floor_for(TARGET, &a_id);
-        store.write_history_floor(TARGET, &floor_a).unwrap();
-
-        // Arm the seam to fail the REAL A→backup rename (src = the marker
-        // path, dst = the backup path) — BEFORE A was moved aside.
-        let seam = Arc::new(TestFloorFsOps::new());
-        let marker = store.history_floor_path(TARGET);
-        let fail_marker = marker.clone();
-        let fail_backup = floor_backup_path(&marker, &b_id);
-        seam.fail_rename_once(move |src, dst| {
-            src == fail_marker.as_path() && dst == fail_backup.as_path()
-        });
-        let _guard = FloorFsSeamGuard::install(seam);
-
-        let floor_b = floor_for(TARGET, &b_id);
-        let err = store
-            .write_history_floor(TARGET, &floor_b)
-            .expect_err("the real backup-rename failure fails the advance");
-        assert!(
-            err.to_string().contains("rename floor"),
-            "the real backup-rename error propagates, got: {err}"
-        );
-
-        // A is STILL at the marker name (never moved, never removed): the
-        // failed advance leaves the previous floor untouched.
-        let floor = store.read_history_floor(TARGET).unwrap().unwrap();
-        assert_eq!(floor.deployment_id.as_str(), a_id);
-        assert!(marker.exists(), "A's marker is never removed");
-        assert!(
-            !floor_backup_path(&marker, &b_id).exists(),
-            "no backup was ever created by the failed backup rename"
-        );
-        // The handler still dropped B's staged temp.
-        assert_no_transaction_artifacts(&store);
-    }
-
-    // ---- the tri-state marker-discovery property --------------------------
-
-    /// The CLASS of a discovery read: `Absent` (Ok(None) / an empty list),
-    /// `Present` (Ok(Some(...)) / a non-empty list), a [`Error::Store`]
-    /// error, or an [`Error::Integrity`] error. The property asserts the
-    /// CLASS — the fail-closed contract, not message text.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum ReadClass {
-        Absent,
-        Present,
-        Store,
-        Integrity,
-    }
-
-    fn optional_read_class<T>(r: Result<Option<T>>) -> ReadClass {
-        match r {
-            Ok(None) => ReadClass::Absent,
-            Ok(Some(_)) => ReadClass::Present,
-            Err(Error::Store(_)) => ReadClass::Store,
-            Err(Error::Integrity(_)) => ReadClass::Integrity,
-            Err(e) => panic!("unexpected error class: {e}"),
-        }
-    }
-
-    fn list_read_class(r: Result<Vec<PathBuf>>) -> ReadClass {
-        match r {
-            Ok(v) if v.is_empty() => ReadClass::Absent,
-            Ok(_) => ReadClass::Present,
-            Err(Error::Store(_)) => ReadClass::Store,
-            Err(Error::Integrity(_)) => ReadClass::Integrity,
-            Err(e) => panic!("unexpected error class: {e}"),
-        }
-    }
-
-    /// TORN-ADVANCE FIXTURE: seed a small history, establish floor A, then
-    /// remove the marker and rename it to the durable tagged backup — the
-    /// marker is ABSENT while one VALID backup (holding A) sits in `refs/`:
-    /// the exact state the readers must read as A (validated-backup
-    /// fallback) and fail closed on when the backup is unreadable.
-    fn torn_fixture(tmp: &Path) -> (LocalStore, PathBuf, PathBuf, PathBuf) {
-        let store = LocalStore::with_base(tmp.join("store")).unwrap();
-        seed_history(&store, TARGET, "deploy", &[true, false]);
-        let floor_a = floor_for(TARGET, "deploy-0000");
-        store.write_history_floor(TARGET, &floor_a).unwrap();
-        let marker = store.history_floor_path(TARGET);
-        let backup = floor_backup_path(&marker, "a-tag");
-        std::fs::rename(&marker, &backup).unwrap();
-        let refs = store.refs_dir(TARGET);
-        (store, marker, backup, refs)
-    }
-
-    /// THE ORACLE for [`LocalStore::read_history_floor`] on the torn
-    /// fixture under the injected (a) marker-metadata, (b) refs-dir
-    /// enumeration, and (c) backup-read outcomes:
-    ///
-    /// * (a) EACCES/EIO → `Store` (the marker cannot even be stat'ed — a
-    ///   permission/I/O error is never "no floor");
-    /// * (a) NotFound → the torn-advance fallback:
-    ///   * (b) EACCES/EIO → `Store` (an unreadable refs dir is never "no
-    ///     backups");
-    ///   * (b) NotFound → `Absent` (genuine absence: no marker, no
-    ///     backups);
-    ///   * (b) genuine (the backup IS enumerated):
-    ///     * (c) genuine → `Present` (the validated backup IS the floor A);
-    ///     * (c) EACCES/EIO → `Store` (a torn advance with an UNREADABLE
-    ///       backup fails closed — never "no floor");
-    ///     * (c) NotFound → `Integrity` (an enumerated backup that cannot
-    ///       be read does not validate, and a leftover that does not
-    ///       validate is never "no floor" either).
-    fn expected_floor_read(a: IoOutcome, b: IoOutcome, c: IoOutcome) -> ReadClass {
-        match a {
-            IoOutcome::Eacc | IoOutcome::Eio => ReadClass::Store,
-            IoOutcome::NotFound => match b {
-                IoOutcome::Eacc | IoOutcome::Eio => ReadClass::Store,
-                IoOutcome::NotFound => ReadClass::Absent,
-                IoOutcome::Genuine => match c {
-                    IoOutcome::Genuine => ReadClass::Present,
-                    IoOutcome::NotFound => ReadClass::Integrity,
-                    IoOutcome::Eacc | IoOutcome::Eio => ReadClass::Store,
-                },
-            },
-            // (a) is never generated as genuine — the fixture's marker is
-            // genuinely absent, so genuine == NotFound at this coordinate.
-            IoOutcome::Genuine => unreachable!("(a) is never generated as Genuine"),
-        }
-    }
-
-    /// One TRI-STATE MARKER-DISCOVERY case: build the torn fixture, force
-    /// (a)/(b)/(c) at their exact paths through the injectable
-    /// [`MarkerIoOps`] seam, drive every discovery reader, and assert each
-    /// result class equals the oracle — `read_history_floor` and
-    /// `read_cleanup_pending` under (a), `floor_backup_siblings` under (b),
-    /// `validated_backup` under (b) × (c).
-    fn run_marker_discovery_case(a: IoOutcome, b: IoOutcome, c: IoOutcome) {
-        let tmp = tempfile::tempdir().unwrap();
-        let (store, marker, backup, refs) = torn_fixture(tmp.path());
-        let cleanup = store.cleanup_pending_path(TARGET);
-
-        // (a) forces the MARKER metadata (and, being the marker-metadata
-        // coordinate, the cleanup-pending marker's metadata too); (b) the
-        // refs-dir enumeration; (c) the backup read. Genuine coordinates
-        // are simply not forced — the seam performs the real fs call.
-        let seam = Arc::new(TestMarkerIoOps::new());
-        let mut forced = BTreeMap::new();
-        forced.insert(marker.clone(), a);
-        forced.insert(cleanup, a);
-        if b != IoOutcome::Genuine {
-            forced.insert(refs, b);
-        }
-        if c != IoOutcome::Genuine {
-            forced.insert(backup, c);
-        }
-        seam.force(forced);
-        let _guard = MarkerIoSeamGuard::install(seam);
-
-        // READ_HISTORY_FLOOR: the torn-advance read under (a) × (b) × (c).
-        let got = optional_read_class(store.read_history_floor(TARGET));
-        assert_eq!(
-            got,
-            expected_floor_read(a, b, c),
-            "read_history_floor under (a={a:?}, b={b:?}, c={c:?})"
-        );
-
-        // READ_CLEANUP_PENDING: its own marker's metadata outcome is the
-        // same (a) (the fixture has no cleanup marker — genuine ==
-        // NotFound); only a genuine NotFound may read "no pending cleanup".
-        let got = optional_read_class(store.read_cleanup_pending(TARGET, None));
-        let want = match a {
-            IoOutcome::NotFound => ReadClass::Absent,
-            IoOutcome::Eacc | IoOutcome::Eio => ReadClass::Store,
-            IoOutcome::Genuine => unreachable!("(a) is never generated as Genuine"),
-        };
-        assert_eq!(
-            got, want,
-            "read_cleanup_pending under (a={a:?}, b={b:?}, c={c:?})"
-        );
-
-        // FLOOR_BACKUP_SIBLINGS: the enumeration outcome (b) directly.
-        let got = list_read_class(floor_backup_siblings(&marker));
-        let want = match b {
-            IoOutcome::NotFound => ReadClass::Absent,
-            IoOutcome::Eacc | IoOutcome::Eio => ReadClass::Store,
-            IoOutcome::Genuine => ReadClass::Present, // the torn fixture genuinely lists the backup
-        };
-        assert_eq!(
-            got, want,
-            "floor_backup_siblings under (a={a:?}, b={b:?}, c={c:?})"
-        );
-
-        // VALIDATED_BACKUP: enumeration (b) × backup read (c).
-        let got = optional_read_class(store.validated_backup(TARGET, &marker));
-        let want = match b {
-            IoOutcome::NotFound => ReadClass::Absent,
-            IoOutcome::Eacc | IoOutcome::Eio => ReadClass::Store,
-            IoOutcome::Genuine => match c {
-                IoOutcome::Genuine => ReadClass::Present,
-                IoOutcome::NotFound => ReadClass::Absent, // the vanished backup is absence at THIS level
-                IoOutcome::Eacc | IoOutcome::Eio => ReadClass::Store,
-            },
-        };
-        assert_eq!(
-            got, want,
-            "validated_backup under (a={a:?}, b={b:?}, c={c:?})"
-        );
-    }
-
-    /// CONTROL (the user's requirement): genuine absence on a fixture that
-    /// never had a checkpoint — the ONE `NotFound` outcome — reads as
-    /// `None` / an empty list on every discovery read (never an error).
-    #[test]
-    fn genuine_absence_reads_as_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
-        let marker = store.history_floor_path(TARGET);
-        assert_eq!(
-            store.read_history_floor(TARGET).unwrap(),
-            None,
-            "genuine absence is no floor"
-        );
-        assert_eq!(
-            store.read_cleanup_pending(TARGET, None).unwrap(),
-            None,
-            "genuine absence is no pending cleanup"
-        );
-        assert_eq!(
-            store.validated_backup(TARGET, &marker).unwrap(),
-            None,
-            "genuine absence is no backup"
-        );
-        assert!(
-            floor_backup_siblings(&marker).unwrap().is_empty(),
-            "genuine absence is an empty backup list"
-        );
-    }
-
-    /// CONTROL (the user's requirement): a TORN ADVANCE (marker absent,
-    /// the durable tagged backup holding A present) with an UNREADABLE
-    /// backup — the backup read faults EACCES through the injectable seam
-    /// while the marker stat and the refs-dir enumeration run genuinely —
-    /// FAILS CLOSED with a [`Error::Store`] error: the unreadable backup is
-    /// never "no backup" (which would read the torn state as "no floor",
-    /// re-exposing the below-floor history).
-    #[test]
-    fn torn_advance_with_unreadable_backup_fails_closed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (store, _marker, backup, _refs) = torn_fixture(tmp.path());
-        let seam = Arc::new(TestMarkerIoOps::new());
-        let mut forced = BTreeMap::new();
-        forced.insert(backup, IoOutcome::Eacc);
-        seam.force(forced);
-        let _guard = MarkerIoSeamGuard::install(seam);
-
-        let err = store
-            .read_history_floor(TARGET)
-            .expect_err("an unreadable backup in a torn advance must fail closed");
-        assert!(
-            matches!(err, Error::Store(_)),
-            "the class is Store (a read failure), never None and never Integrity, got: {err}"
-        );
-    }
+/// The LOCAL store's reachable set for a checkpoint sweep: the union of
+/// everything the sweep must keep (retained ledgers, current/incomplete
+/// state, pins). See [`LocalStore::reachable_set`].
+#[derive(Clone, Debug, Default)]
+pub struct ReachableSet {
+    /// Deployment ids reachable (their `deployments/<id>/` dirs stay).
+    pub deployments: BTreeSet<String>,
+    /// Release ids reachable (their `releases/<id>/` dirs stay).
+    pub releases: BTreeSet<String>,
+    /// Tree digests reachable (their `objects/sha256/<digest>/` dirs stay).
+    pub trees: BTreeSet<String>,
 }
