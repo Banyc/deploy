@@ -110,12 +110,14 @@ deploy push production
 # reference; every relative form resolves against the target argument.
 deploy push production @-              # roll back to the PREVIOUS successful snapshot
 deploy push production @--             # two snapshots back (the grandparent)
-deploy push production parent(@, 3)    # three snapshots back from the latest
+# parent(...) forms contain a comma — the shell splits them at the space, so
+# quote them on the command line:
+deploy push production 'parent(@, 3)'    # three snapshots back from the latest
 # refids resolve to exact snapshots, then step N ancestors (N = 0 is the
 # snapshot itself):
 deploy push production s2              # the exact 2nd successful snapshot
 deploy push production s2--            # two snapshots before snapshot s2
-deploy push production parent(s2, 1)   # one snapshot before s2
+deploy push production 'parent(s2, 1)'   # one snapshot before s2
 deploy push production deploy-20260821T102000Z--   # 2 before the snapshot that deployed that deployment
 deploy push production rel-sha256-41da2f63--        # 2 before the most recent snapshot referencing that release
 ```
@@ -275,7 +277,7 @@ before anything is touched.
   and set `release = "v2"` in `deploy.toml`. Old releases stay deployable
   via the release-refid form (`parent(<release-id>, 0)`).
 - **Roll back**: `deploy push production @-` restores the previous
-  successful snapshot; `deploy push production parent(@, 3)` the 3rd
+  successful snapshot; `deploy push production 'parent(@, 3)'` the 3rd
   previous. Historical deployments restore their original behavior — they
   never re-run today's verification or activation settings.
 - **Change rollout policy**: edit `[targets.<name>]` in `deploy.toml`; push.

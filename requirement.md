@@ -65,7 +65,7 @@ deploy status production
 # Restore the exact snapshot assignment from an earlier deployment
 # (jj-style: the target is passed once; the reference is relative)
 deploy push production @-              # the previous successful snapshot
-deploy push production parent(@, 3)    # three snapshots back
+deploy push production 'parent(@, 3)'    # three snapshots back
 ```
 
 `production` is not a built-in environment type. It is a user-chosen target name, analogous to a Git remote name such as `origin`, except that one target may fan out to multiple servers. Other valid names include `test-lab`, `datacenter-hk`, or `customer-acme`.
@@ -599,11 +599,11 @@ Pushing an older successful reference restores its complete assignment, includin
 ```sh
 deploy push production @-              # the snapshot BEFORE the latest
 deploy push production @--             # two snapshots back
-deploy push production parent(@, 3)    # three snapshots back from the latest
+deploy push production 'parent(@, 3)'    # three snapshots back from the latest
 deploy push production s2              # the exact snapshot s2
 deploy push production s2--            # two snapshots before s2
-deploy push production parent(s2, 1)   # one snapshot before s2
-deploy push production parent(deploy-20260821T102000Z, 0)  # the snapshot that deployed that deployment
+deploy push production 'parent(s2, 1)'   # one snapshot before s2
+deploy push production 'parent(deploy-20260821T102000Z, 0)'  # the snapshot that deployed that deployment
 deploy push production rel-sha256-41da2f63a950--  # 2 before the most recent snapshot referencing that release
 ```
 
@@ -616,7 +616,7 @@ Schema version 1 permits a target-history ref only as a source for that same tar
 The operator may instead push an old release to the new target membership by reference its id as a refid — the most recent snapshot that referenced it:
 
 ```sh
-deploy push production parent(rel-sha256-2fda63a950, 0)
+deploy push production 'parent(rel-sha256-2fda63a950, 0)'
 deploy push production rel-sha256-2fda63a950--
 ```
 

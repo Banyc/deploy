@@ -150,6 +150,10 @@ in the reference; every relative form resolves against the target argument):\n\n
   <id>-- / parent(<id>, N)   N steps back from the most recent snapshot that\n\
                        deployed deployment <id> or referenced release <id>\n\
 \n\
+NOTE: every parent(...) form contains a comma, so the shell splits the\n\
+reference at the space after the comma. shell-quote parent(...) forms —\n\
+e.g. deploy push production 'parent(@, 3)' — in interactive shells.\n\
+\n\
 --dry-run prints the plan and touches nothing (no store writes, no remote\n\
 state, no locks). Pushing identical content prints 'Everything up to date'.\n\
 Rollout batches per rollout.batch_size; on a failed server, earlier batches\n\
@@ -159,7 +163,7 @@ reported explicitly, including partial states like `degraded`.",
   deploy push production               # deploy local files\n\
   deploy push production --dry-run     # preview the plan, touch nothing\n\
   deploy push production @-            # roll back to the previous deployment\n\
-  deploy push production parent(@, 3)  # roll back 3 deployments\n\
+  deploy push production 'parent(@, 3)'  # roll back 3 deployments\n\
   deploy push production s3--          # 2 deployments before snapshot s3"
     )]
     Push {
@@ -744,6 +748,19 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "deploy push production",
         ] {
             assert!(init_help.contains(needle), "init help missing {needle:?}");
+        }
+        let mut push_cmd = Cli::command();
+        let push_help = push_cmd
+            .find_subcommand_mut("push")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for needle in [
+            "shell-quote parent(...) forms",
+            "deploy push production 'parent(@, 3)'",
+            "deploy push production @-",
+        ] {
+            assert!(push_help.contains(needle), "push help missing {needle:?}");
         }
     }
 }
