@@ -1406,27 +1406,74 @@ fn push_inner(
     // refresh — so a failure is only a projection lag. Convergence needs no
     // marker to retry: the next real push re-projects from current state, and
     // the refresh is not incremental — the primary write rebuilds the FULL
-    // observed map from `actual_servers`, and the other-member propagation
-    // (which reads the member's existing map and merges this slot's CURRENT
-    // observed value into it) is refreshed by the next real push to ANY member
-    // target of the shared slot, which re-runs the same propagation. Retries
-    // therefore converge without duplicate history: the projection refresh
-    // never re-records an attempt, snapshot, or transition.
+    // observed map from the LIVE per-slot assignments, and the other-member
+    // propagation (which reads the member's existing map and merges this
+    // slot's CURRENT observed value into it) is refreshed by the next real
+    // push to ANY member target of the shared slot, which re-runs the same
+    // propagation. Retries therefore converge without duplicate history: the
+    // projection refresh never re-records an attempt, snapshot, or
+    // transition.
+    //
+    // THE PROJECTION MUST EQUAL THE LIVE REMOTE ASSIGNMENT — never the
+    // desired plan and never this deployment's id for a slot it did not
+    // touch. `actual_servers` substitutes the DESIRED artifact when the
+    // post-mutation status read fails (a pre-swap-unreachable slot), and the
+    // old refresh stamped THIS deployment's id on every member slot
+    // regardless of whether the deployment advanced it — a slot that was
+    // SKIPPED (stop_on_failure) or UNREACHABLE pre-swap (its `process_server`
+    // aborted `Ok(Failed)` before the swap) kept its prior live generation
+    // yet had its truthful observed record overwritten with a fabricated
+    // `{generation: None, artifact: desired}` and a false `last_deployment`
+    // — a shared slot's lie fanning out to every member target. The
+    // projection is therefore rebuilt from each slot's LIVE generation
+    // assignment (read directly, not from `actual_servers`): a slot this
+    // deployment advanced IS the live assignment this deployment created
+    // (same generation, artifact, and deployment id as before — behavior
+    // preserved), while a skipped/unreachable/unadvanced slot keeps the
+    // assignment's OWN deployment id — the deployment that actually created
+    // the live generation — and, when the live assignment cannot be read,
+    // carries its PRIOR observed record over verbatim (never fabricated,
+    // never re-stamped).
     let mut observed_warnings: Vec<String> = Vec::new();
     let mut observed_servers: BTreeMap<PlacementSlotId, ObservedServer> = BTreeMap::new();
     for (slot, _sdef) in &members {
         let slot_id = PlacementSlotId::new(slot.id.clone());
-        let Some(asv) = actual_servers.get(&slot_id) else {
-            continue;
-        };
-        observed_servers.insert(
-            slot_id.clone(),
-            ObservedServer {
-                generation: asv.generation.clone(),
-                artifact: Some(asv.artifact.clone()),
-                last_deployment: Some(deployment_id.clone()),
-            },
-        );
+        // The slot's LIVE remote assignment. `status` is a read; under the
+        // one-shot pre-swap arm it has already fired and been consumed inside
+        // `process_server`, so this read reflects the true post-mutation
+        // state: the new generation for an advanced slot, the PRIOR
+        // generation for a skipped/unreachable one.
+        let live = helpers[&slot_id]
+            .status()
+            .ok()
+            .and_then(|s| s.current_generation)
+            .and_then(|g| helpers[&slot_id].read_assignment(&g).ok());
+        match live {
+            Some(asn) => {
+                observed_servers.insert(
+                    slot_id.clone(),
+                    ObservedServer {
+                        generation: Some(asn.generation_id.clone()),
+                        artifact: Some(asn.artifact.clone()),
+                        last_deployment: Some(asn.deployment_id.clone()),
+                    },
+                );
+            }
+            None => {
+                // No readable live assignment (the server was never deployed,
+                // or its status/assignment read failed — the
+                // pre-swap-unreachable slot): carry the slot's PRIOR observed
+                // record over VERBATIM, so the projection never fabricates
+                // state this push did not establish and never re-stamps a
+                // deployment that did not touch the slot. A slot with no
+                // prior record and no live assignment stays absent.
+                if let Ok(prior) = store.read_observed(target_name)
+                    && let Some(prior_server) = prior.slots.get(&slot_id)
+                {
+                    observed_servers.insert(slot_id.clone(), prior_server.clone());
+                }
+            }
+        }
     }
     refresh_observed(
         store,
@@ -4072,9 +4119,11 @@ interval_seconds = 0
         );
 
         // OBSERVED REFRESH: observed.json carries the ACTUAL per-slot state —
-        // the restored prior generation/artifact — and attributes the failed
-        // attempt as the last deployment. It must NOT reflect the desired
-        // (failed) v2 tree.
+        // the restored prior generation/artifact — with the LIVE assignment's
+        // OWN minting deployment (id1 created the restored generation; the
+        // failed id2 did not), never the desired (failed) v2 tree and never
+        // the failed deployment re-stamped onto a generation it did not
+        // create.
         let observed = h.store.read_observed("t1").unwrap();
         let os = &observed.slots[&PlacementSlotId::new("p1")];
         assert_eq!(os.generation, Some(prior_gen.clone()));
@@ -4093,7 +4142,12 @@ interval_seconds = 0
             oa.tree, desired_tree,
             "observed must NOT reflect the desired (failed) v2 tree"
         );
-        assert_eq!(os.last_deployment, Some(id2.clone()));
+        assert_eq!(
+            os.last_deployment,
+            Some(id1.clone()),
+            "observed last_deployment must be the LIVE assignment's OWN minting deployment \
+             (id1), not the failed attempt id2"
+        );
         // The per-server record mirrors the observed slot state.
         let server_state = h.store.read_server("s1").unwrap();
         assert_eq!(
@@ -4339,38 +4393,22 @@ interval_seconds = 0
             Some(DeploymentStatus::FailedRolledBack)
         );
 
-        // OBSERVED REFRESH FOR SKIPPED SLOTS: `observed.json` is refreshed
-        // for EVERY member slot, including the never-started p4. The refresh
-        // loop reads each slot's ACTUAL state from the remote `current` and
-        // falls back to `{artifact: desired, generation: None}` when the
-        // server has no live `current` — the contract for a Skipped slot (and
-        // for a first-deploy slot compensated back to no prior state). The
-        // observed entry must carry the DESIRED artifact (never a fabricated
-        // generation, never a stale pre-push state).
+        // OBSERVED REFRESH FOR SKIPPED/COMPENSATED SLOTS: `observed.json` is
+        // refreshed for every member slot with a READABLE LIVE remote
+        // assignment (or a prior observed record carried over verbatim).
+        // NONE of the four slots has a live generation after the failed push
+        // (the first-deploy batch was compensated back to no prior state, p3
+        // failed, p4 was never started) and none has a prior record — so the
+        // observed map must NOT fabricate entries: no `{generation: None,
+        // artifact: desired}` lie for a slot nothing deployed to, no
+        // re-stamped `last_deployment`.
         let observed = store.read_observed("t1").unwrap();
-        assert_eq!(
-            observed.slots.len(),
-            4,
-            "every member slot is refreshed in observed.json"
+        assert!(
+            observed.slots.is_empty(),
+            "slots without a live assignment (and without a prior record) must stay absent — \
+             never fabricated with the desired artifact: {:?}",
+            observed.slots.keys().collect::<Vec<_>>()
         );
-        for sid in ["p1", "p2", "p3", "p4"] {
-            let os = &observed.slots[&PlacementSlotId::new(sid)];
-            assert_eq!(
-                os.generation, None,
-                "slot {sid} has no live generation after the failed push (Skipped or compensated first-deploy)"
-            );
-            let desired_art = &attempt.desired[&PlacementSlotId::new(sid)]
-                .assignment
-                .artifact;
-            let oa = os.artifact.as_ref().expect("observed artifact present");
-            assert_eq!(
-                oa.tree, desired_art.tree,
-                "slot {sid}'s observed artifact must be the DESIRED tree (no live generation to read)"
-            );
-            assert_eq!(oa.variant, desired_art.variant);
-            assert_eq!(oa.release, desired_art.release);
-            assert_eq!(os.last_deployment, Some(id.clone()));
-        }
 
         assert!(
             store.read_snapshots("t1").unwrap().is_empty(),
@@ -4917,9 +4955,11 @@ interval_seconds = 0
         );
 
         // OBSERVED REFRESH: observed.json carries the ACTUAL per-slot state —
-        // the restored prior generation/artifact — and attributes the failed
-        // attempt as the last deployment. It must NOT reflect the desired
-        // (failed) v2 tree.
+        // the restored prior generation/artifact — with the LIVE assignment's
+        // OWN minting deployment (id1 created the prior generation; the
+        // failed id2 did not). It must NOT reflect the desired (failed) v2
+        // tree, and the failed attempt must not be re-stamped onto a slot it
+        // did not leave live.
         let observed = h.store.read_observed("t1").unwrap();
         let os = &observed.slots[&PlacementSlotId::new("p1")];
         assert_eq!(os.generation, Some(prior_gen.clone()));
@@ -4938,7 +4978,12 @@ interval_seconds = 0
             oa.tree, desired_tree,
             "observed must NOT reflect the desired (failed) v2 tree"
         );
-        assert_eq!(os.last_deployment, Some(id2.clone()));
+        assert_eq!(
+            os.last_deployment,
+            Some(id1.clone()),
+            "observed last_deployment must be the LIVE assignment's OWN minting deployment \
+             (id1), not the failed attempt id2"
+        );
 
         // The failed attempt is terminal FailedRolledBack, produced no
         // snapshot, and the s0 snapshot/ref are untouched.
@@ -5783,6 +5828,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .generation
             .clone()
             .expect("baseline generation");
+        // The baseline's REAL live assignment: the truth the prior observed
+        // record carries (an unreadable assignment must fall back to it, not
+        // to a fabricated/unknown marker).
+        let gen1_artifact = r1.attempt.as_ref().expect("attempt").slots
+            [&PlacementSlotId::new("p1")]
+            .artifact
+            .clone();
         eprintln!("DEBUG gen1={gen1}");
 
         // Corrupt the live generation's assignment record on the remote.
@@ -5853,9 +5905,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let status = RemoteHelper::new(&remote).status().unwrap();
         assert_eq!(status.current_generation.as_deref(), Some(gen1.as_str()));
 
-        // THE OBSERVED FALLBACK: observed.json preserves the observed
-        // generation and marks the assignment UNKNOWN (the default artifact),
-        // never the desired v2 artifact.
+        // THE OBSERVED FALLBACK: the live assignment is UNREADABLE (corrupt),
+        // so the observed refresh carries the slot's PRIOR observed record
+        // over VERBATIM — the real generation/artifact/last_deployment the
+        // baseline push recorded — never the desired v2 artifact, never an
+        // unknown (default) marker, never the failed deployment re-stamped.
         let observed = h.store.read_observed("t1").unwrap();
         let os = &observed.slots[&PlacementSlotId::new("p1")];
         assert_eq!(
@@ -5865,9 +5919,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         let oa = os.artifact.as_ref().expect("observed artifact present");
         assert_eq!(
-            oa,
-            &ArtifactRef::default(),
-            "an unreadable assignment must be marked unknown (default artifact), got: {oa:?}"
+            oa, &gen1_artifact,
+            "the prior observed record's REAL artifact must be preserved verbatim, got: {oa:?}"
         );
         let desired_art = &r2.attempt.as_ref().expect("attempt").desired
             [&PlacementSlotId::new("p1")]
@@ -5877,7 +5930,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             oa.tree, desired_art.tree,
             "observed must NOT substitute the desired v2 artifact"
         );
-        assert_eq!(os.last_deployment, Some(id2.clone()));
+        assert_eq!(
+            os.last_deployment,
+            Some(id1.clone()),
+            "observed last_deployment must be the LIVE assignment's OWN minting deployment \
+             (id1), carried over with the prior record — never the failed id2"
+        );
 
         // The PERSISTED INTENT's pre_push map uses the SAME contract:
         // generation preserved, assignment unknown.

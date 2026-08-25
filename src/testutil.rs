@@ -709,20 +709,7 @@ pub(crate) mod step17_hook {
     }
 
     impl HookHandle {
-        /// Block until the engine signals it is parked at a step-17-equivalent
-        /// lock acquisition and return WHICH phase it is parked at. The push
-        /// MUST reach a step-17-equivalent barrier for this deployment id (a
-        /// real push, or a no-op retrying debt); otherwise this blocks
-        /// forever — the property test uses
-        /// [`HookHandle::wait_at_step17_bounded`] for the can-never-fire
-        /// case.
-        pub(crate) fn wait_at_step17(&self) -> HookPhase {
-            self.at_step17
-                .recv()
-                .expect("the step-17 hook fired before the handle dropped")
-        }
-
-        /// Like [`HookHandle::wait_at_step17`], but bounded: returns
+        /// Like [`HookHandle::wait_at_step17_bounded`], but bounded: returns
         /// `Err(Timeout)` when the engine did not fire within `timeout` —
         /// the caller then checks whether the push already completed (the
         /// hook will never fire, e.g. an up-to-date no-op with no debt).
