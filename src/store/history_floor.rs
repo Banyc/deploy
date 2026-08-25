@@ -78,13 +78,18 @@
 //! floor A is moved aside to a durable backup
 //! (`history-floor.json.prev.<B-id>`, tagged by the advance target), B is
 //! renamed into place, and the parent-directory fsync is B's durability
-//! commit point. A failure at ANY stage before that commit point RESTORES
-//! A — but only from THIS transaction's tagged backup, verified to carry
-//! the tag AND to parse and equal the pre-advance floor A, so a stale
-//! backup from another transaction can never roll the floor backward. A
-//! failed advancement leaves EXACTLY the pre-advance state (floor A
-//! durable, the same visible suffix, no compaction side effects) —
-//! advancing a checkpoint can never erase the previously durable floor. If
+//! commit point. A failure at ANY stage after A was moved aside — an
+//! injected fault or a REAL filesystem error alike, INCLUDING a real
+//! B-temp→marker rename failure — routes through ONE cleanup-and-restore
+//! handler ([`LocalStore::cleanup_and_restore`]): A is renamed back from
+//! THIS transaction's tagged backup — verified to carry the tag AND to
+//! parse and equal the pre-advance floor A, so a stale backup from another
+//! transaction can never roll the floor backward — B's temp artifact is
+//! removed, and the ORIGINAL error propagates, so a failed advancement
+//! leaves EXACTLY the pre-advance state (floor A durable, the same visible
+//! suffix, no compaction side effects, no temporary transaction files) —
+//! advancing a checkpoint can never erase the previously durable floor, not
+//! even when the actual temp→marker rename fails after A was backed up. If
 //! the restore of A itself ALSO fails, the marker may be left absent while
 //! the tagged backup (`history-floor.json.prev.<B-id>`) holds A — a TORN
 //! ADVANCE. The reader NEVER treats this as "no floor" (which would expose
@@ -206,6 +211,157 @@ fn floor_backup_siblings(path: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// INJECTABLE FILESYSTEM-OPERATION BOUNDARY for the floor transaction
+/// (test-only seam): the ACTUAL renames of the transactional advance route
+/// through [`floor_fs_rename`], which consults this per-thread slot when a
+/// test installed a seam. The point of the seam is to fail the REAL
+/// temp→marker rename AFTER A was backed up — a genuine `rename(2)` error
+/// on the actual call, the failure mode the injected
+/// [`FaultKind::RenameFloor`] fault (which fires BEFORE the rename I/O)
+/// cannot reproduce. Production never installs a seam: [`floor_fs_rename`]
+/// falls through to [`std::fs::rename`].
+///
+/// The seam is PER-THREAD (not per-store like the fault registry — the
+/// store struct lives in `src/store/local.rs`, which this module does not
+/// modify), so two fixtures in different test threads can never interfere;
+/// [`FloorFsSeamGuard`] scopes one installation to one test case.
+#[cfg(test)]
+pub(crate) trait FloorFsOps: Send + Sync {
+    /// The ACTUAL rename call. A test impl matches `(src, dst)` to fail
+    /// exactly the call it wants — e.g. src's filename starting with the
+    /// temp prefix AND dst == the marker path — while every other rename
+    /// (the A→backup rename, the restore's rename) passes through to the
+    /// real filesystem.
+    fn rename(&self, src: &Path, dst: &Path) -> std::io::Result<()>;
+}
+
+// The installed seam for the current thread ([`FloorFsOps`]). `None` in
+// production and in tests that did not install one — the floor writes then
+// perform the REAL filesystem calls.
+#[cfg(test)]
+thread_local! {
+    static FLOOR_FS_OPS: std::cell::RefCell<Option<std::sync::Arc<dyn FloorFsOps>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Route a floor-transaction rename through the INJECTABLE filesystem
+/// boundary: production always performs the REAL [`std::fs::rename`]; a
+/// test that installed a seam (via [`FloorFsSeamGuard`]) performs the
+/// seam's rename instead — so a test can fail the ACTUAL temp→marker
+/// rename after A was backed up (a real fs error on the real call, not a
+/// pre-I/O fault).
+fn floor_fs_rename(src: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(ops) = FLOOR_FS_OPS.with(|s| s.borrow().clone()) {
+        return ops.rename(src, dst);
+    }
+    std::fs::rename(src, dst)
+}
+
+/// Test-only RAII guard scoping a [`FloorFsOps`] seam to one floor
+/// transaction case: installs the seam for the CURRENT thread and restores
+/// the previous seam on drop, so a proptest case cannot leak its arming
+/// into the next case (or another test on the same thread).
+#[cfg(test)]
+pub(crate) struct FloorFsSeamGuard(Option<std::sync::Arc<dyn FloorFsOps>>);
+
+#[cfg(test)]
+impl FloorFsSeamGuard {
+    pub(crate) fn install(ops: std::sync::Arc<dyn FloorFsOps>) -> Self {
+        // `Option::replace` swaps the value in place and returns the
+        // previous one (the seam the guard restores on drop).
+        let previous = FLOOR_FS_OPS.with(|s| s.borrow_mut().replace(ops));
+        FloorFsSeamGuard(previous)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FloorFsSeamGuard {
+    fn drop(&mut self) {
+        FLOOR_FS_OPS.with(|s| *s.borrow_mut() = self.0.take());
+    }
+}
+
+/// Test impl of [`FloorFsOps`]: performs the REAL filesystem calls while
+/// recording every rename it observed, and can be ARMED to fail ONE rename
+/// whose `(src, dst)` matches a predicate — the seam the real-B-temp-rename
+/// property uses to fail the ACTUAL temp→marker rename after A was backed
+/// up. One-shot: the first matching rename fails with a permission error
+/// and disarms, so the restore's rename (and any later transaction) passes
+/// through to the real filesystem.
+///
+/// The armed one-shot failure predicate decides, per `(src, dst)`, whether
+/// the rename must fail (factored into a `type` alias so the field type
+/// stays readable).
+#[cfg(test)]
+type FailRenamePred = dyn Fn(&Path, &Path) -> bool + Send + Sync;
+
+#[cfg(test)]
+pub(crate) struct TestFloorFsOps {
+    fail_rename: std::sync::Mutex<Option<std::sync::Arc<FailRenamePred>>>,
+    renames: std::sync::Mutex<Vec<(PathBuf, PathBuf)>>,
+}
+
+#[cfg(test)]
+impl TestFloorFsOps {
+    pub(crate) fn new() -> Self {
+        TestFloorFsOps {
+            fail_rename: std::sync::Mutex::new(None),
+            renames: std::sync::Mutex::new(Vec::new()), // rename log (call order)
+        }
+    }
+
+    /// Arm the seam: the NEXT rename whose `(src, dst)` satisfies `pred`
+    /// fails with `PermissionDenied` (one-shot).
+    pub(crate) fn fail_rename_once(
+        &self,
+        pred: impl Fn(&Path, &Path) -> bool + Send + Sync + 'static,
+    ) {
+        *self.fail_rename.lock().unwrap() = Some(std::sync::Arc::new(pred));
+    }
+
+    /// Every rename observed by the seam, in call order — a test asserts
+    /// the seam fired on the REAL temp→marker call AFTER the backup rename.
+    pub(crate) fn renames(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.renames.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+impl Default for TestFloorFsOps {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+impl FloorFsOps for TestFloorFsOps {
+    fn rename(&self, src: &Path, dst: &Path) -> std::io::Result<()> {
+        self.renames
+            .lock()
+            .unwrap()
+            .push((src.to_path_buf(), dst.to_path_buf()));
+        // Check the armed predicate WITHOUT consuming it: the arming must
+        // survive every non-matching rename (e.g. the A→backup rename) and
+        // fire only on the exact call it was armed for (the temp→marker
+        // rename), then disarm.
+        let should_fail = self
+            .fail_rename
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|pred| pred(src, dst))
+            .unwrap_or(false);
+        if should_fail {
+            self.fail_rename.lock().unwrap().take();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "test fault: real floor rename forced to fail once",
+            ));
+        }
+        std::fs::rename(src, dst)
+    }
+}
 /// The exact set a checkpoint floor discards on one target (the dry-run
 /// preview enumerates precisely this; the compaction deletes precisely this).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -265,13 +421,17 @@ impl LocalStore {
     /// 3. move A aside to the durable, TRANSACTION-TAGGED backup
     ///    `history-floor.json.prev.<B-id>` in the same directory, then
     ///    fsync the parent so the BACKUP is durable BEFORE B can overwrite
-    ///    the marker name; a fault or a real backup-sync error → restore A
-    ///    from the tagged backup + `Err`,
-    /// 4. rename B's temp into place (atomic); a fault → restore A + `Err`,
+    ///    the marker name; a fault or a real
+    ///    backup-sync error → `Err` through the ONE cleanup-and-restore
+    ///    handler,
+    /// 4. rename B's temp into place (atomic); a fault OR a REAL rename
+    ///    failure (the actual `rename(2)` call, routed through the
+    ///    injectable filesystem boundary) → `Err` through the SAME
+    ///    handler,
     /// 5. fsync the parent directory — B's DURABILITY COMMIT POINT — errors
-    ///    PROPAGATED; a fault (the marker may already be renamed into
-    ///    place) → unlink B's marker, restore A from the tagged backup, and
-    ///    `Err`: B never committed, A is durable again,
+    ///    PROPAGATED; a fault or a real sync error (the marker may already
+    ///    be renamed into place) → `Err` through the SAME handler: B never
+    ///    committed, A is durable again,
     /// 6. committed: remove THIS transaction's tagged backup (best-effort —
     ///    a leftover is harmless: it carries B's tag, so no other
     ///    transaction ever restores it, and the NEXT advance's step-0
@@ -283,7 +443,13 @@ impl LocalStore {
     /// and verify: the backup must carry the CURRENT advance's tag AND its
     /// content must parse and equal the pre-advance floor A (read at the
     /// start of the transaction) — a stale or foreign backup is REFUSED,
-    /// never renamed over the marker. A restore failure leaves the marker
+    /// never renamed over the marker. EVERY post-backup failure — injected
+    /// fault or real filesystem error alike, INCLUDING a real B-temp→marker
+    /// rename failure — routes through the ONE handler
+    /// ([`LocalStore::cleanup_and_restore`]): it best-effort removes B's
+    /// temp artifact, restores A from the backup via
+    /// [`LocalStore::restore_floor_backup`], and propagates the ORIGINAL
+    /// error. A restore failure leaves the marker
     /// absent while the tagged backup still holds A — a TORN ADVANCE the
     /// readers survive via the validated-backup fallback
     /// ([`LocalStore::read_history_floor`]: a VALIDATED tagged backup with
@@ -401,122 +567,130 @@ impl LocalStore {
                     "test fault: history-floor backup rename forced to fail once",
                 ));
             }
-            std::fs::rename(&path, &backup).map_err(|e| {
-                // A may or may not have moved; attempt the restore either
-                // way so the failed advance leaves the pre-advance state
-                // (floor A durable — or, if the restore itself fails, a
-                // torn state every read fails closed on). The restore only
-                // ever renames THIS transaction's tagged backup back, and
-                // only after verifying its content equals the pre-advance
-                // floor A — a stale backup from another transaction is a
-                // different file and is never consulted.
-                let restore = self.restore_floor_backup(
+            // The REAL backup rename (A → the durable, TRANSACTION-TAGGED
+            // backup), routed through the injectable filesystem boundary so
+            // a test can fail the ACTUAL call BEFORE A moves. A real
+            // failure leaves A at the marker name (rename is atomic — the
+            // backup does not exist): the cleanup-and-restore handler's
+            // `path` guard (`backup.exists() || !had_floor`) keeps A at the
+            // marker name and drops only B's staged temp — a failed backup
+            // can never erase the previous floor.
+            floor_fs_rename(&path, &backup).map_err(|e| {
+                self.cleanup_and_restore(
                     &path,
                     &backup,
+                    &tmp,
+                    true,
                     previous_floor.as_ref(),
                     floor.deployment_id.as_str(),
-                );
-                match restore {
-                    Ok(()) => Error::store(format!("rename floor {}: {e}", path.display())),
-                    Err(re) => Error::store(format!(
-                        "rename floor {}: {e}; restore of the previous floor failed ({re}) — the marker is left in a torn state and every read fails closed",
-                        path.display()
-                    )),
-                }
+                    Error::store(format!("rename floor {}: {e}", path.display())),
+                )
             })?;
             // The BACKUP must be durable before B can overwrite the marker
             // name: without this sync, a later failure could leave the
-            // marker name empty with A only in a not-yet-durable backup.
+            // marker name empty with A only in a not-yet-durable backup. A
+            // real sync failure is POST-BACKUP (A already moved): the ONE
+            // cleanup-and-restore handler restores A and propagates the
+            // original error.
             if let Err(e) = sync_parent_dir(&path) {
-                let restore = self.restore_floor_backup(
+                return Err(self.cleanup_and_restore(
                     &path,
                     &backup,
+                    &tmp,
+                    true,
                     previous_floor.as_ref(),
                     floor.deployment_id.as_str(),
-                );
-                return Err(match restore {
-                    Ok(()) => e,
-                    Err(re) => Error::store(format!(
-                        "history-floor advance: backup parent sync failed ({e}); restore of the previous floor failed ({re}) — the marker is left in a torn state and every read fails closed"
-                    )),
-                });
+                    e,
+                ));
             }
         }
 
-        // Stage fault: the rename into place (B's temp → the marker name).
-        // Fires BEFORE the rename; A is safe at the backup, so the failed
-        // advance restores A and fails.
+        // ---- TRANSACTIONAL ADVANCE, stage 2: B's rename + commit point ----
+        // From here on EVERY failure is POST-BACKUP (A sits in the durable
+        // backup): the injected [`FaultKind::RenameFloor`] fault, a REAL
+        // temp→marker rename error (the ACTUAL fs call, routed through the
+        // injectable filesystem boundary [`floor_fs_rename`]), the injected
+        // [`FaultKind::SyncFloorParent`] fault, and a REAL parent-sync
+        // error ALL route through the ONE cleanup-and-restore handler
+        // ([`LocalStore::cleanup_and_restore`]) — restoring A from the
+        // backup, removing B's temp artifact, and propagating the ORIGINAL
+        // error. A real rename failure is NOT special-cased: without the
+        // handler it would leave the marker absent, B never installed, and
+        // A in the backup — NO floor (discarded history re-exposed).
         #[cfg(test)]
         if self
             .fault_registry()
             .consume(FaultKind::RenameFloor, floor.deployment_id.as_str())
         {
-            let _ = std::fs::remove_file(&tmp);
-            let restore = self.restore_floor_backup(
+            return Err(self.cleanup_and_restore(
                 &path,
                 &backup,
+                &tmp,
+                had_floor,
                 previous_floor.as_ref(),
                 floor.deployment_id.as_str(),
-            );
-            return Err(match restore {
-                Ok(()) => Error::store("test fault: history-floor rename forced to fail once"),
-                Err(re) => Error::store(format!(
-                    "test fault: history-floor rename forced to fail once; restore of the previous floor failed ({re}) — the marker is left in a torn state and every read fails closed"
-                )),
-            });
+                Error::store("test fault: history-floor rename forced to fail once"),
+            ));
         }
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| Error::store(format!("rename {}: {e}", path.display())))?;
+        // The REAL temp→marker rename, through the injectable filesystem
+        // boundary: a test seam fails the ACTUAL call — after A was backed
+        // up — and the REAL error routes through the SAME
+        // cleanup-and-restore handler as the injected faults.
+        floor_fs_rename(&tmp, &path).map_err(|e| {
+            self.cleanup_and_restore(
+                &path,
+                &backup,
+                &tmp,
+                had_floor,
+                previous_floor.as_ref(),
+                floor.deployment_id.as_str(),
+                Error::store(format!("rename {}: {e}", path.display())),
+            )
+        })?;
 
         // Stage fault: B's commit-point parent fsync (the durability
         // COMMIT POINT — B's marker may already be renamed into place when
-        // this fires). Fail-closed: B never committed, so B's marker is
-        // unlinked and A is restored from the backup — the failed
-        // advancement leaves EXACTLY the pre-advance state (floor A
-        // durable, same visible suffix, no compaction side effects).
+        // this fires). Fail-closed: B never committed — the ONE
+        // cleanup-and-restore handler removes B's artifact at the marker
+        // name and restores A from the backup, so the failed advancement
+        // leaves EXACTLY the pre-advance state (floor A durable, same
+        // visible suffix, no compaction side effects).
         #[cfg(test)]
         if self
             .fault_registry()
             .consume(FaultKind::SyncFloorParent, floor.deployment_id.as_str())
         {
-            // B may already be renamed into place: remove B's marker so no
-            // B exists, then restore A from the tagged backup (the marker
-            // name reverts to the pre-advance floor). If the restore ITSELF
-            // fails, the marker is left absent while the tagged backup
-            // holds A — a torn state every read fails closed on.
-            let _ = std::fs::remove_file(&path);
-            let restore = self.restore_floor_backup(
+            // B may already be renamed into place: the handler removes
+            // B's marker so no B exists, then restores A from the tagged
+            // backup (the marker name reverts to the pre-advance floor). If
+            // the restore ITSELF fails, the marker is left absent while the
+            // tagged backup holds A — a torn state every read fails closed
+            // on.
+            return Err(self.cleanup_and_restore(
                 &path,
                 &backup,
+                &tmp,
+                had_floor,
                 previous_floor.as_ref(),
                 floor.deployment_id.as_str(),
-            );
-            return Err(match restore {
-                Ok(()) => Error::store("test fault: history-floor parent sync forced to fail once"),
-                Err(re) => Error::store(format!(
-                    "test fault: history-floor parent sync forced to fail once; restore of the previous floor failed ({re}) — the marker is left in a torn state and every read fails closed"
-                )),
-            });
+                Error::store("test fault: history-floor parent sync forced to fail once"),
+            ));
         }
         // The parent-directory fsync is B's DURABILITY COMMIT POINT: it is
         // what makes B's rename survive power loss. Fail-closed — a real
-        // sync failure means B never committed, so B's marker is unlinked
-        // and A is restored from the backup (mirror the torn-record
-        // cleanup).
+        // sync failure means B never committed, so the ONE
+        // cleanup-and-restore handler removes B's marker and restores A
+        // from the backup (mirror the torn-record cleanup).
         if let Err(e) = sync_parent_dir(&path) {
-            let _ = std::fs::remove_file(&path);
-            let restore = self.restore_floor_backup(
+            return Err(self.cleanup_and_restore(
                 &path,
                 &backup,
+                &tmp,
+                had_floor,
                 previous_floor.as_ref(),
                 floor.deployment_id.as_str(),
-            );
-            return Err(match restore {
-                Ok(()) => e,
-                Err(re) => Error::store(format!(
-                    "history-floor advance: parent sync failed ({e}); restore of the previous floor failed ({re}) — the marker is left in a torn state and every read fails closed"
-                )),
-            });
+                e,
+            ));
         }
         // COMMITTED: B is durable. Remove THIS transaction's tagged backup
         // — best-effort (a leftover `.prev.<B>` holding A is harmless: it
@@ -568,6 +742,64 @@ impl LocalStore {
         sync_parent_dir(path)
     }
 
+    /// The ONE cleanup-and-restore handler for a failed transactional
+    /// ADVANCE (A → B). Runs on EVERY failure after the advance started
+    /// touching the marker — the REAL backup-rename error (A may or may not
+    /// have moved), the injected [`FaultKind::RenameFloor`] fault, a REAL
+    /// temp→marker rename error (the ACTUAL fs call, routed through the
+    /// injectable filesystem boundary [`floor_fs_rename`]), the injected
+    /// [`FaultKind::SyncFloorParent`] fault, and a REAL parent-sync error.
+    ///
+    /// The handler restores the pre-advance state and propagates the
+    /// ORIGINAL error:
+    ///
+    /// 1. best-effort remove B's STAGED TEMP (`tmp`) — it exists at the
+    ///    pre-rename stages (a fault, a failed temp→marker rename) and is
+    ///    gone once B's rename succeeded (a no-op then),
+    /// 2. best-effort remove B's artifact at the MARKER NAME (`path`) — the
+    ///    half-installed B marker after B's rename succeeded — but ONLY
+    ///    when removing it cannot erase the previous floor: after A moved
+    ///    aside (`backup` exists, so `path` is absent or B's marker), or on
+    ///    a first-ever write (`had_floor == false`; `path` is absent or B's
+    ///    marker — A never lived there). A failed BACKUP rename on an
+    ///    ADVANCE (`had_floor == true`, no `backup`) leaves A at `path` —
+    ///    that file is A and must NOT be removed,
+    /// 3. restore A from the tagged backup via
+    ///    [`LocalStore::restore_floor_backup`] (atomic rename over the
+    ///    marker name + parent fsync — a no-op when the advance failed
+    ///    before A moved; the restore is TAG- AND CONTENT-VERIFIED and
+    ///    FAIL-CLOSED when it itself fails),
+    /// 4. propagate the ORIGINAL error — wrapped ONLY when the restore also
+    ///    failed, naming it (a double failure leaves a torn state — marker
+    ///    absent, the tagged backup holds A — every read fails closed on).
+    #[allow(clippy::too_many_arguments)]
+    fn cleanup_and_restore(
+        &self,
+        path: &Path,
+        backup: &Path,
+        tmp: &Path,
+        had_floor: bool,
+        previous_floor: Option<&HistoryFloor>,
+        deployment_id: &str,
+        original: Error,
+    ) -> Error {
+        // 1. B's staged temp (pre-rename stages only; a no-op after B's
+        //    rename succeeded — the temp no longer exists).
+        let _ = std::fs::remove_file(tmp);
+        // 2. B's marker-name artifact — never A (see the doc above for the
+        //    guard: the failed-backup-rename case keeps A at `path`).
+        if backup.exists() || !had_floor {
+            let _ = std::fs::remove_file(path);
+        }
+        // 3. + 4. Restore A (tag- and content-verified) and propagate the
+        //    original error (wrapped only when the restore itself failed).
+        match self.restore_floor_backup(path, backup, previous_floor, deployment_id) {
+            Ok(()) => original,
+            Err(re) => Error::store(format!(
+                "{original}; restore of the previous floor failed ({re}) — the marker is left in a torn state and every read fails closed"
+            )),
+        }
+    }
     /// Restore the PRE-ADVANCE floor A after a failed ADVANCE (A → B):
     /// rename the durable, TRANSACTION-TAGGED backup
     /// `history-floor.json.prev.<B-id>` back over the marker name (atomic on
@@ -1247,5 +1479,419 @@ impl LocalStore {
         write_jsonl_atomic(&self.refs_dir(target).join("snapshots.jsonl"), &keep_snaps)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history;
+    use crate::model::{DeploymentId, TargetName};
+    use crate::records::DeploymentAttempt;
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    const TARGET: &str = "production";
+
+    fn attempt(id: &str, target: &str) -> DeploymentAttempt {
+        DeploymentAttempt {
+            deployment_schema_version: SCHEMA_VERSION,
+            deployment_id: DeploymentId::new(id.to_string()),
+            target: TargetName::new(target.to_string()),
+            slot_ids: vec![],
+            behavior_sha256: "sha256-aa".to_string(),
+            attempted_at: format!("2026-01-01T00:00:00Z-{id}"),
+            desired: BTreeMap::new(),
+            pre_push: BTreeMap::new(),
+            slots: BTreeMap::new(),
+        }
+    }
+
+    fn snapshot_entry(index: u64, id: &str, target: &str) -> DeploymentSnapshot {
+        DeploymentSnapshot {
+            index,
+            deployment_id: DeploymentId::new(id.to_string()),
+            target: TargetName::new(target.to_string()),
+            behavior_sha256: "sha256-aa".to_string(),
+            slots: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+        }
+    }
+
+    /// Seed a target with a history of `(attempt_ok, ...)` flags: every
+    /// attempt gets a `deployments/<id>/` directory; every successful
+    /// attempt appends a snapshot with the next unique index (mirroring the
+    /// checkpoint suite's seeding).
+    fn seed_history(store: &LocalStore, target: &str, prefix: &str, history: &[bool]) {
+        let mut next = 0u64;
+        for (n, ok) in history.iter().enumerate() {
+            let id = format!("{prefix}-{n:04}");
+            store.append_attempt(target, &attempt(&id, target)).unwrap();
+            std::fs::create_dir_all(store.deployment_dir(&id)).unwrap();
+            if *ok {
+                store
+                    .append_snapshot(target, &snapshot_entry(next, &id, target))
+                    .unwrap();
+                next += 1;
+            }
+        }
+    }
+
+    /// A floor marker naming `id` at snapshot `index` (the seeded history
+    /// already carries the bound attempt + snapshot, so the marker reads
+    /// back bound to the exact snapshot pair).
+    fn floor_for(target: &str, id: &str, snapshot_index: u64) -> HistoryFloor {
+        HistoryFloor {
+            schema_version: SCHEMA_VERSION,
+            target: TargetName::new(target.to_string()),
+            deployment_id: DeploymentId::new(id.to_string()),
+            snapshot_index,
+            established_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    /// The ENTIRE visible state of `target` under `floor`: the gated
+    /// snapshot/attempt lists and the below-floor ref refusal. A failed
+    /// ADVANCE must leave this EXACTLY unchanged (identical lists, the same
+    /// below-A refs refused).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct VisibleState {
+        snapshots: Vec<(u64, String)>,
+        attempts: Vec<String>,
+        below_floor_ref_err: Option<String>,
+    }
+
+    fn capture_visible(store: &LocalStore, floor: &HistoryFloor) -> VisibleState {
+        // The ref just below the floor must be REFUSED (never a resolved
+        // below-floor snapshot); capture the exact refusal message so the
+        // post-advance state can be compared byte-for-byte.
+        let below_floor_ref_err = if floor.snapshot_index > 0 {
+            let expr = history::parse_ref_expr(&format!("s{}", floor.snapshot_index - 1)).unwrap();
+            Some(
+                history::resolve_ref_expr(&expr, TARGET, store)
+                    .unwrap_err()
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        VisibleState {
+            snapshots: store
+                .read_snapshots(TARGET)
+                .unwrap()
+                .iter()
+                .map(|s| (s.index, s.deployment_id.as_str().to_string()))
+                .collect(),
+            attempts: store
+                .read_attempts(TARGET)
+                .unwrap()
+                .iter()
+                .map(|a| a.deployment_id.as_str().to_string())
+                .collect(),
+            below_floor_ref_err,
+        }
+    }
+
+    /// NO TEMPORARY TRANSACTION FILES may survive a failed advance: the
+    /// marker is the restored A, the ONLY file in `refs/` beyond the
+    /// durable op log (`snapshots.jsonl`) — no B temp
+    /// (`.history-floor.json.tmp.<pid>.<n>`), no leftover `.prev` backup.
+    /// (A tagged-backup sibling may rename the backup artifact at merge
+    /// time; this asserts the ABSENCE of any temp/backup, not a specific
+    /// backup name.)
+    fn assert_no_transaction_artifacts(store: &LocalStore) {
+        let refs = store.refs_dir(TARGET);
+        assert!(
+            refs.join("history-floor.json").exists(),
+            "the restored A marker is present"
+        );
+        let mut entries: Vec<String> = std::fs::read_dir(&refs)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        let expected: Vec<String> = ["history-floor.json", "snapshots.jsonl"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            entries, expected,
+            "refs/ holds EXACTLY the durable op log and the restored A marker — no temp file, no leftover backup, got: {entries:?}"
+        );
+    }
+
+    proptest! {
+        // THE REAL-B-TEMP-RENAME-FAILURE PROPERTY: a genuine filesystem
+        // error on the ACTUAL temp→marker rename — the seam fails the real
+        // rename(2) call AFTER A was backed up — routes through the SAME
+        // cleanup-and-restore handler as the injected faults: the advance
+        // returns `Err` and leaves EXACTLY the pre-advance state (floor A
+        // installed, the visible suffix unchanged, below-A refs still
+        // refused, no temporary transaction files). Deterministic: the SAME
+        // generator under the pinned 0x5EED_5EED seed runs identical
+        // vectors on every invocation (bounded cases keep the suite fast;
+        // each case drives a fresh fixture).
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn real_b_temp_rename_failure_restores_a(
+            history in prop::collection::vec(any::<bool>(), 3..6),
+            a_at in 0usize..8,
+        ) {
+            run_real_b_temp_rename_failure_case(&history, a_at);
+        }
+    }
+
+    /// One REAL-B-TEMP-RENAME-FAILURE case: establish floor A over a seeded
+    /// history, arm the injectable filesystem boundary ([`TestFloorFsOps`])
+    /// to fail the ACTUAL temp→marker rename (after A was backed up), drive
+    /// the advance A → B, and assert:
+    ///
+    /// * the advance returns `Err` (the REAL rename error, not the injected
+    ///   fault),
+    /// * A REMAINS INSTALLED — `read_history_floor(target)` == A (same
+    ///   deployment_id/snapshot_index, never None),
+    /// * the VISIBLE SUFFIX is exactly unchanged (read_snapshots/
+    ///   read_attempts identical to before the attempt; the below-A ref is
+    ///   still refused),
+    /// * NO TEMPORARY TRANSACTION FILES remain (no B temp, no leftover
+    ///   backup — refs/ holds exactly the restored A marker + the op log).
+    ///
+    /// Then the fault-free CONTROL: the same fixture advances to B and
+    /// reads back as B.
+    fn run_real_b_temp_rename_failure_case(history_in: &[bool], a_at: usize) {
+        // Seeding (mirroring the checkpoint suite): a guaranteed early
+        // success, a guaranteed FAILED attempt, the randomized history, and
+        // a guaranteed FINAL success so B is always a strictly-later
+        // successful deployment.
+        let mut history = vec![true, false];
+        history.extend_from_slice(history_in);
+        history.push(true);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        seed_history(&store, TARGET, "deploy", &history);
+        let ok_ids: Vec<String> = history
+            .iter()
+            .enumerate()
+            .filter(|(_, ok)| **ok)
+            .map(|(n, _)| format!("deploy-{n:04}"))
+            .collect();
+        assert!(
+            ok_ids.len() >= 2,
+            "A and B both need a successful deployment"
+        );
+
+        // A: the `a_at`-th successful deployment (never the last — B owns
+        // the last success). Its snapshot index is its position among the
+        // successes (snapshots are minted in order).
+        let a_id = ok_ids[a_at % (ok_ids.len() - 1)].clone();
+        let a_index = ok_ids.iter().position(|id| *id == a_id).unwrap() as u64;
+        let b_id = ok_ids.last().unwrap().clone();
+        let b_index = (ok_ids.len() - 1) as u64;
+        assert_ne!(a_id, b_id, "B must be a later deployment than A");
+
+        // Establish floor A (direct marker write — the seeded history
+        // already carries A's attempt + snapshot, so the marker reads back
+        // bound to the exact snapshot pair).
+        let floor_a = floor_for(TARGET, &a_id, a_index);
+        store.write_history_floor(TARGET, &floor_a).unwrap();
+        let a_floor = store.read_history_floor(TARGET).unwrap().unwrap();
+        assert_eq!(a_floor.deployment_id.as_str(), a_id);
+        assert_eq!(a_floor.snapshot_index, a_index);
+
+        // PRE-ADVANCE visible state: floor A, the gated suffix, and the
+        // below-A ref refusal.
+        let pre = capture_visible(&store, &a_floor);
+
+        // ARM THE INJECTABLE FILESYSTEM BOUNDARY: fail the REAL
+        // temp→marker rename — the ACTUAL rename(2) call AFTER A was backed
+        // up — matched by (src = the staged temp name, dst = the marker
+        // path), so the A→backup rename and the restore's rename pass
+        // through to the real filesystem. The seam also RECORDS every
+        // rename, so the case can prove the failure fired after A moved.
+        let seam = Arc::new(TestFloorFsOps::new());
+        let marker = store.history_floor_path(TARGET);
+        let fail_marker = marker.clone();
+        let fail_prefix = format!(".{}.tmp.", marker.file_name().unwrap().to_string_lossy());
+        seam.fail_rename_once(move |src, dst| {
+            src.file_name()
+                .map(|n| n.to_string_lossy().starts_with(&fail_prefix))
+                .unwrap_or(false)
+                && dst == fail_marker.as_path()
+        });
+        let _guard = FloorFsSeamGuard::install(seam.clone());
+
+        // DRIVE THE ADVANCE A → B: the real temp→marker rename FAILS (a
+        // genuine fs error on the actual call, after A was moved aside to
+        // the durable backup).
+        let floor_b = floor_for(TARGET, &b_id, b_index);
+        let err = store
+            .write_history_floor(TARGET, &floor_b)
+            .expect_err("the real temp→marker rename failure must fail the advance");
+        assert!(
+            err.to_string()
+                .contains("test fault: real floor rename forced to fail once"),
+            "the REAL rename error (through the fs boundary) is the cause, got: {err}"
+        );
+        assert!(
+            !err.to_string()
+                .contains("test fault: history-floor rename forced to fail once"),
+            "the injected fault must NOT be the cause — the seam failed the actual fs call, got: {err}"
+        );
+        // The seam observed the REAL backup rename (A moved aside) BEFORE
+        // the failing temp→marker rename — the failure happened after A was
+        // backed up.
+        let renames = seam.renames();
+        assert!(
+            renames.len() >= 2
+                && renames[0] == (marker.clone(), floor_backup_path(&marker, &b_id))
+                && renames[1].1 == marker,
+            "the seam must observe the REAL backup rename followed by the failing temp→marker rename, got: {renames:?}"
+        );
+
+        // A REMAINS INSTALLED — the ORIGINAL floor, never None, never B.
+        let floor = store.read_history_floor(TARGET).unwrap();
+        let f = floor
+            .as_ref()
+            .expect("a real temp→marker rename failure must retain floor A — never None");
+        assert_eq!(
+            f.deployment_id.as_str(),
+            a_id,
+            "the ORIGINAL floor deployment A survives the real rename failure"
+        );
+        assert_eq!(
+            f.snapshot_index, a_index,
+            "the ORIGINAL floor index survives the real rename failure"
+        );
+
+        // THE VISIBLE SUFFIX IS EXACTLY UNCHANGED: identical gated
+        // snapshots/attempts, and the same below-A refs still refused.
+        let post = capture_visible(&store, f);
+        assert_eq!(
+            post.snapshots, pre.snapshots,
+            "the visible snapshot suffix is exactly unchanged"
+        );
+        assert_eq!(
+            post.attempts, pre.attempts,
+            "the visible attempts suffix is exactly unchanged"
+        );
+        assert_eq!(
+            post.below_floor_ref_err, pre.below_floor_ref_err,
+            "the same below-A refs stay refused"
+        );
+
+        // NO TEMPORARY TRANSACTION FILES remain: the marker is the restored
+        // A — no B temp file, no leftover backup (refs/ holds exactly the
+        // restored marker + the op log).
+        assert_no_transaction_artifacts(&store);
+
+        // CONTROL: the fault-free advance to B SUCCEEDS on the same fixture
+        // (the failed attempt left the store fully usable) and reads back
+        // as B.
+        store
+            .write_history_floor(TARGET, &floor_b)
+            .expect("the fault-free advance to B succeeds");
+        let b_floor = store.read_history_floor(TARGET).unwrap().unwrap();
+        assert_eq!(b_floor.deployment_id.as_str(), b_id);
+        assert_eq!(b_floor.snapshot_index, b_index);
+    }
+
+    /// CONTROL: the injected [`FaultKind::RenameFloor`] fault (fires BEFORE
+    /// the rename I/O) still routes through the SAME cleanup-and-restore
+    /// handler — A is restored, the visible suffix is unchanged, and no
+    /// transaction artifacts remain (regression guard for the unified
+    /// handler).
+    #[test]
+    fn rename_floor_fault_still_restores_a() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        seed_history(&store, TARGET, "deploy", &[true, true]);
+        let a_id = "deploy-0000".to_string();
+        let b_id = "deploy-0001".to_string();
+        let floor_a = floor_for(TARGET, &a_id, 0);
+        store.write_history_floor(TARGET, &floor_a).unwrap();
+        let a_floor = store.read_history_floor(TARGET).unwrap().unwrap();
+        let pre = capture_visible(&store, &a_floor);
+
+        let floor_b = floor_for(TARGET, &b_id, 1);
+        store.fault_registry().arm_rename_floor(&b_id);
+        let err = store
+            .write_history_floor(TARGET, &floor_b)
+            .expect_err("the RenameFloor fault fails the advance");
+        assert!(
+            err.to_string()
+                .contains("test fault: history-floor rename forced to fail once"),
+            "the injected fault is the cause, got: {err}"
+        );
+
+        // A remains installed (never None, never B) and the visible suffix
+        // is exactly unchanged.
+        let floor = store.read_history_floor(TARGET).unwrap();
+        let f = floor
+            .as_ref()
+            .expect("the injected RenameFloor fault must retain floor A — never None");
+        assert_eq!(f.deployment_id.as_str(), a_id);
+        assert_eq!(f.snapshot_index, 0);
+        let post = capture_visible(&store, f);
+        assert_eq!(post.snapshots, pre.snapshots);
+        assert_eq!(post.attempts, pre.attempts);
+        assert_eq!(post.below_floor_ref_err, pre.below_floor_ref_err);
+        assert_no_transaction_artifacts(&store);
+    }
+
+    /// CONTROL: a REAL rename failure BEFORE A was backed up (the actual
+    /// A→backup rename errors through the seam) leaves A untouched at the
+    /// marker name — the cleanup-and-restore handler's `path` guard keeps
+    /// the previous floor when no backup exists (`had_floor == true`, no
+    /// `.prev`), and drops only B's staged temp.
+    #[test]
+    fn real_rename_failure_before_backup_leaves_a_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        seed_history(&store, TARGET, "deploy", &[true, true]);
+        let a_id = "deploy-0000".to_string();
+        let b_id = "deploy-0001".to_string();
+        let floor_a = floor_for(TARGET, &a_id, 0);
+        store.write_history_floor(TARGET, &floor_a).unwrap();
+
+        // Arm the seam to fail the REAL A→backup rename (src = the marker
+        // path, dst = the backup path) — BEFORE A was moved aside.
+        let seam = Arc::new(TestFloorFsOps::new());
+        let marker = store.history_floor_path(TARGET);
+        let fail_marker = marker.clone();
+        let fail_backup = floor_backup_path(&marker, &b_id);
+        seam.fail_rename_once(move |src, dst| {
+            src == fail_marker.as_path() && dst == fail_backup.as_path()
+        });
+        let _guard = FloorFsSeamGuard::install(seam);
+
+        let floor_b = floor_for(TARGET, &b_id, 1);
+        let err = store
+            .write_history_floor(TARGET, &floor_b)
+            .expect_err("the real backup-rename failure fails the advance");
+        assert!(
+            err.to_string().contains("rename floor"),
+            "the real backup-rename error propagates, got: {err}"
+        );
+
+        // A is STILL at the marker name (never moved, never removed): the
+        // failed advance leaves the previous floor untouched.
+        let floor = store.read_history_floor(TARGET).unwrap().unwrap();
+        assert_eq!(floor.deployment_id.as_str(), a_id);
+        assert_eq!(floor.snapshot_index, 0);
+        assert!(marker.exists(), "A's marker is never removed");
+        assert!(
+            !floor_backup_path(&marker, &b_id).exists(),
+            "no backup was ever created by the failed backup rename"
+        );
+        // The handler still dropped B's staged temp.
+        assert_no_transaction_artifacts(&store);
     }
 }
