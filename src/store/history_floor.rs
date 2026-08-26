@@ -61,18 +61,18 @@ use crate::error::{Error, Result};
 // reachability scan) and the preview side's `LedgerEntry` (the override
 // carries parsed entries) are both live imports — keep both.
 use crate::model::{DeploymentId, ReleaseId};
-use crate::records::{DeploymentStatus, LedgerEntry};
+use crate::records::{LedgerEntry, TerminalDisposition};
 use crate::store::atomic::{path_state, write_atomic_replace};
 use crate::store::gc::SweepStageStats;
 use crate::store::local::LocalStore;
 use std::collections::BTreeSet;
 
 #[cfg(test)]
-use crate::model::{PlacementSlotId, TargetName};
+use crate::model::PlacementSlotId;
 #[cfg(test)]
-use crate::records::LedgerIntent;
-#[cfg(test)]
-use crate::records::{LedgerTerminal, SlotResult};
+use crate::records::{
+    DeploymentIntent, DeploymentStatus, LedgerRollback, LedgerTerminal, SlotResult, SlotTable,
+};
 #[cfg(test)]
 use crate::testutil::test_faults::FaultKind;
 #[cfg(test)]
@@ -187,10 +187,10 @@ impl LocalStore {
                 "checkpoint requires a SUCCESSFUL deployment: deployment '{checkpoint_id}' on target '{target}' has no terminal event (the deployment is still in flight or pending)"
             ))
         })?;
-        if terminal.status != DeploymentStatus::Successful || terminal.rollback.is_none() {
+        if !matches!(terminal.disposition, TerminalDisposition::Successful { .. }) {
             return Err(Error::r#ref(format!(
-                "checkpoint requires a successful deployment: deployment '{checkpoint_id}' on target '{target}' ended {status:?} — only successful deployments carry a rollback state",
-                status = terminal.status
+                "checkpoint requires a successful deployment: deployment '{checkpoint_id}' on target '{target}' ended {:?} — only successful deployments carry a rollback state",
+                terminal.status()
             )));
         }
         let keep_from = entry.seq as usize;
@@ -354,22 +354,25 @@ impl LocalStore {
                 // terminal is the CURRENT/INCOMPLETE state — its dir stays).
                 out.deployments
                     .insert(entry.deployment_id.as_str().to_string());
-                // Intent-referenced artifacts (desired + pre-push).
-                for g in entry.intent.desired.values() {
+                // Intent-referenced artifacts (desired + pre-push): the ONE
+                // authoritative slot table carries both.
+                for s in entry.intent.slots.values() {
                     out.releases
-                        .insert(g.assignment.artifact.release.as_str().to_string());
+                        .insert(s.desired.artifact.release.as_str().to_string());
                     out.trees
-                        .insert(g.assignment.artifact.tree.as_str().to_string());
-                }
-                for s in entry.intent.pre_push.values().flatten() {
-                    out.releases.insert(s.artifact.release.as_str().to_string());
-                    out.trees.insert(s.artifact.tree.as_str().to_string());
+                        .insert(s.desired.artifact.tree.as_str().to_string());
+                    if let Some(p) = &s.pre_push {
+                        out.releases.insert(p.artifact.release.as_str().to_string());
+                        out.trees.insert(p.artifact.tree.as_str().to_string());
+                    }
                 }
                 // The terminal's rollback payload: every slot's OWN artifact
                 // binding (release + tree). A partial snapshot can carry
                 // several releases, so reachability is derived per slot —
                 // there is no snapshot-wide release.
-                if let Some(rollback) = entry.terminal.as_ref().and_then(|t| t.rollback.clone()) {
+                if let Some(t) = entry.terminal.as_ref()
+                    && let TerminalDisposition::Successful { rollback } = &t.disposition
+                {
                     for g in rollback.slots.values() {
                         out.releases
                             .insert(g.assignment.artifact.release.as_str().to_string());
@@ -717,9 +720,9 @@ impl LocalStore {
             .read_ledger(target)?
             .into_iter()
             .filter(|e| {
-                e.terminal.as_ref().is_some_and(|t| {
-                    t.status == DeploymentStatus::Successful && t.rollback.is_some()
-                })
+                e.terminal
+                    .as_ref()
+                    .is_some_and(|t| t.status() == DeploymentStatus::Successful)
             })
             .collect())
     }
@@ -730,7 +733,7 @@ impl LocalStore {
     }
 
     /// TEST-ONLY: append the durable intent (the old `append_attempt`).
-    pub fn append_attempt(&self, target: &str, intent: &LedgerIntent) -> Result<()> {
+    pub fn append_attempt(&self, target: &str, intent: &DeploymentIntent) -> Result<()> {
         self.append_intent(target, intent)
     }
 
@@ -767,7 +770,7 @@ impl LocalStore {
     /// (the outcomes store never existed for it), mirroring the old read.
     pub fn read_results(&self, id: &str) -> Result<BTreeMap<PlacementSlotId, SlotResult>> {
         self.latest_transition(id)?
-            .map(|t| t.outcomes)
+            .map(|t| t.outcomes.into_map())
             .ok_or_else(|| Error::store(format!("no results for deployment '{id}'")))
     }
 
@@ -780,15 +783,35 @@ impl LocalStore {
         reason: Option<&str>,
     ) -> Result<()> {
         let target = self.target_for(id)?;
+        // The TEST adapter appends a status-only terminal; map the status to
+        // its DISPOSITION (the domain truth table is structural — a
+        // `Successful` terminal always carries its rollback payload, and a
+        // `Degraded` one needs its remaining changes, which a status-only
+        // append cannot supply).
+        let disposition = match status {
+            DeploymentStatus::Successful => TerminalDisposition::Successful {
+                rollback: LedgerRollback {
+                    slots: BTreeMap::new(),
+                    bindings: BTreeMap::new(),
+                },
+            },
+            DeploymentStatus::FailedPreflight => TerminalDisposition::FailedPreflight,
+            DeploymentStatus::FailedRolledBack => TerminalDisposition::FailedRolledBack {
+                compensation: SlotTable::new(),
+            },
+            other => {
+                return Err(Error::store(format!(
+                    "append_transition cannot record status {other:?} as a status-only terminal"
+                )));
+            }
+        };
         self.append_terminal(
             &target,
+            &DeploymentId::new(id.to_string()),
             &LedgerTerminal {
-                deployment_id: DeploymentId::new(id.to_string()),
-                target: TargetName::new(target.clone()),
-                status: status.clone(),
                 recorded_at: crate::remote::helper::now_rfc3339(),
-                outcomes: BTreeMap::new(),
-                rollback: None,
+                outcomes: SlotTable::new(),
+                disposition,
                 reason: reason.map(str::to_string),
             },
         )

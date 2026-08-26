@@ -37,13 +37,15 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::layout;
 use crate::model::{
-    ArtifactRef, DeploymentId, GenerationId, GenerationRef, LEDGER_SCHEMA_VERSION,
-    PlacementSlotAssignment, PlacementSlotId, ReleaseId, ServerId, TargetName, TreeDigest,
-    VariantName,
+    ArtifactRef, DeploymentId, GenerationId, PlacementSlotAssignment, PlacementSlotId, ReleaseId,
+    ServerId, TargetName, TreeDigest, VariantName,
 };
 use crate::push::checkpoint::run_checkpoint_unlocked;
 use crate::push::engine::{PushOptions, push, retry_pending_sweep};
-use crate::records::{DeploymentStatus, LedgerIntent, LedgerRollback, LedgerTerminal};
+use crate::records::{
+    DeploymentIntent, DeploymentStatus, DesiredGeneration, IntentSlot, LedgerRollback,
+    LedgerTerminal, NonEmptySlotTable, SlotTable, TerminalDisposition,
+};
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::transport::{LocalTransport, Remote};
 use crate::rotation::compute_retained;
@@ -198,79 +200,75 @@ fn list_generations(helper: &RemoteHelper) -> Vec<String> {
 
 // ---- pusher (checkpoint) fixture helpers -----------------------------------
 
-fn intent(id: &str, target: &str) -> LedgerIntent {
+fn intent(id: &str, target: &str) -> DeploymentIntent {
     let p1 = PlacementSlotId::new("p1".to_string());
-    LedgerIntent {
-        deployment_schema_version: LEDGER_SCHEMA_VERSION,
+    // ONE slot table (the membership + desired/pre-push entries).
+    let slots = BTreeMap::from([(
+        p1.clone(),
+        IntentSlot {
+            desired: DesiredGeneration {
+                generation: GenerationId::new("gen-1".to_string()),
+                artifact: ArtifactRef {
+                    release: ReleaseId::new("rel-1".to_string()),
+                    variant: VariantName::new("standard".to_string()),
+                    tree: TreeDigest::new("tree-1".to_string()),
+                },
+            },
+            pre_push: None,
+        },
+    )]);
+    DeploymentIntent {
         deployment_id: DeploymentId::new(id.to_string()),
         target: TargetName::new(target.to_string()),
         group: None,
-        slot_ids: vec![p1.clone()],
         behavior_sha256: "sha256-aa".to_string(),
         attempted_at: "2026-01-01T00:00:00Z".to_string(),
-        // EXACT key-set equality (slot_ids == desired == pre_push).
-        desired: BTreeMap::from([(
-            p1.clone(),
-            GenerationRef {
-                generation: GenerationId::new("gen-1".to_string()),
-                assignment: PlacementSlotAssignment {
-                    placement_slot: p1.clone(),
-                    artifact: ArtifactRef {
-                        release: ReleaseId::new("rel-1".to_string()),
-                        variant: VariantName::new("standard".to_string()),
-                        tree: TreeDigest::new("tree-1".to_string()),
-                    },
-                },
-            },
-        )]),
-        pre_push: BTreeMap::from([(p1.clone(), None)]),
+        slots: NonEmptySlotTable::build(slots).expect("a fixture intent has at least one slot"),
     }
 }
 
 /// A SUCCESSFUL terminal whose rollback references `release` and `tree` —
 /// the exact bindings the checkpoint's reachability scan keeps.
-fn terminal_for(id: &str, target: &str, release: &str, tree: &str) -> LedgerTerminal {
+fn terminal_for(release: &str, tree: &str) -> LedgerTerminal {
     LedgerTerminal {
-        deployment_id: DeploymentId::new(id.to_string()),
-        target: TargetName::new(target.to_string()),
-        status: DeploymentStatus::Successful,
         recorded_at: "2026-01-01T00:00:00Z".to_string(),
-        outcomes: BTreeMap::new(),
-        rollback: Some(LedgerRollback {
-            slots: BTreeMap::from([(
-                PlacementSlotId::new("p1".to_string()),
-                crate::model::GenerationRef {
-                    generation: GenerationId::new("gen-1".to_string()),
-                    assignment: PlacementSlotAssignment {
-                        placement_slot: PlacementSlotId::new("p1".to_string()),
-                        artifact: ArtifactRef {
-                            release: ReleaseId::new(release.to_string()),
-                            variant: VariantName::new("standard".to_string()),
-                            tree: TreeDigest::new(tree.to_string()),
+        outcomes: SlotTable::new(),
+        disposition: TerminalDisposition::Successful {
+            rollback: LedgerRollback {
+                slots: BTreeMap::from([(
+                    PlacementSlotId::new("p1".to_string()),
+                    crate::model::GenerationRef {
+                        generation: GenerationId::new("gen-1".to_string()),
+                        assignment: PlacementSlotAssignment {
+                            placement_slot: PlacementSlotId::new("p1".to_string()),
+                            artifact: ArtifactRef {
+                                release: ReleaseId::new(release.to_string()),
+                                variant: VariantName::new("standard".to_string()),
+                                tree: TreeDigest::new(tree.to_string()),
+                            },
                         },
                     },
-                },
-            )]),
-            bindings: BTreeMap::from([(
-                PlacementSlotId::new("p1".to_string()),
-                crate::records::PhysicalBinding {
-                    server: ServerId::new("s1".to_string()),
-                    deploy_dir: "/srv/deploy/p1".to_string(),
-                },
-            )]),
-        }),
+                )]),
+                bindings: BTreeMap::from([(
+                    PlacementSlotId::new("p1".to_string()),
+                    crate::records::PhysicalBinding {
+                        server: ServerId::new("s1".to_string()),
+                        deploy_dir: "/srv/deploy/p1".to_string(),
+                    },
+                )]),
+            },
+        },
         reason: None,
     }
 }
 
-fn failed_terminal(id: &str, target: &str) -> LedgerTerminal {
+fn failed_terminal() -> LedgerTerminal {
     LedgerTerminal {
-        deployment_id: DeploymentId::new(id.to_string()),
-        target: TargetName::new(target.to_string()),
-        status: DeploymentStatus::FailedRolledBack,
         recorded_at: "2026-01-01T00:00:00Z".to_string(),
-        outcomes: BTreeMap::new(),
-        rollback: None,
+        outcomes: SlotTable::new(),
+        disposition: TerminalDisposition::FailedRolledBack {
+            compensation: SlotTable::new(),
+        },
         reason: None,
     }
 }
@@ -288,12 +286,16 @@ fn seed_history(store: &LocalStore, target: &str, prefix: &str, history: &[bool]
             let rel = format!("rel-sha256-{id}");
             let tree = format!("tree-{id}");
             store
-                .append_terminal(target, &terminal_for(&id, target, &rel, &tree))
+                .append_terminal(
+                    target,
+                    &DeploymentId::new(id.clone()),
+                    &terminal_for(&rel, &tree),
+                )
                 .unwrap();
             successful.push(id);
         } else {
             store
-                .append_terminal(target, &failed_terminal(&id, target))
+                .append_terminal(target, &DeploymentId::new(id.clone()), &failed_terminal())
                 .unwrap();
         }
     }

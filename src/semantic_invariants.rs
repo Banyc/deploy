@@ -1281,9 +1281,9 @@ impl Fixture {
             .unwrap_or_default()
             .into_iter()
             .filter(|e| {
-                e.terminal.as_ref().is_some_and(|x| {
-                    x.status == DeploymentStatus::Successful && x.rollback.is_some()
-                })
+                e.terminal
+                    .as_ref()
+                    .is_some_and(|x| x.status() == DeploymentStatus::Successful)
             })
             .collect();
         if snaps.is_empty() {
@@ -2643,7 +2643,7 @@ fn state_machine_checkpoint_floor_discards_below_pending_keeps_above() {
         .filter(|e| {
             e.terminal
                 .as_ref()
-                .is_some_and(|x| x.status == DeploymentStatus::Successful && x.rollback.is_some())
+                .is_some_and(|x| x.status() == DeploymentStatus::Successful)
         })
         .map(|e| e.deployment_id.as_str().to_string())
         .collect();
@@ -3158,7 +3158,8 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
         ),
     }
     assert_eq!(
-        terminal.status, status,
+        terminal.status(),
+        status,
         "the ledger records the same status"
     );
 
@@ -5770,11 +5771,10 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
                 "{ctx}: snapshot deployment id at position {wi} for {t} — the SAME position \
                  must never resolve to a different deployment (no duplicate, no re-append)"
             );
-            let rollback = ss
-                .terminal
-                .as_ref()
-                .and_then(|x| x.rollback.as_ref())
-                .expect("a successful entry carries a rollback state");
+            let rollback = match &ss.terminal.as_ref().expect("terminal").disposition {
+                crate::records::TerminalDisposition::Successful { rollback } => rollback,
+                _ => panic!("a successful entry carries a rollback state"),
+            };
             // The snapshot's OWN first slot (a slot has exactly one owning
             // target, so a t1 snapshot carries p1/p2 and a t2 snapshot p3).
             let pid = Model::target_slots(t)[0].clone();
@@ -5805,7 +5805,7 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
                 "{ctx}: attempt id order for {t}"
             );
             let pid = Model::target_slots(t)[0].clone();
-            let art = sa.intent.desired[&pid].assignment.artifact.clone();
+            let art = sa.intent.slots[&pid].desired.artifact.clone();
             learn_artifact(&mut learned, &ctx, *mv, art, "attempt {t}");
         }
     }
@@ -6012,8 +6012,7 @@ fn assert_checkpoint_invariants(model: &Model, system: &Fixture) {
                 "{ctx}: raw ledger id order for {t}"
             );
             if let Some(t) = &se.terminal
-                && t.status == DeploymentStatus::Successful
-                && t.rollback.is_some()
+                && t.status() == DeploymentStatus::Successful
             {
                 successful_positions.push((successful_positions.len() as u64, wid.clone()));
             }

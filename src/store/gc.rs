@@ -462,11 +462,12 @@ mod tests {
     use super::*;
     use crate::config::SlotDef;
     use crate::model::{
-        ArtifactRef, DeploymentId, GenerationId, GenerationRef, LEDGER_SCHEMA_VERSION,
-        PlacementSlotAssignment, PlacementSlotId, TargetName, TreeDigest, VariantName,
+        ArtifactRef, DeploymentId, GenerationId, GenerationRef, PlacementSlotAssignment,
+        PlacementSlotId, TargetName, TreeDigest, VariantName,
     };
     use crate::records::{
-        DeploymentStatus, LedgerIntent, LedgerRollback, LedgerTerminal, ObservedSlot, Pins,
+        DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
+        NonEmptySlotTable, ObservedSlot, Pins, SlotTable, TerminalDisposition,
     };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -566,67 +567,66 @@ interval_seconds = 0
     /// A deployment's LEDGER record: intent + SUCCESSFUL terminal whose
     /// rollback references `release` / `tree`. The intent satisfies EXACT
     /// key-set equality (`slot_ids == desired == pre_push`).
-    fn intent(id: &str) -> LedgerIntent {
+    fn intent(id: &str) -> DeploymentIntent {
         let p1 = PlacementSlotId::new(SLOT.to_string());
-        LedgerIntent {
-            deployment_schema_version: LEDGER_SCHEMA_VERSION,
+        // ONE slot table (the membership + desired/pre-push entries).
+        let slots = BTreeMap::from([(
+            p1.clone(),
+            IntentSlot {
+                desired: DesiredGeneration {
+                    generation: GenerationId::new("gen-1".to_string()),
+                    artifact: ArtifactRef {
+                        release: ReleaseId::new("rel-1".to_string()),
+                        variant: VariantName::new("standard".to_string()),
+                        tree: TreeDigest::new("tree-1".to_string()),
+                    },
+                },
+                pre_push: None,
+            },
+        )]);
+        DeploymentIntent {
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new(TARGET.to_string()),
             group: None,
-            slot_ids: vec![p1.clone()],
             behavior_sha256: "sha256-aa".to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            desired: BTreeMap::from([(
-                p1.clone(),
-                GenerationRef {
-                    generation: GenerationId::new("gen-1".to_string()),
-                    assignment: PlacementSlotAssignment {
-                        placement_slot: p1.clone(),
-                        artifact: ArtifactRef {
-                            release: ReleaseId::new("rel-1".to_string()),
-                            variant: VariantName::new("standard".to_string()),
-                            tree: TreeDigest::new("tree-1".to_string()),
-                        },
-                    },
-                },
-            )]),
-            pre_push: BTreeMap::from([(p1.clone(), None)]),
+            slots: NonEmptySlotTable::build(slots)
+                .expect("a fixture intent always has at least one slot"),
         }
     }
 
-    fn terminal_for(id: &str, release: &str, tree: &str) -> LedgerTerminal {
+    fn terminal_for(release: &str, tree: &str) -> LedgerTerminal {
         LedgerTerminal {
-            deployment_id: DeploymentId::new(id.to_string()),
-            target: TargetName::new(TARGET.to_string()),
-            status: DeploymentStatus::Successful,
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
-            outcomes: BTreeMap::new(),
-            rollback: Some(LedgerRollback {
-                slots: BTreeMap::from([(
-                    PlacementSlotId::new(SLOT.to_string()),
-                    GenerationRef {
-                        generation: GenerationId::new("gen-1".to_string()),
-                        assignment: PlacementSlotAssignment {
-                            placement_slot: PlacementSlotId::new(SLOT.to_string()),
-                            artifact: ArtifactRef {
-                                release: ReleaseId::new(release.to_string()),
-                                variant: VariantName::new("standard".to_string()),
-                                tree: TreeDigest::new(tree.to_string()),
+            outcomes: SlotTable::new(),
+            disposition: TerminalDisposition::Successful {
+                rollback: LedgerRollback {
+                    slots: BTreeMap::from([(
+                        PlacementSlotId::new(SLOT.to_string()),
+                        GenerationRef {
+                            generation: GenerationId::new("gen-1".to_string()),
+                            assignment: PlacementSlotAssignment {
+                                placement_slot: PlacementSlotId::new(SLOT.to_string()),
+                                artifact: ArtifactRef {
+                                    release: ReleaseId::new(release.to_string()),
+                                    variant: VariantName::new("standard".to_string()),
+                                    tree: TreeDigest::new(tree.to_string()),
+                                },
                             },
                         },
-                    },
-                )]),
-                // The binding key set must equal the slot key set EXACTLY
-                // (the wire → domain conversion refuses a rollback whose
-                // bindings omit a slotted generation).
-                bindings: BTreeMap::from([(
-                    PlacementSlotId::new(SLOT.to_string()),
-                    crate::records::PhysicalBinding {
-                        server: crate::model::ServerId::new("s1".to_string()),
-                        deploy_dir: "/srv/eng".to_string(),
-                    },
-                )]),
-            }),
+                    )]),
+                    // The binding key set must equal the slot key set EXACTLY
+                    // (the wire → domain conversion refuses a rollback whose
+                    // bindings omit a slotted generation).
+                    bindings: BTreeMap::from([(
+                        PlacementSlotId::new(SLOT.to_string()),
+                        crate::records::PhysicalBinding {
+                            server: crate::model::ServerId::new("s1".to_string()),
+                            deploy_dir: "/srv/eng".to_string(),
+                        },
+                    )]),
+                },
+            },
             reason: None,
         }
     }
@@ -715,11 +715,8 @@ interval_seconds = 0
             store
                 .append_terminal(
                     TARGET,
-                    &terminal_for(
-                        &id,
-                        &format!("rel-sha256-ret-{i}"),
-                        &format!("tree-ret-{i}"),
-                    ),
+                    &DeploymentId::new(id.clone()),
+                    &terminal_for(&format!("rel-sha256-ret-{i}"), &format!("tree-ret-{i}")),
                 )
                 .unwrap();
             retained_deployments.push(id);

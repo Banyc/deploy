@@ -1638,10 +1638,13 @@ pub fn resolved_mode(mode: &Option<String>) -> Result<Option<u32>> {
 mod tests {
     use super::*;
     use crate::model::{
-        ArtifactRef, DeploymentId, GenerationId, GenerationRef, LEDGER_SCHEMA_VERSION,
-        PlacementSlotAssignment, ReleaseId, TargetName, TreeDigest, VariantName,
+        ArtifactRef, DeploymentId, GenerationId, LEDGER_SCHEMA_VERSION, ReleaseId, TargetName,
+        TreeDigest, VariantName,
     };
-    use crate::records::{LedgerIntent, LedgerIntentWire, LedgerLine};
+    use crate::records::{
+        DeploymentIntent, DesiredGeneration, IntentSlot, LedgerIntentWire, LedgerLine,
+        NonEmptySlotTable,
+    };
     use crate::store::local::LocalStore;
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -2886,31 +2889,31 @@ interval_seconds = 0
 
     /// A minimal but VALID ledger intent for target `t1` (EXACT key-set
     /// equality: `slot_ids == desired.keys() == pre_push.keys()`).
-    fn intended_intent(dep: &str) -> LedgerIntent {
+    fn intended_intent(dep: &str) -> DeploymentIntent {
         let p1 = PlacementSlotId::new("p1".to_string());
-        LedgerIntent {
-            deployment_schema_version: LEDGER_SCHEMA_VERSION,
+        // ONE slot table (the membership + desired/pre-push entries).
+        let slots = std::collections::BTreeMap::from([(
+            p1.clone(),
+            IntentSlot {
+                desired: DesiredGeneration {
+                    generation: GenerationId::new("gen-1".to_string()),
+                    artifact: ArtifactRef {
+                        release: ReleaseId::new("rel-1".to_string()),
+                        variant: VariantName::new("standard".to_string()),
+                        tree: TreeDigest::new("tree-1".to_string()),
+                    },
+                },
+                pre_push: None,
+            },
+        )]);
+        DeploymentIntent {
             deployment_id: DeploymentId::new(dep.to_string()),
             target: TargetName::new("t1".to_string()),
             group: None,
-            slot_ids: vec![p1.clone()],
             behavior_sha256: "sha256-aa".to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            desired: std::collections::BTreeMap::from([(
-                p1.clone(),
-                GenerationRef {
-                    generation: GenerationId::new("gen-1".to_string()),
-                    assignment: PlacementSlotAssignment {
-                        placement_slot: p1.clone(),
-                        artifact: ArtifactRef {
-                            release: ReleaseId::new("rel-1".to_string()),
-                            variant: VariantName::new("standard".to_string()),
-                            tree: TreeDigest::new("tree-1".to_string()),
-                        },
-                    },
-                },
-            )]),
-            pre_push: std::collections::BTreeMap::from([(p1.clone(), None)]),
+            slots: NonEmptySlotTable::build(slots)
+                .expect("a fixture intent always has at least one slot"),
         }
     }
 
@@ -2991,11 +2994,13 @@ interval_seconds = 0
         std::fs::write(&p, deploy_toml("v1")).unwrap();
         Config::load(&p).expect("the config at CONFIG_SCHEMA_VERSION still loads");
         // ... and tamper ONLY the ledger line: the ledger reader fails
-        // closed, naming the version ...
-        let mut foreign = intended_intent("deploy-b");
-        foreign.deployment_schema_version = LEDGER_SCHEMA_VERSION.wrapping_add(1);
-        let line =
-            serde_json::to_string(&LedgerLine::Intent(LedgerIntentWire::from(&foreign))).unwrap();
+        // closed, naming the version ... (the version is a WIRE member — the
+        // domain no longer carries it, so the tamper sets it on the wire
+        // form).
+        let foreign = intended_intent("deploy-b");
+        let mut wire = LedgerIntentWire::from(&foreign);
+        wire.deployment_schema_version = LEDGER_SCHEMA_VERSION.wrapping_add(1);
+        let line = serde_json::to_string(&LedgerLine::Intent(wire)).unwrap();
         std::fs::write(&lp, format!("{line}\n")).unwrap();
         let err = store
             .read_ledger("t1")
@@ -3061,10 +3066,10 @@ interval_seconds = 0
             // intent line — a foreign value is refused, independently of the
             // config.
             let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-            let mut intent = intended_intent("deploy-x");
-            intent.deployment_schema_version = ledger_version;
-            let line =
-                serde_json::to_string(&LedgerLine::Intent(LedgerIntentWire::from(&intent))).unwrap();
+            let intent = intended_intent("deploy-x");
+            let mut wire = LedgerIntentWire::from(&intent);
+            wire.deployment_schema_version = ledger_version;
+            let line = serde_json::to_string(&LedgerLine::Intent(wire)).unwrap();
             let lp = store.ledger_path("t1");
             std::fs::create_dir_all(lp.parent().unwrap()).unwrap();
             std::fs::write(&lp, format!("{line}\n")).unwrap();

@@ -204,7 +204,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         .filter(|e| {
             e.terminal
                 .as_ref()
-                .is_some_and(|t| t.status == DeploymentStatus::Successful && t.rollback.is_some())
+                .is_some_and(|t| t.status() == DeploymentStatus::Successful)
         })
         .collect();
     assert_eq!(

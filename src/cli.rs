@@ -479,7 +479,9 @@ fn render_status(observed: &ObservedTarget) -> Vec<String> {
 /// entry (in flight or recoverable-pending) renders `PendingCommit`.
 fn effective_status(entry: &LedgerEntry) -> (DeploymentStatus, Option<String>) {
     match entry.terminal.as_ref() {
-        Some(t) => (t.status.clone(), t.reason.clone()),
+        // The status is DERIVED from the terminal's disposition (the domain
+        // terminal carries no separate status — they can never disagree).
+        Some(t) => (t.status(), t.reason.clone()),
         None => (DeploymentStatus::PendingCommit, None),
     }
 }
@@ -508,7 +510,7 @@ pub fn render_log(
     for e in entries.iter().filter(|e| {
         e.terminal
             .as_ref()
-            .is_some_and(|t| t.status == DeploymentStatus::Successful && t.rollback.is_some())
+            .is_some_and(|t| t.status() == DeploymentStatus::Successful)
     }) {
         rolled_back.insert(e.deployment_id.as_str());
     }
@@ -577,38 +579,40 @@ fn print_report(report: &PushReport) {
 mod tests {
     use super::*;
     use crate::model::{
-        ArtifactRef, DeploymentId, GenerationId, GenerationRef, LEDGER_SCHEMA_VERSION,
-        PlacementSlotAssignment, PlacementSlotId, ReleaseId, TargetName, TreeDigest, VariantName,
+        ArtifactRef, DeploymentId, GenerationId, PlacementSlotId, ReleaseId, TargetName,
+        TreeDigest, VariantName,
     };
-    use crate::records::{LedgerIntent, LedgerRollback, LedgerTerminal, ObservedSlot};
+    use crate::records::{
+        DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
+        NonEmptySlotTable, ObservedSlot, SlotTable, TerminalDisposition,
+    };
     use std::collections::BTreeMap;
 
-    fn pending_attempt(id: &str) -> LedgerIntent {
+    fn pending_attempt(id: &str) -> DeploymentIntent {
         let p1 = PlacementSlotId::new("p1".to_string());
-        LedgerIntent {
-            deployment_schema_version: LEDGER_SCHEMA_VERSION,
+        // ONE slot table (the membership + desired/pre-push entries).
+        let slots = BTreeMap::from([(
+            p1.clone(),
+            IntentSlot {
+                desired: DesiredGeneration {
+                    generation: GenerationId::new("gen-1".to_string()),
+                    artifact: ArtifactRef {
+                        release: ReleaseId::new("rel-1".to_string()),
+                        variant: VariantName::new("standard".to_string()),
+                        tree: TreeDigest::new("tree-1".to_string()),
+                    },
+                },
+                pre_push: None,
+            },
+        )]);
+        DeploymentIntent {
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new("production".to_string()),
             group: None,
-            slot_ids: vec![p1.clone()],
             behavior_sha256: "sha256-aa".to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            // EXACT key-set equality (slot_ids == desired == pre_push).
-            desired: BTreeMap::from([(
-                p1.clone(),
-                GenerationRef {
-                    generation: GenerationId::new("gen-1".to_string()),
-                    assignment: PlacementSlotAssignment {
-                        placement_slot: p1.clone(),
-                        artifact: ArtifactRef {
-                            release: ReleaseId::new("rel-1".to_string()),
-                            variant: VariantName::new("standard".to_string()),
-                            tree: TreeDigest::new("tree-1".to_string()),
-                        },
-                    },
-                },
-            )]),
-            pre_push: BTreeMap::from([(p1.clone(), None)]),
+            slots: NonEmptySlotTable::build(slots)
+                .expect("a seeded attempt always has at least one slot"),
         }
     }
 
@@ -621,16 +625,16 @@ mod tests {
         store
             .append_terminal(
                 "production",
+                &DeploymentId::new(id.to_string()),
                 &LedgerTerminal {
-                    deployment_id: DeploymentId::new(id.to_string()),
-                    target: TargetName::new("production".to_string()),
-                    status: DeploymentStatus::Successful,
                     recorded_at: attempted_at.to_string(),
-                    outcomes: BTreeMap::new(),
-                    rollback: Some(LedgerRollback {
-                        slots: BTreeMap::new(),
-                        bindings: BTreeMap::new(),
-                    }),
+                    outcomes: SlotTable::new(),
+                    disposition: TerminalDisposition::Successful {
+                        rollback: LedgerRollback {
+                            slots: BTreeMap::new(),
+                            bindings: BTreeMap::new(),
+                        },
+                    },
                     reason: Some("deployed".to_string()),
                 },
             )
@@ -660,16 +664,16 @@ mod tests {
         store
             .append_terminal(
                 "production",
+                &a.deployment_id,
                 &LedgerTerminal {
-                    deployment_id: a.deployment_id.clone(),
-                    target: TargetName::new("production".to_string()),
-                    status: DeploymentStatus::Successful,
                     recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                    outcomes: BTreeMap::new(),
-                    rollback: Some(LedgerRollback {
-                        slots: BTreeMap::new(),
-                        bindings: BTreeMap::new(),
-                    }),
+                    outcomes: SlotTable::new(),
+                    disposition: TerminalDisposition::Successful {
+                        rollback: LedgerRollback {
+                            slots: BTreeMap::new(),
+                            bindings: BTreeMap::new(),
+                        },
+                    },
                     reason: Some("recovery finalization".to_string()),
                 },
             )
@@ -707,13 +711,11 @@ mod tests {
         store
             .append_terminal(
                 "production",
+                &a_failed.deployment_id,
                 &LedgerTerminal {
-                    deployment_id: a_failed.deployment_id.clone(),
-                    target: TargetName::new("production".to_string()),
-                    status: DeploymentStatus::FailedPreflight,
                     recorded_at: "2026-01-02T00:00:00Z".to_string(),
-                    outcomes: BTreeMap::new(),
-                    rollback: None,
+                    outcomes: SlotTable::new(),
+                    disposition: TerminalDisposition::FailedPreflight,
                     reason: Some("preflight failed".to_string()),
                 },
             )

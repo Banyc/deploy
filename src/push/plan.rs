@@ -307,10 +307,9 @@ pub(crate) fn latest_successful_rollback(
 ) -> Result<Option<LedgerRollback>> {
     for entry in store.read_ledger(target)?.into_iter().rev() {
         if let Some(t) = entry.terminal
-            && t.status == crate::records::DeploymentStatus::Successful
-            && let Some(rb) = t.rollback
+            && let crate::records::TerminalDisposition::Successful { rollback } = t.disposition
         {
-            return Ok(Some(rb));
+            return Ok(Some(rollback));
         }
     }
     Ok(None)
@@ -873,12 +872,12 @@ mod tests {
     use super::*;
     use crate::model::{
         ArtifactRef, BehaviorContract, CONFIG_SCHEMA_VERSION, CanonicalSlot, CanonicalSlots,
-        DeploymentId, GenerationId, GenerationRef, LEDGER_SCHEMA_VERSION, Provenance,
-        RELEASE_RECORD_SCHEMA_VERSION, ReleaseRecord, ServerId, TargetName, TreeDigest,
-        VariantName,
+        DeploymentId, GenerationId, GenerationRef, Provenance, RELEASE_RECORD_SCHEMA_VERSION,
+        ReleaseRecord, ServerId, TargetName, TreeDigest, VariantName,
     };
     use crate::records::{
-        DeploymentStatus, LedgerIntent, LedgerRollback, LedgerTerminal, PhysicalBinding,
+        DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
+        NonEmptySlotTable, PhysicalBinding, SlotTable, TerminalDisposition,
     };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -1028,34 +1027,46 @@ interval_seconds = 0
     ) {
         let id = DeploymentId::new(deployment_id.to_string());
         let target = TargetName::new("t1".to_string());
+        // ONE slot table: the membership + per-slot desired entries.
+        let slot_table: BTreeMap<PlacementSlotId, IntentSlot> = slots
+            .iter()
+            .map(|(k, g)| {
+                (
+                    k.clone(),
+                    IntentSlot {
+                        desired: DesiredGeneration {
+                            generation: g.generation.clone(),
+                            artifact: g.assignment.artifact.clone(),
+                        },
+                        pre_push: None,
+                    },
+                )
+            })
+            .collect();
         store
             .append_intent(
                 "t1",
-                &LedgerIntent {
-                    deployment_schema_version: LEDGER_SCHEMA_VERSION,
+                &DeploymentIntent {
                     deployment_id: id.clone(),
                     target: target.clone(),
                     group: None,
-                    slot_ids: slots.keys().cloned().collect(),
                     behavior_sha256: behavior_sha256.to_string(),
                     attempted_at: "2026-01-01T00:00:00Z".to_string(),
-                    // EXACT key-set equality: every member slot has exactly
-                    // one desired + one pre_push entry.
-                    desired: slots.clone(),
-                    pre_push: slots.keys().cloned().map(|k| (k, None)).collect(),
+                    slots: NonEmptySlotTable::build(slot_table)
+                        .expect("a seeded snapshot always has at least one slot"),
                 },
             )
             .unwrap();
         store
             .append_terminal(
                 "t1",
+                &id,
                 &LedgerTerminal {
-                    deployment_id: id,
-                    target,
-                    status: DeploymentStatus::Successful,
                     recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                    outcomes: BTreeMap::new(),
-                    rollback: Some(LedgerRollback { slots, bindings }),
+                    outcomes: SlotTable::new(),
+                    disposition: TerminalDisposition::Successful {
+                        rollback: LedgerRollback { slots, bindings },
+                    },
                     reason: None,
                 },
             )

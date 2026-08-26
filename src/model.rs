@@ -47,7 +47,7 @@ use uuid::Uuid;
 pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 
 /// The deployment LEDGER format version — the version every deployment
-/// record carries (`LedgerIntent.deployment_schema_version`, validated on
+/// record carries (`LedgerIntentWire.deployment_schema_version`, validated on
 /// every read in [`crate::store::local::LocalStore::read_ledger`]). Every
 /// ledger writer emits exactly `LEDGER_SCHEMA_VERSION`; every ledger reader
 /// refuses any other version (fail closed — a mismatched record is never

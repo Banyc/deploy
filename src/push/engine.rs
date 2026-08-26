@@ -13,9 +13,8 @@ use crate::error::{Error, Result};
 use crate::history::{self, PushRef, RefExpr};
 use crate::layout;
 use crate::model::{
-    ArtifactRef, BehaviorContract, DeploymentId, GenerationId, GenerationRef,
-    LEDGER_SCHEMA_VERSION, OperationId, PlacementSlotId, ReleaseId, TargetName, TreeDigest,
-    VariantName,
+    ArtifactRef, BehaviorContract, DeploymentId, GenerationId, OperationId, PlacementSlotId,
+    ReleaseId, TargetName, TreeDigest, VariantName,
 };
 use crate::push::capacity::capacity_preflight;
 use crate::push::lock::FileLock;
@@ -25,9 +24,10 @@ use crate::push::server::{
 };
 use crate::push::staging::{StagingCleanup, cleanup_dry_run_staging, remove_tree_restoring_write};
 use crate::records::{
-    BehaviorIndex, DeploymentPlan, DeploymentStatus, LedgerIntent, LedgerIntentReport,
-    LedgerTerminal, ObservedSlot, PlanSource, ServerOutcomeKind, SlotAttemptState, SlotPlan,
-    SlotResult,
+    BehaviorIndex, DeploymentIntent, DeploymentPlan, DeploymentStatus, DesiredGeneration,
+    IntentSlot, LedgerIntentReport, LedgerTerminal, NonEmptySlotTable, ObservedSlot, PlanSource,
+    PreviousGeneration, ServerOutcomeKind, SlotAttemptState, SlotPlan, SlotResult, SlotTable,
+    TerminalDisposition,
 };
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::transport::Remote;
@@ -1071,32 +1071,37 @@ fn push_inner(
     // The record carries NO outcomes — the `slots` (actual) map is persisted
     // empty; the actual per-slot outcomes and the status live in the
     // deployment's TERMINAL EVENT (appended after the mutation loop).
-    let slot_ids: Vec<PlacementSlotId> = assignments
-        .iter()
-        .map(|a| a.placement_slot.clone())
-        .collect();
-    let desired_map: BTreeMap<PlacementSlotId, GenerationRef> = assignments
+    // The DOMAIN intent stores ONE slot table (the membership + the
+    // desired/pre-push entries are the same table — the exact-key-set
+    // invariant is structural); the wire re-expands it on serialization.
+    let intent_slots: BTreeMap<PlacementSlotId, IntentSlot> = assignments
         .iter()
         .map(|a| {
             (
                 a.placement_slot.clone(),
-                GenerationRef {
-                    generation: new_gen[&a.placement_slot].clone(),
-                    assignment: a.clone(),
+                IntentSlot {
+                    desired: DesiredGeneration {
+                        generation: new_gen[&a.placement_slot].clone(),
+                        artifact: a.artifact.clone(),
+                    },
+                    pre_push: pre_push
+                        .get(&a.placement_slot)
+                        .and_then(|p| p.clone())
+                        .map(|p| PreviousGeneration {
+                            artifact: p.artifact,
+                            generation: p.generation,
+                        }),
                 },
             )
         })
         .collect();
-    let attempt_intent = LedgerIntent {
-        deployment_schema_version: LEDGER_SCHEMA_VERSION,
+    let attempt_intent = DeploymentIntent {
         deployment_id: deployment_id.clone(),
         target: TargetName::new(target_name.to_string()),
         group: selection.group.clone(),
-        slot_ids,
         behavior_sha256: desired_behavior_sha.clone(),
         attempted_at: crate::remote::helper::now_rfc3339(),
-        desired: desired_map,
-        pre_push,
+        slots: NonEmptySlotTable::build(intent_slots)?,
     };
     store.append_intent(target_name, &attempt_intent)?;
 
@@ -1150,13 +1155,13 @@ fn push_inner(
         // by the failed phase are removed best-effort.
         let _ = store.append_terminal(
             target_name,
+            deployment_id,
             &LedgerTerminal {
-                deployment_id: deployment_id.clone(),
-                target: TargetName::new(target_name.to_string()),
-                status: DeploymentStatus::FailedPreflight,
                 recorded_at: crate::remote::helper::now_rfc3339(),
-                outcomes: BTreeMap::new(),
-                rollback: None,
+                outcomes: SlotTable::new(),
+                // FailedPreflight carries no payload: no rollback and no
+                // outcomes (a pre-mutation failure touched no slot).
+                disposition: TerminalDisposition::FailedPreflight,
                 reason: Some(preflight_reason.to_string()),
             },
         );
@@ -1586,15 +1591,56 @@ fn push_inner(
         // before its own no-op check) — appending a PendingCommit terminal
         // would strand the attempt forever (reconciliation only picks up
         // entries WITHOUT a terminal).
+        let outcomes = SlotTable::from_map(outcomes_map);
+        // MAP the final status to its DISPOSITION (the domain truth table is
+        // structural): FailedPreflight carries nothing (empty outcomes — no
+        // slot touched), FailedRolledBack carries the outcome table as its
+        // compensation report, Degraded carries its remaining changes (the
+        // non-restored outcomes, derived by the wire conversion on read —
+        // here the domain is built directly, so the same derivation is
+        // applied to stay in sync with the read path).
+        let disposition = match &commit_status {
+            DeploymentStatus::FailedPreflight => TerminalDisposition::FailedPreflight,
+            DeploymentStatus::FailedRolledBack => TerminalDisposition::FailedRolledBack {
+                compensation: outcomes.clone(),
+            },
+            DeploymentStatus::Degraded => {
+                let remaining: BTreeMap<PlacementSlotId, GenerationId> = outcomes
+                    .iter()
+                    .filter(|(_, r)| {
+                        r.outcome != ServerOutcomeKind::Restored && r.generation.is_some()
+                    })
+                    .map(|(k, r)| {
+                        (
+                            k.clone(),
+                            r.generation.clone().expect(
+                                "a non-restored outcome with a recorded generation (filtered)",
+                            ),
+                        )
+                    })
+                    .collect();
+                TerminalDisposition::Degraded {
+                    remaining_changes: NonEmptySlotTable::build(remaining).map_err(|_| {
+                        Error::store(
+                            "a Degraded terminal requires at least one remaining change — none recorded"
+                                .to_string(),
+                        )
+                    })?,
+                }
+            }
+            other => {
+                return Err(Error::store(format!(
+                    "internal: cannot append a terminal for status {other:?} — only FailedPreflight / FailedRolledBack / Degraded reach the terminal append"
+                )));
+            }
+        };
         store.append_terminal(
             target_name,
+            deployment_id,
             &LedgerTerminal {
-                deployment_id: deployment_id.clone(),
-                target: TargetName::new(target_name.to_string()),
-                status: commit_status.clone(),
                 recorded_at: crate::remote::helper::now_rfc3339(),
-                outcomes: outcomes_map,
-                rollback: None,
+                outcomes,
+                disposition,
                 reason: commit_reason.map(str::to_string),
             },
         )?;
@@ -2303,7 +2349,8 @@ fn validate_behavior_coverage(
 mod tests {
     use super::*;
     use crate::model::{
-        CanonicalSlot, CanonicalSlots, Provenance, RELEASE_RECORD_SCHEMA_VERSION, ReleaseRecord,
+        CanonicalSlot, CanonicalSlots, GenerationRef, Provenance, RELEASE_RECORD_SCHEMA_VERSION,
+        ReleaseRecord,
     };
     use crate::records::LedgerEntry;
     use crate::remote::transport::{FsBytes, LocalTransport};
@@ -2915,34 +2962,46 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         slots: BTreeMap<PlacementSlotId, GenerationRef>,
         bindings: BTreeMap<PlacementSlotId, crate::records::PhysicalBinding>,
     ) {
+        // ONE slot table: the membership + the desired entries.
+        let slot_table: BTreeMap<PlacementSlotId, IntentSlot> = slots
+            .iter()
+            .map(|(k, g)| {
+                (
+                    k.clone(),
+                    IntentSlot {
+                        desired: DesiredGeneration {
+                            generation: g.generation.clone(),
+                            artifact: g.assignment.artifact.clone(),
+                        },
+                        pre_push: None,
+                    },
+                )
+            })
+            .collect();
         store
             .append_intent(
                 target,
-                &LedgerIntent {
-                    deployment_schema_version: LEDGER_SCHEMA_VERSION,
+                &DeploymentIntent {
                     deployment_id: DeploymentId::new(deployment_id.to_string()),
                     target: TargetName::new(target.to_string()),
                     group: None,
-                    slot_ids: slots.keys().cloned().collect(),
                     behavior_sha256: behavior_sha256.to_string(),
                     attempted_at: "2026-01-01T00:00:00Z".to_string(),
-                    // EXACT key-set equality: every member slot has exactly
-                    // one desired + one pre_push entry.
-                    desired: slots.clone(),
-                    pre_push: slots.keys().cloned().map(|k| (k, None)).collect(),
+                    slots: NonEmptySlotTable::build(slot_table)
+                        .expect("a seeded snapshot always has at least one slot"),
                 },
             )
             .unwrap();
         store
             .append_terminal(
                 target,
+                &DeploymentId::new(deployment_id.to_string()),
                 &LedgerTerminal {
-                    deployment_id: DeploymentId::new(deployment_id.to_string()),
-                    target: TargetName::new(target.to_string()),
-                    status: DeploymentStatus::Successful,
                     recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                    outcomes: BTreeMap::new(),
-                    rollback: Some(crate::records::LedgerRollback { slots, bindings }),
+                    outcomes: SlotTable::new(),
+                    disposition: TerminalDisposition::Successful {
+                        rollback: crate::records::LedgerRollback { slots, bindings },
+                    },
                     reason: None,
                 },
             )
@@ -3545,11 +3604,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// The rollback payload of a successful ledger entry (the test view of
     /// the `DeploymentSnapshot` fields: `slots`, `bindings`).
     fn rollback_of(entry: &LedgerEntry) -> &crate::records::LedgerRollback {
-        entry
+        match &entry
             .terminal
             .as_ref()
-            .and_then(|t| t.rollback.as_ref())
-            .expect("a successful snapshot entry carries a rollback state")
+            .expect("the entry has a terminal")
+            .disposition
+        {
+            TerminalDisposition::Successful { rollback } => rollback,
+            _ => panic!("a successful snapshot entry carries a rollback state"),
+        }
     }
 
     #[test]
@@ -3812,17 +3875,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(intent.deployment_id, id);
         // The verified domain intent carries NO outcomes map at all (the
         // type split: outcomes live in the terminal event and the in-memory
-        // report, never in the persisted intent).
+        // report, never in the persisted intent). The ONE slot table carries
+        // the planned (desired) + observed (pre_push) entries per member.
         assert!(
             intent
                 .intent
-                .desired
-                .contains_key(&PlacementSlotId::new("p1"))
-                && intent
-                    .intent
-                    .pre_push
-                    .contains_key(&PlacementSlotId::new("p1")),
-            "the intent carries the planned (desired) and observed (pre_push) maps"
+                .slots
+                .contains_key(&PlacementSlotId::new("p1")),
+            "the intent's one slot table carries the planned (desired) + observed (pre_push) entries"
         );
         assert!(
             h.store.read_results(id.as_str()).is_err(),
@@ -3939,22 +3999,23 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let target_a = GenerationId::generate();
         let id_a = DeploymentId::new("deploy-inprogress-diverged".to_string());
         let desired_ref = baseline.desired[&PlacementSlotId::new("p1")].clone();
-        let intent = LedgerIntent {
-            deployment_schema_version: LEDGER_SCHEMA_VERSION,
+        let intent = DeploymentIntent {
             deployment_id: id_a.clone(),
             target: TargetName::new("t1".to_string()),
             group: None,
-            slot_ids: vec![PlacementSlotId::new("p1".to_string())],
             behavior_sha256: baseline.behavior_sha256.as_str().to_string(),
             attempted_at: crate::remote::helper::now_rfc3339(),
-            desired: BTreeMap::from([(
+            slots: NonEmptySlotTable::build(BTreeMap::from([(
                 PlacementSlotId::new("p1".to_string()),
-                GenerationRef {
-                    generation: target_a,
-                    assignment: desired_ref.assignment,
+                IntentSlot {
+                    desired: DesiredGeneration {
+                        generation: target_a,
+                        artifact: desired_ref.assignment.artifact.clone(),
+                    },
+                    pre_push: None,
                 },
-            )]),
-            pre_push: BTreeMap::from([(PlacementSlotId::new("p1".to_string()), None)]),
+            )]))
+            .expect("one member slot"),
         };
         h.store.append_attempt("t1", &intent).unwrap();
         assert_eq!(
@@ -4022,8 +4083,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(r.status, Some(DeploymentStatus::Successful));
 
         let transitions = h.store.read_transitions(id.as_str()).unwrap();
-        let statuses: Vec<DeploymentStatus> =
-            transitions.iter().map(|t| t.status.clone()).collect();
+        let statuses: Vec<DeploymentStatus> = transitions.iter().map(|t| t.status()).collect();
         assert_eq!(
             statuses,
             vec![DeploymentStatus::Successful],
@@ -4402,16 +4462,23 @@ interval_seconds = 0
         // absent status file as eligible (a just-recorded attempt).
         let id_a = DeploymentId::new("deploy-no-status".to_string());
         let desired_ref = baseline.desired[&PlacementSlotId::new("p1")].clone();
-        let intent = LedgerIntent {
-            deployment_schema_version: LEDGER_SCHEMA_VERSION,
+        let intent = DeploymentIntent {
+            slots: NonEmptySlotTable::build(BTreeMap::from([(
+                PlacementSlotId::new("p1".to_string()),
+                IntentSlot {
+                    desired: DesiredGeneration {
+                        generation: desired_ref.generation.clone(),
+                        artifact: desired_ref.assignment.artifact.clone(),
+                    },
+                    pre_push: None,
+                },
+            )]))
+            .expect("one member slot"),
             deployment_id: id_a.clone(),
             target: TargetName::new("t1".to_string()),
             group: None,
-            slot_ids: vec![PlacementSlotId::new("p1".to_string())],
             behavior_sha256: baseline.behavior_sha256.as_str().to_string(),
             attempted_at: crate::remote::helper::now_rfc3339(),
-            desired: BTreeMap::from([(PlacementSlotId::new("p1".to_string()), desired_ref)]),
-            pre_push: BTreeMap::from([(PlacementSlotId::new("p1".to_string()), None)]),
         };
         h.store.append_attempt("t1", &intent).unwrap();
         assert_eq!(
@@ -4463,19 +4530,23 @@ interval_seconds = 0
         let baseline = r1.attempt.as_ref().expect("attempt recorded");
         let desired_ref = baseline.desired[&PlacementSlotId::new("p1")].clone();
 
-        let mk = |id: &str| LedgerIntent {
-            deployment_schema_version: LEDGER_SCHEMA_VERSION,
+        let mk = |id: &str| DeploymentIntent {
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new("t1".to_string()),
             group: None,
-            slot_ids: vec![PlacementSlotId::new("p1".to_string())],
             behavior_sha256: baseline.behavior_sha256.as_str().to_string(),
             attempted_at: crate::remote::helper::now_rfc3339(),
-            desired: BTreeMap::from([(
+            slots: NonEmptySlotTable::build(BTreeMap::from([(
                 PlacementSlotId::new("p1".to_string()),
-                desired_ref.clone(),
-            )]),
-            pre_push: BTreeMap::from([(PlacementSlotId::new("p1".to_string()), None)]),
+                IntentSlot {
+                    desired: DesiredGeneration {
+                        generation: desired_ref.generation.clone(),
+                        artifact: desired_ref.assignment.artifact.clone(),
+                    },
+                    pre_push: None,
+                },
+            )]))
+            .expect("one member slot"),
         };
         let a = mk("deploy-multi-a");
         let b = mk("deploy-multi-b");
@@ -5896,8 +5967,7 @@ interval_seconds = 0
             "a preflight failure after intent must end FailedPreflight"
         );
         let transitions = h.store.read_transitions(id.as_str()).unwrap();
-        let statuses: Vec<DeploymentStatus> =
-            transitions.iter().map(|t| t.status.clone()).collect();
+        let statuses: Vec<DeploymentStatus> = transitions.iter().map(|t| t.status()).collect();
         assert_eq!(
             statuses,
             vec![DeploymentStatus::FailedPreflight],
@@ -5992,8 +6062,7 @@ interval_seconds = 0
             "a staging failure after intent must end FailedPreflight"
         );
         let transitions = h.store.read_transitions(id.as_str()).unwrap();
-        let statuses: Vec<DeploymentStatus> =
-            transitions.iter().map(|t| t.status.clone()).collect();
+        let statuses: Vec<DeploymentStatus> = transitions.iter().map(|t| t.status()).collect();
         assert_eq!(
             statuses,
             vec![DeploymentStatus::FailedPreflight],
@@ -6163,8 +6232,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "a later staging failure must end FailedPreflight"
         );
         let transitions = store.read_transitions(id.as_str()).unwrap();
-        let statuses: Vec<DeploymentStatus> =
-            transitions.iter().map(|t| t.status.clone()).collect();
+        let statuses: Vec<DeploymentStatus> = transitions.iter().map(|t| t.status()).collect();
         assert_eq!(
             statuses,
             vec![DeploymentStatus::FailedPreflight],
@@ -6727,7 +6795,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(attempts.len(), 2);
         let intent2 = &attempts[1];
         assert_eq!(intent2.deployment_id, id2);
-        let pp = intent2.intent.pre_push[&PlacementSlotId::new("p1")]
+        let pp = intent2.intent.slots[&PlacementSlotId::new("p1")]
+            .pre_push
             .as_ref()
             .expect("pre_push present");
         assert_eq!(pp.generation, Some(gen1.clone()));

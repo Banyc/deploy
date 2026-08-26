@@ -20,7 +20,7 @@ fn successful_entries(store: &LocalStore, target: &str) -> Result<Vec<LedgerEntr
         .filter(|e| {
             e.terminal
                 .as_ref()
-                .is_some_and(|t| t.status == DeploymentStatus::Successful && t.rollback.is_some())
+                .is_some_and(|t| t.status() == DeploymentStatus::Successful)
         })
         .collect())
 }
@@ -28,10 +28,15 @@ fn successful_entries(store: &LocalStore, target: &str) -> Result<Vec<LedgerEntr
 /// The rollback payload of a successful entry (the old snapshot fields:
 /// `slots`, `bindings`, `behavior_sha256`, `release`).
 fn rollback_of(e: &LedgerEntry) -> &LedgerRollback {
-    e.terminal
+    match &e
+        .terminal
         .as_ref()
-        .and_then(|t| t.rollback.as_ref())
-        .expect("a successful entry carries a rollback state")
+        .expect("a successful entry has a terminal")
+        .disposition
+    {
+        deploy::records::TerminalDisposition::Successful { rollback } => rollback,
+        _ => panic!("a successful entry carries a rollback state"),
+    }
 }
 
 /// Shared per-variant policy body. Its mappings use only `{{ variant }}` — the

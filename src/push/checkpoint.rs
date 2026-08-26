@@ -449,42 +449,44 @@ mod tests {
     use super::*;
 
     use crate::model::{
-        ArtifactRef, GenerationId, GenerationRef, LEDGER_SCHEMA_VERSION, PlacementSlotAssignment,
+        ArtifactRef, DeploymentId, GenerationId, GenerationRef, PlacementSlotAssignment,
         PlacementSlotId, ReleaseId, ServerId, TargetName, TreeDigest, VariantName,
     };
-    use crate::records::{LedgerIntent, LedgerRollback, LedgerTerminal, ObservedSlot, Pins};
+    use crate::records::{
+        DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
+        NonEmptySlotTable, ObservedSlot, Pins, SlotTable, TerminalDisposition,
+    };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
     use std::collections::BTreeMap;
 
     const TARGET: &str = "t1";
 
-    fn intent(id: &str, target: &str) -> LedgerIntent {
+    fn intent(id: &str, target: &str) -> DeploymentIntent {
         let p1 = PlacementSlotId::new("p1".to_string());
-        LedgerIntent {
-            deployment_schema_version: LEDGER_SCHEMA_VERSION,
+        // ONE slot table (the membership + desired/pre-push entries).
+        let slots = BTreeMap::from([(
+            p1.clone(),
+            IntentSlot {
+                desired: DesiredGeneration {
+                    generation: GenerationId::new("gen-1".to_string()),
+                    artifact: ArtifactRef {
+                        release: ReleaseId::new("rel-1".to_string()),
+                        variant: VariantName::new("standard".to_string()),
+                        tree: TreeDigest::new("tree-1".to_string()),
+                    },
+                },
+                pre_push: None,
+            },
+        )]);
+        DeploymentIntent {
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new(target.to_string()),
             group: None,
-            slot_ids: vec![p1.clone()],
             behavior_sha256: "sha256-aa".to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            // EXACT key-set equality (slot_ids == desired == pre_push).
-            desired: BTreeMap::from([(
-                p1.clone(),
-                GenerationRef {
-                    generation: GenerationId::new("gen-1".to_string()),
-                    assignment: PlacementSlotAssignment {
-                        placement_slot: p1.clone(),
-                        artifact: ArtifactRef {
-                            release: ReleaseId::new("rel-1".to_string()),
-                            variant: VariantName::new("standard".to_string()),
-                            tree: TreeDigest::new("tree-1".to_string()),
-                        },
-                    },
-                },
-            )]),
-            pre_push: BTreeMap::from([(p1.clone(), None)]),
+            slots: NonEmptySlotTable::build(slots)
+                .expect("a fixture intent always has at least one slot"),
         }
     }
 
@@ -514,14 +516,13 @@ mod tests {
         }
     }
 
-    fn terminal_for(id: &str, target: &str, release: &str) -> LedgerTerminal {
+    fn terminal_for(release: &str) -> LedgerTerminal {
         LedgerTerminal {
-            deployment_id: DeploymentId::new(id.to_string()),
-            target: TargetName::new(target.to_string()),
-            status: crate::records::DeploymentStatus::Successful,
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
-            outcomes: BTreeMap::new(),
-            rollback: Some(rollback_for(release)),
+            outcomes: SlotTable::new(),
+            disposition: TerminalDisposition::Successful {
+                rollback: rollback_for(release),
+            },
             reason: None,
         }
     }
@@ -543,20 +544,20 @@ mod tests {
             if *ok {
                 let rel = format!("rel-sha256-{id}");
                 store
-                    .append_terminal(target, &terminal_for(&id, target, &rel))
+                    .append_terminal(target, &DeploymentId::new(id.clone()), &terminal_for(&rel))
                     .unwrap();
                 successful.push(id);
             } else {
                 store
                     .append_terminal(
                         target,
+                        &DeploymentId::new(id.clone()),
                         &LedgerTerminal {
-                            deployment_id: DeploymentId::new(id.clone()),
-                            target: TargetName::new(target.to_string()),
-                            status: crate::records::DeploymentStatus::FailedRolledBack,
                             recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                            outcomes: BTreeMap::new(),
-                            rollback: None,
+                            outcomes: SlotTable::new(),
+                            disposition: TerminalDisposition::FailedRolledBack {
+                                compensation: SlotTable::new(),
+                            },
                             reason: None,
                         },
                     )
@@ -719,13 +720,18 @@ interval_seconds = 0
     /// need a custom entry).
     fn seed_success(store: &LocalStore, target: &str, id: &str, release: &str, tree: &str) {
         store.append_intent(target, &intent(id, target)).unwrap();
-        let mut term = terminal_for(id, target, release);
+        let mut term = terminal_for(release);
         // Rewrite the rollback's per-slot tree to the caller's tree.
-        let rollback = term.rollback.as_mut().unwrap();
+        let rollback = match &mut term.disposition {
+            TerminalDisposition::Successful { rollback } => rollback,
+            _ => unreachable!("seed_success always builds a Successful terminal"),
+        };
         for g in rollback.slots.values_mut() {
             g.assignment.artifact.tree = TreeDigest::new(tree.to_string());
         }
-        store.append_terminal(target, &term).unwrap();
+        store
+            .append_terminal(target, &DeploymentId::new(id.to_string()), &term)
+            .unwrap();
     }
 
     /// THE PARITY FIX (deterministic regression): a checkpoint whose

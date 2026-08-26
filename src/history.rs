@@ -68,8 +68,8 @@ use crate::model::{
     DeploymentId, GenerationRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, TargetName,
 };
 use crate::records::{
-    DeploymentStatus, LedgerEntry, LedgerIntent, LedgerRollback, LedgerTerminal, PhysicalBinding,
-    SlotAttemptState, SlotResult,
+    DeploymentIntent, DeploymentStatus, LedgerEntry, LedgerRollback, LedgerTerminal,
+    PhysicalBinding, SlotAttemptState, SlotResult, SlotTable, TerminalDisposition,
 };
 use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
@@ -173,12 +173,12 @@ fn successful_chain(entries: &[LedgerEntry]) -> Vec<&LedgerEntry> {
         .filter(|e| {
             e.terminal
                 .as_ref()
-                .is_some_and(|t| t.status == DeploymentStatus::Successful && t.rollback.is_some())
+                .is_some_and(|t| t.status() == DeploymentStatus::Successful)
         })
         .collect()
 }
 
-/// Resolve a relative reference's base to a POSITION in the successful chain
+/// Resolve a relative reference's base to a POSITION in the successful chain's base to a POSITION in the successful chain
 /// (the ledger in deployment order). `expr` renders the reference for error
 /// messages. The chain is the CURRENT ledger (the retained suffix after a
 /// checkpoint — the floor is implicit), so a deployment id below the
@@ -244,7 +244,7 @@ pub fn ref_name(target: &TargetName, deployment_id: &DeploymentId) -> String {
 /// omitted.
 pub fn finalize_successful_attempt(
     store: &LocalStore,
-    attempt: &LedgerIntent,
+    attempt: &DeploymentIntent,
     outcomes: &BTreeMap<PlacementSlotId, SlotResult>,
     actuals: &BTreeMap<PlacementSlotId, SlotAttemptState>,
     reason: &str,
@@ -264,15 +264,14 @@ pub fn finalize_successful_attempt(
     let base = crate::push::plan::latest_successful_rollback(store, attempt.target.as_str())?;
     let rollback = build_rollback(actuals, bindings, base.as_ref(), current_slot_ids);
     let terminal = LedgerTerminal {
-        deployment_id: attempt.deployment_id.clone(),
-        target: attempt.target.clone(),
-        status: DeploymentStatus::Successful,
         recorded_at: crate::remote::helper::now_rfc3339(),
-        outcomes: outcomes.clone(),
-        rollback: Some(rollback),
+        outcomes: SlotTable::from_map(outcomes.clone()),
+        // The Successful disposition ALWAYS carries the complete rollback
+        // payload (the truth table is structural in the domain).
+        disposition: TerminalDisposition::Successful { rollback },
         reason: Some(reason.to_string()),
     };
-    store.append_terminal(attempt.target.as_str(), &terminal)
+    store.append_terminal(attempt.target.as_str(), &attempt.deployment_id, &terminal)
 }
 
 /// Build the rollback state of a successful deployment from the attempt's
@@ -345,23 +344,22 @@ pub fn build_rollback(
 /// per-slot actuals ([`SlotAttemptState`]) for the rollback, built from the
 /// attempt's desired assignments.
 pub fn recovery_outcomes(
-    attempt: &LedgerIntent,
+    attempt: &DeploymentIntent,
 ) -> (
     BTreeMap<PlacementSlotId, SlotResult>,
     BTreeMap<PlacementSlotId, SlotAttemptState>,
 ) {
     let mut outcomes = BTreeMap::new();
     let mut actuals = BTreeMap::new();
-    for sid in &attempt.slot_ids {
-        let Some(desired) = attempt.desired.get(sid) else {
-            continue;
-        };
+    // Iterate the ONE authoritative slot table (the membership AND the
+    // desired entries are the same table in the domain).
+    for (sid, slot) in attempt.slots.iter() {
         outcomes.insert(
             sid.clone(),
             SlotResult {
                 slot_id: sid.clone(),
                 outcome: crate::records::ServerOutcomeKind::Activated,
-                generation: Some(desired.generation.clone()),
+                generation: Some(slot.desired.generation.clone()),
                 compensated: false,
                 error: None,
             },
@@ -369,8 +367,8 @@ pub fn recovery_outcomes(
         actuals.insert(
             sid.clone(),
             SlotAttemptState {
-                artifact: desired.assignment.artifact.clone(),
-                generation: Some(desired.generation.clone()),
+                artifact: slot.desired.artifact.clone(),
+                generation: Some(slot.desired.generation.clone()),
             },
         );
     }
@@ -386,7 +384,7 @@ pub fn successful_deployments(store: &LocalStore, target: &TargetName) -> Result
         .filter(|e| {
             e.terminal
                 .as_ref()
-                .is_some_and(|t| t.status == DeploymentStatus::Successful && t.rollback.is_some())
+                .is_some_and(|t| t.status() == DeploymentStatus::Successful)
         })
         .collect())
 }
@@ -415,17 +413,13 @@ pub fn resolve_deployment(
             "deployment '{deployment_id}' on target '{target}' has no terminal event (the deployment did not complete)"
         ))
     })?;
-    if terminal.status != DeploymentStatus::Successful {
-        return Err(Error::r#ref(format!(
-            "deployment '{deployment_id}' on target '{target}' ended {status:?} — only successful deployments carry a rollback state",
-            status = terminal.status
-        )));
+    match &terminal.disposition {
+        TerminalDisposition::Successful { rollback } => Ok(rollback.clone()),
+        other => Err(Error::r#ref(format!(
+            "deployment '{deployment_id}' on target '{target}' ended {:?} — only successful deployments carry a rollback state",
+            other.status()
+        ))),
     }
-    terminal.rollback.clone().ok_or_else(|| {
-        Error::r#ref(format!(
-            "deployment '{deployment_id}' on target '{target}' has no rollback state"
-        ))
-    })
 }
 
 /// The INTERNAL snapshot position of a successful deployment: its position
@@ -448,8 +442,9 @@ pub fn successful_index(
 
 /// Collect the distinct placement slot IDs referenced across a set of
 /// intent entries.
-pub fn attempt_slot_ids(attempt: &LedgerIntent) -> Vec<PlacementSlotId> {
-    attempt.slot_ids.clone()
+pub fn attempt_slot_ids(attempt: &DeploymentIntent) -> Vec<PlacementSlotId> {
+    // The membership is the ONE table's key set (deployment order).
+    attempt.slots.keys().cloned().collect()
 }
 
 /// Build a map of rollback display names (`deployment <deployment-id> of
@@ -460,8 +455,10 @@ pub fn deployment_index(
 ) -> Result<BTreeMap<String, LedgerRollback>> {
     let mut out = BTreeMap::new();
     for e in successful_deployments(store, target)? {
-        if let Some(rollback) = e.terminal.as_ref().and_then(|t| t.rollback.clone()) {
-            out.insert(ref_name(target, &e.deployment_id), rollback);
+        if let TerminalDisposition::Successful { rollback } =
+            &e.terminal.as_ref().unwrap().disposition
+        {
+            out.insert(ref_name(target, &e.deployment_id), rollback.clone());
         }
     }
     Ok(out)
@@ -470,9 +467,10 @@ pub fn deployment_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{
-        ArtifactRef, GenerationId, LEDGER_SCHEMA_VERSION, ReleaseId, ServerId, TreeDigest,
-        VariantName,
+    use crate::model::{ArtifactRef, GenerationId, ReleaseId, ServerId, TreeDigest, VariantName};
+    use crate::records::{
+        DeploymentIntent, DesiredGeneration, IntentSlot, NonEmptySlotTable, SlotTable,
+        TerminalDisposition,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
@@ -486,31 +484,31 @@ mod tests {
 
     /// A minimal but VALID intent for the target (EXACT key-set equality:
     /// `slot_ids == desired.keys() == pre_push.keys()`).
-    fn intent(dep: &str) -> LedgerIntent {
+    fn intent(dep: &str) -> DeploymentIntent {
         let p1 = PlacementSlotId::new("p1".to_string());
-        LedgerIntent {
-            deployment_schema_version: LEDGER_SCHEMA_VERSION,
+        // ONE slot table (the membership + desired/pre-push entries).
+        let slots = BTreeMap::from([(
+            p1.clone(),
+            IntentSlot {
+                desired: DesiredGeneration {
+                    generation: GenerationId::new("gen-1".to_string()),
+                    artifact: ArtifactRef {
+                        release: ReleaseId::new("rel-1".to_string()),
+                        variant: VariantName::new("standard".to_string()),
+                        tree: TreeDigest::new("tree-1".to_string()),
+                    },
+                },
+                pre_push: None,
+            },
+        )]);
+        DeploymentIntent {
             deployment_id: DeploymentId::new(dep.to_string()),
             target: TargetName::new("production".to_string()),
             group: None,
-            slot_ids: vec![p1.clone()],
             behavior_sha256: "sha256-aa".to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            desired: BTreeMap::from([(
-                p1.clone(),
-                GenerationRef {
-                    generation: GenerationId::new("gen-1".to_string()),
-                    assignment: PlacementSlotAssignment {
-                        placement_slot: p1.clone(),
-                        artifact: ArtifactRef {
-                            release: ReleaseId::new("rel-1".to_string()),
-                            variant: VariantName::new("standard".to_string()),
-                            tree: TreeDigest::new("tree-1".to_string()),
-                        },
-                    },
-                },
-            )]),
-            pre_push: BTreeMap::from([(p1.clone(), None)]),
+            slots: NonEmptySlotTable::build(slots)
+                .expect("a fixture intent always has at least one slot"),
         }
     }
 
@@ -519,34 +517,33 @@ mod tests {
     /// deployment id so "exactly its stored state" is a meaningful equality).
     fn successful_terminal(dep: &str, release: &str) -> LedgerTerminal {
         LedgerTerminal {
-            deployment_id: DeploymentId::new(dep.to_string()),
-            target: TargetName::new("production".to_string()),
-            status: DeploymentStatus::Successful,
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
-            outcomes: BTreeMap::new(),
-            rollback: Some(LedgerRollback {
-                slots: BTreeMap::from([(
-                    PlacementSlotId::new("p1".to_string()),
-                    GenerationRef {
-                        generation: GenerationId::new(format!("gen-{dep}")),
-                        assignment: PlacementSlotAssignment {
-                            placement_slot: PlacementSlotId::new("p1".to_string()),
-                            artifact: ArtifactRef {
-                                release: ReleaseId::new(release.to_string()),
-                                variant: VariantName::new("standard".to_string()),
-                                tree: TreeDigest::new(format!("tree-{dep}")),
+            outcomes: SlotTable::new(),
+            disposition: TerminalDisposition::Successful {
+                rollback: LedgerRollback {
+                    slots: BTreeMap::from([(
+                        PlacementSlotId::new("p1".to_string()),
+                        GenerationRef {
+                            generation: GenerationId::new(format!("gen-{dep}")),
+                            assignment: PlacementSlotAssignment {
+                                placement_slot: PlacementSlotId::new("p1".to_string()),
+                                artifact: ArtifactRef {
+                                    release: ReleaseId::new(release.to_string()),
+                                    variant: VariantName::new("standard".to_string()),
+                                    tree: TreeDigest::new(format!("tree-{dep}")),
+                                },
                             },
                         },
-                    },
-                )]),
-                bindings: BTreeMap::from([(
-                    PlacementSlotId::new("p1".to_string()),
-                    PhysicalBinding {
-                        server: ServerId::new("server-01".to_string()),
-                        deploy_dir: "/srv/deploy/p1".to_string(),
-                    },
-                )]),
-            }),
+                    )]),
+                    bindings: BTreeMap::from([(
+                        PlacementSlotId::new("p1".to_string()),
+                        PhysicalBinding {
+                            server: ServerId::new("server-01".to_string()),
+                            deploy_dir: "/srv/deploy/p1".to_string(),
+                        },
+                    )]),
+                },
+            },
             reason: None,
         }
     }
@@ -561,6 +558,7 @@ mod tests {
             store
                 .append_terminal(
                     "production",
+                    &DeploymentId::new(id.clone()),
                     &successful_terminal(&id, &format!("rel-sha256-{id}")),
                 )
                 .unwrap();
@@ -889,12 +887,16 @@ mod tests {
     #[test]
     fn legacy_rollback_without_bindings_deserializes_with_empty_map() {
         let line = r#"{"kind":"terminal","deployment_id":"deploy-old","target":"production","status":"successful","recorded_at":"2026-01-01T00:00:00Z","outcomes":{},"rollback":{"behavior_sha256":"sha256-aa","release":"rel-sha256-old","slots":{}}}"#;
-        let terminal: LedgerTerminal = serde_json::from_str(line).unwrap();
-        let rollback = terminal.rollback.unwrap();
-        assert!(
-            rollback.bindings.is_empty(),
-            "legacy line without bindings yields an empty map"
+        // The legacy line PARSES at the wire level (the legacy snapshot-wide
+        // members are tolerated by serde — unknown members are skipped), and
+        // the domain conversion REFUSES it (fail closed): the legacy
+        // `release` disagrees with the snapshot's derived releases (the
+        // per-slot bindings — empty here — are the authoritative source).
+        let wire: crate::records::LedgerTerminalWire = serde_json::from_str(line).unwrap();
+        let err = wire.into_domain().expect_err(
+            "a legacy release that disagrees with the derived snapshot releases fails closed",
         );
+        assert!(err.to_string().contains("release"), "error: {err}");
     }
 
     /// A deployment-history shape: 0..=8 (deployment_id, successful?) pairs
@@ -914,7 +916,7 @@ mod tests {
     }
 
     /// A minimal intent record for the target, enough to seed a ledger entry.
-    fn intent_entry(dep: &str) -> LedgerIntent {
+    fn intent_entry(dep: &str) -> DeploymentIntent {
         intent(dep)
     }
 
@@ -931,7 +933,10 @@ mod tests {
             .into_iter()
             .filter_map(|e| {
                 e.terminal
-                    .and_then(|t| t.rollback)
+                    .and_then(|t| match &t.disposition {
+                        TerminalDisposition::Successful { rollback } => Some(rollback.clone()),
+                        _ => None,
+                    })
                     .map(|rb| (e.deployment_id.as_str().to_string(), rb))
             })
             .collect();
@@ -994,19 +999,23 @@ mod tests {
                 // (so "exactly its stored state" is a meaningful equality).
                 let release = id.replace("deploy-", "rel-sha256-");
                 store
-                    .append_terminal("production", &successful_terminal(id, &release))
+                    .append_terminal(
+                        "production",
+                        &DeploymentId::new(id.clone()),
+                        &successful_terminal(id, &release),
+                    )
                     .unwrap();
             } else {
                 store
                     .append_terminal(
                         "production",
+                        &DeploymentId::new(id.clone()),
                         &LedgerTerminal {
-                            deployment_id: DeploymentId::new(id.clone()),
-                            target: TargetName::new("production".to_string()),
-                            status: DeploymentStatus::FailedRolledBack,
                             recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                            outcomes: BTreeMap::new(),
-                            rollback: None,
+                            outcomes: SlotTable::new(),
+                            disposition: TerminalDisposition::FailedRolledBack {
+                                compensation: SlotTable::new(),
+                            },
                             reason: None,
                         },
                     )
