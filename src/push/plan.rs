@@ -216,6 +216,15 @@ pub(crate) fn validate_partial_rollout(
 /// CURRENT member slot-id set, derived from the caller's config exactly as
 /// [`plan_assignments`] derives it (`config.target_slots`, in deterministic
 /// order), so both gates compare the SAME sets.
+///
+/// BOTH call sites pass the target's COMPLETE current member-slot set —
+/// EVERY slot whose owning `target` equals the target — never a
+/// group-filtered selection: a `release:<id> --group <g>` push validates
+/// the FULL membership here and then plans ONLY the selected slots (the
+/// group narrows the planned assignments, never the membership gate). A
+/// `--group` push selecting a proper subset would otherwise compare the
+/// release's full frozen set against the subset and fail for every proper
+/// group.
 pub(crate) fn validate_direct_release_membership(
     target_name: &str,
     release: &ReleaseId,
@@ -377,11 +386,23 @@ pub fn plan_assignments(
             // ALSO runs this gate before the remote factory is ever invoked
             // (real AND dry-run modes); this plan-time call is the second line
             // of defense, protecting the direct-`push_inner` test entry points.
+            // The gate compares the release's frozen slots against the target's
+            // COMPLETE current membership — EVERY slot whose owning `target`
+            // equals the target (`config.target_slots`), never the
+            // group-filtered selection: a `release:<id> --group <g>` push
+            // validates the FULL set here (and in the engine gate) and then
+            // plans ONLY the selected slots (the `members` loop below is
+            // already group-aware).
+            let current_slot_ids: Vec<PlacementSlotId> = config
+                .target_slots(selection.target.as_str())?
+                .into_iter()
+                .map(|(slot, _)| PlacementSlotId::new(slot.id.clone()))
+                .collect();
             validate_direct_release_membership(
                 selection.target.as_str(),
                 release,
                 &rec,
-                &slot_ids,
+                &current_slot_ids,
             )?;
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
@@ -1334,6 +1355,262 @@ interval_seconds = 0
             msg.contains("exact rollback"),
             "error must explain the exact-rollback verification failure, got: {msg}"
         );
+    }
+
+    /// THE DIRECT-RELEASE GROUP PROPERTY (deterministic form): a
+    /// `release:<id>` push with `--group <g>` validates the release against
+    /// the target's COMPLETE current membership and then plans ONLY the
+    /// group's slots. A 3-slot target (`p1`/`p2`/`p3`) with a release frozen
+    /// to all three: every single-slot group (`g1`/`g2`/`g3`) and every pair
+    /// group (`g12`/`g13`/`g23`) plans exactly its selected slots — the
+    /// membership gate compares the FULL frozen set against the FULL target
+    /// membership, never the group-filtered selection (the bug: a `--group`
+    /// push compared the release's full set against the subset and failed for
+    /// every proper group). Adding a 4th slot to the target's config is a
+    /// COMPLETE-membership drift: the release froze 3 slots, the target now
+    /// has 4, so EVERY group refuses at plan time with the membership-drift
+    /// error (even a group selecting a single drifted slot).
+    #[test]
+    fn direct_release_group_plans_every_subset_but_full_membership_drift_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        // Three slots on three servers; each slot belongs to its own
+        // single-slot group plus the two pair groups that contain it.
+        const VARIANT_3: &str = r#"
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+groups = ["g1", "g12", "g13"]
+deploy_dir = "/srv/p1"
+
+[[slots]]
+id = "p2"
+server = "s2"
+target = "t1"
+groups = ["g2", "g12", "g23"]
+deploy_dir = "/srv/p2"
+
+[[slots]]
+id = "p3"
+server = "s3"
+target = "t1"
+groups = ["g3", "g13", "g23"]
+deploy_dir = "/srv/p3"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+        std::fs::write(release_dir.join("standard.toml"), VARIANT_3).unwrap();
+        let cfg_path = project.join("deploy.toml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+schema_version = 2
+application = "plan"
+release = "v1"
+
+[[servers]]
+id = "s1"
+address = "a1"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s2"
+address = "a2"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s3"
+address = "a3"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#,
+        )
+        .unwrap();
+        let config = Config::load(&cfg_path).unwrap();
+        assert_eq!(config.target_slot_ids("t1").unwrap(), ["p1", "p2", "p3"]);
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+
+        // The release's OWN frozen canonical snapshot: all three slots, with
+        // the SAME group declarations as the current config (the release was
+        // built when the target had exactly this membership).
+        let mut rec = legacy_record("unused", "tree-group");
+        rec.slots = BTreeMap::from([(
+            "standard".to_string(),
+            CanonicalSlots {
+                slots: vec![
+                    CanonicalSlot {
+                        id: "p1".to_string(),
+                        server: "s1".to_string(),
+                        deploy_dir: "/srv/p1".to_string(),
+                        target: "t1".to_string(),
+                        groups: vec!["g1".to_string(), "g12".to_string(), "g13".to_string()],
+                    },
+                    CanonicalSlot {
+                        id: "p2".to_string(),
+                        server: "s2".to_string(),
+                        deploy_dir: "/srv/p2".to_string(),
+                        target: "t1".to_string(),
+                        groups: vec!["g2".to_string(), "g12".to_string(), "g23".to_string()],
+                    },
+                    CanonicalSlot {
+                        id: "p3".to_string(),
+                        server: "s3".to_string(),
+                        deploy_dir: "/srv/p3".to_string(),
+                        target: "t1".to_string(),
+                        groups: vec!["g3".to_string(), "g13".to_string(), "g23".to_string()],
+                    },
+                ],
+            },
+        )]);
+        let release = consistent(&mut rec);
+        store.write_release(&rec).unwrap();
+
+        // EVERY single-slot and pair group plans EXACTLY its selected slots:
+        // the membership gate passes on the FULL set (release froze 3, the
+        // target has 3) and the plan narrows to the group.
+        let groups: &[(&str, &[&str])] = &[
+            ("g1", &["p1"]),
+            ("g2", &["p2"]),
+            ("g3", &["p3"]),
+            ("g12", &["p1", "p2"]),
+            ("g13", &["p1", "p3"]),
+            ("g23", &["p2", "p3"]),
+        ];
+        for (group, want) in groups {
+            let selection = SlotSelection::normalize(&config, "t1", Some(group)).unwrap();
+            assert_eq!(
+                selection
+                    .slot_ids
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>(),
+                *want,
+                "group {group} must select exactly {want:?}"
+            );
+            let (assignments, desired, source) = plan_assignments(
+                &selection,
+                &PushRef::Release {
+                    release: release.clone(),
+                },
+                &ReleaseId::new("unused-local".to_string()),
+                &BTreeMap::new(),
+                &store,
+                &config,
+            )
+            .unwrap_or_else(|e| panic!("group {group} must plan a direct release: {e}"));
+            let got: Vec<&str> = assignments
+                .iter()
+                .map(|a| a.placement_slot.as_str())
+                .collect();
+            assert_eq!(got, *want, "group {group} must plan exactly its slots");
+            for a in &assignments {
+                assert_eq!(a.artifact.release, release);
+                assert_eq!(a.artifact.variant.as_str(), "standard");
+            }
+            assert_eq!(desired, BTreeSet::from([release.clone()]));
+            assert_eq!(source, PlanSource::ReleaseRef(release.clone()));
+        }
+
+        // A 4th slot (`p4` on a new server `s4`) joins the target's config:
+        // a COMPLETE-membership drift (the release froze 3 slots, the target
+        // now has 4). EVERY group — single AND pair — refuses at plan time
+        // with the membership-drift error: the gate validates the FULL set,
+        // so even a group selecting a subset of the drifted slots fails.
+        let mut drifted_variant = String::from(VARIANT_3);
+        drifted_variant.push_str(
+            "[[slots]]\nid = \"p4\"\nserver = \"s4\"\ntarget = \"t1\"\ndeploy_dir = \"/srv/p4\"\n",
+        );
+        std::fs::write(release_dir.join("standard.toml"), drifted_variant).unwrap();
+        std::fs::write(
+            &cfg_path,
+            r#"
+schema_version = 2
+application = "plan"
+release = "v1"
+
+[[servers]]
+id = "s1"
+address = "a1"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s2"
+address = "a2"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s3"
+address = "a3"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s4"
+address = "a4"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#,
+        )
+        .unwrap();
+        let drifted = Config::load(&cfg_path).unwrap();
+        assert_eq!(
+            drifted.target_slot_ids("t1").unwrap(),
+            ["p1", "p2", "p3", "p4"]
+        );
+        for (group, _) in groups {
+            let selection = SlotSelection::normalize(&drifted, "t1", Some(group)).unwrap();
+            let err = plan_assignments(
+                &selection,
+                &PushRef::Release {
+                    release: release.clone(),
+                },
+                &ReleaseId::new("unused-local".to_string()),
+                &BTreeMap::new(),
+                &store,
+                &drifted,
+            )
+            .expect_err(&format!(
+                "a 4th slot added to the target must refuse every group ({group})"
+            ));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("membership")
+                    && msg.contains("[p1, p2, p3]")
+                    && msg.contains("[p1, p2, p3, p4]"),
+                "drift error must name expected [p1, p2, p3] vs current [p1, p2, p3, p4], got: {msg}"
+            );
+            assert!(
+                msg.contains("before remote access"),
+                "refusal must explain it happens before remote access, got: {msg}"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------

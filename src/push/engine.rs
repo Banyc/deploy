@@ -192,15 +192,24 @@ pub fn push(
     // touches the snapshot chain (see `resolve_ref_expr`), so gating on the
     // parsed form is exactly equivalent to gating on the resolved ref — no
     // post-reconcile resolution is needed for the direct form.
+    // The gate compares the FULL membership — `config.target_slots`, EVERY
+    // slot whose owning target equals the target — never the group-filtered
+    // `selection.slot_ids`: a `release:<id> --group <g>` push validates the
+    // complete set here and then plans only the selected slots downstream.
     if let RefExpr::Release(release) = &ref_expr {
         let rec = store
             .read_release(release)
             .map_err(|_| Error::rollback(format!("release {release} not available locally")))?;
+        let current_slot_ids: Vec<PlacementSlotId> = config
+            .target_slots(target_name)?
+            .into_iter()
+            .map(|(slot, _)| PlacementSlotId::new(slot.id.clone()))
+            .collect();
         crate::push::plan::validate_direct_release_membership(
             target_name,
             release,
             &rec,
-            &selection.slot_ids,
+            &current_slot_ids,
         )?;
     }
 
@@ -7967,6 +7976,441 @@ interval_seconds = 0
                 assert!(
                     calls.load(Ordering::SeqCst) > 0,
                     "the control real push contacts remotes; the recording factory must count it"
+                );
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // DIRECT-RELEASE GROUP PROPERTY: `release:<id> --group <g>` validates the
+    // release against the target's COMPLETE membership — every generated
+    // proper group subset plans — and a mutated COMPLETE membership
+    // (add/remove/rename of a full-target slot) always fails before any
+    // remote access (zero recording-factory invocations, both modes).
+    // ---------------------------------------------------------------------
+
+    /// A mutation of the CURRENT config only — the release record stays
+    /// frozen to the ORIGINAL membership, so every mutation is a
+    /// COMPLETE-membership drift. The mutated slot is a CONSTANT member
+    /// (never a group slot), so the group selection stays valid and the
+    /// refusal is always the membership-drift error, never a
+    /// group-selects-nothing config error.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum MembershipMutation {
+        /// A fresh slot (`p99` on server `s7`) joins the target's current
+        /// membership — the release froze a target without it.
+        Add,
+        /// The constant member `phys` is dropped from the target's current
+        /// membership — the release froze it as a member.
+        Remove,
+        /// The constant member `phys` is renamed `physX` — the release froze
+        /// the old id.
+        Rename,
+    }
+
+    /// Render the variant file for a t1 membership: the generated universe
+    /// slots (`group_inc` in the group `group-a`, `extra_inc` outside any
+    /// group), the constant `phys` (id `phys_id` — `None` drops it, the
+    /// Remove mutation), and an optional extra slot (the Add mutation's
+    /// `p99`). Every slot owns a distinct server so the per-target
+    /// server-uniqueness validation passes for every rendered membership.
+    fn group_variant_string(
+        group_inc: [bool; 3],
+        extra_inc: [bool; 3],
+        phys_id: Option<&str>,
+        add_slot: Option<(&str, &str, &str)>,
+    ) -> String {
+        let mut variant = String::new();
+        let push_slot = |variant: &mut String,
+                         id: &str,
+                         server: &str,
+                         groups: &[&str],
+                         dir: &str| {
+            let groups_line = if groups.is_empty() {
+                String::new()
+            } else {
+                format!("groups = [\"{}\"]\n", groups.join("\", \""))
+            };
+            variant.push_str(&format!(
+                    "[[slots]]\nid = \"{id}\"\nserver = \"{server}\"\ntarget = \"t1\"\n{groups_line}deploy_dir = \"{dir}\"\n\n"
+                ));
+        };
+        let group = "group-a";
+        for (i, inc) in group_inc.iter().enumerate() {
+            if *inc {
+                let id = MEMBERSHIP_UNIVERSE[i];
+                push_slot(
+                    &mut variant,
+                    id,
+                    &format!("s{}", i + 1),
+                    &[group],
+                    &format!("/srv/{id}"),
+                );
+            }
+        }
+        for (i, inc) in extra_inc.iter().enumerate() {
+            if *inc && !group_inc[i] {
+                let id = MEMBERSHIP_UNIVERSE[i];
+                push_slot(
+                    &mut variant,
+                    id,
+                    &format!("s{}", i + 1),
+                    &[],
+                    &format!("/srv/{id}"),
+                );
+            }
+        }
+        if let Some(pid) = phys_id {
+            push_slot(&mut variant, pid, "s5", &[], "/srv/phys");
+        }
+        if let Some((id, server, dir)) = add_slot {
+            push_slot(&mut variant, id, server, &[], dir);
+        }
+        variant.push_str(
+            "[[artifact.mappings]]\nfrom = \"artifacts/build/output/\"\nto = \"app/\"\nrecursive = true\n\n\
+             [[artifact.mappings]]\nfrom = \"artifacts/deployment/common/\"\nto = \"app-common/\"\nrecursive = true\n\n\
+             [rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n\
+             [rotation.deployment]\nprotect_deployments = 1\n\n\
+             [activation]\nadapter = \"none\"\n\n\
+             [verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
+        );
+        variant
+    }
+
+    /// The group fixture's config: servers `s1..=s7` (s7 backs the Add
+    /// mutation's `p99`; unused servers are harmless) and the single target
+    /// `t1`.
+    fn group_config_string() -> String {
+        let mut servers = String::new();
+        for i in 1..=7 {
+            servers.push_str(&format!(
+                "[[servers]]\nid = \"s{i}\"\naddress = \"a{i}\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n"
+            ));
+        }
+        format!(
+            "schema_version = 2\napplication = \"eng\"\nrelease = \"v1\"\n\n\
+             {servers}\
+             [targets.t1]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n"
+        )
+    }
+
+    /// Build the direct-release GROUP fixture: target `t1`'s CURRENT config
+    /// declares the generated membership (the group `group-a` on exactly the
+    /// `group_inc` subset of the universe, the `extra_inc` slots outside any
+    /// group) plus the constant `phys`; the release record's OWN frozen
+    /// canonical snapshot declares the SAME membership (matching by
+    /// construction); and a SUCCESSFUL ledger entry carries every current t1
+    /// member with its current physical binding — the base a proper-subset
+    /// group push's partial-rollout guard needs to carry the unselected slots
+    /// forward. The behavior + mapping aux snapshots are stored so the
+    /// release path's `read_release_behaviors` verifies. Returns the
+    /// fixture's tempdir, config path, config, store, release id, and group
+    /// name.
+    fn group_membership_fixture(
+        group_inc: [bool; 3],
+        extra_inc: [bool; 3],
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        Config,
+        LocalStore,
+        ReleaseId,
+        String,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        std::fs::write(
+            release_dir.join("standard.toml"),
+            group_variant_string(group_inc, extra_inc, Some("phys"), None),
+        )
+        .unwrap();
+        let cfg_path = project.join("deploy.toml");
+        std::fs::write(&cfg_path, group_config_string()).unwrap();
+        let config = Config::load(&cfg_path).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let remotes_base = dir.path().join("remotes");
+        std::fs::create_dir_all(&remotes_base).unwrap();
+
+        // The behavior snapshot + mapping aux the release path verifies
+        // against the record's provenance digests (mirroring a HEAD push's
+        // `write_release_aux`).
+        let vcfg = config.variant("standard").unwrap();
+        let variant_behaviors: BTreeMap<String, BehaviorContract> = BTreeMap::from([(
+            "standard".to_string(),
+            BehaviorContract {
+                activation: vcfg.activation.clone(),
+                verification: vcfg.verification.clone(),
+            },
+        )]);
+        let behavior_sha = crate::release::variant_behaviors_digest(&variant_behaviors);
+        let behavior_json = serde_json::to_value(&variant_behaviors).unwrap();
+        let mut variant_mappings: BTreeMap<String, Vec<Mapping>> = BTreeMap::new();
+        variant_mappings.insert("standard".to_string(), vcfg.artifact.mappings.clone());
+        let mapping_sha = crate::release::variant_mappings_digest(&variant_mappings);
+
+        // The release's OWN frozen canonical snapshot: the generated
+        // membership (group declarations mirroring the config) plus the
+        // constant `phys`.
+        let group = "group-a".to_string();
+        let mut canonical: Vec<CanonicalSlot> = Vec::new();
+        for (i, id) in MEMBERSHIP_UNIVERSE.iter().enumerate() {
+            if group_inc[i] || extra_inc[i] {
+                canonical.push(CanonicalSlot {
+                    id: id.to_string(),
+                    server: format!("s{}", i + 1),
+                    deploy_dir: format!("/srv/{id}"),
+                    target: "t1".to_string(),
+                    groups: if group_inc[i] {
+                        vec![group.clone()]
+                    } else {
+                        Vec::new()
+                    },
+                });
+            }
+        }
+        canonical.push(CanonicalSlot {
+            id: "phys".to_string(),
+            server: "s5".to_string(),
+            deploy_dir: "/srv/phys".to_string(),
+            target: "t1".to_string(),
+            groups: Vec::new(),
+        });
+        canonical.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut rec = ReleaseRecord {
+            release_schema_version: RELEASE_RECORD_SCHEMA_VERSION,
+            release_id: "unused".to_string(),
+            release_sha256: String::new(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            provenance: Provenance {
+                git_revision: None,
+                mapping_sha256: mapping_sha,
+                behavior_sha256: behavior_sha,
+            },
+            variants: BTreeMap::from([("standard".to_string(), "tree-group".to_string())]),
+            slots: BTreeMap::from([("standard".to_string(), CanonicalSlots { slots: canonical })]),
+        };
+        let release = crate::release::recompute_release_digest(&rec)
+            .expect("the fixture record carries its slot snapshot");
+        rec.release_sha256 = release.as_str().to_string();
+        rec.release_id = crate::model::ReleaseId::from_digest(&release)
+            .as_str()
+            .to_string();
+        let rid = ReleaseId::new(rec.release_id.clone());
+        store.write_release(&rec).unwrap();
+        let mapping_toml = toml::to_string_pretty(&variant_mappings).unwrap();
+        store
+            .write_release_aux(&rid, &mapping_toml, &behavior_json)
+            .unwrap();
+
+        // The SUCCESSFUL ledger entry whose rollback payload carries every
+        // current t1 member and its current binding — the base a
+        // proper-subset group push's partial-rollout guard needs to carry the
+        // unselected slots forward.
+        let artifact = ArtifactRef {
+            release: rid.clone(),
+            variant: VariantName::new("standard".to_string()),
+            tree: TreeDigest::new("tree-group".to_string()),
+        };
+        let slots: BTreeMap<PlacementSlotId, GenerationRef> = config
+            .target_slots("t1")
+            .unwrap()
+            .into_iter()
+            .map(|(slot, _)| {
+                let slot_id = PlacementSlotId::new(slot.id.clone());
+                (
+                    slot_id.clone(),
+                    GenerationRef {
+                        generation: GenerationId::new(format!("gen-{}", slot.id.as_str())),
+                        assignment: crate::model::PlacementSlotAssignment {
+                            placement_slot: slot_id.clone(),
+                            artifact: artifact.clone(),
+                        },
+                    },
+                )
+            })
+            .collect();
+        let bindings = config.target_slot_bindings("t1").unwrap();
+        seed_snapshot(
+            &store,
+            "t1",
+            "deploy-group-base",
+            "sha256-base",
+            slots,
+            bindings,
+        );
+
+        (dir, cfg_path, config, store, rid, group)
+    }
+
+    /// Rewrite the fixture's CURRENT config with a COMPLETE-membership
+    /// mutation on target `t1` (the release record and ledger stay frozen to
+    /// the original membership), and return the reloaded config.
+    fn apply_group_membership_mutation(
+        dir: &tempfile::TempDir,
+        cfg_path: &Path,
+        group_inc: [bool; 3],
+        extra_inc: [bool; 3],
+        mutation: MembershipMutation,
+    ) -> Config {
+        let variant_path = dir
+            .path()
+            .join("proj")
+            .join("releases")
+            .join("v1")
+            .join("standard.toml");
+        let (phys_id, add_slot) = match mutation {
+            MembershipMutation::Add => (Some("phys"), Some(("p99", "s7", "/srv/p99"))),
+            MembershipMutation::Remove => (None, None),
+            MembershipMutation::Rename => (Some("physX"), None),
+        };
+        std::fs::write(
+            &variant_path,
+            group_variant_string(group_inc, extra_inc, phys_id, add_slot),
+        )
+        .unwrap();
+        Config::load(cfg_path).unwrap()
+    }
+
+    // THE USER'S DIRECT-RELEASE GROUP PROPERTY: for generated MATCHING
+    // frozen/current memberships (the release freezes exactly the target's
+    // current membership, by construction) plus an ARBITRARY NONEMPTY group
+    // subset of the target's slots, a direct `release:<id> --group <g>` push
+    // (the COMPLETE push path, dry-run mode) RESOLVES AND PLANS — the
+    // membership gate now validates the release's FULL frozen set against the
+    // target's COMPLETE current set (never the group-filtered selection), so
+    // EVERY proper subset plans, and the dry-run plan covers EXACTLY the
+    // group's slots. MUTATING the COMPLETE membership (add/remove/rename of a
+    // full-target slot) ALWAYS fails BEFORE REMOTE ACCESS: the drift gate
+    // fires on the FULL set in BOTH real and dry-run modes with the recording
+    // factory reporting ZERO invocations.
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            // Bounded + fixed seed: deterministic floor, fast.
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn direct_release_group_every_subset_plans_membership_mutation_fails_pre_remote(
+            group_inc in prop::array::uniform3(prop::bool::ANY)
+                .prop_filter("the group subset must be non-empty", |a| a.iter().any(|b| *b)),
+            extra_inc in prop::array::uniform3(prop::bool::ANY),
+            mutation in prop_oneof![
+                Just(MembershipMutation::Add),
+                Just(MembershipMutation::Remove),
+                Just(MembershipMutation::Rename),
+            ],
+        ) {
+            let (_dir, cfg_path, config, store, release, group) =
+                group_membership_fixture(group_inc, extra_inc);
+            let remotes_base = _dir.path().join("remotes");
+            let token = format!("release:{release}");
+
+            // EVERY non-empty group subset plans: the membership matches (the
+            // release froze exactly the target's current slots), the early
+            // gate passes, and the dry run plans EXACTLY the group's slots —
+            // never the ungrouped members, never phys.
+            let group_slots: Vec<&str> = MEMBERSHIP_UNIVERSE
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| group_inc[*i])
+                .map(|(_, id)| *id)
+                .collect();
+            assert!(
+                !group_slots.is_empty(),
+                "the generated group subset must be non-empty"
+            );
+            let ungrouped: Vec<&str> = MEMBERSHIP_UNIVERSE
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !group_inc[*i] && extra_inc[*i])
+                .map(|(_, id)| *id)
+                .collect();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let factory = recording_factory(remotes_base.clone(), calls.clone());
+            let r = push(
+                &cfg_path,
+                &store,
+                &factory,
+                "t1",
+                &config,
+                &PushOptions {
+                    dry_run: true,
+                    ref_token: Some(token.clone()),
+                    group: Some(group.clone()),
+                },
+            )
+            .unwrap_or_else(|e| {
+                panic!("a matching membership with group {group} must dry-run-plan: {e}")
+            });
+            assert!(r.dry_run);
+            assert!(r.message.contains("dry-run plan"), "got: {}", r.message);
+            for id in &group_slots {
+                assert!(
+                    r.message.contains(&format!("slot {id}:")),
+                    "the plan must cover the group slot {id}, got:\n{}",
+                    r.message
+                );
+            }
+            for id in &ungrouped {
+                assert!(
+                    !r.message.contains(&format!("slot {id}:")),
+                    "the plan must not cover the unselected member {id}, got:\n{}",
+                    r.message
+                );
+            }
+            assert!(
+                !r.message.contains("slot phys:"),
+                "phys is in no group; the plan must not cover it, got:\n{}",
+                r.message
+            );
+            assert!(
+                calls.load(Ordering::SeqCst) > 0,
+                "a valid dry run contacts remotes; the recording factory must count it"
+            );
+
+            // MUTATING the COMPLETE membership always fails BEFORE any remote
+            // access, in BOTH modes: the gate validates the FULL current set,
+            // so a slot added, `phys` removed, or `phys` renamed refuses with
+            // the drift error and ZERO factory invocations.
+            let mut_config =
+                apply_group_membership_mutation(&_dir, &cfg_path, group_inc, extra_inc, mutation);
+            for dry in [false, true] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let factory = recording_factory(remotes_base.clone(), calls.clone());
+                let err = push(
+                    &cfg_path,
+                    &store,
+                    &factory,
+                    "t1",
+                    &mut_config,
+                    &PushOptions {
+                        dry_run: dry,
+                        ref_token: Some(token.clone()),
+                        group: Some(group.clone()),
+                    },
+                )
+                .expect_err(&format!(
+                    "a full-target membership mutation must refuse the group push (dry_run={dry})"
+                ));
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("release")
+                        && msg.contains("drift")
+                        && msg.contains("before remote access"),
+                    "refusal must be the membership-drift error (dry_run={dry}), got: {msg}"
+                );
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    0,
+                    "a membership mutation must fail BEFORE any remote construction or method \
+                     call (dry_run={dry}): zero factory invocations, got {}",
+                    calls.load(Ordering::SeqCst)
                 );
             }
         }
