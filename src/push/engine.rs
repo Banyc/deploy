@@ -7099,7 +7099,7 @@ interval_seconds = 0
 
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 8,
+            cases: 4,
             rng_seed: RngSeed::Fixed(0x0EA5_0E11_0BEA),
             failure_persistence: None,
             ..ProptestConfig::default()

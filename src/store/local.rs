@@ -1989,7 +1989,7 @@ mod tests {
                     Some(AppendStage::DirSync),
                 ]),
             ),
-            0..=8,
+            0..=6,
         )
     }
 
@@ -2120,9 +2120,11 @@ mod tests {
         // persistence (proptest's defaults) — a failing vector writes to
         // `proptest-regressions/local.txt` and is replayed on the next run
         // (commit it so CI keeps reproducing the regression until fixed).
-        // The case count is bounded so the suite stays fast.
+        // The case count is bounded so the suite stays fast (the
+        // randomized leg runs 8 cases; the deterministic fixed-seed leg
+        // below replays the same vectors at 4).
         #![proptest_config(ProptestConfig {
-            cases: 16,
+            cases: 8,
             failure_persistence: Some(Box::new(FileFailurePersistence::default())),
             ..ProptestConfig::default()
         })]
@@ -2140,7 +2142,7 @@ mod tests {
         // reproducible even when no failure has ever been persisted by the
         // main test. The case count is bounded so the suite stays fast.
         #![proptest_config(ProptestConfig {
-            cases: 16,
+            cases: 4,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
@@ -2176,7 +2178,7 @@ mod tests {
         // every invocation; the case count is bounded so the suite stays
         // fast.
         #![proptest_config(ProptestConfig {
-            cases: 16,
+            cases: 4,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()

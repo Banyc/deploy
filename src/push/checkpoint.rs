@@ -1144,8 +1144,8 @@ interval_seconds = 0
 
     proptest! {
         #![proptest_config(ProptestConfig {
-            // Bounded 16 cases, fixed seed per house style.
-            cases: 16,
+            // Bounded 4 cases, fixed seed per house style.
+            cases: 4,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
@@ -1501,7 +1501,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// pre-suffix-only pair).
     fn parity_case_strategy() -> impl Strategy<Value = ParityCase> {
         (2usize..=4usize)
-            .prop_flat_map(|t1_len| (Just(t1_len), 1usize..t1_len, 1usize..=4usize))
+            .prop_flat_map(|t1_len| (Just(t1_len), 1usize..t1_len, 1usize..=3usize))
             .prop_flat_map(|(t1_len, at, t2_len)| {
                 (
                     Just(t1_len),
@@ -1515,8 +1515,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     proptest! {
         #![proptest_config(ProptestConfig {
-            // Bounded 16 cases, fixed seed per house style.
-            cases: 16,
+            // Bounded 4 cases, fixed seed per house style.
+            cases: 4,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()

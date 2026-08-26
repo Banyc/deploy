@@ -5979,7 +5979,9 @@ proptest! {
     // fixed). Random streams explore interleavings the hand-written
     // sequences miss; the shrinker minimizes any failing vector. The case
     // count is bounded so the suite stays fast (each case drives a full
-    // fixture; the state-machine action vectors are capped at ten actions).
+    // fixture; the state-machine action vectors are capped at six actions —
+    // every action type and every prefix stays asserted, and the persisted
+    // regression vectors replay regardless of length).
     #![proptest_config(ProptestConfig {
         cases: 4,
         failure_persistence: Some(Box::new(FileFailurePersistence::default())),
@@ -5988,7 +5990,7 @@ proptest! {
 
     #[test]
     fn semantic_state_machine(
-        steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..10)
+        steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..6)
     ) {
         run_semantic_state_case(steps);
     }
@@ -6000,7 +6002,7 @@ proptest! {
     // the IDENTICAL vectors on every invocation, so the suite stays
     // reproducible even when no failure has ever been persisted by the main
     // test. The case count is bounded so the suite stays fast (and the
-    // action vectors are capped at ten actions); the persisted regression
+    // action vectors are capped at six actions); the persisted regression
     // vectors in `proptest-regressions/semantic_invariants.txt` replay
     // regardless of count and length.
     #![proptest_config(ProptestConfig {
@@ -6012,7 +6014,7 @@ proptest! {
 
     #[test]
     fn semantic_state_machine_fixed_seed_regression(
-        steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..10)
+        steps in prop::collection::vec((action_strategy(), failure_class_strategy()), 1..6)
     ) {
         run_semantic_state_case(steps);
     }

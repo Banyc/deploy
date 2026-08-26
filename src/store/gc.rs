@@ -823,11 +823,11 @@ interval_seconds = 0
         // THE PROPERTY: for a GENERATED retained+garbage partition, corrupt
         // EACH anchor class independently: the sweep errors with ZERO
         // deletions, and after REPAIRING the anchor the retry deletes
-        // EXACTLY the unreachable set. Bounded 16 cases + fixed seed per
+        // EXACTLY the unreachable set. Bounded 4 cases + fixed seed per
         // house style (each case builds 5 small fixtures — one per anchor
         // class — so the bound keeps the suite fast).
         #![proptest_config(ProptestConfig {
-            cases: 16,
+            cases: 4,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()

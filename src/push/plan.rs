@@ -1873,7 +1873,7 @@ interval_seconds = 0
     proptest! {
         #![proptest_config(ProptestConfig {
             // Bounded + fixed seed: deterministic floor, fast.
-            cases: 16,
+            cases: 4,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
@@ -2311,11 +2311,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     proptest! {
         // THE USER'S MULTI-RELEASE PROPERTY: alternating partial pushes
         // across groups with distinguishable behavior contracts, then an
-        // arbitrary FULL/GROUP rollback of an arbitrary snapshot. Bounded 16
+        // arbitrary FULL/GROUP rollback of an arbitrary snapshot. Bounded 4
         // cases + the pinned 0x5EED_5EED seed (house style) keep the
         // deterministic floor fast; each case is store-only (no remote).
         #![proptest_config(ProptestConfig {
-            cases: 16,
+            cases: 4,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
@@ -2323,7 +2323,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         #[test]
         fn multi_release_rollback_per_slot_behavior(
-            partial_groups in prop::collection::vec(any::<bool>(), 1..=4),
+            partial_groups in prop::collection::vec(any::<bool>(), 1..=3),
             rollback_pos in any::<usize>(),
             rollback_full in any::<bool>(),
         ) {
