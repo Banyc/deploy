@@ -198,7 +198,7 @@ pub(crate) fn process_server(
         behavior_sha256: behavior_sha256.to_string(),
         prior_generation: expected_gen.cloned(),
         created_at: crate::remote::helper::now_rfc3339(),
-        target: Some(TargetName::new(target_name.to_string())),
+        target: Some(TargetName::parse(target_name).expect("target name is a safe segment")),
     };
     if let Err(e) = helper.create_generation(op_id.as_str(), &assignment) {
         return Ok(ServerProc {
@@ -484,7 +484,9 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{RELEASE_RECORD_SCHEMA_VERSION, TreeDigest, VariantName};
+    use crate::model::{
+        RELEASE_RECORD_SCHEMA_VERSION, TreeDigest, VariantName, test_deployment_id,
+    };
     use crate::remote::transport::LocalTransport;
     use std::path::PathBuf;
 
@@ -692,9 +694,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             )
             .unwrap();
             let meta = tree::canonicalize_tree(&staging).unwrap();
-            let tree = TreeDigest::new(meta.tree_sha256.clone());
+            let tree = TreeDigest::parse(&meta.tree_sha256)
+                .expect("canonicalized tree sha256 is a valid digest");
             store
-                .store_object(&meta.tree_sha256.into(), &staging)
+                .store_object(
+                    &TreeDigest::parse(&meta.tree_sha256)
+                        .expect("canonicalized tree sha256 is a valid digest"),
+                    &staging,
+                )
                 .unwrap();
 
             let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
@@ -1229,7 +1236,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .create_generation(
                 "op2",
                 &crate::remote::helper::GenerationAssignment {
-                    deployment_id: "d2".to_string().into(),
+                    deployment_id: test_deployment_id("d2"),
                     generation_id: g2.clone(),
                     artifact: ArtifactRef {
                         release: h.harness_release_id(),
@@ -1253,7 +1260,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .create_generation(
                 "op3",
                 &crate::remote::helper::GenerationAssignment {
-                    deployment_id: "d3".to_string().into(),
+                    deployment_id: test_deployment_id("d3"),
                     generation_id: g3.clone(),
                     artifact: ArtifactRef {
                         release: h.harness_release_id(),

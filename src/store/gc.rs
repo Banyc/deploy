@@ -462,8 +462,8 @@ mod tests {
     use super::*;
     use crate::config::SlotConfig;
     use crate::model::{
-        ArtifactRef, DeploymentId, GenerationId, GenerationRef, PlacementSlotAssignment, SlotId,
-        TargetName, TreeDigest, VariantName,
+        ArtifactRef, GenerationRef, PlacementSlotAssignment, SlotId, TargetName, TreeDigest,
+        VariantName, test_deployment_id, test_generation_id, test_tree_digest,
     };
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
@@ -544,7 +544,7 @@ interval_seconds = 0
             "sha256-aa",
             &BTreeMap::from([(
                 VariantName::new("standard".to_string()),
-                TreeDigest::new(format!("tree-pinned-{tag}")),
+                test_tree_digest(&format!("tree-pinned-{tag}")),
             )]),
             &BTreeMap::from([(
                 "standard".to_string(),
@@ -575,18 +575,18 @@ interval_seconds = 0
             p1.clone(),
             IntentSlot {
                 desired: DesiredGeneration {
-                    generation: GenerationId::new("gen-1".to_string()),
+                    generation: test_generation_id("gen-1"),
                     artifact: ArtifactRef {
                         release: ReleaseId::new("rel-1".to_string()),
                         variant: VariantName::new("standard".to_string()),
-                        tree: TreeDigest::new("tree-1".to_string()),
+                        tree: test_tree_digest("tree-1"),
                     },
                 },
                 pre_push: None,
             },
         )]);
         DeploymentIntent {
-            deployment_id: DeploymentId::new(id.to_string()),
+            deployment_id: test_deployment_id(id),
             target: TargetName::new(TARGET.to_string()),
             group: None,
             behavior_sha256: "sha256-aa".to_string(),
@@ -607,7 +607,7 @@ interval_seconds = 0
                 SlotResult {
                     slot_id: SlotId::new(SLOT.to_string()),
                     outcome: SlotOutcomeKind::Activated,
-                    generation: Some(GenerationId::new("gen-1".to_string())),
+                    generation: Some(test_generation_id("gen-1")),
                     compensated: false,
                     error: None,
                 },
@@ -617,13 +617,13 @@ interval_seconds = 0
                     slots: BTreeMap::from([(
                         SlotId::new(SLOT.to_string()),
                         GenerationRef {
-                            generation: GenerationId::new("gen-1".to_string()),
+                            generation: test_generation_id("gen-1"),
                             assignment: PlacementSlotAssignment {
                                 placement_slot: SlotId::new(SLOT.to_string()),
                                 artifact: ArtifactRef {
                                     release: ReleaseId::new(release.to_string()),
                                     variant: VariantName::new("standard".to_string()),
-                                    tree: TreeDigest::new(tree.to_string()),
+                                    tree: test_tree_digest(tree),
                                 },
                             },
                         },
@@ -720,19 +720,21 @@ interval_seconds = 0
         let config = config_with_pin(base, Some(&cfg_pin));
 
         // The target's ledger: `retained` successful deployment records,
-        // each rolling back to `rel-sha256-ret-<i>` / `tree-ret-<i>`.
+        // each rolling back to `rel-sha256-ret-<i>` / `tree-ret-<i>`. The
+        // ledger ids and tree digests are the CANONICAL (validated) forms.
         let mut retained_deployments = Vec::new();
         for i in 0..retained {
             let id = format!("deploy-ret-{i}");
+            let canonical = test_deployment_id(&id);
             store.append_intent(TARGET, &intent(&id)).unwrap();
             store
                 .append_terminal(
                     TARGET,
-                    &DeploymentId::new(id.clone()),
+                    &canonical,
                     &terminal_for(&format!("rel-sha256-ret-{i}"), &format!("tree-ret-{i}")),
                 )
                 .unwrap();
-            retained_deployments.push(id);
+            retained_deployments.push(canonical.as_str().to_string());
         }
         let ledger_text = std::fs::read_to_string(store.ledger_path(TARGET)).unwrap_or_default();
 
@@ -742,9 +744,9 @@ interval_seconds = 0
             artifact: Some(ArtifactRef {
                 release: ReleaseId::new("rel-sha256-obs".to_string()),
                 variant: VariantName::new("standard".to_string()),
-                tree: TreeDigest::new("tree-obs".to_string()),
+                tree: test_tree_digest("tree-obs"),
             }),
-            last_deployment: Some(DeploymentId::new("deploy-obs".to_string())),
+            last_deployment: Some(test_deployment_id("deploy-obs")),
         };
         store
             .write_slot_observed(&SlotId::new(SLOT.to_string()), &observed)
@@ -760,7 +762,7 @@ interval_seconds = 0
             bindings: vec![ArtifactRef {
                 release: store_pin.clone(),
                 variant: VariantName::new("standard".to_string()),
-                tree: TreeDigest::new("tree-pinned-store".to_string()),
+                tree: test_tree_digest("tree-pinned-store"),
             }],
         };
         store.write_pins(&pins).unwrap();
@@ -772,15 +774,19 @@ interval_seconds = 0
         // junk-named dirs (kept/swept by NAME — only pinned records are
         // read).
         let mut retained_releases = vec!["rel-sha256-obs".to_string()];
-        let mut retained_trees = vec!["tree-obs".to_string()];
+        let mut retained_trees = vec![test_tree_digest("tree-obs").as_str().to_string()];
         for i in 0..retained {
             retained_releases.push(format!("rel-sha256-ret-{i}"));
-            retained_trees.push(format!("tree-ret-{i}"));
+            retained_trees.push(
+                test_tree_digest(&format!("tree-ret-{i}"))
+                    .as_str()
+                    .to_string(),
+            );
         }
         retained_releases.push(cfg_pin.as_str().to_string());
-        retained_trees.push("tree-pinned-cfg".to_string());
+        retained_trees.push(test_tree_digest("tree-pinned-cfg").as_str().to_string());
         retained_releases.push(store_pin.as_str().to_string());
-        retained_trees.push("tree-pinned-store".to_string());
+        retained_trees.push(test_tree_digest("tree-pinned-store").as_str().to_string());
         for r in &retained_releases {
             if r == cfg_pin.as_str() || r == store_pin.as_str() {
                 continue;
@@ -796,19 +802,26 @@ interval_seconds = 0
         let mut garbage_trees = Vec::new();
         for i in 0..garbage {
             let r = format!("rel-sha256-garbage-{i}");
-            let t = format!("tree-garbage-{i}");
+            let t = test_tree_digest(&format!("tree-garbage-{i}"))
+                .as_str()
+                .to_string();
             seed_named_release(&store, &r);
             seed_object(&store, &t);
             garbage_releases.push(r);
             garbage_trees.push(t);
         }
+        // The sweep's discard lists are SORTED (deletion order is the sorted
+        // enumeration), so the oracle lists must be sorted too.
+        garbage_trees.sort();
+        retained_trees.sort();
 
-        // Deployment dirs: the reachable ones + the ghost.
+        // Deployment dirs: the reachable ones + the ghost (canonical ids —
+        // the ledger references the validated forms).
         for id in &retained_deployments {
             seed_deployment_dir(&store, id);
         }
-        seed_deployment_dir(&store, "deploy-obs");
-        let ghost_deployment = "deploy-ghost".to_string();
+        seed_deployment_dir(&store, test_deployment_id("deploy-obs").as_str());
+        let ghost_deployment = test_deployment_id("deploy-ghost").as_str().to_string();
         seed_deployment_dir(&store, &ghost_deployment);
 
         Fixture {
@@ -971,7 +984,9 @@ interval_seconds = 0
             );
         }
         assert!(
-            f.store.deployment_dir("deploy-obs").exists(),
+            f.store
+                .deployment_dir(test_deployment_id("deploy-obs").as_str())
+                .exists(),
             "the observed last deployment survives"
         );
         assert!(
@@ -1073,7 +1088,7 @@ interval_seconds = 0
         let missing = ReleaseId::new("rel-sha256-missing".to_string());
         let config = config_with_pin(dir.path(), Some(&missing));
         seed_named_release(&store, "rel-sha256-garbage");
-        seed_object(&store, "tree-garbage");
+        seed_object(&store, test_tree_digest("tree-garbage").as_str());
         let err = store.run_sweep(&config, "anchor", None).unwrap_err();
         assert!(
             matches!(err, Error::Integrity(_)),
@@ -1087,7 +1102,9 @@ interval_seconds = 0
             "zero deletions: the garbage release survives"
         );
         assert!(
-            store.object_root(&TreeDigest::new("tree-garbage")).exists(),
+            store
+                .object_root(&test_tree_digest("tree-garbage"))
+                .exists(),
             "zero deletions: the garbage tree survives"
         );
         // The gc's own entry point preserves the integrity class too.
@@ -1123,7 +1140,7 @@ interval_seconds = 0
         )
         .unwrap();
         seed_named_release(&store, "rel-sha256-garbage");
-        seed_object(&store, "tree-garbage");
+        seed_object(&store, test_tree_digest("tree-garbage").as_str());
         let config = config_with_pin(dir.path(), None);
         let err = store.run_sweep(&config, "anchor", None).unwrap_err();
         assert!(
@@ -1138,7 +1155,9 @@ interval_seconds = 0
             "zero deletions: the garbage release survives"
         );
         assert!(
-            store.object_root(&TreeDigest::new("tree-garbage")).exists(),
+            store
+                .object_root(&test_tree_digest("tree-garbage"))
+                .exists(),
             "zero deletions: the garbage tree survives"
         );
     }
@@ -1158,12 +1177,12 @@ interval_seconds = 0
                 bindings: vec![ArtifactRef {
                     release: missing.clone(),
                     variant: VariantName::new("standard".to_string()),
-                    tree: TreeDigest::new("tree-x".to_string()),
+                    tree: test_tree_digest("tree-x"),
                 }],
             })
             .unwrap();
         seed_named_release(&store, "rel-sha256-garbage");
-        seed_object(&store, "tree-garbage");
+        seed_object(&store, test_tree_digest("tree-garbage").as_str());
         let config = config_with_pin(dir.path(), None);
         let err = store.run_sweep(&config, "anchor", None).unwrap_err();
         assert!(
@@ -1177,7 +1196,9 @@ interval_seconds = 0
             "zero deletions: the garbage release survives"
         );
         assert!(
-            store.object_root(&TreeDigest::new("tree-garbage")).exists(),
+            store
+                .object_root(&test_tree_digest("tree-garbage"))
+                .exists(),
             "zero deletions: the garbage tree survives"
         );
     }

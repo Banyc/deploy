@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a9f1a4fee2963ad2117a6edd4c250f937af388f65caa9e0f2981b18ef13f6cc8 # shrinks to history = [("deploy-0000", false)], token = ""

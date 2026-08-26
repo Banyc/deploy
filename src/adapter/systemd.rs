@@ -329,7 +329,7 @@ pub fn run_activation(
 pub(crate) mod tests {
     use super::*;
     use crate::config::{ActivationConfig, ActivationScope, UnitDef};
-    use crate::model::{DeploymentId, GenerationId, TreeDigest};
+    use crate::model::{TreeDigest, test_deployment_id, test_generation_id};
     use crate::remote::transport::LocalTransport;
 
     // THE single shared env lock (see `crate::testutil`): the fake-`systemctl`
@@ -371,8 +371,8 @@ pub(crate) mod tests {
         .with_server("deploy", "10.0.0.5", 22)
         .with_slot_id("app-1")
         .with_deployment(
-            Some(&DeploymentId::new("deploy-1")),
-            Some(&GenerationId::new("gen-1")),
+            Some(&test_deployment_id("deploy-1")),
+            Some(&test_generation_id("gen-1")),
             Some(&TreeDigest::new("abc123")),
         )
     }
@@ -508,7 +508,10 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             String::from_utf8(staged).unwrap(),
-            "[Service]\n# deployed by deploy on 10.0.0.5:22 (deployment deploy-1)\nExecStart=/srv/deploy/example/current/app/server\nArg=standard example production/server-01\n"
+            format!(
+                "[Service]\n# deployed by deploy on 10.0.0.5:22 (deployment {})\nExecStart=/srv/deploy/example/current/app/server\nArg=standard example production/server-01\n",
+                test_deployment_id("deploy-1")
+            )
         );
         // The install commands install the staged file into the user dir.
         let cmds = activation_commands(&base, Path::new("/home/deploy/.config"), &c);

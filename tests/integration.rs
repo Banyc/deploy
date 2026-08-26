@@ -233,8 +233,15 @@ fn end_to_end_push_rollback() -> Result<()> {
         "first push should succeed"
     );
     let attempt0 = r0.attempt.expect("attempt recorded");
-    let std_v1: TreeDigest = attempt0.slots[&SlotId::new("p1")].artifact.tree.clone();
-    let hc_v1: TreeDigest = attempt0.slots[&SlotId::new("p3")].artifact.tree.clone();
+    let std_v1: TreeDigest = attempt0.slots[&SlotId::parse("p1").unwrap()]
+        .artifact
+        .tree
+        .clone();
+    let hc_v1: TreeDigest = attempt0.slots[&SlotId::parse("p3").unwrap()]
+        .artifact
+        .tree
+        .clone();
+
     assert_ne!(std_v1, hc_v1, "standard and high-capacity trees differ");
 
     // Up-to-date push should be a no-op (no attempt created).
@@ -277,7 +284,11 @@ fn end_to_end_push_rollback() -> Result<()> {
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
     let attempt1 = r1.attempt.expect("attempt recorded");
-    let std_v2: TreeDigest = attempt1.slots[&SlotId::new("p1")].artifact.tree.clone();
+    let std_v2: TreeDigest = attempt1.slots[&SlotId::parse("p1").unwrap()]
+        .artifact
+        .tree
+        .clone();
+
     assert_ne!(
         std_v1, std_v2,
         "standard tree changed after editing content"
@@ -304,13 +315,13 @@ fn end_to_end_push_rollback() -> Result<()> {
         "rollback succeeds"
     );
     let observed = store.read_observed("production", &config)?;
-    let restored = observed.slots[&SlotId::new("p1")]
+    let restored = observed.slots[&SlotId::parse("p1").unwrap()]
         .artifact
         .as_ref()
         .map(|a| a.tree.clone())
         .unwrap();
     assert_eq!(restored, std_v1, "server-01 rolled back to original tree");
-    let hc_restored = observed.slots[&SlotId::new("p3")]
+    let hc_restored = observed.slots[&SlotId::parse("p3").unwrap()]
         .artifact
         .as_ref()
         .map(|a| a.tree.clone())
@@ -374,19 +385,25 @@ fn snapshot_records_each_slots_physical_binding() -> Result<()> {
     // /srv/deploy/example), p3 -> (server-03, /srv/deploy/example) per the
     // shared CONFIG's slot declarations.
     let binding = |server: &str| PhysicalBinding {
-        server: ServerId::new(server),
+        server: ServerId::parse(server).unwrap(),
         deploy_dir: "/srv/deploy/example".to_string(),
     };
     assert_eq!(
-        rollback_of(&snapshots[0]).bindings.get(&SlotId::new("p1")),
+        rollback_of(&snapshots[0])
+            .bindings
+            .get(&SlotId::parse("p1").unwrap()),
         Some(&binding("server-01"))
     );
     assert_eq!(
-        rollback_of(&snapshots[0]).bindings.get(&SlotId::new("p2")),
+        rollback_of(&snapshots[0])
+            .bindings
+            .get(&SlotId::parse("p2").unwrap()),
         Some(&binding("server-02"))
     );
     assert_eq!(
-        rollback_of(&snapshots[0]).bindings.get(&SlotId::new("p3")),
+        rollback_of(&snapshots[0])
+            .bindings
+            .get(&SlotId::parse("p3").unwrap()),
         Some(&binding("server-03"))
     );
     assert_eq!(rollback_of(&snapshots[0]).bindings.len(), 3);
@@ -473,9 +490,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // The rollback ref is the deployment id (the snapshot's key).
     let dep0 = latest_deployment_id(&store, "production");
     assert_eq!(
-        rollback_of(&snapshots[0]).bindings.get(&SlotId::new("p1")),
+        rollback_of(&snapshots[0])
+            .bindings
+            .get(&SlotId::parse("p1").unwrap()),
         Some(&PhysicalBinding {
-            server: ServerId::new("server-01"),
+            server: ServerId::parse("server-01").unwrap(),
             deploy_dir: "/srv/deploy/rebind".to_string(),
         }),
         "the snapshot records the complete physical binding the slot was deployed onto"
@@ -640,9 +659,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let snapshots = successful_entries(&store, "production")?;
     assert_eq!(snapshots.len(), 1);
     assert_eq!(
-        rollback_of(&snapshots[0]).bindings.get(&SlotId::new("p1")),
+        rollback_of(&snapshots[0])
+            .bindings
+            .get(&SlotId::parse("p1").unwrap()),
         Some(&PhysicalBinding {
-            server: ServerId::new("server-01"),
+            server: ServerId::parse("server-01").unwrap(),
             deploy_dir: "/srv/move/movedir-a".to_string(),
         }),
         "s0 records the slot's {{server, deploy_dir}} binding"
@@ -835,7 +856,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
     let attempt0 = r0.attempt.expect("attempt recorded");
-    let old_server = &attempt0.slots[&SlotId::new("p1")];
+    let old_server = &attempt0.slots[&SlotId::parse("p1").unwrap()];
+
     let old_tree = old_server.artifact.tree.clone();
     let old_release = old_server.artifact.release.clone();
 
@@ -873,7 +895,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-    let new_tree = r1.attempt.expect("attempt recorded").slots[&SlotId::new("p1")]
+    let new_tree = r1.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()]
         .artifact
         .tree
         .clone();
@@ -902,7 +924,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "exact rollback must succeed after the variant was renamed"
     );
     let observed = store.read_observed("production", &config0)?;
-    let restored = &observed.slots[&SlotId::new("p1")];
+    let restored = &observed.slots[&SlotId::parse("p1").unwrap()];
+
     assert_eq!(
         restored.artifact.as_ref().map(|a| &a.tree),
         Some(&old_tree),
@@ -1915,7 +1938,7 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
         .as_ref()
         .unwrap()
         .slots
-        .get(&SlotId::new("p1"))
+        .get(&SlotId::parse("p1").unwrap())
         .unwrap()
         .artifact
         .release
@@ -1983,7 +2006,7 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
         .as_ref()
         .unwrap()
         .slots
-        .get(&SlotId::new("p1"))
+        .get(&SlotId::parse("p1").unwrap())
         .unwrap()
         .artifact
         .release
@@ -2106,7 +2129,7 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
         .as_ref()
         .unwrap()
         .slots
-        .get(&SlotId::new("p1"))
+        .get(&SlotId::parse("p1").unwrap())
         .unwrap()
         .artifact
         .release
@@ -2304,18 +2327,21 @@ interval_seconds = 0
     assert_eq!(attempt.slot_ids.len(), 3);
     for sid in ["p1", "p2", "p3"] {
         assert!(
-            attempt.slots.contains_key(&SlotId::new(sid)),
+            attempt.slots.contains_key(&SlotId::parse(sid).unwrap()),
             "slot {sid} missing from attempt"
         );
     }
     // First slot failed; later slots were never started (Skipped).
-    assert_eq!(results[&SlotId::new("p1")].outcome, SlotOutcomeKind::Failed);
     assert_eq!(
-        results[&SlotId::new("p2")].outcome,
+        results[&SlotId::parse("p1").unwrap()].outcome,
+        SlotOutcomeKind::Failed
+    );
+    assert_eq!(
+        results[&SlotId::parse("p2").unwrap()].outcome,
         SlotOutcomeKind::Skipped
     );
     assert_eq!(
-        results[&SlotId::new("p3")].outcome,
+        results[&SlotId::parse("p3").unwrap()].outcome,
         SlotOutcomeKind::Skipped
     );
     // Later servers were left untouched (no `current` pointer was ever created).
@@ -2980,7 +3006,8 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
         "marker must carry the ORIGINAL pending attempt's deployment id"
     );
     assert_eq!(marker_json["committed"].as_bool(), Some(true));
-    let recorded_gen = &attempt1.desired[&SlotId::new("p1")].generation;
+    let recorded_gen = &attempt1.desired[&SlotId::parse("p1").unwrap()].generation;
+
     assert_eq!(
         marker_json["generation"].as_str().unwrap(),
         recorded_gen.as_str(),
@@ -3431,7 +3458,8 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
-    let first = r0.attempt.expect("attempt recorded").slots[&SlotId::new("p1")].clone();
+    let first = r0.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()].clone();
+
     assert_eq!(first.artifact.variant.as_str(), "standard");
 
     // Capacity-only change: identical inputs except the server's `capacity`.
@@ -3502,7 +3530,7 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
         },
     )?;
     assert_eq!(r2.status, Some(DeploymentStatus::Successful));
-    let third = r2.attempt.expect("attempt recorded").slots[&SlotId::new("p1")].clone();
+    let third = r2.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()].clone();
 
     assert_ne!(
         third.artifact.release, first.artifact.release,
@@ -3620,7 +3648,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
-    let first = r0.attempt.expect("attempt recorded").slots[&SlotId::new("p1")].clone();
+    let first = r0.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()].clone();
+
     let old_release = first.artifact.release.clone();
     let tree = first.artifact.tree.clone();
 
@@ -3641,7 +3670,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-    let second = r1.attempt.expect("attempt").slots[&SlotId::new("p1")].clone();
+    let second = r1.attempt.expect("attempt").slots[&SlotId::parse("p1").unwrap()].clone();
+
     assert_ne!(
         second.artifact.release, old_release,
         "a slot-only change must produce a new release identity"
@@ -3733,7 +3763,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         .deployment_id
         .as_str()
         .to_string();
-    let first = r0.attempt.expect("attempt").slots[&SlotId::new("p1")].clone();
+    let first = r0.attempt.expect("attempt").slots[&SlotId::parse("p1").unwrap()].clone();
+
     let old_release = first.artifact.release.clone();
     let old_tree = first.artifact.tree.clone();
 
@@ -3765,7 +3796,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-    let current = r1.attempt.expect("attempt").slots[&SlotId::new("p1")].clone();
+    let current = r1.attempt.expect("attempt").slots[&SlotId::parse("p1").unwrap()].clone();
+
     assert_eq!(current.artifact.variant.as_str(), "canary");
     assert_ne!(current.artifact.release, old_release);
 
@@ -3785,7 +3817,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(rh.status, Some(DeploymentStatus::Successful));
-    let hist = rh.attempt.expect("attempt").slots[&SlotId::new("p1")].clone();
+    let hist = rh.attempt.expect("attempt").slots[&SlotId::parse("p1").unwrap()].clone();
+
     assert_eq!(hist.artifact.release, old_release);
     assert_eq!(
         hist.artifact.variant.as_str(),
@@ -3865,7 +3898,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
-    let t0 = r0.attempt.expect("attempt recorded").slots[&SlotId::new("p1")]
+    let t0 = r0.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()]
         .artifact
         .tree
         .clone();
@@ -3963,7 +3996,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     );
     let observed = store.read_observed("production", &config0)?;
     assert_eq!(
-        observed.slots[&SlotId::new("p1")]
+        observed.slots[&SlotId::parse("p1").unwrap()]
             .artifact
             .as_ref()
             .map(|a| &a.tree),
@@ -4140,7 +4173,7 @@ fn server_policy_change_does_not_change_release_identity() -> Result<()> {
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
-    let first = r0.attempt.expect("attempt recorded").slots[&SlotId::new("p1")].clone();
+    let first = r0.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()].clone();
 
     // Policy-only change: identical inputs except the server's user + address.
     let body = std::fs::read_to_string(proj.join("deploy.toml"))?;
@@ -4258,7 +4291,7 @@ interval_seconds = 0
         },
     )?;
     assert_eq!(r.status, Some(DeploymentStatus::Successful));
-    let slot = &r.attempt.expect("attempt recorded").slots[&SlotId::new("p1")];
+    let slot = &r.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()];
 
     // Both variants bind to the SAME tree digest in the release record.
     let rec = store.read_release(&slot.artifact.release)?;
@@ -4389,7 +4422,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &push_opt("production"),
     )?;
     assert_eq!(rp.status, Some(DeploymentStatus::Successful));
-    let prod_slot = &rp.attempt.expect("attempt recorded").slots[&SlotId::new("p1")];
+    let prod_slot = &rp.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()];
+
     let prod_v1 = prod_slot.artifact.tree.clone();
     let prod_gen = prod_slot
         .generation
@@ -4400,7 +4434,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // carries p1's actual assignment, and staging's view is EMPTY (its own
     // slot p2 was never pushed — no cross-target propagation exists).
     let obs_prod = store.read_observed("production", &config)?;
-    let os = &obs_prod.slots[&SlotId::new("p1")];
+    let os = &obs_prod.slots[&SlotId::parse("p1").unwrap()];
+
     assert_eq!(
         os.artifact.as_ref().expect("observed artifact").tree,
         prod_v1,
@@ -4428,7 +4463,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &push_opt("staging"),
     )?;
     assert_eq!(rs.status, Some(DeploymentStatus::Successful));
-    let staging_slot = &rs.attempt.expect("attempt recorded").slots[&SlotId::new("p2")];
+    let staging_slot = &rs.attempt.expect("attempt recorded").slots[&SlotId::parse("p2").unwrap()];
+
     let staging_v2 = staging_slot.artifact.tree.clone();
     let staging_gen = staging_slot
         .generation
@@ -4445,14 +4481,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // has one owner): production's p1 still carries its own v1 assignment,
     // and staging's p2 carries its fresh v2 actual.
     let obs_prod = store.read_observed("production", &config)?;
-    let os = &obs_prod.slots[&SlotId::new("p1")];
+    let os = &obs_prod.slots[&SlotId::parse("p1").unwrap()];
+
     assert_eq!(
         os.artifact.as_ref().expect("observed artifact").tree,
         prod_v1,
         "production observed must be untouched by the staging push"
     );
     let obs_staging = store.read_observed("staging", &config)?;
-    let os = &obs_staging.slots[&SlotId::new("p2")];
+    let os = &obs_staging.slots[&SlotId::parse("p2").unwrap()];
+
     assert_eq!(
         os.artifact.as_ref().expect("observed artifact").tree,
         staging_v2,
@@ -4481,10 +4519,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(rrb_prod.status, Some(DeploymentStatus::Successful));
-    let restored_prod_slot = &rrb_prod.attempt.expect("attempt recorded").slots[&SlotId::new("p1")];
+    let restored_prod_slot =
+        &rrb_prod.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()];
+
     let restored_prod = store.read_observed("production", &config)?;
     assert_eq!(
-        restored_prod.slots[&SlotId::new("p1")]
+        restored_prod.slots[&SlotId::parse("p1").unwrap()]
             .artifact
             .as_ref()
             .unwrap()
@@ -4493,14 +4533,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production rolled back to its own s0 tree"
     );
     assert_eq!(
-        restored_prod.slots[&SlotId::new("p1")].generation,
+        restored_prod.slots[&SlotId::parse("p1").unwrap()].generation,
         restored_prod_slot.generation,
         "production's observed generation is the actual restored generation"
     );
     // The production rollback does NOT touch staging's observed state.
     let obs_staging = store.read_observed("staging", &config)?;
     assert_eq!(
-        obs_staging.slots[&SlotId::new("p2")]
+        obs_staging.slots[&SlotId::parse("p2").unwrap()]
             .artifact
             .as_ref()
             .unwrap()
@@ -4524,7 +4564,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     assert_eq!(rrb_staging.status, Some(DeploymentStatus::Successful));
     let restored_staging = store.read_observed("staging", &config)?;
     assert_eq!(
-        restored_staging.slots[&SlotId::new("p2")]
+        restored_staging.slots[&SlotId::parse("p2").unwrap()]
             .artifact
             .as_ref()
             .unwrap()
@@ -4623,7 +4663,8 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
         )?;
         assert_eq!(r.status, Some(DeploymentStatus::Successful));
         let attempt = r.attempt.expect("attempt recorded");
-        let slot = &attempt.slots[&SlotId::new("p1")];
+        let slot = &attempt.slots[&SlotId::parse("p1").unwrap()];
+
         trees.push(slot.artifact.tree.clone());
         deploys.push(attempt.deployment_id.clone());
         releases.push(slot.artifact.release.clone());
@@ -4631,7 +4672,7 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
     let tree_at = |idx: usize| trees[idx].clone();
     let observed_tree = |store: &LocalStore| -> Result<Option<TreeDigest>> {
         Ok(
-            store.read_observed("production", &config)?.slots[&SlotId::new("p1")]
+            store.read_observed("production", &config)?.slots[&SlotId::parse("p1").unwrap()]
                 .artifact
                 .as_ref()
                 .map(|a| a.tree.clone()),

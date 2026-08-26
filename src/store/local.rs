@@ -659,7 +659,8 @@ impl LocalStore {
             }
             let observed: ObservedSlot = read_json(&rec)?;
             out.insert(
-                SlotId::new(entry.file_name().to_string_lossy().into_owned()),
+                SlotId::parse(&entry.file_name().to_string_lossy())
+                    .expect("stored slot dir name is a safe segment"),
                 observed,
             );
         }
@@ -692,7 +693,7 @@ impl LocalStore {
             .filter(|(id, _)| members.contains(id.as_str()))
             .collect();
         Ok(ObservedTarget {
-            target: crate::model::TargetName::new(target.to_string()),
+            target: crate::model::TargetName::parse(target).expect("target name is a safe segment"),
             slots,
         })
     }
@@ -1485,8 +1486,9 @@ mod tests {
     use super::*;
     use crate::config::ProjectConfig;
     use crate::model::{
-        ArtifactRef, GenerationId, GenerationRef, PlacementSlotAssignment, ReleaseId, ServerId,
-        SlotId, TargetName, VariantName,
+        ArtifactRef, GenerationRef, PlacementSlotAssignment, ReleaseId, ServerId, SlotId,
+        TargetName, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
+        unknown_artifact,
     };
     use crate::push::lock::FileLock;
     use crate::records::{
@@ -1569,19 +1571,19 @@ mod tests {
             p1.clone(),
             IntentSlot {
                 desired: DesiredGeneration {
-                    generation: GenerationId::new("gen-1".to_string()),
+                    generation: test_generation_id("1"),
                     artifact: ArtifactRef {
                         release: ReleaseId::new("rel-1".to_string()),
                         variant: VariantName::new("standard".to_string()),
-                        tree: TreeDigest::new("tree-1".to_string()),
+                        tree: test_tree_digest("1"),
                     },
                 },
                 pre_push: None,
             },
         )]);
         DeploymentIntent {
-            deployment_id: DeploymentId::new(id.to_string()),
-            target: TargetName::new(target.to_string()),
+            deployment_id: test_deployment_id(id),
+            target: TargetName::parse(target).expect("target name is a safe segment"),
             group: None,
             behavior_sha256: "sha256-aa".to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
@@ -1598,7 +1600,7 @@ mod tests {
                 SlotResult {
                     slot_id: SlotId::new("p1".to_string()),
                     outcome: SlotOutcomeKind::Activated,
-                    generation: Some(GenerationId::new("gen-1".to_string())),
+                    generation: Some(test_generation_id("1")),
                     compensated: false,
                     error: None,
                 },
@@ -1610,13 +1612,13 @@ mod tests {
                     slots: BTreeMap::from([(
                         SlotId::new("p1".to_string()),
                         GenerationRef {
-                            generation: GenerationId::new("gen-1".to_string()),
+                            generation: test_generation_id("1"),
                             assignment: PlacementSlotAssignment {
                                 placement_slot: SlotId::new("p1".to_string()),
                                 artifact: ArtifactRef {
                                     release: ReleaseId::new("rel-sha256-a".to_string()),
                                     variant: VariantName::new("standard".to_string()),
-                                    tree: TreeDigest::new("t1".to_string()),
+                                    tree: test_tree_digest("1"),
                                 },
                             },
                         },
@@ -1637,11 +1639,7 @@ mod tests {
     fn seed_successful(store: &LocalStore, target: &str, id: &str) {
         store.append_intent(target, &intent(id, target)).unwrap();
         store
-            .append_terminal(
-                target,
-                &DeploymentId::new(id.to_string()),
-                &successful_terminal(),
-            )
+            .append_terminal(target, &test_deployment_id(id), &successful_terminal())
             .unwrap();
     }
 
@@ -1679,7 +1677,7 @@ mod tests {
             "a '..' slot must be confined to its own slot dir, not the store root"
         );
         let observed = ObservedSlot {
-            generation: Some(GenerationId::new("g-..".to_string())),
+            generation: Some(test_generation_id("evil")),
             artifact: None,
             last_deployment: None,
         };
@@ -1718,8 +1716,8 @@ mod tests {
         seed_successful(&store, target, "deploy-b");
         let entries = store.read_ledger(target).unwrap();
         assert_eq!(entries.len(), 2, "one merged entry per deployment");
-        assert_eq!(entries[0].deployment_id.as_str(), "deploy-a");
-        assert_eq!(entries[1].deployment_id.as_str(), "deploy-b");
+        assert_eq!(entries[0].deployment_id, test_deployment_id("deploy-a"));
+        assert_eq!(entries[1].deployment_id, test_deployment_id("deploy-b"));
         assert!(entries[0].terminal.is_some());
         assert_eq!(
             entries[0].terminal.as_ref().unwrap().status(),
@@ -1745,7 +1743,7 @@ mod tests {
         let err = store
             .append_terminal(
                 target,
-                &DeploymentId::new("deploy-ghost".to_string()),
+                &test_deployment_id("deploy-ghost"),
                 &successful_terminal(),
             )
             .unwrap_err();
@@ -1759,7 +1757,7 @@ mod tests {
         let err = store
             .append_terminal(
                 target,
-                &DeploymentId::new("deploy-a".to_string()),
+                &test_deployment_id("deploy-a"),
                 &successful_terminal(),
             )
             .unwrap_err();
@@ -1840,13 +1838,13 @@ mod tests {
         wire.desired.insert(
             SlotId::new("not-a-member".to_string()),
             GenerationRef {
-                generation: GenerationId::new("gen-1".to_string()),
+                generation: test_generation_id("1"),
                 assignment: PlacementSlotAssignment {
                     placement_slot: SlotId::new("not-a-member".to_string()),
                     artifact: ArtifactRef {
                         release: ReleaseId::new("rel-1".to_string()),
                         variant: VariantName::new("standard".to_string()),
-                        tree: TreeDigest::new("t1".to_string()),
+                        tree: test_tree_digest("1"),
                     },
                 },
             },
@@ -1868,13 +1866,13 @@ mod tests {
         wire.desired.insert(
             extra.clone(),
             GenerationRef {
-                generation: GenerationId::new("gen-2".to_string()),
+                generation: test_generation_id("2"),
                 assignment: PlacementSlotAssignment {
                     placement_slot: extra.clone(),
                     artifact: ArtifactRef {
                         release: ReleaseId::new("rel-2".to_string()),
                         variant: VariantName::new("standard".to_string()),
-                        tree: TreeDigest::new("t2".to_string()),
+                        tree: test_tree_digest("2"),
                     },
                 },
             },
@@ -1905,7 +1903,7 @@ mod tests {
         store
             .append_terminal(
                 target,
-                &DeploymentId::new("deploy-deg".to_string()),
+                &test_deployment_id("deploy-deg"),
                 &LedgerTerminal {
                     recorded_at: "2026-01-01T00:00:00Z".to_string(),
                     // The degraded terminal records the slot that REMAINS
@@ -1917,7 +1915,7 @@ mod tests {
                         SlotResult {
                             slot_id: SlotId::new("p1".to_string()),
                             outcome: SlotOutcomeKind::Skipped,
-                            generation: Some(GenerationId::new("gen-1".to_string())),
+                            generation: Some(test_generation_id("1")),
                             compensated: false,
                             error: None,
                         },
@@ -1928,19 +1926,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            store.latest_status("deploy-pending").unwrap(),
+            store
+                .latest_status(test_deployment_id("deploy-pending").as_str())
+                .unwrap(),
             Some(DeploymentStatus::PendingCommit),
             "an intent-only entry is the recoverable pending state"
         );
         assert_eq!(
-            store.latest_status("deploy-ok").unwrap(),
+            store
+                .latest_status(test_deployment_id("deploy-ok").as_str())
+                .unwrap(),
             Some(DeploymentStatus::Successful)
         );
         assert_eq!(
-            store.latest_status("deploy-deg").unwrap(),
+            store
+                .latest_status(test_deployment_id("deploy-deg").as_str())
+                .unwrap(),
             Some(DeploymentStatus::Degraded)
         );
-        assert_eq!(store.latest_status("deploy-nope").unwrap(), None);
+        assert_eq!(
+            store
+                .latest_status(test_deployment_id("deploy-nope").as_str())
+                .unwrap(),
+            None
+        );
     }
 
     /// `read_last_successful` is DERIVED from the ledger (the newest
@@ -1955,7 +1964,7 @@ mod tests {
         seed_successful(&store, target, "deploy-b");
         assert_eq!(
             store.read_last_successful(target).as_deref(),
-            Some("deploy-b"),
+            Some(test_deployment_id("deploy-b").as_str()),
             "the newest successful entry is the derived last-successful"
         );
         // A later failed deployment does not move the pointer.
@@ -1965,7 +1974,7 @@ mod tests {
         store
             .append_terminal(
                 target,
-                &DeploymentId::new("deploy-fail".to_string()),
+                &test_deployment_id("deploy-fail"),
                 &LedgerTerminal {
                     recorded_at: "2026-01-01T00:00:00Z".to_string(),
                     // The FailedRolledBack compensation report IS the outcome
@@ -1976,7 +1985,7 @@ mod tests {
                         SlotResult {
                             slot_id: SlotId::new("p1".to_string()),
                             outcome: SlotOutcomeKind::Restored,
-                            generation: Some(GenerationId::new("gen-1".to_string())),
+                            generation: Some(test_generation_id("gen-1")),
                             compensated: true,
                             error: None,
                         },
@@ -1988,7 +1997,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store.read_last_successful(target).as_deref(),
-            Some("deploy-b")
+            Some(test_deployment_id("deploy-b").as_str())
         );
     }
 
@@ -2032,7 +2041,7 @@ mod tests {
         let (contracts, sha) = behavior_fixture();
         let variants: BTreeMap<crate::model::VariantName, TreeDigest> = BTreeMap::from([(
             crate::model::VariantName::new("standard"),
-            TreeDigest::new("t1"),
+            test_tree_digest("1"),
         )]);
         let slots: BTreeMap<String, Vec<crate::config::SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
@@ -2146,12 +2155,14 @@ mod tests {
         store
             .append_intent(target, &intent("deploy-b", target))
             .unwrap();
-        store.fault_registry().arm_append_terminal("deploy-a");
+        store
+            .fault_registry()
+            .arm_append_terminal(test_deployment_id("deploy-a").as_str());
         // The fault fires exactly once on the matching id...
         store
             .append_terminal(
                 target,
-                &DeploymentId::new("deploy-a".to_string()),
+                &test_deployment_id("deploy-a"),
                 &successful_terminal(),
             )
             .expect_err("the armed terminal fault fires");
@@ -2160,7 +2171,7 @@ mod tests {
         store
             .append_terminal(
                 target,
-                &DeploymentId::new("deploy-a".to_string()),
+                &test_deployment_id("deploy-a"),
                 &successful_terminal(),
             )
             .expect("the disarmed retry appends the terminal");
@@ -2168,7 +2179,7 @@ mod tests {
         store
             .append_terminal(
                 target,
-                &DeploymentId::new("deploy-a".to_string()),
+                &test_deployment_id("deploy-a"),
                 &successful_terminal(),
             )
             .expect_err("a second terminal is refused (exactly-once contract)");
@@ -2176,7 +2187,7 @@ mod tests {
         store
             .append_terminal(
                 target,
-                &DeploymentId::new("deploy-b".to_string()),
+                &test_deployment_id("deploy-b"),
                 &successful_terminal(),
             )
             .expect("a different deployment's terminal passes");
@@ -2189,8 +2200,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s1 = LocalStore::with_base(dir.path().join("s1")).unwrap();
         let s2 = LocalStore::with_base(dir.path().join("s2")).unwrap();
-        s1.fault_registry().arm_append_terminal("deploy-a");
-        s2.fault_registry().arm_append_terminal("deploy-b");
+        s1.fault_registry()
+            .arm_append_terminal(test_deployment_id("deploy-a").as_str());
+        s2.fault_registry()
+            .arm_append_terminal(test_deployment_id("deploy-b").as_str());
         for t in ["t1", "t2"] {
             for s in [&s1, &s2] {
                 s.append_intent(t, &intent("deploy-a", t)).unwrap();
@@ -2200,14 +2213,14 @@ mod tests {
         // The s1 arm fires on s1's deploy-a terminal...
         s1.append_terminal(
             "t1",
-            &DeploymentId::new("deploy-a".to_string()),
+            &test_deployment_id("deploy-a"),
             &successful_terminal(),
         )
         .expect_err("s1's own arm fires");
         // ...and never leaks into s2 (its deploy-b arm is untouched).
         s2.append_terminal(
             "t1",
-            &DeploymentId::new("deploy-b".to_string()),
+            &test_deployment_id("deploy-b"),
             &successful_terminal(),
         )
         .expect_err("s2's own arm fires");
@@ -2236,7 +2249,7 @@ mod tests {
         store
             .append_terminal(
                 target,
-                &DeploymentId::new("deploy-a".to_string()),
+                &test_deployment_id("deploy-a"),
                 &successful_terminal(),
             )
             .unwrap();
@@ -2252,13 +2265,11 @@ mod tests {
             let id = format!("deploy-fault-{i}");
             store.append_intent(target, &intent(&id, target)).unwrap();
             let before = store.read_ledger_lines(target).unwrap();
-            store.fault_registry().arm(kind, &id);
+            store
+                .fault_registry()
+                .arm(kind, test_deployment_id(&id).as_str());
             let err = store
-                .append_terminal(
-                    target,
-                    &DeploymentId::new(id.clone()),
-                    &successful_terminal(),
-                )
+                .append_terminal(target, &test_deployment_id(&id), &successful_terminal())
                 .expect_err("the armed stage fault fires");
             assert!(
                 err.to_string().contains("test fault"),
@@ -2279,8 +2290,8 @@ mod tests {
                 assert_eq!(
                     after.last().unwrap(),
                     &serde_json::to_string(&LedgerLine::Terminal(LedgerTerminalWire::from_domain(
-                        &DeploymentId::new(id.clone()),
-                        &TargetName::new(target.to_string()),
+                        &test_deployment_id(&id),
+                        &TargetName::parse(target).expect("target name is a safe segment"),
                         &successful_terminal(),
                     ),))
                     .unwrap(),
@@ -2347,7 +2358,7 @@ mod tests {
         store
             .append_terminal(
                 target,
-                &DeploymentId::new("deploy-a".to_string()),
+                &test_deployment_id("deploy-a"),
                 &successful_terminal(),
             )
             .unwrap();
@@ -2355,7 +2366,9 @@ mod tests {
             .append_intent(target, &intent("deploy-b", target))
             .unwrap();
         // A pre-rename fault: the intent of deploy-c never lands.
-        store.fault_registry().arm_append_rename("deploy-c");
+        store
+            .fault_registry()
+            .arm_append_rename(test_deployment_id("deploy-c").as_str());
         store
             .append_intent(target, &intent("deploy-c", target))
             .expect_err("the armed rename fault aborts before the rename");
@@ -2364,11 +2377,13 @@ mod tests {
         store
             .append_intent(target, &intent("deploy-d", target))
             .unwrap();
-        store.fault_registry().arm_append_dir_sync("deploy-d");
+        store
+            .fault_registry()
+            .arm_append_dir_sync(test_deployment_id("deploy-d").as_str());
         store
             .append_terminal(
                 target,
-                &DeploymentId::new("deploy-d".to_string()),
+                &test_deployment_id("deploy-d"),
                 &successful_terminal(),
             )
             .expect_err("the armed dir-sync fault still leaves the ledger wholly new");
@@ -2386,8 +2401,8 @@ mod tests {
         assert_eq!(
             visible[1],
             serde_json::to_string(&LedgerLine::Terminal(LedgerTerminalWire::from_domain(
-                &DeploymentId::new("deploy-a".to_string()),
-                &TargetName::new(target.to_string()),
+                &test_deployment_id("deploy-a"),
+                &TargetName::parse(target).expect("target name is a safe segment"),
                 &successful_terminal(),
             )))
             .unwrap()
@@ -2409,8 +2424,8 @@ mod tests {
         assert_eq!(
             visible[4],
             serde_json::to_string(&LedgerLine::Terminal(LedgerTerminalWire::from_domain(
-                &DeploymentId::new("deploy-d".to_string()),
-                &TargetName::new(target.to_string()),
+                &test_deployment_id("deploy-d"),
+                &TargetName::parse(target).expect("target name is a safe segment"),
                 &successful_terminal(),
             )))
             .unwrap()
@@ -2421,17 +2436,17 @@ mod tests {
         assert!(
             entries
                 .iter()
-                .any(|e| e.deployment_id.as_str() == "deploy-a" && e.terminal.is_some())
+                .any(|e| e.deployment_id == test_deployment_id("deploy-a") && e.terminal.is_some())
         );
         assert!(
             entries
                 .iter()
-                .any(|e| e.deployment_id.as_str() == "deploy-b" && e.terminal.is_none())
+                .any(|e| e.deployment_id == test_deployment_id("deploy-b") && e.terminal.is_none())
         );
         assert!(
             entries
                 .iter()
-                .any(|e| e.deployment_id.as_str() == "deploy-d" && e.terminal.is_some())
+                .any(|e| e.deployment_id == test_deployment_id("deploy-d") && e.terminal.is_some())
         );
     }
 
@@ -2481,11 +2496,14 @@ mod tests {
     /// Arm the generated stage fault on the fixture's per-fixture registry,
     /// keyed by the deployment id of the append under test.
     fn arm_append_stage(store: &LocalStore, stage: AppendStage, id: &str) {
+        let canonical = test_deployment_id(id);
         match stage {
-            AppendStage::Write => store.fault_registry().arm_append_write(id),
-            AppendStage::Sync => store.fault_registry().arm_append_sync(id),
-            AppendStage::Rename => store.fault_registry().arm_append_rename(id),
-            AppendStage::DirSync => store.fault_registry().arm_append_dir_sync(id),
+            AppendStage::Write => store.fault_registry().arm_append_write(canonical.as_str()),
+            AppendStage::Sync => store.fault_registry().arm_append_sync(canonical.as_str()),
+            AppendStage::Rename => store.fault_registry().arm_append_rename(canonical.as_str()),
+            AppendStage::DirSync => store
+                .fault_registry()
+                .arm_append_dir_sync(canonical.as_str()),
         }
     }
 
@@ -2557,11 +2575,11 @@ mod tests {
                         continue; // nothing open: the op is a valid no-op
                     };
                     let terminal = successful_terminal();
-                    let deployment_id = DeploymentId::new(id.clone());
+                    let deployment_id = test_deployment_id(&id);
                     let line = serde_json::to_string(&LedgerLine::Terminal(
                         LedgerTerminalWire::from_domain(
                             &deployment_id,
-                            &TargetName::new(target.to_string()),
+                            &TargetName::parse(target).expect("target name is a safe segment"),
                             &terminal,
                         ),
                     ))
@@ -2599,7 +2617,7 @@ mod tests {
         for (id, is_intent) in &ok_appends {
             let entry = entries
                 .iter()
-                .find(|e| e.deployment_id.as_str() == id)
+                .find(|e| e.deployment_id.as_str() == test_deployment_id(id).as_str())
                 .unwrap_or_else(|| panic!("a successful append for {id} is missing after reopen"));
             if !is_intent {
                 assert!(
@@ -2737,7 +2755,11 @@ mod tests {
                 "an existing target's append creates no dir, so the dir-sync arms never fire (sync_new={sync_new_target_dir}, sync_targets={sync_targets_dir})"
             );
             assert_eq!(entries.len(), 2);
-            assert!(entries.iter().any(|e| e.deployment_id.as_str() == id));
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.deployment_id.as_str() == test_deployment_id(id).as_str())
+            );
         } else if sync_new_target_dir || sync_targets_dir {
             // A FIRST target with a faulted dir-sync boundary: the append
             // reports `Err` and recovery finds the prior state — the target
@@ -2759,14 +2781,18 @@ mod tests {
                     .read_ledger(target)
                     .unwrap()
                     .iter()
-                    .any(|e| e.deployment_id.as_str() == id)
+                    .any(|e| e.deployment_id.as_str() == test_deployment_id(id).as_str())
             );
         } else {
             // A REPORTED SUCCESS for the first append: recovery retains the
             // complete new ledger and the target directory is present.
             assert!(result.is_ok(), "an un-faulted first append reports success");
             assert_eq!(entries.len(), 1);
-            assert!(entries.iter().any(|e| e.deployment_id.as_str() == id));
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.deployment_id.as_str() == test_deployment_id(id).as_str())
+            );
         }
     }
 
@@ -3010,7 +3036,9 @@ mod tests {
         drop(store);
         let reopened = LocalStore::with_base(base.clone()).unwrap();
         let entries = reopened.read_ledger(target).unwrap();
-        let id_present = entries.iter().any(|e| e.deployment_id.as_str() == id);
+        let id_present = entries
+            .iter()
+            .any(|e| e.deployment_id.as_str() == test_deployment_id(id).as_str());
         if result.is_ok() {
             assert!(
                 reopened.target_dir(target).exists(),
@@ -3076,7 +3104,7 @@ mod tests {
                         .read_ledger(target)
                         .unwrap()
                         .iter()
-                        .any(|e| e.deployment_id.as_str() == id)
+                        .any(|e| e.deployment_id.as_str() == test_deployment_id(id).as_str())
                 );
             }
         }
@@ -3218,10 +3246,10 @@ mod tests {
     /// A canonical generation ref whose assignment names its own map key.
     fn gen_ref(slot: &SlotId) -> GenerationRef {
         GenerationRef {
-            generation: GenerationId::new(format!("gen-{}", slot.as_str())),
+            generation: test_generation_id(slot.as_str()),
             assignment: PlacementSlotAssignment {
                 placement_slot: slot.clone(),
-                artifact: ArtifactRef::default(),
+                artifact: unknown_artifact(),
             },
         }
     }
@@ -3249,20 +3277,20 @@ mod tests {
                     k.clone(),
                     IntentSlot {
                         desired: DesiredGeneration {
-                            generation: GenerationId::new(format!("gen-{}", k.as_str())),
-                            artifact: ArtifactRef::default(),
+                            generation: test_generation_id(k.as_str()),
+                            artifact: unknown_artifact(),
                         },
                         pre_push: Some(PreviousGeneration {
-                            artifact: ArtifactRef::default(),
-                            generation: Some(GenerationId::new("gen-0".to_string())),
+                            artifact: unknown_artifact(),
+                            generation: Some(test_generation_id("0")),
                         }),
                     },
                 )
             })
             .collect();
         DeploymentIntent {
-            deployment_id: DeploymentId::new(id.to_string()),
-            target: TargetName::new(target.to_string()),
+            deployment_id: test_deployment_id(id),
+            target: TargetName::parse(target).expect("target name is a safe segment"),
             group: None,
             behavior_sha256: "sha256-pair".to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
@@ -3291,7 +3319,7 @@ mod tests {
                     SlotResult {
                         slot_id: k,
                         outcome: SlotOutcomeKind::Activated,
-                        generation: Some(GenerationId::new(format!("gen-{id}"))),
+                        generation: Some(test_generation_id(id)),
                         compensated: false,
                         error: None,
                     },
@@ -3398,8 +3426,8 @@ mod tests {
         );
         let err = crate::history::resolve_deployment(
             store,
-            &TargetName::new(target.to_string()),
-            &DeploymentId::new(id.to_string()),
+            &TargetName::parse(target).expect("target name is a safe segment"),
+            &test_deployment_id(id),
         )
         .unwrap_err();
         assert!(
@@ -3507,8 +3535,8 @@ mod tests {
             store.reachable_set(&config, None).unwrap();
             let resolved = crate::history::resolve_deployment(
                 &store,
-                &TargetName::new(target.to_string()),
-                &DeploymentId::new("deploy-pair".to_string()),
+                &TargetName::parse(target).expect("target name is a safe segment"),
+                &test_deployment_id("deploy-pair"),
             );
             match successful {
                 true => {
@@ -3584,8 +3612,8 @@ mod tests {
         assert_eq!(store.read_ledger(target).unwrap().len(), 1);
         crate::history::resolve_deployment(
             &store,
-            &TargetName::new(target.to_string()),
-            &DeploymentId::new(id.to_string()),
+            &TargetName::parse(target).expect("target name is a safe segment"),
+            &test_deployment_id(id),
         )
         .unwrap();
         store.reachable_set(&config, None).unwrap();
@@ -3593,8 +3621,8 @@ mod tests {
         // (a) TRUTH TABLE, direction 1 (wire): a Successful terminal
         // without its rollback payload.
         let mut bad = LedgerTerminalWire::from_domain(
-            &DeploymentId::new(id.to_string()),
-            &TargetName::new(target.to_string()),
+            &test_deployment_id(id),
+            &TargetName::parse(target).expect("target name is a safe segment"),
             &terminal,
         );
         bad.rollback = None;
@@ -3602,8 +3630,8 @@ mod tests {
         // (b) TRUTH TABLE, direction 2 (wire): a failed status carrying a
         // rollback.
         let mut bad = LedgerTerminalWire::from_domain(
-            &DeploymentId::new(id.to_string()),
-            &TargetName::new(target.to_string()),
+            &test_deployment_id(id),
+            &TargetName::parse(target).expect("target name is a safe segment"),
             &terminal,
         );
         bad.status = DeploymentStatus::Degraded;
@@ -3611,8 +3639,8 @@ mod tests {
         // (c) TARGET EQUALITY, terminal leg (wire): the terminal names a
         // different target than the path and its entry.
         let mut bad = LedgerTerminalWire::from_domain(
-            &DeploymentId::new(id.to_string()),
-            &TargetName::new(target.to_string()),
+            &test_deployment_id(id),
+            &TargetName::parse(target).expect("target name is a safe segment"),
             &terminal,
         );
         bad.target = TargetName::new("other-target".to_string());
@@ -3635,7 +3663,7 @@ mod tests {
             SlotResult {
                 slot_id: SlotId::new("extra-slot".to_string()),
                 outcome: SlotOutcomeKind::Activated,
-                generation: Some(GenerationId::new("gen-x".to_string())),
+                generation: Some(test_generation_id("x")),
                 compensated: false,
                 error: None,
             },

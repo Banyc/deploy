@@ -721,6 +721,7 @@ pub fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{test_deployment_id, test_generation_id, test_tree_digest};
     use crate::remote::transport::LocalTransport;
     use std::os::unix::fs::PermissionsExt;
 
@@ -731,12 +732,12 @@ mod tests {
 
     fn assignment(gen_id: &str, tree: &str) -> GenerationAssignment {
         GenerationAssignment {
-            deployment_id: DeploymentId::new("deploy-1".to_string()),
-            generation_id: GenerationId::new(gen_id.to_string()),
+            deployment_id: test_deployment_id("deploy-1"),
+            generation_id: test_generation_id(gen_id),
             artifact: ArtifactRef {
                 release: ReleaseId::new("rel-sha256-x".to_string()),
                 variant: crate::model::VariantName::new("standard".to_string()),
-                tree: crate::model::TreeDigest::new(tree.to_string()),
+                tree: crate::model::test_tree_digest(tree),
             },
             behavior_sha256: "b".to_string(),
             prior_generation: None,
@@ -781,7 +782,7 @@ mod tests {
             crate::model::TreeDigest,
         > = std::collections::BTreeMap::from([(
             crate::model::VariantName::new("standard"),
-            crate::model::TreeDigest::new("t1"),
+            crate::model::test_tree_digest("t1"),
         )]);
         let slots: std::collections::BTreeMap<String, Vec<crate::config::SlotConfig>> =
             std::collections::BTreeMap::from([(
@@ -1165,10 +1166,20 @@ mod tests {
         // ...and the original record survives. (The `root` symlink may dangle
         // here — no object was published in this test — so assert on the link
         // itself rather than its resolved target.)
-        let a = helper.read_assignment("gen-1").unwrap();
-        assert_eq!(a.artifact.tree.as_str(), "tree-a");
+        let a = helper
+            .read_assignment(test_generation_id("gen-1").as_str())
+            .unwrap();
+        assert_eq!(
+            a.artifact.tree.as_str(),
+            test_tree_digest("tree-a").as_str()
+        );
         assert!(
-            std::fs::symlink_metadata(remote.root().join("generations/gen-1/root")).is_ok(),
+            std::fs::symlink_metadata(
+                remote
+                    .root()
+                    .join(format!("generations/{}/root", test_generation_id("gen-1")))
+            )
+            .is_ok(),
             "generation root symlink must exist"
         );
     }

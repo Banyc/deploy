@@ -449,8 +449,9 @@ mod tests {
     use super::*;
 
     use crate::model::{
-        ArtifactRef, DeploymentId, GenerationId, GenerationRef, PlacementSlotAssignment, ReleaseId,
-        ServerId, SlotId, TargetName, TreeDigest, VariantName,
+        ArtifactRef, DeploymentId, GenerationRef, PlacementSlotAssignment, ReleaseId, ServerId,
+        SlotId, TargetName, TreeDigest, VariantName, test_deployment_id, test_generation_id,
+        test_tree_digest,
     };
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
@@ -470,18 +471,18 @@ mod tests {
             p1.clone(),
             IntentSlot {
                 desired: DesiredGeneration {
-                    generation: GenerationId::new("gen-1".to_string()),
+                    generation: test_generation_id("gen-1"),
                     artifact: ArtifactRef {
                         release: ReleaseId::new("rel-1".to_string()),
                         variant: VariantName::new("standard".to_string()),
-                        tree: TreeDigest::new("tree-1".to_string()),
+                        tree: test_tree_digest("tree-1"),
                     },
                 },
                 pre_push: None,
             },
         )]);
         DeploymentIntent {
-            deployment_id: DeploymentId::new(id.to_string()),
+            deployment_id: test_deployment_id(id),
             target: TargetName::new(target.to_string()),
             group: None,
             behavior_sha256: "sha256-aa".to_string(),
@@ -496,13 +497,13 @@ mod tests {
             slots: BTreeMap::from([(
                 SlotId::new("p1".to_string()),
                 GenerationRef {
-                    generation: crate::model::GenerationId::new("gen-1".to_string()),
+                    generation: crate::model::test_generation_id("gen-1"),
                     assignment: PlacementSlotAssignment {
                         placement_slot: SlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
                             release: ReleaseId::new(release.to_string()),
                             variant: VariantName::new("standard".to_string()),
-                            tree: TreeDigest::new("tree-1".to_string()),
+                            tree: test_tree_digest("tree-1"),
                         },
                     },
                 },
@@ -528,7 +529,7 @@ mod tests {
                 SlotResult {
                     slot_id: SlotId::new("p1".to_string()),
                     outcome: SlotOutcomeKind::Activated,
-                    generation: Some(GenerationId::new("gen-1".to_string())),
+                    generation: Some(test_generation_id("gen-1")),
                     compensated: false,
                     error: None,
                 },
@@ -557,14 +558,14 @@ mod tests {
             if *ok {
                 let rel = format!("rel-sha256-{id}");
                 store
-                    .append_terminal(target, &DeploymentId::new(id.clone()), &terminal_for(&rel))
+                    .append_terminal(target, &test_deployment_id(&id), &terminal_for(&rel))
                     .unwrap();
-                successful.push(id);
+                successful.push(test_deployment_id(&id).as_str().to_string());
             } else {
                 store
                     .append_terminal(
                         target,
-                        &DeploymentId::new(id.clone()),
+                        &test_deployment_id(&id),
                         &LedgerTerminal {
                             recorded_at: "2026-01-01T00:00:00Z".to_string(),
                             // The FailedRolledBack compensation report IS the
@@ -575,7 +576,7 @@ mod tests {
                                 SlotResult {
                                     slot_id: SlotId::new("p1".to_string()),
                                     outcome: SlotOutcomeKind::Restored,
-                                    generation: Some(GenerationId::new("gen-1".to_string())),
+                                    generation: Some(test_generation_id("gen-1")),
                                     compensated: true,
                                     error: None,
                                 },
@@ -639,13 +640,15 @@ interval_seconds = 0
     /// referenced by any ledger, observed state, or pin): the sweep must
     /// delete it.
     fn seed_unreachable(store: &LocalStore, deployment: &str, release: &str, tree: &str) {
-        let dir = store.deployment_dir(deployment);
+        // The deployment dir is keyed by the CANONICAL id (the ledger
+        // references the validated form).
+        let dir = store.deployment_dir(test_deployment_id(deployment).as_str());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("plan.json"), "{}").unwrap();
         let rel_dir = store.release_dir(&ReleaseId::new(release.to_string()));
         std::fs::create_dir_all(&rel_dir).unwrap();
         std::fs::write(rel_dir.join("release.json"), "{}").unwrap();
-        let obj_dir = store.object_root(&TreeDigest::new(tree.to_string()));
+        let obj_dir = store.object_root(&test_tree_digest(tree));
         std::fs::create_dir_all(&obj_dir).unwrap();
         std::fs::write(obj_dir.join("file"), "x").unwrap();
     }
@@ -659,7 +662,7 @@ interval_seconds = 0
             "sha256-aa",
             &BTreeMap::from([(
                 VariantName::new("standard".to_string()),
-                TreeDigest::new("tree-pinned".to_string()),
+                test_tree_digest("tree-pinned"),
             )]),
             &BTreeMap::from([(
                 "standard".to_string(),
@@ -691,7 +694,7 @@ interval_seconds = 0
             "sha256-aa",
             &std::collections::BTreeMap::from([(
                 crate::model::VariantName::new("standard".to_string()),
-                crate::model::TreeDigest::new(format!("tree-pinned-{tag}")),
+                crate::model::test_tree_digest(&format!("tree-pinned-{tag}")),
             )]),
             &std::collections::BTreeMap::from([(
                 "standard".to_string(),
@@ -721,9 +724,11 @@ interval_seconds = 0
     }
 
     /// Create a deployment directory under the given id (junk content) — the
-    /// sweep enumerates `deployments/` and sweeps the unreachable dirs.
+    /// sweep enumerates `deployments/` and sweeps the unreachable dirs. The
+    /// dir is keyed by the CANONICAL id (the ledger references the validated
+    /// form).
     fn seed_deployment_dir(store: &LocalStore, id: &str) {
-        let dir = store.deployment_dir(id);
+        let dir = store.deployment_dir(test_deployment_id(id).as_str());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("plan.json"), "{}").unwrap();
     }
@@ -732,7 +737,7 @@ interval_seconds = 0
     /// content) — the sweep enumerates `objects/sha256/` and sweeps the
     /// unreachable digests.
     fn seed_tree_dir(store: &LocalStore, tree: &str) {
-        let dir = store.object_root(&TreeDigest::new(tree.to_string()));
+        let dir = store.object_root(&test_tree_digest(tree));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("file"), "x").unwrap();
     }
@@ -750,10 +755,10 @@ interval_seconds = 0
             _ => unreachable!("seed_success always builds a Successful terminal"),
         };
         for g in rollback.slots.values_mut() {
-            g.assignment.artifact.tree = TreeDigest::new(tree.to_string());
+            g.assignment.artifact.tree = test_tree_digest(tree);
         }
         store
-            .append_terminal(target, &DeploymentId::new(id.to_string()), &term)
+            .append_terminal(target, &test_deployment_id(id), &term)
             .unwrap();
     }
 
@@ -790,13 +795,13 @@ interval_seconds = 0
         // Checkpoint at deploy-1: deploy-0 is strictly BEFORE it — its
         // release, tree, and deployment dir are reachable only from the
         // pre-suffix ledger that the replacement discards.
-        let preview = run_checkpoint(&store, &cfg, TARGET, &DeploymentId::new("deploy-1"), true)
+        let preview = run_checkpoint(&store, &cfg, TARGET, &test_deployment_id("deploy-1"), true)
             .expect("the dry-run preview succeeds");
         assert!(preview.dry_run);
         assert!(!preview.established);
         assert_eq!(
             preview.discards.discarded_entries,
-            vec!["deploy-0".to_string()],
+            vec![test_deployment_id("deploy-0").as_str().to_string()],
             "exactly the entries strictly before the checkpoint are discarded"
         );
         // THE FIX: the preview lists the pre-suffix-only content (reachable
@@ -805,7 +810,7 @@ interval_seconds = 0
             preview
                 .discards
                 .sweep_deployments
-                .contains(&"deploy-0".to_string()),
+                .contains(&test_deployment_id("deploy-0").as_str().to_string()),
             "the pre-suffix deployment dir must be previewed for deletion"
         );
         assert!(
@@ -819,7 +824,7 @@ interval_seconds = 0
             preview
                 .discards
                 .sweep_objects
-                .contains(&"tree-old".to_string()),
+                .contains(&test_tree_digest("tree-old").as_str().to_string()),
             "the pre-suffix tree must be previewed for deletion"
         );
         // The retained suffix's own content is NOT previewed for deletion.
@@ -827,7 +832,7 @@ interval_seconds = 0
             !preview
                 .discards
                 .sweep_deployments
-                .contains(&"deploy-1".to_string())
+                .contains(&test_deployment_id("deploy-1").as_str().to_string())
         );
         assert!(
             !preview
@@ -839,7 +844,7 @@ interval_seconds = 0
             !preview
                 .discards
                 .sweep_objects
-                .contains(&"tree-mid".to_string())
+                .contains(&test_tree_digest("tree-mid").as_str().to_string())
         );
         // COUNTERFACTUAL: WITHOUT the ledger override the preview scans the
         // CURRENT ledger — deploy-0's entry is still present, so its unique
@@ -863,23 +868,37 @@ interval_seconds = 0
         let ids = seed_history(&store, TARGET, "deploy", &[true, false, true]);
         seed_unreachable(&store, "ghost-deploy", "rel-sha256-ghost", "tree-ghost");
         let checkpoint = &ids[1]; // the second successful = deploy-2
-        let rep = run_checkpoint_unlocked(&store, &cfg, TARGET, &DeploymentId::new(checkpoint))
-            .expect("checkpoint succeeds");
+        let rep = run_checkpoint_unlocked(
+            &store,
+            &cfg,
+            TARGET,
+            &DeploymentId::parse(checkpoint).expect("canonical checkpoint id"),
+        )
+        .expect("checkpoint succeeds");
         assert!(rep.established);
         assert!(rep.sweep_completed);
         // The ledger now holds exactly the checkpoint entry onward
         // (deploy-0 and deploy-1 — before deploy-2 — are gone).
         let entries = store.read_ledger(TARGET).unwrap();
         assert_eq!(entries.len(), 1, "only the checkpoint entry is retained");
-        assert_eq!(entries[0].deployment_id.as_str(), *checkpoint);
+        assert_eq!(
+            entries[0].deployment_id.as_str(),
+            DeploymentId::parse(checkpoint)
+                .expect("canonical checkpoint id")
+                .as_str()
+        );
         // The unreachable ghost content was swept.
-        assert!(!store.deployment_dir("ghost-deploy").exists());
+        assert!(
+            !store
+                .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                .exists()
+        );
         assert!(
             !store
                 .release_dir(&ReleaseId::new("rel-sha256-ghost"))
                 .exists()
         );
-        assert!(!store.object_root(&TreeDigest::new("tree-ghost")).exists());
+        assert!(!store.object_root(&test_tree_digest("tree-ghost")).exists());
     }
 
     /// A failed ledger replacement deletes NOTHING: the checkpoint fails
@@ -892,7 +911,7 @@ interval_seconds = 0
         let ids = seed_history(&store, TARGET, "deploy", &[true, true, true]);
         let before = store.read_ledger(TARGET).unwrap();
         store.fault_registry().arm_ledger_replace_before(TARGET);
-        let err = run_checkpoint_unlocked(&store, &cfg, TARGET, &DeploymentId::new(&ids[1]))
+        let err = run_checkpoint_unlocked(&store, &cfg, TARGET, &test_deployment_id(&ids[1]))
             .expect_err("the pre-replace fault fails the checkpoint");
         assert!(err.to_string().contains("ledger"));
         assert_eq!(
@@ -1077,8 +1096,12 @@ interval_seconds = 0
         // is always WHOLY OLD or WHOLY NEW (the atomic replace, never torn),
         // and the fault's CLASS decides which:
         arm_fault(&store, fault);
-        let faulted =
-            run_checkpoint_unlocked(&store, &cfg, TARGET, &DeploymentId::new(checkpoint_id));
+        let faulted = run_checkpoint_unlocked(
+            &store,
+            &cfg,
+            TARGET,
+            &DeploymentId::parse(checkpoint_id).expect("canonical checkpoint id"),
+        );
         let visible: Vec<String> = store
             .read_ledger(TARGET)
             .unwrap()
@@ -1194,9 +1217,13 @@ interval_seconds = 0
         // RETRY CONVERGES: repeat the checkpoint without a fault — the
         // suffix is recomputed (identical) and the sweep finishes (the debt
         // marker is cleared).
-        let retry =
-            run_checkpoint_unlocked(&store, &cfg, TARGET, &DeploymentId::new(checkpoint_id))
-                .expect("the retry checkpoint succeeds");
+        let retry = run_checkpoint_unlocked(
+            &store,
+            &cfg,
+            TARGET,
+            &DeploymentId::parse(checkpoint_id).expect("canonical checkpoint id"),
+        )
+        .expect("the retry checkpoint succeeds");
         assert!(
             retry.sweep_completed,
             "fault {fault:?}: the retry must finish the sweep (converged)"
@@ -1220,7 +1247,9 @@ interval_seconds = 0
             "fault {fault:?}: the converged ledger is the retained suffix"
         );
         assert!(
-            !store.deployment_dir("ghost-deploy").exists(),
+            !store
+                .deployment_dir(test_deployment_id("ghost-deploy").as_str())
+                .exists(),
             "fault {fault:?}: the converged sweep deleted the unreachable deployment dir"
         );
         assert!(
@@ -1438,9 +1467,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     artifact: Some(ArtifactRef {
                         release: obs_rel.clone(),
                         variant: VariantName::new("standard".to_string()),
-                        tree: TreeDigest::new(PROPERTY_TREES[0].to_string()),
+                        tree: test_tree_digest(PROPERTY_TREES[0]),
                     }),
-                    last_deployment: Some(DeploymentId::new(format!("dep-t1-{at}"))),
+                    last_deployment: Some(test_deployment_id(&format!("dep-t1-{at}"))),
                 },
             )
             .unwrap();
@@ -1463,12 +1492,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 bindings: vec![ArtifactRef {
                     release: pinned.clone(),
                     variant: VariantName::new("standard".to_string()),
-                    tree: TreeDigest::new(pinned_tree.clone()),
+                    tree: test_tree_digest(&pinned_tree),
                 }],
             })
             .unwrap();
 
-        let checkpoint_id = DeploymentId::new(format!("dep-t1-{at}"));
+        let checkpoint_id = test_deployment_id(&format!("dep-t1-{at}"));
         // PREVIEW on the ORIGINAL store (read-only: no locks, no writes).
         let preview = run_checkpoint(&store, &cfg, "t1", &checkpoint_id, true)
             .expect("the dry-run preview succeeds");
@@ -1536,7 +1565,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             executed
                 .discards
                 .sweep_objects
-                .contains(&PROPERTY_TREES[3].to_string()),
+                .contains(&test_tree_digest(PROPERTY_TREES[3]).as_str().to_string()),
             "the pre-suffix-only tree must be deleted (t1_len={t1_len}, at={at})"
         );
 
@@ -1576,18 +1605,24 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         assert!(
             clone
-                .object_root(&TreeDigest::new(PROPERTY_TREES[0].to_string()))
+                .object_root(&test_tree_digest(PROPERTY_TREES[0]))
                 .exists()
         );
         assert!(
-            clone
-                .object_root(&TreeDigest::new(pinned_tree.clone()))
-                .exists(),
+            clone.object_root(&test_tree_digest(&pinned_tree)).exists(),
             "the pinned record's variant tree survives"
         );
-        assert!(clone.deployment_dir(&format!("dep-t1-{at}")).exists());
+        assert!(
+            clone
+                .deployment_dir(test_deployment_id(&format!("dep-t1-{at}")).as_str())
+                .exists()
+        );
         for (i, &(r, t)) in t2_hist.iter().enumerate() {
-            assert!(clone.deployment_dir(&format!("dep-t2-{i}")).exists());
+            assert!(
+                clone
+                    .deployment_dir(test_deployment_id(&format!("dep-t2-{i}")).as_str())
+                    .exists()
+            );
             assert!(
                 clone
                     .release_dir(&ReleaseId::new(PROPERTY_RELEASES[r].to_string()))
@@ -1595,7 +1630,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             );
             assert!(
                 clone
-                    .object_root(&TreeDigest::new(PROPERTY_TREES[t].to_string()))
+                    .object_root(&test_tree_digest(PROPERTY_TREES[t]))
                     .exists()
             );
         }

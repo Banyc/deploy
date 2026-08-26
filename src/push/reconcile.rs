@@ -209,8 +209,10 @@ pub(crate) fn reconcile_pending_commits(
         // The CURRENT target slot set: the complete snapshot omits slots
         // removed from the current configuration and carries every current
         // unselected slot forward from the base.
-        let current_slot_ids: Vec<SlotId> =
-            members.iter().map(|m| SlotId::new(m.clone())).collect();
+        let current_slot_ids: Vec<SlotId> = members
+            .iter()
+            .map(|m| SlotId::parse(m).expect("config slot id is a safe segment"))
+            .collect();
         history::finalize_successful_attempt(
             store,
             &attempt,

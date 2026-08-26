@@ -584,8 +584,8 @@ fn print_report(report: &PushReport) {
 mod tests {
     use super::*;
     use crate::model::{
-        ArtifactRef, DeploymentId, GenerationId, GenerationRef, PlacementSlotAssignment, ReleaseId,
-        ServerId, SlotId, TargetName, TreeDigest, VariantName,
+        ArtifactRef, GenerationRef, PlacementSlotAssignment, ReleaseId, ServerId, SlotId,
+        TargetName, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
     };
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
@@ -601,18 +601,18 @@ mod tests {
             p1.clone(),
             IntentSlot {
                 desired: DesiredGeneration {
-                    generation: GenerationId::new("gen-1".to_string()),
+                    generation: test_generation_id("gen-1"),
                     artifact: ArtifactRef {
                         release: ReleaseId::new("rel-1".to_string()),
                         variant: VariantName::new("standard".to_string()),
-                        tree: TreeDigest::new("tree-1".to_string()),
+                        tree: test_tree_digest("tree-1"),
                     },
                 },
                 pre_push: None,
             },
         )]);
         DeploymentIntent {
-            deployment_id: DeploymentId::new(id.to_string()),
+            deployment_id: test_deployment_id(id),
             target: TargetName::new("production".to_string()),
             group: None,
             behavior_sha256: "sha256-aa".to_string(),
@@ -634,7 +634,7 @@ mod tests {
         store
             .append_terminal(
                 "production",
-                &DeploymentId::new(id.to_string()),
+                &test_deployment_id(id),
                 &successful_terminal(attempted_at, "deployed"),
             )
             .unwrap();
@@ -652,7 +652,7 @@ mod tests {
                 SlotResult {
                     slot_id: p1.clone(),
                     outcome: SlotOutcomeKind::Activated,
-                    generation: Some(GenerationId::new("gen-1".to_string())),
+                    generation: Some(test_generation_id("gen-1")),
                     compensated: false,
                     error: None,
                 },
@@ -662,13 +662,13 @@ mod tests {
                     slots: BTreeMap::from([(
                         p1.clone(),
                         GenerationRef {
-                            generation: GenerationId::new("gen-1".to_string()),
+                            generation: test_generation_id("gen-1"),
                             assignment: PlacementSlotAssignment {
                                 placement_slot: p1.clone(),
                                 artifact: ArtifactRef {
                                     release: ReleaseId::new("rel-1".to_string()),
                                     variant: VariantName::new("standard".to_string()),
-                                    tree: TreeDigest::new("tree-1".to_string()),
+                                    tree: test_tree_digest("tree-1"),
                                 },
                             },
                         },
@@ -763,12 +763,19 @@ mod tests {
         // as the prefix; an attempt without a snapshot renders `-`.
         assert_eq!(
             lines[0],
-            "deploy-log-ok  deploy-log-ok  Successful  2026-01-01T00:00:00Z  (deployed)"
+            format!(
+                "{}  {}  Successful  2026-01-01T00:00:00Z  (deployed)",
+                test_deployment_id("deploy-log-ok"),
+                test_deployment_id("deploy-log-ok")
+            )
         );
         // An entry without a rollback state keeps the columns aligned via `-`.
         assert_eq!(
             lines[1],
-            "-  deploy-log-failed  FailedPreflight  2026-01-02T00:00:00Z  (preflight failed)"
+            format!(
+                "-  {}  FailedPreflight  2026-01-02T00:00:00Z  (preflight failed)",
+                test_deployment_id("deploy-log-failed")
+            )
         );
     }
 
@@ -884,13 +891,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .write_slot_observed(
                 &SlotId::new("p1".to_string()),
                 &ObservedSlot {
-                    generation: Some(GenerationId::new("gen-41da".to_string())),
+                    generation: Some(test_generation_id("gen-41da")),
                     artifact: Some(crate::model::ArtifactRef {
                         release: ReleaseId::new("rel-sha256-status".to_string()),
                         variant: VariantName::new("standard".to_string()),
-                        tree: TreeDigest::new("tree-2c4f".to_string()),
+                        tree: test_tree_digest("tree-2c4f"),
                     }),
-                    last_deployment: Some(DeploymentId::new("deploy-status-1".to_string())),
+                    last_deployment: Some(test_deployment_id("deploy-status-1")),
                 },
             )
             .unwrap();
@@ -908,7 +915,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .write_slot_observed(
                 &SlotId::new("p3".to_string()),
                 &ObservedSlot {
-                    generation: Some(GenerationId::new("gen-9f00".to_string())),
+                    generation: Some(test_generation_id("gen-9f00")),
                     artifact: None,
                     last_deployment: None,
                 },
@@ -940,13 +947,19 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(lines.len(), 3, "one line per observed slot: {lines:?}");
         let p1 = &lines[0];
         assert!(p1.contains("p1  generation="), "p1 line: {p1}");
-        assert!(p1.contains("gen-41da"), "generation id rendered: {p1}");
+        assert!(
+            p1.contains(test_generation_id("gen-41da").as_str()),
+            "generation id rendered: {p1}"
+        );
         assert!(
             p1.contains("rel-sha256-status"),
             "release id rendered: {p1}"
         );
         assert!(p1.contains("standard"), "variant rendered: {p1}");
-        assert!(p1.contains("tree-2c4f"), "tree digest rendered: {p1}");
+        assert!(
+            p1.contains(test_tree_digest("tree-2c4f").as_str()),
+            "tree digest rendered: {p1}"
+        );
         // p2: an entirely unknown assignment renders as None on every column.
         assert_eq!(
             lines[1],
@@ -954,7 +967,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         // p3: a known generation with an unknown artifact renders the
         // generation but None on the artifact columns.
-        assert!(lines[2].contains("gen-9f00"), "p3 line: {}", lines[2]);
+        assert!(
+            lines[2].contains(test_generation_id("gen-9f00").as_str()),
+            "p3 line: {}",
+            lines[2]
+        );
         assert!(
             lines[2].contains("release=None variant=None tree=None"),
             "generation-only slot must keep the artifact columns None: {}",
@@ -1029,11 +1046,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "error must name the missing id, got: {msg}"
         );
         // With an id the flags parse (--dry-run and --yes are both optional).
+        // The id must be a canonical (validated) deployment id.
+        let canonical = test_deployment_id("deploy-004");
         let cli = Cli::try_parse_from([
             "deploy",
             "checkpoint",
             "production",
-            "deploy-004",
+            canonical.as_str(),
             "--dry-run",
             "--yes",
         ])
@@ -1048,7 +1067,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             panic!("expected checkpoint");
         };
         assert_eq!(target, "production");
-        assert_eq!(deployment_id.as_str(), "deploy-004");
+        assert_eq!(deployment_id, canonical);
         assert!(dry_run && yes);
     }
 
@@ -1116,10 +1135,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 .unwrap();
 
         // Seed a small history: deploy-0 (s0), deploy-1 (s1), deploy-2 (s2).
+        // The ledger ids are canonical (validated) forms of those tags, and
+        // the deployment dirs are keyed by the same canonical ids.
         for id in ["deploy-0", "deploy-1", "deploy-2"] {
             seed_successful(&store, id, "2026-01-01T00:00:00Z");
-            std::fs::create_dir_all(store.deployment_dir(id)).unwrap();
+            std::fs::create_dir_all(store.deployment_dir(test_deployment_id(id).as_str())).unwrap();
         }
+        let c0 = test_deployment_id("deploy-0");
+        let c1 = test_deployment_id("deploy-1");
+        let c2 = test_deployment_id("deploy-2");
 
         // Bare checkpoint (no --yes, no --dry-run): refused as irreversible
         // BEFORE any store mutation.
@@ -1129,7 +1153,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             cfg_path.to_str().unwrap(),
             "checkpoint",
             "production",
-            "deploy-1",
+            c1.as_str(),
         ])
         .expect_err("a bare checkpoint must be refused");
         assert!(
@@ -1145,7 +1169,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             cfg_path.to_str().unwrap(),
             "checkpoint",
             "production",
-            "deploy-1",
+            c1.as_str(),
             "--dry-run",
         ])
         .expect("dry-run checkpoint succeeds");
@@ -1163,16 +1187,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             cfg_path.to_str().unwrap(),
             "checkpoint",
             "production",
-            "deploy-1",
+            c1.as_str(),
             "--yes",
         ])
         .expect("the confirmed checkpoint establishes the retained suffix");
         let entries = store.read_ledger("production").unwrap();
         assert_eq!(entries.len(), 2, "deploy-1 and deploy-2 are retained");
-        assert_eq!(entries[0].deployment_id.as_str(), "deploy-1");
-        assert!(!store.deployment_dir("deploy-0").exists());
-        assert!(store.deployment_dir("deploy-1").exists());
-        assert!(store.deployment_dir("deploy-2").exists());
+        assert_eq!(entries[0].deployment_id, c1);
+        assert!(!store.deployment_dir(c0.as_str()).exists());
+        assert!(store.deployment_dir(c1.as_str()).exists());
+        assert!(store.deployment_dir(c2.as_str()).exists());
 
         // Repeating the same checkpoint: the suffix is identical (the ledger
         // already IS it) and the sweep finishes.
@@ -1182,7 +1206,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             cfg_path.to_str().unwrap(),
             "checkpoint",
             "production",
-            "deploy-1",
+            c1.as_str(),
             "--yes",
         ])
         .expect("a repeated checkpoint is idempotent");

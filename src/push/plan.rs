@@ -204,7 +204,7 @@ impl SlotSelection {
             .get(target)
             .ok_or_else(|| Error::not_found(format!("target '{target}'")))?;
         Ok(SlotSelection {
-            target: TargetName::new(target.to_string()),
+            target: TargetName::parse(target).expect("target name is a safe segment"),
             group: group.map(str::to_string),
         })
     }
@@ -258,7 +258,7 @@ impl SlotSelection {
                 Some(g) => s.groups.iter().any(|x| x == g),
                 None => true,
             })
-            .map(|s| SlotId::new(s.id.clone()))
+            .map(|s| SlotId::parse(s.id.as_str()).expect("validated slot id is a safe segment"))
             .collect();
         if self.group.is_some() && frozen_ids.is_empty() {
             return Err(Error::config(format!(
@@ -369,9 +369,12 @@ pub(crate) fn validate_partial_rollout(
             // assignment in the base and its physical binding must still
             // match.
             for (slot, sdef) in &unselected {
-                let slot_id = SlotId::new(slot.id.clone());
+                let slot_id =
+                    SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
+
                 let current_binding = PhysicalBinding {
-                    server: ServerId::new(sdef.id.as_str().to_string()),
+                    server: ServerId::parse(sdef.id.as_str())
+                        .expect("validated server id is a safe segment"),
                     deploy_dir: slot.deploy_dir.to_string_lossy().into_owned(),
                 };
                 if !base.slots.contains_key(&slot_id) {
@@ -457,7 +460,7 @@ pub(crate) fn validate_direct_release_membership(
             .values()
             .flat_map(|cs| cs.slots.iter())
             .filter(|s| s.target == target_name)
-            .map(|s| SlotId::new(s.id.clone())),
+            .map(|s| SlotId::parse(s.id.as_str()).expect("validated slot id is a safe segment")),
     );
     let current: SlotSet = SlotSet::new(current_slot_ids.iter().cloned());
     MatchingMembership::verify(frozen.clone(), current.clone()).map_err(|_| {
@@ -535,16 +538,21 @@ pub fn plan_assignments(
             let resolved = ResolvedSelection::new(
                 selection.target.clone(),
                 ResolvedSelectionSource::Head,
-                members.iter().map(|(slot, _)| SlotId::new(slot.id.clone())),
+                members.iter().map(|(slot, _)| {
+                    SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment")
+                }),
             )?;
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
-                let slot_id = SlotId::new(slot.id.clone());
+                let slot_id =
+                    SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
+
                 // The slot's variant is the variant file that declares it (the
                 // declaring file is the binding; there is no per-slot `variant`
                 // field).
                 let variant_name = config.slot_variant(&slot.id)?;
-                let variant = VariantName::new(variant_name.to_string());
+                let variant =
+                    VariantName::parse(variant_name).expect("variant name is a safe segment");
                 let tree = variant_trees.get(variant_name).cloned().ok_or_else(|| {
                     Error::plan(format!("variant '{variant_name}' not materialized"))
                 })?;
@@ -582,11 +590,15 @@ pub fn plan_assignments(
             let resolved = ResolvedSelection::new(
                 selection.target.clone(),
                 ResolvedSelectionSource::Deployment(deployment_id.clone()),
-                members.iter().map(|(slot, _)| SlotId::new(slot.id.clone())),
+                members.iter().map(|(slot, _)| {
+                    SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment")
+                }),
             )?;
             let slot_ids: Vec<SlotId> = members
                 .iter()
-                .map(|(slot, _)| SlotId::new(slot.id.clone()))
+                .map(|(slot, _)| {
+                    SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment")
+                })
                 .collect();
             let entry = resolve_deployment(store, ft, deployment_id)?;
             let recorded: BTreeSet<String> =
@@ -613,9 +625,12 @@ pub fn plan_assignments(
             // unverifiable and refuses for the same reason. Unselected slots
             // are not planned (they remain at the latest current state).
             for (slot, sdef) in &members {
-                let slot_id = SlotId::new(slot.id.clone());
+                let slot_id =
+                    SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
+
                 let current_binding = PhysicalBinding {
-                    server: ServerId::new(sdef.id.as_str().to_string()),
+                    server: ServerId::parse(sdef.id.as_str())
+                        .expect("validated server id is a safe segment"),
                     deploy_dir: slot.deploy_dir.to_string_lossy().into_owned(),
                 };
                 let recorded = entry.bindings.get(&slot_id).ok_or_else(|| {
@@ -640,7 +655,9 @@ pub fn plan_assignments(
             // snapshot-wide release.
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
-                let slot_id = SlotId::new(slot.id.clone());
+                let slot_id =
+                    SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
+
                 let g = entry.slots.get(&slot_id).ok_or_else(|| {
                     Error::rollback(format!("slot {slot_id} missing in snapshot"))
                 })?;
@@ -677,7 +694,9 @@ pub fn plan_assignments(
             let current_slot_ids: Vec<SlotId> = config
                 .target_slots(selection.target.as_str())?
                 .into_iter()
-                .map(|(slot, _)| SlotId::new(slot.id.clone()))
+                .map(|(slot, _)| {
+                    SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment")
+                })
                 .collect();
             // THE MEMBERSHIP GATE PRODUCES THE PROOF: the frozen and current
             // memberships verified EXACTLY EQUAL (the agreed non-empty slot
@@ -714,11 +733,15 @@ pub fn plan_assignments(
             let resolved = ResolvedSelection::new(
                 selection.target.clone(),
                 ResolvedSelectionSource::FrozenRelease(release.clone()),
-                members.iter().map(|(slot, _)| SlotId::new(slot.id.clone())),
+                members.iter().map(|(slot, _)| {
+                    SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment")
+                }),
             )?;
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
-                let slot_id = SlotId::new(slot.id.clone());
+                let slot_id =
+                    SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
+
                 // The variant ALWAYS comes from the release's OWN stored slot
                 // snapshot: a historical release resolves each slot's
                 // slot→variant binding against the slots it was materialized
@@ -750,7 +773,8 @@ pub fn plan_assignments(
                             ))
                         })?
                 };
-                let variant = VariantName::new(variant_name.clone());
+                let variant =
+                    VariantName::parse(&variant_name).expect("variant name is a safe segment");
                 let tree = rec.variants.get(&variant_name).cloned().ok_or_else(|| {
                     Error::rollback(format!("release {release} lacks variant '{variant_name}'"))
                 })?;
@@ -759,7 +783,8 @@ pub fn plan_assignments(
                     artifact: ArtifactRef {
                         release: release.clone(),
                         variant,
-                        tree: TreeDigest::new(tree),
+                        tree: TreeDigest::parse(&tree)
+                            .expect("release record variant tree is a valid digest"),
                     },
                 });
             }
@@ -786,7 +811,8 @@ pub fn plan_assignments(
                 for slot in &cs.slots {
                     if slot.target == selection.target.as_str() {
                         frozen_topology.insert(
-                            SlotId::new(slot.id.clone()),
+                            SlotId::parse(slot.id.as_str())
+                                .expect("validated slot id is a safe segment"),
                             FrozenSlotTopology {
                                 variant: variant.clone(),
                                 groups: slot.groups.clone(),
@@ -828,15 +854,20 @@ pub fn plan_assignments(
                 membership,
                 members
                     .iter()
-                    .map(|(slot, _)| SlotId::new(slot.id.clone()))
+                    .map(|(slot, _)| {
+                        SlotId::parse(slot.id.as_str())
+                            .expect("validated slot id is a safe segment")
+                    })
                     .collect(),
                 members
                     .iter()
                     .map(|(slot, sdef)| {
                         (
-                            SlotId::new(slot.id.clone()),
+                            SlotId::parse(slot.id.as_str())
+                                .expect("validated slot id is a safe segment"),
                             PhysicalBinding {
-                                server: ServerId::new(sdef.id.as_str().to_string()),
+                                server: ServerId::parse(sdef.id.as_str())
+                                    .expect("validated server id is a safe segment"),
                                 deploy_dir: slot.deploy_dir.to_string_lossy().into_owned(),
                             },
                         )
@@ -884,8 +915,9 @@ mod tests {
     use super::*;
     use crate::model::{
         ArtifactRef, BehaviorContract, CONFIG_SCHEMA_VERSION, CanonicalSlot, CanonicalSlots,
-        DeploymentId, GenerationId, GenerationRef, Provenance, RELEASE_RECORD_SCHEMA_VERSION,
-        ReleaseRecord, ServerId, TargetName, TreeDigest, VariantName,
+        DeploymentId, GenerationRef, Provenance, RELEASE_RECORD_SCHEMA_VERSION, ReleaseRecord,
+        ServerId, TargetName, TreeDigest, VariantName, test_deployment_id, test_generation_id,
+        test_tree_digest,
     };
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
@@ -1063,7 +1095,7 @@ interval_seconds = 0
         slots: BTreeMap<SlotId, GenerationRef>,
         bindings: BTreeMap<SlotId, PhysicalBinding>,
     ) {
-        let id = DeploymentId::new(deployment_id.to_string());
+        let id = test_deployment_id(deployment_id);
         let target = TargetName::new("t1".to_string());
         // ONE slot table: the membership + per-slot desired entries.
         let slot_table: BTreeMap<SlotId, IntentSlot> = slots
@@ -1149,7 +1181,13 @@ interval_seconds = 0
                 mapping_sha256: "m".to_string(),
                 behavior_sha256: "b".to_string(),
             },
-            variants: BTreeMap::from([("standard".to_string(), tree.to_string())]),
+            // The variant tree must be a VALID digest (the record is read
+            // back through the validated parse), so derive the canonical
+            // 64-hex form of the tag.
+            variants: BTreeMap::from([(
+                "standard".to_string(),
+                test_tree_digest(tree).as_str().to_string(),
+            )]),
             slots: BTreeMap::new(),
         }
     }
@@ -1224,7 +1262,7 @@ interval_seconds = 0
         );
         assert_eq!(
             a.artifact.tree.as_str(),
-            "tree-legacy",
+            test_tree_digest("tree-legacy").as_str(),
             "the tree must come from the release's own variant bindings"
         );
         assert_eq!(a.artifact.release, release);
@@ -1624,8 +1662,14 @@ interval_seconds = 0
             },
         )]);
         rec.variants = BTreeMap::from([
-            ("standard".to_string(), "tree-standard".to_string()),
-            ("other".to_string(), "tree-other".to_string()),
+            (
+                "standard".to_string(),
+                test_tree_digest("tree-standard").as_str().to_string(),
+            ),
+            (
+                "other".to_string(),
+                test_tree_digest("tree-other").as_str().to_string(),
+            ),
         ]);
         let release = consistent(&mut rec);
         store.write_release(&rec).unwrap();
@@ -1650,7 +1694,7 @@ interval_seconds = 0
         );
         assert_eq!(
             assignments[0].artifact.tree.as_str(),
-            "tree-other",
+            test_tree_digest("tree-other").as_str(),
             "the tree must pair with the snapshot-resolved variant"
         );
     }
@@ -1704,13 +1748,13 @@ interval_seconds = 0
             BTreeMap::from([(
                 SlotId::new("p1".to_string()),
                 GenerationRef {
-                    generation: GenerationId::new("gen-old".to_string()),
+                    generation: test_generation_id("gen-old"),
                     assignment: PlacementSlotAssignment {
                         placement_slot: SlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
                             release: release.clone(),
                             variant: VariantName::new("old".to_string()),
-                            tree: TreeDigest::new("tree-old".to_string()),
+                            tree: test_tree_digest("tree-old"),
                         },
                     },
                 },
@@ -1731,7 +1775,7 @@ interval_seconds = 0
             &SlotSelection::normalize(&config, "t1", None).unwrap(),
             &PushRef::Deployment {
                 target: TargetName::new("t1".to_string()),
-                deployment_id: DeploymentId::new("deploy-snapshot-histvar".to_string()),
+                deployment_id: test_deployment_id("deploy-snapshot-histvar"),
             },
             &ReleaseId::new("unused".to_string()),
             &BTreeMap::new(),
@@ -1741,12 +1785,12 @@ interval_seconds = 0
         .map(|planned| (planned.assignments, planned.releases, planned.origin))
         .expect("deployment ref resolves");
         assert_eq!(assignments[0].artifact.variant.as_str(), "old");
-        assert_eq!(assignments[0].artifact.tree.as_str(), "tree-old");
+        assert_eq!(assignments[0].artifact.tree, test_tree_digest("tree-old"));
         assert_eq!(assignments[0].artifact.release, release);
         assert_eq!(desired, BTreeSet::from([release.clone()]));
         assert_eq!(
             origin,
-            PlanOrigin::Deployment(DeploymentId::new("deploy-snapshot-histvar".to_string()))
+            PlanOrigin::Deployment(test_deployment_id("deploy-snapshot-histvar"))
         );
     }
 
@@ -1784,13 +1828,13 @@ interval_seconds = 0
             BTreeMap::from([(
                 SlotId::new("p1".to_string()),
                 GenerationRef {
-                    generation: GenerationId::new("gen-legacy".to_string()),
+                    generation: test_generation_id("gen-legacy"),
                     assignment: PlacementSlotAssignment {
                         placement_slot: SlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
                             release: ReleaseId::new("rel-sha256-legacy".to_string()),
                             variant: VariantName::new("standard".to_string()),
-                            tree: TreeDigest::new("tree-legacy".to_string()),
+                            tree: test_tree_digest("tree-legacy"),
                         },
                     },
                 },
@@ -1802,7 +1846,7 @@ interval_seconds = 0
             &SlotSelection::normalize(&config, "t1", None).unwrap(),
             &PushRef::Deployment {
                 target: TargetName::new("t1".to_string()),
-                deployment_id: DeploymentId::new("deploy-legacy-snapshot".to_string()),
+                deployment_id: test_deployment_id("deploy-legacy-snapshot"),
             },
             &ReleaseId::new("unused".to_string()),
             &BTreeMap::new(),
@@ -2216,10 +2260,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         let selection = SlotSelection::normalize(&config, "t1", Some("G")).unwrap();
         let local_release = ReleaseId::new("unused-local".to_string());
-        let variant_trees = BTreeMap::from([(
-            "standard".to_string(),
-            TreeDigest::new("tree-current".to_string()),
-        )]);
+        let variant_trees =
+            BTreeMap::from([("standard".to_string(), test_tree_digest("tree-current"))]);
 
         // HEAD --group G: the CURRENT partition {p2} — the current config's
         // group declarations are HEAD's declared temporal source.
@@ -2275,7 +2317,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         for a in &rel_assignments {
             assert_eq!(a.artifact.release, release);
             assert_eq!(a.artifact.variant.as_str(), "standard");
-            assert_eq!(a.artifact.tree.as_str(), "tree-frozen");
+            assert_eq!(a.artifact.tree, test_tree_digest("tree-frozen"));
         }
         assert_eq!(rel_desired, BTreeSet::from([release.clone()]));
         release_origin(&rel_origin, &release);
@@ -2563,7 +2605,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let local_release = ReleaseId::new("unused-local".to_string());
             let variant_trees = BTreeMap::from([(
                 "standard".to_string(),
-                TreeDigest::new("tree-current".to_string()),
+                test_tree_digest("tree-current"),
             )]);
 
             // HEAD --group G: the CURRENT partition governs.
@@ -2622,7 +2664,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             for a in &rel {
                 assert_eq!(a.artifact.release, release);
                 assert_eq!(a.artifact.variant.as_str(), "standard");
-                assert_eq!(a.artifact.tree.as_str(), "tree-frozen");
+                assert_eq!(a.artifact.tree, test_tree_digest("tree-frozen"));
             }
             release_origin(&rel_origin, &release);
             let rp = release_origin(&rel_origin, &release);
@@ -2733,13 +2775,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             BTreeMap::from([(
                 SlotId::new("p1".to_string()),
                 GenerationRef {
-                    generation: GenerationId::new("gen-old".to_string()),
+                    generation: test_generation_id("gen-old"),
                     assignment: PlacementSlotAssignment {
                         placement_slot: SlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
                             release: release.clone(),
                             variant: VariantName::new("standard".to_string()),
-                            tree: TreeDigest::new("tree-direct".to_string()),
+                            tree: test_tree_digest("tree-direct"),
                         },
                     },
                 },
@@ -2816,7 +2858,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 );
                 assert_eq!(
                     a.artifact.tree.as_str(),
-                    "tree-direct",
+                    test_tree_digest("tree-direct").as_str(),
                     "the tree must come from the release's own variant bindings"
                 );
                 assert_eq!(a.artifact.release, release);
@@ -2833,7 +2875,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &SlotSelection::normalize(&config, "t1", None).unwrap(),
                 &PushRef::Deployment {
                     target: TargetName::new("t1".to_string()),
-                    deployment_id: DeploymentId::new("deploy-source".to_string()),
+                    deployment_id: test_deployment_id("deploy-source"),
                 },
                 &ReleaseId::new("unused".to_string()),
                 &BTreeMap::new(),
@@ -2862,7 +2904,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     .expect_err(&format!("{token} on the no-history destination must fail"));
                 }
                 crate::history::resolve_ref_expr(
-                    &crate::history::parse_ref_expr("deploy-source")
+                    &crate::history::parse_ref_expr(test_deployment_id("deploy-source").as_str())
                         .expect("deployment id must parse"),
                     "t2",
                     &store,
@@ -3191,18 +3233,18 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         #[test]
         fn deployment_ref_plans_exactly_the_recorded_snapshot(
-            tree in "[a-f0-9]{6,16}",
+            tree in "[a-f0-9]{64}",
             generation in "[a-z0-9]{4,10}",
             behavior in "[a-f0-9]{4,16}",
         ) {
             let (_dir, config) = project_with_config();
             let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
-            let deployment_id = DeploymentId::new("deploy-prop-plan".to_string());
+            let deployment_id = test_deployment_id("deploy-prop-plan");
             let snapshot_release = ReleaseId::new(format!("rel-sha256-{tree}"));
             let slots = BTreeMap::from([(
                 SlotId::new("p1".to_string()),
                 GenerationRef {
-                    generation: GenerationId::new(format!("gen-{generation}")),
+                    generation: test_generation_id(&format!("gen-{generation}")),
                     assignment: PlacementSlotAssignment {
                         placement_slot: SlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
@@ -3215,7 +3257,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             )]);
             append_successful_snapshot(
                 &store,
-                deployment_id.as_str(),
+                "deploy-prop-plan",
                 &format!("sha256-{behavior}"),
                 slots.clone(),
                 BTreeMap::from([(
@@ -3262,7 +3304,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
             // A deployment id with NO snapshot never plans (failed / unknown
             // ids fail closed at the plan boundary too).
-            let missing = DeploymentId::new("deploy-prop-missing".to_string());
+            let missing = test_deployment_id("deploy-prop-missing");
             let err = plan_assignments(
                 &SlotSelection::normalize(&config, "t1", None).unwrap(),
                 &PushRef::Deployment {
@@ -3481,7 +3523,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let artifact = ArtifactRef {
                 release: rid.clone(),
                 variant: VariantName::new("standard".to_string()),
-                tree: TreeDigest::new(format!("tree-{i}")),
+                tree: test_tree_digest(&format!("tree-{i}")),
             };
             if i == 0 {
                 state.insert(slot_a.clone(), artifact.clone());
@@ -3499,7 +3541,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     (
                         slot.clone(),
                         GenerationRef {
-                            generation: GenerationId::new(format!("gen-{i}")),
+                            generation: test_generation_id(&format!("gen-{i}")),
                             assignment: PlacementSlotAssignment {
                                 placement_slot: slot.clone(),
                                 artifact: art.clone(),
@@ -3508,10 +3550,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     )
                 })
                 .collect();
-            let id = DeploymentId::new(format!("deploy-mr-{i}"));
+            let id = test_deployment_id(&format!("deploy-mr-{i}"));
             append_successful_snapshot(
                 &store,
-                id.as_str(),
+                &format!("deploy-mr-{i}"),
                 &format!("sha256-{i}"),
                 slots.clone(),
                 bindings.clone(),
@@ -3773,7 +3815,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 groups: Vec::new(),
             });
         }
-        rec.variants = BTreeMap::from([(frozen_variant.to_string(), "tree-rel".to_string())]);
+        rec.variants = BTreeMap::from([(
+            frozen_variant.to_string(),
+            test_tree_digest("tree-rel").as_str().to_string(),
+        )]);
         rec.slots = BTreeMap::from([(
             frozen_variant.to_string(),
             CanonicalSlots {
@@ -3792,13 +3837,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             (
                 SlotId::new("p1".to_string()),
                 GenerationRef {
-                    generation: GenerationId::new("gen-p1".to_string()),
+                    generation: test_generation_id("gen-p1"),
                     assignment: PlacementSlotAssignment {
                         placement_slot: SlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
                             release: ReleaseId::new("rel-deploy".to_string()),
                             variant: VariantName::new("standard".to_string()),
-                            tree: TreeDigest::new("tree-deploy".to_string()),
+                            tree: test_tree_digest("tree-deploy"),
                         },
                     },
                 },
@@ -3806,13 +3851,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             (
                 SlotId::new("p2".to_string()),
                 GenerationRef {
-                    generation: GenerationId::new("gen-p2".to_string()),
+                    generation: test_generation_id("gen-p2"),
                     assignment: PlacementSlotAssignment {
                         placement_slot: SlotId::new("p2".to_string()),
                         artifact: ArtifactRef {
                             release: ReleaseId::new("rel-deploy".to_string()),
                             variant: VariantName::new("standard".to_string()),
-                            tree: TreeDigest::new("tree-deploy".to_string()),
+                            tree: test_tree_digest("tree-deploy"),
                         },
                     },
                 },
@@ -3874,7 +3919,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             } else {
                 BTreeMap::from([(
                     "standard".to_string(),
-                    TreeDigest::new("tree-current".to_string()),
+                    test_tree_digest("tree-current"),
                 )])
             };
             let frozen_variant = if release_variant { "special" } else { "standard" };
@@ -3919,7 +3964,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     );
                     assert_eq!(
                         a.artifact.tree.as_str(),
-                        "tree-current",
+                        test_tree_digest("tree-current").as_str(),
                         "HEAD plans from the CURRENT tree, never release/deployment"
                     );
                     assert_eq!(a.artifact.release, local_release);
@@ -3969,7 +4014,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     );
                     assert_eq!(
                         a.artifact.tree.as_str(),
-                        "tree-rel",
+                        test_tree_digest("tree-rel").as_str(),
                         "the tree comes from the release's own bindings"
                     );
                     assert_eq!(a.artifact.release, release);
@@ -3983,7 +4028,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 // binding, even when the fixture drifted it.
                 let rp = release_origin(&origin, &release);
                 assert_eq!(rp.release, release);
-                assert_eq!(rp.target.as_str(), "t1");
+                assert_eq!(rp.target, TargetName::parse("t1").expect("safe segment"));
                 // The membership proof carries the AGREED set (frozen ==
                 // current verified): the target's complete membership.
                 assert_eq!(
@@ -4017,7 +4062,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &selection,
                 &PushRef::Deployment {
                     target: TargetName::new("t1".to_string()),
-                    deployment_id: DeploymentId::new("deploy-snapshot".to_string()),
+                    deployment_id: test_deployment_id("deploy-snapshot"),
                 },
                 &local_release,
                 &variant_trees,
@@ -4050,7 +4095,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                         "the artifact comes from the deployment's exact stored state"
                     );
                     assert_eq!(a.artifact.variant.as_str(), "standard");
-                    assert_eq!(a.artifact.tree.as_str(), "tree-deploy");
+                    assert_eq!(a.artifact.tree, test_tree_digest("tree-deploy"));
                 }
                 assert_eq!(
                     desired,
@@ -4058,7 +4103,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 );
                 assert_eq!(
                     origin,
-                    PlanOrigin::Deployment(DeploymentId::new("deploy-snapshot".to_string()))
+                    PlanOrigin::Deployment(test_deployment_id("deploy-snapshot"))
+
                 );
                 assert!(
                     matches!(origin, PlanOrigin::Deployment(_)),
@@ -4209,7 +4255,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &ReleaseId::new("local".to_string()),
                 &BTreeMap::from([(
                     "standard".to_string(),
-                    TreeDigest::new("tree".to_string()),
+                    test_tree_digest("tree"),
                 )]),
                 &store,
                 &config2,

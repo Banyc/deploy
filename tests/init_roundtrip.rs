@@ -157,7 +157,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     );
     let attempt = r.attempt.expect("attempt recorded");
     assert_eq!(attempt.slot_ids.len(), 1);
-    let srv = &attempt.slots[&deploy::model::SlotId::new("app-1")];
+    let srv = &attempt.slots[&deploy::model::SlotId::parse("app-1").unwrap()];
     let generation = srv.generation.as_ref().expect("generation assigned");
 
     // 6. Remote state: the local endpoint now carries the full layout, the
@@ -229,7 +229,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     );
 
     let observed = store.read_observed("production", &config)?;
-    let obs = &observed.slots[&deploy::model::SlotId::new("app-1")];
+    let obs = &observed.slots[&deploy::model::SlotId::parse("app-1").unwrap()];
     assert_eq!(
         obs.generation.as_ref(),
         Some(generation),

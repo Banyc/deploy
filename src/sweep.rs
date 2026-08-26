@@ -37,8 +37,8 @@ use crate::config::ProjectConfig;
 use crate::error::Result;
 use crate::layout;
 use crate::model::{
-    ArtifactRef, DeploymentId, GenerationId, PlacementSlotAssignment, ReleaseId, ServerId, SlotId,
-    TargetName, TreeDigest, VariantName,
+    ArtifactRef, DeploymentId, PlacementSlotAssignment, ReleaseId, ServerId, SlotId, TargetName,
+    TreeDigest, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
 };
 use crate::push::checkpoint::run_checkpoint_unlocked;
 use crate::push::engine::{PushOptions, push, retry_pending_sweep};
@@ -127,7 +127,7 @@ fn seed_real_release(store: &LocalStore) -> ReleaseId {
         "sha256-aa",
         &BTreeMap::from([(
             VariantName::new("standard".to_string()),
-            TreeDigest::new("tree-pinned".to_string()),
+            test_tree_digest("tree-pinned"),
         )]),
         &BTreeMap::from([(
             "standard".to_string(),
@@ -159,23 +159,27 @@ fn make_gen(
     created: &str,
     prior_generation: Option<&str>,
 ) {
+    // The receiver's generation records are read back through the validated
+    // parse, so the fixture writes the CANONICAL forms of its tags. `tree`
+    // is already a canonical digest (the strategy generates canonical forms).
+    let canonical_tree = TreeDigest::parse(tree).expect("canonical tree");
     helper
         .remote()
-        .create_dir_all(&layout::tree_root(tree))
+        .create_dir_all(&layout::tree_root(canonical_tree.as_str()))
         .unwrap();
     helper
         .create_generation(
             "op",
             &GenerationAssignment {
-                deployment_id: deployment_id.to_string().into(),
-                generation_id: generation_id.to_string().into(),
+                deployment_id: test_deployment_id(deployment_id),
+                generation_id: test_generation_id(generation_id),
                 artifact: ArtifactRef {
                     release: ReleaseId::new("r".to_string()),
                     variant: VariantName::new("standard".to_string()),
-                    tree: TreeDigest::new(tree.to_string()),
+                    tree: canonical_tree,
                 },
                 behavior_sha256: "b".into(),
-                prior_generation: prior_generation.map(|g| g.to_string().into()),
+                prior_generation: prior_generation.map(test_generation_id),
                 created_at: created.into(),
                 target: None,
             },
@@ -207,18 +211,18 @@ fn intent(id: &str, target: &str) -> DeploymentIntent {
         p1.clone(),
         IntentSlot {
             desired: DesiredGeneration {
-                generation: GenerationId::new("gen-1".to_string()),
+                generation: test_generation_id("gen-1"),
                 artifact: ArtifactRef {
                     release: ReleaseId::new("rel-1".to_string()),
                     variant: VariantName::new("standard".to_string()),
-                    tree: TreeDigest::new("tree-1".to_string()),
+                    tree: test_tree_digest("tree-1"),
                 },
             },
             pre_push: None,
         },
     )]);
     DeploymentIntent {
-        deployment_id: DeploymentId::new(id.to_string()),
+        deployment_id: test_deployment_id(id),
         target: TargetName::new(target.to_string()),
         group: None,
         behavior_sha256: "sha256-aa".to_string(),
@@ -239,7 +243,7 @@ fn terminal_for(release: &str, tree: &str) -> LedgerTerminal {
             SlotResult {
                 slot_id: SlotId::new("p1".to_string()),
                 outcome: SlotOutcomeKind::Activated,
-                generation: Some(GenerationId::new("gen-1".to_string())),
+                generation: Some(test_generation_id("gen-1")),
                 compensated: false,
                 error: None,
             },
@@ -249,13 +253,13 @@ fn terminal_for(release: &str, tree: &str) -> LedgerTerminal {
                 slots: BTreeMap::from([(
                     SlotId::new("p1".to_string()),
                     crate::model::GenerationRef {
-                        generation: GenerationId::new("gen-1".to_string()),
+                        generation: test_generation_id("gen-1"),
                         assignment: PlacementSlotAssignment {
                             placement_slot: SlotId::new("p1".to_string()),
                             artifact: ArtifactRef {
                                 release: ReleaseId::new(release.to_string()),
                                 variant: VariantName::new("standard".to_string()),
-                                tree: TreeDigest::new(tree.to_string()),
+                                tree: test_tree_digest(tree),
                             },
                         },
                     },
@@ -284,7 +288,7 @@ fn failed_terminal() -> LedgerTerminal {
             SlotResult {
                 slot_id: SlotId::new("p1".to_string()),
                 outcome: SlotOutcomeKind::Restored,
-                generation: Some(GenerationId::new("gen-1".to_string())),
+                generation: Some(test_generation_id("gen-1")),
                 compensated: true,
                 error: None,
             },
@@ -302,21 +306,18 @@ fn seed_history(store: &LocalStore, target: &str, prefix: &str, history: &[bool]
     let mut successful = Vec::new();
     for (i, ok) in history.iter().enumerate() {
         let id = format!("{prefix}-{i}");
+        let canonical = test_deployment_id(&id);
         store.append_intent(target, &intent(&id, target)).unwrap();
         if *ok {
             let rel = format!("rel-sha256-{id}");
             let tree = format!("tree-{id}");
             store
-                .append_terminal(
-                    target,
-                    &DeploymentId::new(id.clone()),
-                    &terminal_for(&rel, &tree),
-                )
+                .append_terminal(target, &canonical, &terminal_for(&rel, &tree))
                 .unwrap();
-            successful.push(id);
+            successful.push(canonical.as_str().to_string());
         } else {
             store
-                .append_terminal(target, &DeploymentId::new(id.clone()), &failed_terminal())
+                .append_terminal(target, &canonical, &failed_terminal())
                 .unwrap();
         }
     }
@@ -332,9 +333,10 @@ fn seed_named_release(store: &LocalStore, name: &str) {
     std::fs::write(dir.join("release.json"), "{}").unwrap();
 }
 
-/// Create a tree object directory under the given digest.
+/// Create a tree object directory under the given digest (the CANONICAL
+/// 64-hex form of the tag — the ledger references the validated digest).
 fn seed_object(store: &LocalStore, tree: &str) {
-    let dir = store.object_root(&TreeDigest::new(tree.to_string()));
+    let dir = store.object_root(&test_tree_digest(tree));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("file"), "x").unwrap();
 }
@@ -384,10 +386,11 @@ fn run_no_leak_case(
     helper
         .swap_current(None, &format!("g{}", n - 1), "op")
         .unwrap();
-    // The pinned tree exists on the receiver (pin-protected content).
+    // The pinned tree exists on the receiver (pin-protected content). The
+    // receiver's tree dirs are keyed by the canonical digest.
     helper
         .remote()
-        .create_dir_all(&layout::tree_root("tree-pinned"))
+        .create_dir_all(&layout::tree_root(test_tree_digest("tree-pinned").as_str()))
         .unwrap();
 
     // ---- the pusher: a store with a ledger + ghost content ----------------
@@ -445,7 +448,9 @@ fn run_no_leak_case(
         );
     }
     assert!(
-        helper.remote().exists(&layout::tree_root("tree-pinned")),
+        helper
+            .remote()
+            .exists(&layout::tree_root(test_tree_digest("tree-pinned").as_str())),
         "pinned content survives on the receiver"
     );
     // Independence: retention never touches the pusher's ledger.
@@ -458,8 +463,13 @@ fn run_no_leak_case(
     // ---- pusher sweep: checkpoint -----------------------------------------
     let at = checkpoint_at % ids.len();
     let checkpoint_id = &ids[at];
-    let rep = run_checkpoint_unlocked(&store, &cfg, TARGET, &DeploymentId::new(checkpoint_id))
-        .expect("checkpoint succeeds");
+    let rep = run_checkpoint_unlocked(
+        &store,
+        &cfg,
+        TARGET,
+        &DeploymentId::parse(checkpoint_id).expect("canonical checkpoint id"),
+    )
+    .expect("checkpoint succeeds");
     assert!(rep.established);
     assert!(rep.sweep_completed);
     // The pusher retains EXACTLY the reachable artifacts: the retained
@@ -488,7 +498,7 @@ fn run_no_leak_case(
         );
         assert_eq!(
             store
-                .object_root(&TreeDigest::new(format!("tree-{id}")))
+                .object_root(&test_tree_digest(&format!("tree-{id}")))
                 .exists(),
             reachable,
             "tree of entry {id} must survive iff it is in the retained suffix"
@@ -501,10 +511,10 @@ fn run_no_leak_case(
             .release_dir(&ReleaseId::new("rel-sha256-ghost"))
             .exists()
     );
-    assert!(!store.object_root(&TreeDigest::new("tree-ghost")).exists());
+    assert!(!store.object_root(&test_tree_digest("tree-ghost")).exists());
     // Pinned content survives on the pusher.
     assert!(store.release_dir(&pinned).exists());
-    assert!(store.object_root(&TreeDigest::new("tree-pinned")).exists());
+    assert!(store.object_root(&test_tree_digest("tree-pinned")).exists());
     // Independence: checkpoint never touches the receiver's generations.
     assert_eq!(
         list_generations(&helper),
@@ -528,7 +538,10 @@ proptest! {
     fn two_sided_sweep_no_leak(
         receiver_trees in prop::collection::vec(0usize..8, 3..=6)
             .prop_map(|v| {
-                let mut s: Vec<String> = v.into_iter().map(|i| format!("t{i}")).collect();
+                let mut s: Vec<String> = v
+                    .into_iter()
+                    .map(|i| test_tree_digest(&format!("t{i}")).as_str().to_string())
+                    .collect();
                 s.sort();
                 s.dedup();
                 s
@@ -596,6 +609,19 @@ fn run_fault_case(pusher_history: Vec<bool>, checkpoint_at: usize, fault: SweepF
     seed_unreachable(&store, "ghost-deploy", "rel-sha256-ghost", "tree-ghost");
     let at = checkpoint_at % ids.len();
     let checkpoint_id = &ids[at];
+    // The checkpoint entry's RAW tag (its release/tree dirs are seeded under
+    // the raw `deploy-{pos}` name; the ledger references the canonical id).
+    let mut pos = 0usize;
+    let mut seen = 0usize;
+    for (i, ok) in pusher_history.iter().enumerate() {
+        if *ok {
+            if seen == at {
+                pos = i;
+                break;
+            }
+            seen += 1;
+        }
+    }
 
     // Arm the sweep fault (one-shot: the checkpoint's sweep consumes it).
     arm_sweep_fault(&store, checkpoint_id, fault);
@@ -603,8 +629,13 @@ fn run_fault_case(pusher_history: Vec<bool>, checkpoint_at: usize, fault: SweepF
     // The faulted checkpoint: the operation STILL SUCCEEDS (maintenance, not
     // correction) — the ledger commit stands, the sweep is reported
     // retry-required, and durable sweep debt is recorded.
-    let rep = run_checkpoint_unlocked(&store, &cfg, TARGET, &DeploymentId::new(checkpoint_id))
-        .expect("the faulted checkpoint still succeeds");
+    let rep = run_checkpoint_unlocked(
+        &store,
+        &cfg,
+        TARGET,
+        &DeploymentId::parse(checkpoint_id).expect("canonical checkpoint id"),
+    )
+    .expect("the faulted checkpoint still succeeds");
     assert!(rep.established, "the ledger commit stands");
     assert!(
         !rep.sweep_completed,
@@ -630,7 +661,7 @@ fn run_fault_case(pusher_history: Vec<bool>, checkpoint_at: usize, fault: SweepF
             );
         }
         SweepFault::GcDeleteTrees => {
-            assert!(store.object_root(&TreeDigest::new("tree-ghost")).exists());
+            assert!(store.object_root(&test_tree_digest("tree-ghost")).exists());
         }
     }
 
@@ -651,20 +682,20 @@ fn run_fault_case(pusher_history: Vec<bool>, checkpoint_at: usize, fault: SweepF
             .release_dir(&ReleaseId::new("rel-sha256-ghost"))
             .exists()
     );
-    assert!(!store.object_root(&TreeDigest::new("tree-ghost")).exists());
+    assert!(!store.object_root(&test_tree_digest("tree-ghost")).exists());
     // Reachable + pinned content survives the converged sweep.
     assert!(
         store
-            .release_dir(&ReleaseId::new(format!("rel-sha256-{checkpoint_id}")))
+            .release_dir(&ReleaseId::new(format!("rel-sha256-deploy-{pos}")))
             .exists()
     );
     assert!(
         store
-            .object_root(&TreeDigest::new(format!("tree-{checkpoint_id}")))
+            .object_root(&test_tree_digest(&format!("tree-deploy-{pos}")))
             .exists()
     );
     assert!(store.release_dir(&pinned).exists());
-    assert!(store.object_root(&TreeDigest::new("tree-pinned")).exists());
+    assert!(store.object_root(&test_tree_digest("tree-pinned")).exists());
 }
 
 proptest! {

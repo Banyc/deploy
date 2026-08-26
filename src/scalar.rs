@@ -36,14 +36,16 @@ use crate::error::{Error, Result};
 pub(crate) const DIGEST_TEST_HEX_1: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-/// The name rule shared by the identifier-like scalars: non-empty after
-/// trimming, no surrounding whitespace (a name is exactly what was written,
-/// never silently trimmed), no control characters, and no path separators or
-/// traversal components — a name is a SINGLE safe path segment. Names become
-/// directory components on a server (the per-server remote directory is named
-/// by the server id), so a name must never smuggle a separator (`/`, `\`) or
-/// a `.`/`..` traversal component out of the forced namespace.
-fn valid_name(s: &str) -> bool {
+/// The name rule shared by the identifier-like scalars AND the identity
+/// newtypes in [`crate::model`] (ServerId, SlotId, TargetName,
+/// VariantName): non-empty after trimming, no surrounding
+/// whitespace (a name is exactly what was written, never silently trimmed),
+/// no control characters, and no path separators or traversal components — a
+/// name is a SINGLE safe path segment. Names become directory components on a
+/// server (the per-server remote directory is named by the server id), so a
+/// name must never smuggle a separator (`/`, `\`) or a `.`/`..` traversal
+/// component out of the forced namespace.
+pub(crate) fn valid_name(s: &str) -> bool {
     !s.trim().is_empty()
         && s.trim() == s
         && !s.chars().any(|c| c.is_control())

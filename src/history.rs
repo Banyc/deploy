@@ -155,7 +155,7 @@ pub(crate) fn resolve_ref_expr(
                 ))
             })?;
             Ok(PushRef::Deployment {
-                target: TargetName::new(target.to_string()),
+                target: TargetName::parse(target).expect("ledger target is a safe segment"),
                 deployment_id: chain[pos].deployment_id.clone(),
             })
         }
@@ -467,7 +467,11 @@ pub fn deployment_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ArtifactRef, GenerationId, ReleaseId, ServerId, TreeDigest, VariantName};
+    use crate::model::{
+        ArtifactRef, DeploymentId, GenerationRef, PlacementSlotAssignment, ReleaseId, ServerId,
+        SlotId, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
+        unknown_artifact,
+    };
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, NonEmptySlotTable, SlotTable,
         TerminalDisposition,
@@ -491,18 +495,18 @@ mod tests {
             p1.clone(),
             IntentSlot {
                 desired: DesiredGeneration {
-                    generation: GenerationId::new("gen-1".to_string()),
+                    generation: test_generation_id("gen-1"),
                     artifact: ArtifactRef {
                         release: ReleaseId::new("rel-1".to_string()),
                         variant: VariantName::new("standard".to_string()),
-                        tree: TreeDigest::new("tree-1".to_string()),
+                        tree: test_tree_digest("tree-1"),
                     },
                 },
                 pre_push: None,
             },
         )]);
         DeploymentIntent {
-            deployment_id: DeploymentId::new(dep.to_string()),
+            deployment_id: test_deployment_id(dep),
             target: TargetName::new("production".to_string()),
             group: None,
             behavior_sha256: "sha256-aa".to_string(),
@@ -525,7 +529,7 @@ mod tests {
                 SlotResult {
                     slot_id: SlotId::new("p1".to_string()),
                     outcome: crate::records::SlotOutcomeKind::Activated,
-                    generation: Some(GenerationId::new(format!("gen-{dep}"))),
+                    generation: Some(test_generation_id(&format!("gen-{dep}"))),
                     compensated: false,
                     error: None,
                 },
@@ -535,13 +539,13 @@ mod tests {
                     slots: BTreeMap::from([(
                         SlotId::new("p1".to_string()),
                         GenerationRef {
-                            generation: GenerationId::new(format!("gen-{dep}")),
+                            generation: test_generation_id(&format!("gen-{dep}")),
                             assignment: PlacementSlotAssignment {
                                 placement_slot: SlotId::new("p1".to_string()),
                                 artifact: ArtifactRef {
                                     release: ReleaseId::new(release.to_string()),
                                     variant: VariantName::new("standard".to_string()),
-                                    tree: TreeDigest::new(format!("tree-{dep}")),
+                                    tree: test_tree_digest(&format!("tree-{dep}")),
                                 },
                             },
                         },
@@ -565,15 +569,16 @@ mod tests {
         let mut ids = Vec::new();
         for n in 0..count {
             let id = format!("deploy-{n}");
+            let canonical = test_deployment_id(&id);
             store.append_intent("production", &intent(&id)).unwrap();
             store
                 .append_terminal(
                     "production",
-                    &DeploymentId::new(id.clone()),
+                    &canonical,
                     &successful_terminal(&id, &format!("rel-sha256-{id}")),
                 )
                 .unwrap();
-            ids.push(id);
+            ids.push(canonical.as_str().to_string());
         }
         ids
     }
@@ -581,7 +586,7 @@ mod tests {
     fn dep_ref(target: &TargetName, deployment_id: &str) -> PushRef {
         PushRef::Deployment {
             target: target.clone(),
-            deployment_id: DeploymentId::new(deployment_id.to_string()),
+            deployment_id: DeploymentId::parse(deployment_id).expect("canonical id"),
         }
     }
 
@@ -641,19 +646,19 @@ mod tests {
         let ids = seed_chain(&store, 6);
         let target = TargetName::new("production".to_string());
         for (token, want) in [
-            ("@-", ids[4].as_str()),
-            ("@--", ids[3].as_str()),
-            ("parent(@, 3)", ids[2].as_str()),
-            ("parent(@, 2)", ids[3].as_str()),
-            ("deploy-4--", ids[2].as_str()),
-            ("parent(deploy-5, 2)", ids[3].as_str()),
-            ("deploy-1-", ids[0].as_str()),
-            ("deploy-1", ids[1].as_str()),
-            ("parent(deploy-1, 0)", ids[1].as_str()),
-            ("parent(deploy-2, 1)", ids[1].as_str()),
+            ("@-".to_string(), ids[4].as_str()),
+            ("@--".to_string(), ids[3].as_str()),
+            ("parent(@, 3)".to_string(), ids[2].as_str()),
+            ("parent(@, 2)".to_string(), ids[3].as_str()),
+            (format!("{}--", ids[4]), ids[2].as_str()),
+            (format!("parent({}, 2)", ids[5]), ids[3].as_str()),
+            (format!("{}-", ids[1]), ids[0].as_str()),
+            (ids[1].clone(), ids[1].as_str()),
+            (format!("parent({}, 0)", ids[1]), ids[1].as_str()),
+            (format!("parent({}, 1)", ids[2]), ids[1].as_str()),
         ] {
             assert_eq!(
-                resolve(token, &store).unwrap(),
+                resolve(&token, &store).unwrap(),
                 dep_ref(&target, want),
                 "{token} must resolve to deployment {want}"
             );
@@ -685,10 +690,11 @@ mod tests {
         // The bare deployment id resolves to EXACTLY that deployment's stored
         // payload (the rollback state keyed by the id), never "the most
         // recent rollback" of anything.
-        let rollback = resolve_deployment(&store, &target, &DeploymentId::new(&ids[2])).unwrap();
+        let rollback =
+            resolve_deployment(&store, &target, &DeploymentId::parse(&ids[2]).unwrap()).unwrap();
         assert_eq!(
             rollback.slots[&SlotId::new("p1")].generation.as_str(),
-            "gen-deploy-2"
+            test_generation_id("gen-deploy-2").as_str()
         );
     }
 
@@ -749,17 +755,19 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         seed_chain(&store, 4);
+        let c0 = test_deployment_id("deploy-0");
+        let c1 = test_deployment_id("deploy-1");
         for token in [
-            "parent(@, 6)", // len 4, so 6 steps back underflows
-            "deploy-0-",    // deploy-0 is the first deployment
-            "deploy-0--",
-            "parent(deploy-1, 2)",
-            "parent(deploy-0, 1)",
-            "deploy-missing",
-            "deploy-missing-",
-            "parent(deploy-missing, 1)",
+            "parent(@, 6)".to_string(), // len 4, so 6 steps back underflows
+            format!("{c0}-"),           // deploy-0 is the first deployment
+            format!("{c0}--"),
+            format!("parent({c1}, 2)"),
+            format!("parent({c0}, 1)"),
+            "deploy-missing".to_string(),
+            "deploy-missing-".to_string(),
+            "parent(deploy-missing, 1)".to_string(),
         ] {
-            let err = resolve(token, &store).expect_err(&format!("{token} must fail closed"));
+            let err = resolve(&token, &store).expect_err(&format!("{token} must fail closed"));
             assert!(
                 err.to_string().contains("reference") || err.to_string().contains("step(s) back"),
                 "{token} error must be a ref error, got: {err}"
@@ -780,9 +788,12 @@ mod tests {
         assert_eq!(
             ref_name(
                 &TargetName::new("production".to_string()),
-                &DeploymentId::new("deploy-abc")
+                &test_deployment_id("deploy-abc")
             ),
-            "deployment deploy-abc of target production"
+            format!(
+                "deployment {} of target production",
+                test_deployment_id("deploy-abc")
+            )
         );
     }
 
@@ -805,8 +816,8 @@ mod tests {
         let actuals = BTreeMap::from([(
             SlotId::new("p1".to_string()),
             SlotAttemptState {
-                artifact: ArtifactRef::default(),
-                generation: Some(GenerationId::new("gen-1".to_string())),
+                artifact: unknown_artifact(),
+                generation: Some(test_generation_id("gen-1")),
             },
         )]);
         let outcomes = BTreeMap::from([(
@@ -814,7 +825,7 @@ mod tests {
             SlotResult {
                 slot_id: SlotId::new("p1".to_string()),
                 outcome: crate::records::SlotOutcomeKind::Activated,
-                generation: Some(GenerationId::new("gen-1".to_string())),
+                generation: Some(test_generation_id("gen-1")),
                 compensated: false,
                 error: None,
             },
@@ -834,7 +845,9 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert!(entries[0].terminal.is_some());
         assert_eq!(
-            store.latest_status("deploy-idempotent").unwrap(),
+            store
+                .latest_status(test_deployment_id("deploy-idempotent").as_str())
+                .unwrap(),
             Some(DeploymentStatus::Successful)
         );
 
@@ -861,8 +874,8 @@ mod tests {
         let actuals = BTreeMap::from([(
             slot.clone(),
             SlotAttemptState {
-                artifact: ArtifactRef::default(),
-                generation: Some(GenerationId::new("gen-x".to_string())),
+                artifact: unknown_artifact(),
+                generation: Some(test_generation_id("gen-x")),
             },
         )]);
         let bindings: BTreeMap<SlotId, PhysicalBinding> = BTreeMap::from([(
@@ -895,13 +908,19 @@ mod tests {
     /// readable after the snapshot-wide fields were removed).
     #[test]
     fn legacy_rollback_without_bindings_deserializes_with_empty_map() {
-        let line = r#"{"kind":"terminal","deployment_id":"deploy-old","target":"production","status":"successful","recorded_at":"2026-01-01T00:00:00Z","outcomes":{},"rollback":{"behavior_sha256":"sha256-aa","release":"rel-sha256-old","slots":{}}}"#;
+        // The id must be a canonical (validated) deployment id — the legacy
+        // aspect under test is the missing `bindings` key and the
+        // snapshot-wide members, not the id format.
+        let did = test_deployment_id("deploy-old");
+        let line = format!(
+            r#"{{"kind":"terminal","deployment_id":"{did}","target":"production","status":"successful","recorded_at":"2026-01-01T00:00:00Z","outcomes":{{}},"rollback":{{"behavior_sha256":"sha256-aa","release":"rel-sha256-old","slots":{{}}}}}}"#
+        );
         // The legacy line PARSES at the wire level (the legacy snapshot-wide
         // members are tolerated by serde — unknown members are skipped), and
         // the domain conversion REFUSES it (fail closed): the legacy
         // `release` disagrees with the snapshot's derived releases (the
         // per-slot bindings — empty here — are the authoritative source).
-        let wire: crate::records::LedgerTerminalWire = serde_json::from_str(line).unwrap();
+        let wire: crate::records::LedgerTerminalWire = serde_json::from_str(&line).unwrap();
         let err = wire.into_domain().expect_err(
             "a legacy release that disagrees with the derived snapshot releases fails closed",
         );
@@ -919,14 +938,25 @@ mod tests {
             flags
                 .into_iter()
                 .enumerate()
-                .map(|(n, ok)| (format!("deploy-{n:04}"), ok))
+                .map(|(n, ok)| {
+                    (
+                        test_deployment_id(&format!("deploy-{n:04}"))
+                            .as_str()
+                            .to_string(),
+                        ok,
+                    )
+                })
                 .collect()
         })
     }
 
     /// A minimal intent record for the target, enough to seed a ledger entry.
+    /// `dep` is a CANONICAL deployment id (the ledger is keyed by the
+    /// validated form).
     fn intent_entry(dep: &str) -> DeploymentIntent {
-        intent(dep)
+        let mut it = intent(dep);
+        it.deployment_id = DeploymentId::parse(dep).expect("canonical seeded id");
+        it
     }
 
     /// THE USER'S PROPERTY, per resolve-leg case: seed a REAL store with a
@@ -1010,7 +1040,7 @@ mod tests {
                 store
                     .append_terminal(
                         "production",
-                        &DeploymentId::new(id.clone()),
+                        &DeploymentId::parse(id).expect("canonical seeded id"),
                         &successful_terminal(id, &release),
                     )
                     .unwrap();
@@ -1018,7 +1048,7 @@ mod tests {
                 store
                     .append_terminal(
                         "production",
-                        &DeploymentId::new(id.clone()),
+                        &DeploymentId::parse(id).expect("canonical seeded id"),
                         &LedgerTerminal {
                             recorded_at: "2026-01-01T00:00:00Z".to_string(),
                             // The FailedRolledBack compensation report IS the
@@ -1029,7 +1059,7 @@ mod tests {
                                 SlotResult {
                                     slot_id: SlotId::new("p1".to_string()),
                                     outcome: crate::records::SlotOutcomeKind::Restored,
-                                    generation: Some(GenerationId::new("gen-1".to_string())),
+                                    generation: Some(test_generation_id("gen-1")),
                                     compensated: true,
                                     error: None,
                                 },

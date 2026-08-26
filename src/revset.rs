@@ -354,7 +354,12 @@ fn deployment_id_base(input: &mut &str, token: &str) -> ModalResult<RelBase, Ref
     if let Some(rest) = base.strip_prefix("deploy-")
         && !rest.is_empty()
     {
-        return Ok(RelBase::Refid(DeploymentId::new(base.to_string())));
+        return DeploymentId::parse(base).map(RelBase::Refid).map_err(|_| {
+            ErrMode::Backtrack(RefErr(format!(
+                "unrecognized reference id '{base}' in '{token}' (expected a deployment id like \
+                    'deploy-...', the '@' forms, or 'release:<id>')"
+            )))
+        });
     }
     Err(ErrMode::Backtrack(RefErr(format!(
         "unrecognized reference id '{base}' in '{token}' (expected a deployment id like \
@@ -485,14 +490,15 @@ fn deployment_form(input: &mut &str, token: &str) -> ModalResult<RefExpr, RefErr
         ))));
     }
     let dep = match id.strip_prefix("deploy-") {
-        Some(tail) if !tail.is_empty() => DeploymentId::new(id.to_string()),
-        _ => {
-            return Err(ErrMode::Backtrack(RefErr(format!(
-                "unrecognized reference id '{id}' in '{token}' (expected a deployment id like \
-                'deploy-...', the '@' forms, or 'release:<id>')"
-            ))));
-        }
-    };
+        Some(tail) if !tail.is_empty() => DeploymentId::parse(id),
+        _ => Err(Error::config("unrecognized reference id")),
+    }
+    .map_err(|_| {
+        ErrMode::Backtrack(RefErr(format!(
+            "unrecognized reference id '{id}' in '{token}' (expected a deployment id like \
+            'deploy-...', the '@' forms, or 'release:<id>')"
+        )))
+    })?;
     Ok(RefExpr::Relative(RelativeRef {
         base: RelBase::Refid(dep),
         steps: dashes as u64,
@@ -502,6 +508,7 @@ fn deployment_form(input: &mut &str, token: &str) -> ModalResult<RefExpr, RefErr
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::model::test_deployment_id;
     use proptest::prelude::*;
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
 
@@ -549,25 +556,26 @@ pub(crate) mod tests {
                 steps: 3
             })
         );
+        let d = test_deployment_id("deploy-abc123");
         assert_eq!(
-            rel("deploy-abc123--"),
+            rel(&format!("{d}--")),
             RefExpr::Relative(RelativeRef {
-                base: RelBase::Refid(DeploymentId::new("deploy-abc123")),
+                base: RelBase::Refid(d.clone()),
                 steps: 2
             })
         );
         assert_eq!(
-            rel("parent(deploy-abc123, 2)"),
+            rel(&format!("parent({d}, 2)")),
             RefExpr::Relative(RelativeRef {
-                base: RelBase::Refid(DeploymentId::new("deploy-abc123")),
+                base: RelBase::Refid(d.clone()),
                 steps: 2
             })
         );
         // The bare deployment id is the 0-step form.
         assert_eq!(
-            rel("deploy-abc123"),
+            rel(d.as_str()),
             RefExpr::Relative(RelativeRef {
-                base: RelBase::Refid(DeploymentId::new("deploy-abc123")),
+                base: RelBase::Refid(d.clone()),
                 steps: 0
             })
         );
@@ -652,8 +660,14 @@ pub(crate) mod tests {
     /// A `deploy-<id>` deployment-id refid parses to a deployment base.
     #[test]
     fn parse_deployment_id_forms() {
-        for token in ["deploy-a", "deploy-a-", "deploy-a--", "parent(deploy-a, 5)"] {
-            let parsed = parse_ref_expr(token).expect("deployment-id forms parse");
+        let d = test_deployment_id("deploy-a");
+        for token in [
+            d.as_str().to_string(),
+            format!("{d}-"),
+            format!("{d}--"),
+            format!("parent({d}, 5)"),
+        ] {
+            let parsed = parse_ref_expr(&token).expect("deployment-id forms parse");
             assert!(
                 matches!(
                     parsed,
@@ -709,9 +723,10 @@ pub(crate) mod tests {
             // `parent(<deployment-id>, M)` with a huge M (and huge M AND a
             // huge count: M is parsed first, so it reports the ancestor-count
             // error).
+            let d = test_deployment_id("deploy-a");
             for token in [
-                format!("parent(deploy-a, {huge})"),
-                format!("parent(deploy-a, {huge})"),
+                format!("parent({d}, {huge})"),
+                format!("parent({d}, {huge})"),
             ] {
                 let err = parse_no_panic(&token)
                     .expect_err(&format!("oversized ancestor count '{token}' must be a ref error"));
@@ -732,7 +747,10 @@ pub(crate) mod tests {
                 }),
             );
             let over = (u64::MAX as u128 + 1).to_string();
-            for token in [format!("parent(@, {over})"), format!("parent(deploy-a, {over})")] {
+            for token in [
+                format!("parent(@, {over})"),
+                format!("parent({d}, {over})"),
+            ] {
                 let err = parse_no_panic(&token)
                     .expect_err(&format!("u64::MAX + 1 count '{token}' must be a ref error"));
                 assert!(
@@ -764,9 +782,11 @@ pub(crate) mod tests {
         ]
     }
 
-    /// A deployment-id refid (`deploy-<id>`).
+    /// A deployment-id refid (`deploy-<id>`). The id must be a CANONICAL
+    /// (validated) deployment id — the grammar validates the refid, so the
+    /// strategy generates the canonical form of a random tag.
     fn dep_id() -> impl Strategy<Value = String> {
-        "[a-z][a-z0-9]{0,7}".prop_map(|s| format!("deploy-{s}"))
+        "[a-z][a-z0-9]{0,7}".prop_map(|s| test_deployment_id(&s).as_str().to_string())
     }
 
     /// A release id for the DIRECT `release:<id>` form: a full

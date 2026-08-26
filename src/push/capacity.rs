@@ -152,7 +152,7 @@ fn tree_size_on_host(root: &Path) -> u64 {
 mod tests {
     use super::*;
     use crate::model::{
-        ArtifactRef, DeploymentId, OperationId, ReleaseId, SlotId, TreeDigest, VariantName,
+        ArtifactRef, DeploymentId, OperationId, ReleaseId, SlotId, VariantName, test_tree_digest,
     };
     use crate::push::plan::PlannedAssignment;
     use crate::remote::helper::RemoteHelper;
@@ -308,7 +308,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         // Fabricate a local object whose tree totals exactly 6000 bytes.
-        let tree = TreeDigest::new("tree-6000".to_string());
+        let tree = test_tree_digest("tree-6000");
         let obj_root = store.object_root(&tree);
         std::fs::create_dir_all(obj_root.join("app")).unwrap();
         std::fs::write(obj_root.join("app/file"), vec![b'x'; 6000]).unwrap();
@@ -424,7 +424,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         // Fabricate a local object whose tree totals exactly 6000 bytes.
-        let tree = TreeDigest::new("tree-6000".to_string());
+        let tree = test_tree_digest("tree-6000");
         let obj_root = store.object_root(&tree);
         std::fs::create_dir_all(obj_root.join("app")).unwrap();
         std::fs::write(obj_root.join("app/file"), vec![b'x'; 6000]).unwrap();

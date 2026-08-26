@@ -228,7 +228,7 @@ pub fn release_digest(
         variants: variants.clone(),
     };
     let bytes = serde_json::to_vec(&payload).expect("payload serializes");
-    ReleaseDigest::new(sha256_bytes(&bytes))
+    ReleaseDigest::parse(&sha256_bytes(&bytes)).expect("sha256 hex is a valid digest")
 }
 
 /// Build a complete, immutable release record for the given variant bindings.

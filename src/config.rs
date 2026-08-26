@@ -1218,9 +1218,10 @@ impl ProjectConfig {
             .into_iter()
             .map(|(slot, server)| {
                 (
-                    SlotId::new(slot.id.clone()),
+                    SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment"),
                     PhysicalBinding {
-                        server: ServerId::new(server.id.as_str().to_string()),
+                        server: ServerId::parse(server.id.as_str())
+                            .expect("validated server id is a safe segment"),
                         deploy_dir: slot.deploy_dir.to_string_lossy().into_owned(),
                     },
                 )
@@ -1660,8 +1661,8 @@ pub fn resolved_mode(mode: &Option<String>) -> Result<Option<u32>> {
 mod tests {
     use super::*;
     use crate::model::{
-        ArtifactRef, DeploymentId, GenerationId, LEDGER_SCHEMA_VERSION, ReleaseId, TargetName,
-        TreeDigest, VariantName,
+        ArtifactRef, LEDGER_SCHEMA_VERSION, ReleaseId, TargetName, VariantName, test_deployment_id,
+        test_generation_id, test_tree_digest,
     };
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerIntentWire, LedgerLine,
@@ -2922,18 +2923,18 @@ interval_seconds = 0
             p1.clone(),
             IntentSlot {
                 desired: DesiredGeneration {
-                    generation: GenerationId::new("gen-1".to_string()),
+                    generation: test_generation_id("gen-1"),
                     artifact: ArtifactRef {
                         release: ReleaseId::new("rel-1".to_string()),
                         variant: VariantName::new("standard".to_string()),
-                        tree: TreeDigest::new("tree-1".to_string()),
+                        tree: test_tree_digest("tree-1"),
                     },
                 },
                 pre_push: None,
             },
         )]);
         DeploymentIntent {
-            deployment_id: DeploymentId::new(dep.to_string()),
+            deployment_id: test_deployment_id(dep),
             target: TargetName::new("t1".to_string()),
             group: None,
             behavior_sha256: "sha256-aa".to_string(),

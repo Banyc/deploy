@@ -14,7 +14,7 @@ use crate::history::{self, PushRef, RefExpr};
 use crate::layout;
 use crate::model::{
     ArtifactRef, BehaviorContract, DeploymentId, GenerationId, OperationId, ReleaseId, SlotId,
-    TargetName, TreeDigest, VariantName,
+    TargetName, TreeDigest, VariantName, unknown_artifact,
 };
 use crate::push::capacity::capacity_preflight;
 use crate::push::lock::FileLock;
@@ -216,7 +216,9 @@ pub fn push(
         let current_slot_ids: Vec<SlotId> = config
             .target_slots(target_name)?
             .into_iter()
-            .map(|(slot, _)| SlotId::new(slot.id.clone()))
+            .map(|(slot, _)| {
+                SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment")
+            })
             .collect();
         crate::push::plan::validate_direct_release_membership(
             target_name,
@@ -448,9 +450,17 @@ fn push_inner(
             )?;
             let meta = tree::canonicalize_tree(&staging)?;
             if !opts.dry_run {
-                store.store_object(&meta.tree_sha256.clone().into(), &staging)?;
+                store.store_object(
+                    &TreeDigest::parse(&meta.tree_sha256)
+                        .expect("canonicalized tree sha256 is a valid digest"),
+                    &staging,
+                )?;
             }
-            variant_trees.insert(v, TreeDigest::new(meta.tree_sha256));
+            variant_trees.insert(
+                v,
+                TreeDigest::parse(&meta.tree_sha256)
+                    .expect("canonicalized tree sha256 is a valid digest"),
+            );
         }
     }
 
@@ -509,12 +519,14 @@ fn push_inner(
     let mut helpers: HashMap<SlotId, RemoteHelper> = HashMap::new();
     let mut statuses: HashMap<SlotId, crate::remote::helper::RemoteStatus> = HashMap::new();
     for (slot, s) in &all_members {
-        let slot_id = SlotId::new(slot.id.clone());
+        let slot_id = SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
+
         let remote = factory(s, slot)?;
         remotes.insert(slot_id, remote);
     }
     for (slot, _s) in &all_members {
-        let slot_id = SlotId::new(slot.id.clone());
+        let slot_id = SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
+
         let r = remotes.get(&slot_id).unwrap();
         let helper = RemoteHelper::new(r.as_ref());
         // Prepare the host identity (verify/pin the host key) BEFORE any status
@@ -571,7 +583,12 @@ fn push_inner(
     ) {
         let bindings: BTreeMap<VariantName, TreeDigest> = variant_trees
             .iter()
-            .map(|(k, v)| (VariantName::new(k.clone()), v.clone()))
+            .map(|(k, v)| {
+                (
+                    VariantName::parse(k).expect("variant name is a safe segment"),
+                    v.clone(),
+                )
+            })
             .collect();
         let rec = crate::release::build_release(
             &mapping_sha,
@@ -754,7 +771,9 @@ fn push_inner(
     // written.
     if !opts.dry_run {
         for (slot, _s) in &members {
-            let slot_id = SlotId::new(slot.id.clone());
+            let slot_id =
+                SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
+
             let helper = &helpers[&slot_id];
             let status = &statuses[&slot_id];
             helper.handshake()?;
@@ -788,11 +807,11 @@ fn push_inner(
         let expected = statuses
             .get(slot_id)
             .and_then(|st| st.current_generation.clone())
-            .map(GenerationId::new);
+            .map(|g| GenerationId::parse(&g).expect("observed generation is a valid gen id"));
         let expected_tree = statuses
             .get(slot_id)
             .and_then(|st| st.current_tree.clone())
-            .map(TreeDigest::new);
+            .map(|t| TreeDigest::parse(&t).expect("observed tree is a valid digest"));
         let gid = GenerationId::generate();
         new_gen.insert(slot_id.clone(), gid.clone());
         plan_servers.insert(
@@ -821,7 +840,7 @@ fn push_inner(
                         generation: Some(g.clone()),
                     })
                     .unwrap_or_else(|_| SlotAttemptState {
-                        artifact: ArtifactRef::default(),
+                        artifact: unknown_artifact(),
                         generation: Some(g.clone()),
                     })
             }),
@@ -1097,7 +1116,7 @@ fn push_inner(
         .collect();
     let attempt_intent = DeploymentIntent {
         deployment_id: deployment_id.clone(),
-        target: TargetName::new(target_name.to_string()),
+        target: TargetName::parse(target_name).expect("target name is a safe segment"),
         group: selection.group.clone(),
         behavior_sha256: desired_behavior_sha.clone(),
         attempted_at: crate::remote::helper::now_rfc3339(),
@@ -1301,7 +1320,7 @@ fn push_inner(
             let cur = statuses
                 .get(&a.placement_slot)
                 .and_then(|s| s.current_generation.clone())
-                .map(GenerationId::new);
+                .map(|g| GenerationId::parse(&g).expect("observed generation is a valid gen id"));
             results.insert(
                 a.placement_slot.clone(),
                 SlotResult {
@@ -1504,7 +1523,9 @@ fn push_inner(
             Some(g) => match helper.read_assignment(&g) {
                 Ok(asn) => SlotAttemptState {
                     artifact: asn.artifact.clone(),
-                    generation: Some(GenerationId::new(g)),
+                    generation: Some(
+                        GenerationId::parse(&g).expect("observed generation is a valid gen id"),
+                    ),
                 },
                 Err(_) => {
                     // The generation is observed (`g`), but its assignment could
@@ -1513,8 +1534,10 @@ fn push_inner(
                     // generation and mark the assignment unknown rather than
                     // fabricating desired state.
                     SlotAttemptState {
-                        artifact: ArtifactRef::default(),
-                        generation: Some(GenerationId::new(g)),
+                        artifact: unknown_artifact(),
+                        generation: Some(
+                            GenerationId::parse(&g).expect("observed generation is a valid gen id"),
+                        ),
                     }
                 }
             },
@@ -1712,7 +1735,8 @@ fn push_inner(
     let mut observed_warnings: Vec<String> = Vec::new();
     let mut observed_servers: BTreeMap<SlotId, ObservedSlot> = BTreeMap::new();
     for (slot, _sdef) in &members {
-        let slot_id = SlotId::new(slot.id.clone());
+        let slot_id = SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
+
         // The slot's LIVE remote assignment. `status` is a read; under the
         // one-shot pre-swap arm it has already fired and been consumed inside
         // `process_server`, so this read reflects the true post-mutation
@@ -2043,13 +2067,17 @@ fn refresh_observed(
     observed_warnings: &mut Vec<String>,
 ) {
     for (slot, sdef) in members {
-        let slot_id = SlotId::new(slot.id.clone());
+        let slot_id = SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
+
         let Some(observed_server) = observed_servers.get(&slot_id) else {
             continue;
         };
         if let Err(e) = store.write_server(&crate::records::ServerState {
-            id: crate::model::ServerId::new(sdef.id.as_str().to_string()),
-            last_seen_target: Some(TargetName::new(target_name.to_string())),
+            id: crate::model::ServerId::parse(sdef.id.as_str())
+                .expect("validated server id is a safe segment"),
+            last_seen_target: Some(
+                TargetName::parse(target_name).expect("target name is a safe segment"),
+            ),
             last_observed: Some(observed_server.clone()),
         }) {
             // The durable facts are recorded; only the per-server projection
@@ -2114,7 +2142,8 @@ pub(crate) fn retry_deferred_retentions(
     let mut still_deferred: Vec<String> = Vec::new();
     let mut serviced: Vec<String> = Vec::new();
     for slot_str in debt.keys().cloned().collect::<Vec<_>>() {
-        let sid = SlotId::new(slot_str.clone());
+        let sid = SlotId::parse(&slot_str).expect("rotation debt slot id is a safe segment");
+
         let Some(helper) = helpers.get(&sid) else {
             // The slot is no longer a member of this target, so its retention
             // cannot be serviced from here; keep the marker and say so.
@@ -2358,7 +2387,7 @@ mod tests {
     use super::*;
     use crate::model::{
         CanonicalSlot, CanonicalSlots, GenerationRef, Provenance, RELEASE_RECORD_SCHEMA_VERSION,
-        ReleaseRecord,
+        ReleaseRecord, test_deployment_id, test_generation_id, test_tree_digest, unknown_artifact,
     };
     use crate::records::LedgerEntry;
     use crate::remote::transport::{FsBytes, LocalTransport};
@@ -2863,9 +2892,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         .unwrap();
         let meta = tree::canonicalize_tree(&staging).unwrap();
         let tree = TreeDigest::new(meta.tree_sha256.clone());
-        store
-            .store_object(&meta.tree_sha256.into(), &staging)
-            .unwrap();
+        store.store_object(&tree, &staging).unwrap();
 
         // Find the materialized `server` file wherever the recursive mapping
         // placed it (the source dir's contents merge under `app/`).
@@ -2990,7 +3017,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .append_intent(
                 target,
                 &DeploymentIntent {
-                    deployment_id: DeploymentId::new(deployment_id.to_string()),
+                    deployment_id: test_deployment_id(deployment_id),
                     target: TargetName::new(target.to_string()),
                     group: None,
                     behavior_sha256: behavior_sha256.to_string(),
@@ -3003,7 +3030,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         store
             .append_terminal(
                 target,
-                &DeploymentId::new(deployment_id.to_string()),
+                &test_deployment_id(deployment_id),
                 &LedgerTerminal {
                     recorded_at: "2026-01-01T00:00:00Z".to_string(),
                     // The EXACT-EQUAL shape: the outcomes keys equal the
@@ -3461,7 +3488,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn main_path_replays_after_terminal_append_failure() {
         let h = RecoveryHarness::new();
-        let id = DeploymentId::new("deploy-main-terminal-fault".to_string());
+        let id = test_deployment_id("deploy-main-terminal-fault");
 
         let err = {
             h.store.fault_registry().arm_append_terminal(id.as_str());
@@ -3649,7 +3676,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn main_path_finalize_is_replay_safe_and_idempotent() {
         let h = RecoveryHarness::new();
-        let id = DeploymentId::from("deploy-main-plain".to_string());
+        let id = test_deployment_id("deploy-main-plain");
 
         // First: a normal push completes finalization fully (no faults):
         // the attempt is `Successful`, one snapshot entry, the ref set.
@@ -3660,8 +3687,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "clean push must finalize Successful"
         );
         assert!(
-            r1.message
-                .contains("rollback payload keyed by deployment deploy-main-plain of target t1"),
+            r1.message.contains(&format!(
+                "rollback payload keyed by deployment {id} of target t1"
+            )),
             "message must carry the deployment-keyed rollback payload, got: {}",
             r1.message
         );
@@ -3692,7 +3720,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     fn conflicting_commit_marker_finalizes_degraded_and_never_successful() {
         let h = RecoveryHarness::new();
         // Baseline: a clean successful push (dep1) owns s0.
-        let id1 = DeploymentId::new("deploy-conflict-baseline".to_string());
+        let id1 = test_deployment_id("deploy-conflict-baseline");
         let r1 = push_main_with_id(&h, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
 
@@ -3835,7 +3863,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn intent_persist_fault_leaves_remote_untouched() {
         let h = RecoveryHarness::new();
-        let id = DeploymentId::new("deploy-intent-fault".to_string());
+        let id = test_deployment_id("deploy-intent-fault");
         let err = {
             h.store.fault_registry().arm_append_attempt(id.as_str());
             push_main_with_id(&h, &id).expect_err("push must abort when the intent persist fails")
@@ -3865,7 +3893,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
 
         // A clean push with a fresh id proceeds normally: remote advances.
-        let id2 = DeploymentId::new("deploy-intent-fault-clean".to_string());
+        let id2 = test_deployment_id("deploy-intent-fault-clean");
         let r2 = push_main_with_id(&h, &id2).unwrap();
         assert_eq!(
             r2.status,
@@ -3887,7 +3915,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn write_results_fault_leaves_intent_durable_and_recovers_from_verified_desired() {
         let h = RecoveryHarness::new();
-        let id = DeploymentId::new("deploy-inprogress-no-results".to_string());
+        let id = test_deployment_id("deploy-inprogress-no-results");
         let err = {
             h.store.fault_registry().arm_append_terminal(id.as_str());
             push_main_with_id(&h, &id).expect_err("push must abort when write_results fails")
@@ -3955,7 +3983,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn inprogress_crash_window_reconciles_to_exactly_once_success() {
         let h = RecoveryHarness::new();
-        let id = DeploymentId::new("deploy-inprogress-window".to_string());
+        let id = test_deployment_id("deploy-inprogress-window");
         let err = {
             h.store.fault_registry().arm_append_terminal(id.as_str());
             push_main_with_id(&h, &id).expect_err("push must abort when the terminal append fails")
@@ -4012,7 +4040,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     fn inprogress_attempt_diverged_generation_finalizes_degraded() {
         let h = RecoveryHarness::new();
         // Push 1: a real successful deployment advances the remote.
-        let id_b = DeploymentId::new("deploy-diverged-baseline".to_string());
+        let id_b = test_deployment_id("deploy-diverged-baseline");
         let r1 = push_main_with_id(&h, &id_b).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let baseline = r1.attempt.as_ref().expect("attempt recorded");
@@ -4023,8 +4051,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // remote never minted: intent durable, finalization never started,
         // and the remote's current points elsewhere.
         let target_a = GenerationId::generate();
-        let id_a = DeploymentId::new("deploy-inprogress-diverged".to_string());
+        let id_a = test_deployment_id("deploy-inprogress-diverged");
         let desired_ref = baseline.desired[&SlotId::new("p1")].clone();
+
         let intent = DeploymentIntent {
             deployment_id: id_a.clone(),
             target: TargetName::new("t1".to_string()),
@@ -4104,7 +4133,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn clean_push_transition_sequence_and_outcomes() {
         let h = RecoveryHarness::new();
-        let id = DeploymentId::new("deploy-sequence".to_string());
+        let id = test_deployment_id("deploy-sequence");
         let r = push_main_with_id(&h, &id).unwrap();
         assert_eq!(r.status, Some(DeploymentStatus::Successful));
 
@@ -4157,7 +4186,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn mid_mutation_fault_leaves_intent_durable_without_advancing_remote() {
         let h = RecoveryHarness::new();
-        let id = DeploymentId::new("deploy-mid-mutation".to_string());
+        let id = test_deployment_id("deploy-mid-mutation");
         let armed = Arc::new(AtomicBool::new(true));
         let armed_for_factory = armed.clone();
         let rf = h.remotes_base.clone();
@@ -4244,7 +4273,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn no_op_push_leaves_store_untouched() {
         let h = RecoveryHarness::new();
-        let id = DeploymentId::new("deploy-noop-baseline".to_string());
+        let id = test_deployment_id("deploy-noop-baseline");
         let r1 = push_main_with_id(&h, &id).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
 
@@ -4469,7 +4498,7 @@ interval_seconds = 0
     #[test]
     fn reconcile_attempt_without_transitions_is_eligible() {
         let h = RecoveryHarness::new();
-        let id_b = DeploymentId::new("deploy-no-status-baseline".to_string());
+        let id_b = test_deployment_id("deploy-no-status-baseline");
         let r1 = push_main_with_id(&h, &id_b).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let baseline = r1.attempt.as_ref().expect("attempt recorded");
@@ -4478,8 +4507,9 @@ interval_seconds = 0
 
         // Craft an intent with NO transition appended: eligibility treats the
         // absent status file as eligible (a just-recorded attempt).
-        let id_a = DeploymentId::new("deploy-no-status".to_string());
+        let id_a = test_deployment_id("deploy-no-status");
         let desired_ref = baseline.desired[&SlotId::new("p1")].clone();
+
         let intent = DeploymentIntent {
             slots: NonEmptySlotTable::build(BTreeMap::from([(
                 SlotId::new("p1".to_string()),
@@ -4542,14 +4572,14 @@ interval_seconds = 0
     #[test]
     fn reconcile_multiple_pending_oldest_first_with_monotonic_indices() {
         let h = RecoveryHarness::new();
-        let id_b = DeploymentId::new("deploy-multi-baseline".to_string());
+        let id_b = test_deployment_id("deploy-multi-baseline");
         let r1 = push_main_with_id(&h, &id_b).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let baseline = r1.attempt.as_ref().expect("attempt recorded");
         let desired_ref = baseline.desired[&SlotId::new("p1")].clone();
 
         let mk = |id: &str| DeploymentIntent {
-            deployment_id: DeploymentId::new(id.to_string()),
+            deployment_id: test_deployment_id(id),
             target: TargetName::new("t1".to_string()),
             group: None,
             behavior_sha256: baseline.behavior_sha256.as_str().to_string(),
@@ -4627,7 +4657,7 @@ interval_seconds = 0
     #[test]
     fn verification_failure_compensates_prior_and_observed_reflects_actual() {
         let h = RecoveryHarness::new();
-        let id1 = DeploymentId::new("deploy-verify-fail-baseline".to_string());
+        let id1 = test_deployment_id("deploy-verify-fail-baseline");
         let r1 = push_main_with_id(&h, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let prior =
@@ -4672,7 +4702,7 @@ interval_seconds = 0
         });
         assert_ne!(a_digest, b_digest, "behaviors must differ");
 
-        let id2 = DeploymentId::new("deploy-verify-fail".to_string());
+        let id2 = test_deployment_id("deploy-verify-fail");
         let target = config2.targets.get("t1").expect("harness target");
         let op_id = OperationId::new(format!("op-{}", id2.as_str()));
         let rf = h.remotes_base.clone();
@@ -4944,7 +4974,7 @@ interval_seconds = 0
         let remotes_base = dir.path().join("remotes");
         std::fs::create_dir_all(&remotes_base).unwrap();
 
-        let id = DeploymentId::new("deploy-batched-stop".to_string());
+        let id = test_deployment_id("deploy-batched-stop");
         let project_root = config.project_root(&cfg_path);
         let target = config.targets.get("t1").expect("target t1");
         let op_id = OperationId::new(format!("op-{}", id.as_str()));
@@ -5189,7 +5219,7 @@ interval_seconds = 0
         let remotes_base = dir.path().join("remotes");
         std::fs::create_dir_all(&remotes_base).unwrap();
 
-        let id = DeploymentId::new("deploy-ordered".to_string());
+        let id = test_deployment_id("deploy-ordered");
         let op_id = OperationId::new(format!("op-{}", id.as_str()));
         let rf = remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
@@ -5269,7 +5299,7 @@ interval_seconds = 0
     #[test]
     fn snapshot_ref_membership_change_refuses_and_mutates_nothing() {
         let h = RecoveryHarness::new();
-        let id1 = DeploymentId::new("deploy-membership-baseline".to_string());
+        let id1 = test_deployment_id("deploy-membership-baseline");
         let r1 = push_main_with_id(&h, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         assert_eq!(
@@ -5322,7 +5352,11 @@ interval_seconds = 0
             &config2,
             &PushOptions {
                 dry_run: false,
-                ref_token: Some("deploy-membership-baseline".to_string()),
+                ref_token: Some(
+                    test_deployment_id("deploy-membership-baseline")
+                        .as_str()
+                        .to_string(),
+                ),
                 group: None,
             },
         )
@@ -5371,7 +5405,7 @@ interval_seconds = 0
     #[test]
     fn historical_dry_run_snapshot_ref_plans_without_mutating() {
         let h = RecoveryHarness::new();
-        let id1 = DeploymentId::new("deploy-hist-dry-s0".to_string());
+        let id1 = test_deployment_id("deploy-hist-dry-s0");
         let r1 = push_main_with_id(&h, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let s0 = &r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")];
@@ -5394,7 +5428,11 @@ interval_seconds = 0
             &h.config,
             &PushOptions {
                 dry_run: true,
-                ref_token: Some("deploy-hist-dry-s0".to_string()),
+                ref_token: Some(
+                    test_deployment_id("deploy-hist-dry-s0")
+                        .as_str()
+                        .to_string(),
+                ),
                 group: None,
             },
         )
@@ -5445,7 +5483,7 @@ interval_seconds = 0
     #[test]
     fn historical_dry_run_release_ref_plans_without_mutating() {
         let h = RecoveryHarness::new();
-        let id1 = DeploymentId::new("deploy-hist-dry-rel".to_string());
+        let id1 = test_deployment_id("deploy-hist-dry-rel");
         let r1 = push_main_with_id(&h, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let s0 = &r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")];
@@ -5707,7 +5745,7 @@ interval_seconds = 0
         // Push 1: baseline. The fake systemctl succeeds (no marker), so
         // activation completes; s0 records the prior generation/artifact and
         // the remote publishes the prior behavior contract.
-        let id1 = DeploymentId::new("deploy-act-fail-baseline".to_string());
+        let id1 = test_deployment_id("deploy-act-fail-baseline");
         let r1 = h.push_head(&id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let prior = r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")].clone();
@@ -5742,7 +5780,7 @@ interval_seconds = 0
         )
         .unwrap();
         std::fs::write(&marker, "fail").unwrap();
-        let id2 = DeploymentId::new("deploy-act-fail".to_string());
+        let id2 = test_deployment_id("deploy-act-fail");
         let r2 = h.push_head(&id2).unwrap();
         // Restore the environment and release the env lock BEFORE any
         // assertion: a failing assertion must never poison the shared
@@ -5862,7 +5900,7 @@ interval_seconds = 0
         let marker = h._dir.path().join("fail-restart");
         let _env = install_fake_systemctl(h._dir.path(), &marker, false);
 
-        let id1 = DeploymentId::new("deploy-act-compfail-baseline".to_string());
+        let id1 = test_deployment_id("deploy-act-compfail-baseline");
         let r1 = h.push_head(&id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let prior_gen = r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")]
@@ -5885,7 +5923,7 @@ interval_seconds = 0
         )
         .unwrap();
         std::fs::write(&marker, "fail").unwrap();
-        let id2 = DeploymentId::new("deploy-act-compfail".to_string());
+        let id2 = test_deployment_id("deploy-act-compfail");
         let r2 = h.push_head(&id2).unwrap();
         // Restore the environment and release the env lock BEFORE any
         // assertion: a failing assertion must never poison the shared
@@ -6053,7 +6091,7 @@ interval_seconds = 0
         let _env = install_fake_systemctl(h._dir.path(), &marker, true);
         std::fs::write(&marker, "fail").unwrap();
 
-        let id = DeploymentId::new("deploy-first-act-fail".to_string());
+        let id = test_deployment_id("deploy-first-act-fail");
         let r = h.push_head(&id).unwrap();
         // Restore the environment and release the env lock BEFORE any
         // assertion: a failing assertion must never poison the shared
@@ -6122,7 +6160,7 @@ interval_seconds = 0
     #[test]
     fn capacity_preflight_failure_records_failed_preflight_status() {
         let h = RecoveryHarness::new();
-        let id = DeploymentId::new("deploy-capacity-preflight".to_string());
+        let id = test_deployment_id("deploy-capacity-preflight");
         // Deterministic capacity: the remote reports 100 bytes available and
         // the server policy reserves 1 MiB, so the first deployment cannot
         // fit its tree.
@@ -6219,7 +6257,7 @@ interval_seconds = 0
     #[test]
     fn staging_failure_records_failed_preflight_status() {
         let h = RecoveryHarness::new();
-        let id = DeploymentId::new("deploy-staging-fail".to_string());
+        let id = test_deployment_id("deploy-staging-fail");
         let project_root = h.config.project_root(&h.cfg_path);
         let target = h.config.targets.get("t1").expect("harness target");
         let op_id = OperationId::new(format!("op-{}", id.as_str()));
@@ -6387,7 +6425,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let remotes_base = dir.path().join("remotes");
         std::fs::create_dir_all(&remotes_base).unwrap();
 
-        let id = DeploymentId::new("deploy-staging-later".to_string());
+        let id = test_deployment_id("deploy-staging-later");
         let project_root = config.project_root(&cfg_path);
         let target = config.targets.get("t1").expect("target t1");
         let op_id = OperationId::new(format!("op-{}", id.as_str()));
@@ -6540,13 +6578,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             BTreeMap::from([(
                 SlotId::new("p1".to_string()),
                 GenerationRef {
-                    generation: GenerationId::new("gen-hist".to_string()),
+                    generation: test_generation_id("gen-hist"),
                     assignment: crate::model::PlacementSlotAssignment {
                         placement_slot: SlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
                             release: release.clone(),
                             variant: VariantName::new("standard".to_string()),
-                            tree: TreeDigest::new("tree-x".to_string()),
+                            tree: test_tree_digest("tree-x"),
                         },
                     },
                 },
@@ -6568,7 +6606,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let project_root = h.config.project_root(&h.cfg_path);
         let target = h.config.targets.get("t1").expect("harness target");
         let op_id = OperationId::new("op-historical-behavior".to_string());
-        let id = DeploymentId::new("deploy-hist-behavior".to_string());
+        let id = test_deployment_id("deploy-hist-behavior");
         let rf = h.remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
@@ -6581,7 +6619,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &factory,
             "t1",
             &crate::push::plan::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
-            &history::parse_ref_expr("deploy-hist-behavior-fixture").unwrap(),
+            &history::parse_ref_expr(test_deployment_id("deploy-hist-behavior-fixture").as_str())
+                .unwrap(),
             None,
             &id,
             &op_id,
@@ -6616,7 +6655,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         assert_eq!(
             h.store.read_last_successful("t1").as_deref(),
-            Some("deploy-hist-behavior-fixture"),
+            Some(test_deployment_id("deploy-hist-behavior-fixture").as_str()),
             "the derived last-successful still points at the fixture entry"
         );
         assert!(
@@ -6636,7 +6675,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &factory,
             "t1",
             &crate::push::plan::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
-            &history::parse_ref_expr("deploy-hist-behavior-fixture").unwrap(),
+            &history::parse_ref_expr(test_deployment_id("deploy-hist-behavior-fixture").as_str())
+                .unwrap(),
             None,
             &id,
             &op_id2,
@@ -6692,7 +6732,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         // Push 1: FULL Head push under contract A (argv ["true", "a"]) —
         // release R1 for BOTH slots; snapshot S0: p1=R1, p2=R1.
-        let id1 = DeploymentId::new("deploy-mr-baseline".to_string());
+        let id1 = test_deployment_id("deploy-mr-baseline");
         let r1 = two_slot_push(&h, &h.config, &RefExpr::Head, None, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let var_a = h.config.variant("standard").unwrap();
@@ -6752,7 +6792,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // p1 stays R1. The rollback covers EXACTLY the group (the four-set
         // equality: outcomes == rollback slots == rollback bindings == the
         // intent's membership — the selected slots only).
-        let id2 = DeploymentId::new("deploy-mr-group-b".to_string());
+        let id2 = test_deployment_id("deploy-mr-group-b");
+
         let r2 = two_slot_push(&h, &config2, &RefExpr::Head, Some("group-b"), &id2).unwrap();
         assert_eq!(r2.status, Some(DeploymentStatus::Successful));
         let attempt2 = r2.attempt.as_ref().expect("attempt recorded");
@@ -6788,7 +6829,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // four-set equality), so a full rollback of a group-only snapshot
         // cannot cover the unselected slot — exact rollback requires an
         // identical stable placement-slot set.
-        let id3 = DeploymentId::new("deploy-mr-rollback".to_string());
+        let id3 = test_deployment_id("deploy-mr-rollback");
         let err = two_slot_push(
             &h,
             &config2,
@@ -6808,6 +6849,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // Push 3: FULL rollback of the BASELINE deployment (id1 — a full
         // push whose rollback covers both slots) restores BOTH slots to
         // their recorded state (R1, contract A).
+
         let r3 = two_slot_push(
             &h,
             &config2,
@@ -6895,7 +6937,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// OBSERVED-REFRESH UNKNOWN-ASSIGNMENT FALLBACK: when a live generation's
     /// `assignment.json` cannot be read (missing/corrupt), the refresh must
     /// preserve the OBSERVED generation and mark the assignment UNKNOWN
-    /// (`ArtifactRef::default()`) — never substitute the desired/planned
+    /// (`unknown_artifact()`) — never substitute the desired/planned
     /// artifact. BOTH the pre-push intent (`pre_push`) and the post-push
     /// observed refresh use this contract; results.json records the slot's
     /// pre-swap failure, `current` stays on the observed (corrupt) generation,
@@ -6903,7 +6945,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn observed_refresh_preserves_generation_with_unknown_assignment() {
         let h = RecoveryHarness::new();
-        let id1 = DeploymentId::new("deploy-obs-fallback-baseline".to_string());
+        let id1 = test_deployment_id("deploy-obs-fallback-baseline");
         let r1 = push_main_with_id(&h, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let gen1 = r1.attempt.as_ref().expect("attempt").slots[&SlotId::new("p1")]
@@ -6945,7 +6987,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "v2\n",
         )
         .unwrap();
-        let id2 = DeploymentId::new("deploy-obs-fallback".to_string());
+        let id2 = test_deployment_id("deploy-obs-fallback");
         let armed = Arc::new(AtomicBool::new(true));
         let armed_for_factory = armed.clone();
         let rf = h.remotes_base.clone();
@@ -7032,7 +7074,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(pp.generation, Some(gen1.clone()));
         assert_eq!(
             pp.artifact,
-            ArtifactRef::default(),
+            unknown_artifact(),
             "pre_push must mark the unreadable assignment unknown, not fabricate the desired one"
         );
 
@@ -7189,7 +7231,7 @@ interval_seconds = 0
         let remotes_base = dir.path().join("remotes");
         std::fs::create_dir_all(&remotes_base).unwrap();
 
-        let id = DeploymentId::new("deploy-leave-changed".to_string());
+        let id = test_deployment_id("deploy-leave-changed");
         let project_root = config.project_root(&cfg_path);
         let target = config.targets.get("t1").expect("target t1");
         let op_id = OperationId::new(format!("op-{}", id.as_str()));
@@ -7288,7 +7330,7 @@ interval_seconds = 0
     #[test]
     fn snapshot_ref_resolves_target_from_push_argument() {
         let h = RecoveryHarness::new();
-        let id1 = DeploymentId::new("deploy-bare-atf".to_string());
+        let id1 = test_deployment_id("deploy-bare-atf");
         let r1 = push_main_with_id(&h, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let s0_tree = r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")]
@@ -7767,7 +7809,7 @@ interval_seconds = 0
                    BTreeMap::from([(
                        slot.clone(),
                        GenerationRef {
-                           generation: GenerationId::new(format!("gen-relative-{latest}-{i}")),
+                           generation: test_generation_id(&format!("gen-relative-{latest}-{i}")),
                            assignment: crate::model::PlacementSlotAssignment {
                                placement_slot: slot.clone(),
                                artifact: pending_artifact.clone(),
@@ -7807,7 +7849,9 @@ interval_seconds = 0
            let selected_deployment: String = if selected == 0 {
                pending_id.as_str().to_string()
            } else {
-               format!("deploy-relative-chain-{latest}-{}", selected - 1)
+               test_deployment_id(&format!("deploy-relative-chain-{latest}-{}", selected - 1))
+                   .as_str()
+                   .to_string()
            };
            // The PRE-reconcile resolution (against the seeded chain only):
            // `parent(@, depth)` walks to position (latest - depth) — the
@@ -7822,7 +7866,11 @@ interval_seconds = 0
                    );
                    assert_eq!(
                        deployment_id.as_str(),
-                       format!("deploy-relative-chain-{latest}-{}", latest - depth),
+                       test_deployment_id(&format!(
+                           "deploy-relative-chain-{latest}-{}",
+                           latest - depth
+                       ))
+                       .as_str(),
                        "the stale pre-fix selection"
                    );
                 }
@@ -7857,7 +7905,7 @@ interval_seconds = 0
                      -> Result<Box<dyn Remote>> {
                 Ok(Box::new(LocalTransport::new(rf2.join(s.id.as_str()))?))
             };
-            let ref_id = DeploymentId::new(format!("deploy-relative-ref-{latest}-{depth}"));
+            let ref_id = test_deployment_id(&format!("deploy-relative-ref-{latest}-{depth}"));
             h.store
                 .fault_registry()
                .arm_append_attempt(ref_id.as_str());
@@ -7897,9 +7945,13 @@ interval_seconds = 0
                "the reconciled entry is the pending attempt (its intent line was first)"
            );
            assert_eq!(
-               history::successful_index(&h.store, "t1", &DeploymentId::new(pending_id.as_str()))
-                   .unwrap()
-                   .unwrap(),
+               history::successful_index(
+                   &h.store,
+                   "t1",
+                   &DeploymentId::parse(pending_id.as_str()).expect("canonical pending id"),
+               )
+               .unwrap()
+               .unwrap(),
                0,
                "the pending attempt's successful position is s0"
             );
@@ -7914,9 +7966,10 @@ interval_seconds = 0
             .unwrap();
             assert_eq!(
                 plan.source,
-               crate::records::PlanOrigin::Deployment(DeploymentId::new(
-                   selected_deployment.clone()
-               )),
+                crate::records::PlanOrigin::Deployment(
+                    DeploymentId::parse(&selected_deployment).expect("canonical selected id")
+                ),
+
                "'{token}' must select the entry at successful-chain position {selected} =                  s{}(latest + 1) - {depth} — the POST-reconciliation selection, not the                  pre-reconcile s{}(latest) - {depth}",
                 latest + 1,
                 latest
@@ -7956,7 +8009,7 @@ interval_seconds = 0
             let artifact = ArtifactRef {
                 release: ReleaseId::new("rel-sha256-1111".to_string()),
                 variant: VariantName::new("p1".to_string()),
-                tree: TreeDigest::new("aa".to_string()),
+                tree: test_tree_digest("aa"),
             };
             let bindings = crate::records::PhysicalBinding {
                 server: crate::model::ServerId::new("s1".to_string()),
@@ -7971,7 +8024,7 @@ interval_seconds = 0
                     BTreeMap::from([(
                         slot.clone(),
                         GenerationRef {
-                            generation: GenerationId::new(format!("gen-fixture-{i}")),
+                            generation: test_generation_id(&format!("gen-fixture-{i}")),
                             assignment: crate::model::PlacementSlotAssignment {
                                 placement_slot: slot.clone(),
                                 artifact: artifact.clone(),
@@ -7987,11 +8040,13 @@ interval_seconds = 0
             // deployments deploy-fixture-0..=2).
             let token = match kind {
                 // A deployment id absent from the chain.
-                0 => format!("deploy-absent-{offset}"),
+                0 => test_deployment_id(&format!("deploy-absent-{offset}"))
+                    .as_str()
+                    .to_string(),
                 // An ancestor walk past the start of the 3-deployment chain.
                 1 => format!("parent(@, {})", 2 + offset),
                 // A deployment-id ancestor stepping past the FIRST deployment.
-                _ => "deploy-fixture-0-".to_string(),
+                _ => format!("{}-", test_deployment_id("deploy-fixture-0")),
             };
             // Self-check: the token parses and genuinely fails to resolve.
             let expr = history::parse_ref_expr(&token).unwrap();
@@ -8603,7 +8658,10 @@ interval_seconds = 0
                 mapping_sha256: mapping_sha,
                 behavior_sha256: behavior_sha,
             },
-            variants: BTreeMap::from([("standard".to_string(), "tree-group".to_string())]),
+            variants: BTreeMap::from([(
+                "standard".to_string(),
+                test_tree_digest("tree-group").as_str().to_string(),
+            )]),
             slots: BTreeMap::from([("standard".to_string(), CanonicalSlots { slots: canonical })]),
         };
         let release = crate::release::recompute_release_digest(&rec)
@@ -8626,18 +8684,20 @@ interval_seconds = 0
         let artifact = ArtifactRef {
             release: rid.clone(),
             variant: VariantName::new("standard".to_string()),
-            tree: TreeDigest::new("tree-group".to_string()),
+            tree: test_tree_digest("tree-group"),
         };
         let slots: BTreeMap<SlotId, GenerationRef> = config
             .target_slots("t1")
             .unwrap()
             .into_iter()
             .map(|(slot, _)| {
-                let slot_id = SlotId::new(slot.id.clone());
+                let slot_id =
+                    SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
+
                 (
                     slot_id.clone(),
                     GenerationRef {
-                        generation: GenerationId::new(format!("gen-{}", slot.id.as_str())),
+                        generation: test_generation_id(slot.id.as_str()),
                         assignment: crate::model::PlacementSlotAssignment {
                             placement_slot: slot_id.clone(),
                             artifact: artifact.clone(),

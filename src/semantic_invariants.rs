@@ -76,7 +76,7 @@ use crate::history;
 use crate::layout;
 use crate::model::{
     ArtifactRef, DeploymentId, GenerationId, OperationId, ReleaseId, SlotId, TreeDigest,
-    VariantName,
+    VariantName, test_deployment_id, test_tree_digest,
 };
 use crate::push::capacity::capacity_fits;
 use crate::push::checkpoint::{CheckpointReport, run_checkpoint_unlocked};
@@ -1130,7 +1130,7 @@ impl Fixture {
     /// equal the push order for the lifecycle "newest successful" check.
     fn next_prop_id(&self) -> DeploymentId {
         let i = self.prop_ids.fetch_add(1, Ordering::Relaxed);
-        DeploymentId::new(format!("deploy-si-{}-{i:04}", self.prop_tag))
+        test_deployment_id(&format!("deploy-si-{}-{i:04}", self.prop_tag))
     }
 
     /// The per-fixture deployment-id tag (derived from the unique tempdir
@@ -1310,7 +1310,12 @@ impl Fixture {
         let snaps = self.store.read_snapshots(t).unwrap_or_default();
         match snaps.get(i as usize) {
             Some(s) => s.deployment_id.as_str().to_string(),
-            None => format!("deploy-nonexistent-{t}-{i}"),
+            // A VALID canonical id that resolves to nothing (the grammar
+            // validates the refid, so the token must parse; the resolution
+            // then fails closed as "no such deployment").
+            None => test_deployment_id(&format!("deploy-nonexistent-{t}-{i}"))
+                .as_str()
+                .to_string(),
         }
     }
 
@@ -2046,7 +2051,10 @@ impl Fixture {
             // `read_last_successful` is DERIVED from the ledger (the newest
             // entry with a `Successful` terminal) — there is no separate ref
             // file anymore, so no stale-ref crash corner can exist: the
-            // derived value ALWAYS equals the newest successful entry.
+            // derived value ALWAYS equals the newest successful entry. The
+            // ledger is oldest-first, so the newest successful is the LAST
+            // successful entry (id ordering is NOT push order — the ids are
+            // canonical digests).
             let newest_successful = attempts
                 .iter()
                 .filter(|a| {
@@ -2057,7 +2065,7 @@ impl Fixture {
                         == Some(DeploymentStatus::Successful)
                 })
                 .map(|a| a.deployment_id.as_str())
-                .max_by_key(|a| *a);
+                .last();
             match (newest_successful, last_ok.as_deref()) {
                 (Some(newest), Some(ok)) => {
                     assert_eq!(
@@ -2310,7 +2318,7 @@ fn state_machine_lifecycle_cleanup_failure_after_commit() {
 /// RAII-guarded retention block, so it parks at the SAME barrier.
 #[test]
 fn state_machine_lifecycle_retention_lock_contention_defers_not_silent() {
-    let id = DeploymentId::new("si-lockcont-push".to_string());
+    let id = test_deployment_id("si-lockcont-push");
     let holder = "op-lockcont-holder";
     let f = Fixture::new();
     let remote = f.remote();
@@ -2439,7 +2447,7 @@ fn state_machine_lifecycle_retention_lock_contention_defers_not_silent() {
 #[test]
 fn state_machine_lifecycle_intent_persist_leaves_remote_untouched() {
     let f = Fixture::new();
-    let id = DeploymentId::new("si-intent-fault".to_string());
+    let id = test_deployment_id("si-intent-fault");
     let err = {
         f.arm_store_fault(FailureStep::IntentPersist, &id);
         f.push_with_id("t1", &id)
@@ -2729,7 +2737,7 @@ fn state_machine_checkpoint_floor_discards_below_pending_keeps_above() {
 fn observed_scope_crash_before_refresh_recovered_by_noop_retry() {
     let f = Fixture::new();
     f.apply(Action::Build(1));
-    let id = DeploymentId::new("si-obs-crash-before-refresh");
+    let id = test_deployment_id("si-obs-crash-before-refresh");
     let err = {
         f.arm_store_fault(FailureStep::ResultsWrite, &id);
         f.push_with_id("t1", &id)
@@ -2805,7 +2813,7 @@ fn observed_scope_preflight_failure_leaves_observed_equal() {
     // no-op, which never persists an attempt) — it then fails at the intent
     // persist, BEFORE any remote mutation.
     f.apply(Action::Build(2));
-    let id = DeploymentId::new("si-obs-preflight");
+    let id = test_deployment_id("si-obs-preflight");
     let err = {
         f.arm_store_fault(FailureStep::IntentPersist, &id);
         f.push_with_id("t2", &id)
@@ -2886,7 +2894,7 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     // real one; it fails at the intent persist BEFORE any remote mutation, so
     // t2's observed projection stays equal to the unchanged v2 assignment.
     f.apply(Action::Build(3));
-    let id_p = DeploymentId::new("si-obs-seq-preflight");
+    let id_p = test_deployment_id("si-obs-seq-preflight");
     let err = {
         f.arm_store_fault(FailureStep::IntentPersist, &id_p);
         f.push_with_id("t2", &id_p)
@@ -2917,7 +2925,7 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
         .expect("observed p1 exists from the earlier push")
         .generation
         .clone();
-    let id_c = DeploymentId::new("si-obs-seq-crash");
+    let id_c = test_deployment_id("si-obs-seq-crash");
     let err = {
         f.arm_store_fault(FailureStep::ResultsWrite, &id_c);
         f.push_with_id("t1", &id_c)
@@ -3030,7 +3038,7 @@ fn observed_scope_pre_swap_failure_keeps_prior_record_untouched() {
     // HEAD advances so the t2 push is a REAL push (never an up-to-date
     // no-op), then the pre-swap status read fails exactly once.
     f.apply(Action::Build(2));
-    let id = DeploymentId::new("si-obs-preswap");
+    let id = test_deployment_id("si-obs-preswap");
     let res = {
         f.arm_prop_fault(FailureClass::RemoteStatusPreSwap, "t2", &id);
         f.push_with_id("t2", &id)
@@ -3118,7 +3126,7 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
     // the configured failure policy decides their fate.
     f.write_artifacts(2);
     f.set_remote_read_fault_at_position(position);
-    let id = DeploymentId::new(format!("si-fp-{position}"));
+    let id = test_deployment_id(&format!("si-fp-{position}"));
     let report = f
         .push_with_id("t1", &id)
         .expect("the faulted push still returns a report");
@@ -3437,7 +3445,7 @@ fn identity_canonical_serialization_round_trips() {
     let art = ArtifactRef {
         release: ReleaseId::new("rel-sha256-abc".to_string()),
         variant: VariantName::new("standard".to_string()),
-        tree: TreeDigest::new("tree-1".to_string()),
+        tree: test_tree_digest("tree-1"),
     };
     let bytes = serde_json::to_vec(&art).unwrap();
     let back: ArtifactRef = serde_json::from_slice(&bytes).unwrap();
@@ -3604,7 +3612,7 @@ fn lifecycle_store_fault_matrix_recovers_without_duplicate_history() {
     .enumerate()
     {
         let f = Fixture::new();
-        let id = DeploymentId::new(format!("si-lc-fault-{i}"));
+        let id = test_deployment_id(&format!("si-lc-fault-{i}"));
         let err = {
             f.arm_store_fault(step, &id);
             f.push_with_id("t1", &id)
@@ -3690,7 +3698,7 @@ fn lifecycle_observed_refresh_faults_never_fail_after_commit() {
     .enumerate()
     {
         let f = Fixture::new();
-        let id = DeploymentId::new(format!("si-obs-fault-{i}"));
+        let id = test_deployment_id(&format!("si-obs-fault-{i}"));
         f.arm_store_fault(step, &id);
         let r1 = f
             .push_with_id("t1", &id)
@@ -3838,7 +3846,7 @@ fn lifecycle_debt_fault_matrix_never_fails_after_commit() {
             // (which succeeds and clears the marker). ----
             {
                 let f = Fixture::new();
-                let id = DeploymentId::new(format!("si-debt-fault-{i}-{j}"));
+                let id = test_deployment_id(&format!("si-debt-fault-{i}-{j}"));
                 if have_debt {
                     f.store
                         .write_retention_debt(
@@ -3930,7 +3938,7 @@ fn lifecycle_debt_fault_matrix_never_fails_after_commit() {
             // the debt before reporting "Everything up to date". ----
             {
                 let f = Fixture::new();
-                let seed_id = DeploymentId::new(format!("si-debt-seed-{i}-{j}"));
+                let seed_id = test_deployment_id(&format!("si-debt-seed-{i}-{j}"));
                 let r0 = f
                     .push_with_id("debtfx", &seed_id)
                     .expect("seed push succeeds");
@@ -4742,7 +4750,9 @@ impl Model {
     fn mint_id(&mut self) -> String {
         let i = self.prop_ids;
         self.prop_ids += 1;
-        format!("deploy-si-{}-{i:04}", self.prop_tag)
+        test_deployment_id(&format!("deploy-si-{}-{i:04}", self.prop_tag))
+            .as_str()
+            .to_string()
     }
 
     /// The placement slots a target OWNS (a slot has exactly one owning
@@ -6121,6 +6131,7 @@ fn run_semantic_state_case(steps: Vec<(Action, FailureClass)>) {
     // same counter), so its raw logs, floor, and pending state can be
     // compared id-for-id with the system's.
     let mut model = Model::new_with_tag(system.prop_tag());
+    eprintln!("DBG steps: {:?}", steps);
     for (action, fault) in steps {
         // A Tamper needs a live generation (it edits the CURRENT assignment);
         // generated tampers before the first deployment are skipped rather

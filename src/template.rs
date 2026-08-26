@@ -338,6 +338,7 @@ mod tests {
     use super::*;
     use crate::model::{
         ArtifactRef, DeploymentId, GenerationId, ReleaseId, TreeDigest, VariantName,
+        test_deployment_id, test_generation_id, test_tree_digest,
     };
 
     fn slot_vars() -> TemplateVars {
@@ -352,8 +353,8 @@ mod tests {
         .with_server("deploy", "10.0.0.5", 22)
         .with_slot_id("app-1")
         .with_deployment(
-            Some(&DeploymentId::new("deploy-1")),
-            Some(&GenerationId::new("gen-1")),
+            Some(&test_deployment_id("deploy-1")),
+            Some(&test_generation_id("gen-1")),
             Some(&TreeDigest::new("abc123")),
         )
     }
@@ -386,7 +387,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             all,
-            "/srv/deploy/example|standard|example|rel-sha256-7b278acf5041d50a9704392ac9fac4c6c02ca2cf3be9e5aee61668c8070526d2|production|server-01|deploy|10.0.0.5|22|app-1|deploy-1|gen-1|abc123"
+            format!(
+                "/srv/deploy/example|standard|example|rel-sha256-7b278acf5041d50a9704392ac9fac4c6c02ca2cf3be9e5aee61668c8070526d2|production|server-01|deploy|10.0.0.5|22|app-1|{}|{}|abc123",
+                test_deployment_id("deploy-1"),
+                test_generation_id("gen-1"),
+            )
         );
         // `release` renders the immutable ReleaseId of the deployed artifact,
         // not the human release name from deploy.toml.
@@ -528,7 +533,7 @@ mod tests {
         .with_deployment(
             Some(&DeploymentId::new("d1")),
             Some(&GenerationId::new("g1")),
-            Some(&TreeDigest::new("t1")),
+            Some(&test_tree_digest("t1")),
         );
         let argv = render_argv(
             &[
@@ -579,14 +584,14 @@ mod tests {
         .with_deployment(
             Some(&DeploymentId::new("d1")),
             Some(&GenerationId::new("g1")),
-            Some(&TreeDigest::new("t1")),
+            Some(&test_tree_digest("t1")),
         );
         // The prior artifact differs in every artifact-scoped variable: a
         // historical release, a different variant, a different tree.
         let prior = v.with_artifact(&ArtifactRef {
             release: ReleaseId::new("rel-sha256-999"),
             variant: VariantName::new("legacy"),
-            tree: TreeDigest::new("t9"),
+            tree: test_tree_digest("t9"),
         });
         // release + variant + tree move TOGETHER to the prior artifact: never
         // a torn combination (prior variant with the desired release/tree).
@@ -596,7 +601,10 @@ mod tests {
                 &prior
             )
             .unwrap(),
-            "legacy|/srv/a|rel-sha256-999|deploy|app-1|g1|t9"
+            format!(
+                "legacy|/srv/a|rel-sha256-999|deploy|app-1|g1|{}",
+                test_tree_digest("t9")
+            )
         );
         // The source context is unchanged (with_artifact clones).
         assert_eq!(
@@ -621,7 +629,7 @@ mod tests {
         .with_deployment(
             Some(&DeploymentId::new("d-failed")),
             Some(&GenerationId::new("g-failed")),
-            Some(&TreeDigest::new("t-failed")),
+            Some(&test_tree_digest("t-failed")),
         );
         // The prior assignment differs in every one of the five values: a
         // historical release, a different variant/tree, and the PRIOR
@@ -632,7 +640,7 @@ mod tests {
             artifact: ArtifactRef {
                 release: ReleaseId::new("rel-sha256-999"),
                 variant: VariantName::new("legacy"),
-                tree: TreeDigest::new("t9"),
+                tree: test_tree_digest("t9"),
             },
             behavior_sha256: "b".to_string(),
             prior_generation: None,
@@ -647,7 +655,10 @@ mod tests {
                 &prior
             )
             .unwrap(),
-            "legacy|rel-sha256-999|t9|d-prior|g-prior"
+            format!(
+                "legacy|rel-sha256-999|{}|d-prior|g-prior",
+                test_tree_digest("t9")
+            )
         );
         // The failed generation's identities are gone from the prior context.
         assert!(
@@ -692,8 +703,8 @@ mod tests {
             "server-01",
         )
         .with_deployment(
-            Some(&DeploymentId::new("deploy-1")),
-            Some(&GenerationId::new("gen-1")),
+            Some(&test_deployment_id("deploy-1")),
+            Some(&test_generation_id("gen-1")),
             Some(&artifact.tree),
         );
         assert_eq!(

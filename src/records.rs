@@ -2199,7 +2199,10 @@ pub struct SlotResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{PlacementSlotAssignment, SlotSet, VariantName};
+    use crate::model::{
+        PlacementSlotAssignment, SlotSet, VariantName, test_deployment_id, test_generation_id,
+        test_tree_digest, unknown_artifact,
+    };
     use crate::store::local::LocalStore;
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -2225,13 +2228,13 @@ mod tests {
     /// form); the artifact's release is derived from the slot id.
     fn gen_ref_for(key: &SlotId) -> GenerationRef {
         GenerationRef {
-            generation: GenerationId::new(format!("gen-{}", key.as_str())),
+            generation: test_generation_id(key.as_str()),
             assignment: PlacementSlotAssignment {
                 placement_slot: key.clone(),
                 artifact: ArtifactRef {
                     release: ReleaseId::new(format!("rel-{}", key.as_str())),
                     variant: VariantName::new("standard".to_string()),
-                    tree: TreeDigest::new(format!("tree-{}", key.as_str())),
+                    tree: test_tree_digest(key.as_str()),
                 },
             },
         }
@@ -2257,7 +2260,7 @@ mod tests {
             keys.iter().map(|k| (k.clone(), None)).collect();
         LedgerIntentWire {
             deployment_schema_version: crate::model::LEDGER_SCHEMA_VERSION,
-            deployment_id: DeploymentId::new("deploy-w".to_string()),
+            deployment_id: test_deployment_id("deploy-w"),
             target: TargetName::new("t1".to_string()),
             group: None,
             slot_ids: keys.to_vec(),
@@ -2274,7 +2277,7 @@ mod tests {
         SlotResult {
             slot_id: key.clone(),
             outcome: kind,
-            generation: Some(GenerationId::new(format!("gen-{}", key.as_str()))),
+            generation: Some(test_generation_id(key.as_str())),
             compensated,
             error: None,
         }
@@ -2287,7 +2290,7 @@ mod tests {
     /// (outcomes = the compensation report), 3 Degraded (non-restored
     /// outcomes over the membership → non-empty remaining changes).
     fn agreeing_terminal(keys: &[SlotId], status_idx: u32) -> LedgerTerminalWire {
-        let deployment_id = DeploymentId::new("deploy-w".to_string());
+        let deployment_id = test_deployment_id("deploy-w");
         let target = TargetName::new("t1".to_string());
         match status_idx {
             // Successful: EVERY member slot recorded Activated, and the
@@ -2678,7 +2681,7 @@ mod tests {
         t.target = TargetName::new("other-target".to_string());
     }
     fn deployment_id_mismatch(t: &mut LedgerTerminalWire) {
-        t.deployment_id = DeploymentId::new("deploy-other".to_string());
+        t.deployment_id = test_deployment_id("deploy-other");
     }
 
     proptest! {
@@ -3134,7 +3137,7 @@ mod tests {
         bad.slots.insert(
             slot(9),
             SlotAttemptState {
-                artifact: ArtifactRef::default(),
+                artifact: unknown_artifact(),
                 generation: None,
             },
         );
@@ -3174,7 +3177,7 @@ mod tests {
         report.slots.insert(
             slot(1),
             SlotAttemptState {
-                artifact: ArtifactRef::default(),
+                artifact: unknown_artifact(),
                 generation: None,
             },
         );
@@ -3453,7 +3456,7 @@ mod tests {
         assert!(err.to_string().contains("target"), "err: {err}");
         // A terminal claiming a deployment id with no intent line.
         let mut terminal = agreeing_terminal(&keys, 0);
-        terminal.deployment_id = DeploymentId::new("deploy-ghost".to_string());
+        terminal.deployment_id = test_deployment_id("deploy-ghost");
         assert!(pair_to_domain(&(intent.clone(), terminal)).is_err());
         // An outcome key outside the intent's membership.
         let mut terminal = agreeing_terminal(&keys, 0);
@@ -3611,12 +3614,12 @@ mod tests {
         let outcome = || SlotResult {
             slot_id: slot(1),
             outcome: SlotOutcomeKind::Activated,
-            generation: Some(GenerationId::new("gen-1".to_string())),
+            generation: Some(test_generation_id("gen-1")),
             compensated: false,
             error: None,
         };
         let wire = LedgerTerminalWire {
-            deployment_id: DeploymentId::new("deploy-terminal".to_string()),
+            deployment_id: test_deployment_id("deploy-terminal"),
             target: TargetName::new("t1".to_string()),
             status: DeploymentStatus::Successful,
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
@@ -3633,7 +3636,7 @@ mod tests {
         // The domain terminal round-trips through the wire shape; `from_domain`
         // supplies the entry-owned deployment id / target.
         let json = serde_json::to_string(&LedgerTerminalWire::from_domain(
-            &DeploymentId::new("deploy-terminal".to_string()),
+            &test_deployment_id("deploy-terminal"),
             &TargetName::new("t1".to_string()),
             &domain,
         ))
@@ -3737,7 +3740,7 @@ mod tests {
             slot_ids.iter().map(|k| (k.clone(), None)).collect();
         LedgerIntentWire {
             deployment_schema_version: crate::model::LEDGER_SCHEMA_VERSION,
-            deployment_id: DeploymentId::new("deploy-scalar".to_string()),
+            deployment_id: test_deployment_id("deploy-scalar"),
             target: TargetName::new("t1".to_string()),
             group: None,
             slot_ids,
@@ -3862,7 +3865,7 @@ mod tests {
             artifact: ArtifactRef {
                 release: release.clone(),
                 variant: VariantName::new("standard".to_string()),
-                tree: TreeDigest::new(format!("tree-{}", key.as_str())),
+                tree: test_tree_digest(&format!("tree-{}", key.as_str())),
             },
             expected_generation: None,
             expected_tree: None,
@@ -3932,7 +3935,7 @@ mod tests {
         let behaviors = BehaviorIndex::new();
         let source = match source_kind {
             0 => PlanSource::Head,
-            1 => PlanSource::DeploymentRef(DeploymentId::new("deploy-plan".to_string())),
+            1 => PlanSource::DeploymentRef(test_deployment_id("deploy-plan")),
             _ => PlanSource::ReleaseRef(release.clone()),
         };
         let rebinding = match source_kind {
@@ -3940,7 +3943,7 @@ mod tests {
             _ => None,
         };
         DeploymentPlanWire {
-            deployment_id: DeploymentId::new("deploy-plan".to_string()),
+            deployment_id: test_deployment_id("deploy-plan"),
             target,
             behavior_sha256: crate::release::behavior_index_digest(&behaviors),
             behaviors,
@@ -3962,7 +3965,7 @@ mod tests {
 
     /// source: ReleaseRef → DeploymentRef (the claimed rebinding stays).
     fn source_to_deployment(w: &mut DeploymentPlanWire) {
-        w.source = PlanSource::DeploymentRef(DeploymentId::new("deploy-other".to_string()));
+        w.source = PlanSource::DeploymentRef(test_deployment_id("deploy-other"));
     }
 
     /// source: Head/Deployment → ReleaseRef (no rebinding — a Release

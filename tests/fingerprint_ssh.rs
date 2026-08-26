@@ -479,7 +479,7 @@ fn fingerprint_only_first_push_succeeds() -> Result<()> {
             assert!(
                 attempt
                     .slots
-                    .contains_key(&deploy::model::SlotId::new("p1"))
+                    .contains_key(&deploy::model::SlotId::parse("p1").unwrap())
             );
 
             // The emulated remote now has the full layout: a generation under
