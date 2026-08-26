@@ -86,8 +86,8 @@
 
 use crate::error::{Error, Result};
 use crate::model::{
-    ArtifactRef, BehaviorContract, DeploymentId, GenerationId, GenerationRef, PlacementSlotId,
-    ReleaseId, ServerId, TargetName, TreeDigest,
+    ArtifactRef, BehaviorContract, DeploymentId, GenerationId, GenerationRef, MatchingMembership,
+    PlacementSlotId, ReleaseId, ServerId, TargetName, TreeDigest,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
@@ -894,23 +894,19 @@ pub struct FrozenSlotTopology {
     pub groups: Vec<String>,
 }
 
-/// The membership check backing a historical-release rebinding: the
-/// release's FROZEN slot-id membership for the destination target versus the
-/// target's CURRENT slot-id membership, verified EQUAL before planning
-/// proceeds. The comparison is LOGICAL membership only — slot IDs, never
-/// physical bindings (server / deploy_dir) — so two sets may be identical
-/// while every physical binding differs.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MembershipCheck {
-    /// The membership the release record FROZE for the destination target
-    /// (the union over every frozen variant of its slots whose owning target
-    /// equals the destination, deduplicated by slot id).
-    pub frozen: BTreeSet<String>,
-    /// The destination target's CURRENT membership from the caller's current
-    /// configuration (every slot whose owning target equals the target).
-    pub current: BTreeSet<String>,
-}
-
+/// The membership proof backing a historical-release rebinding: the PROOF
+/// ([`MatchingMembership`]) that the release's FROZEN slot-id membership for
+/// the destination target and the target's CURRENT slot-id membership were
+/// verified EXACTLY EQUAL before planning proceeded (the only construction
+/// path is [`MatchingMembership::verify`], so a [`RebindingPlan`] can only
+/// record an already-verified agreement). The proof carries the agreed
+/// NON-EMPTY slot set; the comparison is LOGICAL membership only — slot IDs,
+/// never physical bindings (server / deploy_dir) — so two sets may be
+/// identical while every physical binding differs.
+///
+/// The serialized form is the agreed slot set (the persisted wire replay of
+/// the verified proof).
+///
 /// An EXPLICIT record that a `release:<id>` push is REBINDING a historical
 /// release's frozen topology onto the CURRENT physical slots.
 ///
@@ -940,11 +936,12 @@ pub struct RebindingPlan {
     /// snapshot). Complete regardless of group selection: a `--group` push
     /// narrows the PLANNED assignments, never the recorded topology.
     pub frozen_topology: BTreeMap<PlacementSlotId, FrozenSlotTopology>,
-    /// The logical membership check that ran before planning: `frozen ==
-    /// current` (slot IDs only; physical bindings may differ). For a group
-    /// push this is the COMPLETE membership — the group narrows the planned
-    /// slots, never the membership check.
-    pub membership: MembershipCheck,
+    /// The membership PROOF that ran before planning (see
+    /// [`MatchingMembership`]): `frozen == current` verified (slot IDs only;
+    /// physical bindings may differ). For a group push this is the COMPLETE
+    /// membership — the group narrows the planned slots, never the
+    /// membership check.
+    pub(crate) membership: MatchingMembership,
     /// The CURRENT physical slots the frozen topology is bound onto, per
     /// PLANNED slot: `slot -> {server, deploy_dir}` from the caller's
     /// current configuration. A group selection records exactly the selected

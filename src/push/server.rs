@@ -686,7 +686,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &vcfg.artifact.mappings,
                 &crate::template::TemplateVars::mapping(
                     &config.application,
-                    config.release.as_str(),
+                    config.release().as_str(),
                     "standard",
                 ),
                 &staging,

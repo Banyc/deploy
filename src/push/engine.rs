@@ -26,7 +26,8 @@ use crate::push::server::{
 use crate::push::staging::{StagingCleanup, cleanup_dry_run_staging, remove_tree_restoring_write};
 use crate::records::{
     BehaviorIndex, DeploymentPlan, DeploymentStatus, LedgerIntent, LedgerIntentReport,
-    LedgerTerminal, ObservedSlot, ServerOutcomeKind, SlotAttemptState, SlotPlan, SlotResult,
+    LedgerTerminal, ObservedSlot, PlanSource, ServerOutcomeKind, SlotAttemptState, SlotPlan,
+    SlotResult,
 };
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::transport::Remote;
@@ -405,7 +406,9 @@ fn push_inner(
     //    not the project root, so an artifact `from` can never escape into the
     //    project's other files. Dry-run uses disposable staging and never writes
     //    to the object store.
-    let release_root = project_root.join("releases").join(config.release.as_str());
+    let release_root = project_root
+        .join("releases")
+        .join(config.release().as_str());
     let mut variant_trees: BTreeMap<String, TreeDigest> = BTreeMap::new();
     // Dry-run staging is disposable. The guard's Drop removes the whole
     // `dry-<deployment>` tree (on error, `?`, or unwind); the guard must
@@ -438,7 +441,7 @@ fn push_inner(
                 &config.variant(&v)?.artifact.mappings,
                 &crate::template::TemplateVars::mapping(
                     &config.application,
-                    config.release.as_str(),
+                    config.release().as_str(),
                     &v,
                 ),
                 &staging,
@@ -657,10 +660,14 @@ fn push_inner(
     // The 4th element is the EXPLICIT rebinding context for a DIRECT release
     // ref (a `release:<id>` push applies the release's frozen topology onto
     // the CURRENT physical slots — [`crate::records::RebindingPlan`]); HEAD
-    // and deployment refs carry `None`.
+    // and deployment refs carry `None`. The planner ALSO produces the
+    // PROOF-BEARING resolution ([`crate::push::plan::ResolvedSelection`]:
+    // target + declared temporal source + the non-empty resolved slot set),
+    // which the engine consumes BY ACCESSOR below (`planned.resolved()`) —
+    // never by construction.
     // (`desired_releases` is now DERIVED from the plan's authoritative per-slot
     // collection (`DeploymentPlan::releases`), never stored on the domain).
-    let (assignments, _desired_releases, source, rebinding) = crate::push::plan::plan_assignments(
+    let planned = crate::push::plan::plan_assignments(
         selection,
         &pref,
         &local_release_id,
@@ -668,6 +675,16 @@ fn push_inner(
         store,
         config,
     )?;
+    // The PROOF-BEARING resolution is consumed BY ACCESSOR (the planner is
+    // the only constructor; the engine never builds one).
+    let resolved = planned.resolved().clone();
+    let (assignments, rebinding) = (planned.assignments, planned.rebinding);
+    // The plan's target AND source are DERIVED from the proof-bearing
+    // resolution: the resolved target IS the plan's target, and the resolved
+    // DECLARED TEMPORAL SOURCE ([`crate::push::plan::ResolvedSelectionSource`])
+    // IS the plan's [`PlanSource`] — the planner's proof is the single
+    // authority for what this plan resolves against.
+    let source: PlanSource = resolved.source().clone().into();
 
     // THE SELECTED (slot, server) pairs this push plans, mutates, and
     // refreshes: derived from the plan's assignments — the per-branch
@@ -680,6 +697,11 @@ fn push_inner(
     // current one (the bug: the selection resolved the group from the
     // caller's current config alone, so a historical release's frozen group
     // selected the WRONG slots here).
+    //
+    // The plan's PROOF-BEARING resolution ([`crate::push::plan::ResolvedSelection`])
+    // is consumed by accessor: the planner built it (target + declared
+    // temporal source + the non-empty resolved slot set), the engine never
+    // constructs one.
     let members: Vec<(&crate::config::SlotDef, &crate::config::ServerDef)> = assignments
         .iter()
         .map(|a| {
@@ -703,11 +725,11 @@ fn push_inner(
     // group must cover every target slot, and after membership changes every
     // current unselected slot must have a prior assignment with a matching
     // physical binding. A full-target push (no group) is always allowed. The
-    // selected set is the plan's per-branch resolution (the assignments).
-    let planned_slot_ids: Vec<PlacementSlotId> = assignments
-        .iter()
-        .map(|a| a.placement_slot.clone())
-        .collect();
+    // selected set is the plan's per-branch resolution — consumed from the
+    // planner's PROOF-BEARING [`crate::push::plan::ResolvedSelection`] by
+    // accessor (`planned.resolved().slots()`), the exact non-empty slot set
+    // the planner resolved against the reference's declared temporal source.
+    let planned_slot_ids: Vec<PlacementSlotId> = resolved.slots().iter().cloned().collect();
     crate::push::plan::validate_partial_rollout(selection, &planned_slot_ids, config, store)?;
 
     // Behavior coverage gate: EVERY planned assignment's (release, variant)
@@ -807,7 +829,7 @@ fn push_inner(
 
     let plan = DeploymentPlan {
         deployment_id: deployment_id.clone(),
-        target: TargetName::new(target_name.to_string()),
+        target: resolved.target().clone(),
         behaviors: behavior_index.clone(),
         slots: plan_servers.clone(),
         source,
@@ -2776,7 +2798,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &vcfg.artifact.mappings,
             &crate::template::TemplateVars::mapping(
                 &config.application,
-                config.release.as_str(),
+                config.release().as_str(),
                 "standard",
             ),
             &staging,
@@ -7835,7 +7857,7 @@ interval_seconds = 0
             &config.variant("standard").unwrap().artifact.mappings,
             &crate::template::TemplateVars::mapping(
                 &config.application,
-                config.release.as_str(),
+                config.release().as_str(),
                 "standard",
             ),
             &staging,

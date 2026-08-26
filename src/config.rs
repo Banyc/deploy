@@ -280,11 +280,26 @@ pub struct Pin {
 /// The active release: the name of a directory directly beneath `releases/` in
 /// the project root. The project structure is forced to
 /// `<project>/releases/<name>/<variant>.toml`; there is no configurable path.
+/// The name carries the single-directory-component invariant
+/// ([`ReleaseName::parse`] is the production constructor; the raw
+/// deserialization path is re-validated by the raw -> domain conversion and by
+/// [`Config::with_release`], so an invalid name can never enter a validated
+/// [`Config`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct ReleaseName(String);
 
 impl ReleaseName {
+    /// Parse and validate a release name: exactly ONE directory component
+    /// (the forced structure is `<project>/releases/<name>/`), so the name
+    /// can never escape the release directory. This is the PRODUCTION
+    /// constructor for a validated release name; the deserialization path
+    /// stays raw and the conversion / [`Config::with_release`] re-validate.
+    pub fn parse(s: &str) -> Result<ReleaseName> {
+        validate_release_name(s)?;
+        Ok(ReleaseName(s.to_string()))
+    }
+
     /// Build a release name for the crate-internal raw layer (the conversion
     /// re-checks that it is a single directory component).
     #[cfg(test)]
@@ -301,6 +316,24 @@ impl fmt::Display for ReleaseName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+/// A release name must be exactly ONE directory component (the forced
+/// structure is `<project>/releases/<name>/<variant>.toml`), so it can never
+/// escape the release directory. Shared by the raw -> domain conversion
+/// ([`Config::try_from`]), [`ReleaseName::parse`], and the validated
+/// release-switch operation [`Config::with_release`].
+fn validate_release_name(name: &str) -> Result<()> {
+    let single_component = matches!(
+        Path::new(name).components().collect::<Vec<_>>().as_slice(),
+        [Component::Normal(c)] if *c == std::ffi::OsStr::new(name)
+    );
+    if !single_component {
+        return Err(Error::config(format!(
+            "release '{name}' must be a single directory name (the release directory is forced to `releases/<name>/`)"
+        )));
+    }
+    Ok(())
 }
 
 impl<'de> Deserialize<'de> for ReleaseName {
@@ -851,15 +884,31 @@ pub struct VariantConfig {
 /// which run the full validation and fail closed on any invalid input. The
 /// variants map is private, so a hand-built graph cannot enter the domain.
 ///
+/// IMMUTABLE VALIDATED DOMAIN: the invariant-bearing fields are private and
+/// read-only ([`Config::schema_version`], [`Config::release`]); the ONLY
+/// mutation path is a VALIDATED operation returning a NEW [`Config`] —
+/// [`Config::with_release`] (re-validates the release-name invariant; the
+/// original is never mutated). Fields without invariants (application, pins,
+/// servers, targets) stay public per the "don't overdo" rule — their inner
+/// invariant-bearing fields (e.g. [`ServerDef`]'s host identity) are already
+/// private.
+///
 /// The name [`DomainConfig`] aliases this type (the two-layer story: raw
 /// serde shapes -> validated domain).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
-    pub schema_version: u32,
+    /// The configuration format version this config was validated as: ALWAYS
+    /// [`CONFIG_SCHEMA_VERSION`] by construction (the raw -> domain
+    /// conversion refuses any other value). Private + read-only
+    /// ([`Config::schema_version`]): the format identity is invariant.
+    schema_version: u32,
     pub application: String,
     /// The active release: the name of a directory directly beneath
     /// `releases/` in the project root (`release: v1` -> `releases/v1/`).
-    pub release: ReleaseName,
+    /// INVARIANT-BEARING (a single directory component) — private and
+    /// read-only ([`Config::release`]); change it through the validated
+    /// [`Config::with_release`] operation, which returns a NEW [`Config`].
+    release: ReleaseName,
     /// Durable retention pins applied on every rotation.
     pub pins: Vec<Pin>,
     /// Every validated server; a server's host identity is exactly one form
@@ -910,6 +959,35 @@ impl Config {
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// The schema version this configuration was validated as — ALWAYS
+    /// [`CONFIG_SCHEMA_VERSION`] by construction (the conversion refuses any
+    /// other value). Read-only accessor: the schema identity of a loaded
+    /// config is immutable.
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    /// The active release: the name of a directory directly beneath
+    /// `releases/` in the project root. Read-only accessor: the release is
+    /// an invariant-bearing field (a single directory component); change it
+    /// through the validated [`Config::with_release`] operation, never by
+    /// assignment.
+    pub fn release(&self) -> &ReleaseName {
+        &self.release
+    }
+
+    /// The VALIDATED release-switch operation: returns a NEW [`Config`]
+    /// whose active release is `release`, re-validating the invariant (the
+    /// name must be exactly one directory component; otherwise `Err` and the
+    /// original is unchanged — the operation never mutates). All other
+    /// fields are carried over unchanged: variants, servers, targets, pins,
+    /// and the schema identity are already validated, and the single
+    /// directory-component rule is the only release-name invariant.
+    pub fn with_release(self, release: ReleaseName) -> Result<Config> {
+        validate_release_name(release.as_str())?;
+        Ok(Config { release, ..self })
     }
 
     /// Absolute release directory: forced to `<project>/releases/<release>`.
@@ -1108,16 +1186,7 @@ impl TryFrom<RawProject> for Config {
 
         // The release name must be exactly one directory component so it
         // cannot escape the forced `releases/` directory.
-        let name = manifest.release.as_str();
-        let single_component = matches!(
-            Path::new(name).components().collect::<Vec<_>>().as_slice(),
-            [Component::Normal(c)] if *c == std::ffi::OsStr::new(name)
-        );
-        if !single_component {
-            return Err(Error::config(format!(
-                "release '{name}' must be a single directory name (the release directory is forced to `releases/<name>/`)"
-            )));
-        }
+        validate_release_name(manifest.release.as_str())?;
         if variants.is_empty() {
             return Err(Error::config(
                 "at least one release variant must be declared",
@@ -1809,7 +1878,7 @@ rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml("v1")).unwrap();
         let cfg = Config::load(&p).expect("config loads from the forced structure");
-        assert_eq!(cfg.release.as_str(), "v1");
+        assert_eq!(cfg.release().as_str(), "v1");
         assert_eq!(
             cfg.variant_names(),
             vec!["high-capacity".to_string(), "standard".to_string()],
@@ -3219,7 +3288,7 @@ interval_seconds = 0
         // The manifest surface is carried through.
         assert_eq!(cfg.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(cfg.application, "app");
-        assert_eq!(cfg.release.as_str(), "v1");
+        assert_eq!(cfg.release().as_str(), "v1");
         assert_eq!(cfg.targets.len(), 1);
 
         // A local:// server's identity is EXACTLY ONE form: Local.

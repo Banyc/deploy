@@ -43,14 +43,102 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::history::{PushRef, resolve_deployment};
 use crate::model::{
-    ArtifactRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, ReleaseRecord, ServerId,
-    TargetName, TreeDigest, VariantName,
+    ArtifactRef, DeploymentId, MatchingMembership, NonEmptySlotSet, PlacementSlotAssignment,
+    PlacementSlotId, ReleaseId, ReleaseRecord, ServerId, SlotSet, TargetName, TreeDigest,
+    VariantName,
 };
 use crate::records::{
-    FrozenSlotTopology, LedgerRollback, MembershipCheck, PhysicalBinding, PlanSource, RebindingPlan,
+    FrozenSlotTopology, LedgerRollback, PhysicalBinding, PlanSource, RebindingPlan,
 };
 use crate::store::local::LocalStore;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+/// The plan for one placement slot: exactly the canonical slot→artifact
+/// assignment ([`PlacementSlotAssignment`]), reused rather than re-declared.
+/// The DECLARED temporal source of a resolved push reference: the reference
+/// kind the planner resolved the selected slots against. This is the
+/// proof-bearing form of a [`PushRef`] carried by a [`ResolvedSelection`]:
+/// `Head` (the CURRENT variant slot declarations), `FrozenRelease` (the
+/// release's frozen slot topology rebound onto the current physical slots), or
+/// `Deployment` (the deployment's exact per-slot assignment).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ResolvedSelectionSource {
+    Head,
+    FrozenRelease(ReleaseId),
+    Deployment(DeploymentId),
+}
+
+impl From<ResolvedSelectionSource> for PlanSource {
+    /// The resolved temporal source IS the plan source: `Head` plans from
+    /// the current topology, `FrozenRelease` is the direct-release reference
+    /// ([`PlanSource::ReleaseRef`]), and `Deployment` is the deployment
+    /// rollback ([`PlanSource::DeploymentRef`]). The engine derives the plan
+    /// record's [`PlanSource`] from the proof-bearing resolution's source via
+    /// this conversion — the planner's proof is the single authority for what
+    /// a plan resolves against.
+    fn from(source: ResolvedSelectionSource) -> PlanSource {
+        match source {
+            ResolvedSelectionSource::Head => PlanSource::Head,
+            ResolvedSelectionSource::FrozenRelease(release) => PlanSource::ReleaseRef(release),
+            ResolvedSelectionSource::Deployment(deployment_id) => {
+                PlanSource::DeploymentRef(deployment_id)
+            }
+        }
+    }
+}
+
+/// The PROOF-BEARING resolution of one push reference: the owning target,
+/// the DECLARED temporal source it resolved against, and the NON-EMPTY
+/// resolved slot-ID set. CONSTRUCTIBLE ONLY BY THE PLANNER: the fields are
+/// private and the sole constructor ([`ResolvedSelection::new`]) lives in
+/// this module (plan.rs), so the engine and every other module consume the
+/// resolution by accessor ([`ResolvedSelection::target`],
+/// [`ResolvedSelection::source`], [`ResolvedSelection::slots`]) and can
+/// never construct one themselves — a compile-level confinement via
+/// visibility (private fields + a planner-only constructor).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedSelection {
+    target: TargetName,
+    source: ResolvedSelectionSource,
+    slots: NonEmptySlotSet,
+}
+
+impl ResolvedSelection {
+    /// The PLANNER'S ONLY construction path (this module): the target, the
+    /// declared temporal source, and the resolved slot ids. Refuses an EMPTY
+    /// resolution (a push that resolves zero slots is never a valid
+    /// resolution — the per-branch slot resolution already errors on empty
+    /// selections, and this constructor is the second line of defense).
+    pub(crate) fn new(
+        target: TargetName,
+        source: ResolvedSelectionSource,
+        slots: impl IntoIterator<Item = PlacementSlotId>,
+    ) -> Result<Self> {
+        let slots = NonEmptySlotSet::try_new(slots).ok_or_else(|| {
+            Error::plan(format!(
+                "reference resolution selected no slots for target '{}'",
+                target
+            ))
+        })?;
+        Ok(ResolvedSelection {
+            target,
+            source,
+            slots,
+        })
+    }
+
+    pub(crate) fn target(&self) -> &TargetName {
+        &self.target
+    }
+
+    pub(crate) fn source(&self) -> &ResolvedSelectionSource {
+        &self.source
+    }
+
+    pub(crate) fn slots(&self) -> &NonEmptySlotSet {
+        &self.slots
+    }
+}
 
 /// The plan for one placement slot: exactly the canonical slot→artifact
 /// assignment ([`PlacementSlotAssignment`]), reused rather than re-declared.
@@ -59,16 +147,31 @@ pub type PlannedAssignment = PlacementSlotAssignment;
 /// The resolution of one push reference into a planned assignment set: the
 /// per-slot assignments, the SET of releases they reference (per-slot
 /// artifact provenance — a partial snapshot can span several releases, so
-/// there is NO single snapshot-wide release), the plan source, and — for a
+/// there is NO single snapshot-wide release), the plan source, — and for a
 /// DIRECT release reference — the explicit [`RebindingPlan`] documenting
 /// that the historical release's frozen topology is being applied onto the
-/// CURRENT physical slots (`None` for HEAD and deployment references).
-pub type PlannedResolution = (
-    Vec<PlannedAssignment>,
-    BTreeSet<ReleaseId>,
-    PlanSource,
-    Option<RebindingPlan>,
-);
+/// CURRENT physical slots (`None` for HEAD and deployment references) —
+/// plus the PROOF-BEARING [`ResolvedSelection`] the assignments were derived
+/// from: the target, its declared temporal source, and the non-empty
+/// resolved slot set. The engine consumes the resolution by accessor
+/// ([`PlannedResolution::resolved`]); it can never construct one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedResolution {
+    pub assignments: Vec<PlannedAssignment>,
+    pub releases: BTreeSet<ReleaseId>,
+    pub source: PlanSource,
+    pub rebinding: Option<RebindingPlan>,
+    resolved: ResolvedSelection,
+}
+
+impl PlannedResolution {
+    /// The planner-produced, proof-bearing resolution this plan was derived
+    /// from: target + declared temporal source + non-empty resolved slot set.
+    /// The engine consumes it by accessor, never by construction.
+    pub(crate) fn resolved(&self) -> &ResolvedSelection {
+        &self.resolved
+    }
+}
 
 /// The NORMALIZED selection of one push/status invocation: the owning target
 /// and the optional rollout group. Normalized once near command entry as the
@@ -356,26 +459,24 @@ pub(crate) fn validate_direct_release_membership(
     release: &ReleaseId,
     rec: &ReleaseRecord,
     current_slot_ids: &[PlacementSlotId],
-) -> Result<()> {
-    let expected: BTreeSet<String> = rec
-        .slots
-        .values()
-        .flat_map(|cs| cs.slots.iter())
-        .filter(|s| s.target == target_name)
-        .map(|s| s.id.clone())
-        .collect();
-    let current: BTreeSet<String> = current_slot_ids
-        .iter()
-        .map(|s| s.as_str().to_string())
-        .collect();
-    if expected != current {
-        return Err(Error::rollback(format!(
+) -> Result<MatchingMembership> {
+    let frozen: SlotSet = SlotSet::new(
+        rec.slots
+            .values()
+            .flat_map(|cs| cs.slots.iter())
+            .filter(|s| s.target == target_name)
+            .map(|s| PlacementSlotId::new(s.id.clone())),
+    );
+    let current: SlotSet = SlotSet::new(current_slot_ids.iter().cloned());
+    MatchingMembership::verify(frozen.clone(), current.clone()).map_err(|_| {
+        let expected: Vec<String> = frozen.iter().map(|s| s.as_str().to_string()).collect();
+        let current_list: Vec<String> = current.iter().map(|s| s.as_str().to_string()).collect();
+        Error::rollback(format!(
             "release {release} targets slots [{}] but target '{target_name}' currently has [{}]; direct release membership drift is rejected before remote access",
-            expected.iter().cloned().collect::<Vec<_>>().join(", "),
-            current.iter().cloned().collect::<Vec<_>>().join(", "),
-        )));
-    }
-    Ok(())
+            expected.join(", "),
+            current_list.join(", "),
+        ))
+    })
 }
 
 /// Resolve the desired assignment for each SELECTED slot given the push
@@ -434,6 +535,18 @@ pub fn plan_assignments(
             // or one selecting zero slots in the current config, is a
             // configuration error, unchanged).
             let members = selection.current_members(config)?;
+            // THE PROOF-BEARING RESOLUTION: the planner resolves the
+            // reference against its declared temporal source (HEAD — the
+            // CURRENT topology) into a non-empty slot set, then derives the
+            // assignments from it. The engine consumes the resolution by
+            // accessor, never by construction.
+            let resolved = ResolvedSelection::new(
+                selection.target.clone(),
+                ResolvedSelectionSource::Head,
+                members
+                    .iter()
+                    .map(|(slot, _)| PlacementSlotId::new(slot.id.clone())),
+            )?;
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
                 let slot_id = PlacementSlotId::new(slot.id.clone());
@@ -454,12 +567,13 @@ pub fn plan_assignments(
                     },
                 });
             }
-            Ok((
-                out,
-                BTreeSet::from([local_release_id.clone()]),
-                PlanSource::Head,
-                None,
-            ))
+            Ok(PlannedResolution {
+                assignments: out,
+                releases: BTreeSet::from([local_release_id.clone()]),
+                source: PlanSource::Head,
+                rebinding: None,
+                resolved,
+            })
         }
         PushRef::Deployment {
             target: ft,
@@ -471,6 +585,18 @@ pub fn plan_assignments(
             // is no per-deployment group partition — groups are a
             // current-config selection view.
             let members = selection.current_members(config)?;
+            // THE PROOF-BEARING RESOLUTION of the DEPLOYMENT reference: the
+            // target, its declared temporal source (the deployment's exact
+            // per-slot assignment), and the non-empty selected slot set
+            // (resolved from the current topology, narrowed by the
+            // snapshot's exact per-slot checks below).
+            let resolved = ResolvedSelection::new(
+                selection.target.clone(),
+                ResolvedSelectionSource::Deployment(deployment_id.clone()),
+                members
+                    .iter()
+                    .map(|(slot, _)| PlacementSlotId::new(slot.id.clone())),
+            )?;
             let slot_ids: Vec<PlacementSlotId> = members
                 .iter()
                 .map(|(slot, _)| PlacementSlotId::new(slot.id.clone()))
@@ -538,12 +664,13 @@ pub fn plan_assignments(
             }
             let releases: BTreeSet<ReleaseId> =
                 out.iter().map(|a| a.artifact.release.clone()).collect();
-            Ok((
-                out,
+            Ok(PlannedResolution {
+                assignments: out,
                 releases,
-                PlanSource::DeploymentRef(deployment_id.clone()),
-                None,
-            ))
+                source: PlanSource::DeploymentRef(deployment_id.clone()),
+                rebinding: None,
+                resolved,
+            })
         }
         PushRef::Release { release } => {
             let rec = store
@@ -566,7 +693,11 @@ pub fn plan_assignments(
                 .into_iter()
                 .map(|(slot, _)| PlacementSlotId::new(slot.id.clone()))
                 .collect();
-            validate_direct_release_membership(
+            // THE MEMBERSHIP GATE PRODUCES THE PROOF: the frozen and current
+            // memberships verified EXACTLY EQUAL (the agreed non-empty slot
+            // set); the planner consumes it as the rebinding record's
+            // membership check below.
+            let membership = validate_direct_release_membership(
                 selection.target.as_str(),
                 release,
                 &rec,
@@ -589,6 +720,18 @@ pub fn plan_assignments(
             // current membership, so every frozen id rebinds to a current
             // physical declaration.)
             let members = selection.release_members(config, &rec)?;
+            // THE PROOF-BEARING RESOLUTION of the FROZEN-RELEASE reference:
+            // the target, its declared temporal source (the release's frozen
+            // topology), and the non-empty resolved slot set (the PLANNED
+            // slots — a `--group` push narrows the assignments, never the
+            // full-membership gate above).
+            let resolved = ResolvedSelection::new(
+                selection.target.clone(),
+                ResolvedSelectionSource::FrozenRelease(release.clone()),
+                members
+                    .iter()
+                    .map(|(slot, _)| PlacementSlotId::new(slot.id.clone())),
+            )?;
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
                 let slot_id = PlacementSlotId::new(slot.id.clone());
@@ -654,18 +797,11 @@ pub fn plan_assignments(
             // onto (the PLANNED slots: a `--group` push narrows the
             // assignments — the membership check still covers the complete
             // set, composed with the engine's full-membership gate).
-            let rebinding_current: BTreeSet<String> = config
-                .target_slots(selection.target.as_str())?
-                .into_iter()
-                .map(|(slot, _)| slot.id.clone())
-                .collect();
-            let mut rebinding_frozen: BTreeSet<String> = BTreeSet::new();
             let mut frozen_topology: BTreeMap<PlacementSlotId, FrozenSlotTopology> =
                 BTreeMap::new();
             for (variant, cs) in &rec.slots {
                 for slot in &cs.slots {
                     if slot.target == selection.target.as_str() {
-                        rebinding_frozen.insert(slot.id.clone());
                         frozen_topology.insert(
                             PlacementSlotId::new(slot.id.clone()),
                             FrozenSlotTopology {
@@ -680,10 +816,11 @@ pub fn plan_assignments(
                 release: release.clone(),
                 target: selection.target.clone(),
                 frozen_topology,
-                membership: MembershipCheck {
-                    frozen: rebinding_frozen,
-                    current: rebinding_current,
-                },
+                // The PROOF the membership gate produced above: the frozen
+                // and current memberships verified EXACTLY EQUAL. Only a
+                // verified [`crate::model::MatchingMembership`] can be
+                // recorded here — the proof is the only construction path.
+                membership,
                 current_physical_slots: members
                     .iter()
                     .map(|(slot, sdef)| {
@@ -697,12 +834,13 @@ pub fn plan_assignments(
                     })
                     .collect(),
             };
-            Ok((
-                out,
-                BTreeSet::from([release.clone()]),
-                PlanSource::ReleaseRef(release.clone()),
-                Some(rebinding),
-            ))
+            Ok(PlannedResolution {
+                assignments: out,
+                releases: BTreeSet::from([release.clone()]),
+                source: PlanSource::ReleaseRef(release.clone()),
+                rebinding: Some(rebinding),
+                resolved,
+            })
         }
     }
 }
@@ -734,9 +872,10 @@ pub fn release_behavior_index(
 mod tests {
     use super::*;
     use crate::model::{
-        ArtifactRef, BehaviorContract, CanonicalSlot, CanonicalSlots, DeploymentId, GenerationId,
-        GenerationRef, LEDGER_SCHEMA_VERSION, Provenance, RELEASE_RECORD_SCHEMA_VERSION,
-        ReleaseRecord, ServerId, TargetName, TreeDigest, VariantName,
+        ArtifactRef, BehaviorContract, CONFIG_SCHEMA_VERSION, CanonicalSlot, CanonicalSlots,
+        DeploymentId, GenerationId, GenerationRef, LEDGER_SCHEMA_VERSION, Provenance,
+        RELEASE_RECORD_SCHEMA_VERSION, ReleaseRecord, ServerId, TargetName, TreeDigest,
+        VariantName,
     };
     use crate::records::{
         DeploymentStatus, LedgerIntent, LedgerRollback, LedgerTerminal, PhysicalBinding,
@@ -1005,6 +1144,14 @@ interval_seconds = 0
             &store,
             &config,
         )
+        .map(|planned| {
+            (
+                planned.assignments,
+                planned.releases,
+                planned.source,
+                planned.rebinding,
+            )
+        })
         .expect("snapshot-carrying release resolves");
 
         assert_eq!(assignments.len(), 1);
@@ -1346,6 +1493,14 @@ interval_seconds = 0
             &store,
             &config,
         )
+        .map(|planned| {
+            (
+                planned.assignments,
+                planned.releases,
+                planned.source,
+                planned.rebinding,
+            )
+        })
         .expect("physical binding drift must not block logical-membership planning");
         assert_eq!(assignments.len(), 1);
         assert_eq!(assignments[0].placement_slot, PlacementSlotId::new("p1"));
@@ -1440,6 +1595,14 @@ interval_seconds = 0
             &store,
             &config,
         )
+        .map(|planned| {
+            (
+                planned.assignments,
+                planned.releases,
+                planned.source,
+                planned.rebinding,
+            )
+        })
         .expect("snapshot-declared release resolves");
         assert!(
             rebinding.is_some(),
@@ -1540,6 +1703,14 @@ interval_seconds = 0
             &store,
             &config,
         )
+        .map(|planned| {
+            (
+                planned.assignments,
+                planned.releases,
+                planned.source,
+                planned.rebinding,
+            )
+        })
         .expect("deployment ref resolves");
         assert_eq!(assignments[0].artifact.variant.as_str(), "old");
         assert_eq!(assignments[0].artifact.tree.as_str(), "tree-old");
@@ -1780,6 +1951,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &store,
                 &config,
             )
+            .map(|planned| {
+                (
+                    planned.assignments,
+                    planned.releases,
+                    planned.source,
+                    planned.rebinding,
+                )
+            })
             .unwrap_or_else(|e| panic!("group {group} must plan a direct release: {e}"));
             let got: Vec<&str> = assignments
                 .iter()
@@ -2031,6 +2210,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &store,
             &config,
         )
+        .map(|planned| {
+            (
+                planned.assignments,
+                planned.releases,
+                planned.source,
+                planned.rebinding,
+            )
+        })
         .expect("HEAD --group G must plan the current partition");
         let head_ids: Vec<&str> = head.iter().map(|a| a.placement_slot.as_str()).collect();
         assert_eq!(
@@ -2057,6 +2244,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &store,
             &config,
         )
+        .map(|planned| {
+            (
+                planned.assignments,
+                planned.releases,
+                planned.source,
+                planned.rebinding,
+            )
+        })
         .expect("release:<id> --group G must plan the frozen partition");
         let rel_ids: Vec<&str> = rel_assignments
             .iter()
@@ -2110,11 +2305,18 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             rp.frozen_topology[&PlacementSlotId::new("p3".to_string())].groups,
             vec!["G".to_string()]
         );
+        // The rebinding's membership is the PROOF the gate produced: the
+        // frozen and current memberships verified EXACTLY EQUAL (the agreed
+        // non-empty slot set — read through the proof accessor; a proof can
+        // only come from [`crate::model::MatchingMembership::verify`]).
         assert_eq!(
-            rp.membership.frozen,
+            rp.membership
+                .slots()
+                .iter()
+                .map(|s| s.as_str().to_string())
+                .collect::<BTreeSet<_>>(),
             BTreeSet::from(["p1".to_string(), "p2".to_string(), "p3".to_string()])
         );
-        assert_eq!(rp.membership.current, rp.membership.frozen);
 
         // SCENARIO 2: drop G from the CURRENT config entirely — a group named
         // only in the release's frozen topology still resolves for the
@@ -2142,6 +2344,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &store,
             &config2,
         )
+        .map(|planned| {
+            (
+                planned.assignments,
+                planned.releases,
+                planned.source,
+                planned.rebinding,
+            )
+        })
         .expect("a frozen-only group must still resolve for the release ref");
         let rel2_ids: Vec<&str> = rel2.iter().map(|a| a.placement_slot.as_str()).collect();
         assert_eq!(
@@ -2362,6 +2572,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &store,
                 &config,
             )
+                .map(|planned| (planned.assignments, planned.releases, planned.source, planned.rebinding))
             .unwrap_or_else(|e| {
                 panic!("HEAD --group G must plan the current partition {current:?}: {e}")
             });
@@ -2393,6 +2604,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &store,
                 &config,
             )
+                .map(|planned| (planned.assignments, planned.releases, planned.source, planned.rebinding))
             .unwrap_or_else(|e| {
                 panic!("release:R --group G must plan the frozen partition {frozen:?}: {e}")
             });
@@ -2589,6 +2801,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     &store,
                     &config,
                 )
+                    .map(|planned| (planned.assignments, planned.releases, planned.source, planned.rebinding))
                 .unwrap_or_else(|e| panic!("release:<id> must plan on target {dest}: {e}"));
                 assert_eq!(assignments.len(), 1, "one slot per target");
                 let a = &assignments[0];
@@ -2851,6 +3064,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                         &store,
                         &config,
                     )
+                        .map(|planned| (planned.assignments, planned.releases, planned.source, planned.rebinding))
                     .unwrap_or_else(|e| {
                         panic!("release:<id> must plan on target {dest} when the membership matches: {e}")
                     });
@@ -2947,6 +3161,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     &store,
                     &config,
                 )
+                    .map(|planned| (planned.assignments, planned.releases, planned.source, planned.rebinding))
                 .expect("t2's membership is unchanged, so it still plans");
                 assert_eq!(assignments.len(), 1);
                 assert_eq!(assignments[0].placement_slot, PlacementSlotId::new("iso"));
@@ -3029,6 +3244,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &store,
                 &config,
             )
+                .map(|planned| (planned.assignments, planned.releases, planned.source, planned.rebinding))
             .unwrap_or_else(|e| panic!("the deployment id must plan its stored state: {e}"));
 
             // EXACTLY the stored state: one slot, its artifact (variant +
@@ -3337,6 +3553,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &store,
             &config,
         )
+        .map(|planned| {
+            (
+                planned.assignments,
+                planned.releases,
+                planned.source,
+                planned.rebinding,
+            )
+        })
         .expect("the deployment id must plan its stored state");
 
         // The plan's referenced-releases set is EXACTLY the releases of the
@@ -3694,7 +3918,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     "HEAD's refusal must name the current decl, got: {msg}"
                 );
             } else {
-                let (assignments, desired, source, rebinding) = head.unwrap();
+                let planned = head.unwrap();
+                let (assignments, desired, source, rebinding) = (
+                    planned.assignments,
+                    planned.releases,
+                    planned.source,
+                    planned.rebinding,
+                );
                 assert_eq!(assignments.len(), 2);
                 for a in &assignments {
                     assert_eq!(
@@ -3739,7 +3969,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     "refusal must be the membership-drift error, got: {msg}"
                 );
             } else {
-                let (assignments, desired, source, rebinding) = rel.unwrap();
+                let planned = rel.unwrap();
+                let (assignments, desired, source, rebinding) = (
+                    planned.assignments,
+                    planned.releases,
+                    planned.source,
+                    planned.rebinding,
+                );
                 assert_eq!(assignments.len(), 2);
                 for a in &assignments {
                     assert_eq!(
@@ -3765,13 +4001,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     .expect("a release:<id> plan must carry the explicit RebindingPlan");
                 assert_eq!(rp.release, release);
                 assert_eq!(rp.target.as_str(), "t1");
+                // The membership proof carries the AGREED set (frozen ==
+                // current verified): the target's complete membership.
                 assert_eq!(
-                    rp.membership.frozen,
+                    rp.membership
+                        .slots()
+                        .iter()
+                        .map(|s| s.as_str().to_string())
+                        .collect::<BTreeSet<_>>(),
                     BTreeSet::from(["p1".to_string(), "p2".to_string()])
-                );
-                assert_eq!(
-                    rp.membership.current, rp.membership.frozen,
-                    "frozen membership must equal the current membership (logical-only)"
                 );
                 assert_eq!(rp.frozen_topology.len(), 2);
                 for (slot, topo) in &rp.frozen_topology {
@@ -3815,7 +4053,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     "refusal must be the exact-binding error naming p1, got: {msg}"
                 );
             } else {
-                let (assignments, desired, source, rebinding) = dep.unwrap();
+                let planned = dep.unwrap();
+                let (assignments, desired, source, rebinding) = (
+                    planned.assignments,
+                    planned.releases,
+                    planned.source,
+                    planned.rebinding,
+                );
                 assert_eq!(assignments.len(), 2);
                 for a in &assignments {
                     assert_eq!(
@@ -3839,6 +4083,165 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     "a deployment rollback records no rebinding"
                 );
             }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // IMMUTABILITY + PROOF-BEARING PROPERTY (bounded 16 cases, fixed seed
+    // 0x5EED_5EED per house style, no failure persistence):
+    //
+    // (a) IMMUTABILITY — the validated domain's derived values are STABLE
+    //     after construction: [`Config::with_release`] with an INVALID name
+    //     returns `Err` and the original is unchanged; with a VALID name it
+    //     returns a NEW [`Config`] whose accessors reflect the new name while
+    //     the original stays unchanged (the operation never mutates).
+    // (b) PROOF TYPES — [`crate::model::MatchingMembership::verify`] returns
+    //     `Ok` EXACTLY when the frozen and current slot-id sets are EQUAL
+    //     (and non-empty: a target without slots is invalid, so an empty
+    //     agreement is never a proof) and `Err` otherwise;
+    //     [`ResolvedSelection`] is constructible ONLY by the planner path —
+    //     the fields are private and the sole constructor
+    //     ([`ResolvedSelection::new`]) lives in plan.rs (a compile-level
+    //     confinement via visibility), so the planner path
+    //     (`plan_assignments`) yields the only selections, and the
+    //     constructor refuses an EMPTY resolution.
+    // -------------------------------------------------------------------
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn validated_domain_is_immutable_and_proofs_verify_exactly(
+            invalid_name in "[a-z]{1,4}/[a-z]{1,4}",
+            valid_name in "[a-z]{1,4}",
+            frozen_ids in prop::collection::vec("[p][0-9]{1,2}", 0..5),
+            current_ids in prop::collection::vec("[p][0-9]{1,2}", 0..5),
+        ) {
+            // (a) IMMUTABILITY of the validated domain.
+            let (_dir, config) = project_with_config();
+            let original = config;
+
+            // The release-name invariant lives in
+            // [`crate::config::ReleaseName::parse`] too: the invalid name is
+            // refused at the type boundary.
+            assert!(
+                crate::config::ReleaseName::parse(&invalid_name).is_err(),
+                "parse must reject the invalid release name {invalid_name:?}"
+            );
+            // with_release on an INVALID name -> Err, and the ORIGINAL is
+            // unchanged (the operation returns a NEW Config or Err; it never
+            // mutates in place).
+            let invalid = crate::config::ReleaseName::new(invalid_name.clone());
+            assert!(
+                original.clone().with_release(invalid).is_err(),
+                "with_release must Err on the invalid name {invalid_name:?}"
+            );
+            assert_eq!(original.release().as_str(), "v1");
+            assert_eq!(original.schema_version(), CONFIG_SCHEMA_VERSION);
+            assert_eq!(original.variant_names(), vec!["standard".to_string()]);
+            assert_eq!(original.target_slot_ids("t1").unwrap(), vec!["p1".to_string()]);
+
+            // with_release on a VALID name -> a NEW Config whose accessors
+            // reflect the name; the ORIGINAL is unchanged and its derived
+            // values stay stable.
+            let valid = crate::config::ReleaseName::parse(&valid_name)
+                .expect("a single-component name parses");
+            let switched = original
+                .clone()
+                .with_release(valid)
+                .expect("a valid release name switches");
+            assert_eq!(switched.release().as_str(), valid_name);
+            assert_eq!(original.release().as_str(), "v1", "the original is unchanged");
+            assert_eq!(switched.schema_version(), CONFIG_SCHEMA_VERSION);
+            assert_eq!(switched.variant_names(), original.variant_names());
+            assert_eq!(
+                switched.target_slot_ids("t1").unwrap(),
+                original.target_slot_ids("t1").unwrap()
+            );
+
+            // (b) PROOF TYPES.
+            // MatchingMembership::verify is Ok EXACTLY when the frozen and
+            // current slot-id sets are EQUAL and non-empty, Err otherwise.
+            let frozen: Vec<PlacementSlotId> = frozen_ids
+                .iter()
+                .map(|s| PlacementSlotId::new(s.clone()))
+                .collect();
+            let current: Vec<PlacementSlotId> = current_ids
+                .iter()
+                .map(|s| PlacementSlotId::new(s.clone()))
+                .collect();
+            let frozen_set = SlotSet::new(frozen);
+            let current_set = SlotSet::new(current);
+            let equal = frozen_set == current_set;
+            let nonempty = !frozen_set.is_empty();
+            let proof = MatchingMembership::verify(frozen_set.clone(), current_set.clone());
+            assert_eq!(
+                proof.is_ok(),
+                equal && nonempty,
+                "verify must be Ok EXACTLY when the memberships match and are non-empty \
+                 (frozen {frozen_ids:?}, current {current_ids:?})"
+            );
+            if let Ok(proof) = &proof {
+                // The proof carries the AGREED non-empty membership; the
+                // accessors expose exactly it.
+                assert_eq!(proof.slots().len(), frozen_set.len());
+                assert!(frozen_set
+                    .iter()
+                    .all(|f| proof.slots().contains(f) && proof.slots().len() >= 1));
+                assert!(proof
+                    .slots()
+                    .iter()
+                    .all(|id| frozen_set.iter().any(|f| f == id)));
+            }
+
+            // ResolvedSelection is constructible ONLY by the planner path: the
+            // sole constructor refuses an EMPTY resolution (a non-empty
+            // slot set is a proof invariant), and the planner path
+            // (`plan_assignments`, HEAD below) yields a selection whose
+            // accessors carry the target, the declared temporal source, and
+            // the resolved non-empty slot set.
+            let empty_err = ResolvedSelection::new(
+                TargetName::new("t1".to_string()),
+                ResolvedSelectionSource::Head,
+                std::iter::empty(),
+            )
+            .expect_err("an empty resolution must be refused by the planner constructor");
+            assert!(
+                empty_err.to_string().contains("no slots"),
+                "the refusal must name the empty resolution, got: {empty_err}"
+            );
+            let (_dir2, config2) = project_with_config();
+            let store = LocalStore::with_base(_dir2.path().join("store")).unwrap();
+            let planned = plan_assignments(
+                &SlotSelection::normalize(&config2, "t1", None).unwrap(),
+                &PushRef::Head,
+                &ReleaseId::new("local".to_string()),
+                &BTreeMap::from([(
+                    "standard".to_string(),
+                    TreeDigest::new("tree".to_string()),
+                )]),
+                &store,
+                &config2,
+            )
+            .expect("HEAD resolves the fixture target");
+            let resolved = planned.resolved();
+            assert_eq!(resolved.target().as_str(), "t1");
+            assert_eq!(resolved.source(), &ResolvedSelectionSource::Head);
+            assert_eq!(
+                resolved
+                    .slots()
+                    .iter()
+                    .map(|s| s.as_str().to_string())
+                    .collect::<Vec<_>>(),
+                vec!["p1".to_string()],
+                "the planner's resolution carries exactly the target's member slot"
+            );
+            assert_eq!(resolved.slots().len(), 1);
+            assert!(resolved.slots().contains(&PlacementSlotId::new("p1")));
         }
     }
 }

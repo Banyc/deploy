@@ -38,7 +38,7 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
 
     let config_path = proj.join("deploy.toml");
     let config = Config::load(&config_path)?;
-    assert_eq!(config.release.as_str(), "v1");
+    assert_eq!(config.release().as_str(), "v1");
     assert!(
         config.release_root(&config_path).ends_with("releases/v1"),
         "release directory is forced beneath releases/"

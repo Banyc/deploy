@@ -748,7 +748,7 @@ mod tests {
         // target, verified variant file).
         let config = crate::config::Config::load(&report.target.join("deploy.toml")).unwrap();
         assert_eq!(config.application, "my-app");
-        assert_eq!(config.release.as_str(), "v1");
+        assert_eq!(config.release().as_str(), "v1");
         assert_eq!(config.target_slot_ids("production").unwrap(), vec!["app-1"]);
         assert_eq!(
             config.variant("standard").unwrap().verification.argv,
@@ -979,7 +979,7 @@ mod tests {
         // scaffold (same application name and release, same server/slot
         // bindings, same rollout and variants).
         assert_eq!(reloaded.application, "typed-app");
-        assert_eq!(reloaded.release.as_str(), "v1");
+        assert_eq!(reloaded.release().as_str(), "v1");
         assert_eq!(
             reloaded.target_slot_ids("production").unwrap(),
             vec!["app-1"]
