@@ -6270,7 +6270,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             release_sha256: String::new(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             provenance: crate::model::Provenance {
-                git_revision: None,
                 mapping_sha256: "m".to_string(),
                 behavior_sha256: "b".to_string(),
             },
@@ -7974,7 +7973,6 @@ interval_seconds = 0
             release_sha256: String::new(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             provenance: Provenance {
-                git_revision: None,
                 mapping_sha256: mapping_sha,
                 behavior_sha256: behavior_sha,
             },
@@ -8346,7 +8344,6 @@ interval_seconds = 0
             release_sha256: String::new(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             provenance: Provenance {
-                git_revision: None,
                 mapping_sha256: mapping_sha,
                 behavior_sha256: behavior_sha,
             },

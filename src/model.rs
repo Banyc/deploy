@@ -330,8 +330,6 @@ pub struct CanonicalReleasePayload {
 /// Provenance captured at first materialization.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provenance {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub git_revision: Option<String>,
     pub mapping_sha256: String,
     pub behavior_sha256: String,
 }

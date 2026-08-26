@@ -231,21 +231,6 @@ pub fn release_digest(
     ReleaseDigest::new(sha256_bytes(&bytes))
 }
 
-/// Compute the current Git revision of `root`, if available.
-pub fn git_revision(root: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(root)
-        .output()
-        .ok()?;
-    if out.status.success() {
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if s.is_empty() { None } else { Some(s) }
-    } else {
-        None
-    }
-}
-
 /// Build a complete, immutable release record for the given variant bindings.
 /// The per-variant slot declarations are canonicalized and frozen into the
 /// record (as the slot snapshot) and folded into the release identity digest,
@@ -255,7 +240,7 @@ pub fn build_release(
     behavior_sha: &str,
     variants: &BTreeMap<VariantName, TreeDigest>,
     variant_slots: &BTreeMap<String, Vec<SlotConfig>>,
-    root: &Path,
+    _root: &Path,
 ) -> ReleaseRecord {
     let bindings: BTreeMap<String, String> = variants
         .iter()
@@ -274,7 +259,6 @@ pub fn build_release(
         release_sha256: digest.as_str().to_string(),
         created_at: Timestamp::now().to_string(),
         provenance: Provenance {
-            git_revision: git_revision(root),
             mapping_sha256: mapping_sha.to_string(),
             behavior_sha256: behavior_sha.to_string(),
         },
@@ -1080,11 +1064,11 @@ mod tests {
     //    fields (`release_sha256`, `release_id`), and the schema versions —
     //    is tamper-evident: mutating it makes the recompute disagree (for
     //    content fields) and ALWAYS fails verification with an integrity
-    //    error. The intentionally non-identity fields (`created_at`, the
-    //    `git_revision` provenance) are whitelisted: mutating them must NOT
-    //    change the digest and must NOT break verification. (There is no
-    //    display-name field on `ReleaseRecord`; the docs' exclusion is
-    //    realized by `created_at` + provenance.)
+    //    error. The intentionally non-identity field (`created_at`) is
+    //    whitelisted: mutating it must NOT change the digest and must NOT
+    //    break verification. (There is no display-name field on
+    //    `ReleaseRecord`; the docs' exclusion is realized by `created_at` +
+    //    provenance.)
     // 3. CANONICAL ORDER-INDEPENDENCE: the same logical release written with
     //    differently-ordered slot declarations, differently-ordered target
     //    lists, duplicate targets, or textually-different-but-lexically-
@@ -1279,9 +1263,9 @@ mod tests {
     }
 
     /// A record whose WHITELISTED (intentionally non-identity) field was
-    /// mutated — `created_at`, the `git_revision` provenance — must digest
-    /// IDENTICALLY and still verify: the field is excluded from the identity
-    /// contract, so changing it is not tampering.
+    /// mutated — `created_at` — must digest IDENTICALLY and still verify:
+    /// the field is excluded from the identity contract, so changing it is
+    /// not tampering.
     fn assert_whitelist_mutation(original: &ReleaseRecord, mutated: &ReleaseRecord, label: &str) {
         let recomputed = recompute_release_digest(mutated)
             .expect("whitelist mutations never touch the slot snapshot");
@@ -1468,18 +1452,12 @@ mod tests {
             assert_output_mutation(&rec, &r, &format!("payload schema version {v}"));
         }
 
-        // (2) WHITELIST — the intentionally non-identity fields. Mutating
-        // `created_at` or the `git_revision` provenance must NOT change the
-        // digest and must NOT break verification.
+        // (2) WHITELIST — the intentionally non-identity field. Mutating
+        // `created_at` must NOT change the digest and must NOT break
+        // verification.
         let mut r = rec.clone();
         r.created_at = "2099-12-31T23:59:59Z".to_string();
         assert_whitelist_mutation(&rec, &r, "created_at");
-        let mut r = rec.clone();
-        r.provenance.git_revision = Some("deadbeef".to_string());
-        assert_whitelist_mutation(&rec, &r, "git_revision set");
-        let mut r = rec.clone();
-        r.provenance.git_revision = None;
-        assert_whitelist_mutation(&rec, &r, "git_revision removed");
 
         // (3) CANONICAL ORDER-INDEPENDENCE: the same LOGICAL release written
         // differently canonicalizes to the SAME digest.

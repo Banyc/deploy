@@ -304,7 +304,7 @@ impl<'a> RemoteHelper<'a> {
         let dir = layout::remote_release(release_id);
         // The release record is identified by its canonical digest
         // (`release_sha256`), not by semantic equality of the full document:
-        // metadata fields such as `created_at` (and `provenance.git_revision`)
+        // metadata fields such as `created_at`
         // legitimately differ between runs of the same canonical release, so
         // byte/semantic comparison of the whole record would falsely reject
         // idempotent re-publication. Two records with the same recomputed
@@ -328,7 +328,7 @@ impl<'a> RemoteHelper<'a> {
             // a silent replace. Only a content-verified record whose
             // recomputed identity equals the incoming record's identity is an
             // idempotent no-op (metadata such as `created_at` and
-            // `provenance.git_revision` is excluded from the digest, so it
+            // `created_at` is excluded from the digest, so it
             // may differ between runs of the same canonical release).
             let existing = self.remote.read(&rel)?;
             let existing_rec: ReleaseRecord = serde_json::from_slice(&existing).map_err(|e| {
@@ -901,7 +901,7 @@ mod tests {
     /// must fail with an integrity error naming the remote release and the
     /// content-vs-digest mismatch — a corrupted remote record is never
     /// silently accepted as the same release. Metadata-only differences
-    /// (`created_at`, `provenance.git_revision` — excluded from the digest)
+    /// (`created_at` — excluded from the digest)
     /// still no-op idempotently.
     #[test]
     fn republish_content_verifies_existing_remote_record() {
@@ -1000,16 +1000,13 @@ mod tests {
             "error must name the malformed existing record, got: {err}"
         );
 
-        // Metadata-only differences in the EXISTING record (`created_at`,
-        // `provenance.git_revision`) are excluded from the digest: republishing
+        // Metadata-only differences in the EXISTING record (`created_at`) are
+        // excluded from the digest: republishing
         // against a record that differs ONLY in those fields is still an
         // idempotent no-op.
-        let metadata_mutations: [JsonMutation; 2] = [
+        let metadata_mutations: [JsonMutation; 1] = [
             ("created_at", |v: &mut serde_json::Value| {
                 v["created_at"] = serde_json::json!("2099-01-01T00:00:00Z");
-            }),
-            ("provenance.git_revision", |v: &mut serde_json::Value| {
-                v["provenance"]["git_revision"] = serde_json::json!("tampered-git");
             }),
         ];
         for (name, mutate) in metadata_mutations {

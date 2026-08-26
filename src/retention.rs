@@ -389,7 +389,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             release_sha256: String::new(),
             created_at: "2020-01-01T00:00:00Z".into(),
             provenance: crate::model::Provenance {
-                git_revision: None,
                 mapping_sha256: String::new(),
                 behavior_sha256: String::new(),
             },
