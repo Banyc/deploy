@@ -37,7 +37,13 @@
 //!    everything reachable from ANOTHER target's ledger, the CURRENT /
 //!    INCOMPLETE state (observed artifacts, pending intent-only entries,
 //!    in-flight deployment dirs), or a PIN is kept; everything else is
-//!    unreachable and swept. A failed sweep is retried by RECOMPUTING
+//!    unreachable and swept. A checkpoint sweep scans the checkpointed
+//!    target's ledger AS-IF the suffix replacement ALREADY happened — the
+//!    retained-suffix [`LedgerOverride`] — so the pre-checkpoint history's
+//!    releases/trees/deployment dirs are unreachable the moment the ledger
+//!    is shortened, and the DRY-RUN PREVIEW computes its deletion sets with
+//!    the SAME override the real execution uses: the previewed deletions
+//!    exactly equal the real ones. A failed sweep is retried by RECOMPUTING
 //!    reachability — no persisted deletion worklist, no debt marker, no
 //!    backup. The report carries at most: the logical commit status + sweep
 //!    completed / retry-required.
@@ -52,7 +58,7 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::model::{DeploymentId, ReleaseId};
-use crate::records::DeploymentStatus;
+use crate::records::{DeploymentStatus, LedgerEntry};
 use crate::store::atomic::{path_state, write_atomic_replace};
 use crate::store::local::LocalStore;
 use std::collections::BTreeSet;
@@ -60,7 +66,7 @@ use std::collections::BTreeSet;
 #[cfg(test)]
 use crate::model::{PlacementSlotId, TargetName};
 #[cfg(test)]
-use crate::records::{LedgerEntry, LedgerIntent};
+use crate::records::LedgerIntent;
 #[cfg(test)]
 use crate::records::{LedgerTerminal, ServerResult};
 #[cfg(test)]
@@ -89,6 +95,29 @@ pub struct LedgerDiscards {
     pub sweep_objects: Vec<String>,
 }
 
+/// A HYPOTHETICAL LEDGER OVERRIDE for ONE target, consumed by the sweep's
+/// reachability scan: the target's ledger AS-IF the checkpoint's atomic
+/// suffix replacement had ALREADY happened (the retained suffix — the
+/// checkpoint deployment's entry onward — IS the ledger after the commit).
+///
+/// The checkpoint flow computes the retained suffix ONCE
+/// ([`LocalStore::ledger_suffix`]) and passes the parsed suffix as this
+/// override to BOTH the dry-run preview and the real execution, so the two
+/// paths share the SAME reachability calculation: the artifacts that become
+/// unreachable ONLY when the ledger is shortened (the pre-checkpoint
+/// history's releases, trees, and deployment dirs) are enumerated by the
+/// preview EXACTLY as the real sweep deletes them. Every OTHER target's
+/// ledger is read as-is.
+#[derive(Clone, Debug)]
+pub(crate) struct LedgerOverride {
+    /// The target whose ledger the override replaces.
+    pub target: String,
+    /// The retained-suffix entries — the target's ledger as-if the suffix
+    /// replacement already happened (the checkpoint's own entry onward, in
+    /// ledger order).
+    pub entries: Vec<LedgerEntry>,
+}
+
 impl LocalStore {
     // ---- the retained-suffix computation (step 1) -------------------------
 
@@ -105,11 +134,17 @@ impl LocalStore {
     /// can never move backward because the history is gone) and must have
     /// produced a SUCCESSFUL terminal event with a rollback state (the
     /// ledger's first retained entry is the oldest rollback state).
+    ///
+    /// Returns the physical suffix LINES (for the atomic replacement), the
+    /// SAME suffix parsed as [`LedgerEntry`]s (the as-if ledger the sweep's
+    /// reachability uses via [`LedgerOverride`] — physical line order IS the
+    /// parsed entry order, so the two views agree), and the ids of the
+    /// entries strictly before the checkpoint (the discards).
     pub(crate) fn ledger_suffix(
         &self,
         target: &str,
         checkpoint_id: &DeploymentId,
-    ) -> Result<(Vec<String>, Vec<String>)> {
+    ) -> Result<(Vec<String>, Vec<LedgerEntry>, Vec<String>)> {
         let lines = self.read_ledger_lines(target)?;
         let entries = self.read_ledger(target)?;
         let pos = entries
@@ -137,7 +172,11 @@ impl LocalStore {
             .iter()
             .map(|e| e.deployment_id.as_str().to_string())
             .collect();
-        Ok((lines[keep_from..].to_vec(), discarded))
+        Ok((
+            lines[keep_from..].to_vec(),
+            entries[pos..].to_vec(),
+            discarded,
+        ))
     }
 
     /// Read the ledger's raw physical lines (one string per line, in file
@@ -225,15 +264,17 @@ impl LocalStore {
     /// variant/tree of its release. `deployments/<id>/` dirs of the
     /// retained ledger entries AND observed `last_deployment`s are reachable.
     ///
-    /// FAIL CLOSED on EVERY retention anchor: a PRESENT-but-unreadable
-    /// anchor — an unreadable ledger, an unreadable observed record, an
-    /// unreadable or malformed pins file, or a release record a pin names —
-    /// is an ERROR, never ABSENCE. An anchor that reads as absent shrinks
-    /// the retained set and the sweep would delete content the failed read
-    /// might have protected; the failed scan must abort the pass BEFORE any
-    /// unlink (extra garbage on disk is safe, a partial retained set is
-    /// not).
-    pub(crate) fn reachable_set(&self, config: &Config) -> Result<ReachableSet> {
+    /// `ledger_override` — the checkpoint's retained-suffix override: when
+    /// `Some`, the named target's ledger is scanned as the OVERRIDE entries
+    /// (the as-if ledger after the suffix replacement), never the on-disk
+    /// ledger; every other target's ledger is read as-is. The preview and
+    /// the real execution pass the SAME override, so the two compute the
+    /// identical retained set.
+    pub(crate) fn reachable_set(
+        &self,
+        config: &Config,
+        ledger_override: Option<&LedgerOverride>,
+    ) -> Result<ReachableSet> {
         let mut out = ReachableSet::default();
         let targets_dir = self.base().join("targets");
         let mut target_names: Vec<String> = Vec::new();
@@ -261,7 +302,18 @@ impl LocalStore {
         // delete it.
         let observed = self.read_global_observed()?;
         for name in &target_names {
-            for entry in self.read_ledger(name)? {
+            // THE LEDGER OVERRIDE: when the sweep runs for a checkpoint, the
+            // checkpointed target's ledger is scanned AS-IF the atomic suffix
+            // replacement already happened — the retained suffix IS the
+            // ledger — so the PRE-CHECKPOINT history's releases, trees, and
+            // deployment dirs are unreachable and swept. The override is the
+            // SAME parsed suffix the preview and the real execution share;
+            // every OTHER target's ledger is read as-is.
+            let entries = match ledger_override {
+                Some(o) if o.target == *name => o.entries.clone(),
+                _ => self.read_ledger(name)?,
+            };
+            for entry in &entries {
                 // The entry's deployment dir (an in-flight entry without a
                 // terminal is the CURRENT/INCOMPLETE state — its dir stays).
                 out.deployments
@@ -382,8 +434,16 @@ impl LocalStore {
     /// EXISTS under `deployments/`, `releases/`, `objects/sha256/` and the
     /// reachable set. Pure read — the dry-run preview and the real sweep
     /// share it, so the preview enumerates EXACTLY what the sweep removes.
-    pub(crate) fn sweep_discards(&self, config: &Config) -> Result<LedgerDiscards> {
-        let reachable = self.reachable_set(config)?;
+    /// `ledger_override` — the checkpoint passes its retained-suffix override
+    /// so the preview and the real sweep delete from the SAME reachability:
+    /// the preview never under-reports the artifacts that become unreachable
+    /// only after the suffix replacement.
+    pub(crate) fn sweep_discards(
+        &self,
+        config: &Config,
+        ledger_override: Option<&LedgerOverride>,
+    ) -> Result<LedgerDiscards> {
+        let reachable = self.reachable_set(config, ledger_override)?;
         let mut discards = LedgerDiscards::default();
         let depl_root = self.base().join("deployments");
         if path_state(&depl_root)? {
@@ -444,12 +504,17 @@ impl LocalStore {
     /// tri-state (`path_state`): an already-removed target is skipped; ANY
     /// other stat or removal error stops the stage. Returns the performed
     /// deletions and whether EVERY stage ran clean.
+    /// `ledger_override` — the checkpoint's retained-suffix override, passed
+    /// to BOTH the discard enumeration and the artifact GC so the sweep
+    /// stays on the SAME reachability the dry-run preview reported; `None`
+    /// for the push-side debt retry (current ledgers as-is).
     pub(crate) fn run_sweep(
         &self,
         config: &Config,
         anchor: &str,
+        ledger_override: Option<&LedgerOverride>,
     ) -> Result<(LedgerDiscards, bool)> {
-        let discards = self.sweep_discards(config)?;
+        let discards = self.sweep_discards(config, ledger_override)?;
         let mut complete = true;
         // Stage 1: deployment directories.
         #[cfg(test)]
@@ -479,12 +544,12 @@ impl LocalStore {
             || self.fault_registry().consume(FaultKind::SweepObjects, "")
         {
             complete = false;
-        } else if let Err(e) = self.gc_artifacts(anchor, config) {
+        } else if let Err(e) = self.gc_artifacts(anchor, config, ledger_override) {
             complete = false;
             let _ = e;
         }
         #[cfg(not(test))]
-        if let Err(_e) = self.gc_artifacts(anchor, config) {
+        if let Err(_e) = self.gc_artifacts(anchor, config, ledger_override) {
             complete = false;
         }
         Ok((discards, complete))

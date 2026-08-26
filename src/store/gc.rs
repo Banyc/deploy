@@ -24,7 +24,12 @@
 //!    `pre_push`) and its terminal's rollback payload (release + per-slot
 //!    trees); a terminal-less entry (pending / in-progress) is retained WITH
 //!    its intent references, since the deployment is recoverable and its
-//!    artifacts must stay.
+//!    artifacts must stay. When the GC runs for a CHECKPOINT, the
+//!    checkpointed target's ledger is scanned AS-IF the atomic suffix
+//!    replacement already happened — the retained-suffix
+//!    [`LedgerOverride`] — so the pre-checkpoint history's artifacts are
+//!    unreachable and swept, and the dry-run preview uses the SAME override
+//!    (previewed deletions == real deletions).
 //! 2. **Every target's CURRENT OBSERVED state** (`slots/<id>/observed.json`
 //!    — the ONE physical observed record per slot; target views are a
 //!    selection over it): the observed artifact (release + tree) and the
@@ -86,7 +91,7 @@ use crate::error::{Error, Result};
 use crate::layout;
 use crate::model::ReleaseId;
 use crate::store::atomic::{path_state, sync_parent_dir};
-use crate::store::history_floor::ReachableSet;
+use crate::store::history_floor::{LedgerOverride, ReachableSet};
 use crate::store::local::LocalStore;
 use std::path::Path;
 
@@ -145,8 +150,18 @@ impl LocalStore {
     ///
     /// `anchor` names the triggering checkpoint's deployment id: it is used
     /// ONLY as the per-fixture fault-injection key — production behavior
-    /// never depends on it.
-    pub(crate) fn gc_artifacts(&self, anchor: &str, config: &Config) -> Result<GcOutcome> {
+    /// never depends on it. `ledger_override` — the checkpoint's
+    /// retained-suffix override (see [`LocalStore::reachable_set`]): the GC
+    /// scans the checkpointed target's ledger as-if the replacement already
+    /// happened, so the retained set here is the SAME one the dry-run
+    /// preview computed — the sweep deletes exactly what the preview
+    /// reported.
+    pub(crate) fn gc_artifacts(
+        &self,
+        anchor: &str,
+        config: &Config,
+        ledger_override: Option<&LedgerOverride>,
+    ) -> Result<GcOutcome> {
         // Fault hook: the SCAN itself aborts before any deletion (a failed
         // reachability pass must never unlink anything). The sweep is
         // reported retry-required and the retry recomputes reachability
@@ -157,7 +172,7 @@ impl LocalStore {
                 "test fault: artifact GC scan forced to fail once",
             ));
         }
-        let retained = match self.reachable_set(config) {
+        let retained = match self.reachable_set(config, ledger_override) {
             Ok(rs) => rs,
             // A pin-abort (an un-honorable pinned release) is an integrity
             // error: keep its class — callers distinguish "corrupt anchor"
@@ -712,7 +727,7 @@ interval_seconds = 0
         // pre-sweep artifact inventory stays byte-identical.
         corrupt(&f, class);
         let before = inventory(&f.store);
-        let err = f.store.run_sweep(&f.config, "anchor").unwrap_err();
+        let err = f.store.run_sweep(&f.config, "anchor", None).unwrap_err();
         match class {
             // Requirement 2: a pin that cannot be honored aborts the sweep
             // with an INTEGRITY error before any deletion.
@@ -739,7 +754,7 @@ interval_seconds = 0
         // EXACTLY the unreachable set — the retained/garbage partition
         // matches the oracle.
         repair(&f, class);
-        let (discards, complete) = f.store.run_sweep(&f.config, "anchor").unwrap();
+        let (discards, complete) = f.store.run_sweep(&f.config, "anchor", None).unwrap();
         assert!(complete, "the repaired sweep completes");
         assert_eq!(
             discards.sweep_deployments,
@@ -864,7 +879,7 @@ interval_seconds = 0
         let config = config_with_pin(dir.path(), Some(&missing));
         seed_named_release(&store, "rel-sha256-garbage");
         seed_object(&store, "tree-garbage");
-        let err = store.run_sweep(&config, "anchor").unwrap_err();
+        let err = store.run_sweep(&config, "anchor", None).unwrap_err();
         assert!(
             matches!(err, Error::Integrity(_)),
             "a missing pinned release must abort with an integrity error, got: {err}"
@@ -881,7 +896,7 @@ interval_seconds = 0
             "zero deletions: the garbage tree survives"
         );
         // The gc's own entry point preserves the integrity class too.
-        let err = store.gc_artifacts("anchor", &config).unwrap_err();
+        let err = store.gc_artifacts("anchor", &config, None).unwrap_err();
         assert!(
             matches!(err, Error::Integrity(_)),
             "gc_artifacts must preserve the pin-abort class, got: {err}"
@@ -915,7 +930,7 @@ interval_seconds = 0
         seed_named_release(&store, "rel-sha256-garbage");
         seed_object(&store, "tree-garbage");
         let config = config_with_pin(dir.path(), None);
-        let err = store.run_sweep(&config, "anchor").unwrap_err();
+        let err = store.run_sweep(&config, "anchor", None).unwrap_err();
         assert!(
             matches!(err, Error::Integrity(_)),
             "an unverifiable pinned release must abort with an integrity error, got: {err}"
@@ -955,7 +970,7 @@ interval_seconds = 0
         seed_named_release(&store, "rel-sha256-garbage");
         seed_object(&store, "tree-garbage");
         let config = config_with_pin(dir.path(), None);
-        let err = store.run_sweep(&config, "anchor").unwrap_err();
+        let err = store.run_sweep(&config, "anchor", None).unwrap_err();
         assert!(
             matches!(err, Error::Integrity(_)),
             "an exact-binding pin naming a missing release must abort with an integrity error, got: {err}"

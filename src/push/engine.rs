@@ -2004,7 +2004,11 @@ pub(crate) fn retry_pending_sweep(
     let Some(reason) = pending else {
         return Vec::new();
     };
-    match store.run_sweep(config, anchor) {
+    // The push-side sweep retry recomputes reachability from the CURRENT
+    // ledgers — NO checkpoint ledger override: the override is the
+    // checkpoint's retained-suffix hypothetical and exists only while a
+    // checkpoint sweep runs (see `crate::push::checkpoint`).
+    match store.run_sweep(config, anchor, None) {
         Ok((_, true)) => {
             // The sweep completed: clear the marker. A write/remove failure
             // is post-commit maintenance: warn and leave the marker as it

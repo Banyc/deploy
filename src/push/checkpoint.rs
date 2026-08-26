@@ -38,6 +38,21 @@
 //!    marker (`<base>/sweep-debt.json`) so the NEXT PUSH (not just the next
 //!    checkpoint) retries it. Sweeps are best-effort and NOT secure erasure.
 //!
+//! # Preview == execution (the ledger override)
+//!
+//! The sweep's reachability is computed against the checkpointed target's
+//! ledger AS-IF the suffix replacement ALREADY happened ([`LedgerOverride`]):
+//! the pre-checkpoint history's releases, trees, and deployment dirs are
+//! unreachable the MOMENT the ledger is shortened. The flow computes the
+//! retained suffix ONCE and feeds the parsed suffix as the override to BOTH
+//! the dry-run preview and the real execution — the preview (touch nothing)
+//! and the real command (atomic replacement + sweep) share the SAME
+//! reachability calculation, so the previewed deletion sets EXACTLY match
+//! what the real command deletes. (Without the override the preview would
+//! scan the CURRENT ledger, where the pre-checkpoint entries are still
+//! present, and under-report the artifacts that only become garbage after
+//! the replacement.)
+//!
 //! The old multi-file checkpoint machinery — the `history-floor.json` marker,
 //! the transactional floor ADVANCE with its tagged `.prev.<tag>` backups,
 //! restore/recovery of torn advances, the tri-state marker discovery, and
@@ -60,7 +75,7 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::model::{DeploymentId, OperationId};
 use crate::push::lock::FileLock;
-use crate::store::history_floor::LedgerDiscards;
+use crate::store::history_floor::{LedgerDiscards, LedgerOverride};
 use crate::store::local::LocalStore;
 
 /// The outcome of one checkpoint invocation (preview or real).
@@ -153,20 +168,37 @@ fn checkpoint_inner(
     target: &str,
     deployment_id: &DeploymentId,
 ) -> Result<CheckpointReport> {
-    // 1. Calculate the retained suffix + the entries it discards.
-    let (suffix, discarded_entries) = store.ledger_suffix(target, deployment_id)?;
+    // 1. Calculate the retained suffix (the physical LINES for the atomic
+    //    replacement + the SAME suffix parsed as entries) and the entries it
+    //    discards.
+    let (suffix, suffix_entries, discarded_entries) = store.ledger_suffix(target, deployment_id)?;
+    // THE SHARED LEDGER OVERRIDE: the checkpointed target's ledger as-if the
+    // suffix replacement already happened. Computed ONCE here and fed to the
+    // sweep in BOTH paths — the dry-run preview and this real execution use
+    // the SAME reachability, so the previewed deletion sets are exactly the
+    // real ones (the artifacts that become garbage only when the ledger is
+    // shortened are enumerated by the preview too).
+    let ledger_override = LedgerOverride {
+        target: target.to_string(),
+        entries: suffix_entries,
+    };
     // 2. THE LOGICAL COMMIT: atomically replace the ledger with the suffix.
     //    If this fails, NO DELETION HAPPENS — the previous ledger stands.
     store.write_ledger_suffix(target, &suffix)?;
     // 3. Best-effort global sweep of unreachable deployments / releases /
-    //    objects. The sweep is POST-COMMIT MAINTENANCE: an incomplete sweep
-    //    must NEVER fail the checkpoint (the ledger commit stands) — it
-    //    records a DURABLE sweep-debt marker so the NEXT PUSH (not just the
-    //    next checkpoint) retries the sweep, recomputing reachability fresh
-    //    (no persisted deletion worklist), and clears the marker once it
-    //    completes. The debt write is itself non-fallible maintenance: a
-    //    failure is a warning on the report, never an `Err`.
-    let (sweep, complete) = store.run_sweep(config, deployment_id.as_str())?;
+    //    objects — computed with the SAME override the preview used (after
+    //    the atomic replacement the on-disk ledger IS the suffix, so the
+    //    override and the current ledger agree; passing it keeps the sweep
+    //    structurally identical to the preview's calculation). The sweep is
+    //    POST-COMMIT MAINTENANCE: an incomplete sweep must NEVER fail the
+    //    checkpoint (the ledger commit stands) — it records a DURABLE
+    //    sweep-debt marker so the NEXT PUSH (not just the next checkpoint)
+    //    retries the sweep, recomputing reachability fresh (no persisted
+    //    deletion worklist), and clears the marker once it completes. The
+    //    debt write is itself non-fallible maintenance: a failure is a
+    //    warning on the report, never an `Err`.
+    let (sweep, complete) =
+        store.run_sweep(config, deployment_id.as_str(), Some(&ledger_override))?;
     let sweep_debt_warning = if complete {
         None
     } else {
@@ -196,15 +228,31 @@ fn checkpoint_inner(
 /// The read-only preview (`--dry-run`): the same validation (successful
 /// deployment in the ledger) plus the exact replacement + sweep enumeration —
 /// and nothing else. No locks, no replacement, no sweep, no remote.
+///
+/// THE PARITY FIX: the preview computes the deletion sets with the SAME
+/// [`LedgerOverride`] the real execution uses — the checkpointed target's
+/// ledger as-if the suffix replacement already happened — so the preview
+/// enumerates EXACTLY what the real command deletes (including the
+/// artifacts that become unreachable only when the ledger is shortened).
 fn preview_checkpoint(
     store: &LocalStore,
     config: &Config,
     target: &str,
     deployment_id: &DeploymentId,
 ) -> Result<CheckpointReport> {
-    let (suffix, discarded_entries) = store.ledger_suffix(target, deployment_id)?;
+    let (suffix, suffix_entries, discarded_entries) = store.ledger_suffix(target, deployment_id)?;
+    // The shared override (see [`checkpoint_inner`]): the preview scans the
+    // checkpointed target's ledger as-if the atomic replacement already
+    // happened, so the pre-checkpoint history's releases/trees/deployment
+    // dirs — garbage the moment the ledger is shortened — are enumerated
+    // here, exactly as the real sweep deletes them. `suffix` (the raw lines)
+    // is unused in the preview: it is the replacement payload only.
     let _ = suffix;
-    let sweep = store.sweep_discards(config)?;
+    let ledger_override = LedgerOverride {
+        target: target.to_string(),
+        entries: suffix_entries,
+    };
+    let sweep = store.sweep_discards(config, Some(&ledger_override))?;
     Ok(CheckpointReport {
         target: target.to_string(),
         deployment_id: deployment_id.clone(),
@@ -285,7 +333,7 @@ mod tests {
         ArtifactRef, GenerationRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId,
         SCHEMA_VERSION, ServerId, TargetName, TreeDigest, VariantName,
     };
-    use crate::records::{LedgerIntent, LedgerRollback, LedgerTerminal};
+    use crate::records::{LedgerIntent, LedgerRollback, LedgerTerminal, ObservedServer, Pins};
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
     use std::collections::BTreeMap;
@@ -475,14 +523,172 @@ interval_seconds = 0
         id
     }
 
-    /// Create a release directory under the given NAME (junk content) — the
-    /// sweep keeps or sweeps it by NAME (the reachability set carries the
-    /// names the ledgers/observations reference; only pinned releases need a
-    /// verifiable record).
-    fn seed_named_release(store: &LocalStore, name: &str) {
+    /// Build a REAL release record and return its content-DERIVED id (release
+    /// ids are derived from content, so a pin must reference the id the
+    /// record actually got — `store.write_release` binds the record to its
+    /// derived read path, and the pin expansion's `record.release_id == read
+    /// path` check then holds; a record at a differently-named dir would be
+    /// refused). `tag` differentiates the record's variant tree so distinct
+    /// seeds produce distinct ids.
+    fn seed_named_release(store: &LocalStore, tag: &str) -> ReleaseId {
+        let rec = crate::release::build_release(
+            "sw",
+            "sha256-aa",
+            &std::collections::BTreeMap::from([(
+                crate::model::VariantName::new("standard".to_string()),
+                crate::model::TreeDigest::new(format!("tree-pinned-{tag}")),
+            )]),
+            &std::collections::BTreeMap::from([(
+                "standard".to_string(),
+                vec![crate::config::SlotDef {
+                    id: "p1".to_string(),
+                    server: "s1".to_string(),
+                    deploy_dir: std::path::PathBuf::from("/srv/deploy/p1"),
+                    target: TARGET.to_string(),
+                    groups: Vec::new(),
+                }],
+            )]),
+            std::path::Path::new("."),
+        );
+        let id = ReleaseId::new(rec.release_id.clone());
+        store.write_release(&rec).unwrap();
+        id
+    }
+
+    /// Create a release directory under the given NAME with junk content —
+    /// the sweep keeps or sweeps it by NAME (the reachability set carries the
+    /// names the ledgers/observations reference; only PINNED releases are
+    /// read, and they need a real record seeded via [`seed_named_release`]).
+    fn seed_named_release_dir(store: &LocalStore, name: &str) {
         let dir = store.release_dir(&ReleaseId::new(name.to_string()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("release.json"), "{}").unwrap();
+    }
+
+    /// Create a deployment directory under the given id (junk content) — the
+    /// sweep enumerates `deployments/` and sweeps the unreachable dirs.
+    fn seed_deployment_dir(store: &LocalStore, id: &str) {
+        let dir = store.deployment_dir(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plan.json"), "{}").unwrap();
+    }
+
+    /// Create a tree object directory under the given digest name (junk
+    /// content) — the sweep enumerates `objects/sha256/` and sweeps the
+    /// unreachable digests.
+    fn seed_tree_dir(store: &LocalStore, tree: &str) {
+        let dir = store.object_root(&TreeDigest::new(tree.to_string()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file"), "x").unwrap();
+    }
+
+    /// Seed ONE successful deployment whose rollback references the caller's
+    /// EXACT release + tree (the shared `seed_history` helper always rolls
+    /// back to the same tree digest, so the pre-suffix-unique-artifact cases
+    /// need a custom entry).
+    fn seed_success(store: &LocalStore, target: &str, id: &str, release: &str, tree: &str) {
+        store.append_intent(target, &intent(id, target)).unwrap();
+        let mut term = terminal_for(id, target, release);
+        // Rewrite the rollback's per-slot tree to the caller's tree.
+        let rollback = term.rollback.as_mut().unwrap();
+        for g in rollback.slots.values_mut() {
+            g.assignment.artifact.tree = TreeDigest::new(tree.to_string());
+        }
+        store.append_terminal(target, &term).unwrap();
+    }
+
+    /// THE PARITY FIX (deterministic regression): a checkpoint whose
+    /// PRE-SUFFIX history references artifacts UNIQUE to it — the dry-run
+    /// preview MUST enumerate them. With the ledger override the
+    /// pre-checkpoint releases / trees / deployment dirs are unreachable the
+    /// moment the suffix replacement happens, so the preview lists them;
+    /// WITHOUT the override the preview scans the CURRENT ledger (where the
+    /// pre-checkpoint entries are still present) and misses them — the
+    /// under-report this fix removes.
+    #[test]
+    fn preview_lists_artifacts_that_become_unreachable_only_after_the_suffix_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let cfg = config_for(&dir);
+        // Three successful deployments, each with a UNIQUE release + tree
+        // (rel-sha256-old/tree-old, rel-sha256-mid/tree-mid,
+        // rel-sha256-new/tree-new).
+        seed_success(&store, TARGET, "deploy-0", "rel-sha256-old", "tree-old");
+        seed_success(&store, TARGET, "deploy-1", "rel-sha256-mid", "tree-mid");
+        seed_success(&store, TARGET, "deploy-2", "rel-sha256-new", "tree-new");
+        // Materialize the deployment dirs / release dirs / object dirs for
+        // all three entries (the sweep only enumerates what exists).
+        for id in ["deploy-0", "deploy-1", "deploy-2"] {
+            seed_deployment_dir(&store, id);
+        }
+        for rel in ["rel-sha256-old", "rel-sha256-mid", "rel-sha256-new"] {
+            seed_named_release_dir(&store, rel);
+        }
+        for tree in ["tree-old", "tree-mid", "tree-new"] {
+            seed_tree_dir(&store, tree);
+        }
+        // Checkpoint at deploy-1: deploy-0 is strictly BEFORE it — its
+        // release, tree, and deployment dir are reachable only from the
+        // pre-suffix ledger that the replacement discards.
+        let preview = run_checkpoint(&store, &cfg, TARGET, &DeploymentId::new("deploy-1"), true)
+            .expect("the dry-run preview succeeds");
+        assert!(preview.dry_run);
+        assert!(!preview.established);
+        assert_eq!(
+            preview.discards.discarded_entries,
+            vec!["deploy-0".to_string()],
+            "exactly the entries strictly before the checkpoint are discarded"
+        );
+        // THE FIX: the preview lists the pre-suffix-only content (reachable
+        // only from the discarded history).
+        assert!(
+            preview
+                .discards
+                .sweep_deployments
+                .contains(&"deploy-0".to_string()),
+            "the pre-suffix deployment dir must be previewed for deletion"
+        );
+        assert!(
+            preview
+                .discards
+                .sweep_releases
+                .contains(&"rel-sha256-old".to_string()),
+            "the pre-suffix release must be previewed for deletion"
+        );
+        assert!(
+            preview
+                .discards
+                .sweep_objects
+                .contains(&"tree-old".to_string()),
+            "the pre-suffix tree must be previewed for deletion"
+        );
+        // The retained suffix's own content is NOT previewed for deletion.
+        assert!(
+            !preview
+                .discards
+                .sweep_deployments
+                .contains(&"deploy-1".to_string())
+        );
+        assert!(
+            !preview
+                .discards
+                .sweep_releases
+                .contains(&"rel-sha256-mid".to_string())
+        );
+        assert!(
+            !preview
+                .discards
+                .sweep_objects
+                .contains(&"tree-mid".to_string())
+        );
+        // COUNTERFACTUAL: WITHOUT the ledger override the preview scans the
+        // CURRENT ledger — deploy-0's entry is still present, so its unique
+        // content is NOT listed (and nothing else is unreachable either).
+        // This is the under-report the bug describes.
+        let no_override = store.sweep_discards(&cfg, None).unwrap();
+        assert!(no_override.sweep_deployments.is_empty());
+        assert!(no_override.sweep_releases.is_empty());
+        assert!(no_override.sweep_objects.is_empty());
     }
 
     /// The checkpoint compacts the ledger to the suffix at the checkpoint
@@ -571,10 +777,10 @@ interval_seconds = 0
         seed_history(&store, "t2", "dep2", &[true]);
         // The referenced release dirs (kept by NAME: the ledgers reference
         // them).
-        seed_named_release(&store, "rel-sha256-deploy-0");
-        seed_named_release(&store, "rel-sha256-dep2-0");
+        seed_named_release_dir(&store, "rel-sha256-deploy-0");
+        seed_named_release_dir(&store, "rel-sha256-dep2-0");
         // Unreachable ghost release.
-        seed_named_release(&store, "rel-sha256-ghost");
+        seed_named_release_dir(&store, "rel-sha256-ghost");
 
         let id0 = store.read_ledger(TARGET).unwrap()[0].deployment_id.clone();
         let rep = run_checkpoint_unlocked(&store, &cfg, TARGET, &id0)
@@ -774,6 +980,315 @@ interval_seconds = 0
             ],
         ) {
             run_fault_case(at, fault);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // THE PREVIEW == EXECUTION PARITY PROPERTY: multi-target stores with a
+    // shared release/tree pool, observed state, and pins — the dry-run
+    // preview of a checkpoint on ONE target must enumerate EXACTLY the
+    // deletion sets the same checkpoint performs on a CLONED store (the
+    // previewed inventory == the real deletions), including the artifacts
+    // that become unreachable only AFTER the suffix replacement.
+    // ---------------------------------------------------------------------
+
+    /// The artifact pools of the parity property. Index 3 is RESERVED for
+    /// t1's entry-0 (the pre-suffix-only pair every case discards at the
+    /// checkpoint); indices 0..=2 are the pool the ledger entries draw from.
+    /// The observed state and the pins reference their OWN content-derived
+    /// release ids (see [`seed_named_release`]) — a pin must name the id the
+    /// record actually got.
+    const PROPERTY_RELEASES: [&str; 4] = [
+        "rel-sha256-p0",
+        "rel-sha256-p1",
+        "rel-sha256-p2",
+        "rel-sha256-p3",
+    ];
+    const PROPERTY_TREES: [&str; 4] = ["tree-p0", "tree-p1", "tree-p2", "tree-p3"];
+
+    /// Config for the parity property: TWO targets (t1 + t2), each with its
+    /// own slot (the loader requires every declared target to have at least
+    /// one member slot). No config `[[pins]]` — the property pins via the
+    /// store-level `pins.json` surface instead.
+    fn config_for_property(dir: &tempfile::TempDir) -> Config {
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(project.join("releases").join("v1")).unwrap();
+        std::fs::write(
+            project.join("releases").join("v1").join("standard.toml"),
+            r#"
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+deploy_dir = "/srv/eng"
+
+[[slots]]
+id = "p2"
+server = "s1"
+target = "t2"
+deploy_dir = "/srv/eng2"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("deploy.toml"),
+            r#"schema_version = 2
+application = "cp"
+release = "v1"
+
+[[servers]]
+id = "s1"
+address = "a"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+
+[targets.t2]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#,
+        )
+        .unwrap();
+        Config::load(&project.join("deploy.toml")).unwrap()
+    }
+
+    /// Run ONE parity case: seed two targets' histories (t1's entry 0 always
+    /// carries the UNIQUE pre-suffix-only pair (p3, p3); every other entry
+    /// draws from the pool shared with the observed state and the pins),
+    /// add observed state + pins + ghost content, PREVIEW the checkpoint on
+    /// the original store (touches nothing), CLONE the base and EXECUTE the
+    /// same checkpoint on the clone, and assert the previewed deletion
+    /// inventory EXACTLY equals the real one — and that the real sweep
+    /// actually removed what it reported.
+    fn run_preview_parity_case(
+        t1_len: usize,
+        t2_len: usize,
+        at: usize,
+        t1_rest: &[(usize, usize)],
+        t2_hist: &[(usize, usize)],
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let cfg = config_for_property(&dir);
+
+        // t1's full history: entry 0 carries the UNIQUE pre-suffix-only
+        // artifact (p3) — the checkpoint at `at >= 1` discards it, so every
+        // case exercises the parity fix (content unreachable only after the
+        // suffix replacement). The rest of t1 (and all of t2) draw from the
+        // pool shared with the observed state and the pins (p0..p2).
+        let mut t1_specs: Vec<(usize, usize)> = vec![(3, 3)];
+        t1_specs.extend_from_slice(t1_rest);
+        for (i, &(r, t)) in t1_specs.iter().enumerate() {
+            let id = format!("dep-t1-{i}");
+            seed_success(&store, "t1", &id, PROPERTY_RELEASES[r], PROPERTY_TREES[t]);
+            seed_unreachable(&store, &id, PROPERTY_RELEASES[r], PROPERTY_TREES[t]);
+        }
+        for (i, &(r, t)) in t2_hist.iter().enumerate() {
+            let id = format!("dep-t2-{i}");
+            seed_success(&store, "t2", &id, PROPERTY_RELEASES[r], PROPERTY_TREES[t]);
+            seed_unreachable(&store, &id, PROPERTY_RELEASES[r], PROPERTY_TREES[t]);
+        }
+        // Ghost content unreachable from ANY ledger, observation, or pin.
+        seed_unreachable(&store, "dep-ghost", "rel-sha256-ghost", "tree-ghost");
+        // OBSERVED state: the slot observed the (obs_rel) artifact, with its
+        // last deployment the CHECKPOINTED deployment (dep-t1-{at}) — the
+        // observed release + tree and that deployment dir are retained. The
+        // observed release is a content-derived id seeded as a REAL record
+        // (the sweep keeps the observed release by the id the record got).
+        let obs_rel = seed_named_release(&store, "obs");
+        store
+            .write_slot_observed(
+                &PlacementSlotId::new("s-obs".to_string()),
+                &ObservedServer {
+                    generation: None,
+                    artifact: Some(ArtifactRef {
+                        release: obs_rel.clone(),
+                        variant: VariantName::new("standard".to_string()),
+                        tree: TreeDigest::new(PROPERTY_TREES[0].to_string()),
+                    }),
+                    last_deployment: Some(DeploymentId::new(format!("dep-t1-{at}"))),
+                },
+            )
+            .unwrap();
+        seed_tree_dir(&store, PROPERTY_TREES[0]);
+        // PINS: a whole-release pin (pin_rel2 — keeps its release record and
+        // every recorded variant tree) and an exact-binding pin (pin_rel1:
+        // release + tree). Both reference the DERIVED ids the seeding
+        // returned: a pin is content-verified, so the record at the pinned
+        // id's dir must DECLARE that id (a record swapped into a differently-
+        // named dir is refused).
+        let pin_rel1 = seed_named_release(&store, "pin1");
+        let pin_rel2 = seed_named_release(&store, "pin2");
+        store
+            .write_pins(&Pins {
+                schema_version: crate::model::PINS_SCHEMA_VERSION,
+                releases: vec![pin_rel2.clone()],
+                bindings: vec![ArtifactRef {
+                    release: pin_rel1.clone(),
+                    variant: VariantName::new("standard".to_string()),
+                    tree: TreeDigest::new(PROPERTY_TREES[1].to_string()),
+                }],
+            })
+            .unwrap();
+        seed_tree_dir(&store, PROPERTY_TREES[1]);
+
+        let checkpoint_id = DeploymentId::new(format!("dep-t1-{at}"));
+        // PREVIEW on the ORIGINAL store (read-only: no locks, no writes).
+        let preview = run_checkpoint(&store, &cfg, "t1", &checkpoint_id, true)
+            .expect("the dry-run preview succeeds");
+        assert!(preview.dry_run);
+        assert!(!preview.established);
+
+        // CLONE the base (the preview touched nothing) and EXECUTE the same
+        // checkpoint on the clone.
+        let clone_base = dir.path().join("clone");
+        crate::store::atomic::copy_dir_recursive(store.base(), &clone_base)
+            .expect("the store base clones");
+        let clone = LocalStore::with_base(clone_base).unwrap();
+        let executed = run_checkpoint_unlocked(&clone, &cfg, "t1", &checkpoint_id)
+            .expect("the real checkpoint on the cloned store succeeds");
+        assert!(executed.established);
+        assert!(executed.sweep_completed);
+
+        // THE PARITY: the previewed deletion inventory (deployment dirs,
+        // releases, trees, ledger entries) EXACTLY equals the real one.
+        assert_eq!(
+            preview.discards, executed.discards,
+            "the dry-run preview must enumerate EXACTLY the deletions the real checkpoint performs (t1_len={t1_len}, t2_len={t2_len}, at={at})"
+        );
+        // The pre-suffix-only artifact MUST be in both (the fix).
+        assert!(
+            executed
+                .discards
+                .sweep_releases
+                .contains(&PROPERTY_RELEASES[3].to_string()),
+            "the pre-suffix-only release must be deleted (t1_len={t1_len}, at={at})"
+        );
+        assert!(
+            executed
+                .discards
+                .sweep_objects
+                .contains(&PROPERTY_TREES[3].to_string()),
+            "the pre-suffix-only tree must be deleted (t1_len={t1_len}, at={at})"
+        );
+
+        // The real store removed exactly what it reported.
+        for d in &executed.discards.sweep_deployments {
+            assert!(
+                !clone.deployment_dir(d).exists(),
+                "deployment dir {d} must be deleted"
+            );
+        }
+        for r in &executed.discards.sweep_releases {
+            assert!(
+                !clone.release_dir(&ReleaseId::new(r.clone())).exists(),
+                "release dir {r} must be deleted"
+            );
+        }
+        for t in &executed.discards.sweep_objects {
+            assert!(
+                !clone.object_root(&TreeDigest::new(t.clone())).exists(),
+                "tree object {t} must be deleted"
+            );
+        }
+        // Retained content survives: the observed (obs_rel) and pinned
+        // (pin_rel1 / pin_rel2) release records — each at its content-derived
+        // dir — their retained trees, and every t2 ledger entry's content.
+        assert!(clone.release_dir(&obs_rel).exists());
+        assert!(clone.release_dir(&pin_rel1).exists());
+        assert!(clone.release_dir(&pin_rel2).exists());
+        assert!(
+            clone
+                .object_root(&TreeDigest::new(PROPERTY_TREES[0].to_string()))
+                .exists()
+        );
+        assert!(
+            clone
+                .object_root(&TreeDigest::new(PROPERTY_TREES[1].to_string()))
+                .exists()
+        );
+        assert!(clone.deployment_dir(&format!("dep-t1-{at}")).exists());
+        for (i, &(r, t)) in t2_hist.iter().enumerate() {
+            assert!(clone.deployment_dir(&format!("dep-t2-{i}")).exists());
+            assert!(
+                clone
+                    .release_dir(&ReleaseId::new(PROPERTY_RELEASES[r].to_string()))
+                    .exists()
+            );
+            assert!(
+                clone
+                    .object_root(&TreeDigest::new(PROPERTY_TREES[t].to_string()))
+                    .exists()
+            );
+        }
+    }
+
+    /// One parity case's generated shape: t1_len, t2_len, the checkpoint
+    /// index into t1's history, and the per-entry artifact pool indices
+    /// (release, tree) for t1's entries 1.. and for all of t2's entries
+    /// (t1's entry 0 is the reserved pre-suffix-only pair, not generated).
+    type ParityCase = (
+        usize,
+        usize,
+        usize,
+        Vec<(usize, usize)>,
+        Vec<(usize, usize)>,
+    );
+
+    /// The parity case generator: t1_len >= 2, the checkpoint index `at` in
+    /// 1..t1_len (the checkpoint always has pre-suffix content), t2_len >= 1,
+    /// and the entry artifact refs (pool indices 0..3) for t1's entries
+    /// 1.. and all of t2's entries (t1's entry 0 is the reserved (3, 3)
+    /// pre-suffix-only pair).
+    fn parity_case_strategy() -> impl Strategy<Value = ParityCase> {
+        (2usize..=4usize)
+            .prop_flat_map(|t1_len| (Just(t1_len), 1usize..t1_len, 1usize..=4usize))
+            .prop_flat_map(|(t1_len, at, t2_len)| {
+                (
+                    Just(t1_len),
+                    Just(at),
+                    Just(t2_len),
+                    proptest::collection::vec((0usize..3usize, 0usize..3usize), t1_len - 1),
+                    proptest::collection::vec((0usize..3usize, 0usize..3usize), t2_len),
+                )
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            // Bounded 16 cases, fixed seed per house style.
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        /// MULTI-TARGET PREVIEW == EXECUTION PARITY: for every generated
+        /// two-target store (shared release/tree pool, observed state, pins,
+        /// ghost content), the dry-run preview of a checkpoint on t1 must
+        /// enumerate EXACTLY the deletion sets the same checkpoint performs
+        /// on a cloned store.
+        #[test]
+        fn checkpoint_preview_deletions_exactly_match_execution(
+            (t1_len, at, t2_len, t1_rest, t2_hist) in parity_case_strategy(),
+        ) {
+            run_preview_parity_case(t1_len, t2_len, at, &t1_rest, &t2_hist);
         }
     }
 }
