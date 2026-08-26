@@ -774,7 +774,9 @@ impl LocalStore {
     /// [`LocalStore::append_ledger_atomic`]): a successful append is durable
     /// and a crash can never leave a torn line. Fail-closed keying: the
     /// deployment id keys the entry, so a second intent for the same id (a
-    /// corrupted duplicate) is refused rather than silently merged.
+    /// corrupted duplicate) is refused rather than silently merged. The
+    /// duplicate guard scans EVERY parsed ledger entry (`read_ledger`), not
+    /// just the first one.
     pub fn append_intent(&self, target: &str, intent: &LedgerIntent) -> Result<()> {
         #[cfg(test)]
         if self
@@ -787,12 +789,16 @@ impl LocalStore {
         }
         let dir = self.target_dir(target);
         ensure_private_dir(&dir)?;
-        let p = self.ledger_path(target);
         // The intent is the entry's durable key: a duplicate intent for the
         // same deployment id is corruption (deployment ids are unique per
-        // push) and must fail closed rather than append a second entry.
-        if let Some(existing) = self.ledger_has_intent(&p)?
-            && existing == intent.deployment_id.as_str()
+        // push) and must fail closed rather than append a second entry. The
+        // guard scans EVERY parsed entry (`read_ledger` is the source of
+        // truth and fails closed on malformed lines) — a duplicate at any
+        // position, not just the first entry, is refused.
+        if self
+            .read_ledger(target)?
+            .iter()
+            .any(|e| e.deployment_id == intent.deployment_id)
         {
             return Err(Error::store(format!(
                 "refusing to append a second intent for deployment '{}' (the ledger is keyed by deployment id)",
@@ -1033,26 +1039,6 @@ impl LocalStore {
 }
 
 impl LocalStore {
-    /// Whether the ledger already contains an INTENT line (a cheap tri-state
-    /// existence probe for the append-intent duplicate guard; reads the file
-    /// only when it exists).
-    fn ledger_has_intent(&self, path: &Path) -> Result<Option<String>> {
-        if !path_state(path)? {
-            return Ok(None);
-        }
-        let text =
-            std::fs::read_to_string(path).map_err(|e| Error::store(format!("read ledger: {e}")))?;
-        for line in text.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(LedgerLine::Intent(intent)) = serde_json::from_str::<LedgerLine>(line) {
-                return Ok(Some(intent.deployment_id.as_str().to_string()));
-            }
-        }
-        Ok(None)
-    }
-
     /// The ledger APPEND's durability protocol: atomically rewrite the WHOLE
     /// ledger (read-modify-write) through the same four-stage sequence as
     /// [`crate::store::atomic::write_atomic_replace`] — a UNIQUE temp file in
@@ -1439,6 +1425,37 @@ mod tests {
         assert!(err.to_string().contains("already carries a terminal"));
     }
 
+    /// The duplicate-intent guard scans EVERY ledger entry, not just the
+    /// first one: a second intent whose deployment id duplicates the FIRST,
+    /// a MIDDLE, or the LAST entry is refused (the deployment id keys the
+    /// ledger), while a genuinely NEW id still appends fine.
+    #[test]
+    fn append_intent_duplicate_guard_scans_every_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let target = "t1";
+        seed_successful(&store, target, "deploy-first");
+        seed_successful(&store, target, "deploy-mid");
+        seed_successful(&store, target, "deploy-last");
+        for id in ["deploy-first", "deploy-mid", "deploy-last"] {
+            let err = store
+                .append_intent(target, &intent(id, target))
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("second intent"),
+                "a duplicate of the {id} entry must be refused at any position, got: {err}"
+            );
+        }
+        // A NEW unique id still appends fine (the guard rejects only
+        // duplicates, never over-rejects).
+        seed_successful(&store, target, "deploy-new");
+        assert_eq!(
+            store.read_ledger(target).unwrap().len(),
+            4,
+            "a fresh id appends as a fourth entry"
+        );
+    }
+
     /// A foreign `deployment_schema_version` on an intent line fails closed
     /// (only `SCHEMA_VERSION` is accepted), and a malformed line is a store
     /// error, never a silent drop.
@@ -1816,13 +1833,13 @@ mod tests {
         }
     }
 
-    /// The atomic rewrite never FUSES a new line into a pre-existing torn
-    /// trailing line (a crash from the OLD in-place append protocol): the
-    /// append gives the legacy tail its own newline, so the new line is
-    /// intact and the pre-existing torn line still fails closed on read —
-    /// never silently dropped, never amplified into a merged garbage line.
+    /// The append-intent guard FAILS CLOSED on a crafted torn trailing line
+    /// (a crash from the OLD in-place append protocol): `read_ledger` — the
+    /// guard's source of truth — refuses the malformed ledger, so the
+    /// append returns the parse error and the file bytes stay EXACTLY the
+    /// crafted torn tail: never fused, never appended over, never mutated.
     #[test]
-    fn atomic_append_never_fuses_a_crafted_torn_tail() {
+    fn append_guard_fails_closed_on_a_crafted_torn_tail() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
@@ -1832,31 +1849,20 @@ mod tests {
         // append could leave behind after a crash mid-write.
         let torn = r#"{"kind":"intent","deployment_id":"deploy-torn""#;
         std::fs::write(&p, torn).unwrap();
-        let id = "deploy-fresh";
-        let line = serde_json::to_string(&LedgerLine::Intent(intent(id, target))).unwrap();
-        store.append_intent(target, &intent(id, target)).unwrap();
-        let text = std::fs::read_to_string(&p).unwrap();
-        assert_eq!(
-            text,
-            format!("{torn}\n{line}\n"),
-            "the torn tail gets its own newline — the new line is never fused into it"
+        // The append fails closed at the guard (the ledger does not parse)
+        // and the file bytes are untouched — the corruption is surfaced,
+        // never silently fused or amplified.
+        let err = store
+            .append_intent(target, &intent("deploy-fresh", target))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("parse ledger line"),
+            "the guard must propagate the parse failure, got: {err}"
         );
-        // The torn tail still fails closed on read (the append neither
-        // dropped it nor merged it) — the appended line is structurally in
-        // the file.
-        assert!(store.read_ledger(target).is_err());
-        // A follow-up append keeps the torn tail its own line too.
-        store
-            .append_intent(target, &intent("deploy-fresh-2", target))
-            .unwrap();
-        let text = std::fs::read_to_string(&p).unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 3, "the torn line stays its own line");
-        assert_eq!(lines[0], torn);
-        assert_eq!(lines[1], line);
         assert_eq!(
-            lines[2],
-            serde_json::to_string(&LedgerLine::Intent(intent("deploy-fresh-2", target))).unwrap()
+            std::fs::read_to_string(&p).unwrap(),
+            torn,
+            "a refused append must leave the crafted torn ledger byte-identical"
         );
     }
 
@@ -2143,6 +2149,88 @@ mod tests {
         #[test]
         fn ledger_append_durability_fixed_seed_regression(history in ledger_history_strategy()) {
             run_ledger_durability_history(&history);
+        }
+    }
+
+    // ---- the duplicate-intent guard property ---------------------------
+
+    /// Generate a NONEMPTY deployment sequence of UNIQUE ids (`dep-0` ..
+    /// `dep-{N-1}`, the ledger's N intents) together with a position in
+    /// `0..=N`: an IN-ledger position (`0` = first, middles, `N-1` = last)
+    /// or the position JUST BEYOND the last entry (`N`). The ids are unique
+    /// by construction (derived from distinct indices).
+    fn unique_ledger_strategy() -> impl Strategy<Value = (Vec<String>, usize)> {
+        (1usize..=4, 0usize..=4)
+            .prop_map(|(n, pos)| ((0..n).map(|i| format!("dep-{i}")).collect(), pos.min(n)))
+    }
+
+    proptest! {
+        // FIXED-SEED REGRESSION for the duplicate guard: the guard must
+        // scan EVERY parsed ledger entry, so re-appending the id of ANY
+        // in-ledger position (first, middle, last) is refused and the ledger
+        // file BYTES are EXACTLY unchanged (no torn/partial append, no
+        // mutation). The id JUST BEYOND the last entry — a genuinely fresh
+        // id — still appends one whole line; appending it AGAIN is then a
+        // duplicate and is refused with bytes unchanged. The pinned
+        // 0x5EED_5EED seed with no persistence runs the IDENTICAL vectors on
+        // every invocation; the case count is bounded so the suite stays
+        // fast.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn duplicate_intent_scan_leaves_ledger_bytes_unchanged(ledger in unique_ledger_strategy()) {
+            let (ids, pos) = ledger;
+            let dir = tempfile::tempdir().unwrap();
+            let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+            let target = "t1";
+            for id in &ids {
+                store.append_intent(target, &intent(id, target)).unwrap();
+            }
+            let p = store.ledger_path(target);
+            let before = std::fs::read(&p).unwrap();
+            if pos == ids.len() {
+                // The position JUST BEYOND the last entry: the fresh id is
+                // not in the ledger, so the first append SUCCEEDS — one
+                // whole line appended after the existing newline-terminated
+                // content (atomic, never torn) — proving the every-entry
+                // scan does not over-reject a new id.
+                let fresh = format!("dep-{}", ids.len());
+                let line =
+                    serde_json::to_string(&LedgerLine::Intent(intent(&fresh, target))).unwrap();
+                store.append_intent(target, &intent(&fresh, target)).unwrap();
+                let mut after = before.clone();
+                after.extend_from_slice(format!("{line}\n").as_bytes());
+                assert_eq!(
+                    std::fs::read(&p).unwrap(),
+                    after,
+                    "a fresh id appends exactly one whole line, never torn"
+                );
+                // Appending the fresh id AGAIN is now a duplicate at the NEW
+                // last position: refused, bytes unchanged.
+                let err = store
+                    .append_intent(target, &intent(&fresh, target))
+                    .unwrap_err();
+                assert!(err.to_string().contains("second intent"));
+                assert_eq!(std::fs::read(&p).unwrap(), after);
+            } else {
+                // An IN-ledger position (first, any middle, last): the id is
+                // a duplicate — the append must FAIL and leave the ledger
+                // bytes IDENTICAL (no torn/partial append, no mutation).
+                let err = store
+                    .append_intent(target, &intent(&ids[pos], target))
+                    .unwrap_err();
+                assert!(err.to_string().contains("second intent"));
+                assert_eq!(
+                    std::fs::read(&p).unwrap(),
+                    before,
+                    "a refused duplicate must leave the ledger bytes untouched"
+                );
+            }
         }
     }
 }
