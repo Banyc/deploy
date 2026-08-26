@@ -25,8 +25,8 @@ use crate::push::server::{
 };
 use crate::push::staging::{StagingCleanup, cleanup_dry_run_staging, remove_tree_restoring_write};
 use crate::records::{
-    BehaviorIndex, DeploymentPlan, DeploymentStatus, LedgerIntent, LedgerTerminal, ObservedSlot,
-    ServerOutcomeKind, SlotAttemptState, SlotPlan, SlotResult,
+    BehaviorIndex, DeploymentPlan, DeploymentStatus, LedgerIntent, LedgerIntentReport,
+    LedgerTerminal, ObservedSlot, ServerOutcomeKind, SlotAttemptState, SlotPlan, SlotResult,
 };
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::transport::Remote;
@@ -51,7 +51,11 @@ pub struct PushOptions {
 pub struct PushReport {
     /// `None` means no attempt was created (dry-run or already up to date).
     pub status: Option<DeploymentStatus>,
-    pub attempt: Option<LedgerIntent>,
+    /// The in-memory REPORT form of the attempt: the verified intent fields
+    /// PLUS the observed per-slot actuals (`slots`). Never persisted — the
+    /// ledger's intent line keeps the `slots` map empty (outcomes live in the
+    /// terminal event's `outcomes` map).
+    pub attempt: Option<LedgerIntentReport>,
     pub message: String,
     /// Warning about post-commit maintenance deferred on this push (e.g. a
     /// per-slot rotation that failed after the deployment already committed).
@@ -1071,7 +1075,6 @@ fn push_inner(
         attempted_at: crate::remote::helper::now_rfc3339(),
         desired: desired_map,
         pre_push,
-        slots: BTreeMap::new(),
     };
     store.append_intent(target_name, &attempt_intent)?;
 
@@ -1503,12 +1506,11 @@ fn push_inner(
     // immutable intent; the ACTUAL per-slot outcomes and the terminal status
     // are appended as the deployment's TERMINAL EVENT (the ledger's
     // `{"kind":"terminal"}` line) — the outcomes store the rollback state is
-    // built from. The REPORT's attempt also carries the actuals (for display);
-    // the persisted intent does not.
-    let attempt = LedgerIntent {
-        slots: actual_servers.clone(),
-        ..attempt_intent.clone()
-    };
+    // built from. The REPORT's attempt ([`LedgerIntentReport`]) also carries
+    // the actuals (for display); the persisted intent does not — outcomes are
+    // never part of the verified intent object.
+    let mut attempt = LedgerIntentReport::from(&attempt_intent);
+    attempt.slots = actual_servers.clone();
     let outcomes_map: BTreeMap<PlacementSlotId, SlotResult> = results.clone();
 
     // Finalize the attempt's terminal event. A SUCCESSFUL attempt goes
@@ -2900,9 +2902,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     slot_ids: slots.keys().cloned().collect(),
                     behavior_sha256: behavior_sha256.to_string(),
                     attempted_at: "2026-01-01T00:00:00Z".to_string(),
-                    desired: BTreeMap::new(),
-                    pre_push: BTreeMap::new(),
-                    slots: BTreeMap::new(),
+                    // EXACT key-set equality: every member slot has exactly
+                    // one desired + one pre_push entry.
+                    desired: slots.clone(),
+                    pre_push: slots.keys().cloned().map(|k| (k, None)).collect(),
                 },
             )
             .unwrap();
@@ -2922,7 +2925,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap();
     }
 
-    fn push_pending_attempt(h: &RecoveryHarness) -> LedgerIntent {
+    fn push_pending_attempt(h: &RecoveryHarness) -> LedgerIntentReport {
         let armed = Arc::new(AtomicBool::new(true));
         let armed_for_factory = armed.clone();
         let rf = h.remotes_base.clone();
@@ -3079,7 +3082,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// one snapshot entry at index 0 for the attempt, `refs/last-successful`
     /// pointing at it, latest transition `Successful`, and the commit
     /// marker present on the remote.
-    fn assert_finalized(h: &RecoveryHarness, attempt: &LedgerIntent) {
+    fn assert_finalized(h: &RecoveryHarness, attempt: &LedgerIntentReport) {
         let snapshots = h.store.read_snapshots("t1").unwrap();
         assert_eq!(
             snapshots.len(),
@@ -3506,11 +3509,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         )
     }
 
-    /// The single attempt recorded for target `t1`.
-    fn single_attempt(h: &RecoveryHarness) -> LedgerIntent {
+    /// The single attempt recorded for target `t1`, in REPORT form (the
+    /// in-memory view of the persisted intent; the report's `slots` map is
+    /// empty because the persisted intent carries no outcomes).
+    fn single_attempt(h: &RecoveryHarness) -> LedgerIntentReport {
         let mut attempts = h.store.read_attempts("t1").unwrap();
         assert_eq!(attempts.len(), 1, "exactly one attempt recorded");
-        attempts.remove(0).intent
+        LedgerIntentReport::from(&attempts.remove(0).intent)
     }
 
     /// The rollback payload of a successful ledger entry (the test view of
@@ -3781,10 +3786,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(attempts.len(), 1, "intent must be recorded before mutation");
         let intent = &attempts[0];
         assert_eq!(intent.deployment_id, id);
-        assert!(
-            intent.intent.slots.is_empty(),
-            "persisted intent carries NO outcomes (they live in the terminal event)"
-        );
+        // The verified domain intent carries NO outcomes map at all (the
+        // type split: outcomes live in the terminal event and the in-memory
+        // report, never in the persisted intent).
         assert!(
             intent
                 .intent
@@ -3926,8 +3930,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     assignment: desired_ref.assignment,
                 },
             )]),
-            pre_push: BTreeMap::new(),
-            slots: BTreeMap::new(),
+            pre_push: BTreeMap::from([(PlacementSlotId::new("p1".to_string()), None)]),
         };
         h.store.append_attempt("t1", &intent).unwrap();
         assert_eq!(
@@ -4085,14 +4088,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             r.status
         );
 
-        // The intent record is durable with EMPTY outcomes (results live in
-        // results.json, which records the per-slot failure).
+        // The intent record is durable with NO outcomes member (outcomes live
+        // in the terminal event and the report, never in the persisted intent
+        // — the domain type carries no `slots` map).
         let attempts = h.store.read_attempts("t1").unwrap();
         assert_eq!(attempts.len(), 1, "intent must be recorded before mutation");
-        assert!(
-            attempts[0].intent.slots.is_empty(),
-            "intent carries no outcomes"
-        );
         assert_eq!(
             latest_status(&h, id.as_str()),
             DeploymentStatus::FailedRolledBack
@@ -4387,8 +4387,7 @@ interval_seconds = 0
             behavior_sha256: baseline.behavior_sha256.clone(),
             attempted_at: crate::remote::helper::now_rfc3339(),
             desired: BTreeMap::from([(PlacementSlotId::new("p1".to_string()), desired_ref)]),
-            pre_push: BTreeMap::new(),
-            slots: BTreeMap::new(),
+            pre_push: BTreeMap::from([(PlacementSlotId::new("p1".to_string()), None)]),
         };
         h.store.append_attempt("t1", &intent).unwrap();
         assert_eq!(
@@ -4452,8 +4451,7 @@ interval_seconds = 0
                 PlacementSlotId::new("p1".to_string()),
                 desired_ref.clone(),
             )]),
-            pre_push: BTreeMap::new(),
-            slots: BTreeMap::new(),
+            pre_push: BTreeMap::from([(PlacementSlotId::new("p1".to_string()), None)]),
         };
         let a = mk("deploy-multi-a");
         let b = mk("deploy-multi-b");

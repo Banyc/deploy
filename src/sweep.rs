@@ -37,8 +37,9 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::layout;
 use crate::model::{
-    ArtifactRef, DeploymentId, GenerationId, LEDGER_SCHEMA_VERSION, PlacementSlotAssignment,
-    PlacementSlotId, ReleaseId, ServerId, TargetName, TreeDigest, VariantName,
+    ArtifactRef, DeploymentId, GenerationId, GenerationRef, LEDGER_SCHEMA_VERSION,
+    PlacementSlotAssignment, PlacementSlotId, ReleaseId, ServerId, TargetName, TreeDigest,
+    VariantName,
 };
 use crate::push::checkpoint::run_checkpoint_unlocked;
 use crate::push::engine::{PushOptions, push, retry_pending_sweep};
@@ -198,17 +199,31 @@ fn list_generations(helper: &RemoteHelper) -> Vec<String> {
 // ---- pusher (checkpoint) fixture helpers -----------------------------------
 
 fn intent(id: &str, target: &str) -> LedgerIntent {
+    let p1 = PlacementSlotId::new("p1".to_string());
     LedgerIntent {
         deployment_schema_version: LEDGER_SCHEMA_VERSION,
         deployment_id: DeploymentId::new(id.to_string()),
         target: TargetName::new(target.to_string()),
         group: None,
-        slot_ids: vec![PlacementSlotId::new("p1".to_string())],
+        slot_ids: vec![p1.clone()],
         behavior_sha256: "sha256-aa".to_string(),
         attempted_at: "2026-01-01T00:00:00Z".to_string(),
-        desired: BTreeMap::new(),
-        pre_push: BTreeMap::new(),
-        slots: BTreeMap::new(),
+        // EXACT key-set equality (slot_ids == desired == pre_push).
+        desired: BTreeMap::from([(
+            p1.clone(),
+            GenerationRef {
+                generation: GenerationId::new("gen-1".to_string()),
+                assignment: PlacementSlotAssignment {
+                    placement_slot: p1.clone(),
+                    artifact: ArtifactRef {
+                        release: ReleaseId::new("rel-1".to_string()),
+                        variant: VariantName::new("standard".to_string()),
+                        tree: TreeDigest::new("tree-1".to_string()),
+                    },
+                },
+            },
+        )]),
+        pre_push: BTreeMap::from([(p1.clone(), None)]),
     }
 }
 

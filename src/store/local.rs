@@ -1348,17 +1348,31 @@ mod tests {
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
 
     fn intent(id: &str, target: &str) -> LedgerIntent {
+        let p1 = PlacementSlotId::new("p1".to_string());
         LedgerIntent {
             deployment_schema_version: LEDGER_SCHEMA_VERSION,
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new(target.to_string()),
             group: None,
-            slot_ids: vec![PlacementSlotId::new("p1".to_string())],
+            slot_ids: vec![p1.clone()],
             behavior_sha256: "sha256-aa".to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
-            desired: BTreeMap::new(),
-            pre_push: BTreeMap::new(),
-            slots: BTreeMap::new(),
+            // EXACT key-set equality (slot_ids == desired == pre_push).
+            desired: BTreeMap::from([(
+                p1.clone(),
+                GenerationRef {
+                    generation: GenerationId::new("gen-1".to_string()),
+                    assignment: PlacementSlotAssignment {
+                        placement_slot: p1.clone(),
+                        artifact: ArtifactRef {
+                            release: ReleaseId::new("rel-1".to_string()),
+                            variant: VariantName::new("standard".to_string()),
+                            tree: TreeDigest::new("tree-1".to_string()),
+                        },
+                    },
+                },
+            )]),
+            pre_push: BTreeMap::from([(p1.clone(), None)]),
         }
     }
 
@@ -1621,10 +1635,27 @@ mod tests {
             "a disagreeing intent line must be refused, got: {err}"
         );
 
-        // The same desired map with an AGREEING membership reads fine.
+        // The same record with an AGREEING membership reads fine: the extra
+        // slot joins slot_ids AND both per-slot maps (EXACT key-set equality
+        // — every member slot has exactly one desired + one pre_push entry).
         let mut wire = LedgerIntentWire::from(&intent("deploy-x", target));
-        wire.slot_ids
-            .push(PlacementSlotId::new("not-a-member".to_string()));
+        let extra = PlacementSlotId::new("not-a-member".to_string());
+        wire.slot_ids.push(extra.clone());
+        wire.desired.insert(
+            extra.clone(),
+            GenerationRef {
+                generation: GenerationId::new("gen-2".to_string()),
+                assignment: PlacementSlotAssignment {
+                    placement_slot: extra.clone(),
+                    artifact: ArtifactRef {
+                        release: ReleaseId::new("rel-2".to_string()),
+                        variant: VariantName::new("standard".to_string()),
+                        tree: TreeDigest::new("t2".to_string()),
+                    },
+                },
+            },
+        );
+        wire.pre_push.insert(extra, None);
         let line = serde_json::to_string(&LedgerLine::Intent(wire)).unwrap();
         std::fs::write(&p, format!("{line}\n")).unwrap();
         let entries = store.read_ledger(target).unwrap();

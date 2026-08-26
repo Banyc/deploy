@@ -900,9 +900,10 @@ interval_seconds = 0
                     slot_ids: slots.keys().cloned().collect(),
                     behavior_sha256: behavior_sha256.to_string(),
                     attempted_at: "2026-01-01T00:00:00Z".to_string(),
-                    desired: BTreeMap::new(),
-                    pre_push: BTreeMap::new(),
-                    slots: BTreeMap::new(),
+                    // EXACT key-set equality: every member slot has exactly
+                    // one desired + one pre_push entry.
+                    desired: slots.clone(),
+                    pre_push: slots.keys().cloned().map(|k| (k, None)).collect(),
                 },
             )
             .unwrap();

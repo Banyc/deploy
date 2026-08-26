@@ -18,17 +18,32 @@
 //! shapes, [`LedgerIntentWire`], [`LedgerRollbackWire`], [`LedgerTerminalWire`],
 //! [`DeploymentPlanWire`]) and are RECONCILED by a VERIFYING CONVERSION
 //! (`Wire::into_domain`). The conversion checks that every duplicate
-//! projection AGREES — e.g. the `desired`/`pre_push`/`slots` key sets are
-//! subsets of the authoritative `slot_ids` membership, each
-//! [`crate::model::GenerationRef`]'s assignment names its own map key, the
-//! stored `behavior_sha256` equals the digest derived from the behavior index,
-//! and the stored `desired_releases` equals the releases derived from the
-//! per-slot artifacts. A disagreement is an [`crate::error::Error::integrity`]
+//! projection AGREES — e.g. the intent's `slot_ids` is DUPLICATE-FREE and
+//! its `desired`/`pre_push` key sets EQUAL the authoritative `slot_ids`
+//! membership EXACTLY (a missing or extra key, or a duplicated member id,
+//! is a disagreement — an incomplete authoritative projection is never read
+//! as if it were complete), each [`crate::model::GenerationRef`]'s assignment
+//! names its own map key, the stored `behavior_sha256` equals the digest
+//! derived from the behavior index, and the stored `desired_releases` equals
+//! the releases derived from the per-slot artifacts. A disagreement is an
+//! [`crate::error::Error::integrity`]
 //! error (fail closed — a hand-constructed record can never put the
 //! duplicates out of agreement, and the code then reads whichever projection
 //! it happens to use). The rest of the codebase consumes ONLY the validated
 //! domain types; the store's readers convert wire → domain on read and refuse
 //! disagreeing records.
+//!
+//! # INTENT vs REPORT (outcomes are never part of the intent)
+//!
+//! The INTENT carries NO outcomes: the ledger's intent line keeps its `slots`
+//! (actuals) map EMPTY (outcomes live in the terminal event's `outcomes` map
+//! and the rollback payload), and the verified domain [`LedgerIntent`] does
+//! NOT carry an outcomes map at all — the wire keeps the empty member for
+//! format stability, and the in-memory push REPORT ([`LedgerIntentReport`])
+//! carries the observed per-slot actuals for display. Splitting the datatypes
+//! means the report's `slots` map can never weaken the intent's key-set
+//! invariant (`slot_ids == desired == pre_push`): it is simply not part of
+//! the verified intent object.
 //!
 //! # ONE history ledger per target
 //!
@@ -156,45 +171,80 @@ pub struct LedgerIntentWire {
     pub group: Option<String>,
     /// The placement slots participating in this deployment, in deployment
     /// order (the same set the commit marker `slots` payload records). This
-    /// is the AUTHORITATIVE membership: the `desired` / `pre_push` / `slots`
-    /// maps' key sets must agree with it (every key a member), verified by
+    /// is the AUTHORITATIVE membership: it must be DUPLICATE-FREE, and the
+    /// `desired` / `pre_push` maps' key sets must EQUAL it EXACTLY (every
+    /// member slot has exactly one desired + one pre_push entry), verified by
     /// the wire → domain conversion.
     pub slot_ids: Vec<PlacementSlotId>,
     pub behavior_sha256: String,
     pub attempted_at: String,
     /// Desired per-slot assignments (what the plan intended): each slot's
-    /// minted generation for its planned artifact. Each entry's key must be a
-    /// member of `slot_ids`, and each `GenerationRef`'s assignment must name
+    /// minted generation for its planned artifact. The key set must equal
+    /// `slot_ids` EXACTLY, and each `GenerationRef`'s assignment must name
     /// its own map key.
     pub desired: BTreeMap<PlacementSlotId, GenerationRef>,
     /// Pre-push per-slot state before mutation (`None` if first deployment).
-    /// Every key must be a member of `slot_ids`.
+    /// The key set must equal `slot_ids` EXACTLY.
     pub pre_push: BTreeMap<PlacementSlotId, Option<SlotAttemptState>>,
     /// Actual per-slot result after the attempt. The persisted ledger intent
     /// keeps this map EMPTY (outcomes are recorded in the terminal event's
-    /// `outcomes` map); in memory (the push report) it carries the observed
-    /// actuals for display. Every key must be a member of `slot_ids`.
+    /// `outcomes` map); the in-memory REPORT ([`LedgerIntentReport`]) carries
+    /// the observed actuals for display — the verified domain [`LedgerIntent`]
+    /// does NOT carry this map, so it is not part of the intent's key-set
+    /// invariant. Every key must be a member of `slot_ids`.
     pub slots: BTreeMap<PlacementSlotId, SlotAttemptState>,
 }
 
 impl LedgerIntentWire {
     /// VERIFYING CONVERSION (wire → domain): every duplicate projection must
-    /// AGREE. The authoritative membership is `slot_ids`; the `desired` /
-    /// `pre_push` / `slots` key sets must be subsets of it, and every
-    /// desired [`crate::model::GenerationRef`]'s assignment must name its own
-    /// map key. A disagreement is an [`Error::integrity`] error (fail closed —
-    /// a hand-constructed record can never be read as whichever projection a
-    /// consumer happens to use).
+    /// AGREE. The authoritative membership is `slot_ids`, which must be
+    /// DUPLICATE-FREE, and the `desired` / `pre_push` key sets must EQUAL it
+    /// EXACTLY — every member slot has exactly one desired + one pre_push
+    /// entry; a missing OR extra key (and a duplicated member id) fails
+    /// closed, so an incomplete authoritative projection is never read as if
+    /// the maps were authoritative. Each desired
+    /// [`crate::model::GenerationRef`]'s assignment must name its own map key,
+    /// and every wire `slots` (actuals) key must be a member of `slot_ids`
+    /// (the persisted intent keeps that map EMPTY — outcomes live in the
+    /// terminal event's `outcomes` map and the in-memory report
+    /// [`LedgerIntentReport`]). A disagreement is an [`Error::integrity`]
+    /// error (fail closed — a hand-constructed record can never be read as
+    /// whichever projection a consumer happens to use).
     pub fn into_domain(self) -> Result<LedgerIntent> {
-        let membership: BTreeSet<&PlacementSlotId> = self.slot_ids.iter().collect();
-        let is_member = |sid: &PlacementSlotId| membership.contains(sid);
-        for (key, g) in &self.desired {
-            if !is_member(key) {
+        // `slot_ids` is the AUTHORITATIVE membership and must be
+        // DUPLICATE-FREE: a duplicated member would silently weaken the
+        // key-set equality below (a set collapses the duplicate, so the
+        // duplicated id would never be checked against the maps).
+        let mut seen: BTreeSet<&PlacementSlotId> = BTreeSet::new();
+        for sid in &self.slot_ids {
+            if !seen.insert(sid) {
                 return Err(Error::integrity(format!(
-                    "intent {}: desired assignment for slot '{key}' is not a member of slot_ids",
+                    "intent {}: slot_ids carries duplicate slot '{sid}' — the membership must be unique",
                     self.deployment_id
                 )));
             }
+        }
+        let membership: BTreeSet<&PlacementSlotId> = self.slot_ids.iter().collect();
+        let desired_keys: BTreeSet<&PlacementSlotId> = self.desired.keys().collect();
+        let pre_push_keys: BTreeSet<&PlacementSlotId> = self.pre_push.keys().collect();
+        // EXACT KEY-SET EQUALITY: every member slot has exactly one desired +
+        // one pre_push entry, and neither map carries a slot the membership
+        // omits — a missing OR extra key fails the conversion (an incomplete
+        // authoritative projection is a disagreement, never read as if the
+        // maps were the membership).
+        if membership != desired_keys {
+            return Err(Error::integrity(format!(
+                "intent {}: slot_ids {:?} disagrees with the desired key set {:?} — every member slot needs exactly one desired entry",
+                self.deployment_id, membership, desired_keys
+            )));
+        }
+        if membership != pre_push_keys {
+            return Err(Error::integrity(format!(
+                "intent {}: slot_ids {:?} disagrees with the pre_push key set {:?} — every member slot needs exactly one pre_push entry",
+                self.deployment_id, membership, pre_push_keys
+            )));
+        }
+        for (key, g) in &self.desired {
             if &g.assignment.placement_slot != key {
                 return Err(Error::integrity(format!(
                     "intent {}: desired assignment for slot '{key}' names placement '{}'",
@@ -202,16 +252,12 @@ impl LedgerIntentWire {
                 )));
             }
         }
-        for key in self.pre_push.keys() {
-            if !is_member(key) {
-                return Err(Error::integrity(format!(
-                    "intent {}: pre_push slot '{key}' is not in slot_ids",
-                    self.deployment_id
-                )));
-            }
-        }
+        // The wire `slots` (actuals) map is the REPORT's map in the old
+        // single-datatype design; it is persisted EMPTY. The domain intent
+        // does NOT carry it; any wire key must still be a member — fail
+        // closed.
         for key in self.slots.keys() {
-            if !is_member(key) {
+            if !membership.contains(key) {
                 return Err(Error::integrity(format!(
                     "intent {}: slots key '{key}' is not in slot_ids",
                     self.deployment_id
@@ -228,7 +274,6 @@ impl LedgerIntentWire {
             attempted_at: self.attempted_at,
             desired: self.desired,
             pre_push: self.pre_push,
-            slots: self.slots,
         })
     }
 }
@@ -240,13 +285,19 @@ impl LedgerIntentWire {
 /// generations can never lose the deployment: the intent is already durable
 /// and the next push reconciles it) and never edited. The attempt's STATUS,
 /// per-slot OUTCOMES and (when successful) ROLLBACK STATE come from its
-/// TERMINAL EVENT ([`LedgerTerminal`]), never from this record — the
-/// persisted `slots` map is empty.
+/// TERMINAL EVENT ([`LedgerTerminal`]), never from this record — the verified
+/// intent object carries NO outcomes map at all (the wire keeps the
+/// intentionally-empty `slots` member for format stability; the in-memory
+/// push REPORT [`LedgerIntentReport`] carries the observed per-slot actuals),
+/// so the report's outcomes map can never weaken the intent's key-set
+/// invariant.
 ///
 /// Every slot→assignment map is keyed by [`PlacementSlotId`]; `slot_ids` is
 /// the deployment's membership (mirroring the commit marker `slots`
-/// payload). The record carries `deployment_schema_version`, which must be
-/// exactly [`crate::model::LEDGER_SCHEMA_VERSION`]: writers emit the
+/// payload), DUPLICATE-FREE, and the `desired` / `pre_push` key sets EQUAL it
+/// EXACTLY (enforced by the wire → domain conversion). The record carries
+/// `deployment_schema_version`, which must be exactly
+/// [`crate::model::LEDGER_SCHEMA_VERSION`]: writers emit the
 /// constant and readers (e.g. [`crate::store::local::LocalStore::read_ledger`]) refuse
 /// any other version with an error naming the version (fail closed — a
 /// mismatched record is never silently interpreted). The current v1 shape is
@@ -266,8 +317,8 @@ pub struct LedgerIntent {
     pub group: Option<String>,
     /// The placement slots participating in this deployment, in deployment
     /// order (the same set the commit marker `slots` payload records). THE
-    /// AUTHORITATIVE MEMBERSHIP — the `desired` / `pre_push` / `slots` key
-    /// sets must agree with it (enforced by the wire → domain conversion).
+    /// AUTHORITATIVE MEMBERSHIP, DUPLICATE-FREE — the `desired` / `pre_push`
+    /// key sets require it EXACTLY (enforced by the wire → domain conversion).
     pub slot_ids: Vec<PlacementSlotId>,
     /// The attempt's behavior digest (see [`LedgerIntentWire`]).
     pub behavior_sha256: String,
@@ -277,12 +328,6 @@ pub struct LedgerIntent {
     pub desired: BTreeMap<PlacementSlotId, GenerationRef>,
     /// Pre-push per-slot state before mutation (`None` if first deployment).
     pub pre_push: BTreeMap<PlacementSlotId, Option<SlotAttemptState>>,
-    /// Actual per-slot result after the attempt. INTENT vs OUTCOME: the
-    /// persisted ledger intent keeps this map EMPTY (outcomes are recorded
-    /// in the terminal event's `outcomes` map); in memory (the push report)
-    /// it carries the observed actuals for display, and recovery derives
-    /// outcomes from the verified desired state instead.
-    pub slots: BTreeMap<PlacementSlotId, SlotAttemptState>,
 }
 
 impl LedgerIntent {
@@ -315,7 +360,54 @@ impl From<&LedgerIntent> for LedgerIntentWire {
             attempted_at: i.attempted_at.clone(),
             desired: i.desired.clone(),
             pre_push: i.pre_push.clone(),
-            slots: i.slots.clone(),
+            // The persisted intent carries NO outcomes: the wire keeps the
+            // `slots` member EMPTY (outcomes live in the terminal event's
+            // `outcomes` map; the in-memory report [`LedgerIntentReport`]
+            // carries the observed actuals).
+            slots: BTreeMap::new(),
+        }
+    }
+}
+
+/// The in-memory push REPORT form of a deployment attempt: the verified
+/// intent fields PLUS the observed per-slot ACTUALS (`slots`). Built in
+/// memory from the durable intent at push time and NEVER persisted: the
+/// ledger's intent line carries NO outcomes (the wire [`LedgerIntentWire`]
+/// keeps its `slots` map empty; outcomes live in the terminal event's
+/// `outcomes` map and the rollback payload). Keeping the report as its OWN
+/// type — rather than reusing [`LedgerIntent`] — means the verified intent
+/// object never carries an outcomes map, so the intent's key-set invariant
+/// (`slot_ids == desired == pre_push`) is not weakened by a report map that
+/// is not part of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LedgerIntentReport {
+    pub deployment_schema_version: u32,
+    pub deployment_id: DeploymentId,
+    pub target: TargetName,
+    pub group: Option<String>,
+    pub slot_ids: Vec<PlacementSlotId>,
+    pub behavior_sha256: String,
+    pub attempted_at: String,
+    pub desired: BTreeMap<PlacementSlotId, GenerationRef>,
+    pub pre_push: BTreeMap<PlacementSlotId, Option<SlotAttemptState>>,
+    /// Actual per-slot result after the attempt, for display. The report is
+    /// in-memory only — the persisted intent never carries this map.
+    pub slots: BTreeMap<PlacementSlotId, SlotAttemptState>,
+}
+
+impl From<&LedgerIntent> for LedgerIntentReport {
+    fn from(i: &LedgerIntent) -> Self {
+        LedgerIntentReport {
+            deployment_schema_version: i.deployment_schema_version,
+            deployment_id: i.deployment_id.clone(),
+            target: i.target.clone(),
+            group: i.group.clone(),
+            slot_ids: i.slot_ids.clone(),
+            behavior_sha256: i.behavior_sha256.clone(),
+            attempted_at: i.attempted_at.clone(),
+            desired: i.desired.clone(),
+            pre_push: i.pre_push.clone(),
+            slots: BTreeMap::new(),
         }
     }
 }
@@ -1106,61 +1198,35 @@ mod tests {
         })
     }
 
-    fn agreeing_pre_push()
-    -> impl Strategy<Value = BTreeMap<PlacementSlotId, Option<SlotAttemptState>>> {
-        prop::collection::btree_map(
-            slot_strategy(),
-            any::<bool>().prop_map(|present| {
-                present.then(|| SlotAttemptState {
-                    artifact: ArtifactRef::default(),
-                    generation: Some(GenerationId::new("gen-0".to_string())),
-                })
-            }),
-            0..4,
-        )
-    }
-
-    fn agreeing_actuals() -> impl Strategy<Value = BTreeMap<PlacementSlotId, SlotAttemptState>> {
-        prop::collection::btree_map(slot_strategy(), any::<bool>(), 0..4).prop_map(|m| {
-            m.into_iter()
-                .filter_map(|(key, present)| {
-                    present.then(|| {
-                        (
-                            key.clone(),
-                            SlotAttemptState {
-                                artifact: ArtifactRef::default(),
-                                generation: Some(GenerationId::new("gen-a".to_string())),
-                            },
-                        )
-                    })
-                })
-                .collect()
-        })
-    }
-
+    /// A VALID intent wire: a NON-EMPTY, duplicate-free membership K;
+    /// `slot_ids` = K (deployment order), `desired` = K → agreeing
+    /// generation ref, `pre_push` = K → observed pre-push state, and the
+    /// wire `slots` (actuals) map EMPTY (the persisted intent carries no
+    /// outcomes — they live in the terminal event's `outcomes` map and the
+    /// in-memory report [`LedgerIntentReport`]). The property then mutates
+    /// ONE projection at a time (DELETE / ADD / DUPLICATE) and asserts the
+    /// conversion fails closed on EVERY tamper while accepting the
+    /// untampered record — the exact-equality + duplicate-free cases only.
     fn agreeing_intent_wire() -> impl Strategy<Value = LedgerIntentWire> {
-        (agreeing_gen_refs(), agreeing_pre_push(), agreeing_actuals()).prop_map(
-            |(desired, pre_push, slots)| {
-                // The AUTHORITATIVE membership is the union of the per-slot
-                // maps' keys (every key a member — agreement by construction).
-                let mut membership: BTreeSet<PlacementSlotId> = desired.keys().cloned().collect();
-                membership.extend(pre_push.keys().cloned());
-                membership.extend(slots.keys().cloned());
-                let slot_ids: Vec<PlacementSlotId> = membership.into_iter().collect();
-                LedgerIntentWire {
-                    deployment_schema_version: crate::model::LEDGER_SCHEMA_VERSION,
-                    deployment_id: DeploymentId::new("deploy-w".to_string()),
-                    target: TargetName::new("t1".to_string()),
-                    group: None,
-                    slot_ids,
-                    behavior_sha256: "sha256-w".to_string(),
-                    attempted_at: "2026-01-01T00:00:00Z".to_string(),
-                    desired,
-                    pre_push,
-                    slots,
-                }
-            },
-        )
+        prop::collection::btree_set(slot_strategy(), 1..4).prop_map(|keys| {
+            let slot_ids: Vec<PlacementSlotId> = keys.iter().cloned().collect();
+            let desired: BTreeMap<PlacementSlotId, GenerationRef> =
+                keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
+            let pre_push: BTreeMap<PlacementSlotId, Option<SlotAttemptState>> =
+                keys.iter().map(|k| (k.clone(), None)).collect();
+            LedgerIntentWire {
+                deployment_schema_version: crate::model::LEDGER_SCHEMA_VERSION,
+                deployment_id: DeploymentId::new("deploy-w".to_string()),
+                target: TargetName::new("t1".to_string()),
+                group: None,
+                slot_ids,
+                behavior_sha256: "sha256-w".to_string(),
+                attempted_at: "2026-01-01T00:00:00Z".to_string(),
+                desired,
+                pre_push,
+                slots: BTreeMap::new(),
+            }
+        })
     }
 
     fn agreeing_rollback_wire() -> impl Strategy<Value = LedgerRollbackWire> {
@@ -1259,30 +1325,75 @@ mod tests {
         let domain = w
             .clone()
             .into_domain()
-            .expect("an agreeing intent wire converts");
+            .expect("a valid intent wire converts");
         // Round trip: wire → domain → serialize → deserialize (wire) →
-        // convert — the derived membership and releases never change.
+        // convert — the derived membership and releases never change, and the
+        // serialized domain keeps the wire `slots` map EMPTY (the persisted
+        // intent carries no outcomes).
         let json = serde_json::to_string(&domain).unwrap();
         let wire2: LedgerIntentWire = serde_json::from_str(&json).unwrap();
+        assert!(
+            wire2.slots.is_empty(),
+            "the persisted intent keeps the `slots` map empty (outcomes live in the terminal event and the in-memory report)"
+        );
         let domain2 = wire2.into_domain().unwrap();
         assert_eq!(domain2.membership(), domain.membership());
         assert_eq!(domain2.releases(), domain.releases());
-        // A disagreement PER DUPLICATE fails closed:
-        // (a) a desired key outside the authoritative membership
+        // EVERY tamper per projection fails closed — the conversion accepts
+        // EXACTLY the unique, equal-key-set (no dups) cases:
+        // (a) DELETE a member from `slot_ids` (incomplete membership)
+        let mut bad = w.clone();
+        bad.slot_ids.pop();
+        assert!(
+            bad.into_domain().is_err(),
+            "a deleted slot_ids member is a conversion error"
+        );
+        // (b) ADD a non-member to `slot_ids` (extra membership)
+        let mut bad = w.clone();
+        bad.slot_ids.push(slot(9));
+        assert!(
+            bad.into_domain().is_err(),
+            "an extra slot_ids member is a conversion error"
+        );
+        // (c) DUPLICATE a `slot_ids` member (a duplicate weakens the
+        //     membership check)
+        let mut bad = w.clone();
+        bad.slot_ids.push(bad.slot_ids[0].clone());
+        assert!(
+            bad.into_domain().is_err(),
+            "a duplicate slot_ids member is a conversion error"
+        );
+        // (d) DELETE a desired key (incomplete desired projection)
+        let mut bad = w.clone();
+        let victim = bad.desired.keys().next().unwrap().clone();
+        bad.desired.remove(&victim);
+        assert!(
+            bad.into_domain().is_err(),
+            "a missing desired key is a conversion error"
+        );
+        // (e) ADD a non-member desired key (extra desired projection)
         let mut bad = w.clone();
         bad.desired.insert(slot(9), gen_ref_for(&slot(9)));
         assert!(
             bad.into_domain().is_err(),
-            "a desired key outside slot_ids is a conversion error"
+            "an extra desired key is a conversion error"
         );
-        // (b) a pre_push key outside the membership
+        // (f) DELETE a pre_push key (incomplete pre_push projection)
+        let mut bad = w.clone();
+        let victim = bad.pre_push.keys().next().unwrap().clone();
+        bad.pre_push.remove(&victim);
+        assert!(
+            bad.into_domain().is_err(),
+            "a missing pre_push key is a conversion error"
+        );
+        // (g) ADD a non-member pre_push key (extra pre_push projection)
         let mut bad = w.clone();
         bad.pre_push.insert(slot(9), None);
         assert!(
             bad.into_domain().is_err(),
-            "a pre_push key outside slot_ids is a conversion error"
+            "an extra pre_push key is a conversion error"
         );
-        // (c) a slots (actuals) key outside the membership
+        // (h) a wire slots (actuals) key outside the membership
         let mut bad = w.clone();
         bad.slots.insert(
             slot(9),
@@ -1295,7 +1406,7 @@ mod tests {
             bad.into_domain().is_err(),
             "a slots key outside slot_ids is a conversion error"
         );
-        // (d) a generation assignment naming a different placement slot
+        // (i) a generation assignment naming a different placement slot
         let mut bad = w.clone();
         if let Some((_, g)) = bad.desired.iter_mut().next() {
             g.assignment.placement_slot = slot(9);
@@ -1402,15 +1513,15 @@ mod tests {
     }
 
     proptest! {
-        // PROPERTY: arbitrary WIRE records (arbitrary slot sets, arbitrary
-        // desired/pre_push/behavior/release fields) convert EXACTLY when every
-        // duplicate projection AGREES — a disagreement (any one duplicate
-        // mutated) → `Err`; agreement → `Ok` — and every successfully
-        // converted record ROUND-TRIPS (wire → domain → serialize →
-        // deserialize → convert) without changing its derived membership,
-        // releases, or behavior digest (the derived values are stable).
-        // Bounded 16 cases, fixed seed 0x5EED_5EED (house style), no
-        // persistence.
+        // PROPERTY: VALID wire intents (duplicate-free `slot_ids`, `desired`
+        // and `pre_push` key sets EXACTLY equal to `slot_ids`, empty wire
+        // `slots`) convert `Ok` and ROUND-TRIP (wire → domain → serialize →
+        // deserialize → convert) without changing their derived membership or
+        // releases, while EVERY independent tamper per projection — DELETE /
+        // ADD / DUPLICATE each key of `slot_ids` / `desired` / `pre_push` —
+        // is rejected: the conversion accepts EXACTLY the unique, equal-key-
+        // set cases (no dups, exact equality). Bounded 16 cases, fixed seed
+        // 0x5EED_5EED (house style), no persistence.
         #![proptest_config(ProptestConfig {
             cases: 16,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
@@ -1497,6 +1608,126 @@ mod tests {
             bad.into_domain().is_err(),
             "an assignment naming a different placement fails closed"
         );
+    }
+
+    /// [`LedgerIntentWire`] EXACT-EQUALITY invariant: the conversion accepts
+    /// a wire whose `slot_ids` is duplicate-free and whose `desired` /
+    /// `pre_push` key sets EQUAL `slot_ids` EXACTLY, and rejects every
+    /// weakening — a duplicated slot id, a missing desired key, an extra
+    /// pre_push key, a missing pre_push key, an extra desired key, or a
+    /// deleted member id.
+    #[test]
+    fn intent_requires_exact_equal_key_sets() {
+        let wire = LedgerIntentWire {
+            deployment_schema_version: crate::model::LEDGER_SCHEMA_VERSION,
+            deployment_id: DeploymentId::new("deploy-eq".to_string()),
+            target: TargetName::new("t1".to_string()),
+            group: None,
+            slot_ids: vec![slot(1)],
+            behavior_sha256: "sha256-eq".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            desired: BTreeMap::from([(slot(1), gen_ref_for(&slot(1)))]),
+            pre_push: BTreeMap::from([(slot(1), None)]),
+            slots: BTreeMap::new(),
+        };
+        assert!(
+            wire.clone().into_domain().is_ok(),
+            "the exact-equal key-set case converts Ok"
+        );
+
+        // A DUPLICATE slot id weakens the membership: the duplicate would
+        // collapse in a set and never be checked against the maps.
+        let mut bad = wire.clone();
+        bad.slot_ids.push(slot(1));
+        assert!(
+            bad.into_domain().is_err(),
+            "a duplicate slot id fails closed"
+        );
+        // A MISSING desired key: the member slot has no desired entry.
+        let mut bad = wire.clone();
+        bad.desired.remove(&slot(1));
+        assert!(
+            bad.into_domain().is_err(),
+            "a missing desired key fails closed"
+        );
+        // An EXTRA pre_push key: the map carries a slot the membership omits.
+        let mut bad = wire.clone();
+        bad.pre_push.insert(slot(2), None);
+        assert!(
+            bad.into_domain().is_err(),
+            "an extra pre_push key fails closed"
+        );
+        // A MISSING pre_push key: the member has no pre-push entry.
+        let mut bad = wire.clone();
+        bad.pre_push.remove(&slot(1));
+        assert!(
+            bad.into_domain().is_err(),
+            "a missing pre_push key fails closed"
+        );
+        // An EXTRA desired key: the member has a desired entry for a slot the
+        // membership omits.
+        let mut bad = wire.clone();
+        bad.desired.insert(slot(2), gen_ref_for(&slot(2)));
+        assert!(
+            bad.into_domain().is_err(),
+            "an extra desired key fails closed"
+        );
+        // A DELETED member: the membership omits a key the maps carry.
+        let mut bad = wire.clone();
+        bad.slot_ids.pop();
+        assert!(
+            bad.into_domain().is_err(),
+            "a deleted slot_ids member fails closed"
+        );
+    }
+
+    /// INTENT vs REPORT datatype split: the verified domain [`LedgerIntent`]
+    /// carries NO outcomes map (the wire keeps the intentionally-empty `slots`
+    /// member for format stability), while the in-memory [`LedgerIntentReport`]
+    /// carries the observed per-slot actuals — the report's map is not part of
+    /// the intent's key-set invariant.
+    #[test]
+    fn intent_report_carries_outcomes_while_persisted_intent_slots_stay_empty() {
+        let domain = LedgerIntent {
+            deployment_schema_version: crate::model::LEDGER_SCHEMA_VERSION,
+            deployment_id: DeploymentId::new("deploy-r".to_string()),
+            target: TargetName::new("t1".to_string()),
+            group: None,
+            slot_ids: vec![slot(1)],
+            behavior_sha256: "sha256-r".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            desired: BTreeMap::from([(slot(1), gen_ref_for(&slot(1)))]),
+            pre_push: BTreeMap::from([(slot(1), None)]),
+        };
+        // The REPORT carries the observed per-slot actuals for display.
+        let mut report = LedgerIntentReport::from(&domain);
+        report.slots.insert(
+            slot(1),
+            SlotAttemptState {
+                artifact: ArtifactRef::default(),
+                generation: Some(GenerationId::new("gen-observed".to_string())),
+            },
+        );
+        assert_eq!(report.slot_ids, domain.slot_ids);
+        assert_eq!(report.desired, domain.desired);
+        assert_eq!(
+            report.slots[&slot(1)]
+                .generation
+                .as_ref()
+                .map(|g| g.as_str()),
+            Some("gen-observed"),
+            "the report carries the actual per-slot outcome"
+        );
+        // The PERSISTED (wire) intent keeps `slots` EMPTY, and the verified
+        // domain object has no outcomes map at all (the report's map never
+        // weakens the intent invariant).
+        let wire = LedgerIntentWire::from(&domain);
+        assert!(
+            wire.slots.is_empty(),
+            "the persisted intent keeps the `slots` map empty"
+        );
+        let round = wire.into_domain().unwrap();
+        assert_eq!(round, domain, "the domain round-trips unchanged");
     }
 
     /// [`LedgerRollback`]: an agreeing record converts and round-trips
