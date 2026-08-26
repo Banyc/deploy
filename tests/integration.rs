@@ -2409,17 +2409,20 @@ fn post_lock_failure_releases_lock_and_records() -> Result<()> {
 
 // ---- Rotation lock discipline: the protected rotation in the capacity
 // preflight (step 8) and the per-slot rotation after a successful push (step
-// 17) hold the server mutation lock via an RAII guard, so an error inside
-// `compute_retained` or `rotate` releases the lock on drop. A manual
-// acquire/release pair would leak it on the `?` error path, stranding every
-// later operation on the slot with "mutation lock held by ...".
+// 17) hold the server mutation lock via an RAII guard, so the lock is
+// released on EVERY block exit — after a best-effort failure in the capacity
+// preflight, or on an error in step 17's post-commit rotation. A manual
+// acquire/release pair would leak it, stranding every later operation on the
+// slot with "mutation lock held by ...".
 
 /// A capacity preflight whose protected rotation fails inside
 /// `compute_retained` (a transient remote read error on the generations root)
-/// must NOT leak the server mutation lock: the rotation block holds the lock
-/// via an RAII guard, so the error path releases it on drop, and a later
-/// operation can acquire the lock again. The push itself still fails (the
-/// `compute_retained` error propagates out of the preflight).
+/// must NOT fail the push on the rotation error — the protected rotation is
+/// BEST-EFFORT (it exists only to free capacity), so the failure skips the
+/// sweep and the HARD capacity re-check decides the outcome: with space still
+/// short, the push fails with the preflight error. Either way the server
+/// mutation lock is released on the block exit (the RAII guard drops it), so
+/// a later operation can acquire the lock again.
 #[test]
 fn capacity_rotation_compute_retained_failure_releases_lock() -> Result<()> {
     let tmp = tempfile::tempdir().unwrap();
@@ -2459,8 +2462,10 @@ fn capacity_rotation_compute_retained_failure_releases_lock() -> Result<()> {
         )
     };
 
-    // The push fails: the injected `compute_retained` read error propagates
-    // out of the capacity preflight.
+    // The push fails — NOT on the injected rotation read error (the
+    // preflight rotation is best-effort, so the failure is swallowed) but on
+    // the HARD capacity re-check: with the sweep skipped, the 100-byte
+    // remote still cannot fit need + reserve.
     let err = push(
         &config_path,
         &store,
@@ -2473,10 +2478,11 @@ fn capacity_rotation_compute_retained_failure_releases_lock() -> Result<()> {
             group: None,
         },
     )
-    .expect_err("the injected compute_retained failure must fail the push");
+    .expect_err("the hard capacity re-check must fail the push");
     assert!(
-        err.to_string().contains("generations"),
-        "expected the injected rotation read failure, got: {err}"
+        err.to_string().contains("insufficient capacity"),
+        "rotation is best-effort in the preflight: the hard capacity re-check must fail the \
+         push, got: {err}"
     );
 
     // The mutation lock was released on the error path: no server carries a

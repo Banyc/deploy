@@ -25,7 +25,7 @@
 //! retained binding or applicable pin references it.
 
 use crate::config::{Pin, RotationConfig};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::layout;
 use crate::model::{ReleaseId, TreeDigest};
 use crate::remote::helper::{RemoteHelper, RemoteStatus};
@@ -117,12 +117,28 @@ pub fn compute_retained(
     // recorded in the release record is retained, so the pinned release stays
     // fully rollback-able no matter how old it is or how far outside the
     // count/age windows it falls.
+    //
+    // FAIL CLOSED — the receiver-side mirror of the pusher-side GC anchor
+    // semantics ([`LocalStore::honor_release_pin`]): a pin that names a
+    // release with NO record on disk, or whose record cannot be read or
+    // identity-verified, is an INTEGRITY error (see [`LocalStore::read_release`],
+    // which recomputes-and-verifies the record's identity from its own content
+    // and binds it to the requested release id). An un-honorable pin means the
+    // retained set cannot expand the content the pin protects, so it is
+    // INCOMPLETE — rotation must ABORT BEFORE ANY DELETION, never treat the
+    // pin as absent and sweep the trees it protects. The rotation caller
+    // converts the abort into the rotation-debt machinery (a durable marker +
+    // warning, post-commit maintenance): the next push retries rotation once
+    // the pinned release is repaired.
     for pin in pins {
         let rid = ReleaseId::parse(&pin.release);
-        let rec = match store.read_release(&rid) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+        let rec = store.read_release(&rid).map_err(|e| {
+            Error::integrity(format!(
+                "pin names release {rid} whose record cannot be read or verified ({e}): \
+                 the pin cannot be honored, so the retained set is incomplete — aborting \
+                 rotation before any tree deletion"
+            ))
+        })?;
         for tree in rec.variants.values() {
             retained.insert(tree.clone());
         }
@@ -224,12 +240,19 @@ pub fn retained_summary(retained: &HashSet<String>) -> Vec<TreeDigest> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, SlotDef};
     use crate::layout;
-    use crate::model::RELEASE_RECORD_SCHEMA_VERSION;
+    use crate::model::{
+        PlacementSlotId, RELEASE_RECORD_SCHEMA_VERSION, ReleaseRecord, VariantName,
+    };
+    use crate::push::engine::set_rotation_deferred;
+    use crate::release::build_release;
     use crate::remote::helper::{GenerationAssignment, RemoteHelper};
     use crate::remote::transport::LocalTransport;
     use crate::store::local::LocalStore;
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+    use std::path::PathBuf;
 
     fn cfg() -> Config {
         let dir = tempfile::tempdir().unwrap();
@@ -984,5 +1007,369 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             !retained.contains("t1"),
             "the oldest binding outside the single policy's window is swept"
         );
+    }
+
+    // ---- fail-closed pins: an un-honorable pinned release aborts rotation ----
+
+    /// The three corruption classes for a pinned release's STORED record: the
+    /// record file missing (a pin naming nothing on disk), the record file
+    /// holding garbage bytes (unreadable as JSON), or a record whose stored
+    /// identity fields do not match its content (the recompute-and-verify in
+    /// [`LocalStore::read_release`] fails). Every class must abort rotation
+    /// with an integrity error BEFORE any deletion — never treat the pin as
+    /// absent — and must recover EXACTLY after the record is repaired.
+    #[derive(Clone, Copy, Debug)]
+    enum PinRecordCorruption {
+        Missing,
+        Malformed,
+        Unverifiable,
+    }
+
+    /// Seed the receiver inventory for the pin-abort tests: two generation
+    /// records (current `t-cur` with prior `t-prev`, both inside the slot's
+    /// windows), the pinned release's variant trees on the remote (retained
+    /// ONLY by the pin — no generation references them), and a `tree-garbage`
+    /// object referenced by nothing. Persists and returns the valid pinned
+    /// release record (so a test can corrupt it and later repair it).
+    fn seed_pin_receiver(
+        helper: &RemoteHelper,
+        store: &LocalStore,
+        pin_trees: &[&str],
+    ) -> ReleaseRecord {
+        make_gen(
+            helper,
+            "d1",
+            "g1",
+            "t-prev",
+            "2020-01-01T00:00:00Z",
+            None,
+            None,
+        );
+        make_gen(
+            helper,
+            "d2",
+            "g2",
+            "t-cur",
+            "2020-01-02T00:00:00Z",
+            Some("g1"),
+            None,
+        );
+        helper.swap_current(None, "g2", "op").unwrap();
+        // A garbage object referenced by nothing — genuinely unretained.
+        helper
+            .remote()
+            .create_dir_all(&layout::tree_root("tree-garbage"))
+            .unwrap();
+        // The pin-only trees exist on the receiver; the pinned release's
+        // record is the ONLY reference to them.
+        for t in pin_trees {
+            helper
+                .remote()
+                .create_dir_all(&layout::tree_root(t))
+                .unwrap();
+        }
+        let variants: BTreeMap<VariantName, TreeDigest> = pin_trees
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                (
+                    VariantName::new(format!("v{i}")),
+                    TreeDigest::new(t.to_string()),
+                )
+            })
+            .collect();
+        let rec = build_release(
+            "mapping-sha",
+            "behavior-sha",
+            &variants,
+            &BTreeMap::from([(
+                "standard".to_string(),
+                vec![SlotDef {
+                    id: "p1".to_string(),
+                    server: "s1".to_string(),
+                    deploy_dir: PathBuf::from("/srv/pin"),
+                    target: "t1".to_string(),
+                    groups: Vec::new(),
+                }],
+            )]),
+            std::path::Path::new("."),
+        );
+        store.write_release(&rec).unwrap();
+        rec
+    }
+
+    /// Corrupt the pinned release's stored record per class.
+    fn corrupt_pin_record(store: &LocalStore, rec: &ReleaseRecord, kind: PinRecordCorruption) {
+        let path = store
+            .release_dir(&ReleaseId::new(rec.release_id.clone()))
+            .join("release.json");
+        match kind {
+            PinRecordCorruption::Missing => {
+                std::fs::remove_file(&path).unwrap();
+            }
+            PinRecordCorruption::Malformed => {
+                std::fs::write(&path, b"{ this is not a release record").unwrap();
+            }
+            PinRecordCorruption::Unverifiable => {
+                // A structurally-valid record whose identity fields do not
+                // match its content: recompute-and-verify must fail closed.
+                let mut tampered = rec.clone();
+                tampered.release_id = "rel-sha256-0000deadbeef".to_string();
+                tampered.release_sha256 = "0000deadbeef".to_string();
+                let bytes = serde_json::to_vec_pretty(&tampered).unwrap();
+                std::fs::write(&path, bytes).unwrap();
+            }
+        }
+    }
+
+    /// Repair the pinned release's record: the corrupt directory is removed
+    /// (a `write_release` re-write would refuse to overwrite an unverifiable
+    /// existing record) and the valid record is persisted again.
+    fn repair_pin_record(store: &LocalStore, rec: &ReleaseRecord) {
+        let dir = store.release_dir(&ReleaseId::new(rec.release_id.clone()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        store.write_release(rec).unwrap();
+    }
+
+    /// The shared deterministic scenario, run once per corruption class
+    /// ([`PinRecordCorruption`]): with the record corrupted, `compute_retained`
+    /// ABORTS with an integrity error before any deletion — the receiver
+    /// inventory stays byte-identical and every tree (pin-only AND garbage)
+    /// survives; after the record is REPAIRED, the retry deletes EXACTLY the
+    /// genuinely unretained trees (the pin-only trees survive; the true
+    /// garbage is removed).
+    fn assert_pin_corruption_abort_then_repair(kind: PinRecordCorruption) {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let rec = seed_pin_receiver(&helper, &store, &["tree-pin-a", "tree-pin-b"]);
+        let mut c = cfg();
+        c.pins = vec![Pin {
+            release: rec.release_id.clone(),
+            reason: "known-good".into(),
+        }];
+
+        // Sanity with the VALID record: the pin protects both variant trees
+        // and the garbage object is unretained (sweepable).
+        let retained = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap();
+        assert!(
+            retained.contains("tree-pin-a"),
+            "variant tree protected by the pin"
+        );
+        assert!(
+            retained.contains("tree-pin-b"),
+            "variant tree protected by the pin"
+        );
+        assert!(
+            !retained.contains("tree-garbage"),
+            "the garbage object is unretained"
+        );
+
+        // Byte-identical receiver inventory: the object inventory snapshot.
+        helper.write_inventory().unwrap();
+        let inv_path = dir.path().join("remote").join(layout::inventory());
+        let inventory_before = std::fs::read(&inv_path).unwrap();
+
+        // Corrupt the pinned release's stored record.
+        corrupt_pin_record(&store, &rec, kind);
+
+        // ABORT: an un-honorable pin is an integrity error — the pin is never
+        // treated as absent (a silently-skipped pin would drop its trees from
+        // the retained set and let rotation delete them).
+        let err = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap_err();
+        assert!(
+            matches!(err, Error::Integrity(_)),
+            "an un-honorable pin aborts rotation with an integrity error, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("pin names release"),
+            "the integrity error names the pin, got: {err}"
+        );
+
+        // ZERO DELETIONS: rotation never ran (the retained set was never
+        // computed), so the receiver inventory is byte-identical and every
+        // tree — pin-only AND garbage — survives.
+        let inventory_after = std::fs::read(&inv_path).unwrap();
+        assert_eq!(
+            inventory_after, inventory_before,
+            "the failed rotation must not delete a single tree object"
+        );
+        for t in ["tree-pin-a", "tree-pin-b", "tree-garbage"] {
+            assert!(
+                helper.remote().exists(&layout::tree_root(t)),
+                "tree {t} must survive the failed rotation"
+            );
+        }
+
+        // REPAIR the record, then RETRY the rotation.
+        repair_pin_record(&store, &rec);
+        let retained = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap();
+        assert!(
+            retained.contains("tree-pin-a") && retained.contains("tree-pin-b"),
+            "the repaired record restores the pin's protection"
+        );
+        helper.rotate(&retained, &HashSet::new()).unwrap();
+
+        // EXACT deletions: the genuinely unretained garbage is removed while
+        // the pin-only trees (and the policy-retained live trees) survive.
+        for t in ["tree-pin-a", "tree-pin-b", "t-cur", "t-prev"] {
+            assert!(
+                helper.remote().exists(&layout::tree_root(t)),
+                "tree {t} must survive the retry"
+            );
+        }
+        assert!(
+            !helper.remote().exists(&layout::tree_root("tree-garbage")),
+            "the true garbage is removed by the retry"
+        );
+    }
+
+    /// A MISSING pinned release record: the pin names nothing on disk.
+    #[test]
+    fn pin_record_missing_aborts_then_repair_sweeps_exactly() {
+        assert_pin_corruption_abort_then_repair(PinRecordCorruption::Missing);
+    }
+
+    /// A MALFORMED pinned release record: garbage bytes, unreadable as JSON.
+    #[test]
+    fn pin_record_malformed_aborts_then_repair_sweeps_exactly() {
+        assert_pin_corruption_abort_then_repair(PinRecordCorruption::Malformed);
+    }
+
+    /// An UNVERIFIABLE pinned release record: a structurally-valid record
+    /// whose stored identity does not match its content.
+    #[test]
+    fn pin_record_unverifiable_aborts_then_repair_sweeps_exactly() {
+        assert_pin_corruption_abort_then_repair(PinRecordCorruption::Unverifiable);
+    }
+
+    proptest! {
+        // FIXED-SEED property (0x5EED_5EED, per house style): a random
+        // receiver inventory (random counts of pin-only trees and garbage
+        // objects) with a randomly corrupted pinned release. The abort is
+        // FAIL-CLOSED: `compute_retained` errors with an integrity class, the
+        // rotation-debt machinery records the durable marker, and ZERO trees
+        // are deleted (the receiver inventory is byte-identical). After the
+        // release record is REPAIRED, the retry deletes EXACTLY the genuinely
+        // unretained trees (the pin-only trees survive; the garbage is
+        // removed) and the debt marker is cleared.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn pin_corruption_aborts_before_deletion_debt_then_retry_sweeps_exactly(
+            n_pin_trees in 1usize..=3,
+            n_garbage in 0usize..=2,
+            kind in 0u8..=2,
+        ) {
+            let kind = match kind {
+                0 => PinRecordCorruption::Missing,
+                1 => PinRecordCorruption::Malformed,
+                _ => PinRecordCorruption::Unverifiable,
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+            let helper = RemoteHelper::new(&remote);
+            let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+            let pin_trees: Vec<String> = (0..n_pin_trees).map(|i| format!("tree-pin-{i}")).collect();
+            let pin_refs: Vec<&str> = pin_trees.iter().map(|s| s.as_str()).collect();
+            let garbage: Vec<String> = (0..n_garbage).map(|i| format!("tree-garbage-{i}")).collect();
+            let rec = seed_pin_receiver(&helper, &store, &pin_refs);
+            for t in &garbage {
+                helper
+                    .remote()
+                    .create_dir_all(&layout::tree_root(t))
+                    .unwrap();
+            }
+            let mut c = cfg();
+            c.pins = vec![Pin {
+                release: rec.release_id.clone(),
+                reason: "known-good".into(),
+            }];
+
+            // Sanity: the valid record pins every variant tree; every garbage
+            // object is unretained.
+            let retained = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap();
+            for t in &pin_trees {
+                assert!(retained.contains(t), "pin tree {t} retained via the pin");
+            }
+            for t in &garbage {
+                assert!(!retained.contains(t), "garbage {t} is unretained");
+            }
+
+            helper.write_inventory().unwrap();
+            let inv_path = dir.path().join("remote").join(layout::inventory());
+            let inventory_before = std::fs::read(&inv_path).unwrap();
+
+            corrupt_pin_record(&store, &rec, kind);
+
+            // ABORT before any deletion: an integrity error, never an absent
+            // pin.
+            let err = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap_err();
+            assert!(matches!(err, Error::Integrity(_)));
+            assert!(err.to_string().contains("pin names release"));
+
+            // ZERO DELETIONS: the receiver inventory is byte-identical.
+            assert_eq!(
+                std::fs::read(&inv_path).unwrap(),
+                inventory_before,
+                "the failed rotation must not delete a single tree object"
+            );
+
+            // ROTATION DEBT: the engine's post-commit conversion records the
+            // durable marker (the abort is a maintenance deferral, never a
+            // hard push failure); the retry services it once the record is
+            // repaired.
+            let slot = PlacementSlotId::new("p1".to_string());
+            let warnings = set_rotation_deferred(&store, "t1", &slot, &err.to_string());
+            assert!(warnings.is_empty(), "the marker write must succeed: {warnings:?}");
+            let debt = store.read_rotation_debt("t1").unwrap();
+            assert_eq!(
+                debt.get("p1").map(|s| s.as_str()),
+                Some(err.to_string().as_str()),
+                "the debt marker records the abort reason for the next push"
+            );
+
+            // REPAIR + RETRY: exact deletions — pin trees and live trees
+            // survive, the true garbage is removed — and the marker clears.
+            repair_pin_record(&store, &rec);
+            let retained = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap();
+            helper.rotate(&retained, &HashSet::new()).unwrap();
+            for t in &pin_trees {
+                assert!(
+                    helper.remote().exists(&layout::tree_root(t)),
+                    "pin tree {t} survives the retry"
+                );
+            }
+            for t in ["t-cur", "t-prev"] {
+                assert!(
+                    helper.remote().exists(&layout::tree_root(t)),
+                    "live tree {t} survives the retry"
+                );
+            }
+            for t in &garbage {
+                assert!(
+                    !helper.remote().exists(&layout::tree_root(t)),
+                    "garbage {t} is removed by the retry"
+                );
+            }
+            let mut debt = store.read_rotation_debt("t1").unwrap();
+            assert!(
+                debt.remove("p1").is_some(),
+                "the retried rotation services the marker"
+            );
+            store.write_rotation_debt("t1", &debt).unwrap();
+            assert!(
+                store.read_rotation_debt("t1").unwrap().is_empty(),
+                "the debt marker is cleared once the retry succeeds"
+            );
+        }
     }
 }

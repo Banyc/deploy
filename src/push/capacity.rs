@@ -77,24 +77,33 @@ pub(crate) fn capacity_preflight(
             // only), then recheck capacity directly rather than failing the
             // restore. Best-effort by design: rotation is only an
             // optimization to free capacity, and the hard capacity check below
-            // decides the outcome.
-            // A rotation failure is not recoverable at this point (the push
-            // would have to abort mid-preflight), and the recheck fails the
-            // push loudly if space is genuinely short.
+            // decides the outcome — a rotation failure (compute_retained
+            // abort or mark-and-sweep failure) is not recoverable at this
+            // point, so it is skipped and the recheck fails the push loudly
+            // if space is genuinely short. A compute_retained abort — e.g. an
+            // un-honorable pinned release whose record is missing, unreadable,
+            // or identity-unverifiable — must NEVER hard-fail the push here:
+            // the post-commit step-17 rotation defers it to the rotation-debt
+            // machinery (a durable marker + warning, retried on the next push
+            // once the pinned release is repaired).
             //
             // The mutation lock is held via an RAII guard for the whole
-            // rotation block, so EVERY exit path releases it on drop — a `?`
-            // error from `compute_retained` included. A manual
-            // acquire/release pair would leak the lock on that error path,
-            // stranding every later operation on this slot with "mutation
-            // lock held by ...".
+            // rotation block, so EVERY exit path releases it on drop. A manual
+            // acquire/release pair would leak the lock, stranding every later
+            // operation on this slot with "mutation lock held by ...".
             if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
                 let rotation = config
                     .slot_rotation(&slot.id)
                     .expect("the assignment's slot is declared by its owning variant");
-                let retained = compute_retained(helper, &config.pins, store, rotation)?;
-                let active = HashSet::from([deployment_id.as_str().to_string()]);
-                helper.rotate(&retained, &active).ok();
+                // Best-effort by design (compute_retained failure INCLUDED):
+                // rotation is only an optimization to free capacity, and the
+                // hard capacity check below decides the outcome. The recheck
+                // below still fails the push loudly if space is genuinely
+                // short.
+                if let Ok(retained) = compute_retained(helper, &config.pins, store, rotation) {
+                    let active = HashSet::from([deployment_id.as_str().to_string()]);
+                    helper.rotate(&retained, &active).ok();
+                }
             }
             let fs2 = helper.remote().filesystem_bytes().unwrap_or(FsBytes {
                 total: 0,

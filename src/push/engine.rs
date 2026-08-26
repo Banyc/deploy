@@ -3025,6 +3025,186 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
     }
 
+    /// Build and persist a valid release record protecting the given variant
+    /// trees (the pin-only trees of the engine-level pin-abort test).
+    fn engine_pin_release(store: &LocalStore, pin_trees: &[&str]) -> ReleaseRecord {
+        let variants: BTreeMap<VariantName, TreeDigest> = pin_trees
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                (
+                    VariantName::new(format!("v{i}")),
+                    TreeDigest::new(t.to_string()),
+                )
+            })
+            .collect();
+        let rec = crate::release::build_release(
+            "mapping-sha",
+            "behavior-sha",
+            &variants,
+            &BTreeMap::from([(
+                "standard".to_string(),
+                vec![SlotDef {
+                    id: "p1".to_string(),
+                    server: "s1".to_string(),
+                    deploy_dir: PathBuf::from("/srv/pin"),
+                    target: "t1".to_string(),
+                    groups: Vec::new(),
+                }],
+            )]),
+            std::path::Path::new("."),
+        );
+        store.write_release(&rec).unwrap();
+        rec
+    }
+
+    /// ENGINE-LEVEL wiring for the fail-closed pin abort: a post-commit
+    /// step-17 rotation whose pinned release record is unreadable must abort
+    /// before ANY deletion, and the rotation caller must convert the abort
+    /// into the rotation-debt machinery — the push still reports SUCCESS with
+    /// a deferred-maintenance warning and a durable debt marker (never a hard
+    /// push failure), and the NEXT push's maintenance retry services the
+    /// marker once the record is repaired, deleting EXACTLY the genuinely
+    /// unretained trees: the pin-only trees survive and the true garbage is
+    /// removed. (All three corruption classes — missing / malformed /
+    /// unverifiable — produce the SAME integrity abort and are each covered
+    /// deterministically in the rotation unit tests plus the 16-case
+    /// property; this engine test proves the debt/warning/retry wiring with
+    /// the missing-record class.)
+    #[test]
+    fn pin_abort_defers_rotation_and_retry_after_repair_deletes_exactly() {
+        let mut h = RecoveryHarness::new();
+
+        // Push 1 (no pins yet): the first deployment establishes the
+        // receiver — generation, current, tree.
+        let r1 = push_clean(&h).unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+
+        // The pinned release protects two pin-only trees (referenced ONLY by
+        // the pin — outside every count/age window), and a garbage object is
+        // referenced by nothing.
+        let rec = engine_pin_release(&h.store, &["tree-pin-a", "tree-pin-b"]);
+        h.config.pins.push(crate::config::Pin {
+            release: rec.release_id.clone(),
+            reason: "known-good".into(),
+        });
+        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        for t in ["tree-pin-a", "tree-pin-b", "tree-garbage"] {
+            helper
+                .remote()
+                .create_dir_all(&layout::tree_root(t))
+                .unwrap();
+        }
+
+        // MISSING pinned release record: the pin names nothing on disk.
+        let path = h
+            .store
+            .release_dir(&ReleaseId::new(rec.release_id.clone()))
+            .join("release.json");
+        std::fs::remove_file(&path).unwrap();
+
+        // Push 2 (a REAL push — changed artifact content promotes a new
+        // generation, so step-17 rotation runs): the pin abort must NOT fail
+        // the push. It is converted into rotation debt + a warning, and
+        // NOTHING is deleted.
+        let artifacts = h
+            .cfg_path
+            .parent()
+            .unwrap()
+            .join("releases")
+            .join("v1")
+            .join("artifacts");
+        std::fs::write(
+            artifacts
+                .join("build")
+                .join("output")
+                .join("app")
+                .join("server"),
+            "v2\n",
+        )
+        .unwrap();
+        let r2 = push_clean(&h).unwrap();
+        assert_eq!(
+            r2.status,
+            Some(DeploymentStatus::Successful),
+            "the pin abort must never hard-fail the push (post-commit maintenance)"
+        );
+        let warning = r2
+            .warning
+            .as_ref()
+            .expect("the push must warn about the deferred rotation");
+        assert!(
+            warning.contains("rotation deferred"),
+            "the warning describes the deferred rotation, got: {warning}"
+        );
+        let debt = h.store.read_rotation_debt("t1").unwrap();
+        let reason = debt
+            .get("p1")
+            .expect("a durable debt marker for slot p1 must be recorded");
+        assert!(
+            reason.contains("pin names release"),
+            "the debt marker records the un-honorable pin, got: {reason}"
+        );
+
+        // ZERO DELETIONS: every pre-existing object survives push 2 (the
+        // only inventory delta is the push's own new tree object).
+        let inventory_after = helper.status().unwrap().inventory;
+        for t in ["tree-pin-a", "tree-pin-b", "tree-garbage"] {
+            assert!(
+                inventory_after.contains(&t.to_string()),
+                "tree {t} must survive the failed rotation"
+            );
+        }
+
+        // Repair the pinned release's record.
+        let dir = h.store.release_dir(&ReleaseId::new(rec.release_id.clone()));
+        std::fs::remove_dir_all(&dir).unwrap();
+        h.store.write_release(&rec).unwrap();
+
+        // Push 3 (up-to-date no-op): the deferred-maintenance retry
+        // services the marker — the rotation now succeeds, deleting
+        // EXACTLY the genuinely unretained trees — and clears the marker.
+        let r3 = push_clean(&h).unwrap();
+        assert_eq!(r3.message, "Everything up to date");
+        assert!(
+            r3.warning.is_none(),
+            "the retried rotation succeeded: no warning remains, got {:?}",
+            r3.warning
+        );
+        assert!(
+            h.store.read_rotation_debt("t1").unwrap().is_empty(),
+            "the debt marker is cleared once the retry succeeds"
+        );
+        let inventory = helper.status().unwrap().inventory;
+        for t in ["tree-pin-a", "tree-pin-b"] {
+            assert!(
+                inventory.contains(&t.to_string()),
+                "pin-only tree {t} survives the retry"
+            );
+        }
+        assert!(
+            !inventory.contains(&"tree-garbage".to_string()),
+            "the true garbage is removed by the retry"
+        );
+        let cur = helper
+            .status()
+            .unwrap()
+            .current_generation
+            .expect("a current generation exists");
+        let live = helper
+            .read_assignment(&cur)
+            .unwrap()
+            .artifact
+            .tree
+            .as_str()
+            .to_string();
+        assert!(
+            inventory.contains(&live),
+            "the live tree {live} survives the retry"
+        );
+    }
+
     /// The TERMINAL EVENT append (the deployment's ONE atomic finalize write)
     /// fails once on the replaying push: `Err`, no rollback state exists
     /// (the entry stays intent-only = recoverable-pending), and the next
