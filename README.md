@@ -125,9 +125,9 @@ deploy push production 'parent(@, 3)'    # three deployments back from the lates
 deploy push production release:rel-sha256-41da2f63a950
 # deployment-id refs resolve to EXACT stored states, then step N ancestors
 # (N = 0 is the deployment itself; positions are DERIVED from the log order):
-deploy push production deploy-20260821T102000Z              # EXACT stored state of that deployment
-deploy push production deploy-20260821T102000Z--            # two deployments before it
-deploy push production 'parent(deploy-20260821T102000Z, 1)'   # one deployment before it
+deploy push production deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b  # EXACT stored state of that deployment
+deploy push production deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b--  # two deployments before it
+deploy push production 'parent(deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b, 1)'  # one deployment before it
 ```
 
 ROLLBACK PAYLOADS ARE KEYED BY DEPLOYMENT ID: `@`, `@-`, `@--`, and
@@ -191,13 +191,13 @@ gone. The CLI requires `--yes` for the real operation; `--dry-run` previews
 exactly what would be discarded and touches nothing.
 
 ```sh
-deploy checkpoint production deploy-20260821T102000Z --dry-run   # preview the discard list; touches nothing
+deploy checkpoint production deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b --dry-run  # preview the discard list; touches nothing
 # would discard 3 snapshots: deploy-... (the deployments before the checkpoint)
 # would discard 4 attempts: deploy-...
 # would delete 4 deployment directories: ...
-deploy checkpoint production deploy-20260821T102000Z --yes       # retain the suffix + sweep (IRREVERSIBLE)
+deploy checkpoint production deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b --yes  # retain the suffix + sweep (IRREVERSIBLE)
 deploy log production       # now shows only the retained suffix
-deploy push production deploy-20260821T102000Z   # the checkpoint deployment stays the oldest rollback
+deploy push production deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b  # the checkpoint deployment stays the oldest rollback
 ```
 
 - The deployment id is an explicit, REQUIRED argument (the operation is

@@ -189,7 +189,7 @@ reported explicitly, including partial states like `degraded`.",
   deploy push production --dry-run     # preview the plan, touch nothing\n\
   deploy push production @-            # roll back to the previous deployment\n\
   deploy push production 'parent(@, 3)'  # roll back 3 deployments\n\
-  deploy push production deploy-20260821T102000Z  # roll back to that deployment's stored state\n\
+  deploy push production deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b  # roll back to that deployment's stored state\n\
   deploy push production release:rel-sha256-2fda63a950  # DIRECT release deploy to this target (cross-target; no history needed)"
     )]
     Push {
@@ -261,10 +261,10 @@ sweep keeps everything reachable from another target's ledger, the current\n\
 observed state, or a pin. Sweeps are best-effort, not secure erasure.\n\
 A checkpoint does not deploy anything or contact remote servers.",
         after_help = "Examples:\n\
-  deploy checkpoint production deploy-004 --dry-run   # preview what would be discarded\n\
-         deploy checkpoint production deploy-004 --yes       # retain the suffix + sweep (irreversible)\n\
+  deploy checkpoint production deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b --dry-run  # preview what would be discarded\n\
+         deploy checkpoint production deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b --yes  # retain the suffix + sweep (irreversible)\n\
           deploy log production                               # now shows only the retained suffix\n\
-          deploy push production deploy-004   # the checkpoint entry stays the oldest rollback"
+          deploy push production deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b  # the checkpoint entry stays the oldest rollback"
     )]
     Checkpoint {
         target: String,

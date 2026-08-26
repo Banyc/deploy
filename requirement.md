@@ -84,11 +84,11 @@ deploy status production
 # resolve).
 deploy push production @-              # the previous successful deployment
 deploy push production 'parent(@, 3)'    # three deployments back
-deploy push production deploy-20260821T102000Z  # exact state of that deployment
+deploy push production deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b  # exact state of that deployment
 # Establish a monotonic HISTORY FLOOR at a successful deployment
 # (IRREVERSIBLE — requires --yes; --dry-run previews the discard list):
-deploy checkpoint production deploy-20260821T102000Z --dry-run
-deploy checkpoint production deploy-20260821T102000Z --yes
+deploy checkpoint production deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b --dry-run
+deploy checkpoint production deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b --yes
 ```
 
 `deploy log` output is one line per recorded attempt, newest last, each line
@@ -98,8 +98,8 @@ exact rollback key the push reference grammar accepts (`deploy push <target>
 render `-` so the columns stay aligned:
 
 ```
-deploy-20260821T102000Z  deploy-20260821T102000Z  Successful  2026-08-21T10:20:00Z
--                        deploy-20260822T091400Z  FailedPreflight  2026-08-22T09:15:00Z  (preflight failed)
+deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b  deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b  Successful  2026-08-21T10:20:00Z
+-                                            deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b  FailedPreflight  2026-08-22T09:15:00Z  (preflight failed)
 ```
 
 `production` is not a built-in environment type. It is a user-chosen target name, analogous to a Git remote name such as `origin`, except that one target may fan out to multiple servers. Other valid names include `test-lab`, `datacenter-hk`, or `customer-acme`.
@@ -722,7 +722,7 @@ Every deployment attempt records its immutable intent: target snapshot, behavior
 ```json
 {
   "deployment_schema_version": 1,
-  "deployment_id": "deploy-20260821T102000Z",
+  "deployment_id": "deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b",
   "target": "production",
   "slot_ids": ["p1", "p2", "p3"],
   "behavior_sha256": "03df...",
@@ -769,8 +769,8 @@ The deployment's status is an append-only transition stream
 is the LATEST transition. For example:
 
 ```jsonl
-{"deployment_id": "deploy-20260821T102000Z", "status": "in_progress", "recorded_at": "2026-08-21T10:20:00Z", "reason": "attempt started"}
-{"deployment_id": "deploy-20260821T102000Z", "status": "successful", "recorded_at": "2026-08-21T10:25:00Z"}
+{"deployment_id": "deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b", "status": "in_progress", "recorded_at": "2026-08-21T10:20:00Z", "reason": "attempt started"}
+{"deployment_id": "deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b", "status": "successful", "recorded_at": "2026-08-21T10:25:00Z"}
 ```
 
 The target snapshot log contains only fully successful snapshots, KEYED BY THE DEPLOYMENT ID that produced them (`deploy push production <deployment-id>` restores exactly that deployment's stored state). Failed and degraded attempts remain visible through `deploy log production` and `attempts.jsonl`, but are not valid rollback sources (a failed deployment id never resolves). Each snapshot entry records every slot's advanced generation AND the complete physical binding it had (`bindings`, keyed by slot ID — the slot's `{server, deploy_dir}` pair at deployment time): exact rollback maps generations to slots by slot ID, so the recorded binding is what proves a slot still lives at the exact on-host location it was deployed onto.
@@ -802,9 +802,9 @@ deploy push production @-              # the deployment BEFORE the latest
 deploy push production @--             # two deployments back
 deploy push production 'parent(@, 3)'    # three deployments back from the latest
 deploy push production release:rel-sha256-2fda63a950  # DIRECT: deploy this release to the current target's slots (cross-target; no snapshot history needed)
-deploy push production deploy-20260821T102000Z  # EXACT stored state of that deployment
-deploy push production deploy-20260821T102000Z--  # two deployments before it
-deploy push production 'parent(deploy-20260821T102000Z, 1)'  # one deployment before it
+deploy push production deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b  # EXACT stored state of that deployment
+deploy push production deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b--  # two deployments before it
+deploy push production 'parent(deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b, 1)'  # one deployment before it
 ```
 
 ROLLBACK PAYLOADS ARE KEYED BY DEPLOYMENT ID. The `@` / `parent(...)` forms
