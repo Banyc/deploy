@@ -3,8 +3,9 @@
 //! The domain model carries a set of small values whose validity is part of
 //! their meaning: an identifier must be a non-empty name, a behavior digest
 //! must be a sha256 digest, an on-server `deploy_dir` must be an absolute
-//! path, a batch size must be nonzero, a capacity percent must fit 0..=100,
-//! and a recorded timestamp must parse as RFC 3339. Each such value is
+//! TRAVERSAL-FREE path, a batch size must be nonzero, a capacity percent
+//! must fit 0..=100, and a recorded timestamp must parse as RFC 3339. Each
+//! such value is
 //! wrapped in a NEWTYPE whose CONSTRUCTION validates the invariant (a
 //! private inner value, reachable only through [`parse`]-style constructors
 //! and read-only accessors) — an invalid value cannot be constructed, so the
@@ -34,9 +35,19 @@ pub(crate) const DIGEST_TEST_HEX_1: &str =
 
 /// The name rule shared by the identifier-like scalars: non-empty after
 /// trimming, no surrounding whitespace (a name is exactly what was written,
-/// never silently trimmed), and no control characters.
+/// never silently trimmed), no control characters, and no path separators or
+/// traversal components — a name is a SINGLE safe path segment. Names become
+/// directory components on a server (the per-server remote directory is named
+/// by the server id), so a name must never smuggle a separator (`/`, `\`) or
+/// a `.`/`..` traversal component out of the forced namespace.
 fn valid_name(s: &str) -> bool {
-    !s.trim().is_empty() && s.trim() == s && !s.chars().any(|c| c.is_control())
+    !s.trim().is_empty()
+        && s.trim() == s
+        && !s.chars().any(|c| c.is_control())
+        && !s.contains('/')
+        && !s.contains('\\')
+        && s != "."
+        && s != ".."
 }
 
 macro_rules! name_scalar {
@@ -102,10 +113,11 @@ name_scalar!(
 
 name_scalar!(
     ApplicationName,
-    "The deployment application name: a validated NON-EMPTY name. The \
-    application has no format rule beyond non-emptiness (a deployment tool \
-    name may be any non-empty string).",
-    |s: &str| !s.trim().is_empty()
+    "The deployment application name: a validated NON-EMPTY name that is a \
+    single safe path segment (no separators, no `.`/`..` traversal, no \
+    surrounding whitespace or control characters). The application name \
+    may become a directory component, so the segment rule applies.",
+    valid_name
 );
 
 name_scalar!(
@@ -156,15 +168,20 @@ impl FromStr for BehaviorDigest {
     }
 }
 
-/// An ABSOLUTE on-server directory. Construction requires an absolute path;
-/// a relative or empty path is rejected (the scheduler never deploys into a
-/// location relative to an unspecified working directory).
+/// An ABSOLUTE on-server directory. Construction requires an absolute,
+/// TRAVERSAL-FREE path: a relative or empty path is rejected (the scheduler
+/// never deploys into a location relative to an unspecified working
+/// directory), and so is ANY path with a `.` or `..` component at any
+/// position (a traversal component could escape the intended namespace).
+/// The canonical form is NORMALIZED: rebuilt from the path components, so
+/// doubled separators and a trailing slash are folded away (the root `/` is
+/// the only path that keeps a trailing slash).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AbsoluteDeployDir(std::path::PathBuf);
 
 impl AbsoluteDeployDir {
-    /// Validate that `s` is an absolute path and construct an
-    /// [`AbsoluteDeployDir`].
+    /// Validate that `s` is an absolute, traversal-free path and construct
+    /// an [`AbsoluteDeployDir`] holding the normalized canonical form.
     pub fn parse(s: &str) -> Result<AbsoluteDeployDir> {
         let path = Path::new(s);
         if !path.is_absolute() {
@@ -173,7 +190,25 @@ impl AbsoluteDeployDir {
                 s
             )));
         }
-        Ok(AbsoluteDeployDir(path.to_path_buf()))
+        // Reject ANY traversal component (`.` or `..`) at ANY position, then
+        // rebuild the canonical form from the raw `/`-separated segments
+        // (empty segments — doubled separators, a trailing slash — are
+        // normalized away). `Path::components()` skips `.` segments, so the
+        // raw split is used to catch them.
+        let mut canonical = std::path::PathBuf::from("/");
+        for segment in s.split('/') {
+            match segment {
+                "" => {}
+                "." | ".." => {
+                    return Err(Error::config(format!(
+                        "invalid deploy_dir {:?}: traversal components (`.`/`..`) are not allowed",
+                        s
+                    )));
+                }
+                _ => canonical.push(segment),
+            }
+        }
+        Ok(AbsoluteDeployDir(canonical))
     }
 
     /// The validated absolute path.
@@ -322,41 +357,49 @@ impl FromStr for Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
 
     const DIGEST: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     #[test]
     fn identifier_accepts_valid_rejects_invalid() {
-        for ok in ["s1", "production", "wave-1", "α", "x y", "a"] {
+        for ok in ["s1", "production", "wave-1", "α", "x y", "a", "a..b", "a.b"] {
             let id = Identifier::parse(ok).expect("valid identifier parses");
             assert_eq!(id.as_str(), ok);
             assert_eq!(id.to_string(), ok);
             assert_eq!(ok.parse::<Identifier>().expect("from_str"), id);
         }
-        for bad in ["", "   ", " x", "x ", "\u{0}", "a\nb"] {
+        for bad in [
+            "", "   ", " x", "x ", "\u{0}", "a\nb", "a/b", "a\\b", ".", "..", "../x", "x/..",
+        ] {
             Identifier::parse(bad).expect_err("invalid identifier must be rejected");
             assert!(bad.parse::<Identifier>().is_err(), "{bad:?}");
         }
     }
 
     #[test]
-    fn application_name_requires_non_empty() {
-        for ok in ["app", "my app", "α", " x"] {
-            let name = ApplicationName::parse(ok).expect("non-empty name parses");
+    fn application_name_requires_safe_single_segment() {
+        for ok in ["app", "my app", "α", "a..b"] {
+            let name = ApplicationName::parse(ok).expect("safe name parses");
             assert_eq!(name.as_str(), ok);
         }
-        for bad in ["", "   ", "\n"] {
-            ApplicationName::parse(bad).expect_err("empty application name rejected");
+        for bad in [
+            "", "   ", "\n", " x", "x ", "a/b", "a\\b", ".", "..", "\u{0}",
+        ] {
+            ApplicationName::parse(bad).expect_err("unsafe application name rejected");
         }
     }
 
     #[test]
     fn group_name_accepts_valid_rejects_invalid() {
-        for ok in ["canary", "wave-1", "α"] {
+        for ok in ["canary", "wave-1", "α", "a..b"] {
             let g = GroupName::parse(ok).expect("valid group parses");
             assert_eq!(g.as_str(), ok);
         }
-        for bad in ["", "   ", " x", "x ", "\u{0}"] {
+        for bad in [
+            "", "   ", " x", "x ", "\u{0}", "a/b", "a\\b", ".", "..", "../x",
+        ] {
             GroupName::parse(bad).expect_err("invalid group name rejected");
         }
     }
@@ -382,14 +425,34 @@ mod tests {
     }
 
     #[test]
-    fn absolute_deploy_dir_requires_absolute_path() {
+    fn absolute_deploy_dir_requires_absolute_traversal_free_path() {
         for ok in ["/srv/p1", "/", "/srv/deploy/app"] {
             let d = AbsoluteDeployDir::parse(ok).expect("absolute path parses");
             assert!(d.as_path().is_absolute());
             assert_eq!(d.as_path(), std::path::Path::new(ok));
         }
-        for bad in ["", "srv/p1", "relative", "./x", "../x"] {
-            AbsoluteDeployDir::parse(bad).expect_err("relative deploy_dir rejected");
+        // A trailing slash is harmless but normalized away (the root keeps
+        // its slash); the canonical form is a parse fixed point.
+        let d = AbsoluteDeployDir::parse("/srv/").expect("trailing slash normalizes");
+        assert_eq!(d.as_path(), std::path::Path::new("/srv"));
+        assert_eq!(
+            AbsoluteDeployDir::parse("/srv").expect("canonical re-parses"),
+            d
+        );
+        for bad in [
+            "",
+            "srv/p1",
+            "relative",
+            "./x",
+            "../x",
+            "/srv/../etc",
+            "/srv/./x",
+            "/../etc",
+            "/etc/..",
+            "/./x",
+            "/srv/..",
+        ] {
+            AbsoluteDeployDir::parse(bad).expect_err("traversal or relative deploy_dir rejected");
         }
     }
 
@@ -444,6 +507,172 @@ mod tests {
             "2026-13-01T00:00:00Z",
         ] {
             Timestamp::parse(bad).expect_err("unparseable timestamp rejected");
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // THE TRAVERSAL PROPERTY: over ARBITRARY name/path values (with `..`,
+    // `.`, `/`, `\`, empty, whitespace, control characters, unicode, and
+    // absolute/relative mixes), each scalar accepts EXACTLY the
+    // traversal-free, single-segment values and rejects everything else.
+    // Bounded 16 cases, fixed seed 0x5EED_5EED per house style.
+    // -------------------------------------------------------------------
+
+    /// The independent characterization of the name rule: a value is a safe
+    /// single path segment iff it is non-empty, unpadded, control-free, has
+    /// no path separator, and is not a `.`/`..` traversal component.
+    fn is_safe_segment(s: &str) -> bool {
+        !s.is_empty()
+            && s.trim() == s
+            && !s.chars().any(|c| c.is_control())
+            && !s.contains('/')
+            && !s.contains('\\')
+            && s != "."
+            && s != ".."
+    }
+
+    /// Arbitrary name/path-segment values covering every traversal class:
+    /// `..`, `.`, `/`, `\`, empty, whitespace, control characters, unicode,
+    /// and clean single segments.
+    fn arbitrary_segment_text() -> impl Strategy<Value = String> {
+        prop_oneof![
+            prop::sample::select(vec![
+                String::new(),
+                ".".to_string(),
+                "..".to_string(),
+                "...".to_string(),
+                "/".to_string(),
+                "\\".to_string(),
+                "a/b".to_string(),
+                "a\\b".to_string(),
+                "../x".to_string(),
+                "x/..".to_string(),
+                "./x".to_string(),
+                "x/.".to_string(),
+                " x".to_string(),
+                "x ".to_string(),
+                "x y".to_string(),
+                "\u{0}".to_string(),
+                "a\nb".to_string(),
+                "α".to_string(),
+                "s1".to_string(),
+                "wave-1".to_string(),
+                "a..b".to_string(),
+                "a.b".to_string(),
+            ]),
+            prop::collection::vec(prop::char::any(), 0..12).prop_map(|v| v.into_iter().collect()),
+        ]
+    }
+
+    proptest! {
+        // THE PROPERTY: the three name scalars (Identifier, GroupName,
+        // ApplicationName) accept EXACTLY the safe single-segment values —
+        // every traversal class (`..`, `.`, `/`, `\`, padding, control
+        // chars) is rejected, every clean single segment is accepted.
+        // Bounded 16 cases, fixed seed 0x5EED_5EED (house style), no
+        // failure persistence — the identical vectors on every run.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn name_scalars_accept_exactly_safe_single_segments(s in arbitrary_segment_text()) {
+            let expected = is_safe_segment(&s);
+            assert_eq!(
+                Identifier::parse(&s).is_ok(),
+                expected,
+                "Identifier must accept exactly safe single segments: {s:?}"
+            );
+            assert_eq!(
+                GroupName::parse(&s).is_ok(),
+                expected,
+                "GroupName must accept exactly safe single segments: {s:?}"
+            );
+            assert_eq!(
+                ApplicationName::parse(&s).is_ok(),
+                expected,
+                "ApplicationName must accept exactly safe single segments: {s:?}"
+            );
+        }
+    }
+
+    /// The independent characterization of the deploy_dir rule: an absolute
+    /// path whose every non-empty `/`-separated segment is a normal name
+    /// (no `.`/`..` component at any position).
+    fn is_traversal_free_absolute(s: &str) -> bool {
+        Path::new(s).is_absolute()
+            && s.split('/')
+                .all(|seg| seg.is_empty() || (seg != "." && seg != ".."))
+    }
+
+    /// Arbitrary path values covering every traversal class: absolute with
+    /// `..`/`.` at any position, doubled separators, trailing slashes, the
+    /// root, relative paths, empty, whitespace, and unicode.
+    fn arbitrary_path_text() -> impl Strategy<Value = String> {
+        prop_oneof![
+            prop::sample::select(vec![
+                "/srv/p1".to_string(),
+                "/".to_string(),
+                "/srv/".to_string(),
+                "//srv//deploy//".to_string(),
+                "/srv/../etc".to_string(),
+                "/srv/./x".to_string(),
+                "/../etc".to_string(),
+                "/etc/..".to_string(),
+                "/./x".to_string(),
+                "/srv/..".to_string(),
+                "/srv/deploy/app".to_string(),
+                "srv/p1".to_string(),
+                "relative".to_string(),
+                "./x".to_string(),
+                "../x".to_string(),
+                String::new(),
+                " ".to_string(),
+            ]),
+            prop::collection::vec(prop::char::any(), 0..12).prop_map(|v| v.into_iter().collect()),
+        ]
+    }
+
+    proptest! {
+        // THE PROPERTY: AbsoluteDeployDir accepts EXACTLY the
+        // traversal-free absolute paths — every `.`/`..` component at any
+        // position and every relative/empty path is rejected, and the
+        // accepted canonical form is normalized (no trailing slash except
+        // the root, no doubled separators) and a parse fixed point.
+        // Bounded 16 cases, fixed seed 0x5EED_5EED (house style), no
+        // failure persistence — the identical vectors on every run.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn absolute_deploy_dir_accepts_exactly_traversal_free_absolute_paths(
+            s in arbitrary_path_text(),
+        ) {
+            let expected = is_traversal_free_absolute(&s);
+            assert_eq!(
+                AbsoluteDeployDir::parse(&s).is_ok(),
+                expected,
+                "AbsoluteDeployDir must accept exactly traversal-free absolute paths: {s:?}"
+            );
+            if let Ok(dir) = AbsoluteDeployDir::parse(&s) {
+                let canonical = dir.as_path().to_string_lossy();
+                assert!(
+                    canonical == "/" || !canonical.ends_with('/'),
+                    "canonical form must not carry a trailing slash: {canonical:?}"
+                );
+                assert_eq!(
+                    AbsoluteDeployDir::parse(&canonical).expect("canonical form re-parses"),
+                    dir,
+                    "the canonical form must be a parse fixed point: {canonical:?}"
+                );
+            }
         }
     }
 }
