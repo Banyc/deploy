@@ -44,7 +44,8 @@ use crate::push::checkpoint::run_checkpoint_unlocked;
 use crate::push::engine::{PushOptions, push, retry_pending_sweep};
 use crate::records::{
     DeploymentIntent, DeploymentStatus, DesiredGeneration, IntentSlot, LedgerRollback,
-    LedgerTerminal, NonEmptySlotTable, SlotTable, TerminalDisposition,
+    LedgerTerminal, NonEmptySlotTable, SlotOutcomeKind, SlotResult, SlotTable,
+    TerminalDisposition,
 };
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::transport::{LocalTransport, Remote};
@@ -228,11 +229,22 @@ fn intent(id: &str, target: &str) -> DeploymentIntent {
 }
 
 /// A SUCCESSFUL terminal whose rollback references `release` and `tree` —
-/// the exact bindings the checkpoint's reachability scan keeps.
+/// the exact bindings the checkpoint's reachability scan keeps. The
+/// EXACT-EQUAL shape: one Activated outcome per slotted generation (the
+/// four-set equality is enforced by the conversion).
 fn terminal_for(release: &str, tree: &str) -> LedgerTerminal {
     LedgerTerminal {
         recorded_at: "2026-01-01T00:00:00Z".to_string(),
-        outcomes: SlotTable::new(),
+        outcomes: SlotTable::from_map(BTreeMap::from([(
+            SlotId::new("p1".to_string()),
+            SlotResult {
+                slot_id: SlotId::new("p1".to_string()),
+                outcome: SlotOutcomeKind::Activated,
+                generation: Some(GenerationId::new("gen-1".to_string())),
+                compensated: false,
+                error: None,
+            },
+        )])),
         disposition: TerminalDisposition::Successful {
             rollback: LedgerRollback {
                 slots: BTreeMap::from([(
@@ -265,7 +277,19 @@ fn terminal_for(release: &str, tree: &str) -> LedgerTerminal {
 fn failed_terminal() -> LedgerTerminal {
     LedgerTerminal {
         recorded_at: "2026-01-01T00:00:00Z".to_string(),
-        outcomes: SlotTable::new(),
+        // The FailedRolledBack compensation report IS the outcome table — it
+        // must EXACTLY cover the membership (the status-specific outcome
+        // rule).
+        outcomes: SlotTable::from_map(BTreeMap::from([(
+            SlotId::new("p1".to_string()),
+            SlotResult {
+                slot_id: SlotId::new("p1".to_string()),
+                outcome: SlotOutcomeKind::Restored,
+                generation: Some(GenerationId::new("gen-1".to_string())),
+                compensated: true,
+                error: None,
+            },
+        )])),
         disposition: TerminalDisposition::FailedRolledBack,
         reason: None,
     }

@@ -1565,9 +1565,19 @@ fn push_inner(
         // The CURRENT target slot set: the complete snapshot omits slots
         // removed from the current configuration and carries every current
         // unselected slot forward from the base.
-        let current_slot_ids: Vec<SlotId> = all_members
+       // The rollback must key EXACTLY the deployment's membership (the
+       // four-set equality: outcomes == rollback slots == rollback bindings
+       // == intent membership, enforced by the conversion). The membership
+       // is the SELECTED slots (`assignments` — the full target for a full
+       // push, the group for a group push), so the rollback records exactly
+       // what the deployment touched: slots removed from the current
+       // configuration are omitted (they are not selected), and the
+       // partial-rollout overlay (carrying unselected base slots forward)
+       // is gone — a successful terminal's rollback must equal its
+       // outcomes.
+       let current_slot_ids: Vec<SlotId> = assignments
             .iter()
-            .map(|(slot, _)| SlotId::new(slot.id.clone()))
+            .map(|a| a.placement_slot.clone())
             .collect();
         history::finalize_successful_attempt(
             store,
@@ -2995,7 +3005,30 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &DeploymentId::new(deployment_id.to_string()),
                 &LedgerTerminal {
                     recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                    outcomes: SlotTable::new(),
+                    // The EXACT-EQUAL shape: the outcomes keys equal the
+                    // rollback's slots keys (and bindings keys) — the
+                    // four-set equality (outcomes == rollback slots ==
+                    // rollback bindings == intent membership) is enforced
+                    // by the conversion, so a seeded Successful terminal
+                    // must carry one Activated outcome per slotted
+                    // generation.
+                    outcomes: SlotTable::from_map(
+                        slots
+                            .iter()
+                            .map(|(k, g)| {
+                                (
+                                    k.clone(),
+                                    SlotResult {
+                                        slot_id: k.clone(),
+                                        outcome: SlotOutcomeKind::Activated,
+                                        generation: Some(g.generation.clone()),
+                                        compensated: false,
+                                        error: None,
+                                    },
+                                )
+                            })
+                            .collect(),
+                    ),
                     disposition: TerminalDisposition::Successful {
                         rollback: crate::records::LedgerRollback { slots, bindings },
                     },
@@ -6432,24 +6465,26 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
     }
 
-    /// MULTI-RELEASE PARTIAL-SNAPSHOT ROLLBACK (the user's bug, end to end):
-    /// a successful snapshot can carry slots from DIFFERENT releases (group A
-    /// pushed R1, group B pushed R2 — the overlay snapshot keeps each slot's
-    /// OWN artifact), and a rollback of that snapshot must resolve EACH
-    /// SLOT's behavior from ITS OWN (release, variant) binding — never a
-    /// snapshot-wide single release.
+    /// GROUP-PUSH ROLLBACK COVERS EXACTLY THE GROUP (the four-set equality,
+    /// end to end): a successful terminal's outcomes keys, rollback slots
+    /// keys, rollback bindings keys, and the intent's membership are EXACTLY
+    /// EQUAL — so a group push's rollback records EXACTLY its selected
+    /// slots (never the unselected base slots carried forward), and a
+    /// rollback of that deployment restores EXACTLY the group, resolving
+    /// EACH slot's behavior from ITS OWN (release, variant) binding — never
+    /// a snapshot-wide single release.
     ///
     /// Drives the REAL push path on a two-group harness: a full push
     /// establishes both slots under contract A (release R1), a group-b push
-    /// advances only `p2` to contract B (release R2), and the resulting
-    /// partial snapshot carries R1 on `p1` and R2 on `p2` with DISTINCT
-    /// contract digests. A FULL rollback of that snapshot must publish per
-    /// slot: `p1`'s new generation assignment carries R1's variant behavior
-    /// digest, `p2`'s carries R2's (each slot's OWN release — under the old
-    /// snapshot-wide behavior `p2` would receive R1's digest), and both
-    /// releases' records are published on their servers' remotes.
+    /// advances only `p2` to contract B (release R2) and records a rollback
+    /// covering EXACTLY `p2` (the four-set equality — the unselected `p1`
+    /// is NOT carried into the rollback). A rollback of that deployment
+    /// restores `p2` to R2's variant behavior digest while `p1` stays on
+    /// R1's (each slot's OWN release — under the old snapshot-wide behavior
+    /// `p2` would receive R1's digest), and the referenced release's record
+    /// is published on its server's remote.
     #[test]
-    fn multi_release_partial_snapshot_rollback_publishes_per_slot_behavior() {
+    fn group_push_rollback_covers_exactly_the_group_and_publishes_per_slot_behavior() {
         let h = TwoSlotHarness::new();
         let slot_a = SlotId::new("p1".to_string());
         let slot_b = SlotId::new("p2".to_string());
@@ -6513,7 +6548,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
 
         // Push 2: PARTIAL group-b push under contract B — p2 advances to R2,
-        // p1 stays R1; the overlay snapshot S1 carries TWO releases.
+        // p1 stays R1. The rollback covers EXACTLY the group (the four-set
+        // equality: outcomes == rollback slots == rollback bindings == the
+        // intent's membership — the selected slots only).
         let id2 = DeploymentId::new("deploy-mr-group-b".to_string());
         let r2 = two_slot_push(&h, &config2, &RefExpr::Head, Some("group-b"), &id2).unwrap();
         assert_eq!(r2.status, Some(DeploymentStatus::Successful));
@@ -6533,27 +6570,47 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "a group push plans only its selected slots"
         );
         let snapshots = h.store.read_snapshots("t1").unwrap();
-        assert_eq!(
-            snapshots.len(),
-            2,
-            "baseline + the group-b partial snapshot"
-        );
+        assert_eq!(snapshots.len(), 2, "baseline + the group-b snapshot");
         let s1 = rollback_of(&snapshots[1]);
         assert_eq!(
-            s1.slots[&slot_a].assignment.artifact.release, r1_release,
-            "the partial snapshot CARRIES the unselected slot's own release (R1)"
+            s1.slots.len(),
+            1,
+            "the group push's rollback covers EXACTLY its membership (the four-set equality) — the unselected slot is NOT carried forward"
         );
         assert_eq!(
             s1.slots[&slot_b].assignment.artifact.release, r2_release,
-            "the partial snapshot's selected slot advances to its own release (R2)"
+            "the group push's rollback records its selected slot's own release (R2)"
         );
 
-        // Push 3: FULL rollback of the TWO-RELEASE snapshot (deployment id2).
+        // A FULL rollback to the group-b deployment is REFUSED: the
+        // rollback must key EXACTLY the deployment's membership (the
+        // four-set equality), so a full rollback of a group-only snapshot
+        // cannot cover the unselected slot — exact rollback requires an
+        // identical stable placement-slot set.
         let id3 = DeploymentId::new("deploy-mr-rollback".to_string());
-        let r3 = two_slot_push(
+        let err = two_slot_push(
             &h,
             &config2,
             &history::parse_ref_expr(id2.as_str()).unwrap(),
+            None,
+            &id3,
+        )
+        .expect_err(
+            "a FULL rollback of a group-only snapshot must be refused (the rollback keys exactly the deployment's membership)",
+        );
+        assert!(
+            err.to_string()
+                .contains("identical stable placement-slot set"),
+            "expected the exact-rollback membership error, got: {err}"
+        );
+
+        // Push 3: FULL rollback of the BASELINE deployment (id1 — a full
+        // push whose rollback covers both slots) restores BOTH slots to
+        // their recorded state (R1, contract A).
+        let r3 = two_slot_push(
+            &h,
+            &config2,
+            &history::parse_ref_expr(id1.as_str()).unwrap(),
             None,
             &id3,
         )
@@ -6561,8 +6618,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(r3.status, Some(DeploymentStatus::Successful));
 
         // The persisted plan carries the frozen PER-RELEASE behavior index
-        // (both referenced releases, each with its own contract) and the
-        // referenced-release set derived from the snapshot's slots.
+        // for the rollback's referenced release (R1 — the baseline's own
+        // release) and the referenced-release set derived from the
+        // snapshot's slots.
         let plan: DeploymentPlan = serde_json::from_str(
             &std::fs::read_to_string(h.store.deployment_dir(id3.as_str()).join("plan.json"))
                 .unwrap(),
@@ -6570,30 +6628,26 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         .unwrap();
         assert_eq!(
             plan.releases(),
-            BTreeSet::from([r1_release.clone(), r2_release.clone()]),
-            "the plan references BOTH snapshot releases"
+            BTreeSet::from([r1_release.clone()]),
+            "the rollback plan references the baseline's own release (R1)"
         );
         assert_eq!(
             plan.behaviors.len(),
-            2,
-            "one frozen behavior block per release"
+            1,
+            "one frozen behavior block per referenced release"
         );
         assert_eq!(
             crate::release::behavior_contract_digest(&plan.behaviors[&r1_release]["standard"]),
             digest_a
         );
-        assert_eq!(
-            crate::release::behavior_contract_digest(&plan.behaviors[&r2_release]["standard"]),
-            digest_b
-        );
 
         // EVERY SELECTED SLOT receives EXACTLY its own release's variant
-        // behavior: the live generation assignment published on p1's server
-        // carries digest A (R1), p2's carries digest B (R2) — never a
-        // snapshot-wide single release's contract.
+        // behavior: the live generation assignment published on p1's and p2's
+        // servers carries digest A (R1) — the baseline's own release — never
+        // a snapshot-wide single release's contract.
         for (server, slot, want_digest, want_release) in [
             ("s1", &slot_a, &digest_a, &r1_release),
-            ("s2", &slot_b, &digest_b, &r2_release),
+            ("s2", &slot_b, &digest_a, &r1_release),
         ] {
             let remote = LocalTransport::new(h.remotes_base.join(server)).unwrap();
             let helper = RemoteHelper::new(&remote);
@@ -6630,9 +6684,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "slot {slot}'s release behavior.json must be published on its server's remote"
             );
         }
-        // And the two digests are DISTINCT — the assertion above is not
-        // vacuous: a snapshot-wide single-release behavior would have applied
-        // the SAME digest to both slots.
+        // And the two contracts are DISTINGUISHABLE — the assertion above is
+        // not vacuous: the group push's release R2 really differs from the
+        // baseline's R1 (a single contract would have made the group push a
+        // no-op).
         assert_ne!(digest_a, digest_b);
     }
 

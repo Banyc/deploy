@@ -454,7 +454,8 @@ mod tests {
     };
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
-        NonEmptySlotTable, ObservedSlot, Pins, SlotTable, TerminalDisposition,
+        NonEmptySlotTable, ObservedSlot, Pins, SlotOutcomeKind, SlotResult, SlotTable,
+        TerminalDisposition,
     };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -519,7 +520,19 @@ mod tests {
     fn terminal_for(release: &str) -> LedgerTerminal {
         LedgerTerminal {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
-            outcomes: SlotTable::new(),
+            // The EXACT-EQUAL shape: one Activated outcome per slotted
+            // generation (the four-set equality is enforced by the
+            // conversion).
+            outcomes: SlotTable::from_map(BTreeMap::from([(
+                SlotId::new("p1".to_string()),
+                SlotResult {
+                    slot_id: SlotId::new("p1".to_string()),
+                    outcome: SlotOutcomeKind::Activated,
+                    generation: Some(GenerationId::new("gen-1".to_string())),
+                    compensated: false,
+                    error: None,
+                },
+            )])),
             disposition: TerminalDisposition::Successful {
                 rollback: rollback_for(release),
             },
@@ -554,7 +567,19 @@ mod tests {
                         &DeploymentId::new(id.clone()),
                         &LedgerTerminal {
                             recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                            outcomes: SlotTable::new(),
+                            // The FailedRolledBack compensation report IS the
+                            // outcome table — it must EXACTLY cover the
+                            // membership (the status-specific outcome rule).
+                            outcomes: SlotTable::from_map(BTreeMap::from([(
+                                SlotId::new("p1".to_string()),
+                                SlotResult {
+                                    slot_id: SlotId::new("p1".to_string()),
+                                    outcome: SlotOutcomeKind::Restored,
+                                    generation: Some(GenerationId::new("gen-1".to_string())),
+                                    compensated: true,
+                                    error: None,
+                                },
+                            )])),
                             disposition: TerminalDisposition::FailedRolledBack,
                             reason: None,
                         },

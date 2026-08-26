@@ -584,12 +584,13 @@ fn print_report(report: &PushReport) {
 mod tests {
     use super::*;
     use crate::model::{
-        ArtifactRef, DeploymentId, GenerationId, ReleaseId, SlotId, TargetName, TreeDigest,
-        VariantName,
+        ArtifactRef, DeploymentId, GenerationId, GenerationRef, PlacementSlotAssignment, ReleaseId,
+        ServerId, SlotId, TargetName, TreeDigest, VariantName,
     };
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
-        NonEmptySlotTable, ObservedSlot, SlotTable, TerminalDisposition,
+        NonEmptySlotTable, ObservedSlot, SlotOutcomeKind, SlotResult, SlotTable,
+        TerminalDisposition,
     };
     use std::collections::BTreeMap;
 
@@ -622,7 +623,10 @@ mod tests {
     }
 
     /// Seed the ledger with a successful deployment (intent + `Successful`
-    /// terminal carrying a rollback state, so `sN`/log prefixes apply).
+    /// terminal carrying a rollback state, so `sN`/log prefixes apply). The
+    /// terminal is the EXACT-EQUAL shape: one Activated outcome per slotted
+    /// generation, and a rollback whose slots/bindings key the same
+    /// membership (the four-set equality is enforced by the conversion).
     fn seed_successful(store: &LocalStore, id: &str, attempted_at: &str) {
         let mut it = pending_attempt(id);
         it.attempted_at = attempted_at.to_string();
@@ -631,19 +635,55 @@ mod tests {
             .append_terminal(
                 "production",
                 &DeploymentId::new(id.to_string()),
-                &LedgerTerminal {
-                    recorded_at: attempted_at.to_string(),
-                    outcomes: SlotTable::new(),
-                    disposition: TerminalDisposition::Successful {
-                        rollback: LedgerRollback {
-                            slots: BTreeMap::new(),
-                            bindings: BTreeMap::new(),
-                        },
-                    },
-                    reason: Some("deployed".to_string()),
-                },
+                &successful_terminal(attempted_at, "deployed"),
             )
             .unwrap();
+    }
+
+    /// A `Successful` terminal in the EXACT-EQUAL shape for the one-slot
+    /// fixture intent (membership `p1`): one Activated outcome, and a
+    /// rollback whose slots and bindings key exactly `p1`.
+    fn successful_terminal(recorded_at: &str, reason: &str) -> LedgerTerminal {
+        let p1 = SlotId::new("p1".to_string());
+        LedgerTerminal {
+            recorded_at: recorded_at.to_string(),
+            outcomes: SlotTable::from_map(BTreeMap::from([(
+                p1.clone(),
+                SlotResult {
+                    slot_id: p1.clone(),
+                    outcome: SlotOutcomeKind::Activated,
+                    generation: Some(GenerationId::new("gen-1".to_string())),
+                    compensated: false,
+                    error: None,
+                },
+            )])),
+            disposition: TerminalDisposition::Successful {
+                rollback: LedgerRollback {
+                    slots: BTreeMap::from([(
+                        p1.clone(),
+                        GenerationRef {
+                            generation: GenerationId::new("gen-1".to_string()),
+                            assignment: PlacementSlotAssignment {
+                                placement_slot: p1.clone(),
+                                artifact: ArtifactRef {
+                                    release: ReleaseId::new("rel-1".to_string()),
+                                    variant: VariantName::new("standard".to_string()),
+                                    tree: TreeDigest::new("tree-1".to_string()),
+                                },
+                            },
+                        },
+                    )]),
+                    bindings: BTreeMap::from([(
+                        p1.clone(),
+                        crate::records::PhysicalBinding {
+                            server: ServerId::new("s1".to_string()),
+                            deploy_dir: "/srv/deploy/p1".to_string(),
+                        },
+                    )]),
+                },
+            },
+            reason: Some(reason.to_string()),
+        }
     }
 
     #[test]
@@ -670,17 +710,7 @@ mod tests {
             .append_terminal(
                 "production",
                 &a.deployment_id,
-                &LedgerTerminal {
-                    recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                    outcomes: SlotTable::new(),
-                    disposition: TerminalDisposition::Successful {
-                        rollback: LedgerRollback {
-                            slots: BTreeMap::new(),
-                            bindings: BTreeMap::new(),
-                        },
-                    },
-                    reason: Some("recovery finalization".to_string()),
-                },
+                &successful_terminal("2026-01-01T00:00:00Z", "recovery finalization"),
             )
             .unwrap();
         let entries = store.read_ledger("production").unwrap();

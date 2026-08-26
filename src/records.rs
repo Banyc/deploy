@@ -951,7 +951,10 @@ pub type CompensationReport = SlotTable<SlotOutcome>;
 /// * [`TerminalDisposition::Successful`] ALWAYS carries its complete
 ///   rollback payload (a successful deployment always records its rollback
 ///   state — the generation refs + physical bindings, the ONE fact the
-///   per-slot outcomes cannot express).
+///   per-slot outcomes cannot express). The outcomes keys, the rollback's
+///   slots keys, and the rollback's bindings keys are EXACTLY EQUAL and
+///   NON-EMPTY (enforced by the conversion; the intent's membership is the
+///   fourth equal set, enforced where the terminal merges into its entry).
 /// * [`TerminalDisposition::FailedPreflight`] carries NOTHING — a
 ///   pre-mutation failure cannot carry a rollback, and no slot was touched.
 /// * [`TerminalDisposition::FailedRolledBack`] carries NOTHING — its
@@ -1141,14 +1144,18 @@ impl LedgerTerminalWire {
     /// status never carries one), each outcome's value must name its OWN
     /// map key (the outcome's `slot_id` is the placement slot it records),
     /// and the disposition's duplicated projections must AGREE with the
-    /// authoritative outcomes: a `Successful` wire's outcomes must be
-    /// covered by the rollback's slots and every outcome must be Activated,
-    /// and a `Degraded` wire's outcomes must derive a NON-EMPTY
-    /// remaining-changes set (all-restored outcomes are refused). A
-    /// disagreement → `Error::integrity`. The cross-record claims (outcome
-    /// key set vs the intent's `slot_ids`, and the `target` field vs the
-    /// read path / intent) are enforced by the ledger read that merges the
-    /// intent and the terminal ([`crate::store::local::LocalStore::read_ledger`]).
+    /// authoritative outcomes, BY STATUS: a `Successful` wire's outcomes
+    /// keys, rollback slots keys, and rollback bindings keys must be
+    /// EXACTLY EQUAL and NON-EMPTY (every outcome must also be Activated),
+    /// a `FailedPreflight` wire must carry NO outcomes (a pre-mutation
+    /// failure touched no slot), and a `Degraded` wire's outcomes must
+    /// derive a NON-EMPTY remaining-changes set (all-restored outcomes are
+    /// refused). A disagreement → `Error::integrity`. The cross-record
+    /// claims (the outcome key set vs the intent's `slot_ids` — the
+    /// membership leg of the four-set equality — and the `target` field vs
+    /// the read path / intent) are enforced by the ledger read that merges
+    /// the intent and the terminal
+    /// ([`crate::store::local::LocalStore::read_ledger`]).
     pub fn into_domain(self) -> Result<LedgerTerminal> {
         // The recorded timestamp must parse as RFC 3339 (fail closed).
         Timestamp::parse(&self.recorded_at).map_err(|_| {
@@ -1180,20 +1187,36 @@ impl LedgerTerminalWire {
         // conversion error (fail closed).
         let disposition = match (&self.status, rollback) {
             (DeploymentStatus::Successful, Some(rollback)) => {
-                // OUTCOME/ROLLBACK AGREEMENT: every outcome key must be a
-                // rollback slot — the rollback is the authoritative rollback
-                // fact (the complete snapshot), and an outcome for a slot the
-                // rollback does not cover is a disagreement. (The reverse — a
-                // rollback slot without an outcome — is legitimate: a
-                // partial rollout's rollback carries unselected slots
-                // forward from the base.)
-                for key in outcomes.keys() {
-                    if !rollback.slots.contains_key(key) {
-                        return Err(Error::integrity(format!(
-                            "terminal {}: outcome for slot '{key}' is not covered by the Successful rollback — the outcomes must agree with the rollback's slots",
-                            self.deployment_id
-                        )));
-                    }
+                // THE FOUR-SET AGREEMENT (terminal-local half): the
+                // outcomes keys, the rollback's slots keys, and the
+                // rollback's bindings keys must be EXACTLY EQUAL and
+                // NON-EMPTY — a successful deployment records a COMPLETE
+                // rollback over EXACTLY the slots it reports outcomes for
+                // (a missing OR extra key in any of the three
+                // terminal-local sets is a disagreement; the fourth set —
+                // the intent's membership — is enforced where the terminal
+                // merges into its entry). The rollback's own conversion
+                // already guarantees bindings == slots; the equality is
+                // checked here against the outcomes so the invariant is
+                // enforced in ONE place, and the NON-EMPTY refusal closes
+                // the "successful with no outcomes" hole (an empty outcome
+                // table can never agree with a non-empty rollback).
+                let outcome_keys: BTreeSet<&SlotId> = outcomes.keys().collect();
+                let rollback_slot_keys: BTreeSet<&SlotId> =
+                    rollback.slots.keys().collect();
+                let rollback_binding_keys: BTreeSet<&SlotId> =
+                    rollback.bindings.keys().collect();
+                if outcome_keys.is_empty() {
+                    return Err(Error::integrity(format!(
+                        "terminal {}: status Successful requires NON-EMPTY outcomes — a successful deployment records a complete rollback over exactly the slots it reports outcomes for",
+                        self.deployment_id
+                    )));
+                }
+                if outcome_keys != rollback_slot_keys || outcome_keys != rollback_binding_keys {
+                    return Err(Error::integrity(format!(
+                        "terminal {}: status Successful requires the outcomes keys, the rollback's slots keys, and the rollback's bindings keys to be EXACTLY EQUAL (outcomes {outcome_keys:?} vs rollback slots {rollback_slot_keys:?} vs rollback bindings {rollback_binding_keys:?})",
+                        self.deployment_id
+                    )));
                 }
                 // A Successful deployment implies every slot activated: a
                 // non-activated outcome is a disagreement (the disposition's
@@ -1925,8 +1948,11 @@ mod tests {
     /// Run the full verifying conversion of an intent + terminal pair — the
     /// SAME checks `read_ledger` runs when it merges a terminal into its
     /// entry (the entry owns identity: the terminal's id is the entry key,
-    /// its target must equal the entry's, and every outcome key must be a
-    /// member of the intent's membership) — returning the validated domain
+    /// its target must equal the entry's, every outcome key must be a
+    /// member of the intent's membership, and the outcome key set must
+    /// agree with the membership BY STATUS: Successful → EXACTLY equal
+    /// (the four-set equality's membership leg), FailedPreflight → empty,
+    /// every other state → EXACT coverage) — returning the validated domain
     /// pair.
     fn pair_to_domain(
         pair: &(LedgerIntentWire, LedgerTerminalWire),
@@ -1953,6 +1979,37 @@ mod tests {
             }
         }
         let terminal = pair.1.clone().into_domain()?;
+        // STATUS-SPECIFIC OUTCOME AGREEMENT (the membership leg of the
+        // four-set equality — the same rules `read_ledger` enforces when it
+        // merges the terminal into its entry).
+        let outcome_keys: BTreeSet<&SlotId> = terminal.outcomes.keys().collect();
+        let membership: BTreeSet<&SlotId> = intent.slots.keys().collect();
+        match terminal.status() {
+            DeploymentStatus::Successful => {
+                if outcome_keys != membership {
+                    return Err(Error::integrity(format!(
+                        "terminal {}: Successful outcomes {outcome_keys:?} must EXACTLY equal the intent's membership {membership:?} (the four-set equality: outcomes == rollback slots == rollback bindings == intent membership)",
+                        pair.1.deployment_id
+                    )));
+                }
+            }
+            DeploymentStatus::FailedPreflight => {
+                if !outcome_keys.is_empty() {
+                    return Err(Error::integrity(format!(
+                        "terminal {}: FailedPreflight must carry NO outcomes (a pre-mutation failure touched no slot)",
+                        pair.1.deployment_id
+                    )));
+                }
+            }
+            _ => {
+                if outcome_keys != membership {
+                    return Err(Error::integrity(format!(
+                        "terminal {}: outcomes {outcome_keys:?} must EXACTLY cover the intent's membership {membership:?} — no missing, no extra",
+                        pair.1.deployment_id
+                    )));
+                }
+            }
+        }
         Ok((intent, terminal))
     }
 
@@ -2273,7 +2330,227 @@ mod tests {
         }
     }
 
+    // ---- THE FOUR-SET EQUALITY PROPERTY (Successful) -----------------------
+
+    /// One key-set operation applied to ONE of the four sets (outcomes,
+    /// rollback slots, rollback bindings, intent membership). The ops are
+    /// chosen INDEPENDENTLY per set; the application is deterministic given
+    /// the op (delete the first key / add the first absent slot / replace
+    /// the first key with the first absent slot), so the property's
+    /// "succeeds iff all four sets are identical" verdict is exact.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum KeyOp {
+        Unchanged,
+        Delete,
+        Add,
+        Replace,
+    }
+
+    fn key_op() -> impl Strategy<Value = KeyOp> {
+        prop_oneof![
+            Just(KeyOp::Unchanged),
+            Just(KeyOp::Delete),
+            Just(KeyOp::Add),
+            Just(KeyOp::Replace),
+        ]
+    }
+
+    /// Apply one key op to a slot set (deterministic: delete the first
+    /// key, add the first slot absent from the set, replace the first key
+    /// with the first absent slot).
+    fn apply_key_op(set: &BTreeSet<SlotId>, op: KeyOp) -> BTreeSet<SlotId> {
+        let mut out = set.clone();
+        match op {
+            KeyOp::Unchanged => {}
+            KeyOp::Delete => {
+                if let Some(k) = out.iter().next().cloned() {
+                    out.remove(&k);
+                }
+            }
+            KeyOp::Add => {
+                for i in 0..6u32 {
+                    let k = slot(i);
+                    if !out.contains(&k) {
+                        out.insert(k);
+                        break;
+                    }
+                }
+            }
+            KeyOp::Replace => {
+                if let Some(k) = out.iter().next().cloned() {
+                    out.remove(&k);
+                    for i in 0..6u32 {
+                        let nk = slot(i);
+                        if !out.contains(&nk) {
+                            out.insert(nk);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Rebuild the intent wire with a NEW membership, keeping the intent's
+    /// internal agreement (slot_ids == desired == pre_push, each assignment
+    /// names its own key, the wire actuals map empty).
+    fn intent_with_membership(
+        intent: &LedgerIntentWire,
+        membership: &BTreeSet<SlotId>,
+    ) -> LedgerIntentWire {
+        let keys: Vec<SlotId> = membership.iter().cloned().collect();
+        let desired: BTreeMap<SlotId, GenerationRef> =
+            keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
+        let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> =
+            keys.iter().map(|k| (k.clone(), None)).collect();
+        LedgerIntentWire {
+            deployment_schema_version: intent.deployment_schema_version,
+            deployment_id: intent.deployment_id.clone(),
+            target: intent.target.clone(),
+            group: intent.group.clone(),
+            slot_ids: keys.clone(),
+            behavior_sha256: intent.behavior_sha256.clone(),
+            attempted_at: intent.attempted_at.clone(),
+            desired,
+            pre_push,
+            slots: BTreeMap::new(),
+        }
+    }
+
+    /// Apply the four INDEPENDENT key ops to a valid Successful pair and
+    /// return the tampered pair: (a) the outcomes keys, (b) the rollback's
+    /// slots keys, (c) the rollback's bindings keys, (d) the intent's
+    /// membership (rebuilt so the intent stays internally agreeing).
+    fn apply_four_set_tamper(
+        pair: &(LedgerIntentWire, LedgerTerminalWire),
+        ops: [KeyOp; 4],
+    ) -> (LedgerIntentWire, LedgerTerminalWire) {
+        let (intent, terminal) = pair;
+        let mut terminal = terminal.clone();
+        // (a) outcomes keys.
+        let outcome_keys: BTreeSet<SlotId> = terminal.outcomes.keys().cloned().collect();
+        let new_outcomes = apply_key_op(&outcome_keys, ops[0]);
+        terminal.outcomes = new_outcomes
+            .iter()
+            .map(|k| (k.clone(), outcome_for(k, SlotOutcomeKind::Activated)))
+            .collect();
+        // (b) rollback slots keys, (c) rollback bindings keys.
+        let rb = terminal
+            .rollback
+            .as_mut()
+            .expect("a Successful terminal carries its rollback");
+        let slot_keys: BTreeSet<SlotId> = rb.slots.keys().cloned().collect();
+        let new_slots = apply_key_op(&slot_keys, ops[1]);
+        rb.slots = new_slots
+            .iter()
+            .map(|k| (k.clone(), gen_ref_for(k)))
+            .collect();
+        let binding_keys: BTreeSet<SlotId> = rb.bindings.keys().cloned().collect();
+        let new_bindings = apply_key_op(&binding_keys, ops[2]);
+        rb.bindings = new_bindings
+            .iter()
+            .map(|k| (k.clone(), binding(k)))
+            .collect();
+        // (d) the intent's membership.
+        let membership: BTreeSet<SlotId> = intent.slot_ids.iter().cloned().collect();
+        let new_membership = apply_key_op(&membership, ops[3]);
+        let intent = intent_with_membership(intent, &new_membership);
+        (intent, terminal)
+    }
+
+    proptest! {
+        // PROPERTY (the directive's point 4): generate a VALID
+        // intent/successful-terminal pair, then INDEPENDENTLY DELETE / ADD /
+        // REPLACE keys in (a) the outcomes, (b) the rollback's slots, (c)
+        // the rollback's bindings — and (d) the intent's membership (the
+        // fourth set, so the "a tamper happens to keep the sets equal — e.g.
+        // adding the same key to all four — succeeds" direction is exercised
+        // too). READING (the real `read_ledger` conversion) SUCCEEDS IFF
+        // ALL FOUR SETS ARE IDENTICAL (and non-empty — the Successful
+        // rule's non-emptiness): the untampered case and any tamper that
+        // keeps the four sets equal succeed; any single-set divergence
+        // fails. Bounded 16 cases, fixed seed 0x5EED_5EED per house style,
+        // no persistence.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn successful_four_set_equality_is_necessary_and_sufficient(
+            (intent, terminal) in agreeing_pair().prop_filter(
+                "the property needs a Successful pair",
+                |(_, t)| t.status == DeploymentStatus::Successful,
+            ),
+            ops in prop::array::uniform4(key_op()),
+        ) {
+            let (t_intent, t_terminal) = apply_four_set_tamper(&(intent, terminal), ops);
+            // The four resulting sets (owned — the pair is consumed by the
+            // ledger write below).
+            let outcomes: BTreeSet<SlotId> = t_terminal.outcomes.keys().cloned().collect();
+            let rb = t_terminal
+                .rollback
+                .as_ref()
+                .expect("Successful carries its rollback");
+            let rollback_slots: BTreeSet<SlotId> = rb.slots.keys().cloned().collect();
+            let rollback_bindings: BTreeSet<SlotId> = rb.bindings.keys().cloned().collect();
+            let membership: BTreeSet<SlotId> = t_intent.slot_ids.iter().cloned().collect();
+            let all_identical = outcomes == rollback_slots
+                && outcomes == rollback_bindings
+                && outcomes == membership;
+            let expect_ok = all_identical && !outcomes.is_empty();
+            let read = write_pair_ledger(&(t_intent, t_terminal));
+            assert_eq!(
+                read.is_ok(),
+                expect_ok,
+                "read_ledger must succeed iff the four sets are identical and non-empty (outcomes {outcomes:?}, rollback slots {rollback_slots:?}, rollback bindings {rollback_bindings:?}, membership {membership:?}); read: {read:?}"
+            );
+        }
+    }
+
     // ---- deterministic unit tests -----------------------------------------
+
+    /// THE FOUR-SET EQUALITY, SUFFICIENCY DIRECTION (deterministic): a
+    /// tamper that happens to KEEP the four sets identical — e.g. adding
+    /// the SAME key to all four (outcomes, rollback slots, rollback
+    /// bindings, intent membership) — is NOT a disagreement: the read
+    /// succeeds. (The necessity direction — any single-set divergence fails
+    /// — is the property's verdict; this pins the sufficiency case the
+    /// bounded property may not draw.)
+    #[test]
+    fn successful_four_set_equality_suffices_when_a_tamper_keeps_the_sets_equal() {
+        let keys = vec![slot(1), slot(2)];
+        let intent = agreeing_intent(&keys);
+        let terminal = agreeing_terminal(&keys, 0);
+        // The untampered pair reads.
+        write_pair_ledger(&(intent.clone(), terminal.clone()))
+            .expect("the exact-equal Successful pair reads");
+        // Add the SAME key (slot-9) to all four sets: the sets stay
+        // identical, so the read still succeeds.
+        let mut intent = intent;
+        intent.slot_ids.push(slot(9));
+        intent.desired.insert(slot(9), gen_ref_for(&slot(9)));
+        intent.pre_push.insert(slot(9), None);
+        let mut terminal = terminal;
+        terminal
+            .outcomes
+            .insert(slot(9), outcome_for(&slot(9), SlotOutcomeKind::Activated));
+        let rb = terminal.rollback.as_mut().unwrap();
+        rb.slots.insert(slot(9), gen_ref_for(&slot(9)));
+        rb.bindings.insert(slot(9), binding(&slot(9)));
+        let entries = write_pair_ledger(&(intent, terminal)).expect(
+            "adding the same key to all four sets keeps them identical — the read succeeds",
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].intent.slots.len(),
+            3,
+            "the intent's membership grew with the added key"
+        );
+    }
 
     /// [`DeploymentIntent`]: the wire's three projections COLLAPSE into ONE
     /// slot table; every duplicate-projection disagreement (duplicate member,
@@ -2539,6 +2816,134 @@ mod tests {
         assert!(
             bad.into_domain().is_err(),
             "a PendingCommit terminal is refused"
+        );
+    }
+
+    /// THE STATUS-SPECIFIC OUTCOME RULES (the directive's fix, enforced BY
+    /// STATUS): a `Successful` terminal's outcomes keys, rollback slots
+    /// keys, and rollback bindings keys must be EXACTLY EQUAL and NON-EMPTY
+    /// (a missing/extra key in ANY of the three terminal-local sets fails
+    /// the conversion; the fourth set — the intent's membership — fails the
+    /// pair/ledger read), a `FailedPreflight` terminal must carry NO
+    /// outcomes, and every other terminal state's outcomes must EXACTLY
+    /// COVER the intent's membership (no missing, no extra).
+    #[test]
+    fn status_specific_outcome_rules_fail_closed() {
+        let keys = vec![slot(1), slot(2)];
+
+        // THE EXACT-EQUAL SUCCESSFUL → Ok (the four sets are identical and
+        // non-empty: outcomes == rollback slots == rollback bindings == the
+        // intent's membership).
+        let intent = agreeing_intent(&keys);
+        let terminal = agreeing_terminal(&keys, 0);
+        let (d_intent, d_terminal) = pair_to_domain(&(intent.clone(), terminal.clone()))
+            .expect("the exact-equal Successful pair converts");
+        assert_eq!(d_terminal.status(), DeploymentStatus::Successful);
+        assert_eq!(
+            d_terminal.outcomes.len(),
+            d_intent.slots.len(),
+            "the outcomes exactly cover the membership"
+        );
+        let TerminalDisposition::Successful { rollback } = &d_terminal.disposition else {
+            panic!("Successful disposition");
+        };
+        assert_eq!(rollback.slots.len(), d_intent.slots.len());
+        assert_eq!(rollback.bindings.len(), d_intent.slots.len());
+
+        // SUCCESSFUL with a MISSING outcome key → Err (the outcomes no
+        // longer equal the rollback's slots / the membership).
+        let mut bad = terminal.clone();
+        bad.outcomes.remove(&slot(1));
+        assert!(
+            bad.clone().into_domain().is_err(),
+            "Successful with a missing outcome key fails the conversion (the three terminal-local sets diverge)"
+        );
+        assert!(
+            pair_to_domain(&(intent.clone(), bad)).is_err(),
+            "Successful with a missing outcome key fails the pair read"
+        );
+
+        // SUCCESSFUL with an EXTRA outcome key → Err (an outcome for a slot
+        // the rollback does not cover).
+        let mut bad = terminal.clone();
+        bad.outcomes
+            .insert(slot(9), outcome_for(&slot(9), SlotOutcomeKind::Activated));
+        assert!(
+            bad.into_domain().is_err(),
+            "Successful with an extra outcome key fails the conversion"
+        );
+
+        // SUCCESSFUL with a MISSING rollback slot (and binding) → Err (the
+        // rollback no longer equals the outcomes).
+        let mut bad = terminal.clone();
+        let rb = bad.rollback.as_mut().unwrap();
+        rb.slots.remove(&slot(1));
+        rb.bindings.remove(&slot(1));
+        assert!(
+            bad.into_domain().is_err(),
+            "Successful with a missing rollback slot fails the conversion"
+        );
+
+        // SUCCESSFUL with an EXTRA rollback slot (and binding) → Err (the
+        // rollback covers a slot the outcomes do not).
+        let mut bad = terminal.clone();
+        let rb = bad.rollback.as_mut().unwrap();
+        rb.slots.insert(slot(9), gen_ref_for(&slot(9)));
+        rb.bindings.insert(slot(9), binding(&slot(9)));
+        assert!(
+            bad.into_domain().is_err(),
+            "Successful with an extra rollback slot fails the conversion"
+        );
+
+        // SUCCESSFUL with EMPTY outcomes → Err (the four sets must be
+        // NON-EMPTY — a successful deployment records a complete rollback
+        // over exactly the slots it reports outcomes for).
+        let mut bad = terminal.clone();
+        bad.outcomes = BTreeMap::new();
+        assert!(
+            bad.into_domain().is_err(),
+            "Successful with empty outcomes fails the conversion"
+        );
+
+        // FAILEDPREFLIGHT with an outcome → Err (a pre-mutation failure
+        // touched no slot).
+        let mut bad = agreeing_terminal(&keys, 1);
+        bad.outcomes
+            .insert(slot(1), outcome_for(&slot(1), SlotOutcomeKind::Activated));
+        assert!(
+            bad.clone().into_domain().is_err(),
+            "FailedPreflight with an outcome fails the conversion"
+        );
+        assert!(
+            pair_to_domain(&(intent.clone(), bad)).is_err(),
+            "FailedPreflight with an outcome fails the pair read"
+        );
+
+        // DEGRADED with a MISSING outcome → Err (the outcomes must EXACTLY
+        // cover the membership).
+        let mut bad = agreeing_terminal(&keys, 3);
+        bad.outcomes.remove(&slot(1));
+        assert!(
+            pair_to_domain(&(intent.clone(), bad)).is_err(),
+            "Degraded with a missing outcome fails the pair read (the outcomes must exactly cover the membership)"
+        );
+
+        // DEGRADED with an EXTRA outcome → Err.
+        let mut bad = agreeing_terminal(&keys, 3);
+        bad.outcomes
+            .insert(slot(9), outcome_for(&slot(9), SlotOutcomeKind::Skipped));
+        assert!(
+            pair_to_domain(&(intent.clone(), bad)).is_err(),
+            "Degraded with an extra outcome fails the pair read"
+        );
+
+        // FAILEDROLLEDBACK with a MISSING outcome → Err (the compensation
+        // report must exactly cover the membership).
+        let mut bad = agreeing_terminal(&keys, 2);
+        bad.outcomes.remove(&slot(1));
+        assert!(
+            pair_to_domain(&(intent, bad)).is_err(),
+            "FailedRolledBack with a missing outcome fails the pair read"
         );
     }
 

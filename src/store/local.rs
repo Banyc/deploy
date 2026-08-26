@@ -958,8 +958,13 @@ impl LocalStore {
     /// Successful terminal without its rollback, an outcome whose value
     /// names a different slot, a rollback whose binding keys are not exactly
     /// its generation keys), or whose cross-record claims disagree (the
-    /// terminal's target vs the read path / its intent, a non-empty outcome
-    /// key set vs the intent's `slot_ids`), is REFUSED with an integrity
+    /// terminal's target vs the read path / its intent, the outcome key set
+    /// vs the intent's `slot_ids` — BY STATUS: a Successful terminal's
+    /// outcomes must EXACTLY equal its membership (the four-set equality:
+    /// outcomes == rollback slots == rollback bindings == intent
+    /// membership, non-empty), a FailedPreflight terminal must carry NO
+    /// outcomes, and every other terminal state's outcomes must EXACTLY
+    /// cover the membership), is REFUSED with an integrity
     /// error — a hand-constructed or tampered record is never read as
     /// whichever projection a consumer happens to use. Fail closed on
     /// malformed lines, foreign `deployment_schema_version`, an intent-less
@@ -1100,13 +1105,45 @@ impl LocalStore {
                     // stays valid; a PARTIAL outcome map — the shape that
                     // would let a consumer absorb only some members — is
                     // always refused.
-                    if !terminal.outcomes.is_empty() {
-                        let outcome_keys: BTreeSet<&SlotId> = terminal.outcomes.keys().collect();
-                        let membership: BTreeSet<&SlotId> = entry.intent.slots.keys().collect();
-                        if outcome_keys != membership {
-                            return Err(Error::integrity(format!(
-                                "ledger of target '{target}': terminal for deployment '{id}' carries outcomes for slots {outcome_keys:?} but its intent's slot_ids are {membership:?} — every member slot has exactly one outcome, no extras"
-                            )));
+                   // outcome leg), BY STATUS: the terminal's outcome key
+                   // set must agree with the intent's AUTHORITATIVE
+                   // membership EXACTLY —
+                   // - Successful: the four sets (outcomes, rollback
+                   //   slots, rollback bindings, intent membership) are
+                   //   EXACTLY EQUAL and NON-EMPTY — the terminal-local
+                   //   three-set equality is enforced by the wire → domain
+                   //   conversion; the membership leg is enforced here.
+                   // - FailedPreflight: outcomes EMPTY (a pre-mutation
+                   //   failure touched no slot).
+                   // - every other terminal state (FailedRolledBack,
+                   //   Degraded): the outcomes EXACTLY COVER the
+                   //   membership — every member slot has one outcome, no
+                   //   extras, no missing.
+                   let outcome_keys: BTreeSet<&SlotId> =
+                       terminal.outcomes.keys().collect();
+                   let membership: BTreeSet<&SlotId> =
+                       entry.intent.slots.keys().collect();
+                   match terminal.status() {
+                       DeploymentStatus::Successful => {
+                           if outcome_keys != membership {
+                               return Err(Error::integrity(format!(
+                                   "ledger of target '{target}': Successful terminal for deployment '{id}' carries outcomes for slots {outcome_keys:?} but its intent's slot_ids are {membership:?} — a successful deployment's outcomes must EXACTLY equal its membership (the rollback's slots and bindings equal them by the conversion)"
+                               )));
+                           }
+                       }
+                       DeploymentStatus::FailedPreflight => {
+                           if !outcome_keys.is_empty() {
+                               return Err(Error::integrity(format!(
+                                   "ledger of target '{target}': FailedPreflight terminal for deployment '{id}' carries outcomes for slots {outcome_keys:?} — a pre-mutation failure touched no slot"
+                               )));
+                           }
+                       }
+                       _ => {
+                           if outcome_keys != membership {
+                               return Err(Error::integrity(format!(
+                                   "ledger of target '{target}': terminal for deployment '{id}' carries outcomes for slots {outcome_keys:?} but its intent's slot_ids are {membership:?} — every member slot has exactly one outcome, no extras"
+                               )));
+                           }
                         }
                     }
                     entry.terminal = Some(terminal);
@@ -1889,7 +1926,19 @@ mod tests {
                 &DeploymentId::new("deploy-fail".to_string()),
                 &LedgerTerminal {
                     recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                    outcomes: SlotTable::new(),
+                    // The FailedRolledBack compensation report IS the outcome
+                    // table — it must EXACTLY cover the membership (the
+                    // status-specific outcome rule).
+                    outcomes: SlotTable::from_map(BTreeMap::from([(
+                        SlotId::new("p1".to_string()),
+                        SlotResult {
+                            slot_id: SlotId::new("p1".to_string()),
+                            outcome: SlotOutcomeKind::Restored,
+                            generation: Some(GenerationId::new("gen-1".to_string())),
+                            compensated: true,
+                            error: None,
+                        },
+                    )])),
                     disposition: TerminalDisposition::FailedRolledBack,
                     reason: None,
                 },

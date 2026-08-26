@@ -467,7 +467,8 @@ mod tests {
     };
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
-        NonEmptySlotTable, ObservedSlot, Pins, SlotTable, TerminalDisposition,
+        NonEmptySlotTable, ObservedSlot, Pins, SlotOutcomeKind, SlotResult, SlotTable,
+        TerminalDisposition,
     };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -598,7 +599,19 @@ interval_seconds = 0
     fn terminal_for(release: &str, tree: &str) -> LedgerTerminal {
         LedgerTerminal {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
-            outcomes: SlotTable::new(),
+            // The EXACT-EQUAL shape: one Activated outcome per slotted
+            // generation (the four-set equality is enforced by the
+            // conversion).
+            outcomes: SlotTable::from_map(BTreeMap::from([(
+                SlotId::new(SLOT.to_string()),
+                SlotResult {
+                    slot_id: SlotId::new(SLOT.to_string()),
+                    outcome: SlotOutcomeKind::Activated,
+                    generation: Some(GenerationId::new("gen-1".to_string())),
+                    compensated: false,
+                    error: None,
+                },
+            )])),
             disposition: TerminalDisposition::Successful {
                 rollback: LedgerRollback {
                     slots: BTreeMap::from([(

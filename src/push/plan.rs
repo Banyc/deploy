@@ -869,7 +869,8 @@ mod tests {
     };
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
-        NonEmptySlotTable, PhysicalBinding, SlotTable, TerminalDisposition,
+        NonEmptySlotTable, PhysicalBinding, SlotOutcomeKind, SlotResult, SlotTable,
+        TerminalDisposition,
     };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -1055,7 +1056,26 @@ interval_seconds = 0
                 &id,
                 &LedgerTerminal {
                     recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                    outcomes: SlotTable::new(),
+                    // The EXACT-EQUAL shape: one Activated outcome per
+                    // slotted generation (the four-set equality is enforced
+                    // by the conversion).
+                    outcomes: SlotTable::from_map(
+                        slots
+                            .iter()
+                            .map(|(k, g)| {
+                                (
+                                    k.clone(),
+                                    SlotResult {
+                                        slot_id: k.clone(),
+                                        outcome: SlotOutcomeKind::Activated,
+                                        generation: Some(g.generation.clone()),
+                                        compensated: false,
+                                        error: None,
+                                    },
+                                )
+                            })
+                            .collect(),
+                    ),
                     disposition: TerminalDisposition::Successful {
                         rollback: LedgerRollback { slots, bindings },
                     },

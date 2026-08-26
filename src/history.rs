@@ -515,10 +515,21 @@ mod tests {
     /// A SUCCESSFUL terminal for `deployment` carrying the given release in
     /// its rollback (one slot `p1`, deterministic payload derived from the
     /// deployment id so "exactly its stored state" is a meaningful equality).
+    /// The EXACT-EQUAL shape: one Activated outcome per slotted generation
+    /// (the four-set equality is enforced by the conversion).
     fn successful_terminal(dep: &str, release: &str) -> LedgerTerminal {
         LedgerTerminal {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
-            outcomes: SlotTable::new(),
+            outcomes: SlotTable::from_map(BTreeMap::from([(
+                SlotId::new("p1".to_string()),
+                SlotResult {
+                    slot_id: SlotId::new("p1".to_string()),
+                    outcome: crate::records::SlotOutcomeKind::Activated,
+                    generation: Some(GenerationId::new(format!("gen-{dep}"))),
+                    compensated: false,
+                    error: None,
+                },
+            )])),
             disposition: TerminalDisposition::Successful {
                 rollback: LedgerRollback {
                     slots: BTreeMap::from([(
@@ -1010,7 +1021,19 @@ mod tests {
                         &DeploymentId::new(id.clone()),
                         &LedgerTerminal {
                             recorded_at: "2026-01-01T00:00:00Z".to_string(),
-                            outcomes: SlotTable::new(),
+                            // The FailedRolledBack compensation report IS the
+                            // outcome table — it must EXACTLY cover the
+                            // membership (the status-specific outcome rule).
+                            outcomes: SlotTable::from_map(BTreeMap::from([(
+                                SlotId::new("p1".to_string()),
+                                SlotResult {
+                                    slot_id: SlotId::new("p1".to_string()),
+                                    outcome: crate::records::SlotOutcomeKind::Restored,
+                                    generation: Some(GenerationId::new("gen-1".to_string())),
+                                    compensated: true,
+                                    error: None,
+                                },
+                            )])),
                             disposition: TerminalDisposition::FailedRolledBack,
                             reason: None,
                         },
