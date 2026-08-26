@@ -30,7 +30,9 @@
 
 use crate::error::{Error, Result};
 use crate::remote::runner::{OpKind, RunError, SSH_CONNECT_TIMEOUT_SECS, SshRunner};
-use crate::remote::transport::{FsBytes, Remote, RemoteEntry, RemoteMeta};
+use crate::remote::transport::{
+    FsBytes, Remote, RemoteEntry, RemoteMeta, has_normal_component_below_root,
+};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -61,7 +63,12 @@ pub struct SshTransport {
 
 impl SshTransport {
     /// Build a transport for `user@address` (connecting on `port`), whose
-    /// application root is the absolute `deploy_dir` path on that host.
+    /// application root is the absolute `deploy_dir` path on that host — a
+    /// path with at least one normal component below the root (the
+    /// filesystem root itself is refused, mirroring the
+    /// [`crate::scalar::AbsoluteDeployDir`] parse rule: a transport rooted
+    /// at `/` would make the deployment cleanup operate on the system
+    /// root).
     ///
     /// Host identity must be configured with EXACTLY ONE source: pass a
     /// `known_hosts` file OR a `host_key_fingerprint`. If neither is provided
@@ -83,6 +90,11 @@ impl SshTransport {
         }
         if deploy_dir.is_relative() {
             return Err(Error::transport("ssh deploy_dir must be an absolute path"));
+        }
+        if !has_normal_component_below_root(deploy_dir) {
+            return Err(Error::transport(
+                "ssh deploy_dir must have at least one normal path component below the root (the filesystem root is not a valid deploy_dir)",
+            ));
         }
         // Defensive rejection of ambiguous or unusable identity states, even
         // when the config validation was bypassed (e.g. a direct caller):
@@ -729,6 +741,29 @@ mod tests {
 
     // Host identity must be EXACTLY ONE source: both set is ambiguous, neither
     // set is trust-on-first-use (disabled). Construction fails closed on both.
+    #[test]
+    fn new_rejects_root_deploy_dir() {
+        // The filesystem root is refused at construction (defense in depth,
+        // mirroring the AbsoluteDeployDir parse rule): a transport rooted
+        // at `/` would make the deployment cleanup operate on the system
+        // root.
+        let err = SshTransport::new(
+            "deploy",
+            "db.example.com",
+            2222,
+            Path::new("/"),
+            Some(Path::new("/dev/null")),
+            None,
+        )
+        .err()
+        .expect("the filesystem root must be refused as a deploy_dir");
+        assert!(
+            err.to_string()
+                .contains("at least one normal path component"),
+            "error must name the rule, got: {err}"
+        );
+    }
+
     #[test]
     fn new_rejects_both_identity_sources() {
         let err = SshTransport::new(

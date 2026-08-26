@@ -128,6 +128,16 @@ fn join(root: &Path, rel: &Path) -> PathBuf {
     }
 }
 
+/// True when `p` has at least one NORMAL path component below the root —
+/// i.e. `p` is not the filesystem root (nor a root-with-only-dots form that
+/// normalizes to it, like `//` or `/./`). A transport must never operate on
+/// `/`: deployment cleanup (rotation/retention deleting stale generations,
+/// the GC sweep) would otherwise run against system-level directories.
+pub(crate) fn has_normal_component_below_root(p: &Path) -> bool {
+    p.components()
+        .any(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
 fn meta_to_remote(m: &std::fs::Metadata) -> RemoteMeta {
     RemoteMeta {
         is_dir: m.is_dir(),
@@ -149,7 +159,19 @@ impl LocalTransport {
     /// no directories are created and nothing is touched on disk. Call
     /// [`Remote::provision_layout`] to create the deployment layout before the
     /// first mutation (the push engine does this behind its non-dry-run gate).
+    ///
+    /// The FILESYSTEM ROOT is refused (defense in depth, mirroring the
+    /// [`crate::scalar::AbsoluteDeployDir`] parse rule): a transport rooted at
+    /// `/` would make the deployment cleanup (rotation/retention deleting
+    /// stale generations, the GC sweep) operate on the system root, so the
+    /// base must have at least one normal path component below the root.
     pub fn new(base: PathBuf) -> Result<Self> {
+        if !has_normal_component_below_root(&base) {
+            return Err(Error::transport(format!(
+                "deploy_dir {:?} must have at least one normal path component below the root (the filesystem root is not a valid deploy_dir)",
+                base
+            )));
+        }
         Ok(LocalTransport { base })
     }
 }
@@ -532,6 +554,29 @@ mod tests {
         for i in 0..100 {
             let data = std::fs::read(markers.join(format!("m{i}.json"))).unwrap();
             assert_eq!(String::from_utf8_lossy(&data).as_ref(), PAYLOAD);
+        }
+    }
+
+    #[test]
+    fn new_refuses_root_deploy_dir() {
+        // The filesystem root (and any form that normalizes to it) is
+        // refused at construction: a transport rooted at `/` would make the
+        // deployment cleanup operate on the system root.
+        for bad in ["/", "//", "/./", "/../"] {
+            let err = LocalTransport::new(std::path::PathBuf::from(bad))
+                .err()
+                .unwrap_or_else(|| panic!("root deploy_dir {bad:?} must be refused"));
+            assert!(
+                err.to_string()
+                    .contains("at least one normal path component"),
+                "error must name the rule, got: {err}"
+            );
+        }
+        // A deploy_dir with at least one normal component below the root is
+        // accepted (construction stays side-effect-free).
+        for ok in ["/srv", "/srv/app/", "/srv//app"] {
+            LocalTransport::new(std::path::PathBuf::from(ok))
+                .expect("a deploy_dir with a normal component below the root is accepted");
         }
     }
 

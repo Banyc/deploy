@@ -3,7 +3,8 @@
 //! The domain model carries a set of small values whose validity is part of
 //! their meaning: an identifier must be a non-empty name, a behavior digest
 //! must be a sha256 digest, an on-server `deploy_dir` must be an absolute
-//! TRAVERSAL-FREE path, a batch size must be nonzero, a capacity percent
+//! TRAVERSAL-FREE path with at least one normal component below the root,
+//! a batch size must be nonzero, a capacity percent
 //! must fit 0..=100, and a recorded timestamp must parse as RFC 3339. The
 //! application name splits into a free-form DISPLAY name (messages and
 //! rendering) and a single-segment STORE KEY (the one filesystem component
@@ -245,19 +246,23 @@ impl FromStr for BehaviorDigest {
 }
 
 /// An ABSOLUTE on-server directory. Construction requires an absolute,
-/// TRAVERSAL-FREE path: a relative or empty path is rejected (the scheduler
-/// never deploys into a location relative to an unspecified working
-/// directory), and so is ANY path with a `.` or `..` component at any
-/// position (a traversal component could escape the intended namespace).
-/// The canonical form is NORMALIZED: rebuilt from the path components, so
-/// doubled separators and a trailing slash are folded away (the root `/` is
-/// the only path that keeps a trailing slash).
+/// TRAVERSAL-FREE path with AT LEAST ONE NORMAL COMPONENT below the root:
+/// a relative or empty path is rejected (the scheduler never deploys into a
+/// location relative to an unspecified working directory), so is ANY path
+/// with a `.` or `..` component at any position (a traversal component
+/// could escape the intended namespace), and so is the FILESYSTEM ROOT
+/// itself (`/`, or any form that normalizes to it — `//`, `/./`, `/../`) —
+/// a deploy_dir of `/` would make the deployment cleanup (rotation/
+/// retention deleting stale generations, the GC sweep) operate on the
+/// system root. The canonical form is NORMALIZED: rebuilt from the path
+/// components, so doubled separators and a trailing slash are folded away.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AbsoluteDeployDir(std::path::PathBuf);
 
 impl AbsoluteDeployDir {
-    /// Validate that `s` is an absolute, traversal-free path and construct
-    /// an [`AbsoluteDeployDir`] holding the normalized canonical form.
+    /// Validate that `s` is an absolute, traversal-free path with at least
+    /// one normal component below the root, and construct an
+    /// [`AbsoluteDeployDir`] holding the normalized canonical form.
     pub fn parse(s: &str) -> Result<AbsoluteDeployDir> {
         let path = Path::new(s);
         if !path.is_absolute() {
@@ -272,6 +277,7 @@ impl AbsoluteDeployDir {
         // normalized away). `Path::components()` skips `.` segments, so the
         // raw split is used to catch them.
         let mut canonical = std::path::PathBuf::from("/");
+        let mut normal_components = 0usize;
         for segment in s.split('/') {
             match segment {
                 "" => {}
@@ -281,8 +287,22 @@ impl AbsoluteDeployDir {
                         s
                     )));
                 }
-                _ => canonical.push(segment),
+                _ => {
+                    canonical.push(segment);
+                    normal_components += 1;
+                }
             }
+        }
+        // The FILESYSTEM ROOT is rejected: a deploy_dir of `/` (or any form
+        // that normalizes to it — `//`, `/./`, `/../`) would make the
+        // deployment cleanup (rotation/retention deleting stale generations,
+        // the GC sweep) operate on the system root. The deploy_dir must have
+        // at least one normal path component below the root.
+        if normal_components == 0 {
+            return Err(Error::config(format!(
+                "invalid deploy_dir {:?}: the deploy_dir must have at least one normal path component below the root",
+                s
+            )));
         }
         Ok(AbsoluteDeployDir(canonical))
     }
@@ -433,6 +453,7 @@ impl FromStr for Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::transport::LocalTransport;
     use crate::store::local::{LocalStore, default_base};
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -553,19 +574,21 @@ mod tests {
 
     #[test]
     fn absolute_deploy_dir_requires_absolute_traversal_free_path() {
-        for ok in ["/srv/p1", "/", "/srv/deploy/app"] {
+        for ok in ["/srv/p1", "/srv", "/srv/deploy/app"] {
             let d = AbsoluteDeployDir::parse(ok).expect("absolute path parses");
             assert!(d.as_path().is_absolute());
             assert_eq!(d.as_path(), std::path::Path::new(ok));
         }
-        // A trailing slash is harmless but normalized away (the root keeps
-        // its slash); the canonical form is a parse fixed point.
+        // A trailing slash is harmless but normalized away; the canonical
+        // form is a parse fixed point.
         let d = AbsoluteDeployDir::parse("/srv/").expect("trailing slash normalizes");
         assert_eq!(d.as_path(), std::path::Path::new("/srv"));
         assert_eq!(
             AbsoluteDeployDir::parse("/srv").expect("canonical re-parses"),
             d
         );
+        let d = AbsoluteDeployDir::parse("/srv/app/").expect("trailing slash normalizes");
+        assert_eq!(d.as_path(), std::path::Path::new("/srv/app"));
         for bad in [
             "",
             "srv/p1",
@@ -578,8 +601,17 @@ mod tests {
             "/etc/..",
             "/./x",
             "/srv/..",
+            // The filesystem root (and any form that normalizes to it) is
+            // rejected: a deploy_dir must have at least one normal
+            // component below the root, so deployment cleanup can never
+            // operate on `/`.
+            "/",
+            "//",
+            "/./",
+            "/../",
         ] {
-            AbsoluteDeployDir::parse(bad).expect_err("traversal or relative deploy_dir rejected");
+            AbsoluteDeployDir::parse(bad)
+                .expect_err("traversal, relative, or root deploy_dir rejected");
         }
     }
 
@@ -809,11 +841,15 @@ mod tests {
 
     /// The independent characterization of the deploy_dir rule: an absolute
     /// path whose every non-empty `/`-separated segment is a normal name
-    /// (no `.`/`..` component at any position).
-    fn is_traversal_free_absolute(s: &str) -> bool {
+    /// (no `.`/`..` component at any position) AND that has at least one
+    /// normal component below the root (the filesystem root itself is not a
+    /// valid deploy_dir — deployment cleanup must never operate on `/`).
+    fn is_valid_deploy_dir(s: &str) -> bool {
         Path::new(s).is_absolute()
             && s.split('/')
                 .all(|seg| seg.is_empty() || (seg != "." && seg != ".."))
+            && s.split('/')
+                .any(|seg| !seg.is_empty() && seg != "." && seg != "..")
     }
 
     /// Arbitrary path values covering every traversal class: absolute with
@@ -824,6 +860,9 @@ mod tests {
             prop::sample::select(vec![
                 "/srv/p1".to_string(),
                 "/".to_string(),
+                "//".to_string(),
+                "/./".to_string(),
+                "/../".to_string(),
                 "/srv/".to_string(),
                 "//srv//deploy//".to_string(),
                 "/srv/../etc".to_string(),
@@ -846,12 +885,15 @@ mod tests {
 
     proptest! {
         // THE PROPERTY: AbsoluteDeployDir accepts EXACTLY the
-        // traversal-free absolute paths — every `.`/`..` component at any
-        // position and every relative/empty path is rejected, and the
-        // accepted canonical form is normalized (no trailing slash except
-        // the root, no doubled separators) and a parse fixed point.
-        // Bounded 16 cases, fixed seed 0x5EED_5EED (house style), no
-        // failure persistence — the identical vectors on every run.
+        // traversal-free absolute paths with at least one normal component
+        // below the root — every `.`/`..` component at any position, every
+        // relative/empty path, and the filesystem root itself (including
+        // forms that normalize to it) are rejected, and the accepted
+        // canonical form is normalized (no trailing slash, no doubled
+        // separators) and a parse fixed point. The transport construction
+        // refuses the root too (defense in depth). Bounded 16 cases, fixed
+        // seed 0x5EED_5EED (house style), no failure persistence — the
+        // identical vectors on every run.
         #![proptest_config(ProptestConfig {
             cases: 16,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
@@ -863,16 +905,16 @@ mod tests {
         fn absolute_deploy_dir_accepts_exactly_traversal_free_absolute_paths(
             s in arbitrary_path_text(),
         ) {
-            let expected = is_traversal_free_absolute(&s);
+            let expected = is_valid_deploy_dir(&s);
             assert_eq!(
                 AbsoluteDeployDir::parse(&s).is_ok(),
                 expected,
-                "AbsoluteDeployDir must accept exactly traversal-free absolute paths: {s:?}"
+                "AbsoluteDeployDir must accept exactly traversal-free absolute paths with ≥1 normal component below the root: {s:?}"
             );
             if let Ok(dir) = AbsoluteDeployDir::parse(&s) {
                 let canonical = dir.as_path().to_string_lossy();
                 assert!(
-                    canonical == "/" || !canonical.ends_with('/'),
+                    !canonical.ends_with('/'),
                     "canonical form must not carry a trailing slash: {canonical:?}"
                 );
                 assert_eq!(
@@ -881,6 +923,19 @@ mod tests {
                     "the canonical form must be a parse fixed point: {canonical:?}"
                 );
             }
+            // Defense in depth: the transport construction refuses the root
+            // too — a transport whose root has no normal component below
+            // the root (the filesystem root) can never be built, so
+            // deployment cleanup can never operate on `/` even if the
+            // scalar check were bypassed.
+            let root_only = !Path::new(&s)
+                .components()
+                .any(|c| matches!(c, std::path::Component::Normal(_)));
+            assert_eq!(
+                LocalTransport::new(std::path::PathBuf::from(&s)).is_ok(),
+                !root_only,
+                "LocalTransport must refuse a root deploy_dir: {s:?}"
+            );
         }
     }
 }
