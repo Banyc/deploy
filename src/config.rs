@@ -52,6 +52,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
+use std::str::FromStr;
 use unicode_normalization::UnicodeNormalization;
 
 /// Reject any path that is absolute or contains a parent/root/prefix component,
@@ -335,6 +336,117 @@ impl<'de> Deserialize<'de> for ReleaseName {
     }
 }
 
+/// A target's batch-failure policy: what happens to the servers whose batches
+/// already ADVANCED when a LATER batch fails. STRICT typed enum replacing the
+/// old loose `String` field: an unknown `failure_policy` spelling used to
+/// silently behave as "leave changed" (fail-open — an operator typo kept the
+/// changed servers in their new state instead of rolling back). The raw
+/// string is consumed by the STRICT parse below during the merged raw ->
+/// domain conversion (the config layers are merged, so the typed parse runs
+/// when the manifest is deserialized), and ANY unsupported spelling is
+/// rejected with a config error naming the valid options. The default stays
+/// [`FailurePolicy::RollbackChanged`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FailurePolicy {
+    /// `failure_policy = "rollback_changed"`: when a later batch fails, every
+    /// server whose batch already advanced is COMPENSATED back to its
+    /// pre-push generation (compare-and-swap). The attempt ends
+    /// `failed_rolled_back` when every advanced server is compensated, else
+    /// `degraded`. The default.
+    #[default]
+    RollbackChanged,
+    /// `failure_policy = "leave_changed"`: a later batch failing RETAINS the
+    /// already-advanced servers deliberately — no compensation pass runs and
+    /// the attempt ends `degraded` with the mixed per-server state retained.
+    LeaveChanged,
+}
+
+impl FailurePolicy {
+    /// The exact supported config spellings, in documentation order (also the
+    /// error message's "valid options" list).
+    pub const SPELLINGS: [&'static str; 2] = ["rollback_changed", "leave_changed"];
+
+    /// The canonical config spelling of this policy.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FailurePolicy::RollbackChanged => "rollback_changed",
+            FailurePolicy::LeaveChanged => "leave_changed",
+        }
+    }
+}
+
+impl fmt::Display for FailurePolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for FailurePolicy {
+    type Err = Error;
+
+    /// STRICT EXACT parse — the conversion's ONLY entry from the raw
+    /// `failure_policy` string. The two supported spellings
+    /// ([`FailurePolicy::SPELLINGS`], matching the existing docs) parse;
+    /// EVERYTHING else — case variants, whitespace, dashes, typos, the empty
+    /// string — is REJECTED with a config error naming the valid options, so
+    /// an unsupported spelling can never silently mean "leave changed".
+    fn from_str(s: &str) -> Result<FailurePolicy> {
+        match s {
+            "rollback_changed" => Ok(FailurePolicy::RollbackChanged),
+            "leave_changed" => Ok(FailurePolicy::LeaveChanged),
+            other => Err(Error::config(format!(
+                "unsupported failure_policy '{other}' (valid: {})",
+                FailurePolicy::SPELLINGS.join(", ")
+            ))),
+        }
+    }
+}
+
+impl Serialize for FailurePolicy {
+    /// The canonical spelling is the serialized form (`failure_policy =
+    /// "rollback_changed"`), so a scaffolded/round-tripped config carries
+    /// exactly what the strict parse accepts.
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for FailurePolicy {
+    /// Deserialization IS the raw -> domain parse (the layers are merged: a
+    /// `RolloutConfig` is both the raw serde shape and the domain record, so
+    /// the string is consumed exactly here). Delegates to the strict
+    /// [`FailurePolicy::from_str`] so unsupported spellings fail closed with
+    /// the same config error naming the valid options.
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct FailurePolicyVisitor;
+        impl<'d> serde::de::Visitor<'d> for FailurePolicyVisitor {
+            type Value = FailurePolicy;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(
+                    f,
+                    "a failure_policy string (valid: {})",
+                    FailurePolicy::SPELLINGS.join(", ")
+                )
+            }
+
+            fn visit_str<E>(self, v: &str) -> std::result::Result<FailurePolicy, E>
+            where
+                E: serde::de::Error,
+            {
+                v.parse::<FailurePolicy>().map_err(E::custom)
+            }
+        }
+        deserializer.deserialize_str(FailurePolicyVisitor)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RolloutConfig {
@@ -342,15 +454,19 @@ pub struct RolloutConfig {
     pub batch_size: u32,
     #[serde(default = "default_true")]
     pub stop_on_failure: bool,
+    /// The batch-failure policy as the TYPED [`FailurePolicy`] enum (never a
+    /// loose string): the raw `failure_policy` spelling is parsed strictly
+    /// during deserialization, so an unsupported spelling fails the config
+    /// load instead of silently behaving as "leave changed".
     #[serde(default = "default_failure_policy")]
-    pub failure_policy: String,
+    pub failure_policy: FailurePolicy,
 }
 
 fn default_batch_size() -> u32 {
     1
 }
-fn default_failure_policy() -> String {
-    "rollback_changed".to_string()
+fn default_failure_policy() -> FailurePolicy {
+    FailurePolicy::RollbackChanged
 }
 fn default_ssh_port() -> u16 {
     22
@@ -3431,7 +3547,7 @@ interval_seconds = 0
     }
 
     fn arbitrary_target() -> impl Strategy<Value = TargetDef> {
-        (any::<u32>(), any::<bool>(), arbitrary_identifier()).prop_map(
+        (any::<u32>(), any::<bool>(), arbitrary_failure_policy()).prop_map(
             |(batch_size, stop_on_failure, failure_policy)| TargetDef {
                 rollout: RolloutConfig {
                     batch_size,
@@ -3440,6 +3556,19 @@ interval_seconds = 0
                 },
             },
         )
+    }
+
+    /// Both supported policies: the failure-policy dimension of the arbitrary
+    /// project. The STRICTNESS itself (an unsupported spelling is rejected)
+    /// is pinned by the parse-table unit test and the arbitrary-strings
+    /// property below — an arbitrary project cannot carry a policy outside
+    /// the closed enum, so the conversion's failure-policy gate can only
+    /// reject at parse time, never by constructing an invalid domain.
+    fn arbitrary_failure_policy() -> impl Strategy<Value = FailurePolicy> {
+        prop_oneof![
+            Just(FailurePolicy::RollbackChanged),
+            Just(FailurePolicy::LeaveChanged),
+        ]
     }
 
     /// A fully arbitrary raw project: wrong schema versions, arbitrary ids
@@ -3576,6 +3705,15 @@ interval_seconds = 0
                     "one slot per server per target"
                 );
             }
+            // The failure policy is a closed typed enum by construction: the
+            // raw string was consumed by the strict parse during the raw ->
+            // domain conversion, so every domain target carries EXACTLY one
+            // supported policy — an unsupported spelling can never enter a
+            // domain (it fails the conversion instead).
+            match cfg.targets[tname].rollout.failure_policy {
+                FailurePolicy::RollbackChanged => {}
+                FailurePolicy::LeaveChanged => {}
+            }
         }
     }
 
@@ -3599,6 +3737,174 @@ interval_seconds = 0
                 assert_domain_invariants(&cfg);
             }
             // fail-closed: rejection is a valid outcome for arbitrary input
+        }
+    }
+
+    // =====================================================================
+    // failure_policy: the strict FailurePolicy enum
+    // =====================================================================
+    //
+    // THE BUG this pins: an unknown `failure_policy` spelling used to parse
+    // into a loose String and silently behave as "leave changed" (fail-open:
+    // an operator typo kept changed servers in their new state instead of
+    // rolling back). The policy is now a typed enum whose parse is STRICT
+    // EXACT — the parse-table test below pins every supported spelling, the
+    // load-level test pins the fail-closed rejection through the real
+    // `Config::load` path, and the arbitrary-strings property pins the
+    // accept-only-the-supported-spellings contract over the whole space.
+
+    /// The STRICT parse table: the exact supported spellings
+    /// (`rollback_changed`, `leave_changed`) parse to their variants; every
+    /// OTHER spelling — case variants, whitespace, dashes, typos, the empty
+    /// string — is rejected with a config error naming the valid options.
+    #[test]
+    fn failure_policy_parse_table_is_strict_exact() {
+        // The two supported spellings (matching the existing docs).
+        assert_eq!(
+            "rollback_changed".parse::<FailurePolicy>().unwrap(),
+            FailurePolicy::RollbackChanged
+        );
+        assert_eq!(
+            "leave_changed".parse::<FailurePolicy>().unwrap(),
+            FailurePolicy::LeaveChanged
+        );
+        // The canonical spellings round-trip through Display/as_str.
+        assert_eq!(FailurePolicy::RollbackChanged.as_str(), "rollback_changed");
+        assert_eq!(FailurePolicy::LeaveChanged.as_str(), "leave_changed");
+        assert_eq!(
+            FailurePolicy::RollbackChanged.to_string(),
+            "rollback_changed"
+        );
+
+        // Everything else is REJECTED — exact match, no normalization, no
+        // case folding, no whitespace trimming, no aliases.
+        for bad in [
+            "",
+            "rollback",
+            "leave",
+            "leave-changed",
+            "rollback-changed",
+            "ROLLBACK_CHANGED",
+            "RollbackChanged",
+            "Rollback_Changed",
+            " rollback_changed",
+            "rollback_changed ",
+            "rollbackchanged",
+            "frobnicate",
+            "none",
+            "roll back changed",
+            "rollback_changed\n",
+        ] {
+            let err = bad
+                .parse::<FailurePolicy>()
+                .expect_err("unsupported spelling must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("failure_policy") && msg.contains(&format!("'{bad}'")),
+                "error must name the rejected spelling, got: {msg}"
+            );
+            assert!(
+                msg.contains("rollback_changed") && msg.contains("leave_changed"),
+                "error must name the valid options, got: {msg}"
+            );
+        }
+    }
+
+    /// THE BUG end-to-end: an unknown `failure_policy` spelling in a real
+    /// `deploy.toml` is rejected at `Config::load` (the merged raw -> domain
+    /// conversion) with a config error naming the valid options — it can
+    /// NEVER silently behave as "leave changed".
+    #[test]
+    fn unknown_failure_policy_spelling_is_rejected_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        let p = project.join("deploy.toml");
+        // Every valid spelling loads; every unsupported spelling fails the
+        // whole load with the strict parse error.
+        for ok in ["rollback_changed", "leave_changed"] {
+            std::fs::write(&p, deploy_toml("v1").replace("rollback_changed", ok)).unwrap();
+            Config::load(&p).expect("supported spelling loads");
+        }
+        for bad in ["rollback", "leave", "RollbackChanged", "ROLLBACK"] {
+            std::fs::write(&p, deploy_toml("v1").replace("rollback_changed", bad)).unwrap();
+            let err = Config::load(&p).expect_err("unsupported spelling must fail the load");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("failure_policy") && msg.contains(bad),
+                "error must name the rejected spelling, got: {msg}"
+            );
+            assert!(
+                msg.contains("rollback_changed") && msg.contains("leave_changed"),
+                "error must name the valid options, got: {msg}"
+            );
+        }
+    }
+
+    /// The default stays `RollbackChanged` — an omitted `failure_policy` is
+    /// the safe fail-closed default, never "leave changed".
+    #[test]
+    fn failure_policy_defaults_to_rollback_changed() {
+        assert_eq!(
+            RolloutConfig::default().failure_policy,
+            FailurePolicy::RollbackChanged
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        let p = project.join("deploy.toml");
+        // Drop the failure_policy key entirely (defaults to rollback_changed).
+        let minimal_rollout =
+            deploy_toml("v1").replace(", failure_policy = \"rollback_changed\" }", " }");
+        std::fs::write(&p, minimal_rollout).unwrap();
+        let cfg = Config::load(&p).expect("omitted failure_policy defaults");
+        assert_eq!(
+            cfg.targets["t1"].rollout.failure_policy,
+            FailurePolicy::RollbackChanged
+        );
+    }
+
+    proptest! {
+        // THE STRICT-PARSE PROPERTY: over ARBITRARY strings the failure
+        // policy parses iff the string is EXACTLY one of the two supported
+        // spellings, and every rejection carries a config error naming the
+        // valid options. Bounded 16 cases, fixed seed 0x5EED_5EED (house
+        // style), no persistence — the identical vectors on every run. This
+        // is the property half of the user's requirement: parsing must be
+        // success-only-for-supported-spellings, never an implicit fallback.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn failure_policy_arbitrary_strings_parse_only_supported_spellings(s in any::<String>()) {
+            let parsed = FailurePolicy::from_str(&s);
+            match parsed {
+                Ok(policy) => {
+                    assert!(
+                        s == "rollback_changed" || s == "leave_changed",
+                        "a non-supported string must not parse: {s:?} -> {policy:?}"
+                    );
+                    // The parse round-trips to the exact spelling.
+                    assert_eq!(policy.as_str(), s);
+                }
+                Err(e) => {
+                    assert!(
+                        s != "rollback_changed" && s != "leave_changed",
+                        "the supported spellings must always parse: {s:?}"
+                    );
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("rollback_changed") && msg.contains("leave_changed"),
+                        "the rejection must name the valid options, got: {msg}"
+                    );
+                }
+            }
         }
     }
 }

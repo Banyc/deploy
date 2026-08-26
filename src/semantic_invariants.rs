@@ -70,18 +70,20 @@
 //! | Integrity: stored records carry only their own schema version | `integrity_stored_release_schema_version_tamper_fails_closed` |
 //! | Bounds: `need + reserve > available` wraps | `bounds_capacity_matches_u128_reference_over_grid` |
 
-use crate::config::{Config, SlotDef};
+use crate::config::{Config, FailurePolicy, SlotDef};
 use crate::error::Result;
 use crate::history;
 use crate::layout;
 use crate::model::{
-    ArtifactRef, DeploymentId, OperationId, PlacementSlotId, ReleaseId, TreeDigest, VariantName,
+    ArtifactRef, DeploymentId, GenerationId, OperationId, PlacementSlotId, ReleaseId, TreeDigest,
+    VariantName,
 };
 use crate::push::capacity::capacity_fits;
 use crate::push::checkpoint::{CheckpointReport, run_checkpoint_unlocked};
 use crate::push::engine::{PushOptions, PushReport, push, push_with_id};
 use crate::records::DeploymentStatus;
 use crate::records::LedgerEntry;
+use crate::records::ServerOutcomeKind;
 use crate::release::{
     canonicalize_slots, release_digest, variant_slots_digest, verify_release_identity,
 };
@@ -226,6 +228,21 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 "#;
 
+/// [`DEPLOY_TOML`] with `t1`'s rollout carrying `policy`: the
+/// failure-policy tests drive BOTH supported policies through the SAME
+/// multi-server fixture (`t1` owns `p1`/`p2`). The replacement targets the
+/// `[targets.t1]` heading line only — `t2` and `debtfx` keep the default
+/// `rollback_changed`.
+fn deploy_toml_with_failure_policy(policy: FailurePolicy) -> String {
+    DEPLOY_TOML.replacen(
+        "[targets.t1]\nrollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }",
+        &format!(
+            "[targets.t1]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"{policy}\" }}"
+        ),
+        1,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Fault injection
 // ---------------------------------------------------------------------------
@@ -289,6 +306,17 @@ struct RemoteFault {
     /// aborts with `Ok(Failed)` before the swap: nothing advanced, and under
     /// `stop_on_failure` the remaining slots are SKIPPED.
     fail_current_read_after_lock: bool,
+    /// PER-SERVER PRE-SWAP STATUS-READ FAULT: the same gate as above, but
+    /// fired only on the transport of ONE NAMED server directory (`s1` /
+    /// `s2` / `s3` — each [`FailOnceRemote`] wraps exactly one server
+    /// directory and knows its own base name). This is how the failure
+    /// POLICY tests fail a SPECIFIC BATCH POSITION of a multi-server push:
+    /// the batch order of a `t1` push is `p1` (server `s1`), then `p2`
+    /// (server `s2`), so arming `s1` fails batch 0, arming `s2` fails batch
+    /// 1 — while every other server's pre-swap reads pass untouched. The arm
+    /// is consumed by the matching server's first post-lock `current`-link
+    /// read; a non-matching server leaves it armed.
+    fail_current_read_on_server: Option<String>,
     /// Whether the push has written (or found) the mutation lock on ANY
     /// server this push touches: the pre-swap status-read arm fires only
     /// after a lock write, so the planning/reconcile status reads (before any
@@ -332,11 +360,33 @@ impl FailOnceRemote {
     /// (which verify generations BEFORE acquiring any lock) pass.
     fn should_fail_status_read(&self, rel: &Path) -> bool {
         let mut f = self.fault.lock().unwrap();
+        // The per-server arm fires only on the transport of the NAMED server
+        // (the batch-position failures): that server's first post-lock
+        // `current`-link read fails exactly once; any other server's reads
+        // pass and leave the arm armed.
+        if f.fail_current_read_on_server.as_deref() == Some(self.server_name().as_str())
+            && f.lock_written
+            && rel == layout::current()
+        {
+            f.fail_current_read_on_server = None;
+            return true;
+        }
         if f.fail_current_read_after_lock && f.lock_written && rel == layout::current() {
             f.fail_current_read_after_lock = false;
             return true;
         }
         false
+    }
+
+    /// The name of the server directory this transport wraps (each
+    /// [`FailOnceRemote`] wraps exactly one server's remote directory, so
+    /// the base name is the server id used by the per-server pre-swap arm).
+    fn server_name(&self) -> String {
+        self.inner
+            .root()
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 }
 
@@ -853,6 +903,14 @@ pub(crate) struct Fixture {
 
 impl Fixture {
     fn new() -> Fixture {
+        Fixture::with_failure_policy(FailurePolicy::RollbackChanged)
+    }
+
+    /// The fixture with `t1`'s rollout carrying `policy` — the
+    /// failure-policy tests drive BOTH supported policies through the SAME
+    /// multi-server fixture (`t1` owns `p1`/`p2`, each its own batch); every
+    /// other target keeps the default `rollback_changed`.
+    fn with_failure_policy(policy: FailurePolicy) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
@@ -866,7 +924,7 @@ impl Fixture {
         // canary declares no slots; identical mappings -> same tree bytes.
         std::fs::write(release_dir.join("canary.toml"), VARIANT_BODY).unwrap();
         let cfg_path = project.join("deploy.toml");
-        std::fs::write(&cfg_path, DEPLOY_TOML).unwrap();
+        std::fs::write(&cfg_path, deploy_toml_with_failure_policy(policy)).unwrap();
         let artifacts_dir = release_dir.join("artifacts");
         let common_dir = artifacts_dir.join("deployment/common");
         std::fs::create_dir_all(&common_dir).unwrap();
@@ -1147,6 +1205,7 @@ impl Fixture {
         let mut f = self.fault.lock().unwrap();
         f.fail_write_once = None;
         f.fail_current_read_after_lock = false;
+        f.fail_current_read_on_server = None;
         f.lock_written = false;
         self.store.fault_registry().clear();
     }
@@ -1535,6 +1594,33 @@ impl Fixture {
         // A fresh push: no lock write has been seen yet, so the planning /
         // reconcile status reads (before any mutation-lock write) pass.
         f.lock_written = false;
+    }
+
+    /// Arm the PRE-SWAP status-read fault for ONE named server: that
+    /// server's first post-lock `current`-link read fails exactly once while
+    /// every other server's pre-swap reads pass — the per-server half the
+    /// failure-position tests use to fail a SPECIFIC batch of a multi-server
+    /// push.
+    fn set_remote_read_fault_on_server(&self, server: &str) {
+        let mut f = self.fault.lock().unwrap();
+        f.fail_current_read_on_server = Some(server.to_string());
+        // A fresh push: no lock write has been seen yet, so the planning /
+        // reconcile status reads (before any mutation-lock write) pass.
+        f.lock_written = false;
+    }
+
+    /// Arm the pre-swap status-read fault for the server holding batch
+    /// `position` of a `t1` push: the batch order is `p1` (server `s1`),
+    /// then `p2` (server `s2`) — so position 0 names `s1` and position 1
+    /// names `s2`. Earlier batches (already advanced when the faulted batch
+    /// fails) then exercise the configured failure policy.
+    fn set_remote_read_fault_at_position(&self, position: usize) {
+        let server = match position {
+            0 => "s1",
+            1 => "s2",
+            other => panic!("fixture t1 has two batch positions, got {other}"),
+        };
+        self.set_remote_read_fault_on_server(server);
     }
 
     /// The ONE owning target of a fixture slot: a slot has exactly one
@@ -2975,6 +3061,244 @@ fn observed_scope_pre_swap_failure_keeps_prior_record_untouched() {
     // + artifact + the live assignment's OWN minting deployment).
     f.assert_observed_scope_property();
     f.check_invariants();
+}
+
+// ===========================================================================
+// failure_policy: rollback / leave postconditions over batch positions
+// ===========================================================================
+//
+// The strict [`FailurePolicy`] enum's runtime contract, driven through the
+// state-machine fixture: a multi-server `t1` push (batch 0 = `p1` on `s1`,
+// batch 1 = `p2` on `s2`, `batch_size = 1`) fails a SPECIFIC batch position
+// pre-swap (per-server fault, [`Fixture::set_remote_read_fault_at_position`])
+// AFTER a baseline push established a generation on every slot, and the
+// RESPECTIVE POSTCONDITIONS are asserted:
+//
+// * [`FailurePolicy::RollbackChanged`] — a failure at batch k leaves batches
+//   0..k-1 ROLLED BACK to their pre-push generation (the ledger records the
+//   restoration and the attempt ends `FailedRolledBack`) and batch k FAILED
+//   (pre-swap: it stays at its pre-push generation); later batches are
+//   skipped.
+// * [`FailurePolicy::LeaveChanged`] — a failure at batch k leaves batches
+//   0..k-1 at the NEW state (no compensation pass runs, the attempt ends
+//   `Degraded`) and batch k FAILED; later batches are skipped.
+//
+// The same helper drives the deterministic per-policy tests below and the
+// bounded 16-case property (both supported policies x every batch position,
+// fixed seed 0x5EED_5EED).
+
+/// Drive one failure-position case: baseline push (tree v1) on both `t1`
+/// slots, then a real push (tree v2) whose batch `position` fails pre-swap,
+/// then assert the policy's postconditions on the live remote generations,
+/// the ledger terminal record, and the observed projections.
+fn run_failure_position_case(policy: FailurePolicy, position: usize) {
+    let f = Fixture::with_failure_policy(policy);
+    // A `t1` push's batch order: `p1` (server `s1`) is batch 0, `p2`
+    // (server `s2`) is batch 1 (the fixture's `batch_size = 1` makes each
+    // slot its own batch).
+    let slots = ["p1", "p2"];
+
+    // Baseline: tree v1 lands on BOTH slots (a real push).
+    f.write_artifacts(1);
+    let r = f.push("t1").expect("the baseline push succeeds");
+    assert_eq!(r.status, Some(DeploymentStatus::Successful));
+    let baseline: BTreeMap<String, GenerationId> = f
+        .current_assignments()
+        .into_iter()
+        .map(|(sid, asn)| (sid.as_str().to_string(), asn.generation_id))
+        .collect();
+    assert_eq!(baseline.len(), 2, "t1 plans both fixture slots");
+
+    // The second push is a REAL push (tree v2) whose batch `position` fails
+    // PRE-SWAP on its server: batches before it have already advanced, so
+    // the configured failure policy decides their fate.
+    f.write_artifacts(2);
+    f.set_remote_read_fault_at_position(position);
+    let id = DeploymentId::new(format!("si-fp-{position}"));
+    let report = f
+        .push_with_id("t1", &id)
+        .expect("the faulted push still returns a report");
+    let status = report
+        .status
+        .expect("a faulted push records a terminal status");
+
+    // The live remote generation of every slot after the faulted push.
+    let after: BTreeMap<String, GenerationId> = f
+        .current_assignments()
+        .into_iter()
+        .map(|(sid, asn)| (sid.as_str().to_string(), asn.generation_id))
+        .collect();
+
+    // The terminal entry's per-slot outcomes: the ledger shows exactly what
+    // the mutation loop (and the failure-policy pass) recorded.
+    let terminal = f
+        .store
+        .read_ledger("t1")
+        .unwrap()
+        .into_iter()
+        .find(|e| e.deployment_id.as_str() == id.as_str())
+        .and_then(|e| e.terminal)
+        .expect("the faulted attempt has a terminal entry");
+
+    // The observed projections are rebuilt from the LIVE assignments, so
+    // they mirror the generations asserted below.
+    let observed = f.store.read_observed("t1", &f.config).unwrap();
+
+    // The terminal status per policy.
+    match policy {
+        FailurePolicy::RollbackChanged => assert_eq!(
+            status,
+            DeploymentStatus::FailedRolledBack,
+            "rollback_changed: every advanced server was compensated"
+        ),
+        FailurePolicy::LeaveChanged => assert_eq!(
+            status,
+            DeploymentStatus::Degraded,
+            "leave_changed: a failing batch always ends Degraded"
+        ),
+    }
+    assert_eq!(
+        terminal.status, status,
+        "the ledger records the same status"
+    );
+
+    for (i, sid) in slots.iter().copied().enumerate() {
+        let live = after
+            .get(sid)
+            .unwrap_or_else(|| panic!("slot {sid} keeps a live assignment"));
+        // The observed projection mirrors the live remote generation.
+        let observed_gen = observed
+            .slots
+            .get(&PlacementSlotId::new(sid.to_string()))
+            .and_then(|o| o.generation.clone());
+        assert_eq!(
+            observed_gen.as_ref(),
+            Some(live),
+            "slot {sid}: the observed record mirrors the live generation"
+        );
+        // The ledger outcome for this slot.
+        let out = terminal
+            .outcomes
+            .get(&PlacementSlotId::new(sid.to_string()))
+            .unwrap_or_else(|| panic!("slot {sid} must appear in the terminal outcomes"));
+
+        match (policy, i.cmp(&position)) {
+            // Batches BEFORE the failed batch.
+            (FailurePolicy::RollbackChanged, std::cmp::Ordering::Less) => {
+                // POSTCONDITION: rolled back to the pre-push generation.
+                assert_eq!(live, &baseline[sid], "slot {sid} must be compensated back");
+                assert_eq!(
+                    out.outcome,
+                    ServerOutcomeKind::Restored,
+                    "slot {sid}: compensation upgrades the outcome to Restored"
+                );
+                assert!(
+                    out.compensated,
+                    "slot {sid}: the ledger marks the restoration"
+                );
+            }
+            (FailurePolicy::LeaveChanged, std::cmp::Ordering::Less) => {
+                // POSTCONDITION: stays at the NEW generation.
+                assert_ne!(
+                    live, &baseline[sid],
+                    "slot {sid}: leave_changed retains the advance (tree v2)"
+                );
+                assert_eq!(
+                    out.outcome,
+                    ServerOutcomeKind::Activated,
+                    "slot {sid}: the advance is retained"
+                );
+                assert!(!out.compensated, "slot {sid}: no compensation pass ran");
+            }
+            // The failed batch k itself.
+            (_, std::cmp::Ordering::Equal) => {
+                // POSTCONDITION (both policies): batch k FAILED pre-swap — it
+                // never advanced, so it stays at its pre-push generation.
+                assert_eq!(
+                    live, &baseline[sid],
+                    "slot {sid}: the failed batch never advanced"
+                );
+                assert_eq!(
+                    out.outcome,
+                    ServerOutcomeKind::Failed,
+                    "slot {sid}: batch {position} is recorded failed"
+                );
+                assert!(
+                    !out.compensated,
+                    "slot {sid}: a pre-swap failure is not compensated"
+                );
+            }
+            // Batches after the failed batch: skipped under stop_on_failure.
+            (_, std::cmp::Ordering::Greater) => {
+                assert_eq!(live, &baseline[sid], "slot {sid}: skipped, untouched");
+                assert_eq!(
+                    out.outcome,
+                    ServerOutcomeKind::Skipped,
+                    "slot {sid}: the later batch is skipped"
+                );
+                assert!(
+                    !out.compensated,
+                    "slot {sid}: skipped slots are not compensated"
+                );
+            }
+        }
+    }
+}
+
+/// The `rollback_changed` postcondition (deterministic): a failure at batch
+/// 1 compensates batch 0 back to its pre-push state (`FailedRolledBack`),
+/// and a failure at batch 0 (nothing advanced) still ends `FailedRolledBack`
+/// with the later batch skipped.
+#[test]
+fn failure_policy_rollback_changed_rolls_back_earlier_batches() {
+    run_failure_position_case(FailurePolicy::RollbackChanged, 1);
+    run_failure_position_case(FailurePolicy::RollbackChanged, 0);
+}
+
+/// The `leave_changed` postcondition (deterministic): earlier batches stay
+/// at the NEW state after a later batch fails (`Degraded`, no compensation
+/// pass); a failure at batch 0 (nothing earlier) also ends `Degraded`.
+#[test]
+fn failure_policy_leave_changed_retains_earlier_batches() {
+    run_failure_position_case(FailurePolicy::LeaveChanged, 1);
+    run_failure_position_case(FailurePolicy::LeaveChanged, 0);
+}
+
+/// Both supported policies — the `policy` dimension of the failure-position
+/// property (the strict parse already proved these are the ONLY policies
+/// that can exist in a domain config; the property exercises each one's
+/// postconditions over every batch position).
+fn failure_policy_strategy() -> impl Strategy<Value = FailurePolicy> {
+    prop_oneof![
+        Just(FailurePolicy::RollbackChanged),
+        Just(FailurePolicy::LeaveChanged),
+    ]
+}
+
+proptest! {
+    // THE FAILURE-POSITION POSTCONDITION PROPERTY: for every supported
+    // policy and every batch position of the multi-server fixture push, a
+    // fault at that position must leave exactly the policy's postcondition —
+    // `RollbackChanged` rolls earlier batches back to their pre-push state
+    // (ledger shows the restoration, attempt `FailedRolledBack`),
+    // `LeaveChanged` keeps them at the new state (`Degraded`). Bounded 16
+    // cases, fixed seed 0x5EED_5EED (house style), no persistence — the
+    // identical vectors on every run; each case drives its OWN fixture
+    // (per-fixture fault registry, structurally isolated).
+    #![proptest_config(ProptestConfig {
+        cases: 16,
+        rng_seed: RngSeed::Fixed(0x5EED_5EED),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn failure_policy_position_postconditions_fixed_seed(
+        policy in failure_policy_strategy(),
+        position in 0..2usize,
+    ) {
+        run_failure_position_case(policy, position);
+    }
 }
 
 // ===========================================================================

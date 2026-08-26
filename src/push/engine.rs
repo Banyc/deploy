@@ -8,7 +8,7 @@
 //! per-server rotation.
 
 use crate::adapter::verify::run_verification;
-use crate::config::{Config, Mapping, RotationConfig, SlotDef};
+use crate::config::{Config, FailurePolicy, Mapping, RotationConfig, SlotDef};
 use crate::error::{Error, Result};
 use crate::history::{self, PushRef, RefExpr};
 use crate::layout;
@@ -1145,7 +1145,11 @@ fn push_inner(
 
     // 10-13. Process slots in batches.
     let batch_size = target.rollout.batch_size.max(1) as usize;
-    let failure_policy = target.rollout.failure_policy.clone();
+    // The TYPED batch-failure policy: never a loose string. It is matched
+    // EXHAUSTIVELY below (step 13 compensation and step 14 status) — an
+    // unsupported spelling cannot exist (the strict parse rejected it at
+    // config load), so there is no implicit fallback to "leave changed".
+    let failure_policy = target.rollout.failure_policy;
     let stop_on_failure = target.rollout.stop_on_failure;
 
     let mut results: BTreeMap<PlacementSlotId, SlotResult> = BTreeMap::new();
@@ -1279,57 +1283,82 @@ fn push_inner(
         }
     }
 
-    // 13. Failure policy compensation of still-advanced servers.
-    if had_failure && failure_policy == "rollback_changed" {
-        for sid in &advanced {
-            let prior = plan_servers[sid].expected_generation.as_ref();
-            // A compensation failure (e.g. prior behavior unavailable, or
-            // activation/verification failed during rollback) is reported as a
-            // failed compensation rather than aborting the whole push; the
-            // slot stays advanced and the attempt is marked Degraded.
-            let vars = slot_vars(
-                &members,
-                config,
-                target_name,
-                sid,
-                &plan_servers[sid].artifact,
-                Some(deployment_id),
-                Some(&new_gen[sid]),
-            )?;
-            let ok = compensate_server(
-                store,
-                remotes[sid].as_ref(),
-                &helpers[sid],
-                op_id,
-                deployment_id,
-                prior,
-                &new_gen[sid],
-                config,
-                &vars,
-            )
-            .unwrap_or_default();
-            if ok {
-                compensated.push(sid.clone());
-                if let Some(r) = results.get_mut(sid) {
-                    r.compensated = true;
-                    r.outcome = ServerOutcomeKind::Restored;
+    // 13. Failure policy compensation of still-advanced servers. The policy
+    // is matched EXHAUSTIVELY (no `_ =>` fallback, no string compare):
+    //
+    // * [`FailurePolicy::RollbackChanged`] (the default) — postcondition:
+    //   every server whose batch already advanced when a later batch failed
+    //   is COMPENSATED back to its pre-push generation. A compensation
+    //   failure (e.g. prior behavior unavailable, or activation/verification
+    //   failed during rollback) is reported as a failed compensation rather
+    //   than aborting the whole push; the slot stays advanced and the
+    //   attempt is marked Degraded.
+    // * [`FailurePolicy::LeaveChanged`] — postcondition: the earlier
+    //   successfully-mutated batches are RETAINED deliberately; no
+    //   compensation pass runs and the attempt ends Degraded with the mixed
+    //   per-server state.
+    if had_failure {
+        match failure_policy {
+            FailurePolicy::RollbackChanged => {
+                for sid in &advanced {
+                    let prior = plan_servers[sid].expected_generation.as_ref();
+                    let vars = slot_vars(
+                        &members,
+                        config,
+                        target_name,
+                        sid,
+                        &plan_servers[sid].artifact,
+                        Some(deployment_id),
+                        Some(&new_gen[sid]),
+                    )?;
+                    let ok = compensate_server(
+                        store,
+                        remotes[sid].as_ref(),
+                        &helpers[sid],
+                        op_id,
+                        deployment_id,
+                        prior,
+                        &new_gen[sid],
+                        config,
+                        &vars,
+                    )
+                    .unwrap_or_default();
+                    if ok {
+                        compensated.push(sid.clone());
+                        if let Some(r) = results.get_mut(sid) {
+                            r.compensated = true;
+                            r.outcome = ServerOutcomeKind::Restored;
+                        }
+                    }
                 }
+                advanced.retain(|s| !compensated.contains(s));
+            }
+            FailurePolicy::LeaveChanged => {
+                // Deliberate retention: earlier batches keep their new
+                // state, so no compensation pass runs at all.
             }
         }
-        advanced.retain(|s| !compensated.contains(s));
     }
 
-    // 14. Determine attempt status.
+    // 14. Determine attempt status — again an EXHAUSTIVE match on the typed
+    // policy (no string compare, no fallback): a failed push is
+    // `FailedRolledBack` under `RollbackChanged` when every advanced server
+    // was compensated (or nothing had advanced), `Degraded` when any
+    // compensation failed; under `LeaveChanged` a failed push is always
+    // `Degraded` (the advances are retained deliberately).
     let status = if !had_failure {
         DeploymentStatus::Successful
-    } else if failure_policy == "rollback_changed" {
-        if compensated.len() == assignments.len() || advanced.is_empty() {
-            DeploymentStatus::FailedRolledBack
-        } else {
-            DeploymentStatus::Degraded
-        }
     } else {
-        DeploymentStatus::Degraded
+        match failure_policy {
+            FailurePolicy::RollbackChanged => {
+                if compensated.len() == assignments.len() || advanced.is_empty() {
+                    DeploymentStatus::FailedRolledBack
+                } else {
+                    DeploymentStatus::Degraded
+                }
+            }
+            FailurePolicy::LeaveChanged => DeploymentStatus::Degraded,
+        }
     };
 
     // 15. Commit markers (only for otherwise-successful attempts). The

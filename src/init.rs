@@ -22,8 +22,8 @@
 
 use crate::config::{
     ActivationConfig, ActivationScope, ArtifactConfig, CapacityConfig, ConflictPolicy,
-    DeploymentRotation, Mapping, PerServerRotation, RolloutConfig, RotationConfig, SlotDef,
-    TargetDef, UnitDef, VerificationConfig,
+    DeploymentRotation, FailurePolicy, Mapping, PerServerRotation, RolloutConfig, RotationConfig,
+    SlotDef, TargetDef, UnitDef, VerificationConfig,
 };
 use crate::error::{Error, Result};
 use serde::Serialize;
@@ -296,7 +296,12 @@ fn build_docs(
                 rollout: RolloutConfig {
                     batch_size: 1,
                     stop_on_failure: true,
-                    failure_policy: "rollback_changed".to_string(),
+                    // The scaffolded project uses the safe fail-closed
+                    // default: an unknown policy spelling can never enter a
+                    // generated config (the enum is closed; the serialized
+                    // `failure_policy = "rollback_changed"` is exactly the
+                    // spelling the strict parse accepts).
+                    failure_policy: FailurePolicy::RollbackChanged,
                 },
             },
         )]),
