@@ -290,7 +290,7 @@ pub struct Pin {
 /// The name carries the single-directory-component invariant
 /// ([`ReleaseName::parse`] is the production constructor; the raw
 /// deserialization path is re-validated by the raw -> domain conversion and by
-/// [`ProjectConfig::with_release`], so an invalid name can never enter a validated
+/// [`ProjectConfig::load_release`], so an invalid name can never enter a validated
 /// [`ProjectConfig`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
@@ -301,7 +301,7 @@ impl ReleaseName {
     /// (the forced structure is `<project>/releases/<name>/`), so the name
     /// can never escape the release directory. This is the PRODUCTION
     /// constructor for a validated release name; the deserialization path
-    /// stays raw and the conversion / [`ProjectConfig::with_release`] re-validate.
+    /// stays raw and the conversion / [`ProjectConfig::load_release`] re-validate.
     pub fn parse(s: &str) -> Result<ReleaseName> {
         validate_release_name(s)?;
         Ok(ReleaseName(s.to_string()))
@@ -329,7 +329,7 @@ impl fmt::Display for ReleaseName {
 /// structure is `<project>/releases/<name>/<variant>.toml`), so it can never
 /// escape the release directory. Shared by the raw -> domain conversion
 /// ([`ProjectConfig::try_from`]), [`ReleaseName::parse`], and the validated
-/// release-switch operation [`ProjectConfig::with_release`].
+/// release-switch operation [`ProjectConfig::load_release`].
 fn validate_release_name(name: &str) -> Result<()> {
     let single_component = matches!(
         Path::new(name).components().collect::<Vec<_>>().as_slice(),
@@ -950,9 +950,9 @@ pub struct VariantConfig {
 /// variants map is private, so a hand-built graph cannot enter the domain.
 ///
 /// IMMUTABLE VALIDATED DOMAIN: the invariant-bearing fields are private and
-/// read-only ([`ProjectConfig::schema_version`], [`ProjectConfig::release`]); the ONLY
-/// mutation path is a VALIDATED operation returning a NEW [`ProjectConfig`] —
-/// [`ProjectConfig::with_release`] (re-validates the release-name invariant; the
+/// read-only ([`ProjectConfig::schema_version`], [`ProjectConfig::release`]); there is
+/// NO mutation path — the release is switched by [`ProjectConfig::load_release`], a
+/// FRESH validated load of the project with the new release selected (the
 /// original is never mutated). Fields without invariants (application, pins,
 /// servers, targets) stay public per the "don't overdo" rule — their inner
 /// invariant-bearing fields (e.g. [`ServerDef`]'s host identity) are already
@@ -980,8 +980,9 @@ pub struct ProjectConfig {
     /// The active release: the name of a directory directly beneath
     /// `releases/` in the project root (`release: v1` -> `releases/v1/`).
     /// INVARIANT-BEARING (a single directory component) — private and
-    /// read-only ([`ProjectConfig::release`]); change it through the validated
-    /// [`ProjectConfig::with_release`] operation, which returns a NEW [`ProjectConfig`].
+    /// read-only ([`ProjectConfig::release`]); switch it through the validated
+    /// [`ProjectConfig::load_release`] operation (a fresh load), never by
+    /// assignment.
     release: ReleaseName,
     /// Durable retention pins applied on every retention pass.
     pub pins: Vec<Pin>,
@@ -1006,12 +1007,18 @@ impl ProjectConfig {
     /// whole raw input is converted into the validated domain — any invalid
     /// identifier, reference, or option combination fails the load.
     pub fn load(path: &Path) -> Result<ProjectConfig> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| Error::config(format!("reading {}: {e}", path.display())))?;
-        let manifest: raw::RawConfig = toml::from_str(&text)
-            .map_err(|e| Error::config(format!("parsing deploy.toml: {e}")))?;
+        let manifest = Self::read_manifest(path)?;
         let variants = manifest.load_variant_files(path)?;
         ProjectConfig::from_raw_parts(manifest, variants)
+    }
+
+    /// Read + parse the raw `deploy.toml` manifest at `path` (the raw layer:
+    /// whatever the file says, unknown fields refused at parse). Shared by
+    /// [`ProjectConfig::load`] and [`ProjectConfig::load_release`].
+    fn read_manifest(path: &Path) -> Result<raw::RawConfig> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| Error::config(format!("reading {}: {e}", path.display())))?;
+        toml::from_str(&text).map_err(|e| Error::config(format!("parsing deploy.toml: {e}")))
     }
 
     /// Total-fail-closed conversion of the raw deserialized input: every
@@ -1045,23 +1052,28 @@ impl ProjectConfig {
 
     /// The active release: the name of a directory directly beneath
     /// `releases/` in the project root. Read-only accessor: the release is
-    /// an invariant-bearing field (a single directory component); change it
-    /// through the validated [`ProjectConfig::with_release`] operation, never by
-    /// assignment.
+    /// an invariant-bearing field (a single directory component); switch it
+    /// through the validated [`ProjectConfig::load_release`] operation (a fresh
+    /// load), never by assignment.
     pub fn release(&self) -> &ReleaseName {
         &self.release
     }
 
-    /// The VALIDATED release-switch operation: returns a NEW [`ProjectConfig`]
-    /// whose active release is `release`, re-validating the invariant (the
-    /// name must be exactly one directory component; otherwise `Err` and the
-    /// original is unchanged — the operation never mutates). All other
-    /// fields are carried over unchanged: variants, servers, targets, pins,
-    /// and the schema identity are already validated, and the single
-    /// directory-component rule is the only release-name invariant.
-    pub fn with_release(self, release: ReleaseName) -> Result<ProjectConfig> {
+    /// The VALIDATED release-switch operation: a FRESH LOAD of the project at
+    /// `path` with `release` selected. The deploy.toml is re-read, the release
+    /// field is overridden with `release` (whose name is re-validated —
+    /// exactly one directory component; otherwise `Err`), and THAT release's
+    /// variant files are re-discovered and re-validated by the raw -> domain
+    /// conversion: a missing or invalid release's variant files fail the
+    /// whole load, so the result is a complete, freshly-validated
+    /// [`ProjectConfig`] for the new release — never a partially-switched
+    /// config.
+    pub fn load_release(path: &Path, release: ReleaseName) -> Result<ProjectConfig> {
         validate_release_name(release.as_str())?;
-        Ok(ProjectConfig { release, ..self })
+        let mut manifest = Self::read_manifest(path)?;
+        manifest.release = release;
+        let variants = manifest.load_variant_files(path)?;
+        ProjectConfig::from_raw_parts(manifest, variants)
     }
 
     /// Absolute release directory: forced to `<project>/releases/<release>`.
@@ -4285,5 +4297,298 @@ interval_seconds = 0
                 }
             }
         }
+    }
+
+    // =====================================================================
+    // load_release: the validated release-switch (a FRESH load)
+    // =====================================================================
+    //
+    // [`ProjectConfig::load_release`] replaces the old in-memory `with_release`
+    // mutation: the release switch is a FRESH LOAD of the project with the
+    // new release selected — the deploy.toml is re-read, the release field is
+    // overridden, and THAT release's variant files are re-discovered and
+    // re-validated by the raw -> domain conversion. The property below pins
+    // the contract: `load_release(path, R)` EQUALS a fresh `ProjectConfig::load`
+    // of a project configured with R (identical variants, policies, and
+    // scalars), and a MISSING or INVALID R fails the WHOLE load — no
+    // partially-switched config can escape.
+
+    /// Write a two-release project: `release_a` and `release_b` with
+    /// DIFFERENT variant files and DIFFERENT policies. Release A declares
+    /// the single `standard` variant (slot `p1`, retention
+    /// `keep_distinct_artifacts = keep_a`); release B declares `standard`
+    /// (slot `p1`, retention `keep_distinct_artifacts = keep_b`) PLUS the
+    /// extra `extra` variant (no slots) — so the two releases differ in
+    /// BOTH their variant sets and their retention policies. The shared
+    /// deploy.toml carries the generated rollout (`batch_size`). Returns
+    /// the `deploy.toml` path.
+    fn write_two_release_project(
+        project: &Path,
+        release_a: &str,
+        release_b: &str,
+        keep_a: u32,
+        keep_b: u32,
+        batch_size: u32,
+    ) -> PathBuf {
+        let release_a_dir = project.join("releases").join(release_a);
+        let release_b_dir = project.join("releases").join(release_b);
+        std::fs::create_dir_all(&release_a_dir).unwrap();
+        std::fs::create_dir_all(&release_b_dir).unwrap();
+        std::fs::write(
+            release_a_dir.join("standard.toml"),
+            format!(
+                "{MINIMAL_VARIANT}\n{STANDARD_SLOTS}\n[retention.per_server]\nkeep_distinct_artifacts = {keep_a}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            release_b_dir.join("standard.toml"),
+            format!(
+                "{MINIMAL_VARIANT}\n{STANDARD_SLOTS}\n[retention.per_server]\nkeep_distinct_artifacts = {keep_b}\n"
+            ),
+        )
+        .unwrap();
+        // The extra variant (no slots) makes release B's variant set
+        // strictly larger than release A's.
+        std::fs::write(release_b_dir.join("extra.toml"), MINIMAL_VARIANT).unwrap();
+        let p = project.join("deploy.toml");
+        std::fs::write(
+            &p,
+            deploy_toml(release_a).replace("batch_size = 1", &format!("batch_size = {batch_size}")),
+        )
+        .unwrap();
+        p
+    }
+
+    proptest! {
+        // THE RELEASE-SWITCH PROPERTY: `load_release(path, R)` is a FRESH,
+        // fully-validated load of the project with R selected — it EQUALS a
+        // fresh `ProjectConfig::load` of a project configured with R (the two
+        // configs are identical: same variants, same policies, same scalars),
+        // and a MISSING or INVALID R (no variant files, or a variant file
+        // that fails validation) fails the WHOLE load — the Err is a full
+        // load failure, no partially-switched config escapes. Bounded 16
+        // cases, fixed seed 0x5EED_5EED per house style.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn load_release_equals_fresh_load_and_fails_closed(
+            release_a in "[a-z]{1,4}",
+            release_b in "[a-z]{1,4}",
+            keep_a in 1u32..=3,
+            keep_b in 1u32..=3,
+            batch_size in 1u32..=3,
+        ) {
+            // The two releases must be distinct directories (a rejected case
+            // is regenerated by proptest).
+            prop_assume!(release_a != release_b);
+            let dir = tempfile::tempdir().unwrap();
+            let project = dir.path().join("proj");
+            std::fs::create_dir_all(&project).unwrap();
+            let p = write_two_release_project(
+                &project, &release_a, &release_b, keep_a, keep_b, batch_size,
+            );
+
+            // `load_release(path, R)` EQUALS a fresh `ProjectConfig::load` of
+            // a project configured with R: the oracle deploy.toml names R and
+            // the two configs are identical (variants, policies, scalars).
+            for (release, keep) in [(&release_a, keep_a), (&release_b, keep_b)] {
+                std::fs::write(
+                    &p,
+                    deploy_toml(release).replace(
+                        "batch_size = 1",
+                        &format!("batch_size = {batch_size}"),
+                    ),
+                )
+                .unwrap();
+                let oracle = ProjectConfig::load(&p).expect("the oracle project loads");
+                let switched = ProjectConfig::load_release(
+                    &p,
+                    ReleaseName::parse(release).expect("a single-component release name parses"),
+                )
+                .expect("load_release loads the existing release");
+                assert_eq!(
+                    switched, oracle,
+                    "load_release({release}) must equal a fresh load of a project configured with {release}"
+                );
+                assert_eq!(switched.release().as_str(), release);
+                assert_eq!(
+                    switched
+                        .variant("standard")
+                        .unwrap()
+                        .retention
+                        .per_server
+                        .keep_distinct_artifacts,
+                    keep,
+                    "the release's own retention policy is loaded"
+                );
+                assert_eq!(
+                    switched.targets["t1"].rollout.batch_size.get(),
+                    u64::from(batch_size),
+                    "the rollout scalar is carried identically"
+                );
+            }
+
+            // The two releases genuinely differ: release B has the extra
+            // variant and a different retention policy.
+            let a = ProjectConfig::load_release(
+                &p,
+                ReleaseName::parse(&release_a).expect("a single-component release name parses"),
+            )
+            .expect("release A loads");
+            let b = ProjectConfig::load_release(
+                &p,
+                ReleaseName::parse(&release_b).expect("a single-component release name parses"),
+            )
+            .expect("release B loads");
+            assert_ne!(a, b, "the two releases' configs must differ");
+            assert_eq!(a.variant_names(), vec!["standard".to_string()]);
+            assert_eq!(
+                b.variant_names(),
+                vec!["extra".to_string(), "standard".to_string()]
+            );
+
+            // A MISSING release (no variant files) fails the WHOLE load: the
+            // Err is a full load failure — no config object escapes.
+            let err = ProjectConfig::load_release(
+                &p,
+                ReleaseName::parse("missing").expect("a single-component release name parses"),
+            )
+            .expect_err("a release with no variant files must fail the load");
+            assert!(
+                !err.to_string().is_empty(),
+                "the load failure must carry a message"
+            );
+
+            // An INVALID release (a variant file that fails validation) fails
+            // the WHOLE load: the raw -> domain conversion rejects it.
+            let invalid_dir = project.join("releases").join("invalid");
+            std::fs::create_dir_all(&invalid_dir).unwrap();
+            std::fs::write(
+                invalid_dir.join("bad.toml"),
+                MINIMAL_VARIANT.replace("adapter = \"none\"", "adapter = \"bogus\""),
+            )
+            .unwrap();
+            let err = ProjectConfig::load_release(
+                &p,
+                ReleaseName::parse("invalid").expect("a single-component release name parses"),
+            )
+            .expect_err("a release whose variant file fails validation must fail the load");
+            assert!(
+                !err.to_string().is_empty(),
+                "the load failure must carry a message"
+            );
+        }
+    }
+
+    #[test]
+    fn load_release_switches_between_two_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let p = write_two_release_project(&project, "v1", "v2", 1, 5, 2);
+
+        // The oracle: a fresh load of a project configured with each release.
+        std::fs::write(
+            &p,
+            deploy_toml("v1").replace("batch_size = 1", "batch_size = 2"),
+        )
+        .unwrap();
+        let oracle_v1 = ProjectConfig::load(&p).unwrap();
+        std::fs::write(
+            &p,
+            deploy_toml("v2").replace("batch_size = 1", "batch_size = 2"),
+        )
+        .unwrap();
+        let oracle_v2 = ProjectConfig::load(&p).unwrap();
+
+        // load_release(path, R) equals the fresh load of a project configured
+        // with R — the switch is a full re-validation, never a partial switch.
+        let v1 = ProjectConfig::load_release(&p, ReleaseName::parse("v1").unwrap()).unwrap();
+        let v2 = ProjectConfig::load_release(&p, ReleaseName::parse("v2").unwrap()).unwrap();
+        assert_eq!(v1, oracle_v1);
+        assert_eq!(v2, oracle_v2);
+        assert_eq!(v1.release().as_str(), "v1");
+        assert_eq!(v2.release().as_str(), "v2");
+
+        // The two releases differ in variants and policies.
+        assert_ne!(v1, v2);
+        assert_eq!(v1.variant_names(), vec!["standard".to_string()]);
+        assert_eq!(
+            v2.variant_names(),
+            vec!["extra".to_string(), "standard".to_string()]
+        );
+        assert_eq!(
+            v1.variant("standard")
+                .unwrap()
+                .retention
+                .per_server
+                .keep_distinct_artifacts,
+            1
+        );
+        assert_eq!(
+            v2.variant("standard")
+                .unwrap()
+                .retention
+                .per_server
+                .keep_distinct_artifacts,
+            5
+        );
+    }
+
+    #[test]
+    fn load_release_missing_release_fails_the_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        // A release directory with NO variant files also fails the load.
+        std::fs::create_dir_all(project.join("releases").join("empty")).unwrap();
+        let p = project.join("deploy.toml");
+        std::fs::write(&p, deploy_toml("v1")).unwrap();
+
+        // A release with no directory (and no variant files) fails the WHOLE
+        // load: the Err is a full load failure — no config object escapes.
+        let err = ProjectConfig::load_release(&p, ReleaseName::parse("missing").unwrap())
+            .expect_err("a missing release must fail the load");
+        assert!(!err.to_string().is_empty());
+
+        // An EMPTY release directory (no variant files) fails the same way.
+        let err = ProjectConfig::load_release(&p, ReleaseName::parse("empty").unwrap())
+            .expect_err("a release with no variant files must fail the load");
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn load_release_invalid_variant_fails_the_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        // A release whose variant file fails validation (unknown activation
+        // adapter) fails the WHOLE load: the raw -> domain conversion rejects
+        // it — no partially-switched config can escape.
+        let bad_dir = project.join("releases").join("bad");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(
+            bad_dir.join("bad.toml"),
+            MINIMAL_VARIANT.replace("adapter = \"none\"", "adapter = \"bogus\""),
+        )
+        .unwrap();
+        let p = project.join("deploy.toml");
+        std::fs::write(&p, deploy_toml("v1")).unwrap();
+
+        let err = ProjectConfig::load_release(&p, ReleaseName::parse("bad").unwrap())
+            .expect_err("a release with an invalid variant must fail the load");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bogus"),
+            "the load failure must name the invalid adapter, got: {msg}"
+        );
     }
 }

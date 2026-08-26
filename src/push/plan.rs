@@ -4093,11 +4093,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // IMMUTABILITY + PROOF-BEARING PROPERTY (bounded 16 cases, fixed seed
     // 0x5EED_5EED per house style, no failure persistence):
     //
-    // (a) IMMUTABILITY — the validated domain's derived values are STABLE
-    //     after construction: [`ProjectConfig::with_release`] with an INVALID name
-    //     returns `Err` and the original is unchanged; with a VALID name it
-    //     returns a NEW [`ProjectConfig`] whose accessors reflect the new name while
-    //     the original stays unchanged (the operation never mutates).
+    // (a) IMMUTABILITY — the validated domain is obtained ONLY by a full
+    //     validated load ([`ProjectConfig::load`] / [`ProjectConfig::load_release`]),
+    //     so a config can never be partially switched: `load_release` on an
+    //     INVALID name returns `Err` (the name is re-validated — exactly one
+    //     directory component), and on a VALID name it returns a FRESH load
+    //     of the project with that release selected — equal to a fresh
+    //     `ProjectConfig::load` of a project configured with that release
+    //     (the original is never mutated).
     // (b) PROOF TYPES — [`crate::model::MatchingMembership::verify`] returns
     //     `Ok` EXACTLY when the frozen and current slot-id sets are EQUAL
     //     (and non-empty: a target without slots is invalid, so an empty
@@ -4120,13 +4123,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         #[test]
         fn validated_domain_is_immutable_and_proofs_verify_exactly(
             invalid_name in "[a-z]{1,4}/[a-z]{1,4}",
-            valid_name in "[a-z]{1,4}",
             frozen_ids in prop::collection::vec("[p][0-9]{1,2}", 0..5),
             current_ids in prop::collection::vec("[p][0-9]{1,2}", 0..5),
         ) {
             // (a) IMMUTABILITY of the validated domain.
-            let (_dir, config) = project_with_config();
+            let (dir, config) = project_with_config();
             let original = config;
+            let config_path = dir.path().join("proj").join("deploy.toml");
 
             // The release-name invariant lives in
             // [`crate::config::ReleaseName::parse`] too: the invalid name is
@@ -4135,30 +4138,32 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 crate::config::ReleaseName::parse(&invalid_name).is_err(),
                 "parse must reject the invalid release name {invalid_name:?}"
             );
-            // with_release on an INVALID name -> Err, and the ORIGINAL is
-            // unchanged (the operation returns a NEW ProjectConfig or Err; it never
-            // mutates in place).
+            // load_release on an INVALID name -> Err (the name is re-validated
+            // by the operation; a partially-switched config can never escape).
             let invalid = crate::config::ReleaseName::new(invalid_name.clone());
             assert!(
-                original.clone().with_release(invalid).is_err(),
-                "with_release must Err on the invalid name {invalid_name:?}"
+                ProjectConfig::load_release(&config_path, invalid).is_err(),
+                "load_release must Err on the invalid name {invalid_name:?}"
             );
             assert_eq!(original.release().as_str(), "v1");
             assert_eq!(original.schema_version(), CONFIG_SCHEMA_VERSION);
             assert_eq!(original.variant_names(), vec!["standard".to_string()]);
             assert_eq!(original.target_slot_ids("t1").unwrap(), vec!["p1".to_string()]);
 
-            // with_release on a VALID name -> a NEW ProjectConfig whose accessors
-            // reflect the name; the ORIGINAL is unchanged and its derived
-            // values stay stable.
-            let valid = crate::config::ReleaseName::parse(&valid_name)
+            // load_release on a VALID name (the project's own release) -> a
+            // FRESH, fully-validated load of the project with that release
+            // selected: equal to the original `ProjectConfig::load` (the
+            // release-switch re-validates the whole config; the original is
+            // untouched).
+            let valid = crate::config::ReleaseName::parse("v1")
                 .expect("a single-component name parses");
-            let switched = original
-                .clone()
-                .with_release(valid)
-                .expect("a valid release name switches");
-            assert_eq!(switched.release().as_str(), valid_name);
-            assert_eq!(original.release().as_str(), "v1", "the original is unchanged");
+            let switched = ProjectConfig::load_release(&config_path, valid)
+                .expect("a valid release name loads");
+            assert_eq!(
+                switched, original,
+                "a fresh load of the same release equals the original load"
+            );
+            assert_eq!(switched.release().as_str(), "v1");
             assert_eq!(switched.schema_version(), CONFIG_SCHEMA_VERSION);
             assert_eq!(switched.variant_names(), original.variant_names());
             assert_eq!(
