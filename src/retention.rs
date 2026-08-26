@@ -60,22 +60,11 @@ pub fn compute_retained(
     let status = helper.status()?;
 
     // Current generation's tree — the live artifact is ALWAYS in the retained
-    // set. When the live generation's assignment cannot be read (a missing or
-    // corrupt `assignment.json`), the current tree is UNKNOWN: sweeping
-    // anything we cannot prove unreferenced would leave `current` pointing at
-    // a deleted tree (a dangling commit pointer). Fail closed — retain every
-    // object present so retention deletes nothing it cannot account for.
-    let live_tree_unknown = status.current_generation.is_some() && status.current_tree.is_none();
-    if live_tree_unknown {
-        let obj_root = layout::objects();
-        if helper.remote().exists(obj_root) {
-            for e in helper.remote().list(obj_root)? {
-                if e.is_dir {
-                    retained.insert(e.name);
-                }
-            }
-        }
-    } else if let Some(t) = &status.current_tree {
+    // set. `status()` validates the complete symlink layout, so a missing or
+    // corrupt `assignment.json` under the current generation already failed
+    // closed above (an integrity error — nothing is swept); a successful
+    // status always carries the current tree.
+    if let Some(t) = &status.current_tree {
         retained.insert(t.clone());
     }
 
@@ -164,7 +153,7 @@ fn retained_for_policy(
     // Prior distinct successful generation when protect_previous is true.
     if retention.per_server.protect_previous
         && let Some(cur) = &status.current_generation
-        && let Ok(a) = helper.read_assignment(cur)
+        && let Ok(a) = helper.read_assignment(cur.as_str())
         && let Some(prior) = &a.prior_generation
         && let Ok(pa) = helper.read_assignment(prior.as_str())
     {
@@ -777,13 +766,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     /// Retention must NEVER sweep the tree behind a live `current` whose
     /// assignment cannot be read (a missing or corrupt `assignment.json`): the
-    /// retained set always includes "the artifact referenced by the current
-    /// generation" (requirement.md), and an unreadable assignment makes that
-    /// artifact UNKNOWN. Failing open (sweeping) would leave `current`
-    /// dangling. The engine hits this when a push fails pre-swap against a
-    /// corrupt live generation and then runs retention.
+    /// A corrupt CURRENT generation assignment is detected by `status()`
+    /// itself (the complete symlink layout is validated: `current` ->
+    /// generation dir -> `assignment.json` -> generation id), so retention
+    /// against a remote whose live assignment is unreadable FAILS CLOSED with
+    /// an integrity error BEFORE any sweep decision — the tree behind the
+    /// unreadable current is never deleted, because nothing is ever swept.
     #[test]
-    fn retention_never_sweeps_when_live_assignment_is_unreadable() {
+    fn retention_fails_closed_when_live_assignment_is_unreadable() {
         let dir = tempfile::tempdir().unwrap();
         let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
         let helper = RemoteHelper::new(&remote);
@@ -839,17 +829,20 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .deployment
             .protect_deployments = 0;
 
-        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
+        // Retention fails closed with an integrity error: the corrupt live
+        // assignment is caught by `status()`'s layout validation, so no sweep
+        // decision is ever made and nothing is deleted.
+        let err = compute_retained(&helper, c.pins(), &store, ret(&c))
+            .expect_err("retention must fail closed on a corrupt live assignment");
         assert!(
-            retained.contains(test_tree_digest("t1").as_str()),
-            "the live (unreadable) generation's tree must be retained fail-closed"
+            err.to_string().contains("integrity"),
+            "the retention failure must be an integrity error, got: {err}"
         );
-        helper.rotate(&retained, &HashSet::new()).unwrap();
         assert!(
             helper
                 .remote()
                 .exists(&crate::layout::tree_root(test_tree_digest("t1").as_str())),
-            "retention must not sweep the tree behind a live current with an unreadable assignment"
+            "retention must not sweep the tree behind a corrupt current"
         );
     }
 

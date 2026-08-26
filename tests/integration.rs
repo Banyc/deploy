@@ -1918,7 +1918,7 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
         &remote
             .read(
                 &Path::new("generations")
-                    .join(&gen_id)
+                    .join(gen_id.as_str())
                     .join("assignment.json"),
             )
             .unwrap(),

@@ -184,7 +184,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     let helper = RemoteHelper::new(&endpoint);
     let status = helper.status()?;
     assert_eq!(
-        status.current_generation.as_deref(),
+        status.current_generation.as_ref().map(|g| g.as_str()),
         Some(generation.as_str()),
         "current symlink points at the deployed generation"
     );

@@ -92,7 +92,7 @@ pub(crate) fn process_server(
         }
     };
     if let Some(exp) = expected_gen
-        && status.current_generation.as_deref() != Some(exp.as_str())
+        && status.current_generation.as_ref().map(|g| g.as_str()) != Some(exp.as_str())
     {
         return Ok(ServerProc {
             kind: SlotOutcomeKind::Skipped,

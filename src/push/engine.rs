@@ -803,8 +803,7 @@ fn push_inner(
         let slot_id = &a.placement_slot;
         let expected = statuses
             .get(slot_id)
-            .and_then(|st| st.current_generation.clone())
-            .map(|g| GenerationId::parse(&g).expect("observed generation is a valid gen id"));
+            .and_then(|st| st.current_generation.clone());
         let expected_tree = statuses
             .get(slot_id)
             .and_then(|st| st.current_tree.clone())
@@ -861,7 +860,7 @@ fn push_inner(
             let want = new_gen[&a.placement_slot].as_str().to_string();
             let missing_locally = !store.object_exists(&a.artifact.tree);
             let note = match cur {
-                Some(c) if c == want => format!(
+                Some(c) if c.as_str() == want => format!(
                     "slot {}: already at desired generation ({})\n",
                     a.placement_slot, c
                 ),
@@ -920,7 +919,7 @@ fn push_inner(
                 .as_ref()
                 .map(|g| {
                     helpers[&a.placement_slot]
-                        .read_assignment(g)
+                        .read_assignment(g.as_str())
                         .map(|asn| {
                             // COMPLETE ArtifactRef equality (release + variant
                             // + tree). Two variants can share a release AND the
@@ -1326,8 +1325,7 @@ fn push_inner(
         if !results.contains_key(&a.placement_slot) {
             let cur = statuses
                 .get(&a.placement_slot)
-                .and_then(|s| s.current_generation.clone())
-                .map(|g| GenerationId::parse(&g).expect("observed generation is a valid gen id"));
+                .and_then(|s| s.current_generation.clone());
             results.insert(
                 a.placement_slot.clone(),
                 SlotResult {
@@ -1458,7 +1456,7 @@ fn push_inner(
                     continue;
                 }
             };
-            if cur.as_deref() != Some(new_gen[sid].as_str()) {
+            if cur.as_ref().map(|g| g.as_str()) != Some(new_gen[sid].as_str()) {
                 // The live generation no longer matches what we deployed: the
                 // controller's view diverged, so this marker would be wrong.
                 // Report Degraded rather than a falsely successful commit.
@@ -1527,12 +1525,10 @@ fn push_inner(
         let helper = &helpers[sid];
         let final_gen = helper.status().ok().and_then(|s| s.current_generation);
         let actual = match final_gen {
-            Some(g) => match helper.read_assignment(&g) {
+            Some(g) => match helper.read_assignment(g.as_str()) {
                 Ok(asn) => SlotAttemptState {
                     artifact: asn.artifact.clone(),
-                    generation: Some(
-                        GenerationId::parse(&g).expect("observed generation is a valid gen id"),
-                    ),
+                    generation: Some(g),
                 },
                 Err(_) => {
                     // The generation is observed (`g`), but its assignment could
@@ -1542,9 +1538,7 @@ fn push_inner(
                     // fabricating desired state.
                     SlotAttemptState {
                         artifact: unknown_artifact(),
-                        generation: Some(
-                            GenerationId::parse(&g).expect("observed generation is a valid gen id"),
-                        ),
+                        generation: Some(g),
                     }
                 }
             },
@@ -1767,7 +1761,7 @@ fn push_inner(
             .status()
             .ok()
             .and_then(|s| s.current_generation)
-            .and_then(|g| helpers[&slot_id].read_assignment(&g).ok());
+            .and_then(|g| helpers[&slot_id].read_assignment(g.as_str()).ok());
         match live {
             Some(asn) => {
                 observed_servers.insert(
@@ -2408,7 +2402,7 @@ mod tests {
     use super::*;
     use crate::model::{
         CanonicalSlot, CanonicalSlots, GenerationRef, Provenance, RELEASE_RECORD_SCHEMA_VERSION,
-        ReleaseRecord, test_deployment_id, test_generation_id, test_tree_digest, unknown_artifact,
+        ReleaseRecord, test_deployment_id, test_generation_id, test_tree_digest,
     };
     use crate::records::LedgerEntry;
     use crate::remote::transport::{FsBytes, LocalTransport};
@@ -3457,7 +3451,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .current_generation
             .expect("a current generation exists");
         let live = helper
-            .read_assignment(&cur)
+            .read_assignment(cur.as_str())
             .unwrap()
             .artifact
             .tree
@@ -3857,7 +3851,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 .status()
                 .unwrap()
                 .current_generation
-                .as_deref(),
+                .as_ref()
+                .map(|g| g.as_str()),
             Some(gen_v2.as_str()),
             "the conflict must not disturb the live deployment"
         );
@@ -4414,7 +4409,7 @@ interval_seconds = 0
             &remote
                 .read(
                     &crate::layout::generations()
-                        .join(&cur)
+                        .join(cur.as_str())
                         .join("assignment.json"),
                 )
                 .unwrap(),
@@ -4426,7 +4421,7 @@ interval_seconds = 0
         );
         assert_eq!(
             assignment.generation_id.as_str(),
-            cur,
+            cur.as_str(),
             "the assignment must be the current generation's"
         );
 
@@ -4792,7 +4787,7 @@ interval_seconds = 0
             &remote
                 .read(
                     &crate::layout::generations()
-                        .join(&cur)
+                        .join(cur.as_str())
                         .join("assignment.json"),
                 )
                 .unwrap(),
@@ -5490,7 +5485,7 @@ interval_seconds = 0
         let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
         let status = RemoteHelper::new(&remote).status().unwrap();
         assert_eq!(
-            status.current_generation.as_deref(),
+            status.current_generation.as_ref().map(|g| g.as_str()),
             Some(s0_gen.as_str()),
             "the remote current still points at s0's generation"
         );
@@ -5852,7 +5847,7 @@ interval_seconds = 0
             &remote
                 .read(
                     &crate::layout::generations()
-                        .join(&cur)
+                        .join(cur.as_str())
                         .join("assignment.json"),
                 )
                 .unwrap(),
@@ -5995,7 +5990,7 @@ interval_seconds = 0
         let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
         let status = RemoteHelper::new(&remote).status().unwrap();
         assert_eq!(
-            status.current_generation.as_deref(),
+            status.current_generation.as_ref().map(|g| g.as_str()),
             Some(prior_gen.as_str()),
             "the compensation swap-back is visible on the remote current"
         );
@@ -6930,7 +6925,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &remote
                     .read(
                         &crate::layout::generations()
-                            .join(&cur)
+                            .join(cur.as_str())
                             .join("assignment.json"),
                     )
                     .unwrap(),
@@ -6962,16 +6957,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_ne!(digest_a, digest_b);
     }
 
-    /// OBSERVED-REFRESH UNKNOWN-ASSIGNMENT FALLBACK: when a live generation's
-    /// `assignment.json` cannot be read (missing/corrupt), the refresh must
-    /// preserve the OBSERVED generation and mark the assignment UNKNOWN
-    /// (`unknown_artifact()`) — never substitute the desired/planned
-    /// artifact. BOTH the pre-push intent (`pre_push`) and the post-push
-    /// observed refresh use this contract; results.json records the slot's
-    /// pre-swap failure, `current` stays on the observed (corrupt) generation,
-    /// and no stale snapshot/ref is produced.
+    /// A corrupt CURRENT generation assignment is detected by `status()`
+    /// itself — the complete symlink layout is validated (`current` ->
+    /// generation dir -> `assignment.json` -> generation id) — so a push
+    /// against a remote whose live assignment is corrupt FAILS CLOSED with an
+    /// integrity error BEFORE any mutation or intent persistence: never a
+    /// panic, never a fabricated observation, never a silent proceed on an
+    /// unverifiable current.
     #[test]
-    fn observed_refresh_preserves_generation_with_unknown_assignment() {
+    fn corrupt_current_assignment_fails_status_and_push_closed() {
         let h = RecoveryHarness::new();
         let id1 = test_deployment_id("deploy-obs-fallback-baseline");
         let r1 = push_main_with_id(&h, &id1).unwrap();
@@ -6980,13 +6974,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .generation
             .clone()
             .expect("baseline generation");
-        // The baseline's REAL live assignment: the truth the prior observed
-        // record carries (an unreadable assignment must fall back to it, not
-        // to a fabricated/unknown marker).
-        let gen1_artifact = r1.attempt.as_ref().expect("attempt").slots[&SlotId::new("p1")]
-            .artifact
-            .clone();
-        eprintln!("DEBUG gen1={gen1}");
 
         // Corrupt the live generation's assignment record on the remote.
         let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
@@ -7001,125 +6988,49 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "the assignment must be unreadable after corruption"
         );
 
-        // Push 2: the artifact content changes (not a no-op) and the
-        // generation-record write for the NEW generation fails once
-        // (pre-swap). `current` therefore stays at gen1 — whose assignment is
-        // unreadable.
-        std::fs::write(
-            h.config
-                .project_root(&h.cfg_path)
-                .join("releases")
-                .join("v1")
-                .join("artifacts")
-                .join("build/output/app/server"),
-            "v2\n",
-        )
-        .unwrap();
+        // `status()` validates the complete symlink layout: a corrupt
+        // assignment under the current generation is a MALFORMED remote state
+        // and fails closed with an integrity error — never a panic, never a
+        // `None` that would let a caller proceed on an unverifiable current.
+        let err = RemoteHelper::new(&remote)
+            .status()
+            .expect_err("a corrupt current assignment must fail status closed");
+        assert!(
+            err.to_string().contains("integrity"),
+            "the status failure must be an integrity error, got: {err}"
+        );
+
+        // A push against the corrupt remote fails closed at the status read,
+        // BEFORE any mutation or intent persistence: no new generation, no
+        // attempt, no snapshot, and the baseline ref is untouched.
         let id2 = test_deployment_id("deploy-obs-fallback");
-        let armed = Arc::new(AtomicBool::new(true));
-        let armed_for_factory = armed.clone();
-        let rf = h.remotes_base.clone();
-        let fault_factory = move |s: &crate::config::ServerDef,
-                                  _slot: &crate::config::SlotConfig|
-              -> Result<Box<dyn Remote>> {
-            FailOnceGenerationRemote::build(rf.join(s.id.as_str()), armed_for_factory.clone())
-        };
-        let project_root = h.config.project_root(&h.cfg_path);
-        let target = h.config.target("t1").expect("harness target");
-        let op_id = OperationId::new(format!("op-{}", id2.as_str()));
-        let r2 = push_inner(
-            &project_root,
-            &h.store,
-            &fault_factory,
-            "t1",
-            &crate::push::plan::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
-            &RefExpr::Head,
-            None,
-            &id2,
-            &op_id,
-            &h.config,
-            target,
-            &PushOptions {
-                dry_run: false,
-                ref_token: None,
-                group: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            r2.status,
-            Some(DeploymentStatus::FailedRolledBack),
-            "a pre-swap mid-mutation failure must be reported as a failure, got {:?}",
-            r2.status
-        );
-
-        // The remote `current` still points at gen1 (never advanced, never
-        // clobbered) — the observed generation we are about to record.
-        let status = RemoteHelper::new(&remote).status().unwrap();
-        assert_eq!(status.current_generation.as_deref(), Some(gen1.as_str()));
-
-        // THE OBSERVED FALLBACK: the live assignment is UNREADABLE (corrupt),
-        // so the observed refresh carries the slot's PRIOR observed record
-        // over VERBATIM — the real generation/artifact/last_deployment the
-        // baseline push recorded — never the desired v2 artifact, never an
-        // unknown (default) marker, never the failed deployment re-stamped.
-        let observed = h.store.read_observed("t1", &h.config).unwrap();
-        let os = &observed.slots[&SlotId::new("p1")];
-        assert_eq!(
-            os.generation,
-            Some(gen1.clone()),
-            "observed generation must be preserved"
-        );
-        let oa = os.artifact.as_ref().expect("observed artifact present");
-        assert_eq!(
-            oa, &gen1_artifact,
-            "the prior observed record's REAL artifact must be preserved verbatim, got: {oa:?}"
-        );
-        let desired_art = &r2.attempt.as_ref().expect("attempt").desired[&SlotId::new("p1")]
-            .assignment
-            .artifact;
-        assert_ne!(
-            oa.tree, desired_art.tree,
-            "observed must NOT substitute the desired v2 artifact"
+        let err = push_main_with_id(&h, &id2)
+            .expect_err("a push against a corrupt current assignment must fail closed");
+        assert!(
+            err.to_string().contains("integrity"),
+            "the push failure must be an integrity error, got: {err}"
         );
         assert_eq!(
-            os.last_deployment,
-            Some(id1.clone()),
-            "observed last_deployment must be the LIVE assignment's OWN minting deployment \
-             (id1), carried over with the prior record — never the failed id2"
+            h.store.read_attempts("t1").unwrap().len(),
+            1,
+            "no attempt may be recorded for the failed push"
         );
-
-        // The PERSISTED INTENT's pre_push map uses the SAME contract:
-        // generation preserved, assignment unknown.
-        let attempts = h.store.read_attempts("t1").unwrap();
-        assert_eq!(attempts.len(), 2);
-        let intent2 = &attempts[1];
-        assert_eq!(intent2.deployment_id, id2);
-        let pp = intent2.intent.slots[&SlotId::new("p1")]
-            .pre_push
-            .as_ref()
-            .expect("pre_push present");
-        assert_eq!(pp.generation, Some(gen1.clone()));
         assert_eq!(
-            pp.artifact,
-            unknown_artifact(),
-            "pre_push must mark the unreadable assignment unknown, not fabricate the desired one"
+            h.store.read_snapshots("t1").unwrap().len(),
+            1,
+            "no snapshot may be recorded for the failed push"
         );
-
-        // results.json records the pre-swap failure; the failed attempt
-        // produced no snapshot/ref and the baseline ref is untouched.
-        let results = h.store.read_results(id2.as_str()).unwrap();
-        assert_eq!(results[&SlotId::new("p1")].outcome, SlotOutcomeKind::Failed);
-        assert_eq!(
-            latest_status(&h, id2.as_str()),
-            DeploymentStatus::FailedRolledBack
-        );
-        let snapshots = h.store.read_snapshots("t1").unwrap();
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].deployment_id, id1);
         assert_eq!(
             h.store.read_last_successful("t1").as_deref(),
-            Some(id1.as_str())
+            Some(id1.as_str()),
+            "the baseline ref must be untouched"
+        );
+        // The remote `current` still points at gen1 — the failed push never
+        // mutated the remote.
+        assert_eq!(
+            remote.read_link(crate::layout::current()).unwrap(),
+            crate::layout::generation(gen1.as_str()).join("root"),
+            "current must still point at the baseline generation"
         );
     }
 
@@ -7654,12 +7565,12 @@ interval_seconds = 0
         let cur = status
             .current_generation
             .expect("push 2 must advance the remote");
-        assert_eq!(cur, second_gen.as_str());
+        assert_eq!(cur.as_str(), second_gen.as_str());
         let asn: crate::remote::helper::GenerationAssignment = serde_json::from_slice(
             &remote
                 .read(
                     &crate::layout::generations()
-                        .join(&cur)
+                        .join(cur.as_str())
                         .join("assignment.json"),
                 )
                 .unwrap(),

@@ -41,7 +41,13 @@ pub struct GenerationAssignment {
 
 #[derive(Clone, Debug, Default)]
 pub struct RemoteStatus {
-    pub current_generation: Option<String>,
+    /// The validated identity of the generation the `current` symlink names.
+    /// `None` when there is no `current` link, or when the link's target does
+    /// not name a generation (no `generations` component, or an unparseable
+    /// generation id) — a corrupt generation name is never a panic and never
+    /// a fabricated id. A link that names a generation whose record is
+    /// missing or malformed fails `status()` with an integrity error instead.
+    pub current_generation: Option<GenerationId>,
     pub current_tree: Option<String>,
     pub inventory: Vec<String>,
     pub lock: Option<String>,
@@ -100,26 +106,71 @@ impl<'a> RemoteHelper<'a> {
 
     /// Inspect the actual remote generation, object inventory, lock, and
     /// pending incoming directories.
+    ///
+    /// The COMPLETE symlink layout is validated: `current` ->
+    /// `generations/<gen>/root` -> `assignment.json` -> the generation id. A
+    /// `current` link that does not name a generation (no `generations`
+    /// component, or an unparseable generation id) reports NO current
+    /// generation (`None`); a link that names a generation whose record is
+    /// missing or malformed (nonexistent generation directory, unreadable or
+    /// corrupt `assignment.json`, or an assignment whose generation id does
+    /// not match its directory) fails closed with an integrity error — never
+    /// a panic.
     pub fn status(&self) -> Result<RemoteStatus> {
         let mut status = RemoteStatus::default();
 
-        // Current generation via the top-level `current` symlink.
-        if self.remote.exists(layout::current()) {
+        // Current generation via the top-level `current` symlink. `exists`
+        // FOLLOWS the link, so a DANGLING `current` (one whose target does
+        // not resolve) reports false; `metadata` is an lstat and sees the
+        // link itself. Both are checked so a link pointing at a missing
+        // generation is validated as malformed rather than silently treated
+        // as absent.
+        let meta = self.remote.metadata(layout::current());
+        let present =
+            self.remote.exists(layout::current()) || matches!(&meta, Ok(m) if m.is_symlink);
+        if present {
+            let meta = meta?;
+            if !meta.is_symlink {
+                // `current` exists but is not a symlink: malformed remote
+                // state.
+                return Err(Error::integrity("current is not a symlink"));
+            }
             let target = self.remote.read_link(layout::current())?;
             let comps: Vec<&str> = target
                 .components()
                 .map(|c| c.as_os_str().to_str().unwrap_or(""))
                 .collect();
-            if let Some(pos) = comps
+            let gid = comps
                 .iter()
                 .position(|&c| c == layout::GENERATIONS_COMPONENT)
-                && let Some(gid) = comps.get(pos + 1)
-            {
-                status.current_generation = Some(gid.to_string());
-            }
-            if let Some(genid) = &status.current_generation
-                && let Ok(a) = self.read_assignment(genid)
-            {
+                .and_then(|pos| comps.get(pos + 1))
+                .and_then(|name| GenerationId::parse(name).ok());
+            if let Some(gid) = gid {
+                // The link names a generation: validate the record it points
+                // at. A missing generation directory, a missing/corrupt
+                // assignment, or an assignment whose id does not match its
+                // directory is a MALFORMED remote state — fail closed with an
+                // integrity error rather than reporting a current generation
+                // that cannot be verified.
+                let gen_dir = layout::generation(gid.as_str());
+                if !self.remote.exists(&gen_dir) {
+                    return Err(Error::integrity(format!(
+                        "current symlink points at missing generation directory {}",
+                        gen_dir.display()
+                    )));
+                }
+                let a = self.read_assignment(gid.as_str()).map_err(|e| {
+                    Error::integrity(format!(
+                        "current generation {gid} has a malformed assignment: {e}"
+                    ))
+                })?;
+                if a.generation_id != gid {
+                    return Err(Error::integrity(format!(
+                        "current generation {gid} assignment names generation {}",
+                        a.generation_id
+                    )));
+                }
+                status.current_generation = Some(gid);
                 status.current_tree = Some(a.artifact.tree.as_str().to_string());
             }
         }
@@ -723,6 +774,8 @@ mod tests {
     use super::*;
     use crate::model::{test_deployment_id, test_generation_id, test_tree_digest};
     use crate::remote::transport::LocalTransport;
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
     use std::os::unix::fs::PermissionsExt;
 
     /// A named (label, mutator) pair driving the publish-rejection mutation
@@ -1339,6 +1392,308 @@ mod tests {
             remote_meta.tree_sha256, host_meta.tree_sha256,
             "uploaded tree must match the host tree digest"
         );
+    }
+
+    // ---- status() validates the complete symlink layout -------------------
+
+    /// Install a `current` symlink with the given target and (optionally) a
+    /// generation record, then run `status` under `catch_unwind`: a panic
+    /// becomes a test failure at the `.expect`, so every malformed-layout
+    /// case asserts BOTH the expected outcome AND that `status` never panics.
+    fn status_with_layout(
+        target: &str,
+        gen_id: Option<&str>,
+        assignment: Option<&[u8]>,
+    ) -> Result<RemoteStatus> {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("remote");
+        std::fs::create_dir_all(&base).unwrap();
+        std::os::unix::fs::symlink(target, base.join("current")).unwrap();
+        if let Some(gid) = gen_id {
+            let gen_dir = base.join(layout::generation(gid));
+            std::fs::create_dir_all(&gen_dir).unwrap();
+            if let Some(bytes) = assignment {
+                std::fs::write(gen_dir.join("assignment.json"), bytes).unwrap();
+            }
+        }
+        let remote = LocalTransport::new(base).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| helper.status()))
+            .expect("status must never panic on a malformed layout")
+    }
+
+    /// A structurally valid assignment record for `gen_id` (its generation id
+    /// matches the id it is built for).
+    fn assignment_json(gen_id: &str, tree: &str) -> Vec<u8> {
+        serde_json::to_vec(&assignment(gen_id, tree)).unwrap()
+    }
+
+    /// A remote with no `current` link reports NO current generation.
+    #[test]
+    fn status_reports_none_when_current_link_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("remote");
+        std::fs::create_dir_all(&base).unwrap();
+        let remote = LocalTransport::new(base).unwrap();
+        let helper = RemoteHelper::new(&remote);
+        let st = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| helper.status()))
+            .expect("status must never panic")
+            .unwrap();
+        assert!(st.current_generation.is_none());
+        assert!(st.current_tree.is_none());
+    }
+
+    /// A `current` link whose target has no `generations` component does not
+    /// name a generation: `None`, never a panic.
+    #[test]
+    fn status_reports_none_for_link_without_generations_component() {
+        let st = status_with_layout("objects/sha256/x/root", None, None).unwrap();
+        assert!(st.current_generation.is_none());
+        assert!(st.current_tree.is_none());
+    }
+
+    /// A `current` link whose target names an UNPARSEABLE generation id
+    /// (after the `generations` component) reports `None` — a corrupt
+    /// generation name is never a panic and never a fabricated id.
+    #[test]
+    fn status_reports_none_for_unparseable_generation_name() {
+        for target in [
+            "generations/not-a-gen-id/root",
+            "generations//root",
+            "generations/",
+        ] {
+            let st = status_with_layout(target, None, None).unwrap();
+            assert!(
+                st.current_generation.is_none(),
+                "target {target:?} must report no current generation"
+            );
+            assert!(st.current_tree.is_none());
+        }
+    }
+
+    /// A `current` link naming a generation whose DIRECTORY does not exist is
+    /// a malformed remote state: an integrity error, never a panic.
+    #[test]
+    fn status_fails_integrity_for_missing_generation_dir() {
+        let gid = test_generation_id("gen-missing-dir");
+        let target = format!("generations/{}/root", gid.as_str());
+        let err = status_with_layout(&target, None, None)
+            .expect_err("a dangling current link must fail closed");
+        assert!(
+            err.to_string().contains("integrity"),
+            "error must be an integrity error, got: {err}"
+        );
+    }
+
+    /// A `current` link naming a generation whose `assignment.json` is
+    /// MISSING is a malformed remote state: an integrity error, never a
+    /// panic.
+    #[test]
+    fn status_fails_integrity_for_missing_assignment() {
+        let gid = test_generation_id("gen-missing-asn");
+        let target = format!("generations/{}/root", gid.as_str());
+        let err = status_with_layout(&target, Some(gid.as_str()), None)
+            .expect_err("a generation without an assignment must fail closed");
+        assert!(
+            err.to_string().contains("integrity"),
+            "error must be an integrity error, got: {err}"
+        );
+    }
+
+    /// A `current` link naming a generation whose `assignment.json` is
+    /// CORRUPT (unparseable) is a malformed remote state: an integrity
+    /// error, never a panic.
+    #[test]
+    fn status_fails_integrity_for_corrupt_assignment() {
+        let gid = test_generation_id("gen-corrupt-asn");
+        let target = format!("generations/{}/root", gid.as_str());
+        let err = status_with_layout(&target, Some(gid.as_str()), Some(b"{ corrupt json !"))
+            .expect_err("a corrupt assignment must fail closed");
+        assert!(
+            err.to_string().contains("integrity"),
+            "error must be an integrity error, got: {err}"
+        );
+    }
+
+    /// A `current` link naming a generation whose `assignment.json` carries a
+    /// DIFFERENT generation id than its directory is a malformed remote
+    /// state: an integrity error, never a panic.
+    #[test]
+    fn status_fails_integrity_for_mismatched_assignment_id() {
+        let dir_gid = test_generation_id("gen-dir");
+        let target = format!("generations/{}/root", dir_gid.as_str());
+        let json = assignment_json("gen-other", "tree-a");
+        let err = status_with_layout(&target, Some(dir_gid.as_str()), Some(&json))
+            .expect_err("an assignment naming a different generation must fail closed");
+        assert!(
+            err.to_string().contains("integrity"),
+            "error must be an integrity error, got: {err}"
+        );
+    }
+
+    /// A VALID layout (`current` -> `generations/<gen>/root` -> a matching
+    /// `assignment.json`) reports the VALIDATED generation id and its tree.
+    #[test]
+    fn status_reports_validated_generation_and_tree() {
+        let gid = test_generation_id("gen-ok");
+        let target = format!("generations/{}/root", gid.as_str());
+        let json = assignment_json("gen-ok", "tree-a");
+        let st = status_with_layout(&target, Some(gid.as_str()), Some(&json)).unwrap();
+        assert_eq!(st.current_generation, Some(gid));
+        assert_eq!(
+            st.current_tree.as_deref(),
+            Some(test_tree_digest("tree-a").as_str())
+        );
+    }
+
+    // ---- PROPERTY: arbitrary symlink layouts never panic status ------------
+
+    /// A generation id: either a VALID `gen-<uuid-v7>` (derived from an
+    /// arbitrary tag, so distinct tags yield distinct valid ids) or an
+    /// arbitrary malformed string (wrong prefix, empty, garbage).
+    fn arbitrary_gen_id() -> impl Strategy<Value = String> {
+        prop_oneof![
+            // Valid: gen-<uuid-v7> derived from an arbitrary tag.
+            "[a-z0-9]{1,16}".prop_map(|tag| format!("gen-{}", crate::model::test_uuid_v7(&tag))),
+            // Malformed: wrong prefix, empty, garbage.
+            "[a-zA-Z0-9]{0,40}",
+        ]
+    }
+
+    /// Arbitrary `current` symlink targets: well-formed
+    /// `generations/<id>/root` paths, `generations` with a malformed id,
+    /// paths without a `generations` component, and arbitrary garbage.
+    fn arbitrary_symlink_target() -> impl Strategy<Value = String> {
+        prop_oneof![
+            // Well-formed: generations/<id>/root.
+            (
+                Just(layout::GENERATIONS_COMPONENT.to_string()),
+                arbitrary_gen_id(),
+                Just("root".to_string()),
+            )
+                .prop_map(|(g, id, r)| format!("{g}/{id}/{r}")),
+            // generations/<id> without the root suffix.
+            (
+                Just(layout::GENERATIONS_COMPONENT.to_string()),
+                arbitrary_gen_id(),
+            )
+                .prop_map(|(g, id)| format!("{g}/{id}")),
+            // No generations component: arbitrary path-ish garbage.
+            "[a-zA-Z0-9/._-]{1,60}",
+            // Arbitrary printable garbage (may or may not contain
+            // `generations` as a component).
+            "[ -~]{1,60}",
+        ]
+    }
+
+    /// Arbitrary `assignment.json` contents: a structurally VALID record
+    /// whose generation id may or may not match the directory it is installed
+    /// under, corrupt JSON, and arbitrary bytes.
+    fn arbitrary_assignment_content() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            // A structurally valid record (arbitrary generation id, so it may
+            // or may not match its directory).
+            (arbitrary_gen_id(), "[a-f0-9]{64}").prop_map(|(gid, tree)| {
+                serde_json::to_vec(&serde_json::json!({
+                    "deployment_id": format!("deploy-{}", crate::model::test_uuid_v7("prop")),
+                    "generation_id": gid,
+                    "artifact": {
+                        "release": format!("rel-sha256-{}", "0".repeat(64)),
+                        "variant": "standard",
+                        "tree": tree,
+                    },
+                    "behavior_sha256": "0".repeat(64),
+                    "created_at": "2020-01-01T00:00:00Z",
+                }))
+                .expect("the generated record serializes")
+            }),
+            // Corrupt JSON.
+            Just(b"{ corrupt json !".to_vec()),
+            // Arbitrary bytes.
+            prop::collection::vec(any::<u8>(), 0..64),
+        ]
+    }
+
+    proptest! {
+        // PROPERTY (the directive's point 4): generate ARBITRARY symlink
+        // targets and assignment contents (valid, nonexistent, malformed,
+        // mismatched-id, corrupt); `status()` must EITHER return TYPED STATE
+        // (a validated `Option<GenerationId>` + tree) OR AN ERROR — NEVER
+        // PANIC (asserted via `catch_unwind`). The downstream engine
+        // consumers are panic-free by construction: `current_generation` is
+        // already the validated `GenerationId`, so no consumer ever parses or
+        // unwraps it. Bounded 16 cases, fixed seed 0x5EED_5EED (house style),
+        // no persistence.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn status_never_panics_on_arbitrary_symlink_layouts(
+            target in arbitrary_symlink_target(),
+            install_dir in any::<bool>(),
+            assignment in prop::option::weighted(0.8, arbitrary_assignment_content()),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().join("remote");
+            std::fs::create_dir_all(&base).unwrap();
+            // Install the `current` symlink with the arbitrary target. A
+            // target that cannot be installed (e.g. an empty string) simply
+            // leaves the link absent — still a valid input for `status`.
+            if !target.is_empty() {
+                let _ = std::os::unix::fs::symlink(&target, base.join("current"));
+            }
+            // If the target names a parseable generation, install that
+            // generation's directory (optionally with the arbitrary
+            // assignment content).
+            let comps: Vec<&str> = Path::new(&target)
+                .components()
+                .map(|c| c.as_os_str().to_str().unwrap_or(""))
+                .collect();
+            if let Some(pos) = comps
+                .iter()
+                .position(|&c| c == layout::GENERATIONS_COMPONENT)
+                && let Some(name) = comps.get(pos + 1)
+                && GenerationId::parse(name).is_ok()
+            {
+                let gen_dir = base.join(layout::generation(name));
+                if install_dir {
+                    std::fs::create_dir_all(&gen_dir).unwrap();
+                    if let Some(bytes) = &assignment {
+                        std::fs::write(gen_dir.join("assignment.json"), bytes).unwrap();
+                    }
+                }
+            }
+
+            let remote = LocalTransport::new(base).unwrap();
+            let helper = RemoteHelper::new(&remote);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| helper.status()))
+                .expect("status must never panic on arbitrary symlink layouts");
+            match result {
+                Ok(st) => {
+                    // TYPED STATE: a present current generation is a VALIDATED
+                    // GenerationId, and it always carries its tree.
+                    if let Some(g) = &st.current_generation {
+                        assert_eq!(
+                            GenerationId::parse(g.as_str()).unwrap().as_str(),
+                            g.as_str(),
+                            "a reported current generation must be a validated GenerationId"
+                        );
+                        assert!(
+                            st.current_tree.is_some(),
+                            "a validated current generation must carry its tree"
+                        );
+                    }
+                }
+                Err(_) => {
+                    // An error (e.g. integrity) is acceptable — never a
+                    // panic.
+                }
+            }
+        }
     }
 }
 

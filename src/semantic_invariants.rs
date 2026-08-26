@@ -1034,7 +1034,7 @@ impl Fixture {
         self.with_helper(|helper| {
             let status = helper.status().ok()?;
             let g = status.current_generation?;
-            helper.read_assignment(&g).ok()
+            helper.read_assignment(g.as_str()).ok()
         })
     }
 
@@ -1050,7 +1050,7 @@ impl Fixture {
             let asn = self.with_slot_helper(slot, |helper| {
                 let status = helper.status().ok()?;
                 let g = status.current_generation?;
-                helper.read_assignment(&g).ok()
+                helper.read_assignment(g.as_str()).ok()
             });
             if let Some(a) = asn {
                 out.insert(SlotId::new(slot.to_string()), a);
@@ -2100,7 +2100,7 @@ impl Fixture {
                     && let Some(g) = &status.current_generation
                 {
                     let asn = helper
-                        .read_assignment(g)
+                        .read_assignment(g.as_str())
                         .expect("current generation assignment must parse");
                     assert!(
                         helper

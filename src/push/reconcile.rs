@@ -120,7 +120,10 @@ pub(crate) fn reconcile_pending_commits(
                 break;
             };
             match helper.status() {
-                Ok(st) if st.current_generation.as_deref() == Some(recorded_gen.as_str()) => {
+                Ok(st)
+                    if st.current_generation.as_ref().map(|g| g.as_str())
+                        == Some(recorded_gen.as_str()) =>
+                {
                     recorded.insert(sid.clone(), recorded_gen);
                 }
                 Ok(_) => {
