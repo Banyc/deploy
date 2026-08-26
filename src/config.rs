@@ -49,7 +49,7 @@ use crate::error::{Error, Result};
 use crate::model::{CONFIG_SCHEMA_VERSION, ServerId, SlotId};
 use crate::records::PhysicalBinding;
 use crate::scalar::{
-    AbsoluteDeployDir, ApplicationName, BatchSize, CapacityPercent, GroupName, Identifier,
+    AbsoluteDeployDir, ApplicationDisplayName, BatchSize, CapacityPercent, GroupName, Identifier,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -967,10 +967,16 @@ pub struct ProjectConfig {
     /// conversion refuses any other value). Private + read-only
     /// ([`ProjectConfig::schema_version`]): the format identity is invariant.
     schema_version: u32,
-    /// The deployment application name: a validated NON-EMPTY [`ApplicationName`]
-    /// parsed by the raw -> domain conversion (an empty or whitespace-only
-    /// application name is rejected).
-    pub application: ApplicationName,
+    /// The deployment application DISPLAY name: a validated NON-EMPTY,
+    /// control-free [`ApplicationDisplayName`] parsed by the raw -> domain
+    /// conversion (an empty or control-bearing application name is
+    /// rejected). The display name is FREE-FORM (it may contain `/`, `\`,
+    /// `.`/`..`, or surrounding whitespace) — it is used in messages and
+    /// rendering, never as a path. The STORE directory key is the separate
+    /// [`crate::scalar::ApplicationStoreKey`], derived from the display
+    /// name at the store boundary ([`crate::store::local::LocalStore::new`]
+    /// takes the key), so the store path can never be escaped.
+    pub application: ApplicationDisplayName,
     /// The active release: the name of a directory directly beneath
     /// `releases/` in the project root (`release: v1` -> `releases/v1/`).
     /// INVARIANT-BEARING (a single directory component) — private and
@@ -1268,11 +1274,14 @@ impl TryFrom<RawProject> for ProjectConfig {
             return Err(Error::config("at least one target must be declared"));
         }
 
-        // The application name is parsed into the validated NON-EMPTY
-        // [`ApplicationName`] scalar: an empty or whitespace-only application
-        // name is rejected (fail closed).
-        let application = ApplicationName::parse(&manifest.application)
-            .map_err(|_| Error::config("application must be a non-empty name"))?;
+        // The application name is parsed into the validated NON-EMPTY,
+        // control-free [`ApplicationDisplayName`] scalar: an empty or
+        // control-bearing application name is rejected (fail closed). The
+        // display name is free-form (it is not a path); the STORE KEY is
+        // derived from it at the store boundary, where a display name that
+        // is not a single safe path segment is rejected.
+        let application = ApplicationDisplayName::parse(&manifest.application)
+            .map_err(|_| Error::config("application must be a non-empty, control-free name"))?;
 
         // Each loaded variant carries its own artifact/activation/verification
         // policy; validate each one and build the domain variant (the raw
@@ -4190,11 +4199,11 @@ interval_seconds = 0
     /// scalar outcome exactly.
     fn scalar_mutation_project() -> impl Strategy<Value = (RawProject, bool)> {
         prop_oneof![
-            // application: ApplicationName (non-empty).
+            // application: ApplicationDisplayName (non-empty, control-free).
             arbitrary_scalar_text().prop_map(|v| {
                 let mut p = minimal_raw_project();
                 p.manifest.application = v.clone();
-                (p, ApplicationName::parse(&v).is_ok())
+                (p, ApplicationDisplayName::parse(&v).is_ok())
             }),
             // slot id: Identifier.
             arbitrary_scalar_text().prop_map(|v| {

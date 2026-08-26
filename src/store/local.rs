@@ -69,6 +69,7 @@ use crate::records::{
     DeploymentIntent, DeploymentStatus, LedgerEntry, LedgerIntentWire, LedgerLine, LedgerTerminal,
     LedgerTerminalWire, ObservedSlot, ObservedTarget, Pins, ServerState,
 };
+use crate::scalar::ApplicationStoreKey;
 use crate::store::atomic::{
     copy_dir_recursive, ensure_private_dir, ensure_private_dir_durable, path_state, read_json,
     set_private, sync_parent_dir, temp_name_for, write_atomic_replace,
@@ -85,7 +86,7 @@ use crate::testutil::test_faults::{FaultKind, FaultRegistry};
 #[cfg(test)]
 use std::sync::Arc;
 
-fn default_base() -> PathBuf {
+pub(crate) fn default_base() -> PathBuf {
     let data = std::env::var("XDG_DATA_HOME")
         .ok()
         .filter(|s| !s.is_empty())
@@ -213,10 +214,14 @@ pub struct LocalStore {
 }
 
 impl LocalStore {
-    /// Create a store rooted at `<data>/simple-deploy/<application>` with private
-    /// permissions, creating the directory tree if needed.
-    pub fn new(application: &str) -> Result<LocalStore> {
-        let base = default_base().join(application);
+    /// Create a store rooted at `<data>/simple-deploy/<key>` with private
+    /// permissions, creating the directory tree if needed. The application
+    /// STORE KEY is the ONLY way in: the key is a validated single safe
+    /// path segment ([`crate::scalar::ApplicationStoreKey`]), so the store
+    /// path is `default_base().join(key)` — exactly ONE component appended
+    /// — and an application name can never escape the store base.
+    pub fn new(application: &ApplicationStoreKey) -> Result<LocalStore> {
+        let base = default_base().join(application.as_str());
         Self::with_base(base)
     }
 
@@ -1438,6 +1443,44 @@ mod tests {
     };
     use proptest::prelude::*;
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
+
+    /// The store path is `default_base().join(key)`: a clean store key
+    /// places the store DIRECTLY under the base with exactly ONE component
+    /// appended (no traversal), and every escape class is rejected at the
+    /// key parse — an invalid name can never reach the store construction
+    /// (the key type is the only way in).
+    #[test]
+    fn new_places_store_under_base_plus_single_component() {
+        // Hermetic store base: `LocalStore::new` resolves `default_base()`
+        // from the process-global `XDG_DATA_HOME`, so it is pointed at a
+        // temp dir under ENV_LOCK (the house env-mutation invariant).
+        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = dir.path().join("data");
+        unsafe { std::env::set_var("XDG_DATA_HOME", &data_home) };
+
+        // A clean name → Ok, and the store path is `<base>/<name>` with no
+        // traversal: exactly ONE component (the key) appended.
+        let key = ApplicationStoreKey::parse("my-app").expect("clean name parses");
+        let store = LocalStore::new(&key).expect("a valid store key constructs a store");
+        assert_eq!(store.base().parent(), Some(default_base().as_path()));
+        assert_eq!(
+            store.base().file_name(),
+            Some(std::ffi::OsStr::new("my-app"))
+        );
+        assert_eq!(store.base(), default_base().join("my-app"));
+
+        // Every escape class is rejected at the KEY parse — the store
+        // construction takes the key type, so an invalid name can never
+        // reach it.
+        for bad in [
+            "a/b", "a\\b", "..", ".", "../x", "x/..", " x", "x ", "", "\u{0}",
+        ] {
+            ApplicationStoreKey::parse(bad).expect_err("unsafe store key rejected");
+        }
+
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+    }
 
     fn intent(id: &str, target: &str) -> DeploymentIntent {
         let p1 = SlotId::new("p1".to_string());

@@ -14,6 +14,7 @@ use crate::push::engine::{PushOptions, PushReport, push};
 use crate::records::{DeploymentStatus, LedgerEntry, ObservedTarget};
 use crate::remote::create_remote;
 use crate::remote::transport::Remote;
+use crate::scalar::ApplicationStoreKey;
 use crate::store::local::LocalStore;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -347,7 +348,11 @@ where
         )));
     }
     let config = ProjectConfig::load(&config_path)?;
-    let store = LocalStore::new(config.application.as_str())?;
+    // The config→store handoff: the display name must ALSO be a valid
+    // store key (a single safe path segment) — an application name that is
+    // not a safe key is rejected HERE, at the store boundary, so the store
+    // path can never escape the store base.
+    let store = LocalStore::new(&ApplicationStoreKey::try_from(&config.application)?)?;
     let remotes_base = store.base().join("remotes");
     std::fs::create_dir_all(&remotes_base).ok();
 
@@ -1068,7 +1073,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let cfg_path = project.join("deploy.toml");
         let data_home = dir.path().join("data");
         unsafe { std::env::set_var("XDG_DATA_HOME", &data_home) };
-        // `run_with` resolves the store as `LocalStore::new("checkpoint-cli")`
+        // `run_with` resolves the store as
+        // `LocalStore::new(&ApplicationStoreKey::parse("checkpoint-cli")?)`
         // = XDG_DATA_HOME/simple-deploy/checkpoint-cli.
         let store =
             LocalStore::with_base(data_home.join("simple-deploy").join("checkpoint-cli")).unwrap();
