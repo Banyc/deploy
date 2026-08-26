@@ -75,7 +75,10 @@ pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// stages), the FIRST-append durable dir-creation syncs
 /// ([`FaultKind::SyncNewTargetDir`] / [`FaultKind::SyncTargetsDir`], keyed by
 /// TARGET, firing only when the append actually created the target directory),
-/// the post-commit observed-refresh faults ([`FaultKind::WriteServer`],
+/// the LOCK-PATH target-dir creation ([`FaultKind::LockMkdir`], keyed by
+/// TARGET, firing before the durable pre-creation the engine/checkpoint run
+/// ahead of the target lock — the crash-at-mkdir boundary, leaving NO target
+/// directory), the post-commit observed-refresh faults ([`FaultKind::WriteServer`],
 /// [`FaultKind::WriteObserved`], keyed additionally by TARGET), and the
 /// rotation-maintenance arms ([`FaultKind::ReadRotationDebt`],
 /// [`FaultKind::WriteRotationDebt`], keyed by TARGET). The CHECKPOINT kinds
@@ -139,6 +142,15 @@ pub(crate) mod test_faults {
         /// target directory (same conditioning as
         /// [`FaultKind::SyncNewTargetDir`]).
         SyncTargetsDir,
+        /// The LOCK-PATH target-dir creation (the reported lock-bypass bug):
+        /// the durable pre-creation the engine/checkpoint run BEFORE the
+        /// target lock is acquired (the lock file lives inside the target
+        /// dir, so a plain unsynced mkdir on the lock path used to bypass the
+        /// first-append durability helper entirely). Keyed by target; fires
+        /// BEFORE the durable helper creates anything — a crash at the mkdir
+        /// step — so recovery finds the PRIOR STATE with NO target directory
+        /// (a first target) and no ledger, and a retry re-appends cleanly.
+        LockMkdir,
         /// Post-commit observed-refresh per-server record write
         /// (`servers/<id>.json`), keyed by (deployment id, target).
         WriteServer,
@@ -396,6 +408,16 @@ pub(crate) mod test_faults {
         /// [`FaultRegistry::arm_sync_new_target_dir`].
         pub(crate) fn arm_sync_targets_dir(&self, target: &str) {
             self.arm(FaultKind::SyncTargetsDir, target);
+        }
+
+        /// Arm the LOCK-PATH target-dir creation (the durable pre-creation
+        /// the engine/checkpoint run before the target lock) to fail once for
+        /// `target`. Fires BEFORE the durable helper creates anything — a
+        /// crash at the mkdir step — so recovery finds the prior state with
+        /// NO target directory (a first target) and no ledger, and a retry
+        /// re-appends cleanly.
+        pub(crate) fn arm_lock_mkdir(&self, target: &str) {
+            self.arm(FaultKind::LockMkdir, target);
         }
 
         /// Arm the next `write_server` call that records `deployment_id`

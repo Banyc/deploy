@@ -505,7 +505,28 @@ impl LocalStore {
     /// dir-sync boundaries fire ONLY on the creation path (an EXISTING
     /// target's append creates and syncs nothing, so the arms never fire
     /// there).
-    fn ensure_target_dir_durable(&self, target: &str) -> Result<()> {
+    ///
+    /// The engine and checkpoint ALSO call this BEFORE acquiring the target
+    /// lock ([`crate::push::engine::push`], [`crate::push::checkpoint`]): the
+    /// lock file lives INSIDE the target dir, so the lock path used to create
+    /// it with a plain unsynced mkdir that bypassed this helper — the
+    /// lock-path pre-creation makes the directory durable BEFORE the lock is
+    /// taken (the lock's own parent creation then no-ops), and the append's
+    /// later call finds it existing. The [`FaultKind::LockMkdir`] arm below
+    /// models a crash at that lock-path mkdir step: it fires BEFORE the
+    /// helper runs, leaving the prior state with NO target directory.
+    pub(crate) fn ensure_target_dir_durable(&self, target: &str) -> Result<()> {
+        // Test-only: the LOCK-PATH dir-creation boundary (the durable
+        // pre-creation the engine/checkpoint run before the target lock) —
+        // fires BEFORE the durable helper creates anything, modeling a crash
+        // at the mkdir step: recovery finds the PRIOR STATE with no target
+        // directory (a first target) and no ledger.
+        #[cfg(test)]
+        if self.fault_registry.consume(FaultKind::LockMkdir, target) {
+            return Err(Error::store(
+                "test fault: the lock-path target-dir creation forced to fail once",
+            ));
+        }
         let created = ensure_private_dir_durable(&self.target_dir(target))?;
         // Test-only: the two dir-sync boundaries of a FIRST append, keyed by
         // target. They fire after the durable helper returned (the directory
@@ -1318,6 +1339,7 @@ mod tests {
         ArtifactRef, GenerationId, GenerationRef, PlacementSlotAssignment, PlacementSlotId,
         ReleaseId, TargetName, VariantName,
     };
+    use crate::push::lock::FileLock;
     use crate::records::{
         LedgerIntent, LedgerIntentWire, LedgerLine, LedgerRollback, LedgerTerminal,
         LedgerTerminalWire, ServerOutcomeKind, SlotResult,
@@ -2543,6 +2565,239 @@ mod tests {
             (existing, sync_new, sync_targets) in (any::<bool>(), any::<bool>(), any::<bool>()),
         ) {
             run_first_append_dir_sync_model(existing, sync_new, sync_targets);
+        }
+    }
+
+    // ---- the lock-path target-dir creation (the reported lock bypass) --
+
+    /// The crashable boundary of the COMPLETE first-push sequence — store
+    /// open → target lock acquisition → intent append — that the property
+    /// below injects a fault at. The lock-path mkdir boundary
+    /// ([`LockPathBoundary::LockMkdir`]) and the two durable dir-sync
+    /// boundaries ([`LockPathBoundary::SyncNewTargetDir`] /
+    /// [`LockPathBoundary::SyncTargetsDir`]) fire on the target-dir creation
+    /// the engine/checkpoint run BEFORE the target lock; the four atomic-
+    /// append stage boundaries fire on the ledger write inside the append.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LockPathBoundary {
+        /// No fault: the sequence reports success.
+        None,
+        /// The LOCK-PATH mkdir step: the durable pre-creation crashes
+        /// before it creates anything — recovery finds NO target directory
+        /// (a first target) and no ledger.
+        LockMkdir,
+        /// The sync of the NEW TARGET DIR's entry (`targets/`), on the
+        /// lock-path pre-creation: the dir exists, no ledger.
+        SyncNewTargetDir,
+        /// The sync of `targets/`'s OWN entry (the store base), on the
+        /// lock-path pre-creation: the dir exists, no ledger.
+        SyncTargetsDir,
+        /// The ledger append's TEMP-WRITE stage: the visible ledger is
+        /// wholly prior.
+        AppendWrite,
+        /// The ledger append's TEMP-SYNC stage: wholly prior.
+        AppendSync,
+        /// The ledger append's RENAME stage: wholly prior.
+        AppendRename,
+        /// The ledger append's PARENT-DIR-SYNC stage: the rename already
+        /// landed — the ledger is wholly new, though the append returns
+        /// `Err`.
+        AppendDirSync,
+    }
+
+    /// The eight crash boundaries of the complete sequence, for the
+    /// deterministic unit test and the fixed-seed property generator.
+    fn lock_path_boundaries() -> Vec<LockPathBoundary> {
+        vec![
+            LockPathBoundary::None,
+            LockPathBoundary::LockMkdir,
+            LockPathBoundary::SyncNewTargetDir,
+            LockPathBoundary::SyncTargetsDir,
+            LockPathBoundary::AppendWrite,
+            LockPathBoundary::AppendSync,
+            LockPathBoundary::AppendRename,
+            LockPathBoundary::AppendDirSync,
+        ]
+    }
+
+    /// Run one model case of the lock-path durability property: a fresh
+    /// fixture, optionally pre-seeded as an EXISTING target (its dir + first
+    /// ledger entry already written), with the boundary fault armed per the
+    /// spec; then the COMPLETE SEQUENCE — store open, the durable target-dir
+    /// pre-creation + target lock acquisition exactly as the engine's lock
+    /// block runs it ([`crate::push::engine::push`]: local lock, then
+    /// `ensure_target_dir_durable`, then the target lock), then the intent
+    /// append — a fresh-store reopen over the same base, and the durability
+    /// contract:
+    ///
+    /// * a REPORTED SUCCESS recovers with the COMPLETE ledger AND the target
+    ///   directory present — never a missing target directory after an `Ok`;
+    /// * a faulted boundary returns `Err` and recovery finds the PRIOR
+    ///   STATE: the `LockMkdir` crash leaves NO target dir (the pre-creation
+    ///   never ran, for a first target); every later boundary leaves the
+    ///   target dir present with the prior ledger (or the wholly-new
+    ///   committed ledger when the append's rename already landed);
+    /// * the prior-state cases re-append cleanly on the same base (the
+    ///   landed dir-sync case is fail-closed: the recovered ledger already
+    ///   holds the entry and the duplicate guard refuses the replay).
+    fn run_lock_path_durability_model(existing: bool, boundary: LockPathBoundary) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("store");
+        let store = LocalStore::with_base(base.clone()).unwrap(); // store open
+        let target = "t1";
+        if existing {
+            store
+                .append_intent(target, &intent("dep-0", target))
+                .unwrap();
+        }
+        let id = if existing { "dep-1" } else { "dep-0" };
+        // Arm the boundary fault: the dir-creation kinds key by target (the
+        // lock-path pre-creation and the append's `ensure_target_dir_durable`
+        // consume them); the append-stage kinds key by deployment id.
+        match boundary {
+            LockPathBoundary::None => {}
+            LockPathBoundary::LockMkdir => store.fault_registry().arm_lock_mkdir(target),
+            LockPathBoundary::SyncNewTargetDir => {
+                store.fault_registry().arm_sync_new_target_dir(target)
+            }
+            LockPathBoundary::SyncTargetsDir => store.fault_registry().arm_sync_targets_dir(target),
+            LockPathBoundary::AppendWrite => store.fault_registry().arm_append_write(id),
+            LockPathBoundary::AppendSync => store.fault_registry().arm_append_sync(id),
+            LockPathBoundary::AppendRename => store.fault_registry().arm_append_rename(id),
+            LockPathBoundary::AppendDirSync => store.fault_registry().arm_append_dir_sync(id),
+        }
+        // THE COMPLETE SEQUENCE: store open → target lock acquisition →
+        // intent append, mirroring the engine's lock block exactly (local
+        // store lock first, then the durable target-dir pre-creation, then
+        // the target lock, then the append).
+        let result = (|| -> Result<()> {
+            let local = FileLock::acquire(&store.base().join("operation.lock"), "op-1")?;
+            store.ensure_target_dir_durable(target)?;
+            let target_lock =
+                FileLock::acquire(&store.target_dir(target).join("operation.lock"), "op-1")?;
+            store.append_intent(target, &intent(id, target))?;
+            drop(target_lock);
+            drop(local);
+            Ok(())
+        })();
+        drop(store);
+        let reopened = LocalStore::with_base(base.clone()).unwrap();
+        let entries = reopened.read_ledger(target).unwrap();
+        let id_present = entries.iter().any(|e| e.deployment_id.as_str() == id);
+        if result.is_ok() {
+            assert!(
+                reopened.target_dir(target).exists(),
+                "a reported success never loses the target directory (existing={existing}, boundary={boundary:?})"
+            );
+            assert!(
+                id_present,
+                "a reported success always retains the complete ledger (existing={existing}, boundary={boundary:?})"
+            );
+        } else {
+            // The faulted boundary's contract, per crash point.
+            match boundary {
+                LockPathBoundary::LockMkdir => {
+                    // The crash hit BEFORE the durable helper created
+                    // anything: a FIRST target recovers with NO target
+                    // directory; an existing one keeps its pre-existing dir.
+                    // Either way the ledger is the prior one.
+                    if existing {
+                        assert!(reopened.target_dir(target).exists());
+                        assert_eq!(entries.len(), 1, "the prior ledger is intact");
+                    } else {
+                        assert!(
+                            !reopened.target_dir(target).exists(),
+                            "the crashed lock-path mkdir leaves NO target dir (boundary={boundary:?})"
+                        );
+                        assert!(entries.is_empty());
+                    }
+                }
+                LockPathBoundary::AppendDirSync => {
+                    // The append's rename already landed: the ledger is
+                    // wholly NEW (the committed entry is present) even
+                    // though the append reported `Err`.
+                    assert!(reopened.target_dir(target).exists());
+                    assert!(id_present, "the landed rename is wholly new");
+                }
+                _ => {
+                    // A dir-sync or pre-rename boundary: the target dir was
+                    // durably created before any crashable boundary (present)
+                    // and the ledger is the PRIOR one (the append did not
+                    // commit).
+                    assert!(reopened.target_dir(target).exists());
+                    assert!(!id_present, "the append did not commit ({boundary:?})");
+                }
+            }
+            // A faulted step recovers to a re-appendable state: a fresh
+            // store over the same base re-appends the same intent cleanly
+            // when the entry did not land; when the rename already landed
+            // (dir-sync), the recovered ledger already holds the entry and
+            // the fail-closed duplicate guard refuses the replay.
+            let retry = LocalStore::with_base(base.clone()).unwrap();
+            if id_present {
+                let err = retry
+                    .append_intent(target, &intent(id, target))
+                    .unwrap_err();
+                assert!(
+                    err.to_string().contains("second intent"),
+                    "a landed entry is fail-closed against a duplicate replay ({boundary:?})"
+                );
+            } else {
+                retry.append_intent(target, &intent(id, target)).unwrap();
+                assert!(
+                    retry
+                        .read_ledger(target)
+                        .unwrap()
+                        .iter()
+                        .any(|e| e.deployment_id.as_str() == id)
+                );
+            }
+        }
+    }
+
+    /// The DETERMINISTIC unit test of the complete sequence: every crash
+    /// boundary faulted, on a first AND an existing target. This is the exact
+    /// sequence the reported bug bypassed — store open → target lock
+    /// acquisition → intent append — with each boundary faulted in turn, and
+    /// the durability contract above (a reported success recovers with the
+    /// complete ledger AND the target directory present; a faulted step
+    /// returns `Err` with the prior state; a retry re-appends cleanly).
+    #[test]
+    fn lock_path_dir_creation_each_boundary_faulted() {
+        for existing in [false, true] {
+            for boundary in lock_path_boundaries() {
+                run_lock_path_durability_model(existing, boundary);
+            }
+        }
+    }
+
+    proptest! {
+        // FIXED-SEED PROPERTY for the lock-path target-dir creation (the
+        // reported bug): the COMPLETE sequence — store open → target lock
+        // acquisition → intent append — is faulted at EVERY mkdir / fsync /
+        // rename boundary (the durable-dir kinds
+        // [`FaultKind::SyncNewTargetDir`] / [`FaultKind::SyncTargetsDir`], the
+        // lock-path mkdir kind [`FaultKind::LockMkdir`], and the four
+        // atomic-append stages), on first AND existing targets. Every
+        // REPORTED SUCCESS must recover (a fresh store over the same base)
+        // with the COMPLETE ledger AND the target directory present — NEVER a
+        // missing target directory after a reported success; a faulted step
+        // returns `Err` with the prior state (no target dir or the prior
+        // ledger) and a retry re-appends cleanly. The pinned 0x5EED_5EED seed
+        // with no persistence runs the IDENTICAL vectors on every invocation;
+        // the case count is bounded so the suite stays fast.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn lock_path_dir_creation_durability(
+            (existing, boundary) in (any::<bool>(), prop::sample::select(lock_path_boundaries())),
+        ) {
+            run_lock_path_durability_model(existing, boundary);
         }
     }
 

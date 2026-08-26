@@ -145,11 +145,16 @@ pub fn run_checkpoint(
     let op_id = OperationId::generate();
     let local_guard = FileLock::acquire(&store.base().join("operation.lock"), op_id.as_str())?;
     let target_guard = {
-        let p = store.target_dir(target).join("operation.lock");
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        FileLock::acquire(&p, op_id.as_str())?
+        // Durable pre-creation of the target directory BEFORE the target
+        // lock, mirroring [`crate::push::engine::push`]: the lock path must
+        // never create the target dir with an unsynced mkdir (the lock file
+        // lives inside it, so a plain `create_dir_all` here would bypass the
+        // durable first-append helper exactly as the reported bug did).
+        store.ensure_target_dir_durable(target)?;
+        FileLock::acquire(
+            &store.target_dir(target).join("operation.lock"),
+            op_id.as_str(),
+        )?
     };
     let result = checkpoint_inner(store, config, target, deployment_id);
     // The guards drop here, releasing both advisory locks regardless of how

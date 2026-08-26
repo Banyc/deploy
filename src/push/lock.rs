@@ -31,8 +31,21 @@ pub(crate) struct FileLock {
 
 impl FileLock {
     pub(crate) fn acquire(path: &Path, op_id: &str) -> Result<Self> {
+        // DURABLE parent creation: the lock file's parent directory is
+        // created with EVERY newly created directory entry fsynced (see
+        // [`crate::store::atomic::ensure_private_dir_durable`]) BEFORE the
+        // lock is taken. A lock acquisition that creates a directory must
+        // never do so with a plain unsynced mkdir — the engine's first
+        // push used to let the lock path create `targets/<target>/` that
+        // way, bypassing the durable first-append helper (the target dir
+        // already existed when the append's creation detection ran, so no
+        // parent sync happened) and a reported-successful first push could
+        // recover with the target directory missing after power loss. The
+        // engine also durably pre-creates the target directory before
+        // locking (see [`crate::push::engine::push`]); this helper makes
+        // the lock path itself durable for every caller.
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+            crate::store::atomic::ensure_private_dir_durable(parent)
                 .map_err(|e| Error::preflight(format!("mkdir {}: {e}", parent.display())))?;
         }
         let mut file = std::fs::OpenOptions::new()

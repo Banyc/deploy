@@ -231,11 +231,22 @@ pub fn push(
     let target_guard = if opts.dry_run {
         None
     } else {
-        let p = store.target_dir(target_name).join("operation.lock");
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        Some(FileLock::acquire(&p, op_id.as_str())?)
+        // DURABLE pre-creation of the target directory BEFORE the target
+        // lock is acquired. The lock file lives INSIDE the target dir, so
+        // the lock path used to create `targets/<target>/` with a plain
+        // (UNSYNCED) mkdir that ran BEFORE the durable first-append helper
+        // — the append's "newly created" detection then no-oped and a
+        // reported-successful first push could recover with the target
+        // directory missing after power loss. Pre-creating durably here
+        // (every new directory entry fsynced, see
+        // [`crate::store::atomic::ensure_private_dir_durable`]) means the
+        // lock's own parent creation finds the directory existing and
+        // never touches the fs.
+        store.ensure_target_dir_durable(target_name)?;
+        Some(FileLock::acquire(
+            &store.target_dir(target_name).join("operation.lock"),
+            op_id.as_str(),
+        )?)
     };
 
     let result = push_inner(
