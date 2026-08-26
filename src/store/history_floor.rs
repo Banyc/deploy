@@ -400,7 +400,7 @@ impl LocalStore {
         // verified, is an INTEGRITY error (see [`LocalStore::honor_release_pin`])
         // — the pin cannot be honored, so reachability is incomplete and the
         // sweep must abort before any deletion.
-        for pin in &config.pins {
+        for pin in config.pins() {
             let rid = crate::model::ReleaseId::parse(&pin.release);
             self.honor_release_pin(&mut out, &rid, true)?;
         }

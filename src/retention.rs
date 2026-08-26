@@ -370,7 +370,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let c = cfg();
-        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
         assert!(
             retained.contains(test_tree_digest("t2").as_str()),
             "current tree retained"
@@ -561,7 +561,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .per_server
             .protect_previous = false;
 
-        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
         assert!(
             retained.contains(test_tree_digest("t3").as_str()),
             "current tree retained"
@@ -614,7 +614,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .deployment
             .protect_deployments = 0;
 
-        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
         assert!(retained.contains(test_tree_digest("t-recent").as_str()));
         assert!(
             !retained.contains(test_tree_digest("t-old").as_str()),
@@ -627,7 +627,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .retention
             .per_server
             .keep_days = 90;
-        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
         assert!(
             retained.contains(test_tree_digest("t-old").as_str()),
             "artifact inside keep_days must be retained"
@@ -696,7 +696,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .deployment
             .protect_deployments = 2;
 
-        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
         assert!(
             retained.contains(test_tree_digest("t3").as_str()),
             "current deployment retained"
@@ -764,7 +764,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .deployment
             .protect_deployments = 0;
 
-        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
         assert!(
             retained.contains(test_tree_digest("t2").as_str()),
             "current tree is never swept"
@@ -839,7 +839,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .deployment
             .protect_deployments = 0;
 
-        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
         assert!(
             retained.contains(test_tree_digest("t1").as_str()),
             "the live (unreadable) generation's tree must be retained fail-closed"
@@ -951,7 +951,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 "#;
         std::fs::write(proj.join("deploy.toml"), deploy_toml).unwrap();
         let c = ProjectConfig::load(&proj.join("deploy.toml")).unwrap();
-        let before = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
+        let before = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
 
         // The config-level group change: ADD a new rollout group (`wave-1`)
         // to slot `p1`'s `groups` list, then reload. Groups are selection-only
@@ -968,7 +968,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "standard",
             "the owning variant is unchanged by group edits"
         );
-        let after = compute_retained(&helper, &c2.pins, &store, ret(&c2)).unwrap();
+        let after = compute_retained(&helper, c2.pins(), &store, ret(&c2)).unwrap();
         assert_eq!(
             before, after,
             "changing a slot's group membership must never change its retained set"
@@ -1043,7 +1043,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .deployment
             .protect_deployments = 0;
 
-        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
         assert!(
             retained.contains(test_tree_digest("t3").as_str()),
             "current live tree retained"
@@ -1132,13 +1132,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &variants,
             &BTreeMap::from([(
                 "standard".to_string(),
-                vec![SlotConfig {
-                    id: "p1".to_string(),
-                    server: "s1".to_string(),
-                    deploy_dir: PathBuf::from("/srv/pin"),
-                    target: "t1".to_string(),
-                    groups: Vec::new(),
-                }],
+                vec![SlotConfig::new(
+                    "p1".to_string(),
+                    "s1".to_string(),
+                    PathBuf::from("/srv/pin"),
+                    "t1".to_string(),
+                    Vec::new(),
+                )],
             )]),
             std::path::Path::new("."),
         );
@@ -1194,15 +1194,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let helper = RemoteHelper::new(&remote);
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let rec = seed_pin_receiver(&helper, &store, &["tree-pin-a", "tree-pin-b"]);
-        let mut c = cfg();
-        c.pins = vec![Pin {
-            release: rec.release_id.clone(),
-            reason: "known-good".into(),
-        }];
+        let c = cfg()
+            .with_pin(Pin {
+                release: rec.release_id.clone(),
+                reason: "known-good".into(),
+            })
+            .unwrap();
 
         // Sanity with the VALID record: the pin protects both variant trees
         // and the garbage object is unretained (sweepable).
-        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
         assert!(
             retained.contains(test_tree_digest("tree-pin-a").as_str()),
             "variant tree protected by the pin"
@@ -1227,7 +1228,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // ABORT: an un-honorable pin is an integrity error — the pin is never
         // treated as absent (a silently-skipped pin would drop its trees from
         // the retained set and let retention delete them).
-        let err = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap_err();
+        let err = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap_err();
         assert!(
             matches!(err, Error::Integrity(_)),
             "an un-honorable pin aborts retention with an integrity error, got: {err}"
@@ -1256,7 +1257,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         // REPAIR the record, then RETRY the retention.
         repair_pin_record(&store, &rec);
-        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
+        let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
         assert!(
             retained.contains(test_tree_digest("tree-pin-a").as_str())
                 && retained.contains(test_tree_digest("tree-pin-b").as_str()),
@@ -1344,14 +1345,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     .unwrap();
             }
             let mut c = cfg();
-            c.pins = vec![Pin {
+            c = c.with_pin(Pin {
                 release: rec.release_id.clone(),
                 reason: "known-good".into(),
-            }];
+            }).unwrap();
 
             // Sanity: the valid record pins every variant tree; every garbage
             // object is unretained.
-            let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
+            let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
             for t in &pin_trees {
                 assert!(
                     retained.contains(test_tree_digest(t).as_str()),
@@ -1373,7 +1374,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
             // ABORT before any deletion: an integrity error, never an absent
             // pin.
-            let err = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap_err();
+            let err = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap_err();
             assert!(matches!(err, Error::Integrity(_)));
             assert!(err.to_string().contains("pin names release"));
 
@@ -1401,7 +1402,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // REPAIR + RETRY: exact deletions — pin trees and live trees
             // survive, the true garbage is removed — and the marker clears.
             repair_pin_record(&store, &rec);
-            let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
+            let retained = compute_retained(&helper, c.pins(), &store, ret(&c)).unwrap();
             helper.rotate(&retained, &HashSet::new()).unwrap();
             for t in &pin_trees {
                 assert!(

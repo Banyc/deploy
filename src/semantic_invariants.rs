@@ -1745,7 +1745,7 @@ impl Fixture {
                 let op = OperationId::generate();
                 let _guard = helper.acquire_lock_guard(op.as_str())?;
                 let retained =
-                    compute_retained(&helper, &self.config.pins, &self.store, retention)?;
+                    compute_retained(&helper, self.config.pins(), &self.store, retention)?;
                 helper.rotate(&retained, &HashSet::new())
             })?;
         }
@@ -1960,7 +1960,7 @@ impl Fixture {
                 // (`standard` declares the shared slots) — never a union of
                 // member-target policies.
                 let retention = &self.config.variant("standard").unwrap().retention;
-                compute_retained(&helper, &self.config.pins, &self.store, retention)
+                compute_retained(&helper, self.config.pins(), &self.store, retention)
                     .expect("retained under the slot's owning-variant policy")
             });
             // Every tree the single policy retains must actually survive the
@@ -3445,13 +3445,13 @@ proptest! {
 // ===========================================================================
 
 fn sdef(id: &str, server: &str, dir: &str, target: &str) -> SlotConfig {
-    SlotConfig {
-        id: id.to_string(),
-        server: server.to_string(),
-        deploy_dir: PathBuf::from(dir),
-        target: target.to_string(),
-        groups: Vec::new(),
-    }
+    SlotConfig::new(
+        id.to_string(),
+        server.to_string(),
+        PathBuf::from(dir),
+        target.to_string(),
+        Vec::new(),
+    )
 }
 
 /// Reordering slots, variants, or a slot's targets list preserves the digest.
@@ -3529,28 +3529,28 @@ fn identity_duplicates_are_rejected_and_canonicalize_identically() {
     let mut dedup: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::new();
     dedup.insert(
         "standard".to_string(),
-        vec![SlotConfig {
-            id: "p1".to_string(),
-            server: "s1".to_string(),
-            deploy_dir: PathBuf::from("/srv/si"),
-            target: "t1".to_string(),
-            groups: vec!["canary".to_string(), "wave-1".to_string()],
-        }],
+        vec![SlotConfig::new(
+            "p1".to_string(),
+            "s1".to_string(),
+            PathBuf::from("/srv/si"),
+            "t1".to_string(),
+            vec!["canary".to_string(), "wave-1".to_string()],
+        )],
     );
     let mut dup: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::new();
     dup.insert(
         "standard".to_string(),
-        vec![SlotConfig {
-            id: "p1".to_string(),
-            server: "s1".to_string(),
-            deploy_dir: PathBuf::from("/srv/si"),
-            target: "t1".to_string(),
-            groups: vec![
+        vec![SlotConfig::new(
+            "p1".to_string(),
+            "s1".to_string(),
+            PathBuf::from("/srv/si"),
+            "t1".to_string(),
+            vec![
                 "wave-1".to_string(),
                 "canary".to_string(),
                 "canary".to_string(),
             ],
-        }],
+        )],
     );
     assert_eq!(
         variant_slots_digest(&dedup),
@@ -3614,7 +3614,7 @@ fn scope_retained_is_the_owning_variants_single_policy() {
     let via_p1 = f.with_helper(|helper| {
         compute_retained(
             &helper,
-            &f.config.pins,
+            f.config.pins(),
             &f.store,
             f.config.slot_retention("p1").unwrap(),
         )
@@ -3623,7 +3623,7 @@ fn scope_retained_is_the_owning_variants_single_policy() {
     let via_p2 = f.with_helper(|helper| {
         compute_retained(
             &helper,
-            &f.config.pins,
+            f.config.pins(),
             &f.store,
             f.config.slot_retention("p2").unwrap(),
         )
@@ -3656,7 +3656,7 @@ fn scope_strengthening_policy_never_reduces_retained() {
         f.with_helper(|helper| {
             compute_retained(
                 &helper,
-                &cfg.pins,
+                cfg.pins(),
                 &f.store,
                 cfg.slot_retention("p1").unwrap(),
             )
@@ -6906,12 +6906,12 @@ fn run_slot_view_property(members: Vec<Vec<bool>>, pushes: Vec<usize>) {
 /// every member target's view agrees with it by construction.
 fn assert_views_match_physical(store: &LocalStore, config: &ProjectConfig) {
     let physical = store.read_global_observed().unwrap();
-    for t in config.targets.keys() {
-        let view = store.read_observed(t, config).unwrap();
+    for (tname, _) in config.targets() {
+        let view = store.read_observed(tname, config).unwrap();
         let members: std::collections::HashSet<&str> = config
             .slot_defs()
             .iter()
-            .filter(|s| s.target == *t)
+            .filter(|s| s.target == *tname)
             .map(|s| s.id.as_str())
             .collect();
         let want: BTreeMap<_, _> = physical
@@ -6921,7 +6921,7 @@ fn assert_views_match_physical(store: &LocalStore, config: &ProjectConfig) {
             .collect();
         assert_eq!(
             view.slots, want,
-            "target '{t}': its view must equal the single physical slot state filtered to its \
+            "target '{tname}': its view must equal the single physical slot state filtered to its \
              member slots (same generation/artifact/last_deployment)"
         );
     }
@@ -6953,7 +6953,7 @@ fn assert_membership_never_changes_retention(
         let helper = RemoteHelper::new(&remote);
         compute_retained(
             &helper,
-            &cfg.pins,
+            cfg.pins(),
             store,
             cfg.slot_retention(slot_id).unwrap(),
         )

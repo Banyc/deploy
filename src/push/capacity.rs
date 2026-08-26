@@ -45,8 +45,7 @@ pub(crate) fn capacity_preflight(
             .find(|s| s.id.as_str() == a.placement_slot.as_str())
             .expect("assignment slot present in config");
         let server = config
-            .servers
-            .iter()
+            .servers()
             .find(|s| s.id.as_str() == slot.server)
             .expect("slot's server present in config");
         let capacity = &server.capacity;
@@ -100,7 +99,7 @@ pub(crate) fn capacity_preflight(
                 // hard capacity check below decides the outcome. The recheck
                 // below still fails the push loudly if space is genuinely
                 // short.
-                if let Ok(retained) = compute_retained(helper, &config.pins, store, retention) {
+                if let Ok(retained) = compute_retained(helper, config.pins(), store, retention) {
                     let active = HashSet::from([deployment_id.as_str().to_string()]);
                     helper.rotate(&retained, &active).ok();
                 }
@@ -335,10 +334,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         // Comfortable: 1000 bytes / 1% of total (1000) -> reserve 1000 ->
         // 7000 <= 10000.
-        config.servers[0].capacity = crate::config::CapacityConfig {
-            reserve_bytes: 1000,
-            reserve_percent: crate::scalar::CapacityPercent::new(1).expect("1 is in range"),
-        };
+        config = config
+            .with_server_capacity(
+                "s1",
+                crate::config::CapacityConfig {
+                    reserve_bytes: 1000,
+                    reserve_percent: crate::scalar::CapacityPercent::new(1).expect("1 is in range"),
+                },
+            )
+            .unwrap();
         capacity_preflight(
             &store,
             std::slice::from_ref(&assignment),
@@ -351,10 +355,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         // reserve_bytes dominates: 4500 bytes -> 10500 > 10000 fails, while
         // the 1% (1000 bytes) alone would fit.
-        config.servers[0].capacity = crate::config::CapacityConfig {
-            reserve_bytes: 4500,
-            reserve_percent: crate::scalar::CapacityPercent::new(1).expect("1 is in range"),
-        };
+        config = config
+            .with_server_capacity(
+                "s1",
+                crate::config::CapacityConfig {
+                    reserve_bytes: 4500,
+                    reserve_percent: crate::scalar::CapacityPercent::new(1).expect("1 is in range"),
+                },
+            )
+            .unwrap();
         let err = capacity_preflight(
             &store,
             std::slice::from_ref(&assignment),
@@ -374,10 +383,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // while the 1000 bytes alone would fit. The old avail-based math (10%
         // of the 10000 available = 1000) would have PASSED this case, so this
         // assertion pins the percent-of-total semantics.
-        config.servers[0].capacity = crate::config::CapacityConfig {
-            reserve_bytes: 1000,
-            reserve_percent: crate::scalar::CapacityPercent::new(10).expect("10 is in range"),
-        };
+        config = config
+            .with_server_capacity(
+                "s1",
+                crate::config::CapacityConfig {
+                    reserve_bytes: 1000,
+                    reserve_percent: crate::scalar::CapacityPercent::new(10)
+                        .expect("10 is in range"),
+                },
+            )
+            .unwrap();
         let err = capacity_preflight(
             &store,
             std::slice::from_ref(&assignment),
@@ -396,10 +411,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         remote
             .create_dir_all(&crate::layout::tree_root(tree.as_str()))
             .unwrap();
-        config.servers[0].capacity = crate::config::CapacityConfig {
-            reserve_bytes: u64::MAX,
-            reserve_percent: crate::scalar::CapacityPercent::new(100).expect("100 is in range"),
-        };
+        config = config
+            .with_server_capacity(
+                "s1",
+                crate::config::CapacityConfig {
+                    reserve_bytes: u64::MAX,
+                    reserve_percent: crate::scalar::CapacityPercent::new(100)
+                        .expect("100 is in range"),
+                },
+            )
+            .unwrap();
         capacity_preflight(
             &store,
             std::slice::from_ref(&assignment),
@@ -435,11 +456,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let helpers = HashMap::from([(SlotId::new("p1".to_string()), helper)]);
 
         let mut config = cfg();
-        config.servers[0].capacity = crate::config::CapacityConfig {
-            reserve_bytes,
-            reserve_percent: crate::scalar::CapacityPercent::new(reserve_percent)
-                .expect("fixture percent in range"),
-        };
+        config = config
+            .with_server_capacity(
+                "s1",
+                crate::config::CapacityConfig {
+                    reserve_bytes,
+                    reserve_percent: crate::scalar::CapacityPercent::new(reserve_percent)
+                        .expect("fixture percent in range"),
+                },
+            )
+            .unwrap();
         let assignment = PlannedAssignment {
             placement_slot: SlotId::new("p1".to_string()),
             artifact: ArtifactRef {

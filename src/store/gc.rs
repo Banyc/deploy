@@ -548,13 +548,13 @@ interval_seconds = 0
             )]),
             &BTreeMap::from([(
                 "standard".to_string(),
-                vec![SlotConfig {
-                    id: SLOT.to_string(),
-                    server: "s1".to_string(),
-                    deploy_dir: PathBuf::from("/srv/deploy/p1"),
-                    target: TARGET.to_string(),
-                    groups: Vec::new(),
-                }],
+                vec![SlotConfig::new(
+                    SLOT.to_string(),
+                    "s1".to_string(),
+                    PathBuf::from("/srv/deploy/p1"),
+                    TARGET.to_string(),
+                    Vec::new(),
+                )],
             )]),
             std::path::Path::new("."),
         );

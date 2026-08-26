@@ -49,12 +49,13 @@ use crate::error::{Error, Result};
 use crate::model::{CONFIG_SCHEMA_VERSION, ServerId, SlotId};
 use crate::records::PhysicalBinding;
 use crate::scalar::{
-    AbsoluteDeployDir, ApplicationDisplayName, BatchSize, CapacityPercent, Identifier,
-    RolloutGroupName,
+    AbsoluteDeployDir, ApplicationDisplayName, BatchSize, CapacityPercent, Host, Identifier,
+    RolloutGroupName, SshUser,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::num::NonZeroU16;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use unicode_normalization::UnicodeNormalization;
@@ -537,8 +538,13 @@ pub struct SlotConfig {
     /// The ID of the top-level server this slot deploys onto.
     pub server: String,
     /// Absolute directory on the server where this slot's deployment state
-    /// (objects, releases, generations, `current`) lives.
-    pub deploy_dir: PathBuf,
+    /// (objects, releases, generations, `current`) lives. INVARIANT-BEARING
+    /// (must be an absolute path on the server) — private, read through
+    /// [`SlotConfig::deploy_dir`]; the absoluteness rule is enforced by the
+    /// raw -> domain conversion and re-checked by every validated rebuild
+    /// operation, so an invalid deploy_dir can never enter a validated
+    /// [`ProjectConfig`].
+    deploy_dir: PathBuf,
     /// The slot's EXACTLY ONE owning target: a physical slot has one owner
     /// that governs its history, checkpoints, observed state, rollout
     /// policy, and retention policy. Required and must reference an existing
@@ -554,6 +560,36 @@ pub struct SlotConfig {
     /// "wave-1"]`.
     #[serde(default)]
     pub groups: Vec<String>,
+}
+
+impl SlotConfig {
+    /// Build a slot from its raw parts. The graph-level rules (identifier
+    /// validity, reference resolution, deploy_dir absoluteness, location
+    /// uniqueness) are enforced when the slot enters a [`ProjectConfig`]: the
+    /// raw -> domain conversion and every validated rebuild operation
+    /// re-validate the whole graph, so an invalid slot can never enter a
+    /// validated config.
+    pub fn new(
+        id: impl Into<String>,
+        server: impl Into<String>,
+        deploy_dir: impl Into<PathBuf>,
+        target: impl Into<String>,
+        groups: Vec<String>,
+    ) -> SlotConfig {
+        SlotConfig {
+            id: id.into(),
+            server: server.into(),
+            deploy_dir: deploy_dir.into(),
+            target: target.into(),
+            groups,
+        }
+    }
+
+    /// The absolute on-server directory this slot's deployment state lives
+    /// in (read-only).
+    pub fn deploy_dir(&self) -> &Path {
+        &self.deploy_dir
+    }
 }
 
 /// The DOMAIN target: ROLLOUT behavior only (batch_size, stop_on_failure,
@@ -875,47 +911,121 @@ impl From<Activation> for ActivationConfig {
     }
 }
 
-/// A validated server: connection details plus the ONE validated host
-/// identity ([`HostIdentity`] — never both/neither by construction). The
-/// `known_hosts`/`host_key_fingerprint` view fields are DERIVED from the
-/// identity enum at construction and kept only for the transport seam
-/// (`remote::create_remote`); the enum itself is private, so a `ServerDef`
-/// cannot be hand-built with an inconsistent identity.
+/// A server's EXACTLY ONE connection form, consolidating the raw
+/// `address`/`user`/`port`/identity fields: `Local` for a `local://`
+/// endpoint (the transport is rooted at the path after the prefix; no host
+/// verification is ever performed), or `Ssh` carrying the validated host,
+/// deployment account, nonzero port, and the EXACTLY ONE host-identity
+/// form. By construction a server is either local or SSH — never both,
+/// never neither. The raw/wire layer keeps the separate fields; the
+/// conversion builds this enum, so the connection form is exactly-one by
+/// construction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServerConnection {
+    /// A `local://` endpoint: `address` is the full `local://<absolute-path>`
+    /// form (the transport is rooted at the path after the prefix; no host
+    /// verification is ever performed). The identity is ALWAYS
+    /// [`HostIdentity::Local`] by construction (the conversion builds it so;
+    /// the validated rebuild operations re-check it).
+    Local {
+        address: String,
+        identity: HostIdentity,
+    },
+    /// An SSH connection: the validated host, deployment account, nonzero
+    /// port, and the EXACTLY ONE host-identity form ([`HostIdentity::KnownHosts`]
+    /// or [`HostIdentity::Fingerprint`] — never `Local`).
+    Ssh {
+        address: Host,
+        user: SshUser,
+        port: NonZeroU16,
+        identity: HostIdentity,
+    },
+}
+
+/// A validated server: the validated identifier plus the EXACTLY ONE
+/// connection form ([`ServerConnection`] — local or SSH, never both/neither
+/// by construction). The connection is PRIVATE: a server is only built by
+/// the raw -> domain conversion or the validated rebuild operations, so an
+/// inconsistent connection (an SSH form with a `Local` identity, a
+/// `local://` address that is not absolute) can never enter a validated
+/// [`ProjectConfig`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerDef {
     /// The server's validated identifier (non-empty, well-formed): parsed by
     /// the raw -> domain conversion, so an invalid server id cannot exist in
     /// a domain server.
     pub id: Identifier,
-    pub address: String,
-    pub user: String,
-    /// SSH port used to reach the server (default 22). Passed to both
-    /// `ssh -p` and `ssh-keyscan -p`.
-    pub port: u16,
-    /// Derived view of `host_identity`: `Some` exactly when the identity is
-    /// `KnownHosts`. Kept for `remote::create_remote` (the transport seam);
-    /// always consistent with the enum because construction is private.
-    pub(crate) known_hosts: Option<PathBuf>,
-    /// Derived view of `host_identity`: `Some` exactly when the identity is
-    /// `Fingerprint`. Kept for `remote::create_remote`; always consistent
-    /// with the enum because construction is private.
-    pub(crate) host_key_fingerprint: Option<String>,
+    /// The server's EXACTLY ONE connection form. Private: read through
+    /// [`ServerDef::connection`] and the wire-view accessors
+    /// ([`ServerDef::address`], [`ServerDef::user`], [`ServerDef::port`],
+    /// [`ServerDef::identity`]); changed only through the validated rebuild
+    /// operations, which re-validate the whole graph.
+    connection: ServerConnection,
     /// Per-server capacity headroom policy (defaults to 0/0 when omitted),
     /// shared by every deployment slot on this server and resolved from the
     /// caller's current configuration at preflight time. Not part of the
     /// release identity.
     pub capacity: CapacityConfig,
-    /// The ONE validated host-identity form. Private: a server is only
-    /// constructed by the raw -> domain conversion, so `Local`,
-    /// `KnownHosts`, and `Fingerprint` are mutually exclusive by
-    /// construction.
-    host_identity: HostIdentity,
 }
 
 impl ServerDef {
-    /// The server's validated, single host-identity form.
-    pub fn host_identity(&self) -> &HostIdentity {
-        &self.host_identity
+    /// Build a server from its validated parts. The connection's
+    /// well-formedness (a `local://` address that is absolute, an SSH form
+    /// with a `KnownHosts`/`Fingerprint` identity) is enforced when the
+    /// server enters a [`ProjectConfig`]: the conversion and every validated
+    /// rebuild operation re-validate the whole graph.
+    pub fn new(
+        id: Identifier,
+        connection: ServerConnection,
+        capacity: CapacityConfig,
+    ) -> ServerDef {
+        ServerDef {
+            id,
+            connection,
+            capacity,
+        }
+    }
+
+    /// The server's EXACTLY ONE connection form.
+    pub fn connection(&self) -> &ServerConnection {
+        &self.connection
+    }
+
+    /// The connection address: the full `local://<path>` endpoint for a
+    /// local server, the SSH host for an SSH server.
+    pub fn address(&self) -> &str {
+        match &self.connection {
+            ServerConnection::Local { address, .. } => address,
+            ServerConnection::Ssh { address, .. } => address.as_str(),
+        }
+    }
+
+    /// The SSH deployment account; empty for a local server (a local
+    /// endpoint has no SSH user).
+    pub fn user(&self) -> &str {
+        match &self.connection {
+            ServerConnection::Local { .. } => "",
+            ServerConnection::Ssh { user, .. } => user.as_str(),
+        }
+    }
+
+    /// The SSH port (default 22); 22 for a local server (a local endpoint
+    /// has no SSH port).
+    pub fn port(&self) -> u16 {
+        match &self.connection {
+            ServerConnection::Local { .. } => 22,
+            ServerConnection::Ssh { port, .. } => port.get(),
+        }
+    }
+
+    /// The server's validated, single host-identity form: ALWAYS
+    /// [`HostIdentity::Local`] for a local server, the exactly-one
+    /// `KnownHosts`/`Fingerprint` form for an SSH server.
+    pub fn identity(&self) -> &HostIdentity {
+        match &self.connection {
+            ServerConnection::Local { identity, .. } => identity,
+            ServerConnection::Ssh { identity, .. } => identity,
+        }
     }
 }
 
@@ -947,17 +1057,21 @@ pub struct VariantConfig {
 /// The validated domain configuration. Privately constructed: the ONLY ways
 /// to obtain a [`ProjectConfig`] are [`ProjectConfig::load`] (parse + discover + convert)
 /// and the crate-internal conversion [`ProjectConfig::from_raw_parts`], both of
-/// which run the full validation and fail closed on any invalid input. The
-/// variants map is private, so a hand-built graph cannot enter the domain.
+/// which run the full validation and fail closed on any invalid input.
 ///
-/// IMMUTABLE VALIDATED DOMAIN: the invariant-bearing fields are private and
-/// read-only ([`ProjectConfig::schema_version`], [`ProjectConfig::release`]); there is
-/// NO mutation path — the release is switched by [`ProjectConfig::load_release`], a
-/// FRESH validated load of the project with the new release selected (the
-/// original is never mutated). Fields without invariants (application, pins,
-/// servers, targets) stay public per the "don't overdo" rule — their inner
-/// invariant-bearing fields (e.g. [`ServerDef`]'s host identity) are already
-/// private.
+/// IMMUTABLE VALIDATED DOMAIN: EVERY field is private and read-only — the
+/// graph is exposed through read-only accessors and iterators
+/// ([`ProjectConfig::application`], [`ProjectConfig::pins`], [`ProjectConfig::servers`],
+/// [`ProjectConfig::targets`], [`ProjectConfig::server`], [`ProjectConfig::target`],
+/// [`ProjectConfig::slot_defs`], [`ProjectConfig::slot_retention`], ...). The ONLY
+/// mutation path is a VALIDATED operation returning a NEW [`ProjectConfig`] —
+/// [`ProjectConfig::load_release`] (a fresh validated load switching the
+/// release), [`ProjectConfig::with_server`], [`ProjectConfig::with_target`],
+/// [`ProjectConfig::with_pin`], ... — each of which re-validates the whole
+/// graph (references resolve, no impossible combos) and returns `Err` with
+/// the ORIGINAL untouched on any violation. A hand-built invalid graph cannot
+/// enter the domain, and no code can mutate a validated graph into an invalid
+/// state.
 ///
 /// The name [`DomainConfig`] aliases this type (the two-layer story: raw
 /// serde shapes -> validated domain).
@@ -976,8 +1090,9 @@ pub struct ProjectConfig {
     /// rendering, never as a path. The STORE directory key is the separate
     /// [`crate::scalar::ApplicationStoreKey`], derived from the display
     /// name at the store boundary ([`crate::store::local::LocalStore::new`]
-    /// takes the key), so the store path can never be escaped.
-    pub application: ApplicationDisplayName,
+    /// takes the key), so the store path can never be escaped. Private +
+    /// read-only ([`ProjectConfig::application`]).
+    application: ApplicationDisplayName,
     /// The active release: the name of a directory directly beneath
     /// `releases/` in the project root (`release: v1` -> `releases/v1/`).
     /// INVARIANT-BEARING (a single directory component) — private and
@@ -985,12 +1100,20 @@ pub struct ProjectConfig {
     /// [`ProjectConfig::load_release`] operation (a fresh load), never by
     /// assignment.
     release: ReleaseName,
-    /// Durable retention pins applied on every retention pass.
-    pub pins: Vec<Pin>,
-    /// Every validated server; a server's host identity is exactly one form
-    /// by construction ([`ServerDef::host_identity`]).
-    pub servers: Vec<ServerDef>,
-    pub targets: BTreeMap<String, TargetConfig>,
+    /// Durable retention pins applied on every retention pass. Private +
+    /// read-only ([`ProjectConfig::pins`]); changed only through the
+    /// validated [`ProjectConfig::with_pin`] / [`ProjectConfig::without_pin`]
+    /// operations.
+    pins: Vec<Pin>,
+    /// Every validated server; a server's connection is exactly one form by
+    /// construction ([`ServerDef::connection`]). Private + read-only
+    /// ([`ProjectConfig::servers`] iterator, [`ProjectConfig::server`]);
+    /// changed only through the validated rebuild operations.
+    servers: Vec<ServerDef>,
+    /// Every validated target, keyed by name. Private + read-only
+    /// ([`ProjectConfig::targets`] iterator, [`ProjectConfig::target`]);
+    /// changed only through the validated rebuild operations.
+    targets: BTreeMap<String, TargetConfig>,
     /// Validated variants, keyed by name. Private: the domain graph cannot
     /// be hand-built — variants only enter through the conversion.
     variants: BTreeMap<String, VariantConfig>,
@@ -1060,6 +1183,39 @@ impl ProjectConfig {
         &self.release
     }
 
+    /// The deployment application DISPLAY name (read-only).
+    pub fn application(&self) -> &ApplicationDisplayName {
+        &self.application
+    }
+
+    /// The durable retention pins applied on every retention pass
+    /// (read-only).
+    pub fn pins(&self) -> &[Pin] {
+        &self.pins
+    }
+
+    /// Every validated server, in declaration order (read-only iterator).
+    pub fn servers(&self) -> std::slice::Iter<'_, ServerDef> {
+        self.servers.iter()
+    }
+
+    /// Every validated target, in name order (read-only iterator).
+    pub fn targets(&self) -> impl Iterator<Item = (&str, &TargetConfig)> + '_ {
+        self.targets
+            .iter()
+            .map(|(name, target)| (name.as_str(), target))
+    }
+
+    /// Look up one validated server by id.
+    pub fn server(&self, id: &str) -> Option<&ServerDef> {
+        self.servers.iter().find(|s| s.id.as_str() == id)
+    }
+
+    /// Look up one validated target by name.
+    pub fn target(&self, name: &str) -> Option<&TargetConfig> {
+        self.targets.get(name)
+    }
+
     /// The VALIDATED release-switch operation: a FRESH LOAD of the project at
     /// `path` with `release` selected. The deploy.toml is re-read, the release
     /// field is overridden with `release` (whose name is re-validated —
@@ -1075,6 +1231,447 @@ impl ProjectConfig {
         manifest.release = release;
         let variants = manifest.load_variant_files(path)?;
         ProjectConfig::from_raw_parts(manifest, variants)
+    }
+
+    /// Re-validate the WHOLE graph: every reference resolves, ids are valid
+    /// and unique, no impossible combos, and the connection enum is
+    /// well-formed. This is the single gate every validated rebuild
+    /// operation runs after mutating a clone; the raw -> domain conversion
+    /// runs the same rules inline (with raw-layer context for the error
+    /// messages).
+    fn validate_graph(&self) -> Result<()> {
+        // Server ids are validated [`Identifier`]s by construction; the graph
+        // rule is uniqueness. The connection enum must be well-formed: a
+        // local form carries a `local://` address whose path is absolute and
+        // a `Local` identity; an SSH form carries a `KnownHosts`/`Fingerprint`
+        // identity (never `Local`) with an absolute `known_hosts`.
+        let mut server_ids = HashSet::new();
+        for s in &self.servers {
+            if !server_ids.insert(s.id.as_str()) {
+                return Err(Error::config(format!(
+                    "duplicate server id '{}' in top-level servers",
+                    s.id
+                )));
+            }
+            match s.connection() {
+                ServerConnection::Local { address, identity } => {
+                    if identity != &HostIdentity::Local {
+                        return Err(Error::config(format!(
+                            "server '{}': a local connection must carry a Local identity",
+                            s.id
+                        )));
+                    }
+                    let Some(path) = address.strip_prefix("local://") else {
+                        return Err(Error::config(format!(
+                            "server '{}': a local connection must carry a local:// address",
+                            s.id
+                        )));
+                    };
+                    if !Path::new(path).is_absolute() {
+                        return Err(Error::config(format!(
+                            "server '{}': local:// endpoint must be an absolute path",
+                            s.id
+                        )));
+                    }
+                }
+                ServerConnection::Ssh { identity, .. } => match identity {
+                    HostIdentity::Local => {
+                        return Err(Error::config(format!(
+                            "server '{}': an SSH connection cannot carry a Local identity",
+                            s.id
+                        )));
+                    }
+                    HostIdentity::KnownHosts(p) => {
+                        if !p.is_absolute() {
+                            return Err(Error::config(format!(
+                                "server '{}': known_hosts must be an absolute path",
+                                s.id
+                            )));
+                        }
+                    }
+                    HostIdentity::Fingerprint(_) => {}
+                },
+            }
+        }
+
+        // Variant names are valid identifiers (the map is keyed by them) and
+        // the typed activation enum is well-formed (systemd requires units).
+        let mut variant_names = HashSet::new();
+        for name in self.variants.keys() {
+            Identifier::parse(name).map_err(|_| {
+                Error::config(format!(
+                    "variant name '{name}' must be a non-empty, well-formed identifier"
+                ))
+            })?;
+            if !variant_names.insert(name) {
+                return Err(Error::config(format!("duplicate variant name '{name}'")));
+            }
+            if let Activation::Systemd(sa) = &self.variants[name].activation
+                && sa.units.is_empty()
+            {
+                return Err(Error::config(format!(
+                    "variant '{name}': systemd activation requires at least one unit"
+                )));
+            }
+        }
+        if variant_names.is_empty() {
+            return Err(Error::config(
+                "at least one release variant must be declared",
+            ));
+        }
+
+        // Slots: ids valid + unique across variants, references resolve,
+        // groups clean, deploy_dir absolute, locations unique.
+        let mut slot_ids = HashSet::new();
+        let mut bound_locations: BTreeMap<(&str, &Path), &str> = BTreeMap::new();
+        for (vname, variant) in &self.variants {
+            for p in &variant.slots {
+                Identifier::parse(&p.id).map_err(|_| {
+                    Error::config(format!(
+                        "variant '{vname}': slot id '{}' must be a non-empty, well-formed identifier",
+                        p.id
+                    ))
+                })?;
+                Identifier::parse(&p.server).map_err(|_| {
+                    Error::config(format!(
+                        "variant '{vname}': slot '{}' server '{}' must be a non-empty, well-formed identifier",
+                        p.id, p.server
+                    ))
+                })?;
+                Identifier::parse(&p.target).map_err(|_| {
+                    Error::config(format!(
+                        "variant '{vname}': slot '{}' target '{}' must be a non-empty, well-formed identifier",
+                        p.id, p.target
+                    ))
+                })?;
+                if !slot_ids.insert(p.id.clone()) {
+                    return Err(Error::config(format!(
+                        "duplicate slot id '{}' (declared by variant '{vname}')",
+                        p.id
+                    )));
+                }
+                if !server_ids.contains(p.server.as_str()) {
+                    return Err(Error::config(format!(
+                        "variant '{vname}': slot '{}' references unknown server '{}'",
+                        p.id, p.server
+                    )));
+                }
+                if !self.targets.contains_key(&p.target) {
+                    return Err(Error::config(format!(
+                        "variant '{vname}': slot '{}' references unknown target '{}'",
+                        p.id, p.target
+                    )));
+                }
+                let mut seen_groups = HashSet::new();
+                for g in &p.groups {
+                    RolloutGroupName::parse(g).map_err(|_| {
+                        Error::config(format!(
+                            "variant '{vname}': slot '{}' declares an invalid group name {g:?}",
+                            p.id
+                        ))
+                    })?;
+                    if !seen_groups.insert(g) {
+                        return Err(Error::config(format!(
+                            "variant '{vname}': slot '{}' declares duplicate group '{}'",
+                            p.id, g
+                        )));
+                    }
+                }
+                if !p.deploy_dir.is_absolute() {
+                    return Err(Error::config(format!(
+                        "variant '{vname}': slot '{}' deploy_dir must be an absolute path on the server",
+                        p.id
+                    )));
+                }
+                if let Some(existing) =
+                    bound_locations.get(&(p.server.as_str(), p.deploy_dir.as_path()))
+                {
+                    return Err(Error::config(format!(
+                        "slots '{existing}' and '{}' bind the same location (server '{}', deploy_dir '{}'); each server+deploy_dir pair must belong to exactly one slot",
+                        p.id,
+                        p.server,
+                        p.deploy_dir.display()
+                    )));
+                }
+                bound_locations.insert((p.server.as_str(), p.deploy_dir.as_path()), &p.id);
+            }
+        }
+
+        // Targets: names valid, each has at least one member slot, one slot
+        // per server per target.
+        if self.targets.is_empty() {
+            return Err(Error::config("at least one target must be declared"));
+        }
+        for tname in self.targets.keys() {
+            Identifier::parse(tname).map_err(|_| {
+                Error::config(format!(
+                    "target name '{tname}' must be a non-empty, well-formed identifier"
+                ))
+            })?;
+            let mut used_servers = HashSet::new();
+            let mut members = 0;
+            for slot in self.variants.values().flat_map(|v| v.slots.iter()) {
+                if slot.target != *tname {
+                    continue;
+                }
+                members += 1;
+                if !used_servers.insert(slot.server.as_str()) {
+                    return Err(Error::config(format!(
+                        "target '{tname}' has multiple slots on server '{}'",
+                        slot.server
+                    )));
+                }
+            }
+            if members == 0 {
+                return Err(Error::config(format!("target '{tname}' has no slots")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Add or replace a server (keyed by its id). Re-validates the whole
+    /// graph: a duplicate id, a slot reference left dangling, or an
+    /// ill-formed connection fails the operation and the ORIGINAL is
+    /// untouched (the operation never mutates).
+    pub fn with_server(&self, server: ServerDef) -> Result<ProjectConfig> {
+        let mut next = self.clone();
+        if let Some(existing) = next.servers.iter_mut().find(|s| s.id == server.id) {
+            *existing = server;
+        } else {
+            next.servers.push(server);
+        }
+        next.validate_graph()?;
+        Ok(next)
+    }
+
+    /// Remove a server. Fails if any slot references it (the graph would
+    /// dangle); the ORIGINAL is untouched.
+    pub fn without_server(&self, id: &str) -> Result<ProjectConfig> {
+        let mut next = self.clone();
+        let Some(pos) = next.servers.iter().position(|s| s.id.as_str() == id) else {
+            return Err(Error::not_found(format!("server '{id}'")));
+        };
+        next.servers.remove(pos);
+        next.validate_graph()?;
+        Ok(next)
+    }
+
+    /// Rename a server, rewriting every slot reference. Fails if the new id
+    /// collides with an existing server; the ORIGINAL is untouched.
+    pub fn rename_server(&self, old: &str, new: &str) -> Result<ProjectConfig> {
+        let new_id = Identifier::parse(new).map_err(|_| {
+            Error::config(format!(
+                "server id '{new}' must be a non-empty, well-formed identifier"
+            ))
+        })?;
+        let mut next = self.clone();
+        if !next.servers.iter().any(|s| s.id.as_str() == old) {
+            return Err(Error::not_found(format!("server '{old}'")));
+        }
+        if next.servers.iter().any(|s| s.id.as_str() == new) {
+            return Err(Error::config(format!("duplicate server id '{new}'")));
+        }
+        for server in &mut next.servers {
+            if server.id.as_str() == old {
+                server.id = new_id.clone();
+            }
+        }
+        for variant in next.variants.values_mut() {
+            for slot in &mut variant.slots {
+                if slot.server == old {
+                    slot.server = new.to_string();
+                }
+            }
+        }
+        next.validate_graph()?;
+        Ok(next)
+    }
+
+    /// Add or replace a target (keyed by its name). A NEW target must already
+    /// have at least one member slot (the per-target non-empty rule is
+    /// re-validated), so adding a target with no slots fails; the ORIGINAL is
+    /// untouched.
+    pub fn with_target(&self, name: &str, target: TargetConfig) -> Result<ProjectConfig> {
+        Identifier::parse(name).map_err(|_| {
+            Error::config(format!(
+                "target name '{name}' must be a non-empty, well-formed identifier"
+            ))
+        })?;
+        let mut next = self.clone();
+        next.targets.insert(name.to_string(), target);
+        next.validate_graph()?;
+        Ok(next)
+    }
+
+    /// Remove a target. Fails if any slot references it (the graph would
+    /// dangle); the ORIGINAL is untouched.
+    pub fn without_target(&self, name: &str) -> Result<ProjectConfig> {
+        let mut next = self.clone();
+        if next.targets.remove(name).is_none() {
+            return Err(Error::not_found(format!("target '{name}'")));
+        }
+        next.validate_graph()?;
+        Ok(next)
+    }
+
+    /// Rename a target, rewriting every slot reference. Fails if the new
+    /// name collides with an existing target; the ORIGINAL is untouched.
+    pub fn rename_target(&self, old: &str, new: &str) -> Result<ProjectConfig> {
+        Identifier::parse(new).map_err(|_| {
+            Error::config(format!(
+                "target name '{new}' must be a non-empty, well-formed identifier"
+            ))
+        })?;
+        let mut next = self.clone();
+        let Some(target) = next.targets.remove(old) else {
+            return Err(Error::not_found(format!("target '{old}'")));
+        };
+        if next.targets.contains_key(new) {
+            return Err(Error::config(format!("duplicate target name '{new}'")));
+        }
+        next.targets.insert(new.to_string(), target);
+        for variant in next.variants.values_mut() {
+            for slot in &mut variant.slots {
+                if slot.target == old {
+                    slot.target = new.to_string();
+                }
+            }
+        }
+        next.validate_graph()?;
+        Ok(next)
+    }
+
+    /// Add a durable retention pin. Pins carry no graph invariants, but the
+    /// whole graph is still re-validated; the ORIGINAL is untouched.
+    pub fn with_pin(&self, pin: Pin) -> Result<ProjectConfig> {
+        let mut next = self.clone();
+        next.pins.push(pin);
+        next.validate_graph()?;
+        Ok(next)
+    }
+
+    /// Remove every pin naming the given release. Fails if no pin names it;
+    /// the ORIGINAL is untouched.
+    pub fn without_pin(&self, release: &str) -> Result<ProjectConfig> {
+        let mut next = self.clone();
+        let before = next.pins.len();
+        next.pins.retain(|p| p.release != release);
+        if next.pins.len() == before {
+            return Err(Error::not_found(format!("pin for release '{release}'")));
+        }
+        next.validate_graph()?;
+        Ok(next)
+    }
+
+    /// Rename every pin naming `old` to name `new`. Fails if no pin names
+    /// `old`; the ORIGINAL is untouched.
+    pub fn rename_pin(&self, old: &str, new: &str) -> Result<ProjectConfig> {
+        let mut next = self.clone();
+        let mut renamed = false;
+        for pin in &mut next.pins {
+            if pin.release == old {
+                pin.release = new.to_string();
+                renamed = true;
+            }
+        }
+        if !renamed {
+            return Err(Error::not_found(format!("pin for release '{old}'")));
+        }
+        next.validate_graph()?;
+        Ok(next)
+    }
+
+    /// Add or replace a slot inside a variant (keyed by slot id).
+    /// Re-validates the whole graph: a duplicate slot id, an unresolvable
+    /// server/target reference, a relative deploy_dir, a shared location, or
+    /// a target left without members fails the operation and the ORIGINAL is
+    /// untouched.
+    pub fn with_slot(&self, variant: &str, slot: SlotConfig) -> Result<ProjectConfig> {
+        let mut next = self.clone();
+        let Some(v) = next.variants.get_mut(variant) else {
+            return Err(Error::not_found(format!("variant '{variant}'")));
+        };
+        if let Some(existing) = v.slots.iter_mut().find(|s| s.id == slot.id) {
+            *existing = slot;
+        } else {
+            v.slots.push(slot);
+        }
+        next.validate_graph()?;
+        Ok(next)
+    }
+
+    /// Remove a slot from a variant. Fails if the slot does not exist or its
+    /// target would be left without members; the ORIGINAL is untouched.
+    pub fn without_slot(&self, variant: &str, slot_id: &str) -> Result<ProjectConfig> {
+        let mut next = self.clone();
+        let Some(v) = next.variants.get_mut(variant) else {
+            return Err(Error::not_found(format!("variant '{variant}'")));
+        };
+        let before = v.slots.len();
+        v.slots.retain(|s| s.id != slot_id);
+        if v.slots.len() == before {
+            return Err(Error::not_found(format!(
+                "slot '{slot_id}' in variant '{variant}'"
+            )));
+        }
+        next.validate_graph()?;
+        Ok(next)
+    }
+
+    /// Rename a slot inside a variant. Fails if the slot does not exist or
+    /// the new id collides; the ORIGINAL is untouched.
+    pub fn rename_slot(&self, variant: &str, old: &str, new: &str) -> Result<ProjectConfig> {
+        let mut next = self.clone();
+        let Some(v) = next.variants.get_mut(variant) else {
+            return Err(Error::not_found(format!("variant '{variant}'")));
+        };
+        let mut renamed = false;
+        for slot in &mut v.slots {
+            if slot.id == old {
+                slot.id = new.to_string();
+                renamed = true;
+            }
+        }
+        if !renamed {
+            return Err(Error::not_found(format!(
+                "slot '{old}' in variant '{variant}'"
+            )));
+        }
+        next.validate_graph()?;
+        Ok(next)
+    }
+
+    /// Replace a server's EXACTLY ONE connection form. Re-validates the
+    /// whole graph (the connection enum must be well-formed); the ORIGINAL is
+    /// untouched.
+    pub fn with_server_connection(
+        &self,
+        id: &str,
+        connection: ServerConnection,
+    ) -> Result<ProjectConfig> {
+        let mut next = self.clone();
+        let Some(server) = next.servers.iter_mut().find(|s| s.id.as_str() == id) else {
+            return Err(Error::not_found(format!("server '{id}'")));
+        };
+        server.connection = connection;
+        next.validate_graph()?;
+        Ok(next)
+    }
+
+    /// Replace a server's capacity headroom policy. Re-validates the whole
+    /// graph; the ORIGINAL is untouched.
+    pub fn with_server_capacity(
+        &self,
+        id: &str,
+        capacity: CapacityConfig,
+    ) -> Result<ProjectConfig> {
+        let mut next = self.clone();
+        let Some(server) = next.servers.iter_mut().find(|s| s.id.as_str() == id) else {
+            return Err(Error::not_found(format!("server '{id}'")));
+        };
+        server.capacity = capacity;
+        next.validate_graph()?;
+        Ok(next)
     }
 
     /// Absolute release directory: forced to `<project>/releases/<release>`.
@@ -1417,25 +2014,60 @@ impl TryFrom<RawProject> for ProjectConfig {
                         s.id
                     ))
                 })?;
-            // Collapse the raw identity pair into the ONE validated form.
+            // Collapse the raw identity pair into the ONE validated form
+            // (the per-source format checks apply to every server; the
+            // exactly-one rule is scoped to SSH addresses).
             let identity = validate_server_identity(s)?;
-            let (known_hosts, host_key_fingerprint) = match &identity {
-                HostIdentity::Local => (None, None),
-                HostIdentity::KnownHosts(p) => (Some(p.clone()), None),
-                HostIdentity::Fingerprint(f) => (None, Some(f.as_str().to_string())),
+            // Build the EXACTLY ONE connection form: a `local://` address
+            // becomes `Local` (the path after the prefix must be absolute —
+            // the transport is rooted there), an SSH address becomes `Ssh`
+            // with the validated host/user/nonzero port and the exactly-one
+            // host identity.
+            let connection = if s.address.starts_with("local://") {
+                let path = s.address.trim_start_matches("local://");
+                if !Path::new(path).is_absolute() {
+                    return Err(Error::config(format!(
+                        "server '{}': local:// endpoint must be an absolute path",
+                        s.id
+                    )));
+                }
+                ServerConnection::Local {
+                    address: s.address.clone(),
+                    identity,
+                }
+            } else {
+                let address = Host::parse(&s.address).map_err(|_| {
+                    Error::config(format!(
+                        "server '{}': address '{}' must be a well-formed SSH host",
+                        s.id, s.address
+                    ))
+                })?;
+                let user = SshUser::parse(&s.user).map_err(|_| {
+                    Error::config(format!(
+                        "server '{}': user '{}' must be a well-formed SSH user",
+                        s.id, s.user
+                    ))
+                })?;
+                let port = NonZeroU16::new(s.port).ok_or_else(|| {
+                    Error::config(format!(
+                        "server '{}': port must be nonzero (got {})",
+                        s.id, s.port
+                    ))
+                })?;
+                ServerConnection::Ssh {
+                    address,
+                    user,
+                    port,
+                    identity,
+                }
             };
             domain_servers.push(ServerDef {
                 id,
-                address: s.address.clone(),
-                user: s.user.clone(),
-                port: s.port,
-                known_hosts,
-                host_key_fingerprint,
+                connection,
                 capacity: CapacityConfig {
                     reserve_bytes: s.capacity.reserve_bytes,
                     reserve_percent,
                 },
-                host_identity: identity,
             });
         }
 
@@ -2461,13 +3093,16 @@ slots = ["p1"]
             .replace("host_key_fingerprint = \"SHA256:test\"\n", "");
         std::fs::write(&p, local).unwrap();
         let cfg = ProjectConfig::load(&p).expect("local:// address needs no identity");
-        assert!(cfg.servers[0].address.starts_with("local://"));
+        assert!(cfg.server("s1").unwrap().address().starts_with("local://"));
 
         // SSH address + exactly one source: valid.
         std::fs::write(&p, deploy_toml("v1")).unwrap();
         let cfg = ProjectConfig::load(&p).expect("SSH address with exactly one identity is valid");
         assert_eq!(
-            cfg.servers[0].host_key_fingerprint.as_deref(),
+            match cfg.server("s1").unwrap().identity() {
+                HostIdentity::Fingerprint(f) => Some(f.as_str()),
+                _ => None,
+            },
             Some("SHA256:test")
         );
         let kh_only = deploy_toml("v1").replace(
@@ -2477,10 +3112,16 @@ slots = ["p1"]
         std::fs::write(&p, kh_only).unwrap();
         let cfg = ProjectConfig::load(&p).expect("known_hosts-only SSH address is valid");
         assert_eq!(
-            cfg.servers[0].known_hosts.as_deref(),
+            match cfg.server("s1").unwrap().identity() {
+                HostIdentity::KnownHosts(p) => Some(p.as_path()),
+                _ => None,
+            },
             Some(Path::new("/etc/ssh/known_hosts"))
         );
-        assert!(cfg.servers[0].host_key_fingerprint.is_none());
+        assert!(!matches!(
+            cfg.server("s1").unwrap().identity(),
+            HostIdentity::Fingerprint(_)
+        ));
     }
 
     /// `local://` addresses never perform host verification, so their domain
@@ -2504,8 +3145,8 @@ slots = ["p1"]
         // local:// with no identity: Local.
         std::fs::write(&p, local.clone()).unwrap();
         let cfg = ProjectConfig::load(&p).expect("local:// without identity loads");
-        assert!(cfg.servers[0].address.starts_with("local://"));
-        assert_eq!(cfg.servers[0].host_identity(), &HostIdentity::Local);
+        assert!(cfg.server("s1").unwrap().address().starts_with("local://"));
+        assert_eq!(cfg.server("s1").unwrap().identity(), &HostIdentity::Local);
 
         // local:// + known_hosts: the file may say it, but the domain
         // identity is still Local (a local endpoint never verifies a host).
@@ -2515,7 +3156,7 @@ slots = ["p1"]
         );
         std::fs::write(&p, with_kh).unwrap();
         let cfg = ProjectConfig::load(&p).expect("local:// + known_hosts is allowed");
-        assert_eq!(cfg.servers[0].host_identity(), &HostIdentity::Local);
+        assert_eq!(cfg.server("s1").unwrap().identity(), &HostIdentity::Local);
 
         // local:// + host_key_fingerprint: allowed, still Local.
         let with_fp = local.replace(
@@ -2524,7 +3165,7 @@ slots = ["p1"]
         );
         std::fs::write(&p, with_fp).unwrap();
         let cfg = ProjectConfig::load(&p).expect("local:// + fingerprint is allowed");
-        assert_eq!(cfg.servers[0].host_identity(), &HostIdentity::Local);
+        assert_eq!(cfg.server("s1").unwrap().identity(), &HostIdentity::Local);
 
         // local:// + BOTH identity sources: still allowed — the ambiguity
         // rule is scoped to SSH addresses only (the exact same pair is
@@ -2538,7 +3179,7 @@ slots = ["p1"]
             );
         std::fs::write(&p, with_both).unwrap();
         let cfg = ProjectConfig::load(&p).expect("local:// + both identities is allowed");
-        assert_eq!(cfg.servers[0].host_identity(), &HostIdentity::Local);
+        assert_eq!(cfg.server("s1").unwrap().identity(), &HostIdentity::Local);
     }
 
     /// Every user-written config surface is strict: an unknown key fails at
@@ -2783,7 +3424,11 @@ slots = ["p1"]
         // Omitted port defaults to 22.
         std::fs::write(&p, deploy_toml("v1")).unwrap();
         let cfg = ProjectConfig::load(&p).expect("config loads");
-        assert_eq!(cfg.servers[0].port, 22, "default SSH port is 22");
+        assert_eq!(
+            cfg.server("s1").unwrap().port(),
+            22,
+            "default SSH port is 22"
+        );
 
         // `port` alone does not satisfy the exactly-one identity rule.
         let port_only = deploy_toml("v1")
@@ -2801,7 +3446,7 @@ slots = ["p1"]
         let with_port = deploy_toml("v1").replace("user = \"u\"", "user = \"u\"\nport = 2200");
         std::fs::write(&p, with_port).unwrap();
         let cfg = ProjectConfig::load(&p).expect("explicit port with one identity is valid");
-        assert_eq!(cfg.servers[0].port, 2200);
+        assert_eq!(cfg.server("s1").unwrap().port(), 2200);
     }
 
     /// `deny_unknown_fields` extends to the remaining user-written surfaces:
@@ -3466,14 +4111,14 @@ interval_seconds = 0
 
         // The manifest surface is carried through.
         assert_eq!(cfg.schema_version, CONFIG_SCHEMA_VERSION);
-        assert_eq!(cfg.application.as_str(), "app");
+        assert_eq!(cfg.application().as_str(), "app");
         assert_eq!(cfg.release().as_str(), "v1");
-        assert_eq!(cfg.targets.len(), 1);
+        assert_eq!(cfg.targets().count(), 1);
 
         // A local:// server's identity is EXACTLY ONE form: Local.
-        assert_eq!(cfg.servers.len(), 1);
-        assert_eq!(cfg.servers[0].host_identity(), &HostIdentity::Local);
-        assert!(cfg.servers[0].address.starts_with("local://"));
+        assert_eq!(cfg.servers().count(), 1);
+        assert_eq!(cfg.server("s1").unwrap().identity(), &HostIdentity::Local);
+        assert!(cfg.server("s1").unwrap().address().starts_with("local://"));
 
         // The variant carries the typed activation enum (none here), its
         // slot, and its slot-owned retention.
@@ -3509,15 +4154,21 @@ interval_seconds = 0
         p.manifest.servers[0].host_key_fingerprint = Some("SHA256:abc".to_string());
         let cfg = ProjectConfig::from_raw_parts(p.manifest, p.variants)
             .expect("fingerprint server converts");
-        let HostIdentity::Fingerprint(fp) = cfg.servers[0].host_identity() else {
+        let HostIdentity::Fingerprint(fp) = cfg.server("s1").unwrap().identity() else {
             panic!("SSH + fingerprint must produce HostIdentity::Fingerprint");
         };
         assert_eq!(fp.as_str(), "SHA256:abc");
         assert_eq!(
-            cfg.servers[0].host_key_fingerprint.as_deref(),
+            match cfg.server("s1").unwrap().identity() {
+                HostIdentity::Fingerprint(f) => Some(f.as_str()),
+                _ => None,
+            },
             Some("SHA256:abc")
         );
-        assert!(cfg.servers[0].known_hosts.is_none());
+        assert!(!matches!(
+            cfg.server("s1").unwrap().identity(),
+            HostIdentity::KnownHosts(_)
+        ));
     }
 
     /// An SSH server with a dedicated known_hosts file resolves to
@@ -3530,14 +4181,20 @@ interval_seconds = 0
         let cfg = ProjectConfig::from_raw_parts(p.manifest, p.variants)
             .expect("known_hosts identity converts");
         assert_eq!(
-            cfg.servers[0].host_identity(),
+            cfg.server("s1").unwrap().identity(),
             &HostIdentity::KnownHosts(PathBuf::from("/etc/ssh/known_hosts"))
         );
         assert_eq!(
-            cfg.servers[0].known_hosts.as_deref(),
+            match cfg.server("s1").unwrap().identity() {
+                HostIdentity::KnownHosts(p) => Some(p.as_path()),
+                _ => None,
+            },
             Some(Path::new("/etc/ssh/known_hosts"))
         );
-        assert!(cfg.servers[0].host_key_fingerprint.is_none());
+        assert!(!matches!(
+            cfg.server("s1").unwrap().identity(),
+            HostIdentity::Fingerprint(_)
+        ));
     }
 
     /// A systemd variant converts to the typed `Activation::Systemd` with its
@@ -3875,15 +4532,18 @@ interval_seconds = 0
         ]
     }
 
-    /// Assert the invariants every successful conversion must produce:
-    /// valid + unique identifiers, every reference resolves (slot->server,
-    /// slot->target, slot->variant, group names), exactly-one host identity
-    /// (and the derived view fields consistent with it), the activation
-    /// enum covers the space, and the per-target graph rules hold. This
-    /// inspects the DomainConfig itself — it never re-runs the validation.
+    /// Assert the invariants every successful conversion (and every
+    /// successful validated rebuild operation) must produce: valid + unique
+    /// identifiers, every reference resolves (slot->server, slot->target,
+    /// slot->variant, group names), the connection enum is well-formed (a
+    /// local form carries a `local://` absolute address and a `Local`
+    /// identity; an SSH form carries a `KnownHosts`/`Fingerprint` identity
+    /// with an absolute `known_hosts`), the activation enum covers the
+    /// space, and the per-target graph rules hold. This inspects the
+    /// DomainConfig itself — it never re-runs the validation.
     fn assert_domain_invariants(cfg: &ProjectConfig) {
         let mut server_ids = HashSet::new();
-        for s in &cfg.servers {
+        for s in cfg.servers() {
             assert!(
                 valid_identifier(s.id.as_str()),
                 "server id must be valid: {:?}",
@@ -3893,29 +4553,54 @@ interval_seconds = 0
                 server_ids.insert(s.id.as_str()),
                 "server ids must be unique"
             );
-            match s.host_identity() {
-                HostIdentity::Local => {
-                    assert!(
-                        s.address.starts_with("local://"),
-                        "Local identity requires a local:// address"
+            match s.connection() {
+                ServerConnection::Local { address, identity } => {
+                    assert_eq!(
+                        identity,
+                        &HostIdentity::Local,
+                        "a local connection must carry a Local identity"
                     );
-                    assert_eq!(s.known_hosts, None);
-                    assert_eq!(s.host_key_fingerprint, None);
-                }
-                HostIdentity::KnownHosts(p) => {
-                    assert!(!s.address.starts_with("local://"));
-                    assert!(p.is_absolute(), "known_hosts must be absolute");
-                    assert_eq!(s.known_hosts.as_deref(), Some(p.as_path()));
-                    assert_eq!(s.host_key_fingerprint, None);
-                }
-                HostIdentity::Fingerprint(fp) => {
-                    assert!(!s.address.starts_with("local://"));
                     assert!(
-                        fp.as_str().starts_with("SHA256:"),
-                        "fingerprints are format-checked"
+                        address.starts_with("local://"),
+                        "a local connection must carry a local:// address"
                     );
-                    assert_eq!(s.host_key_fingerprint.as_deref(), Some(fp.as_str()));
-                    assert_eq!(s.known_hosts, None);
+                    let path = address.trim_start_matches("local://");
+                    assert!(
+                        Path::new(path).is_absolute(),
+                        "a local:// endpoint must be an absolute path"
+                    );
+                }
+                ServerConnection::Ssh {
+                    address,
+                    user,
+                    port,
+                    identity,
+                } => {
+                    assert!(
+                        valid_identifier(address.as_str()),
+                        "SSH host must be valid: {:?}",
+                        address
+                    );
+                    assert!(
+                        valid_identifier(user.as_str()),
+                        "SSH user must be valid: {:?}",
+                        user
+                    );
+                    assert!(port.get() > 0, "SSH port must be nonzero");
+                    match identity {
+                        HostIdentity::Local => {
+                            panic!("an SSH connection cannot carry a Local identity");
+                        }
+                        HostIdentity::KnownHosts(p) => {
+                            assert!(p.is_absolute(), "known_hosts must be absolute");
+                        }
+                        HostIdentity::Fingerprint(fp) => {
+                            assert!(
+                                fp.as_str().starts_with("SHA256:"),
+                                "fingerprints are format-checked"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -3944,16 +4629,19 @@ interval_seconds = 0
                 "slot ids unique across variants"
             );
             assert!(
-                cfg.servers.iter().any(|s| s.id.as_str() == slot.server),
+                cfg.servers().any(|s| s.id.as_str() == slot.server),
                 "slot '{}' server must resolve",
                 slot.id
             );
             assert!(
-                cfg.targets.contains_key(&slot.target),
+                cfg.target(slot.target.as_str()).is_some(),
                 "slot '{}' target must resolve",
                 slot.id
             );
-            assert!(slot.deploy_dir.is_absolute(), "deploy_dir must be absolute");
+            assert!(
+                slot.deploy_dir().is_absolute(),
+                "deploy_dir must be absolute"
+            );
             let mut seen_groups = HashSet::new();
             for g in &slot.groups {
                 assert!(!g.trim().is_empty(), "group names must be non-empty");
@@ -3965,7 +4653,7 @@ interval_seconds = 0
             );
         }
 
-        for tname in cfg.targets.keys() {
+        for (tname, _) in cfg.targets() {
             assert!(valid_identifier(tname), "target name must be valid");
             let slots = cfg.target_slots(tname).expect("target exists");
             assert!(!slots.is_empty(), "a target must have at least one slot");
@@ -3981,7 +4669,7 @@ interval_seconds = 0
             // domain conversion, so every domain target carries EXACTLY one
             // supported policy — an unsupported spelling can never enter a
             // domain (it fails the conversion instead).
-            match cfg.targets[tname].rollout.failure_policy {
+            match cfg.target(tname).unwrap().rollout.failure_policy {
                 FailurePolicy::RollbackChanged => {}
                 FailurePolicy::LeaveChanged => {}
             }
@@ -4009,6 +4697,600 @@ interval_seconds = 0
             }
             // fail-closed: rejection is a valid outcome for arbitrary input
         }
+    }
+
+    // =====================================================================
+    // THE REBUILD-OP PROPERTY: validated graph-rebuilding operations
+    // =====================================================================
+    //
+    // THE USER'S REQUIREMENT: the domain graph is IMMUTABLE — every mutation
+    // is a VALIDATED operation returning a NEW [`ProjectConfig`] (or `Err`
+    // with the ORIGINAL untouched). The property generates VALID
+    // configurations plus ARBITRARY update operations (add/remove/rename a
+    // server, a target, a pin, a slot; change a connection field); every
+    // SUCCESSFUL result must satisfy the ONE central
+    // [`assert_domain_invariants`], and every INVALID update must FAIL and
+    // PRESERVE the original (its accessors are unchanged).
+
+    /// A server template: (id, address, user, known_hosts, fingerprint).
+    type ServerTemplate = (
+        &'static str,
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+        Option<&'static str>,
+    );
+
+    /// A valid raw project by construction: 1..=2 servers from a pool of
+    /// valid templates, 1..=2 targets, and slots that reference the chosen
+    /// servers/targets with unique ids and deploy_dirs (one slot per server
+    /// per target). The conversion always succeeds.
+    fn valid_raw_project() -> impl Strategy<Value = RawProject> {
+        let server_templates: Vec<ServerTemplate> = vec![
+            ("s1", "local:///srv/s1", "u", None, None),
+            (
+                "s2",
+                "db.example.com",
+                "ops",
+                Some("/etc/ssh/known_hosts"),
+                None,
+            ),
+            ("s3", "web.example.com", "deploy", None, Some("SHA256:test")),
+        ];
+        let target_names: Vec<&str> = vec!["t1", "t2", "t3"];
+        prop::sample::subsequence(server_templates, 1..=2).prop_flat_map(move |servers| {
+            let n_servers = servers.len();
+            prop::sample::subsequence(target_names.clone(), 1..=2).prop_flat_map(move |targets| {
+                // One plan per target: distinct server indices (the
+                // per-target one-server rule holds by construction).
+                let plan = prop::collection::vec(
+                    prop::sample::subsequence((0..n_servers).collect::<Vec<_>>(), 1..=n_servers),
+                    targets.len(),
+                );
+                let servers = servers.clone();
+                let targets = targets.clone();
+                plan.prop_map(move |plans| {
+                    let mut raw_servers = Vec::new();
+                    for (id, address, user, kh, fp) in &servers {
+                        raw_servers.push(raw::RawServer {
+                            id: id.to_string(),
+                            address: address.to_string(),
+                            user: user.to_string(),
+                            port: 22,
+                            known_hosts: kh.map(PathBuf::from),
+                            host_key_fingerprint: fp.map(|s| s.to_string()),
+                            capacity: raw::RawCapacityConfig::default(),
+                        });
+                    }
+                    let mut raw_targets = BTreeMap::new();
+                    for t in &targets {
+                        raw_targets.insert(
+                            t.to_string(),
+                            raw::RawTargetConfig {
+                                rollout: raw::RawRolloutConfig::default(),
+                            },
+                        );
+                    }
+                    let mut slots = Vec::new();
+                    for (t, plan) in targets.iter().zip(&plans) {
+                        for (i, &server_idx) in plan.iter().enumerate() {
+                            let slot_id = format!("{t}-{i}");
+                            slots.push(SlotConfig::new(
+                                slot_id.clone(),
+                                servers[server_idx].0.to_string(),
+                                PathBuf::from(format!("/srv/{slot_id}")),
+                                t.to_string(),
+                                Vec::new(),
+                            ));
+                        }
+                    }
+                    let mut variant = minimal_raw_variant();
+                    variant.slots = slots;
+                    RawProject {
+                        manifest: raw::RawConfig {
+                            schema_version: CONFIG_SCHEMA_VERSION,
+                            application: "app".to_string(),
+                            release: ReleaseName::new("v1"),
+                            pins: Vec::new(),
+                            servers: raw_servers,
+                            targets: raw_targets,
+                        },
+                        variants: BTreeMap::from([("standard".to_string(), variant)]),
+                    }
+                })
+            })
+        })
+    }
+
+    /// One arbitrary update operation: add/remove/rename a server, a target,
+    /// a pin, or a slot, or change a server's connection. The payloads are
+    /// arbitrary (valid or not); the operation either succeeds (the result
+    /// must satisfy the domain invariants) or fails (the original is
+    /// untouched).
+    #[derive(Clone, Debug)]
+    enum UpdateOp {
+        AddServer(ServerDef),
+        RemoveServer(String),
+        RenameServer(String, String),
+        AddTarget(String, TargetConfig),
+        RemoveTarget(String),
+        RenameTarget(String, String),
+        AddPin(Pin),
+        RemovePin(String),
+        RenamePin(String, String),
+        AddSlot(String, SlotConfig),
+        RemoveSlot(String, String),
+        RenameSlot(String, String, String),
+        SetConnection(String, ServerConnection),
+    }
+
+    impl UpdateOp {
+        fn apply(&self, config: &ProjectConfig) -> Result<ProjectConfig> {
+            match self {
+                UpdateOp::AddServer(s) => config.with_server(s.clone()),
+                UpdateOp::RemoveServer(id) => config.without_server(id),
+                UpdateOp::RenameServer(a, b) => config.rename_server(a, b),
+                UpdateOp::AddTarget(n, t) => config.with_target(n, t.clone()),
+                UpdateOp::RemoveTarget(n) => config.without_target(n),
+                UpdateOp::RenameTarget(a, b) => config.rename_target(a, b),
+                UpdateOp::AddPin(p) => config.with_pin(p.clone()),
+                UpdateOp::RemovePin(r) => config.without_pin(r),
+                UpdateOp::RenamePin(a, b) => config.rename_pin(a, b),
+                UpdateOp::AddSlot(v, s) => config.with_slot(v, s.clone()),
+                UpdateOp::RemoveSlot(v, s) => config.without_slot(v, s),
+                UpdateOp::RenameSlot(v, a, b) => config.rename_slot(v, a, b),
+                UpdateOp::SetConnection(id, c) => config.with_server_connection(id, c.clone()),
+            }
+        }
+    }
+
+    /// An arbitrary host identity: any form, including the impossible
+    /// combinations the connection well-formedness rule must reject (a
+    /// `Local` identity inside an SSH connection, a relative `known_hosts`).
+    fn arbitrary_identity() -> impl Strategy<Value = HostIdentity> {
+        prop_oneof![
+            Just(HostIdentity::Local),
+            prop::sample::select(vec![
+                PathBuf::from("/etc/ssh/known_hosts"),
+                PathBuf::from("relative/kh"),
+            ])
+            .prop_map(HostIdentity::KnownHosts),
+            Just(HostIdentity::Fingerprint(
+                Fingerprint::parse("SHA256:test").unwrap()
+            )),
+        ]
+    }
+
+    /// An arbitrary connection: a local form with an arbitrary address (valid
+    /// or not), or an SSH form with arbitrary host/user/port/identity (the
+    /// identity may be any form, including the impossible `Local` inside an
+    /// SSH connection).
+    fn arbitrary_connection() -> impl Strategy<Value = ServerConnection> {
+        prop_oneof![
+            arbitrary_identifier().prop_map(|address| ServerConnection::Local {
+                address,
+                identity: HostIdentity::Local,
+            }),
+            (
+                prop::sample::select(vec!["host", "db.example.com", "x y", ""]),
+                prop::sample::select(vec!["user", "ops", "x y", ""]),
+                any::<u16>(),
+                arbitrary_identity(),
+            )
+                .prop_map(|(address, user, port, identity)| ServerConnection::Ssh {
+                    address: Host::parse(address).unwrap_or_else(|_| Host::parse("host").unwrap()),
+                    user: SshUser::parse(user).unwrap_or_else(|_| SshUser::parse("user").unwrap()),
+                    port: NonZeroU16::new(port).unwrap_or(NonZeroU16::new(1).unwrap()),
+                    identity,
+                }),
+        ]
+    }
+
+    /// An arbitrary domain server: a valid id (the scalar is validated by
+    /// construction) with an arbitrary connection and capacity.
+    fn arbitrary_server_def() -> impl Strategy<Value = ServerDef> {
+        (
+            prop::sample::select(vec!["s1", "s2", "s3", "s4", "new-server"]),
+            arbitrary_connection(),
+            arbitrary_capacity_domain(),
+        )
+            .prop_map(|(id, connection, capacity)| {
+                ServerDef::new(Identifier::parse(id).unwrap(), connection, capacity)
+            })
+    }
+
+    /// An arbitrary domain capacity policy (the percent is validated by
+    /// construction).
+    fn arbitrary_capacity_domain() -> impl Strategy<Value = CapacityConfig> {
+        (any::<u64>(), 0u8..=100).prop_map(|(reserve_bytes, reserve_percent)| CapacityConfig {
+            reserve_bytes,
+            reserve_percent: CapacityPercent::new(reserve_percent).unwrap(),
+        })
+    }
+
+    /// An arbitrary domain target (the batch size is validated by
+    /// construction).
+    fn arbitrary_target_domain() -> impl Strategy<Value = TargetConfig> {
+        (any::<u32>(), any::<bool>(), arbitrary_failure_policy()).prop_map(
+            |(batch_size, stop_on_failure, failure_policy)| TargetConfig {
+                rollout: RolloutConfig {
+                    batch_size: BatchSize::new(u64::from(batch_size))
+                        .unwrap_or(BatchSize::new(1).unwrap()),
+                    stop_on_failure,
+                    failure_policy,
+                },
+            },
+        )
+    }
+
+    /// An arbitrary update operation over the whole op space.
+    fn arbitrary_op() -> impl Strategy<Value = UpdateOp> {
+        prop_oneof![
+            arbitrary_server_def().prop_map(UpdateOp::AddServer),
+            arbitrary_identifier().prop_map(UpdateOp::RemoveServer),
+            (arbitrary_identifier(), arbitrary_identifier())
+                .prop_map(|(a, b)| UpdateOp::RenameServer(a, b)),
+            (arbitrary_identifier(), arbitrary_target_domain())
+                .prop_map(|(n, t)| UpdateOp::AddTarget(n, t)),
+            arbitrary_identifier().prop_map(UpdateOp::RemoveTarget),
+            (arbitrary_identifier(), arbitrary_identifier())
+                .prop_map(|(a, b)| UpdateOp::RenameTarget(a, b)),
+            (arbitrary_identifier(), arbitrary_identifier())
+                .prop_map(|(release, reason)| UpdateOp::AddPin(Pin { release, reason })),
+            arbitrary_identifier().prop_map(UpdateOp::RemovePin),
+            (arbitrary_identifier(), arbitrary_identifier())
+                .prop_map(|(a, b)| UpdateOp::RenamePin(a, b)),
+            (arbitrary_identifier(), arbitrary_slot()).prop_map(|(v, s)| UpdateOp::AddSlot(v, s)),
+            (arbitrary_identifier(), arbitrary_identifier())
+                .prop_map(|(v, s)| UpdateOp::RemoveSlot(v, s)),
+            (
+                arbitrary_identifier(),
+                arbitrary_identifier(),
+                arbitrary_identifier()
+            )
+                .prop_map(|(v, a, b)| UpdateOp::RenameSlot(v, a, b)),
+            (arbitrary_identifier(), arbitrary_connection())
+                .prop_map(|(id, c)| UpdateOp::SetConnection(id, c)),
+        ]
+    }
+
+    proptest! {
+        // THE PROPERTY: over VALID configurations (generated by construction)
+        // plus ARBITRARY update operations, every SUCCESSFUL result satisfies
+        // the ONE central [`assert_domain_invariants`] (every reference
+        // resolves, ids valid, no impossible combos, the connection enum is
+        // well-formed), and every INVALID update FAILS and PRESERVES the
+        // original (its accessors are unchanged). Bounded 16 cases, fixed
+        // seed 0x5EED_5EED per house style, no failure persistence; the
+        // generation is pure (no filesystem), so the property stays fast.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn validated_rebuild_ops_preserve_invariants(
+            project in valid_raw_project(),
+            ops in prop::collection::vec(arbitrary_op(), 0..8),
+        ) {
+            let config = ProjectConfig::from_raw_parts(project.manifest, project.variants)
+                .expect("the generated project is valid by construction");
+            assert_domain_invariants(&config);
+            let mut current = config;
+            for op in &ops {
+                let original = current.clone();
+                match op.apply(&current) {
+                    Ok(next) => {
+                        assert_domain_invariants(&next);
+                        current = next;
+                    }
+                    Err(_) => {
+                        assert_eq!(
+                            current, original,
+                            "a failed update must leave the original untouched"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- deterministic unit tests per update class ----------------------
+
+    /// The minimal valid config used by the per-class unit tests.
+    fn unit_config() -> ProjectConfig {
+        let p = minimal_raw_project();
+        ProjectConfig::from_raw_parts(p.manifest, p.variants).expect("minimal project converts")
+    }
+
+    fn ssh_connection() -> ServerConnection {
+        ServerConnection::Ssh {
+            address: Host::parse("db.example.com").unwrap(),
+            user: SshUser::parse("ops").unwrap(),
+            port: NonZeroU16::new(2222).unwrap(),
+            identity: HostIdentity::Fingerprint(Fingerprint::parse("SHA256:test").unwrap()),
+        }
+    }
+
+    #[test]
+    fn with_server_adds_and_replaces() {
+        let cfg = unit_config();
+        // Add a new server: succeeds, the graph stays valid.
+        let added = cfg
+            .with_server(ServerDef::new(
+                Identifier::parse("s2").unwrap(),
+                ssh_connection(),
+                CapacityConfig::default(),
+            ))
+            .unwrap();
+        assert_eq!(added.servers().count(), 2);
+        assert_domain_invariants(&added);
+        // The original is untouched.
+        assert_eq!(cfg.servers().count(), 1);
+
+        // Replace an existing server: succeeds.
+        let replaced = added
+            .with_server(ServerDef::new(
+                Identifier::parse("s1").unwrap(),
+                ServerConnection::Local {
+                    address: "local:///srv/other".to_string(),
+                    identity: HostIdentity::Local,
+                },
+                CapacityConfig::default(),
+            ))
+            .unwrap();
+        assert_eq!(replaced.servers().count(), 2);
+        assert_domain_invariants(&replaced);
+
+        // An ill-formed connection (SSH with a Local identity) is rejected
+        // and the original is untouched.
+        let bad = cfg.with_server(ServerDef::new(
+            Identifier::parse("s2").unwrap(),
+            ServerConnection::Ssh {
+                address: Host::parse("db.example.com").unwrap(),
+                user: SshUser::parse("ops").unwrap(),
+                port: NonZeroU16::new(2222).unwrap(),
+                identity: HostIdentity::Local,
+            },
+            CapacityConfig::default(),
+        ));
+        assert!(bad.is_err());
+        assert_eq!(cfg.servers().count(), 1);
+    }
+
+    #[test]
+    fn without_server_fails_when_referenced() {
+        let cfg = unit_config();
+        // s1 is referenced by slot p1: removing it must fail (the graph
+        // would dangle); the original is untouched.
+        assert!(cfg.without_server("s1").is_err());
+        assert_eq!(cfg.servers().count(), 1);
+        // An unknown server fails.
+        assert!(cfg.without_server("ghost").is_err());
+    }
+
+    #[test]
+    fn rename_server_rewrites_slot_references() {
+        let cfg = unit_config();
+        let renamed = cfg.rename_server("s1", "s1b").unwrap();
+        assert!(renamed.server("s1").is_none());
+        assert!(renamed.server("s1b").is_some());
+        // The slot reference was rewritten.
+        let (slot, server) = renamed.target_slots("t1").unwrap()[0];
+        assert_eq!(slot.server, "s1b");
+        assert_eq!(server.id.as_str(), "s1b");
+        assert_domain_invariants(&renamed);
+        // Renaming onto an existing id fails.
+        assert!(cfg.rename_server("s1", "s1").is_err());
+    }
+
+    #[test]
+    fn with_target_replaces_and_rejects_empty() {
+        let cfg = unit_config();
+        // Replacing an existing target's rollout succeeds.
+        let replaced = cfg
+            .with_target(
+                "t1",
+                TargetConfig {
+                    rollout: RolloutConfig::default(),
+                },
+            )
+            .unwrap();
+        assert_domain_invariants(&replaced);
+        // A NEW target with no member slots fails (the per-target non-empty
+        // rule is re-validated); the original is untouched.
+        assert!(
+            cfg.with_target(
+                "t2",
+                TargetConfig {
+                    rollout: RolloutConfig::default()
+                }
+            )
+            .is_err()
+        );
+        assert!(cfg.target("t2").is_none());
+    }
+
+    #[test]
+    fn without_target_fails_when_referenced() {
+        let cfg = unit_config();
+        // t1 is referenced by slot p1: removing it must fail; the original
+        // is untouched.
+        assert!(cfg.without_target("t1").is_err());
+        assert!(cfg.target("t1").is_some());
+        // An unknown target fails.
+        assert!(cfg.without_target("ghost").is_err());
+    }
+
+    #[test]
+    fn rename_target_rewrites_slot_references() {
+        let cfg = unit_config();
+        let renamed = cfg.rename_target("t1", "t1b").unwrap();
+        assert!(renamed.target("t1").is_none());
+        assert!(renamed.target("t1b").is_some());
+        let (slot, _) = renamed.target_slots("t1b").unwrap()[0];
+        assert_eq!(slot.target, "t1b");
+        assert_domain_invariants(&renamed);
+        // Renaming to the same name is a valid no-op.
+        let same = cfg.rename_target("t1", "t1").unwrap();
+        assert_eq!(same.target_slot_ids("t1").unwrap(), vec!["p1"]);
+    }
+
+    #[test]
+    fn pin_ops_add_remove_rename() {
+        let cfg = unit_config();
+        let pin = Pin {
+            release: "rel-1".to_string(),
+            reason: "known-good".to_string(),
+        };
+        let added = cfg.with_pin(pin.clone()).unwrap();
+        assert_eq!(added.pins().len(), 1);
+        assert_eq!(added.pins()[0].release, "rel-1");
+        // Removing a pin that is not present fails.
+        assert!(cfg.without_pin("rel-1").is_err());
+        let removed = added.without_pin("rel-1").unwrap();
+        assert!(removed.pins().is_empty());
+        // Renaming rewrites the release.
+        let renamed = added.rename_pin("rel-1", "rel-2").unwrap();
+        assert_eq!(renamed.pins()[0].release, "rel-2");
+        assert!(added.rename_pin("rel-9", "rel-3").is_err());
+    }
+
+    #[test]
+    fn with_slot_adds_and_rejects_invalid() {
+        let cfg = unit_config();
+        // Add a second server, then a slot on it for t1.
+        let two = cfg
+            .with_server(ServerDef::new(
+                Identifier::parse("s2").unwrap(),
+                ServerConnection::Local {
+                    address: "local:///srv/s2".to_string(),
+                    identity: HostIdentity::Local,
+                },
+                CapacityConfig::default(),
+            ))
+            .unwrap();
+        let added = two
+            .with_slot(
+                "standard",
+                SlotConfig::new("p2", "s2", "/srv/p2", "t1", Vec::new()),
+            )
+            .unwrap();
+        assert_eq!(added.slot_defs().len(), 2);
+        assert_domain_invariants(&added);
+
+        // A slot referencing an unknown server is rejected; the original is
+        // untouched.
+        assert!(
+            two.with_slot(
+                "standard",
+                SlotConfig::new("p2", "ghost", "/srv/p2", "t1", Vec::new())
+            )
+            .is_err()
+        );
+        assert_eq!(two.slot_defs().len(), 1);
+
+        // A relative deploy_dir is rejected.
+        assert!(
+            two.with_slot(
+                "standard",
+                SlotConfig::new("p2", "s2", "srv/p2", "t1", Vec::new())
+            )
+            .is_err()
+        );
+
+        // Replacing an existing slot (keyed by id) is a valid update.
+        let replaced = two
+            .with_slot(
+                "standard",
+                SlotConfig::new("p1", "s2", "/srv/p2", "t1", Vec::new()),
+            )
+            .unwrap();
+        assert_eq!(replaced.slot_defs().len(), 1);
+        assert_eq!(replaced.slot_defs()[0].server, "s2");
+        assert_domain_invariants(&replaced);
+
+        // An unknown variant is rejected.
+        assert!(
+            two.with_slot(
+                "ghost",
+                SlotConfig::new("p2", "s2", "/srv/p2", "t1", Vec::new())
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn without_slot_fails_when_target_loses_all_members() {
+        let cfg = unit_config();
+        // Removing the only slot of t1 leaves t1 without members: rejected;
+        // the original is untouched.
+        assert!(cfg.without_slot("standard", "p1").is_err());
+        assert_eq!(cfg.slot_defs().len(), 1);
+        // An unknown slot fails.
+        assert!(cfg.without_slot("standard", "ghost").is_err());
+    }
+
+    #[test]
+    fn rename_slot_rewrites_the_id() {
+        let cfg = unit_config();
+        let renamed = cfg.rename_slot("standard", "p1", "p1b").unwrap();
+        assert_eq!(renamed.target_slot_ids("t1").unwrap(), vec!["p1b"]);
+        assert_domain_invariants(&renamed);
+        assert!(cfg.rename_slot("standard", "ghost", "p9").is_err());
+    }
+
+    #[test]
+    fn with_server_connection_validates_the_enum() {
+        let cfg = unit_config();
+        // A valid SSH connection replaces the local one.
+        let ssh = cfg.with_server_connection("s1", ssh_connection()).unwrap();
+        assert!(matches!(
+            ssh.server("s1").unwrap().connection(),
+            ServerConnection::Ssh { .. }
+        ));
+        assert_domain_invariants(&ssh);
+
+        // An SSH connection with a Local identity is rejected; the original
+        // is untouched.
+        let bad = cfg.with_server_connection(
+            "s1",
+            ServerConnection::Ssh {
+                address: Host::parse("db.example.com").unwrap(),
+                user: SshUser::parse("ops").unwrap(),
+                port: NonZeroU16::new(2222).unwrap(),
+                identity: HostIdentity::Local,
+            },
+        );
+        assert!(bad.is_err());
+        assert!(matches!(
+            cfg.server("s1").unwrap().connection(),
+            ServerConnection::Local { .. }
+        ));
+
+        // A local connection with a non-local address is rejected.
+        let bad = cfg.with_server_connection(
+            "s1",
+            ServerConnection::Local {
+                address: "not-local".to_string(),
+                identity: HostIdentity::Local,
+            },
+        );
+        assert!(bad.is_err());
+
+        // An unknown server fails.
+        assert!(
+            cfg.with_server_connection(
+                "ghost",
+                ServerConnection::Local {
+                    address: "local:///x".to_string(),
+                    identity: HostIdentity::Local,
+                },
+            )
+            .is_err()
+        );
     }
 
     // =====================================================================

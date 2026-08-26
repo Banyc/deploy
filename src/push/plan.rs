@@ -200,8 +200,7 @@ impl SlotSelection {
     /// (validated here, before any lock or remote access).
     pub fn normalize(config: &ProjectConfig, target: &str, group: Option<&str>) -> Result<Self> {
         config
-            .targets
-            .get(target)
+            .target(target)
             .ok_or_else(|| Error::not_found(format!("target '{target}'")))?;
         Ok(SlotSelection {
             target: TargetName::parse(target).expect("target name is a safe segment"),
@@ -375,7 +374,7 @@ pub(crate) fn validate_partial_rollout(
                 let current_binding = PhysicalBinding {
                     server: ServerId::parse(sdef.id.as_str())
                         .expect("validated server id is a safe segment"),
-                    deploy_dir: slot.deploy_dir.to_string_lossy().into_owned(),
+                    deploy_dir: slot.deploy_dir().to_string_lossy().into_owned(),
                 };
                 if !base.slots.contains_key(&slot_id) {
                     return Err(Error::preflight(format!(
@@ -508,7 +507,7 @@ pub fn plan_assignments(
     store: &LocalStore,
     config: &ProjectConfig,
 ) -> Result<PlannedResolution> {
-    if !config.targets.contains_key(selection.target.as_str()) {
+    if config.target(selection.target.as_str()).is_none() {
         return Err(Error::not_found(format!("target '{}'", selection.target)));
     }
 
@@ -631,7 +630,7 @@ pub fn plan_assignments(
                 let current_binding = PhysicalBinding {
                     server: ServerId::parse(sdef.id.as_str())
                         .expect("validated server id is a safe segment"),
-                    deploy_dir: slot.deploy_dir.to_string_lossy().into_owned(),
+                    deploy_dir: slot.deploy_dir().to_string_lossy().into_owned(),
                 };
                 let recorded = entry.bindings.get(&slot_id).ok_or_else(|| {
                     Error::rollback(format!(
@@ -868,7 +867,7 @@ pub fn plan_assignments(
                             PhysicalBinding {
                                 server: ServerId::parse(sdef.id.as_str())
                                     .expect("validated server id is a safe segment"),
-                                deploy_dir: slot.deploy_dir.to_string_lossy().into_owned(),
+                                deploy_dir: slot.deploy_dir().to_string_lossy().into_owned(),
                             },
                         )
                     })

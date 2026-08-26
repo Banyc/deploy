@@ -78,18 +78,21 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
         "the unit artifact ships with the fixture"
     );
     // Capacity is a per-server policy, not a variant one.
-    assert_eq!(config.servers[0].capacity.reserve_bytes, 1_073_741_824);
-    assert_eq!(config.servers[1].capacity.reserve_bytes, 1_073_741_824);
+    assert_eq!(
+        config.servers().next().unwrap().capacity.reserve_bytes,
+        1_073_741_824
+    );
+    assert_eq!(
+        config.servers().nth(1).unwrap().capacity.reserve_bytes,
+        1_073_741_824
+    );
     // SSH-shaped addresses carry exactly one host-identity source (the
     // placeholder fingerprint in the fixture), so the documented example stays
     // valid under the exactly-one rule — the domain holds it as a single
     // `HostIdentity::Fingerprint`, never an option pair.
-    for s in &config.servers {
+    for s in config.servers() {
         assert!(
-            matches!(
-                s.host_identity(),
-                deploy::config::HostIdentity::Fingerprint(_)
-            ),
+            matches!(s.identity(), deploy::config::HostIdentity::Fingerprint(_)),
             "server '{}' must have exactly one identity form",
             s.id
         );

@@ -131,13 +131,13 @@ fn seed_real_release(store: &LocalStore) -> ReleaseId {
         )]),
         &BTreeMap::from([(
             "standard".to_string(),
-            vec![crate::config::SlotConfig {
-                id: "p1".to_string(),
-                server: "s1".to_string(),
-                deploy_dir: PathBuf::from("/srv/deploy/p1"),
-                target: TARGET.to_string(),
-                groups: vec![],
-            }],
+            vec![crate::config::SlotConfig::new(
+                "p1".to_string(),
+                "s1".to_string(),
+                PathBuf::from("/srv/deploy/p1"),
+                TARGET.to_string(),
+                vec![],
+            )],
         )]),
         std::path::Path::new("."),
     );
@@ -435,7 +435,7 @@ fn run_no_leak_case(
 
     // ---- receiver sweep: retention -----------------------------------------
     let retention = &cfg.variant("standard").unwrap().retention;
-    let retained = compute_retained(&helper, &cfg.pins, &store, retention).unwrap();
+    let retained = compute_retained(&helper, cfg.pins(), &store, retention).unwrap();
     helper.rotate(&retained, &HashSet::new()).unwrap();
     // The receiver retains EXACTLY the policy-retained trees: stale ones are
     // gone, retained + pinned content survives.

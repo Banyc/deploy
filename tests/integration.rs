@@ -1728,16 +1728,19 @@ interval_seconds = 0
     // Plug the real endpoint directory into the server address and use the real
     // CLI remote factory (create_remote), which routes `local://` addresses to
     // the configured endpoint rather than the application store's remotes/.
-    config
-        .servers
-        .iter_mut()
-        .find(|s| s.id.as_str() == "server-01")
-        .unwrap()
-        .address = format!("local://{}", endpoints.join("server-01").display());
+    config = config
+        .with_server_connection(
+            "server-01",
+            deploy::config::ServerConnection::Local {
+                address: format!("local://{}", endpoints.join("server-01").display()),
+                identity: deploy::config::HostIdentity::Local,
+            },
+        )
+        .unwrap();
 
     let factory = move |s: &deploy::config::ServerDef,
                         slot: &deploy::config::SlotConfig|
-          -> Result<Box<dyn Remote>> { create_remote(s, &slot.deploy_dir) };
+          -> Result<Box<dyn Remote>> { create_remote(s, slot.deploy_dir()) };
 
     let r = push(
         &proj.join("deploy.toml"),
@@ -2456,11 +2459,21 @@ fn capacity_retention_compute_retained_failure_releases_lock() -> Result<()> {
     // Force the capacity preflight to trigger protected retention: the remote
     // reports 100 bytes available and every server policy reserves 1 MiB, so
     // need + reserve > avail on every slot.
-    for s in &mut config.servers {
-        s.capacity = deploy::config::CapacityConfig {
-            reserve_bytes: 1024 * 1024,
-            reserve_percent: deploy::scalar::CapacityPercent::new(0).expect("0 is in range"),
-        };
+    let server_ids: Vec<String> = config
+        .servers()
+        .map(|s| s.id.as_str().to_string())
+        .collect();
+    for id in server_ids {
+        config = config
+            .with_server_capacity(
+                &id,
+                deploy::config::CapacityConfig {
+                    reserve_bytes: 1024 * 1024,
+                    reserve_percent: deploy::scalar::CapacityPercent::new(0)
+                        .expect("0 is in range"),
+                },
+            )
+            .unwrap();
     }
 
     // Inject a one-shot failure into `compute_retained`'s remote read of the
@@ -3471,7 +3484,10 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
     assert_ne!(body, changed, "capacity line must be insertable");
     std::fs::write(&config_path, changed).unwrap();
     let config2 = ProjectConfig::load(&config_path)?;
-    assert_eq!(config2.servers[0].capacity.reserve_bytes, 4096);
+    assert_eq!(
+        config2.servers().next().unwrap().capacity.reserve_bytes,
+        4096
+    );
 
     let r1 = push(
         &config_path,
@@ -4186,7 +4202,7 @@ fn server_policy_change_does_not_change_release_identity() -> Result<()> {
     assert_ne!(body, changed, "policy line must be replaceable");
     std::fs::write(proj.join("deploy.toml"), changed).unwrap();
     let config2 = ProjectConfig::load(&proj.join("deploy.toml"))?;
-    assert_eq!(config2.servers[0].user, "deployer");
+    assert_eq!(config2.servers().next().unwrap().user(), "deployer");
 
     let r1 = push(
         &proj.join("deploy.toml"),

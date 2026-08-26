@@ -63,12 +63,20 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     // deploy_dir, unique server ids, known variant, non-empty target).
     let config_path = proj.join("deploy.toml");
     let config = ProjectConfig::load(&config_path)?;
-    assert_eq!(config.application.as_str(), "roundtrip-app");
+    assert_eq!(config.application().as_str(), "roundtrip-app");
     assert_eq!(config.release().as_str(), "v1");
     // Membership is derived from the slots' `targets` lists (the slot is
     // declared inside releases/v1/standard.toml, bound to `production`).
     assert_eq!(config.target_slot_ids("production")?, vec!["app-1"]);
-    assert_eq!(config.targets["production"].rollout.batch_size.get(), 1);
+    assert_eq!(
+        config
+            .target("production")
+            .unwrap()
+            .rollout
+            .batch_size
+            .get(),
+        1
+    );
     let variant = config.variant("standard")?;
     assert_eq!(variant.verification.argv, vec!["true"]);
     assert_eq!(
@@ -96,9 +104,18 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     );
     // Capacity is a per-server policy: the scaffold puts it on the server
     // entry (0/0 by default), and the variant file has no `[capacity]` block.
-    assert_eq!(config.servers[0].capacity.reserve_bytes, 0);
-    assert_eq!(config.servers[0].capacity.reserve_percent.get(), 0);
-    let addr = &config.servers[0].address;
+    assert_eq!(config.servers().next().unwrap().capacity.reserve_bytes, 0);
+    assert_eq!(
+        config
+            .servers()
+            .next()
+            .unwrap()
+            .capacity
+            .reserve_percent
+            .get(),
+        0
+    );
+    let addr = &config.servers().next().unwrap().address();
     assert!(
         addr.starts_with("local://")
             && Path::new(addr.trim_start_matches("local://")).is_absolute(),
@@ -109,7 +126,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     let store = LocalStore::with_base(tmp.path().join("store"))?;
     let factory = move |s: &deploy::config::ServerDef,
                         slot: &deploy::config::SlotConfig|
-          -> Result<Box<dyn Remote>> { create_remote(s, &slot.deploy_dir) };
+          -> Result<Box<dyn Remote>> { create_remote(s, slot.deploy_dir()) };
 
     let r_dry = push(
         &config_path,
@@ -281,11 +298,17 @@ fn cli_init_flags_reach_config() -> Result<()> {
         proj.to_str().unwrap(),
         "--name",
         "backend",
+        "--address",
+        "app.example.com",
         "--user",
         "ops",
+        "--known-hosts",
+        "/etc/ssh/known_hosts",
     ])?;
     let config = ProjectConfig::load(&proj.join("deploy.toml"))?;
-    assert_eq!(config.application.as_str(), "backend");
-    assert_eq!(config.servers[0].user, "ops");
+    assert_eq!(config.application().as_str(), "backend");
+    // The SSH connection carries the deployment account (a local:// endpoint
+    // has no SSH user).
+    assert_eq!(config.servers().next().unwrap().user(), "ops");
     Ok(())
 }

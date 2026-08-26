@@ -117,6 +117,27 @@ name_scalar!(
 );
 
 name_scalar!(
+    Host,
+    "A validated SSH host: the address of an SSH server. Non-empty, no \
+    surrounding whitespace, no control characters, and no path separators or \
+    traversal components — a host is a single safe token (a DNS name, an IP, \
+    or a bracketed IPv6 literal), never a path. The `local://` endpoint form \
+    is NOT a host: it is the separate [`crate::config::ServerConnection::Local`] \
+    connection form, so a host can never smuggle a path out of the SSH \
+    namespace.",
+    valid_name
+);
+
+name_scalar!(
+    SshUser,
+    "A validated SSH deployment account: the `user` of an SSH connection. \
+    Non-empty, no surrounding whitespace, no control characters, and no path \
+    separators or traversal components — a user is a single safe token, never \
+    a path.",
+    valid_name
+);
+
+name_scalar!(
     ApplicationStoreKey,
     "The application STORE KEY: the single filesystem component that names \
     the application's local store directory (`<data>/simple-deploy/<key>`). \

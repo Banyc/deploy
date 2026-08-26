@@ -387,10 +387,10 @@ fn fingerprint_only_dry_run_leaves_remote_untouched() -> Result<()> {
                                 slot: &deploy::config::SlotConfig|
                   -> Result<Box<dyn Remote>> {
                 Ok(Box::new(SshTransport::new(
-                    &s.user,
-                    &s.address,
-                    s.port,
-                    &slot.deploy_dir,
+                    s.user(),
+                    s.address(),
+                    s.port(),
+                    slot.deploy_dir(),
                     None,
                     Some(&fp),
                 )?))
@@ -449,10 +449,10 @@ fn fingerprint_only_first_push_succeeds() -> Result<()> {
                                 slot: &deploy::config::SlotConfig|
                   -> Result<Box<dyn Remote>> {
                 Ok(Box::new(SshTransport::new(
-                    &s.user,
-                    &s.address,
-                    s.port,
-                    &slot.deploy_dir,
+                    s.user(),
+                    s.address(),
+                    s.port(),
+                    slot.deploy_dir(),
                     None,
                     Some(&fp),
                 )?))
@@ -532,10 +532,10 @@ fn fingerprint_only_repeat_push_is_idempotent() -> Result<()> {
                                 slot: &deploy::config::SlotConfig|
                   -> Result<Box<dyn Remote>> {
                 Ok(Box::new(SshTransport::new(
-                    &s.user,
-                    &s.address,
-                    s.port,
-                    &slot.deploy_dir,
+                    s.user(),
+                    s.address(),
+                    s.port(),
+                    slot.deploy_dir(),
                     None,
                     Some(&fp),
                 )?))

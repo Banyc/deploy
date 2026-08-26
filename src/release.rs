@@ -171,7 +171,7 @@ pub fn canonicalize_slots(slots: &[SlotConfig]) -> CanonicalSlots {
         .map(|s| CanonicalSlot {
             id: s.id.clone(),
             server: s.server.clone(),
-            deploy_dir: normalize_deploy_dir(&s.deploy_dir),
+            deploy_dir: normalize_deploy_dir(s.deploy_dir()),
             target: s.target.clone(),
             groups: {
                 let mut g = s.groups.clone();
@@ -292,12 +292,14 @@ pub fn recompute_release_digest(rec: &ReleaseRecord) -> Option<ReleaseDigest> {
                 v.clone(),
                 cs.slots
                     .iter()
-                    .map(|s| SlotConfig {
-                        id: s.id.clone(),
-                        server: s.server.clone(),
-                        deploy_dir: PathBuf::from(&s.deploy_dir),
-                        target: s.target.clone(),
-                        groups: s.groups.clone(),
+                    .map(|s| {
+                        SlotConfig::new(
+                            s.id.clone(),
+                            s.server.clone(),
+                            PathBuf::from(&s.deploy_dir),
+                            s.target.clone(),
+                            s.groups.clone(),
+                        )
                     })
                     .collect(),
             )
@@ -372,13 +374,13 @@ mod tests {
     use super::*;
 
     fn sdef(id: &str, server: &str, deploy_dir: &str, target: &str) -> SlotConfig {
-        SlotConfig {
-            id: id.to_string(),
-            server: server.to_string(),
-            deploy_dir: PathBuf::from(deploy_dir),
-            target: target.to_string(),
-            groups: Vec::new(),
-        }
+        SlotConfig::new(
+            id.to_string(),
+            server.to_string(),
+            PathBuf::from(deploy_dir),
+            target.to_string(),
+            Vec::new(),
+        )
     }
 
     /// Two variants with the same slot declarations written in different file
@@ -470,26 +472,26 @@ mod tests {
     fn variant_slots_digest_is_sensitive_to_targets_list() {
         let base: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
-            vec![SlotConfig {
-                id: "p1".to_string(),
-                server: "server-01".to_string(),
-                deploy_dir: PathBuf::from("/srv/deploy/example"),
-                target: "production".to_string(),
-                groups: Vec::new(),
-            }],
+            vec![SlotConfig::new(
+                "p1".to_string(),
+                "server-01".to_string(),
+                PathBuf::from("/srv/deploy/example"),
+                "production".to_string(),
+                Vec::new(),
+            )],
         )]);
         let base_sha = variant_slots_digest(&base);
 
         // Changing the slot's ONE owning target changes the digest.
         let retargeted: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
-            vec![SlotConfig {
-                id: "p1".to_string(),
-                server: "server-01".to_string(),
-                deploy_dir: PathBuf::from("/srv/deploy/example"),
-                target: "staging".to_string(),
-                groups: Vec::new(),
-            }],
+            vec![SlotConfig::new(
+                "p1".to_string(),
+                "server-01".to_string(),
+                PathBuf::from("/srv/deploy/example"),
+                "staging".to_string(),
+                Vec::new(),
+            )],
         )]);
         assert_ne!(
             variant_slots_digest(&retargeted),
@@ -500,13 +502,13 @@ mod tests {
         // Reordering the same list canonicalizes identically.
         let reordered: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
-            vec![SlotConfig {
-                id: "p1".to_string(),
-                server: "server-01".to_string(),
-                deploy_dir: PathBuf::from("/srv/deploy/example"),
-                target: "staging".to_string(),
-                groups: Vec::new(),
-            }],
+            vec![SlotConfig::new(
+                "p1".to_string(),
+                "server-01".to_string(),
+                PathBuf::from("/srv/deploy/example"),
+                "staging".to_string(),
+                Vec::new(),
+            )],
         )]);
         assert_eq!(
             variant_slots_digest(&reordered),
@@ -525,23 +527,23 @@ mod tests {
     fn variant_slots_digest_dedups_duplicate_groups() {
         let single: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
-            vec![SlotConfig {
-                id: "p1".to_string(),
-                server: "server-01".to_string(),
-                deploy_dir: PathBuf::from("/srv/deploy/example"),
-                target: "t1".to_string(),
-                groups: vec!["canary".to_string()],
-            }],
+            vec![SlotConfig::new(
+                "p1".to_string(),
+                "server-01".to_string(),
+                PathBuf::from("/srv/deploy/example"),
+                "t1".to_string(),
+                vec!["canary".to_string()],
+            )],
         )]);
         let duplicated: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
-            vec![SlotConfig {
-                id: "p1".to_string(),
-                server: "server-01".to_string(),
-                deploy_dir: PathBuf::from("/srv/deploy/example"),
-                target: "t1".to_string(),
-                groups: vec!["canary".to_string(), "canary".to_string()],
-            }],
+            vec![SlotConfig::new(
+                "p1".to_string(),
+                "server-01".to_string(),
+                PathBuf::from("/srv/deploy/example"),
+                "t1".to_string(),
+                vec!["canary".to_string(), "canary".to_string()],
+            )],
         )]);
         assert_eq!(
             variant_slots_digest(&single),
@@ -552,13 +554,13 @@ mod tests {
         // A change that DOES alter membership still changes the digest.
         let retargeted: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
-            vec![SlotConfig {
-                id: "p1".to_string(),
-                server: "server-01".to_string(),
-                deploy_dir: PathBuf::from("/srv/deploy/example"),
-                target: "t2".to_string(),
-                groups: vec!["canary".to_string()],
-            }],
+            vec![SlotConfig::new(
+                "p1".to_string(),
+                "server-01".to_string(),
+                PathBuf::from("/srv/deploy/example"),
+                "t2".to_string(),
+                vec!["canary".to_string()],
+            )],
         )]);
         assert_ne!(
             variant_slots_digest(&single),
@@ -717,13 +719,13 @@ mod tests {
         // `target` field creates a new ReleaseId.
         let s3: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
-            vec![SlotConfig {
-                id: "p1".to_string(),
-                server: "server-01".to_string(),
-                deploy_dir: PathBuf::from("/srv/deploy/example"),
-                target: "staging".to_string(),
-                groups: Vec::new(),
-            }],
+            vec![SlotConfig::new(
+                "p1".to_string(),
+                "server-01".to_string(),
+                PathBuf::from("/srv/deploy/example"),
+                "staging".to_string(),
+                Vec::new(),
+            )],
         )]);
         let st = release_digest(
             "mapping-sha",
@@ -1156,12 +1158,8 @@ mod tests {
             target_strategy(),
             prop::collection::vec(group_strategy(), 0..3),
         )
-            .prop_map(|(id, server, deploy_dir, target, groups)| SlotConfig {
-                id,
-                server,
-                deploy_dir: PathBuf::from(deploy_dir),
-                target,
-                groups,
+            .prop_map(|(id, server, deploy_dir, target, groups)| {
+                SlotConfig::new(id, server, PathBuf::from(deploy_dir), target, groups)
             })
     }
 
@@ -1421,12 +1419,14 @@ mod tests {
                     v.clone(),
                     cs.slots
                         .iter()
-                        .map(|s| SlotConfig {
-                            id: s.id.clone(),
-                            server: s.server.clone(),
-                            deploy_dir: PathBuf::from(&s.deploy_dir),
-                            target: s.target.clone(),
-                            groups: s.groups.clone(),
+                        .map(|s| {
+                            SlotConfig::new(
+                                s.id.clone(),
+                                s.server.clone(),
+                                PathBuf::from(&s.deploy_dir),
+                                s.target.clone(),
+                                s.groups.clone(),
+                            )
                         })
                         .collect(),
                 )
@@ -1474,8 +1474,14 @@ mod tests {
                 let mut out: Vec<SlotConfig> = defs.iter().rev().cloned().collect();
                 for (i, s) in out.iter_mut().enumerate() {
                     s.groups.reverse();
-                    let n = normalize_deploy_dir(&s.deploy_dir);
-                    s.deploy_dir = PathBuf::from(equivalent_dir_spellings(&n)[i % 3].clone());
+                    let n = normalize_deploy_dir(s.deploy_dir());
+                    *s = SlotConfig::new(
+                        s.id.clone(),
+                        s.server.clone(),
+                        PathBuf::from(equivalent_dir_spellings(&n)[i % 3].clone()),
+                        s.target.clone(),
+                        s.groups.clone(),
+                    );
                 }
                 (v.clone(), out)
             })

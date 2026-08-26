@@ -666,13 +666,13 @@ interval_seconds = 0
             )]),
             &BTreeMap::from([(
                 "standard".to_string(),
-                vec![crate::config::SlotConfig {
-                    id: "p1".to_string(),
-                    server: "s1".to_string(),
-                    deploy_dir: std::path::PathBuf::from("/srv/deploy/p1"),
-                    target: TARGET.to_string(),
-                    groups: Vec::new(),
-                }],
+                vec![crate::config::SlotConfig::new(
+                    "p1".to_string(),
+                    "s1".to_string(),
+                    std::path::PathBuf::from("/srv/deploy/p1"),
+                    TARGET.to_string(),
+                    Vec::new(),
+                )],
             )]),
             std::path::Path::new("."),
         );
@@ -698,13 +698,13 @@ interval_seconds = 0
             )]),
             &std::collections::BTreeMap::from([(
                 "standard".to_string(),
-                vec![crate::config::SlotConfig {
-                    id: "p1".to_string(),
-                    server: "s1".to_string(),
-                    deploy_dir: std::path::PathBuf::from("/srv/deploy/p1"),
-                    target: TARGET.to_string(),
-                    groups: Vec::new(),
-                }],
+                vec![crate::config::SlotConfig::new(
+                    "p1".to_string(),
+                    "s1".to_string(),
+                    std::path::PathBuf::from("/srv/deploy/p1"),
+                    TARGET.to_string(),
+                    Vec::new(),
+                )],
             )]),
             std::path::Path::new("."),
         );

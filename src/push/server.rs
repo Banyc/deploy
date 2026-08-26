@@ -686,7 +686,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &release_root,
                 &vcfg.artifact.mappings,
                 &crate::template::TemplateVars::mapping(
-                    config.application.as_str(),
+                    config.application().as_str(),
                     config.release().as_str(),
                     "standard",
                 ),
@@ -773,14 +773,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let members = self.config.target_slots("t1").unwrap();
             let (slot, server) = members[0];
             let vars = crate::template::TemplateVars::slot(
-                &slot.deploy_dir,
+                slot.deploy_dir(),
                 artifact.variant.as_str(),
-                self.config.application.as_str(),
+                self.config.application().as_str(),
                 artifact.release.as_str(),
                 "t1",
                 server.id.as_str(),
             )
-            .with_server(&server.user, &server.address, server.port)
+            .with_server(server.user(), server.address(), server.port())
             .with_slot_id(&slot.id)
             .with_deployment(
                 Some(&deployment_id),
@@ -1108,14 +1108,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 tree: TreeDigest::new("desired-tree"),
             };
             let desired_vars = crate::template::TemplateVars::slot(
-                &slot.deploy_dir,
+                slot.deploy_dir(),
                 desired.variant.as_str(),
-                h.config.application.as_str(),
+                h.config.application().as_str(),
                 desired.release.as_str(),
                 "t1",
                 server.id.as_str(),
             )
-            .with_server(&server.user, &server.address, server.port)
+            .with_server(server.user(), server.address(), server.port())
             .with_slot_id(&slot.id)
             .with_deployment(
                 Some(&failed_deployment_id),
@@ -1292,14 +1292,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let members = h.config.target_slots("t1").unwrap();
         let (slot, server) = members[0];
         let vars = crate::template::TemplateVars::slot(
-            &slot.deploy_dir,
+            slot.deploy_dir(),
             "standard",
-            h.config.application.as_str(),
+            h.config.application().as_str(),
             "rel-sha256-desired",
             "t1",
             server.id.as_str(),
         )
-        .with_server(&server.user, &server.address, server.port)
+        .with_server(server.user(), server.address(), server.port())
         .with_slot_id(&slot.id)
         .with_deployment(
             Some(&DeploymentId::generate()),

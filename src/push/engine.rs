@@ -104,14 +104,14 @@ fn slot_vars(
             ))
         })?;
     Ok(crate::template::TemplateVars::slot(
-        &slot.deploy_dir,
+        slot.deploy_dir(),
         artifact.variant.as_str(),
-        config.application.as_str(),
+        config.application().as_str(),
         artifact.release.as_str(),
         target_name,
         server.id.as_str(),
     )
-    .with_server(&server.user, &server.address, server.port)
+    .with_server(server.user(), server.address(), server.port())
     .with_slot_id(&slot.id)
     .with_deployment(deployment_id, generation, Some(&artifact.tree)))
 }
@@ -136,8 +136,7 @@ pub fn push(
     let deployment_id = DeploymentId::generate();
     let op_id = OperationId::generate();
     let target = config
-        .targets
-        .get(target_name)
+        .target(target_name)
         .ok_or_else(|| Error::not_found(format!("target '{target_name}'")))?;
     let project_root = config.project_root(config_path);
 
@@ -303,8 +302,7 @@ pub(crate) fn push_with_id(
 ) -> Result<PushReport> {
     let op_id = OperationId::new(format!("op-{}", deployment_id.as_str()));
     let target = config
-        .targets
-        .get(target_name)
+        .target(target_name)
         .ok_or_else(|| Error::not_found(format!("target '{target_name}'")))?;
     let project_root = config.project_root(config_path);
     let selection =
@@ -345,8 +343,7 @@ pub(crate) fn push_ref_with_id(
 ) -> Result<PushReport> {
     let op_id = OperationId::new(format!("op-{}", deployment_id.as_str()));
     let target = config
-        .targets
-        .get(target_name)
+        .target(target_name)
         .ok_or_else(|| Error::not_found(format!("target '{target_name}'")))?;
     let project_root = config.project_root(config_path);
     // Parse the ref token EARLY (syntax only, store-free — mirroring
@@ -442,7 +439,7 @@ fn push_inner(
                 &release_root,
                 &config.variant(&v)?.artifact.mappings,
                 &crate::template::TemplateVars::mapping(
-                    config.application.as_str(),
+                    config.application().as_str(),
                     config.release().as_str(),
                     &v,
                 ),
@@ -1974,7 +1971,7 @@ fn rotate_slot_locked(
     retention: &RetentionConfig,
     deployment_id: &DeploymentId,
 ) -> Result<()> {
-    let retained = compute_retained(helper, &config.pins, store, retention)?;
+    let retained = compute_retained(helper, config.pins(), store, retention)?;
     let active_incoming = HashSet::from([deployment_id.as_str().to_string()]);
     helper.rotate(&retained, &active_incoming)?;
     Ok(())
@@ -2601,7 +2598,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         deployment_id: &DeploymentId,
     ) -> Result<PushReport> {
         let project_root = config.project_root(&h.cfg_path);
-        let target = config.targets.get("t1").expect("harness target");
+        let target = config.target("t1").expect("harness target");
         let op_id = OperationId::new(format!("op-{}", deployment_id.as_str()));
         let rf = h.remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
@@ -2903,7 +2900,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &release_root,
             &vcfg.artifact.mappings,
             &crate::template::TemplateVars::mapping(
-                config.application.as_str(),
+                config.application().as_str(),
                 config.release().as_str(),
                 "standard",
             ),
@@ -3301,13 +3298,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &variants,
             &BTreeMap::from([(
                 "standard".to_string(),
-                vec![SlotConfig {
-                    id: "p1".to_string(),
-                    server: "s1".to_string(),
-                    deploy_dir: PathBuf::from("/srv/pin"),
-                    target: "t1".to_string(),
-                    groups: Vec::new(),
-                }],
+                vec![SlotConfig::new(
+                    "p1".to_string(),
+                    "s1".to_string(),
+                    PathBuf::from("/srv/pin"),
+                    "t1".to_string(),
+                    Vec::new(),
+                )],
             )]),
             std::path::Path::new("."),
         );
@@ -3341,10 +3338,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // the pin — outside every count/age window), and a garbage object is
         // referenced by nothing.
         let rec = engine_pin_release(&h.store, &["tree-pin-a", "tree-pin-b"]);
-        h.config.pins.push(crate::config::Pin {
-            release: rec.release_id.clone(),
-            reason: "known-good".into(),
-        });
+        h.config = h
+            .config
+            .with_pin(crate::config::Pin {
+                release: rec.release_id.clone(),
+                reason: "known-good".into(),
+            })
+            .unwrap();
         let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
         let helper = RemoteHelper::new(&remote);
         for t in ["tree-pin-a", "tree-pin-b", "tree-garbage"] {
@@ -3638,11 +3638,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// faults keyed by the fixed deployment id BEFORE the push runs.
     fn push_main_with_id(h: &RecoveryHarness, deployment_id: &DeploymentId) -> Result<PushReport> {
         let project_root = h.config.project_root(&h.cfg_path);
-        let target = h
-            .config
-            .targets
-            .get("t1")
-            .expect("harness configures target t1");
+        let target = h.config.target("t1").expect("harness configures target t1");
         let op_id = OperationId::new(format!("op-{}", deployment_id.as_str()));
         let rf = h.remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
@@ -4216,7 +4212,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             FailOnceGenerationRemote::build(rf.join(s.id.as_str()), armed_for_factory.clone())
         };
         let project_root = h.config.project_root(&h.cfg_path);
-        let target = h.config.targets.get("t1").expect("harness target");
+        let target = h.config.target("t1").expect("harness target");
         let op_id = OperationId::new(format!("op-{}", id.as_str()));
         let r = push_inner(
             &project_root,
@@ -4723,7 +4719,7 @@ interval_seconds = 0
         assert_ne!(a_digest, b_digest, "behaviors must differ");
 
         let id2 = test_deployment_id("deploy-verify-fail");
-        let target = config2.targets.get("t1").expect("harness target");
+        let target = config2.target("t1").expect("harness target");
         let op_id = OperationId::new(format!("op-{}", id2.as_str()));
         let rf = h.remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
@@ -4996,7 +4992,7 @@ interval_seconds = 0
 
         let id = test_deployment_id("deploy-batched-stop");
         let project_root = config.project_root(&cfg_path);
-        let target = config.targets.get("t1").expect("target t1");
+        let target = config.target("t1").expect("target t1");
         let op_id = OperationId::new(format!("op-{}", id.as_str()));
         let rf = remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
@@ -5258,7 +5254,7 @@ interval_seconds = 0
             &id,
             &op_id,
             &config,
-            config.targets.get("t1").expect("target t1"),
+            config.target("t1").expect("target t1"),
             &PushOptions {
                 dry_run: false,
                 ref_token: None,
@@ -5724,7 +5720,7 @@ interval_seconds = 0
 
         fn push_head(&self, deployment_id: &DeploymentId) -> Result<PushReport> {
             let project_root = self.config.project_root(&self.cfg_path);
-            let target = self.config.targets.get("t1").expect("harness target");
+            let target = self.config.target("t1").expect("harness target");
             let op_id = OperationId::new(format!("op-{}", deployment_id.as_str()));
             let rf = self.remotes_base.clone();
             let factory = move |s: &crate::config::ServerDef,
@@ -6185,12 +6181,17 @@ interval_seconds = 0
         // the server policy reserves 1 MiB, so the first deployment cannot
         // fit its tree.
         let mut config = ProjectConfig::load(&h.cfg_path).unwrap();
-        config.servers[0].capacity = crate::config::CapacityConfig {
-            reserve_bytes: 1024 * 1024,
-            reserve_percent: crate::scalar::CapacityPercent::new(0).expect("0 is in range"),
-        };
+        config = config
+            .with_server_capacity(
+                "s1",
+                crate::config::CapacityConfig {
+                    reserve_bytes: 1024 * 1024,
+                    reserve_percent: crate::scalar::CapacityPercent::new(0).expect("0 is in range"),
+                },
+            )
+            .unwrap();
         let project_root = config.project_root(&h.cfg_path);
-        let target = config.targets.get("t1").expect("harness target");
+        let target = config.target("t1").expect("harness target");
         let op_id = OperationId::new(format!("op-{}", id.as_str()));
         let rf = h.remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
@@ -6279,7 +6280,7 @@ interval_seconds = 0
         let h = RecoveryHarness::new();
         let id = test_deployment_id("deploy-staging-fail");
         let project_root = h.config.project_root(&h.cfg_path);
-        let target = h.config.targets.get("t1").expect("harness target");
+        let target = h.config.target("t1").expect("harness target");
         let op_id = OperationId::new(format!("op-{}", id.as_str()));
         // One-shot fault: the FIRST incoming file write of the staging upload
         // fails (after the incoming dir and its `app/` subdir were created),
@@ -6447,7 +6448,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         let id = test_deployment_id("deploy-staging-later");
         let project_root = config.project_root(&cfg_path);
-        let target = config.targets.get("t1").expect("target t1");
+        let target = config.target("t1").expect("target t1");
         let op_id = OperationId::new(format!("op-{}", id.as_str()));
         // Arm the fault ONLY on s2 (the LATER assignment): s1's staging must
         // complete, then s2's first incoming write fails.
@@ -6624,7 +6625,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
 
         let project_root = h.config.project_root(&h.cfg_path);
-        let target = h.config.targets.get("t1").expect("harness target");
+        let target = h.config.target("t1").expect("harness target");
         let op_id = OperationId::new("op-historical-behavior".to_string());
         let id = test_deployment_id("deploy-hist-behavior");
         let rf = h.remotes_base.clone();
@@ -7017,7 +7018,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             FailOnceGenerationRemote::build(rf.join(s.id.as_str()), armed_for_factory.clone())
         };
         let project_root = h.config.project_root(&h.cfg_path);
-        let target = h.config.targets.get("t1").expect("harness target");
+        let target = h.config.target("t1").expect("harness target");
         let op_id = OperationId::new(format!("op-{}", id2.as_str()));
         let r2 = push_inner(
             &project_root,
@@ -7253,7 +7254,7 @@ interval_seconds = 0
 
         let id = test_deployment_id("deploy-leave-changed");
         let project_root = config.project_root(&cfg_path);
-        let target = config.targets.get("t1").expect("target t1");
+        let target = config.target("t1").expect("target t1");
         let op_id = OperationId::new(format!("op-{}", id.as_str()));
         let rf = remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
@@ -8232,7 +8233,7 @@ interval_seconds = 0
             &release_dir,
             &config.variant("standard").unwrap().artifact.mappings,
             &crate::template::TemplateVars::mapping(
-                config.application.as_str(),
+                config.application().as_str(),
                 config.release().as_str(),
                 "standard",
             ),

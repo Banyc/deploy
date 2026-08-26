@@ -352,13 +352,13 @@ where
     // store key (a single safe path segment) — an application name that is
     // not a safe key is rejected HERE, at the store boundary, so the store
     // path can never escape the store base.
-    let store = LocalStore::new(&ApplicationStoreKey::try_from(&config.application)?)?;
+    let store = LocalStore::new(&ApplicationStoreKey::try_from(config.application())?)?;
     let remotes_base = store.base().join("remotes");
     std::fs::create_dir_all(&remotes_base).ok();
 
     let factory = move |s: &crate::config::ServerDef,
                         slot: &crate::config::SlotConfig|
-          -> Result<Box<dyn Remote>> { create_remote(s, &slot.deploy_dir) };
+          -> Result<Box<dyn Remote>> { create_remote(s, slot.deploy_dir()) };
 
     match cli.command {
         Command::Push {

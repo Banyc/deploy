@@ -375,13 +375,13 @@ fn standard_variant(deploy_dir: &Path) -> crate::config::raw::RawVariant {
             units: Vec::new(),
         },
         verification: command_verification(),
-        slots: vec![SlotConfig {
-            id: "app-1".to_string(),
-            server: "server-01".to_string(),
-            deploy_dir: deploy_dir.to_path_buf(),
-            target: "production".to_string(),
-            groups: Vec::new(),
-        }],
+        slots: vec![SlotConfig::new(
+            "app-1",
+            "server-01",
+            deploy_dir.to_path_buf(),
+            "production",
+            Vec::new(),
+        )],
         // The slot's ONE retention policy: the standard variant file owns the
         // policy of the slot it declares (app-1). A slot's owning variant is
         // its single retention source — never a per-target policy.
@@ -748,7 +748,7 @@ mod tests {
         // target, verified variant file).
         let config =
             crate::config::ProjectConfig::load(&report.target.join("deploy.toml")).unwrap();
-        assert_eq!(config.application.as_str(), "my-app");
+        assert_eq!(config.application().as_str(), "my-app");
         assert_eq!(config.release().as_str(), "v1");
         assert_eq!(config.target_slot_ids("production").unwrap(), vec!["app-1"]);
         assert_eq!(
@@ -775,12 +775,12 @@ mod tests {
         );
 
         // The local-first address routes the transport into the project.
-        let addr = &config.servers[0].address;
+        let addr = config.server("server-01").unwrap().address();
         assert!(
             addr.starts_with("local://") && addr.ends_with("/.deploy-remote"),
             "unexpected address {addr}"
         );
-        assert!(config.slot_defs()[0].deploy_dir.is_absolute());
+        assert!(config.slot_defs()[0].deploy_dir().is_absolute());
     }
 
     #[test]
@@ -830,10 +830,16 @@ mod tests {
         let config =
             crate::config::ProjectConfig::load(&report.target.join("deploy.toml")).unwrap();
         assert_eq!(
-            config.servers[0].host_key_fingerprint.as_deref(),
+            match config.server("server-01").unwrap().identity() {
+                crate::config::HostIdentity::Fingerprint(f) => Some(f.as_str()),
+                _ => None,
+            },
             Some("SHA256:abc")
         );
-        assert!(config.servers[0].known_hosts.is_none());
+        assert!(!matches!(
+            config.server("server-01").unwrap().identity(),
+            crate::config::HostIdentity::KnownHosts(_)
+        ));
 
         // local:// address with no identity stays the zero-SSH default.
         let proj = tmp.path().join("local");
@@ -855,18 +861,25 @@ mod tests {
         let report = init_project(&proj, &opts).unwrap();
         let config =
             crate::config::ProjectConfig::load(&report.target.join("deploy.toml")).unwrap();
-        assert_eq!(config.application.as_str(), "prod");
-        let s = &config.servers[0];
-        assert_eq!(s.address, "app.example.com");
-        assert_eq!(s.user, "ops");
-        assert_eq!(s.port, 2222);
+        assert_eq!(config.application().as_str(), "prod");
+        let s = config.server("server-01").unwrap();
+        assert_eq!(s.address(), "app.example.com");
+        assert_eq!(s.user(), "ops");
+        assert_eq!(s.port(), 2222);
         assert_eq!(
-            s.known_hosts.as_deref(),
+            match s.identity() {
+                crate::config::HostIdentity::KnownHosts(p) => Some(p.as_path()),
+                _ => None,
+            },
             Some(Path::new("/etc/ssh/known_hosts"))
         );
         // No local endpoint: the slot targets a conventional server path.
-        assert!(config.slot_defs()[0].deploy_dir.is_absolute());
-        assert!(config.slot_defs()[0].deploy_dir.starts_with("/srv/deploy/"));
+        assert!(config.slot_defs()[0].deploy_dir().is_absolute());
+        assert!(
+            config.slot_defs()[0]
+                .deploy_dir()
+                .starts_with("/srv/deploy/")
+        );
     }
 
     // Every option combination that would make the generated config invalid
@@ -982,19 +995,36 @@ mod tests {
         // The re-serialized project carries the same semantics as the
         // scaffold (same application name and release, same server/slot
         // bindings, same rollout and variants).
-        assert_eq!(reloaded.application.as_str(), "typed-app");
+        assert_eq!(reloaded.application().as_str(), "typed-app");
         assert_eq!(reloaded.release().as_str(), "v1");
         assert_eq!(
             reloaded.target_slot_ids("production").unwrap(),
             vec!["app-1"]
         );
-        assert_eq!(reloaded.targets["production"].rollout.batch_size.get(), 1);
-        assert_eq!(reloaded.servers[0].address, config.servers[0].address);
-        assert_eq!(reloaded.servers[0].user, config.servers[0].user);
-        assert_eq!(reloaded.servers[0].capacity, config.servers[0].capacity);
         assert_eq!(
-            reloaded.slot_defs()[0].deploy_dir,
-            config.slot_defs()[0].deploy_dir
+            reloaded
+                .target("production")
+                .unwrap()
+                .rollout
+                .batch_size
+                .get(),
+            1
+        );
+        assert_eq!(
+            reloaded.server("server-01").unwrap().address(),
+            config.server("server-01").unwrap().address()
+        );
+        assert_eq!(
+            reloaded.server("server-01").unwrap().user(),
+            config.server("server-01").unwrap().user()
+        );
+        assert_eq!(
+            reloaded.server("server-01").unwrap().capacity,
+            config.server("server-01").unwrap().capacity
+        );
+        assert_eq!(
+            reloaded.slot_defs()[0].deploy_dir(),
+            config.slot_defs()[0].deploy_dir()
         );
         assert_eq!(
             reloaded.variant("standard").unwrap().activation,
@@ -1070,11 +1100,17 @@ mod tests {
         let report = init_project(&proj, &opts).unwrap();
         let config =
             crate::config::ProjectConfig::load(&report.target.join("deploy.toml")).unwrap();
-        assert_eq!(config.servers[0].user, "ops");
+        assert_eq!(config.server("server-01").unwrap().user(), "ops");
         assert_eq!(
-            config.servers[0].known_hosts.as_deref(),
+            match config.server("server-01").unwrap().identity() {
+                crate::config::HostIdentity::KnownHosts(p) => Some(p.as_path()),
+                _ => None,
+            },
             Some(Path::new("/etc/ssh/known_hosts"))
         );
-        assert!(config.servers[0].host_key_fingerprint.is_none());
+        assert!(!matches!(
+            config.server("server-01").unwrap().identity(),
+            crate::config::HostIdentity::Fingerprint(_)
+        ));
     }
 }

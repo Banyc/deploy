@@ -2045,13 +2045,13 @@ mod tests {
         )]);
         let slots: BTreeMap<String, Vec<crate::config::SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
-            vec![crate::config::SlotConfig {
-                id: "p1".to_string(),
-                server: "s1".to_string(),
-                deploy_dir: std::path::PathBuf::from("/srv/deploy/p1"),
-                target: "t1".to_string(),
-                groups: Vec::new(),
-            }],
+            vec![crate::config::SlotConfig::new(
+                "p1".to_string(),
+                "s1".to_string(),
+                std::path::PathBuf::from("/srv/deploy/p1"),
+                "t1".to_string(),
+                Vec::new(),
+            )],
         )]);
         let rec =
             crate::release::build_release("m", &sha, &variants, &slots, std::path::Path::new("."));
