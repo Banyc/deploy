@@ -224,8 +224,10 @@ impl<T> SlotTable<T> {
         Self(OrderedSlotMap::new())
     }
 
-    pub fn from_map(map: BTreeMap<SlotId, T>) -> Self {
-        Self(OrderedSlotMap::from_map(map))
+    pub fn from_map<U: Into<T>>(map: BTreeMap<SlotId, U>) -> Self {
+        Self(OrderedSlotMap::from_map(
+            map.into_iter().map(|(k, v)| (k, v.into())).collect(),
+        ))
     }
 
     pub fn into_map(self) -> BTreeMap<SlotId, T> {
@@ -1091,12 +1093,118 @@ impl From<&LedgerRollback> for LedgerRollbackWire {
 /// index spans every release the attempt's slots reference.
 pub type BehaviorIndex = BTreeMap<ReleaseId, BTreeMap<String, BehaviorContract>>;
 
+/// The per-slot TRANSITION STATE of one slot during a deployment attempt —
+/// the per-slot fact the terminal's outcomes carry (the DOMAIN form; the
+/// WIRE keeps the current on-disk shape and the wire → domain conversion
+/// derives the transition from the wire's status/outcome fields). The
+/// remaining-changes derivation is based on THIS state, never on the
+/// outcome's generation field alone: a slot that was never advanced (or
+/// whose advance outcome is unknown) records a generation that is not
+/// evidence of a change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotTransition {
+    /// The slot was NEVER mutated: skipped (stop_on_failure) or a
+    /// pre-mutation failure. Its final observed state equals its pre_push
+    /// state, so it is never a remaining change.
+    NeverAdvanced,
+    /// The slot successfully advanced to the new state: its outcome's
+    /// generation is the generation it is on (a remaining change whenever
+    /// the new state differs from pre_push).
+    Advanced,
+    /// The slot advanced then was compensated back to its pre_push state
+    /// (never a remaining change).
+    Restored,
+    /// The advance outcome is UNKNOWN: a pre-swap failure — the slot may or
+    /// may not have changed. The outcome's generation is the OBSERVED
+    /// post-state (the engine records the actual generation, never the
+    /// desired one); the slot is a remaining change iff that observed state
+    /// differs from pre_push.
+    AdvanceUnknown,
+}
+
 /// The per-slot OUTCOME of one slot during a deployment's mutation loop —
-/// the existing [`SlotResult`] under the domain terminal's name (the domain
-/// keeps the existing type; the OUTCOME OWN-KEY agreement — each outcome's
-/// `slot_id` names its own table key — is verified by the wire → domain
-/// conversion and by the ledger read, per the cross-field-invariants work).
-pub type SlotOutcome = SlotResult;
+/// the DOMAIN form of the wire's [`SlotResult`]: the wire's status/outcome
+/// fields PLUS the per-slot TRANSITION STATE ([`SlotTransition`]) the
+/// remaining-changes derivation is based on. The WIRE keeps the current
+/// on-disk shape ([`SlotResult`]); the wire → domain conversion derives the
+/// transition from the wire's status/outcome fields
+/// ([`SlotOutcome::from_wire`]). The OUTCOME OWN-KEY agreement — each
+/// outcome's `slot_id` names its own table key — is verified by the wire →
+/// domain conversion and by the ledger read, per the cross-field-invariants
+/// work.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotOutcome {
+    pub slot_id: SlotId,
+    pub outcome: SlotOutcomeKind,
+    /// The generation this slot advanced to, or `None` if it never started.
+    pub generation: Option<GenerationId>,
+    pub compensated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The per-slot transition state (see [`SlotTransition`]).
+    pub transition: SlotTransition,
+}
+
+impl SlotOutcome {
+    /// Derive the per-slot TRANSITION STATE from the wire's status/outcome
+    /// fields (the wire keeps the current on-disk shape; the transition is
+    /// the per-slot fact the domain outcomes carry). `Restored` and a
+    /// compensated `Failed` are a compensation that restored the slot;
+    /// `Skipped` never advanced; `Activated` advanced; an UNCOMPENSATED
+    /// `Failed` is a pre-swap failure OR a post-swap failure whose
+    /// compensation failed — the wire cannot distinguish them, so the
+    /// advance outcome is UNKNOWN (the slot may or may not have changed;
+    /// the remaining-changes derivation compares the outcome's OBSERVED
+    /// generation against pre_push).
+    pub fn from_wire(r: SlotResult) -> SlotOutcome {
+        let transition = match r.outcome {
+            SlotOutcomeKind::Restored => SlotTransition::Restored,
+            SlotOutcomeKind::Skipped => SlotTransition::NeverAdvanced,
+            SlotOutcomeKind::Activated => SlotTransition::Advanced,
+            SlotOutcomeKind::Failed => {
+                if r.compensated {
+                    SlotTransition::Restored
+                } else {
+                    SlotTransition::AdvanceUnknown
+                }
+            }
+            // Reserved: never emitted today. The in-process compensation
+            // marker (a post-swap failure restored by the per-server
+            // pipeline) is recorded as `Failed` with `compensated = true`;
+            // a `Compensated` outcome would be a restored slot.
+            SlotOutcomeKind::Compensated => SlotTransition::Restored,
+        };
+        SlotOutcome {
+            slot_id: r.slot_id,
+            outcome: r.outcome,
+            generation: r.generation,
+            compensated: r.compensated,
+            error: r.error,
+            transition,
+        }
+    }
+}
+
+impl From<SlotResult> for SlotOutcome {
+    fn from(r: SlotResult) -> SlotOutcome {
+        SlotOutcome::from_wire(r)
+    }
+}
+
+impl From<SlotOutcome> for SlotResult {
+    /// The WIRE form of a domain outcome: the transition state is a DOMAIN
+    /// fact (the wire keeps the current on-disk shape) and is dropped.
+    fn from(o: SlotOutcome) -> SlotResult {
+        SlotResult {
+            slot_id: o.slot_id,
+            outcome: o.outcome,
+            generation: o.generation,
+            compensated: o.compensated,
+            error: o.error,
+        }
+    }
+}
 
 /// The COMPLETE ROLLBACK payload of a SUCCESSFUL deployment — the existing
 /// [`LedgerRollback`] under the domain terminal's name: the per-slot
@@ -1245,28 +1353,63 @@ impl LedgerTerminal {
 
     /// The REMAINING CHANGES of a [`TerminalDisposition::Degraded`] terminal
     /// — DERIVED from the authoritative per-slot outcomes (the slots whose
-    /// outcome is non-restored, each mapped to the generation it recorded),
-    /// never stored. `None` for any non-Degraded disposition. For a Degraded
-    /// terminal the conversion guarantees at least one remaining change, so
-    /// the derived value is always `Some` (non-empty by construction).
-    pub fn remaining_changes(&self) -> Option<NonEmptySlotTable<GenerationId>> {
+    /// FINAL OBSERVED STATE differs from their pre_push state, each mapped
+    /// to the generation it is on), never stored. `None` for any non-Degraded
+    /// disposition. For a Degraded terminal the set may be EMPTY (a
+    /// `leave_changed` failure that advanced nothing — e.g. a pre-swap
+    /// failure with every slot skipped — is Degraded with no remaining
+    /// change); the conversion refuses only a Degraded wire whose outcomes
+    /// are ALL restored (a fully-compensated attempt must be
+    /// `FailedRolledBack`, never Degraded).
+    ///
+    /// THE DERIVATION IS THE TRANSITION STATE, NOT THE OUTCOME'S GENERATION
+    /// FIELD: each slot's [`SlotTransition`] classifies it — a
+    /// `NeverAdvanced` slot (skipped) and a `Restored` slot (compensated
+    /// back) are back at their pre_push state (never remaining changes); an
+    /// `Advanced` slot is at the desired state (always a remaining change);
+    /// an `AdvanceUnknown` slot (a pre-swap failure — the advance outcome is
+    /// unknown) is a remaining change iff its OBSERVED state (the outcome's
+    /// generation, which the engine records as the actual post-state, never
+    /// the desired one) differs from pre_push. The intent's `pre_push` per
+    /// slot is the comparison baseline.
+    pub fn remaining_changes(&self, intent: &DeploymentIntent) -> Option<SlotTable<GenerationId>> {
         if !matches!(self.disposition, TerminalDisposition::Degraded) {
             return None;
         }
         let remaining: BTreeMap<SlotId, GenerationId> = self
             .outcomes
             .iter()
-            .filter(|(_, r)| r.outcome != SlotOutcomeKind::Restored && r.generation.is_some())
+            .filter(|(sid, r)| match r.transition {
+                SlotTransition::NeverAdvanced | SlotTransition::Restored => false,
+                SlotTransition::Advanced => true,
+                SlotTransition::AdvanceUnknown => {
+                    // The advance outcome is unknown (a pre-swap failure):
+                    // the slot is a remaining change iff its OBSERVED state
+                    // differs from pre_push. A `None` observed state (the
+                    // post-mutation status read failed) is not evidence of a
+                    // change.
+                    let pre = intent
+                        .slots
+                        .get(sid)
+                        .and_then(|s| s.pre_push.as_ref())
+                        .and_then(|p| p.generation.clone());
+                    match (r.generation.as_ref(), pre.as_ref()) {
+                        (Some(obs), Some(pre_gen)) => obs != pre_gen,
+                        (Some(_), None) => true,
+                        _ => false,
+                    }
+                }
+            })
             .map(|(k, r)| {
                 (
                     k.clone(),
                     r.generation
                         .clone()
-                        .expect("a non-restored outcome whose generation is Some (filtered above)"),
+                        .expect("a remaining change records the generation it is on"),
                 )
             })
             .collect();
-        NonEmptySlotTable::build(remaining).ok()
+        Some(SlotTable::from_map(remaining))
     }
 
     /// The COMPENSATION REPORT of a [`TerminalDisposition::FailedRolledBack`]
@@ -1352,7 +1495,12 @@ impl LedgerTerminalWire {
                 )));
             }
         }
-        let outcomes = SlotTable::from_map(self.outcomes);
+        // The wire outcomes are converted to the DOMAIN outcomes, deriving
+        // each slot's TRANSITION STATE from the wire's status/outcome fields
+        // ([`SlotOutcome::from_wire`]) — the wire keeps the current on-disk
+        // shape; the transition is the per-slot fact the domain outcomes
+        // carry.
+        let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(self.outcomes);
         // STATUS → DISPOSITION: each status maps to exactly one disposition,
         // and a status whose payload does not match its disposition is a
         // conversion error (fail closed).
@@ -1437,34 +1585,29 @@ impl LedgerTerminalWire {
                 )));
             }
             (DeploymentStatus::Degraded, None) => {
-                // REMAINING CHANGES: the slots whose outcome did NOT restore
-                // (compensated back), each mapped to the generation it
-                // recorded. DERIVED from the wire outcomes
+                // REMAINING CHANGES: the slots whose FINAL OBSERVED STATE
+                // differs from their pre_push state, each mapped to the
+                // generation it is on. DERIVED from the wire outcomes
                 // ([`LedgerTerminal::remaining_changes`]) — never stored.
-                // The derivation must be NON-EMPTY (a degraded terminal with
-                // every slot restored — or with no recorded outcome — has no
-                // remaining change and is refused: a status whose payload
-                // does not match its disposition).
-                let remaining: BTreeMap<SlotId, GenerationId> = outcomes
-                    .iter()
-                    .filter(|(_, r)| {
-                        r.outcome != SlotOutcomeKind::Restored && r.generation.is_some()
-                    })
-                    .map(|(key, r)| {
-                        (
-                            key.clone(),
-                            r.generation.clone().expect(
-                                "a non-restored outcome whose generation is Some (filtered above)",
-                            ),
-                        )
-                    })
-                    .collect();
-                NonEmptySlotTable::build(remaining).map_err(|_| {
-                    Error::integrity(format!(
-                        "terminal {}: status Degraded requires at least one REMAINING change (a non-restored outcome with a recorded generation)",
+                // The conversion refuses a Degraded wire whose outcomes are
+                // ALL restored (a fully-compensated attempt must be
+                // `FailedRolledBack`, never `Degraded` — and an EMPTY
+                // outcome table is vacuously all-restored, so a Degraded
+                // terminal with no outcomes is refused too). A Degraded
+                // terminal whose outcomes are all never-advanced (e.g. a
+                // `leave_changed` failure that advanced nothing) is
+                // legitimate: the policy marks the attempt Degraded even
+                // though no slot changed, and the derived remaining-changes
+                // set is empty.
+                if outcomes
+                    .values()
+                    .all(|r| r.outcome == SlotOutcomeKind::Restored)
+                {
+                    return Err(Error::integrity(format!(
+                        "terminal {}: status Degraded requires at least one non-restored outcome (an all-restored attempt is FailedRolledBack, never Degraded)",
                         self.deployment_id
-                    ))
-                })?;
+                    )));
+                }
                 TerminalDisposition::Degraded
             }
             (DeploymentStatus::Degraded, Some(_)) => {
@@ -1508,7 +1651,13 @@ impl LedgerTerminalWire {
             target: target.clone(),
             status: t.disposition.status(),
             recorded_at: t.recorded_at.clone(),
-            outcomes: t.outcomes.clone().into_map(),
+            // The WIRE keeps the current on-disk shape: the domain outcomes'
+            // transition state is a DOMAIN fact and is dropped here.
+            outcomes: t
+                .outcomes
+                .iter()
+                .map(|(k, r)| (k.clone(), SlotResult::from(r.clone())))
+                .collect(),
             rollback,
             reason: t.reason.clone(),
         }
@@ -2337,8 +2486,12 @@ mod tests {
                 rollback: None,
                 reason: Some("rolled back".to_string()),
             },
-            // Degraded: every member's outcome is a REMAINING change
-            // (non-restored, with a recorded generation).
+            // Degraded: every member's outcome is a REMAINING change — an
+            // UNCOMPENSATED `Failed` (a pre-swap failure / failed
+            // compensation: the advance outcome is unknown, and the
+            // outcome's observed generation differs from the intent's
+            // `pre_push` (None — a first deployment), so the derived
+            // remaining-changes set is non-empty).
             _ => LedgerTerminalWire {
                 deployment_id,
                 target,
@@ -2346,7 +2499,7 @@ mod tests {
                 recorded_at: "2026-01-01T00:00:00Z".to_string(),
                 outcomes: keys
                     .iter()
-                    .map(|k| (k.clone(), outcome_for(k, SlotOutcomeKind::Skipped)))
+                    .map(|k| (k.clone(), outcome_for(k, SlotOutcomeKind::Failed)))
                     .collect(),
                 rollback: None,
                 reason: Some("degraded".to_string()),
@@ -2544,7 +2697,7 @@ mod tests {
             }
             (TerminalDisposition::Degraded, 3) => {
                 let remaining_changes = terminal
-                    .remaining_changes()
+                    .remaining_changes(intent)
                     .expect("a Degraded terminal derives its remaining changes from the outcomes");
                 assert!(
                     !remaining_changes.is_empty(),
@@ -3238,9 +3391,10 @@ mod tests {
         // (derived, never stored twice).
         let wire = agreeing_terminal(&keys, 3);
         let d = wire.into_domain().unwrap();
+        let intent = agreeing_intent(&keys).into_domain().unwrap();
         assert_eq!(d.disposition, TerminalDisposition::Degraded);
         assert_eq!(
-            d.remaining_changes()
+            d.remaining_changes(&intent)
                 .expect("derived remaining changes")
                 .len(),
             2
@@ -4343,5 +4497,162 @@ mod tests {
                 panic!("a Release-origin plan must round-trip as a Release origin, got {other:?}")
             }
         }
+    }
+
+    // ---- the transition-state derivation (deterministic) ----------------
+
+    /// Build a Degraded terminal with the given per-slot outcomes (each
+    /// outcome names its own key) and an intent whose pre_push carries the
+    /// given per-slot generations (the fixture's default pre_push is `None`
+    /// — a first deployment — so the given entries override it).
+    fn degraded_terminal_with(
+        outcomes: Vec<(SlotId, SlotResult)>,
+        pre_push: Vec<(SlotId, Option<GenerationId>)>,
+    ) -> (DeploymentIntent, LedgerTerminal) {
+        let keys: Vec<SlotId> = outcomes.iter().map(|(k, _)| k.clone()).collect();
+        let mut intent_wire = agreeing_intent(&keys);
+        for (k, g) in pre_push {
+            intent_wire.pre_push.insert(
+                k,
+                Some(SlotAttemptState {
+                    artifact: ArtifactRef::default(),
+                    generation: g,
+                }),
+            );
+        }
+        let intent = intent_wire.into_domain().unwrap();
+        let terminal = LedgerTerminal {
+            recorded_at: "2026-01-01T00:00:00Z".to_string(),
+            outcomes: SlotTable::from_map(outcomes.into_iter().collect()),
+            disposition: TerminalDisposition::Degraded,
+            reason: None,
+        };
+        (intent, terminal)
+    }
+
+    /// THE TRANSITION-STATE DERIVATION (deterministic, per transition
+    /// class): `remaining_changes()` returns exactly the slots whose FINAL
+    /// OBSERVED STATE differs from their pre_push state — a SKIPPED slot
+    /// (`NeverAdvanced`) is never a remaining change, an ADVANCED slot
+    /// (`Advanced`) always is, a RESTORED slot (`Restored`) never is, and
+    /// an ADVANCE-UNKNOWN slot (`AdvanceUnknown` — a pre-swap failure / a
+    /// failed compensation) is a remaining change iff its observed state
+    /// differs from pre_push. The old derivation counted a skipped slot
+    /// (its outcome records a generation) and a pre-swap failure (its
+    /// outcome records the DESIRED generation) as changed — the transition
+    /// state is the per-slot fact the derivation is based on, never the
+    /// outcome's generation field alone.
+    #[test]
+    fn remaining_changes_reflects_the_transition_state_not_the_generation_field() {
+        // A SKIPPED slot (NeverAdvanced): never mutated — its observed
+        // state equals pre_push, so it is never a remaining change (the old
+        // derivation counted it because its outcome records a generation).
+        let (intent, terminal) = degraded_terminal_with(
+            vec![(
+                slot(1),
+                SlotResult {
+                    slot_id: slot(1),
+                    outcome: SlotOutcomeKind::Skipped,
+                    generation: Some(GenerationId::new("pre-1".to_string())),
+                    compensated: false,
+                    error: None,
+                },
+            )],
+            vec![(slot(1), Some(GenerationId::new("pre-1".to_string())))],
+        );
+        let remaining = terminal.remaining_changes(&intent).expect("Degraded");
+        assert!(
+            !remaining.contains_key(&slot(1)),
+            "a skipped slot (NeverAdvanced) is never a remaining change"
+        );
+
+        // An ADVANCED slot (Advanced): at the desired state — always a
+        // remaining change, mapped to the generation it is on.
+        let (intent, terminal) = degraded_terminal_with(
+            vec![(
+                slot(1),
+                SlotResult {
+                    slot_id: slot(1),
+                    outcome: SlotOutcomeKind::Activated,
+                    generation: Some(GenerationId::new("new-1".to_string())),
+                    compensated: false,
+                    error: None,
+                },
+            )],
+            vec![(slot(1), Some(GenerationId::new("pre-1".to_string())))],
+        );
+        let remaining = terminal.remaining_changes(&intent).expect("Degraded");
+        assert_eq!(
+            remaining.get(&slot(1)),
+            Some(&GenerationId::new("new-1".to_string())),
+            "an advanced slot (Advanced) is a remaining change at the generation it is on"
+        );
+
+        // A RESTORED slot (Restored): compensated back to pre_push — never
+        // a remaining change (even though its outcome records the generation
+        // it advanced to).
+        let (intent, terminal) = degraded_terminal_with(
+            vec![(
+                slot(1),
+                SlotResult {
+                    slot_id: slot(1),
+                    outcome: SlotOutcomeKind::Restored,
+                    generation: Some(GenerationId::new("new-1".to_string())),
+                    compensated: true,
+                    error: None,
+                },
+            )],
+            vec![(slot(1), Some(GenerationId::new("pre-1".to_string())))],
+        );
+        let remaining = terminal.remaining_changes(&intent).expect("Degraded");
+        assert!(
+            !remaining.contains_key(&slot(1)),
+            "a restored slot (Restored) is never a remaining change"
+        );
+
+        // An ADVANCE-UNKNOWN slot (a pre-swap failure / a failed
+        // compensation): a remaining change iff its OBSERVED state differs
+        // from pre_push. Observed == pre_push (a pre-swap failure that
+        // advanced nothing) → NOT a remaining change.
+        let (intent, terminal) = degraded_terminal_with(
+            vec![(
+                slot(1),
+                SlotResult {
+                    slot_id: slot(1),
+                    outcome: SlotOutcomeKind::Failed,
+                    generation: Some(GenerationId::new("pre-1".to_string())),
+                    compensated: false,
+                    error: None,
+                },
+            )],
+            vec![(slot(1), Some(GenerationId::new("pre-1".to_string())))],
+        );
+        let remaining = terminal.remaining_changes(&intent).expect("Degraded");
+        assert!(
+            !remaining.contains_key(&slot(1)),
+            "an advance-unknown slot whose observed state equals pre_push is not a remaining change"
+        );
+        // Observed != pre_push (a post-swap failure whose compensation
+        // failed — the slot is still on the new generation) → a remaining
+        // change.
+        let (intent, terminal) = degraded_terminal_with(
+            vec![(
+                slot(1),
+                SlotResult {
+                    slot_id: slot(1),
+                    outcome: SlotOutcomeKind::Failed,
+                    generation: Some(GenerationId::new("new-1".to_string())),
+                    compensated: false,
+                    error: None,
+                },
+            )],
+            vec![(slot(1), Some(GenerationId::new("pre-1".to_string())))],
+        );
+        let remaining = terminal.remaining_changes(&intent).expect("Degraded");
+        assert_eq!(
+            remaining.get(&slot(1)),
+            Some(&GenerationId::new("new-1".to_string())),
+            "an advance-unknown slot whose observed state differs from pre_push is a remaining change"
+        );
     }
 }

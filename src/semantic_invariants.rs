@@ -96,7 +96,7 @@ use crate::store::local::LocalStore;
 use crate::testutil::step17_hook;
 use proptest::prelude::*;
 use proptest::test_runner::{FileFailurePersistence, RngSeed};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -3311,6 +3311,132 @@ proptest! {
         position in 0..2usize,
     ) {
         run_failure_position_case(policy, position);
+    }
+}
+
+// ===========================================================================
+// Property — remaining_changes equals the observed-vs-pre_push set
+// ===========================================================================
+
+/// THE REMAINING-CHANGES PROPERTY (one case): a multi-server `t1` push
+/// (batch 0 = `p1` on `s1`, batch 1 = `p2` on `s2`, `batch_size = 1`) fails
+/// a SPECIFIC batch position pre-swap (per-server fault,
+/// [`Fixture::set_remote_read_fault_at_position`]) AFTER a baseline push
+/// established a generation on every slot, and the faulted attempt's
+/// [`LedgerTerminal::remaining_changes`] must EQUAL EXACTLY the slots whose
+/// FINAL OBSERVED STATE differs from their pre_push state (compared against
+/// the observed records — the actual post-state per slot, never the desired
+/// plan). The scenario generates all four transition classes across the two
+/// policies: the FAILED batch is a PRE-SWAP FAILURE (`AdvanceUnknown` —
+/// never advanced, its observed state equals pre_push), the LATER batches
+/// are SKIPPED (`NeverAdvanced`), and the EARLIER batches are either
+/// COMPENSATION SUCCESSES (`Restored` — `rollback_changed` compensates them
+/// back) or retained SUCCESSFUL ADVANCES (`Advanced` — `leave_changed`
+/// keeps them at the new state). A pre-swap failure that advanced nothing
+/// and a skipped slot must NOT appear in the derived set even though their
+/// outcomes record a generation — the derivation is the transition state,
+/// never the outcome's generation field alone.
+fn run_remaining_changes_case(policy: FailurePolicy, position: usize) {
+    let f = Fixture::with_failure_policy(policy);
+    let slots = ["p1", "p2"];
+
+    // Baseline: tree v1 lands on BOTH slots (a real push).
+    f.write_artifacts(1);
+    let r = f.push("t1").expect("the baseline push succeeds");
+    assert_eq!(r.status, Some(DeploymentStatus::Successful));
+
+    // The second push is a REAL push (tree v2) whose batch `position` fails
+    // PRE-SWAP on its server.
+    f.write_artifacts(2);
+    f.set_remote_read_fault_at_position(position);
+    let id = test_deployment_id(&format!("si-rc-{position}"));
+    let report = f
+        .push_with_id("t1", &id)
+        .expect("the faulted push still returns a report");
+    let status = report
+        .status
+        .expect("a faulted push records a terminal status");
+
+    // The faulted attempt's ledger entry: the intent (the pre_push per
+    // slot) and the terminal (the outcomes + disposition).
+    let entry = f
+        .store
+        .read_ledger("t1")
+        .unwrap()
+        .into_iter()
+        .find(|e| e.deployment_id.as_str() == id.as_str())
+        .expect("the faulted attempt has a ledger entry");
+    let intent = &entry.intent;
+    let terminal = entry
+        .terminal
+        .as_ref()
+        .expect("the faulted attempt has a terminal");
+
+    // The observed records: the ACTUAL post-state per slot (the observed
+    // refresh rebuilds them from the LIVE assignments — a skipped or
+    // pre-swap-failed slot keeps its prior record, an advanced slot shows
+    // the new generation, a compensated slot its restored prior one).
+    let observed = f.store.read_observed("t1", &f.config).unwrap();
+
+    // THE ORACLE: the slots whose FINAL OBSERVED STATE differs from their
+    // pre_push state (the intent's pre_push per slot).
+    let expected: BTreeSet<SlotId> = slots
+        .iter()
+        .map(|s| SlotId::new(s.to_string()))
+        .filter(|sid| {
+            let observed_gen = observed.slots.get(sid).and_then(|o| o.generation.clone());
+            let pre_gen = intent
+                .slots
+                .get(sid)
+                .and_then(|s| s.pre_push.as_ref())
+                .and_then(|p| p.generation.clone());
+            observed_gen != pre_gen
+        })
+        .collect();
+
+    // `remaining_changes()` must equal the oracle EXACTLY: `None` (not
+    // Degraded — `rollback_changed` fully compensated) iff the oracle is
+    // empty, and the derived set otherwise.
+    let remaining = terminal.remaining_changes(intent);
+    match remaining {
+        Some(rc) => {
+            let actual: BTreeSet<SlotId> = rc.keys().cloned().collect();
+            assert_eq!(
+                actual, expected,
+                "policy {policy:?} position {position}: remaining_changes must equal exactly the \
+                 slots whose observed state differs from pre_push (status {status:?})"
+            );
+        }
+        None => assert!(
+            expected.is_empty(),
+            "policy {policy:?} position {position}: a non-Degraded terminal ({status:?}) must \
+             have no slot whose observed state differs from pre_push"
+        ),
+    }
+}
+
+proptest! {
+    // THE REMAINING-CHANGES PROPERTY: for every supported failure policy and
+    // every batch position of the multi-server fixture push, a fault at that
+    // position must leave `remaining_changes()` EQUAL EXACTLY the slots
+    // whose FINAL OBSERVED STATE differs from their pre_push state
+    // (compared against the observed records). Bounded 16 cases, fixed seed
+    // 0x5EED_5EED (house style), no persistence — the identical vectors on
+    // every run; each case drives its OWN fixture (per-fixture fault
+    // registry, structurally isolated).
+    #![proptest_config(ProptestConfig {
+        cases: 16,
+        rng_seed: RngSeed::Fixed(0x5EED_5EED),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+
+    #[test]
+    fn remaining_changes_matches_observed_vs_pre_push(
+        policy in failure_policy_strategy(),
+        position in 0..2usize,
+    ) {
+        run_remaining_changes_case(policy, position);
     }
 }
 

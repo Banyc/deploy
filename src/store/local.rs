@@ -3666,7 +3666,8 @@ mod tests {
                 generation: Some(test_generation_id("x")),
                 compensated: false,
                 error: None,
-            },
+            }
+            .into(),
         );
         bad.outcomes = SlotTable::from_map(outcomes);
         assert_terminal_refused(&tmp, target, &intent, &bad, "e");

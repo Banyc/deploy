@@ -770,7 +770,13 @@ impl LocalStore {
     /// (the outcomes store never existed for it), mirroring the old read.
     pub fn read_results(&self, id: &str) -> Result<BTreeMap<SlotId, SlotResult>> {
         self.latest_transition(id)?
-            .map(|t| t.outcomes.into_map())
+            .map(|t| {
+                t.outcomes
+                    .into_map()
+                    .into_iter()
+                    .map(|(k, r)| (k, SlotResult::from(r)))
+                    .collect()
+            })
             .ok_or_else(|| Error::store(format!("no results for deployment '{id}'")))
     }
 

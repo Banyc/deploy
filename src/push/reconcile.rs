@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::history;
 use crate::model::{GenerationId, OperationId, SlotId};
 use crate::records::{
-    DeploymentIntent, LedgerTerminal, NonEmptySlotTable, SlotOutcomeKind, SlotResult, SlotTable,
+    DeploymentIntent, LedgerTerminal, SlotOutcome, SlotOutcomeKind, SlotResult, SlotTable,
     TerminalDisposition,
 };
 use crate::remote::helper::RemoteHelper;
@@ -236,12 +236,14 @@ fn append_degraded(
     reason: &str,
 ) -> Result<()> {
     // The Degraded disposition's REMAINING CHANGES are DERIVED from the
-    // outcomes (the non-restored slots with a recorded generation) — never
-    // stored. The wire record therefore records the pending changes — the
-    // attempt's desired generations, each as a Skipped outcome (never
-    // advanced) — so the read-back conversion derives a NON-EMPTY
-    // remaining-changes set (a Degraded terminal with nothing remaining is
-    // a payload mismatch).
+    // The Degraded disposition's REMAINING CHANGES are DERIVED from the
+    // outcomes (the slots whose FINAL OBSERVED STATE differs from their
+    // pre_push state) — never stored. The wire record therefore records the
+    // pending changes — the attempt's desired generations, each as an
+    // UNCOMPENSATED `Failed` outcome (a pre-swap failure / failed
+    // compensation: the advance outcome is unknown, and the outcome's
+    // observed generation differs from the intent's pre_push, so the
+    // derived remaining-changes set is non-empty).
     let outcomes: BTreeMap<SlotId, SlotResult> = attempt
         .slots
         .iter()
@@ -250,7 +252,7 @@ fn append_degraded(
                 sid.clone(),
                 SlotResult {
                     slot_id: sid.clone(),
-                    outcome: SlotOutcomeKind::Skipped,
+                    outcome: SlotOutcomeKind::Failed,
                     generation: Some(slot.desired.generation.clone()),
                     compensated: false,
                     error: None,
@@ -258,14 +260,19 @@ fn append_degraded(
             )
         })
         .collect();
-    let outcomes = SlotTable::from_map(outcomes);
-    // Verify the derivation is NON-EMPTY (fail fast — the read path derives
-    // the same set and refuses an empty one).
-    let remaining_changes: BTreeMap<SlotId, GenerationId> = outcomes
-        .iter()
-        .map(|(sid, r)| (sid.clone(), r.generation.clone().expect("recorded above")))
-        .collect();
-    NonEmptySlotTable::build(remaining_changes)?;
+    let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(outcomes);
+    // Verify the disposition is not all-restored (fail fast — the read path
+    // refuses a Degraded wire whose outcomes are ALL restored; a
+    // fully-compensated attempt must be `FailedRolledBack`, never Degraded).
+    if outcomes
+        .values()
+        .all(|r| r.outcome == SlotOutcomeKind::Restored)
+    {
+        return Err(Error::store(
+            "a Degraded terminal requires at least one non-restored outcome — none recorded"
+                .to_string(),
+        ));
+    }
     store.append_terminal(
         target_name,
         &attempt.deployment_id,

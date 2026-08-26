@@ -26,8 +26,8 @@ use crate::push::staging::{StagingCleanup, cleanup_dry_run_staging, remove_tree_
 use crate::records::{
     BehaviorIndex, DeploymentIntent, DeploymentPlan, DeploymentStatus, DesiredGeneration,
     IntentSlot, LedgerIntentReport, LedgerTerminal, NonEmptySlotTable, ObservedSlot,
-    PreviousGeneration, SlotAttemptState, SlotOutcomeKind, SlotPlan, SlotResult, SlotTable,
-    TerminalDisposition,
+    PreviousGeneration, SlotAttemptState, SlotOutcome, SlotOutcomeKind, SlotPlan, SlotResult,
+    SlotTable, TerminalDisposition,
 };
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::transport::Remote;
@@ -1206,6 +1206,11 @@ fn push_inner(
     let mut results: BTreeMap<SlotId, SlotResult> = BTreeMap::new();
     let mut advanced: Vec<SlotId> = Vec::new();
     let mut compensated: Vec<SlotId> = Vec::new();
+    // Pre-swap failures (never advanced): the slot's outcome records the
+    // ACTUAL observed generation (the post-mutation status read below),
+    // never the desired one — the outcome's generation field is the observed
+    // post-state the remaining-changes derivation compares against pre_push.
+    let mut never_advanced: Vec<SlotId> = Vec::new();
     let mut had_failure = false;
 
     let servers_order: Vec<SlotId> = assignments
@@ -1294,6 +1299,12 @@ fn push_inner(
                 // included: for them `advanced.is_empty()` correctly yields
                 // `FailedRolledBack` (nothing to roll back).
                 advanced.push(sid.clone());
+            } else {
+                // A pre-swap failure (never advanced) or a compare-and-swap
+                // skip: the slot's outcome records the ACTUAL observed
+                // generation (the post-mutation status read below), never the
+                // desired one.
+                never_advanced.push(sid.clone());
             }
             results.insert(
                 sid.clone(),
@@ -1548,6 +1559,21 @@ fn push_inner(
         };
         actual_servers.insert(sid.clone(), actual);
     }
+    // A pre-swap failure (never advanced) records the ACTUAL observed
+    // generation — the outcome's generation field is the observed post-state
+    // the remaining-changes derivation compares against pre_push, never the
+    // desired generation. The post-mutation status read above reflects the
+    // true state: the slot never advanced, so it is still on its pre-push
+    // generation (or `None` when the read fails — the state is unknown, and
+    // an unknown state is not evidence of a change). Skipped outcomes
+    // already record the reconciled current assignment.
+    for sid in &never_advanced {
+        if let Some(r) = results.get_mut(sid)
+            && r.outcome == SlotOutcomeKind::Failed
+        {
+            r.generation = actual_servers.get(sid).and_then(|a| a.generation.clone());
+        }
+    }
     // `desired` (each slot's minted generation for its planned artifact, as a
     // complete [`GenerationRef`]) was computed BEFORE the mutation loop and
     // persisted as part of the immutable intent (`attempt_intent`); it is not
@@ -1624,43 +1650,37 @@ fn push_inner(
         // before its own no-op check) — appending a PendingCommit terminal
         // would strand the attempt forever (reconciliation only picks up
         // entries WITHOUT a terminal).
-        let outcomes = SlotTable::from_map(outcomes_map);
+        let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(outcomes_map);
         // MAP the final status to its DISPOSITION (the domain truth table is
         // structural): FailedPreflight carries nothing (empty outcomes — no
         // slot touched), FailedRolledBack derives its compensation report
         // from the outcome table, Degraded derives its remaining changes
-        // (the non-restored outcomes) from the outcomes — the same
-        // derivation the read path applies, so the domain and the wire
-        // conversion stay in sync.
+        // (the slots whose FINAL OBSERVED STATE differs from their pre_push
+        // state) from the outcomes — the same derivation the read path
+        // applies, so the domain and the wire conversion stay in sync.
         let disposition = match &commit_status {
             DeploymentStatus::FailedPreflight => TerminalDisposition::FailedPreflight,
             DeploymentStatus::FailedRolledBack => TerminalDisposition::FailedRolledBack,
             DeploymentStatus::Degraded => {
                 // The Degraded disposition's remaining changes are DERIVED
-                // from the outcomes (the non-restored slots with a recorded
-                // generation) — never stored. The derivation must be
-                // NON-EMPTY (a Degraded terminal with nothing remaining is
-                // a payload mismatch).
-                let remaining: BTreeMap<SlotId, GenerationId> = outcomes
-                    .iter()
-                    .filter(|(_, r)| {
-                        r.outcome != SlotOutcomeKind::Restored && r.generation.is_some()
-                    })
-                    .map(|(k, r)| {
-                        (
-                            k.clone(),
-                            r.generation.clone().expect(
-                                "a non-restored outcome with a recorded generation (filtered)",
-                            ),
-                        )
-                    })
-                    .collect();
-                NonEmptySlotTable::build(remaining).map_err(|_| {
-                    Error::store(
-                        "a Degraded terminal requires at least one remaining change — none recorded"
+                // from the outcomes (the slots whose final observed state
+                // differs from their pre_push state) — never stored. The
+                // conversion refuses a Degraded wire whose outcomes are ALL
+                // restored (a fully-compensated attempt must be
+                // `FailedRolledBack`, never `Degraded`); a Degraded terminal
+                // whose outcomes are all never-advanced (e.g. a
+                // `leave_changed` failure that advanced nothing) is
+                // legitimate — the policy marks the attempt Degraded even
+                // though no slot changed.
+                if outcomes
+                    .values()
+                    .all(|r| r.outcome == SlotOutcomeKind::Restored)
+                {
+                    return Err(Error::store(
+                        "a Degraded terminal requires at least one non-restored outcome — none recorded"
                             .to_string(),
-                    )
-                })?;
+                    ));
+                }
                 TerminalDisposition::Degraded
             }
             other => {
