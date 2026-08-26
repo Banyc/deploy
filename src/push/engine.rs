@@ -106,10 +106,10 @@ fn slot_vars(
     Ok(crate::template::TemplateVars::slot(
         &slot.deploy_dir,
         artifact.variant.as_str(),
-        &config.application,
+        config.application.as_str(),
         artifact.release.as_str(),
         target_name,
-        &server.id,
+        server.id.as_str(),
     )
     .with_server(&server.user, &server.address, server.port)
     .with_slot_id(&slot.id)
@@ -440,7 +440,7 @@ fn push_inner(
                 &release_root,
                 &config.variant(&v)?.artifact.mappings,
                 &crate::template::TemplateVars::mapping(
-                    &config.application,
+                    config.application.as_str(),
                     config.release().as_str(),
                     &v,
                 ),
@@ -1168,8 +1168,10 @@ fn push_inner(
         return Err(e);
     }
 
-    // 10-13. Process slots in batches.
-    let batch_size = target.rollout.batch_size.max(1) as usize;
+    // 10-13. Process slots in batches. The batch size is a validated NONZERO
+    // [`BatchSize`] (the raw -> domain conversion rejects zero), so the
+    // `max(1)` guard is an invariant-preserving no-op kept for the batch loop.
+    let batch_size = target.rollout.batch_size.get().max(1) as usize;
     // The TYPED batch-failure policy: never a loose string. It is matched
     // EXHAUSTIVELY below (step 13 compensation and step 14 status) — an
     // unsupported spelling cannot exist (the strict parse rejected it at
@@ -1531,7 +1533,7 @@ fn push_inner(
     // built from. The REPORT's attempt ([`LedgerIntentReport`]) also carries
     // the actuals (for display); the persisted intent does not — outcomes are
     // never part of the verified intent object.
-    let mut attempt = LedgerIntentReport::from(&attempt_intent);
+    let mut attempt = LedgerIntentReport::from_intent(&attempt_intent)?;
     attempt.slots = actual_servers.clone();
     let outcomes_map: BTreeMap<PlacementSlotId, SlotResult> = results.clone();
 
@@ -1992,7 +1994,7 @@ fn refresh_observed(
             continue;
         };
         if let Err(e) = store.write_server(&crate::records::ServerState {
-            id: crate::model::ServerId::new(sdef.id.clone()),
+            id: crate::model::ServerId::new(sdef.id.as_str().to_string()),
             last_seen_target: Some(TargetName::new(target_name.to_string())),
             last_observed: Some(observed_server.clone()),
         }) {
@@ -2501,7 +2503,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
         push_inner(
             &project_root,
@@ -2797,7 +2799,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &release_root,
             &vcfg.artifact.mappings,
             &crate::template::TemplateVars::mapping(
-                &config.application,
+                config.application.as_str(),
                 config.release().as_str(),
                 "standard",
             ),
@@ -2954,7 +2956,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let fault_factory = move |s: &crate::config::ServerDef,
                                   _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
-            FailOnceMarkerRemote::build(rf.join(&s.id), armed_for_factory.clone())
+            FailOnceMarkerRemote::build(rf.join(s.id.as_str()), armed_for_factory.clone())
         };
         let r1 = push(
             &h.cfg_path,
@@ -3076,7 +3078,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let clean_factory = move |s: &crate::config::ServerDef,
                                   _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
         push(
             &h.cfg_path,
@@ -3509,7 +3511,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
         push_inner(
             &project_root,
@@ -3537,7 +3539,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     fn single_attempt(h: &RecoveryHarness) -> LedgerIntentReport {
         let mut attempts = h.store.read_attempts("t1").unwrap();
         assert_eq!(attempts.len(), 1, "exactly one attempt recorded");
-        LedgerIntentReport::from(&attempts.remove(0).intent)
+        LedgerIntentReport::from_intent(&attempts.remove(0).intent).expect("verified intent parses")
     }
 
     /// The rollback payload of a successful ledger entry (the test view of
@@ -3626,7 +3628,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let fault_factory = move |s: &crate::config::ServerDef,
                                   _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
-            FailOnceMarkerRemote::build(rf.join(&s.id), armed_for_factory.clone())
+            FailOnceMarkerRemote::build(rf.join(s.id.as_str()), armed_for_factory.clone())
         };
         let r2 = push(
             &h.cfg_path,
@@ -3943,7 +3945,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             target: TargetName::new("t1".to_string()),
             group: None,
             slot_ids: vec![PlacementSlotId::new("p1".to_string())],
-            behavior_sha256: baseline.behavior_sha256.clone(),
+            behavior_sha256: baseline.behavior_sha256.as_str().to_string(),
             attempted_at: crate::remote::helper::now_rfc3339(),
             desired: BTreeMap::from([(
                 PlacementSlotId::new("p1".to_string()),
@@ -4079,7 +4081,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let fault_factory = move |s: &crate::config::ServerDef,
                                   _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
-            FailOnceGenerationRemote::build(rf.join(&s.id), armed_for_factory.clone())
+            FailOnceGenerationRemote::build(rf.join(s.id.as_str()), armed_for_factory.clone())
         };
         let project_root = h.config.project_root(&h.cfg_path);
         let target = h.config.targets.get("t1").expect("harness target");
@@ -4245,7 +4247,7 @@ interval_seconds = 0
                             _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(RecordingRemote::new(
-                rf.join(&s.id),
+                rf.join(s.id.as_str()),
                 recorded.clone(),
             )?))
         };
@@ -4406,7 +4408,7 @@ interval_seconds = 0
             target: TargetName::new("t1".to_string()),
             group: None,
             slot_ids: vec![PlacementSlotId::new("p1".to_string())],
-            behavior_sha256: baseline.behavior_sha256.clone(),
+            behavior_sha256: baseline.behavior_sha256.as_str().to_string(),
             attempted_at: crate::remote::helper::now_rfc3339(),
             desired: BTreeMap::from([(PlacementSlotId::new("p1".to_string()), desired_ref)]),
             pre_push: BTreeMap::from([(PlacementSlotId::new("p1".to_string()), None)]),
@@ -4467,7 +4469,7 @@ interval_seconds = 0
             target: TargetName::new("t1".to_string()),
             group: None,
             slot_ids: vec![PlacementSlotId::new("p1".to_string())],
-            behavior_sha256: baseline.behavior_sha256.clone(),
+            behavior_sha256: baseline.behavior_sha256.as_str().to_string(),
             attempted_at: crate::remote::helper::now_rfc3339(),
             desired: BTreeMap::from([(
                 PlacementSlotId::new("p1".to_string()),
@@ -4589,7 +4591,7 @@ interval_seconds = 0
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
         let r2 = push_inner(
             &config2.project_root(&h.cfg_path),
@@ -4863,7 +4865,7 @@ interval_seconds = 0
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
         let r = push_inner(
             &project_root,
@@ -5026,7 +5028,7 @@ interval_seconds = 0
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
         let err = push(
             &h.cfg_path,
@@ -5098,7 +5100,7 @@ interval_seconds = 0
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
         let r = push(
             &h.cfg_path,
@@ -5172,7 +5174,7 @@ interval_seconds = 0
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
         let r = push(
             &h.cfg_path,
@@ -5387,7 +5389,7 @@ interval_seconds = 0
             let factory = move |s: &crate::config::ServerDef,
                                 _slot: &crate::config::SlotDef|
                   -> Result<Box<dyn Remote>> {
-                Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+                Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
             };
             push_inner(
                 &project_root,
@@ -5845,7 +5847,7 @@ interval_seconds = 0
         let mut config = Config::load(&h.cfg_path).unwrap();
         config.servers[0].capacity = crate::config::CapacityConfig {
             reserve_bytes: 1024 * 1024,
-            reserve_percent: 0,
+            reserve_percent: crate::scalar::CapacityPercent::new(0).expect("0 is in range"),
         };
         let project_root = config.project_root(&h.cfg_path);
         let target = config.targets.get("t1").expect("harness target");
@@ -5854,7 +5856,7 @@ interval_seconds = 0
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
-            FakeCapacityRemote::build(rf.join(&s.id), 100)
+            FakeCapacityRemote::build(rf.join(s.id.as_str()), 100)
         };
         let err = push_inner(
             &project_root,
@@ -5949,7 +5951,7 @@ interval_seconds = 0
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
-            FailOnceStagingRemote::build(rf.join(&s.id), armed_for_factory.clone())
+            FailOnceStagingRemote::build(rf.join(s.id.as_str()), armed_for_factory.clone())
         };
         let err = push_inner(
             &project_root,
@@ -6117,12 +6119,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
-            let arm = if s.id == "s2" {
+            let arm = if s.id.as_str() == "s2" {
                 armed_for_factory.clone()
             } else {
                 Arc::new(AtomicBool::new(false))
             };
-            FailOnceStagingRemote::build(rf.join(&s.id), arm)
+            FailOnceStagingRemote::build(rf.join(s.id.as_str()), arm)
         };
         let err = push_inner(
             &project_root,
@@ -6293,7 +6295,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
         let err = push_inner(
             &project_root,
@@ -6651,7 +6653,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let fault_factory = move |s: &crate::config::ServerDef,
                                   _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
-            FailOnceGenerationRemote::build(rf.join(&s.id), armed_for_factory.clone())
+            FailOnceGenerationRemote::build(rf.join(s.id.as_str()), armed_for_factory.clone())
         };
         let project_root = h.config.project_root(&h.cfg_path);
         let target = h.config.targets.get("t1").expect("harness target");
@@ -6899,7 +6901,7 @@ interval_seconds = 0
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
         let r = push_inner(
             &project_root,
@@ -7005,7 +7007,7 @@ interval_seconds = 0
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
         let r = push(
             &h.cfg_path,
@@ -7176,7 +7178,7 @@ interval_seconds = 0
                             _slot: &crate::config::SlotDef|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(RecordingRemote::new(
-                rf.join(&s.id),
+                rf.join(s.id.as_str()),
                 recorded.clone(),
             )?))
         };
@@ -7431,7 +7433,7 @@ interval_seconds = 0
             let fault_factory = move |s: &crate::config::ServerDef,
                                       _slot: &crate::config::SlotDef|
                      -> Result<Box<dyn Remote>> {
-                FailOnceMarkerRemote::build(rf.join(&s.id), armed_for_factory.clone())
+                FailOnceMarkerRemote::build(rf.join(s.id.as_str()), armed_for_factory.clone())
             };
             let rp = push(
                 &h.cfg_path,
@@ -7560,7 +7562,7 @@ interval_seconds = 0
             let clean_factory = move |s: &crate::config::ServerDef,
                                       _slot: &crate::config::SlotDef|
                      -> Result<Box<dyn Remote>> {
-                Ok(Box::new(LocalTransport::new(rf2.join(&s.id))?))
+                Ok(Box::new(LocalTransport::new(rf2.join(s.id.as_str()))?))
             };
             let ref_id = DeploymentId::new(format!("deploy-relative-ref-{latest}-{depth}"));
             h.store
@@ -7856,7 +7858,7 @@ interval_seconds = 0
             &release_dir,
             &config.variant("standard").unwrap().artifact.mappings,
             &crate::template::TemplateVars::mapping(
-                &config.application,
+                config.application.as_str(),
                 config.release().as_str(),
                 "standard",
             ),

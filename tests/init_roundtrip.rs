@@ -63,12 +63,12 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     // deploy_dir, unique server ids, known variant, non-empty target).
     let config_path = proj.join("deploy.toml");
     let config = Config::load(&config_path)?;
-    assert_eq!(config.application, "roundtrip-app");
+    assert_eq!(config.application.as_str(), "roundtrip-app");
     assert_eq!(config.release().as_str(), "v1");
     // Membership is derived from the slots' `targets` lists (the slot is
     // declared inside releases/v1/standard.toml, bound to `production`).
     assert_eq!(config.target_slot_ids("production")?, vec!["app-1"]);
-    assert_eq!(config.targets["production"].rollout.batch_size, 1);
+    assert_eq!(config.targets["production"].rollout.batch_size.get(), 1);
     let variant = config.variant("standard")?;
     assert_eq!(variant.verification.argv, vec!["true"]);
     assert_eq!(
@@ -97,7 +97,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     // Capacity is a per-server policy: the scaffold puts it on the server
     // entry (0/0 by default), and the variant file has no `[capacity]` block.
     assert_eq!(config.servers[0].capacity.reserve_bytes, 0);
-    assert_eq!(config.servers[0].capacity.reserve_percent, 0);
+    assert_eq!(config.servers[0].capacity.reserve_percent.get(), 0);
     let addr = &config.servers[0].address;
     assert!(
         addr.starts_with("local://")
@@ -285,7 +285,7 @@ fn cli_init_flags_reach_config() -> Result<()> {
         "ops",
     ])?;
     let config = Config::load(&proj.join("deploy.toml"))?;
-    assert_eq!(config.application, "backend");
+    assert_eq!(config.application.as_str(), "backend");
     assert_eq!(config.servers[0].user, "ops");
     Ok(())
 }

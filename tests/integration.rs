@@ -1717,7 +1717,7 @@ interval_seconds = 0
     config
         .servers
         .iter_mut()
-        .find(|s| s.id == "server-01")
+        .find(|s| s.id.as_str() == "server-01")
         .unwrap()
         .address = format!("local://{}", endpoints.join("server-01").display());
 
@@ -2445,7 +2445,7 @@ fn capacity_rotation_compute_retained_failure_releases_lock() -> Result<()> {
     for s in &mut config.servers {
         s.capacity = deploy::config::CapacityConfig {
             reserve_bytes: 1024 * 1024,
-            reserve_percent: 0,
+            reserve_percent: deploy::scalar::CapacityPercent::new(0).expect("0 is in range"),
         };
     }
 

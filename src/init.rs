@@ -21,9 +21,9 @@
 //! project is valid.
 
 use crate::config::{
-    ActivationConfig, ActivationScope, ArtifactConfig, CapacityConfig, ConflictPolicy,
-    DeploymentRotation, FailurePolicy, Mapping, PerServerRotation, RolloutConfig, RotationConfig,
-    SlotDef, TargetDef, UnitDef, VerificationConfig,
+    ActivationConfig, ActivationScope, ArtifactConfig, ConflictPolicy, DeploymentRotation,
+    FailurePolicy, Mapping, PerServerRotation, RotationConfig, SlotDef, UnitDef,
+    VerificationConfig,
 };
 use crate::error::{Error, Result};
 use serde::Serialize;
@@ -255,7 +255,7 @@ struct ScaffoldManifest {
     application: String,
     release: String,
     servers: Vec<crate::config::raw::RawServer>,
-    targets: BTreeMap<String, TargetDef>,
+    targets: BTreeMap<String, crate::config::raw::RawTargetDef>,
 }
 
 /// Build the typed scaffold documents and serialize them with
@@ -282,7 +282,7 @@ fn build_docs(
             host_key_fingerprint: opts.host_key_fingerprint.clone(),
             // Capacity is a per-server policy (shared by every deployment
             // slot on the server), zero by default.
-            capacity: CapacityConfig {
+            capacity: crate::config::raw::RawCapacityConfig {
                 reserve_bytes: 0,
                 reserve_percent: 0,
             },
@@ -292,8 +292,8 @@ fn build_docs(
             // Targets own ROLLOUT behavior only; retention is slot-owned
             // (it lives in the slot's OWNING VARIANT file, see
             // [`standard_variant`]).
-            TargetDef {
-                rollout: RolloutConfig {
+            crate::config::raw::RawTargetDef {
+                rollout: crate::config::raw::RawRolloutConfig {
                     batch_size: 1,
                     stop_on_failure: true,
                     // The scaffolded project uses the safe fail-closed
@@ -747,7 +747,7 @@ mod tests {
         // absolute deploy_dir, unique server ids, known variant, non-empty
         // target, verified variant file).
         let config = crate::config::Config::load(&report.target.join("deploy.toml")).unwrap();
-        assert_eq!(config.application, "my-app");
+        assert_eq!(config.application.as_str(), "my-app");
         assert_eq!(config.release().as_str(), "v1");
         assert_eq!(config.target_slot_ids("production").unwrap(), vec!["app-1"]);
         assert_eq!(
@@ -852,7 +852,7 @@ mod tests {
         };
         let report = init_project(&proj, &opts).unwrap();
         let config = crate::config::Config::load(&report.target.join("deploy.toml")).unwrap();
-        assert_eq!(config.application, "prod");
+        assert_eq!(config.application.as_str(), "prod");
         let s = &config.servers[0];
         assert_eq!(s.address, "app.example.com");
         assert_eq!(s.user, "ops");
@@ -978,13 +978,13 @@ mod tests {
         // The re-serialized project carries the same semantics as the
         // scaffold (same application name and release, same server/slot
         // bindings, same rollout and variants).
-        assert_eq!(reloaded.application, "typed-app");
+        assert_eq!(reloaded.application.as_str(), "typed-app");
         assert_eq!(reloaded.release().as_str(), "v1");
         assert_eq!(
             reloaded.target_slot_ids("production").unwrap(),
             vec!["app-1"]
         );
-        assert_eq!(reloaded.targets["production"].rollout.batch_size, 1);
+        assert_eq!(reloaded.targets["production"].rollout.batch_size.get(), 1);
         assert_eq!(reloaded.servers[0].address, config.servers[0].address);
         assert_eq!(reloaded.servers[0].user, config.servers[0].user);
         assert_eq!(reloaded.servers[0].capacity, config.servers[0].capacity);

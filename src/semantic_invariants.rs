@@ -978,7 +978,7 @@ impl Fixture {
         let rf = self.remotes_base.clone();
         let fault = self.fault.clone();
         move |s: &crate::config::ServerDef, _slot: &crate::config::SlotDef| {
-            FailOnceRemote::build(rf.join(&s.id), fault.clone())
+            FailOnceRemote::build(rf.join(s.id.as_str()), fault.clone())
         }
     }
 
@@ -6719,7 +6719,7 @@ fn run_slot_view_property(members: Vec<Vec<bool>>, pushes: Vec<usize>) {
     let factory = move |s: &crate::config::ServerDef,
                         _slot: &crate::config::SlotDef|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
     };
 
     // The artifact source the variant maps; rewritten before every push so

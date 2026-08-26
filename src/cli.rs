@@ -347,7 +347,7 @@ where
         )));
     }
     let config = Config::load(&config_path)?;
-    let store = LocalStore::new(&config.application)?;
+    let store = LocalStore::new(config.application.as_str())?;
     let remotes_base = store.base().join("remotes");
     std::fs::create_dir_all(&remotes_base).ok();
 

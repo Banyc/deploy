@@ -48,6 +48,9 @@
 use crate::error::{Error, Result};
 use crate::model::{CONFIG_SCHEMA_VERSION, PlacementSlotId, ServerId};
 use crate::records::PhysicalBinding;
+use crate::scalar::{
+    AbsoluteDeployDir, ApplicationName, BatchSize, CapacityPercent, GroupName, Identifier,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -216,16 +219,20 @@ fn default_interval() -> u64 {
 /// time — servers have no per-release history — and it is NOT part of the
 /// release identity: changing a server's capacity never produces a new release
 /// and never touches any stored snapshot.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(deny_unknown_fields)]
+///
+/// The DOMAIN form: `reserve_percent` is a validated [`CapacityPercent`]
+/// (0..=100). Built ONLY by the raw -> domain conversion; the raw
+/// serialization shape is [`raw::RawCapacityConfig`] (bare integer percent).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct CapacityConfig {
     /// Keep at least this many bytes free on the server after an upload.
-    #[serde(default)]
     pub reserve_bytes: u64,
     /// Keep at least this percentage of the destination filesystem's TOTAL
-    /// size free after an upload (0..=100).
-    #[serde(default)]
-    pub reserve_percent: u8,
+    /// size free after an upload (0..=100). A VALIDATED [`CapacityPercent`]:
+    /// the raw `reserve_percent` integer is parsed by the raw -> domain
+    /// conversion, which rejects any value outside 0..=100, so a domain
+    /// capacity percent is in range by construction.
+    pub reserve_percent: CapacityPercent,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -480,24 +487,25 @@ impl<'de> Deserialize<'de> for FailurePolicy {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(deny_unknown_fields)]
+/// The DOMAIN rollout policy of one target. Built ONLY by the raw -> domain
+/// conversion: `batch_size` is a validated NONZERO [`BatchSize`] (the raw
+/// integer is parsed by the conversion, which rejects zero), `failure_policy`
+/// is the closed typed enum. The raw serialization shape is
+/// [`raw::RawRolloutConfig`] (bare integer batch size); this domain type is
+/// never deserialized from the file directly.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct RolloutConfig {
-    #[serde(default = "default_batch_size")]
-    pub batch_size: u32,
-    #[serde(default = "default_true")]
+    /// How many slots a rollout advances per batch. NONZERO by construction:
+    /// a zero batch would stall the rollout without ever progressing.
+    pub batch_size: BatchSize,
     pub stop_on_failure: bool,
     /// The batch-failure policy as the TYPED [`FailurePolicy`] enum (never a
     /// loose string): the raw `failure_policy` spelling is parsed strictly
     /// during deserialization, so an unsupported spelling fails the config
     /// load instead of silently behaving as "leave changed".
-    #[serde(default = "default_failure_policy")]
     pub failure_policy: FailurePolicy,
 }
 
-fn default_batch_size() -> u32 {
-    1
-}
 fn default_failure_policy() -> FailurePolicy {
     FailurePolicy::RollbackChanged
 }
@@ -547,14 +555,14 @@ pub struct SlotDef {
     pub groups: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+/// The DOMAIN target: ROLLOUT behavior only (batch_size, stop_on_failure,
+/// failure_policy). Retention is NOT a target surface: a slot's retention
+/// comes from its owning variant (see [`VariantConfig::rotation`]), so a
+/// target that shares a slot with other targets can never change that slot's
+/// policy. Built ONLY by the raw -> domain conversion; the raw serialization
+/// shape is [`raw::RawTargetDef`] (bare integer batch size).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetDef {
-    /// ROLLOUT behavior only (batch_size, stop_on_failure, failure_policy).
-    /// Retention is NOT a target surface: a slot's retention comes from its
-    /// owning variant (see [`VariantConfig::rotation`]), so a target that
-    /// shares a slot with other targets can never change that slot's policy.
-    #[serde(default)]
     pub rollout: RolloutConfig,
 }
 
@@ -581,7 +589,7 @@ pub(crate) mod raw {
         #[serde(default)]
         pub pins: Vec<Pin>,
         pub servers: Vec<RawServer>,
-        pub targets: BTreeMap<String, TargetDef>,
+        pub targets: BTreeMap<String, RawTargetDef>,
     }
 
     /// One raw `[[servers]]` entry: the raw host-identity option PAIR. The
@@ -600,7 +608,61 @@ pub(crate) mod raw {
         #[serde(default)]
         pub host_key_fingerprint: Option<String>,
         #[serde(default)]
-        pub capacity: CapacityConfig,
+        pub capacity: RawCapacityConfig,
+    }
+
+    /// The raw per-server capacity shape: exactly what the file says. The
+    /// conversion parses `reserve_percent` into the validated
+    /// [`super::CapacityPercent`] (0..=100) and builds the domain
+    /// [`super::CapacityConfig`]; this raw type keeps the bare integer so
+    /// arbitrary out-of-range values remain constructible for the fail-closed
+    /// property.
+    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct RawCapacityConfig {
+        #[serde(default)]
+        pub reserve_bytes: u64,
+        #[serde(default)]
+        pub reserve_percent: u8,
+    }
+
+    /// The raw `[targets.<name>]` entry: rollout with a BARE integer
+    /// `batch_size`. The conversion parses it into the validated NONZERO
+    /// [`super::BatchSize`] and builds the domain [`super::TargetDef`]; the
+    /// raw shape keeps the bare integer so an arbitrary (including zero)
+    /// value remains constructible for the fail-closed property.
+    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct RawTargetDef {
+        #[serde(default)]
+        pub rollout: RawRolloutConfig,
+    }
+
+    /// The raw rollout shape: a bare integer `batch_size` (any value the
+    /// file says — the nonzero rule is enforced by the conversion).
+    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct RawRolloutConfig {
+        #[serde(default = "raw_default_batch_size")]
+        pub batch_size: u32,
+        #[serde(default = "super::default_true")]
+        pub stop_on_failure: bool,
+        #[serde(default = "super::default_failure_policy")]
+        pub failure_policy: FailurePolicy,
+    }
+
+    fn raw_default_batch_size() -> u32 {
+        1
+    }
+
+    impl Default for RawRolloutConfig {
+        fn default() -> Self {
+            RawRolloutConfig {
+                batch_size: raw_default_batch_size(),
+                stop_on_failure: true,
+                failure_policy: FailurePolicy::RollbackChanged,
+            }
+        }
     }
 
     /// One raw variant file (`releases/<name>/<variant>.toml`): the raw
@@ -820,7 +882,10 @@ impl From<Activation> for ActivationConfig {
 /// cannot be hand-built with an inconsistent identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerDef {
-    pub id: String,
+    /// The server's validated identifier (non-empty, well-formed): parsed by
+    /// the raw -> domain conversion, so an invalid server id cannot exist in
+    /// a domain server.
+    pub id: Identifier,
     pub address: String,
     pub user: String,
     /// SSH port used to reach the server (default 22). Passed to both
@@ -902,7 +967,10 @@ pub struct Config {
     /// conversion refuses any other value). Private + read-only
     /// ([`Config::schema_version`]): the format identity is invariant.
     schema_version: u32,
-    pub application: String,
+    /// The deployment application name: a validated NON-EMPTY [`ApplicationName`]
+    /// parsed by the raw -> domain conversion (an empty or whitespace-only
+    /// application name is rejected).
+    pub application: ApplicationName,
     /// The active release: the name of a directory directly beneath
     /// `releases/` in the project root (`release: v1` -> `releases/v1/`).
     /// INVARIANT-BEARING (a single directory component) — private and
@@ -1067,7 +1135,7 @@ impl Config {
             let server = self
                 .servers
                 .iter()
-                .find(|s| s.id == slot.server)
+                .find(|s| s.id.as_str() == slot.server)
                 .ok_or_else(|| {
                     Error::config(format!(
                         "slot '{}' references unknown server '{}'",
@@ -1133,7 +1201,7 @@ impl Config {
                 (
                     PlacementSlotId::new(slot.id.clone()),
                     PhysicalBinding {
-                        server: ServerId::new(server.id.clone()),
+                        server: ServerId::new(server.id.as_str().to_string()),
                         deploy_dir: slot.deploy_dir.to_string_lossy().into_owned(),
                     },
                 )
@@ -1152,7 +1220,11 @@ pub(crate) struct RawProject {
 
 /// An identifier is valid when it is non-empty after trimming (any Unicode
 /// content is allowed; an empty or whitespace-only identifier cannot name a
-/// server, slot, target, or variant).
+/// server, slot, target, or variant). Kept for the test-side domain invariant
+/// assertions; the CONVERSION gates identifiers through the stricter
+/// [`crate::scalar::Identifier`] parse (which additionally rejects surrounding
+/// whitespace and control characters).
+#[cfg(test)]
 fn valid_identifier(id: &str) -> bool {
     !id.trim().is_empty()
 }
@@ -1196,16 +1268,22 @@ impl TryFrom<RawProject> for Config {
             return Err(Error::config("at least one target must be declared"));
         }
 
+        // The application name is parsed into the validated NON-EMPTY
+        // [`ApplicationName`] scalar: an empty or whitespace-only application
+        // name is rejected (fail closed).
+        let application = ApplicationName::parse(&manifest.application)
+            .map_err(|_| Error::config("application must be a non-empty name"))?;
+
         // Each loaded variant carries its own artifact/activation/verification
         // policy; validate each one and build the domain variant (the raw
         // `adapter` string becomes the typed [`Activation`] enum).
         let mut domain_variants = BTreeMap::new();
         for (vname, variant) in &variants {
-            if !valid_identifier(vname) {
-                return Err(Error::config(format!(
-                    "variant name '{vname}' must be a non-empty identifier"
-                )));
-            }
+            Identifier::parse(vname).map_err(|_| {
+                Error::config(format!(
+                    "variant name '{vname}' must be a non-empty, well-formed identifier"
+                ))
+            })?;
             let activation = match variant.activation.adapter.as_str() {
                 "none" => Activation::None,
                 "systemd" => {
@@ -1288,27 +1366,34 @@ impl TryFrom<RawProject> for Config {
 
         // Server declarations are unique and well-formed; capacity is a
         // per-server policy, so its validation lives here.
-        let mut all_server_ids: HashSet<&str> = HashSet::new();
+        let mut all_server_ids: HashSet<String> = HashSet::new();
         let mut domain_servers = Vec::with_capacity(manifest.servers.len());
         for s in &manifest.servers {
-            if !valid_identifier(&s.id) {
-                return Err(Error::config(format!(
-                    "server id '{}' must be a non-empty identifier",
+            // The server id is parsed into the validated [`Identifier`]
+            // scalar (non-empty, well-formed) and STORED as the scalar in
+            // the domain server.
+            let id = Identifier::parse(&s.id).map_err(|_| {
+                Error::config(format!(
+                    "server id '{}' must be a non-empty, well-formed identifier",
                     s.id
-                )));
-            }
-            if !all_server_ids.insert(s.id.as_str()) {
+                ))
+            })?;
+            if !all_server_ids.insert(id.as_str().to_string()) {
                 return Err(Error::config(format!(
                     "duplicate server id '{}' in top-level servers",
                     s.id
                 )));
             }
-            if s.capacity.reserve_percent > 100 {
-                return Err(Error::config(format!(
-                    "server '{}': reserve_percent must not exceed 100",
-                    s.id
-                )));
-            }
+            // The capacity percent is parsed into the validated 0..=100
+            // [`CapacityPercent`] scalar (replacing the bare out-of-range
+            // check with the scalar's own gate).
+            let reserve_percent =
+                CapacityPercent::new(s.capacity.reserve_percent).map_err(|_| {
+                    Error::config(format!(
+                        "server '{}': reserve_percent must be within 0..=100",
+                        s.id
+                    ))
+                })?;
             // Collapse the raw identity pair into the ONE validated form.
             let identity = validate_server_identity(s)?;
             let (known_hosts, host_key_fingerprint) = match &identity {
@@ -1317,13 +1402,16 @@ impl TryFrom<RawProject> for Config {
                 HostIdentity::Fingerprint(f) => (None, Some(f.as_str().to_string())),
             };
             domain_servers.push(ServerDef {
-                id: s.id.clone(),
+                id,
                 address: s.address.clone(),
                 user: s.user.clone(),
                 port: s.port,
                 known_hosts,
                 host_key_fingerprint,
-                capacity: s.capacity.clone(),
+                capacity: CapacityConfig {
+                    reserve_bytes: s.capacity.reserve_bytes,
+                    reserve_percent,
+                },
                 host_identity: identity,
             });
         }
@@ -1341,12 +1429,27 @@ impl TryFrom<RawProject> for Config {
         let mut bound_locations: BTreeMap<(&str, &Path), &str> = BTreeMap::new();
         for (vname, variant) in &domain_variants {
             for p in &variant.slots {
-                if !valid_identifier(&p.id) {
-                    return Err(Error::config(format!(
-                        "variant '{vname}': slot id '{}' must be a non-empty identifier",
+                // The slot's id-bearing fields are parsed into the validated
+                // [`Identifier`] scalar (non-empty, well-formed) before any
+                // graph rule runs.
+                Identifier::parse(&p.id).map_err(|_| {
+                    Error::config(format!(
+                        "variant '{vname}': slot id '{}' must be a non-empty, well-formed identifier",
                         p.id
-                    )));
-                }
+                    ))
+                })?;
+                Identifier::parse(&p.server).map_err(|_| {
+                    Error::config(format!(
+                        "variant '{vname}': slot '{}' server '{}' must be a non-empty, well-formed identifier",
+                        p.id, p.server
+                    ))
+                })?;
+                Identifier::parse(&p.target).map_err(|_| {
+                    Error::config(format!(
+                        "variant '{vname}': slot '{}' target '{}' must be a non-empty, well-formed identifier",
+                        p.id, p.target
+                    ))
+                })?;
                 if !slot_ids.insert(p.id.clone()) {
                     return Err(Error::config(format!(
                         "duplicate slot id '{}' (declared by variant '{vname}')",
@@ -1367,12 +1470,17 @@ impl TryFrom<RawProject> for Config {
                 }
                 let mut seen_groups = HashSet::new();
                 for g in &p.groups {
-                    if g.trim().is_empty() {
-                        return Err(Error::config(format!(
-                            "variant '{vname}': slot '{}' declares an empty group name",
+                    // Each group name is parsed into the validated
+                    // [`GroupName`] scalar (non-empty, well-formed); the
+                    // DUPLICATE rule is structural and stays here (a
+                    // duplicate adds no membership yet would change the
+                    // release identity).
+                    GroupName::parse(g).map_err(|_| {
+                        Error::config(format!(
+                            "variant '{vname}': slot '{}' declares an invalid group name {g:?}",
                             p.id
-                        )));
-                    }
+                        ))
+                    })?;
                     if !seen_groups.insert(g) {
                         return Err(Error::config(format!(
                             "variant '{vname}': slot '{}' declares duplicate group '{}'",
@@ -1380,12 +1488,14 @@ impl TryFrom<RawProject> for Config {
                         )));
                     }
                 }
-                if p.deploy_dir.is_relative() {
-                    return Err(Error::config(format!(
+                // The deploy_dir is validated by the [`AbsoluteDeployDir`]
+                // scalar (absolute path on the server).
+                AbsoluteDeployDir::parse(&p.deploy_dir.to_string_lossy()).map_err(|_| {
+                    Error::config(format!(
                         "variant '{vname}': slot '{}' deploy_dir must be an absolute path on the server",
                         p.id
-                    )));
-                }
+                    ))
+                })?;
                 if let Some(existing) =
                     bound_locations.get(&(p.server.as_str(), p.deploy_dir.as_path()))
                 {
@@ -1400,6 +1510,37 @@ impl TryFrom<RawProject> for Config {
             }
         }
 
+        // Targets carry ROLLOUT behavior only. Each target name is parsed
+        // into the validated [`Identifier`] scalar, and each target's raw
+        // integer `batch_size` is parsed into the validated NONZERO
+        // [`BatchSize`] scalar (a zero batch would stall the rollout without
+        // ever progressing — a NEW fail-closed gate the raw shape allows).
+        let mut domain_targets = BTreeMap::new();
+        for (tname, raw_target) in &manifest.targets {
+            Identifier::parse(tname).map_err(|_| {
+                Error::config(format!(
+                    "target name '{tname}' must be a non-empty, well-formed identifier"
+                ))
+            })?;
+            let batch_size =
+                BatchSize::new(u64::from(raw_target.rollout.batch_size)).map_err(|_| {
+                    Error::config(format!(
+                        "target '{tname}': batch_size must be a nonzero integer (got {})",
+                        raw_target.rollout.batch_size
+                    ))
+                })?;
+            domain_targets.insert(
+                tname.clone(),
+                TargetDef {
+                    rollout: RolloutConfig {
+                        batch_size,
+                        stop_on_failure: raw_target.rollout.stop_on_failure,
+                        failure_policy: raw_target.rollout.failure_policy,
+                    },
+                },
+            );
+        }
+
         // A target's members are DERIVED by scanning every variant's slots for
         // the target name. One server runs exactly one generation, so two
         // member slots of the same target can never share a server — and a
@@ -1407,11 +1548,6 @@ impl TryFrom<RawProject> for Config {
         // target, so the per-target checks run once per slot (its owner) and
         // the same two slots can never share a server in DIFFERENT targets.
         for tname in manifest.targets.keys() {
-            if !valid_identifier(tname) {
-                return Err(Error::config(format!(
-                    "target name '{tname}' must be a non-empty identifier"
-                )));
-            }
             let mut used_servers = HashSet::new();
             let mut members = 0;
             for slot in domain_variants.values().flat_map(|v| v.slots.iter()) {
@@ -1433,11 +1569,11 @@ impl TryFrom<RawProject> for Config {
 
         Ok(Config {
             schema_version: manifest.schema_version,
-            application: manifest.application,
+            application,
             release: manifest.release,
             pins: manifest.pins,
             servers: domain_servers,
-            targets: manifest.targets,
+            targets: domain_targets,
             variants: domain_variants,
         })
     }
@@ -1778,7 +1914,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // the policy and the variant files parse without any `[capacity]` block.
         assert_eq!(cfg.servers.len(), 1);
         assert_eq!(cfg.servers[0].capacity.reserve_bytes, 1073741824);
-        assert_eq!(cfg.servers[0].capacity.reserve_percent, 5);
+        assert_eq!(cfg.servers[0].capacity.reserve_percent.get(), 5);
         assert_eq!(cfg.variant("standard").unwrap().artifact.mappings.len(), 1);
 
         // Unknown variant name is rejected.
@@ -2237,7 +2373,7 @@ slots = ["p1"]
         let err = Config::load(&p).expect_err("reserve_percent > 100 must fail");
         let msg = err.to_string();
         assert!(
-            msg.contains("reserve_percent must not exceed 100") && msg.contains("server 's1'"),
+            msg.contains("reserve_percent must be within 0..=100") && msg.contains("server 's1'"),
             "error must name the server and the violation, got: {msg}"
         );
 
@@ -2249,7 +2385,7 @@ slots = ["p1"]
         std::fs::write(&p, ok).unwrap();
         let cfg = Config::load(&p).expect("inline server capacity parses");
         assert_eq!(cfg.servers[0].capacity.reserve_bytes, 4096);
-        assert_eq!(cfg.servers[0].capacity.reserve_percent, 10);
+        assert_eq!(cfg.servers[0].capacity.reserve_percent.get(), 10);
     }
 
     /// SSH addresses require EXACTLY ONE host-identity source; `local://`
@@ -2969,12 +3105,12 @@ interval_seconds = 0
                     port: 22,
                     known_hosts: None,
                     host_key_fingerprint: None,
-                    capacity: CapacityConfig::default(),
+                    capacity: raw::RawCapacityConfig::default(),
                 }],
                 targets: BTreeMap::from([(
                     "t1".to_string(),
-                    TargetDef {
-                        rollout: RolloutConfig::default(),
+                    raw::RawTargetDef {
+                        rollout: raw::RawRolloutConfig::default(),
                     },
                 )]),
             },
@@ -3043,8 +3179,8 @@ interval_seconds = 0
             let mut p = minimal_raw_project();
             p.manifest.targets = BTreeMap::from([(
                 id.to_string(),
-                TargetDef {
-                    rollout: RolloutConfig::default(),
+                raw::RawTargetDef {
+                    rollout: raw::RawRolloutConfig::default(),
                 },
             )]);
             p.variants.get_mut("standard").unwrap().slots[0].target = id.to_string();
@@ -3071,7 +3207,7 @@ interval_seconds = 0
             port: 22,
             known_hosts: None,
             host_key_fingerprint: None,
-            capacity: CapacityConfig::default(),
+            capacity: raw::RawCapacityConfig::default(),
         });
         expect_conversion_err(p, "duplicate server id");
 
@@ -3236,8 +3372,8 @@ interval_seconds = 0
         let mut p = minimal_raw_project();
         p.manifest.targets.insert(
             "empty".to_string(),
-            TargetDef {
-                rollout: RolloutConfig::default(),
+            raw::RawTargetDef {
+                rollout: raw::RawRolloutConfig::default(),
             },
         );
         expect_conversion_err(p, "target without slots");
@@ -3264,8 +3400,8 @@ interval_seconds = 0
         });
         p.manifest.targets.insert(
             "t2".to_string(),
-            TargetDef {
-                rollout: RolloutConfig::default(),
+            raw::RawTargetDef {
+                rollout: raw::RawRolloutConfig::default(),
             },
         );
         expect_conversion_err(p, "duplicate server+deploy_dir location");
@@ -3287,7 +3423,7 @@ interval_seconds = 0
 
         // The manifest surface is carried through.
         assert_eq!(cfg.schema_version, CONFIG_SCHEMA_VERSION);
-        assert_eq!(cfg.application, "app");
+        assert_eq!(cfg.application.as_str(), "app");
         assert_eq!(cfg.release().as_str(), "v1");
         assert_eq!(cfg.targets.len(), 1);
 
@@ -3313,7 +3449,7 @@ interval_seconds = 0
         assert_eq!(cfg.target_slot_ids("t1").unwrap(), vec!["p1"]);
         let (slot, server) = cfg.target_slots("t1").unwrap()[0];
         assert_eq!(slot.id, "p1");
-        assert_eq!(server.id, "s1");
+        assert_eq!(server.id.as_str(), "s1");
         assert_eq!(cfg.target_slot_bindings("t1").unwrap().len(), 1);
     }
 
@@ -3494,10 +3630,12 @@ interval_seconds = 0
             )
     }
 
-    fn arbitrary_capacity() -> impl Strategy<Value = CapacityConfig> {
-        (any::<u64>(), 0u8..200).prop_map(|(reserve_bytes, reserve_percent)| CapacityConfig {
-            reserve_bytes,
-            reserve_percent,
+    fn arbitrary_capacity() -> impl Strategy<Value = raw::RawCapacityConfig> {
+        (any::<u64>(), 0u8..200).prop_map(|(reserve_bytes, reserve_percent)| {
+            raw::RawCapacityConfig {
+                reserve_bytes,
+                reserve_percent,
+            }
         })
     }
 
@@ -3632,10 +3770,10 @@ interval_seconds = 0
             )
     }
 
-    fn arbitrary_target() -> impl Strategy<Value = TargetDef> {
+    fn arbitrary_target() -> impl Strategy<Value = raw::RawTargetDef> {
         (any::<u32>(), any::<bool>(), arbitrary_failure_policy()).prop_map(
-            |(batch_size, stop_on_failure, failure_policy)| TargetDef {
-                rollout: RolloutConfig {
+            |(batch_size, stop_on_failure, failure_policy)| raw::RawTargetDef {
+                rollout: raw::RawRolloutConfig {
                     batch_size,
                     stop_on_failure,
                     failure_policy,
@@ -3700,7 +3838,7 @@ interval_seconds = 0
         let mut server_ids = HashSet::new();
         for s in &cfg.servers {
             assert!(
-                valid_identifier(&s.id),
+                valid_identifier(s.id.as_str()),
                 "server id must be valid: {:?}",
                 s.id
             );
@@ -3759,7 +3897,7 @@ interval_seconds = 0
                 "slot ids unique across variants"
             );
             assert!(
-                cfg.servers.iter().any(|s| s.id == slot.server),
+                cfg.servers.iter().any(|s| s.id.as_str() == slot.server),
                 "slot '{}' server must resolve",
                 slot.id
             );
@@ -3988,6 +4126,128 @@ interval_seconds = 0
                     assert!(
                         msg.contains("rollback_changed") && msg.contains("leave_changed"),
                         "the rejection must name the valid options, got: {msg}"
+                    );
+                }
+            }
+        }
+    }
+
+    // =====================================================================
+    // THE SCALAR PROPERTY: arbitrary raw scalar values convert iff the scalar
+    // =====================================================================
+
+    /// Arbitrary raw strings for a config scalar field: empty, whitespace,
+    /// format-violating, out-of-range, and valid forms.
+    fn arbitrary_scalar_text() -> impl Strategy<Value = String> {
+        prop_oneof![
+            prop::sample::select(vec![
+                String::new(),
+                " ".to_string(),
+                "s1".to_string(),
+                "production".to_string(),
+                "wave-1".to_string(),
+                " x".to_string(),
+                "x ".to_string(),
+                "x y".to_string(),
+                "α".to_string(),
+                "a\nb".to_string(),
+                "/srv/p1".to_string(),
+                "/srv/deploy/app".to_string(),
+                "srv/relative".to_string(),
+            ]),
+            prop::collection::vec(prop::char::any(), 0..8).prop_map(|v| v.into_iter().collect()),
+        ]
+    }
+
+    /// One scalar-mutation case: the minimal valid raw project with EXACTLY
+    /// ONE scalar field set to an arbitrary raw value, paired with the
+    /// scalar's own parse verdict on that value. Each mutation is isolated:
+    /// no other conversion gate can fire, so the conversion outcome is the
+    /// scalar outcome exactly.
+    fn scalar_mutation_project() -> impl Strategy<Value = (RawProject, bool)> {
+        prop_oneof![
+            // application: ApplicationName (non-empty).
+            arbitrary_scalar_text().prop_map(|v| {
+                let mut p = minimal_raw_project();
+                p.manifest.application = v.clone();
+                (p, ApplicationName::parse(&v).is_ok())
+            }),
+            // slot id: Identifier.
+            arbitrary_scalar_text().prop_map(|v| {
+                let mut p = minimal_raw_project();
+                p.variants.get_mut("standard").unwrap().slots[0].id = v.clone();
+                (p, Identifier::parse(&v).is_ok())
+            }),
+            // variant name: Identifier.
+            arbitrary_scalar_text().prop_map(|v| {
+                let mut p = minimal_raw_project();
+                p.variants = BTreeMap::from([(v.clone(), minimal_raw_variant())]);
+                (p, Identifier::parse(&v).is_ok())
+            }),
+            // slot group (single element: the duplicate rule cannot fire):
+            // GroupName.
+            arbitrary_scalar_text().prop_map(|v| {
+                let mut p = minimal_raw_project();
+                p.variants.get_mut("standard").unwrap().slots[0].groups = vec![v.clone()];
+                (p, GroupName::parse(&v).is_ok())
+            }),
+            // slot deploy_dir (single slot: the location-uniqueness rule
+            // cannot fire): AbsoluteDeployDir.
+            arbitrary_scalar_text().prop_map(|v| {
+                let mut p = minimal_raw_project();
+                p.variants.get_mut("standard").unwrap().slots[0].deploy_dir = PathBuf::from(&v);
+                (p, AbsoluteDeployDir::parse(&v).is_ok())
+            }),
+            // batch_size (any u32, including zero): BatchSize.
+            any::<u32>().prop_map(|v| {
+                let mut p = minimal_raw_project();
+                p.manifest.targets.get_mut("t1").unwrap().rollout.batch_size = v;
+                (p, BatchSize::new(u64::from(v)).is_ok())
+            }),
+            // capacity reserve_percent (any u8, including 101..):
+            // CapacityPercent.
+            any::<u8>().prop_map(|v| {
+                let mut p = minimal_raw_project();
+                p.manifest.servers[0].capacity.reserve_percent = v;
+                (p, CapacityPercent::new(v).is_ok())
+            }),
+        ]
+    }
+
+    proptest! {
+        // THE PROPERTY: over ARBITRARY raw values for each config scalar
+        // field (empty, format-violating, out-of-range, invalid), the raw ->
+        // domain conversion accepts EXACTLY the values the scalar accepts
+        // (non-empty/format for names and the digest, absolute for
+        // deploy_dir, nonzero for batch_size, 0..=100 for capacity percent)
+        // and rejects everything else with a config error (fail closed).
+        // Bounded 16 cases, fixed seed 0x5EED_5EED per house style.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn arbitrary_scalar_values_convert_fail_closed((project, expected) in scalar_mutation_project()) {
+            match Config::from_raw_parts(project.manifest, project.variants) {
+                Ok(cfg) => {
+                    assert!(
+                        expected,
+                        "the conversion must accept exactly the values the scalar accepts"
+                    );
+                    // The accepted scalar is carried into the domain.
+                    assert_domain_invariants(&cfg);
+                }
+                Err(e) => {
+                    assert!(
+                        !expected,
+                        "the conversion must accept a value the scalar accepts, got: {e}"
+                    );
+                    assert!(
+                        matches!(e, Error::Config(_)),
+                        "the rejection must be a config error, got: {e}"
                     );
                 }
             }

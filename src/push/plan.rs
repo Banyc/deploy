@@ -379,7 +379,7 @@ pub(crate) fn validate_partial_rollout(
             for (slot, sdef) in &unselected {
                 let slot_id = PlacementSlotId::new(slot.id.clone());
                 let current_binding = PhysicalBinding {
-                    server: ServerId::new(sdef.id.clone()),
+                    server: ServerId::new(sdef.id.as_str().to_string()),
                     deploy_dir: slot.deploy_dir.to_string_lossy().into_owned(),
                 };
                 if !base.slots.contains_key(&slot_id) {
@@ -628,7 +628,7 @@ pub fn plan_assignments(
             for (slot, sdef) in &members {
                 let slot_id = PlacementSlotId::new(slot.id.clone());
                 let current_binding = PhysicalBinding {
-                    server: ServerId::new(sdef.id.clone()),
+                    server: ServerId::new(sdef.id.as_str().to_string()),
                     deploy_dir: slot.deploy_dir.to_string_lossy().into_owned(),
                 };
                 let recorded = entry.bindings.get(&slot_id).ok_or_else(|| {
@@ -827,7 +827,7 @@ pub fn plan_assignments(
                         (
                             PlacementSlotId::new(slot.id.clone()),
                             PhysicalBinding {
-                                server: ServerId::new(sdef.id.clone()),
+                                server: ServerId::new(sdef.id.as_str().to_string()),
                                 deploy_dir: slot.deploy_dir.to_string_lossy().into_owned(),
                             },
                         )

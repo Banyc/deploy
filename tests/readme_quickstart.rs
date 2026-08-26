@@ -104,7 +104,9 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
     let factory = move |s: &deploy::config::ServerDef,
                         _slot: &deploy::config::SlotDef|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(remotes_base.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(
+            remotes_base.join(s.id.as_str()),
+        )?))
     };
     let r = push(
         &config_path,

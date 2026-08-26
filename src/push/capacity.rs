@@ -47,11 +47,11 @@ pub(crate) fn capacity_preflight(
         let server = config
             .servers
             .iter()
-            .find(|s| s.id == slot.server)
+            .find(|s| s.id.as_str() == slot.server)
             .expect("slot's server present in config");
         let capacity = &server.capacity;
         let reserve_bytes = capacity.reserve_bytes;
-        let reserve_percent = capacity.reserve_percent as u64;
+        let reserve_percent = capacity.reserve_percent.get() as u64;
         let helper = helpers.get(&a.placement_slot).expect("helper present");
         if helper.tree_exists(a.artifact.tree.as_str()) {
             continue;
@@ -337,7 +337,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // 7000 <= 10000.
         config.servers[0].capacity = crate::config::CapacityConfig {
             reserve_bytes: 1000,
-            reserve_percent: 1,
+            reserve_percent: crate::scalar::CapacityPercent::new(1).expect("1 is in range"),
         };
         capacity_preflight(
             &store,
@@ -353,7 +353,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // the 1% (1000 bytes) alone would fit.
         config.servers[0].capacity = crate::config::CapacityConfig {
             reserve_bytes: 4500,
-            reserve_percent: 1,
+            reserve_percent: crate::scalar::CapacityPercent::new(1).expect("1 is in range"),
         };
         let err = capacity_preflight(
             &store,
@@ -376,7 +376,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // assertion pins the percent-of-total semantics.
         config.servers[0].capacity = crate::config::CapacityConfig {
             reserve_bytes: 1000,
-            reserve_percent: 10,
+            reserve_percent: crate::scalar::CapacityPercent::new(10).expect("10 is in range"),
         };
         let err = capacity_preflight(
             &store,
@@ -398,7 +398,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap();
         config.servers[0].capacity = crate::config::CapacityConfig {
             reserve_bytes: u64::MAX,
-            reserve_percent: 100,
+            reserve_percent: crate::scalar::CapacityPercent::new(100).expect("100 is in range"),
         };
         capacity_preflight(
             &store,
@@ -437,7 +437,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let mut config = cfg();
         config.servers[0].capacity = crate::config::CapacityConfig {
             reserve_bytes,
-            reserve_percent,
+            reserve_percent: crate::scalar::CapacityPercent::new(reserve_percent)
+                .expect("fixture percent in range"),
         };
         let assignment = PlannedAssignment {
             placement_slot: PlacementSlotId::new("p1".to_string()),

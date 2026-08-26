@@ -685,7 +685,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &release_root,
                 &vcfg.artifact.mappings,
                 &crate::template::TemplateVars::mapping(
-                    &config.application,
+                    config.application.as_str(),
                     config.release().as_str(),
                     "standard",
                 ),
@@ -769,10 +769,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let vars = crate::template::TemplateVars::slot(
                 &slot.deploy_dir,
                 artifact.variant.as_str(),
-                &self.config.application,
+                self.config.application.as_str(),
                 artifact.release.as_str(),
                 "t1",
-                &server.id,
+                server.id.as_str(),
             )
             .with_server(&server.user, &server.address, server.port)
             .with_slot_id(&slot.id)
@@ -1104,10 +1104,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let desired_vars = crate::template::TemplateVars::slot(
                 &slot.deploy_dir,
                 desired.variant.as_str(),
-                &h.config.application,
+                h.config.application.as_str(),
                 desired.release.as_str(),
                 "t1",
-                &server.id,
+                server.id.as_str(),
             )
             .with_server(&server.user, &server.address, server.port)
             .with_slot_id(&slot.id)
@@ -1288,10 +1288,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let vars = crate::template::TemplateVars::slot(
             &slot.deploy_dir,
             "standard",
-            &h.config.application,
+            h.config.application.as_str(),
             "rel-sha256-desired",
             "t1",
-            &server.id,
+            server.id.as_str(),
         )
         .with_server(&server.user, &server.address, server.port)
         .with_slot_id(&slot.id)

@@ -89,6 +89,7 @@ use crate::model::{
     ArtifactRef, BehaviorContract, DeploymentId, GenerationId, GenerationRef, MatchingMembership,
     PlacementSlotId, ReleaseId, ServerId, TargetName, TreeDigest,
 };
+use crate::scalar::{BehaviorDigest, GroupName, Timestamp};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -211,6 +212,29 @@ impl LedgerIntentWire {
     /// error (fail closed — a hand-constructed record can never be read as
     /// whichever projection a consumer happens to use).
     pub fn into_domain(self) -> Result<LedgerIntent> {
+        // The scalar invariants are validated HERE (fail closed): the attempt
+        // timestamp must parse as RFC 3339, and the optional rollout group
+        // must be a well-formed group name. A wire record violating either is
+        // refused with an integrity error before any membership check runs.
+        // (The stored `behavior_sha256` is NOT format-gated here: legacy
+        // records may carry a snapshot-wide digest that is only carried, and
+        // the canonical sha256-form digest is enforced where the value is
+        // INTERPRETED — the in-memory report's [`BehaviorDigest`] and the
+        // plan conversion's derived-digest check.)
+        Timestamp::parse(&self.attempted_at).map_err(|_| {
+            Error::integrity(format!(
+                "intent {}: attempted_at {:?} is not an RFC 3339 timestamp",
+                self.deployment_id, self.attempted_at
+            ))
+        })?;
+        if let Some(g) = &self.group {
+            GroupName::parse(g).map_err(|_| {
+                Error::integrity(format!(
+                    "intent {}: rollout group {g:?} is not a valid group name",
+                    self.deployment_id
+                ))
+            })?;
+        }
         // `slot_ids` is the AUTHORITATIVE membership and must be
         // DUPLICATE-FREE: a duplicated member would silently weaken the
         // key-set equality below (a set collapses the duplicate, so the
@@ -384,10 +408,15 @@ pub struct LedgerIntentReport {
     pub deployment_schema_version: u32,
     pub deployment_id: DeploymentId,
     pub target: TargetName,
-    pub group: Option<String>,
+    /// The optional rollout group this attempt selected, as a validated
+    /// [`GroupName`] (parsed from the verified intent's group string).
+    pub group: Option<GroupName>,
     pub slot_ids: Vec<PlacementSlotId>,
-    pub behavior_sha256: String,
-    pub attempted_at: String,
+    /// The attempt's behavior digest, as a validated [`BehaviorDigest`]
+    /// (parsed from the wire's `behavior_sha256` string).
+    pub behavior_sha256: BehaviorDigest,
+    /// When the attempt was recorded, as a parsed RFC 3339 [`Timestamp`].
+    pub attempted_at: Timestamp,
     pub desired: BTreeMap<PlacementSlotId, GenerationRef>,
     pub pre_push: BTreeMap<PlacementSlotId, Option<SlotAttemptState>>,
     /// Actual per-slot result after the attempt, for display. The report is
@@ -395,20 +424,45 @@ pub struct LedgerIntentReport {
     pub slots: BTreeMap<PlacementSlotId, SlotAttemptState>,
 }
 
-impl From<&LedgerIntent> for LedgerIntentReport {
-    fn from(i: &LedgerIntent) -> Self {
-        LedgerIntentReport {
+impl LedgerIntentReport {
+    /// Build the in-memory report from a verified domain intent, parsing the
+    /// intent's bare strings into the validated scalars. The intent's values
+    /// were already scalar-gated by the wire → domain conversion
+    /// ([`LedgerIntentWire::into_domain`]), so the parses succeed in
+    /// practice; a violation still fails closed with an integrity error
+    /// rather than constructing an invalid report.
+    pub fn from_intent(i: &LedgerIntent) -> Result<LedgerIntentReport> {
+        let group = match &i.group {
+            Some(g) => Some(GroupName::parse(g).map_err(|_| {
+                Error::integrity(format!(
+                    "intent {}: rollout group {g:?} is not a valid group name",
+                    i.deployment_id
+                ))
+            })?),
+            None => None,
+        };
+        Ok(LedgerIntentReport {
             deployment_schema_version: i.deployment_schema_version,
             deployment_id: i.deployment_id.clone(),
             target: i.target.clone(),
-            group: i.group.clone(),
+            group,
             slot_ids: i.slot_ids.clone(),
-            behavior_sha256: i.behavior_sha256.clone(),
-            attempted_at: i.attempted_at.clone(),
+            behavior_sha256: BehaviorDigest::parse(&i.behavior_sha256).map_err(|_| {
+                Error::integrity(format!(
+                    "intent {}: stored behavior_sha256 {:?} is not a sha256 digest",
+                    i.deployment_id, i.behavior_sha256
+                ))
+            })?,
+            attempted_at: Timestamp::parse(&i.attempted_at).map_err(|_| {
+                Error::integrity(format!(
+                    "intent {}: attempted_at {:?} is not an RFC 3339 timestamp",
+                    i.deployment_id, i.attempted_at
+                ))
+            })?,
             desired: i.desired.clone(),
             pre_push: i.pre_push.clone(),
             slots: BTreeMap::new(),
-        }
+        })
     }
 }
 
@@ -673,6 +727,13 @@ impl LedgerTerminalWire {
     /// read path / intent) are enforced by the ledger read that merges the
     /// intent and the terminal ([`crate::store::local::LocalStore::read_ledger`]).
     pub fn into_domain(self) -> Result<LedgerTerminal> {
+        // The recorded timestamp must parse as RFC 3339 (fail closed).
+        Timestamp::parse(&self.recorded_at).map_err(|_| {
+            Error::integrity(format!(
+                "terminal {}: recorded_at {:?} is not an RFC 3339 timestamp",
+                self.deployment_id, self.recorded_at
+            ))
+        })?;
         let rollback = match self.rollback {
             Some(wire) => Some(wire.into_domain()?),
             None => None,
@@ -1009,6 +1070,16 @@ impl DeploymentPlanWire {
     /// `behavior_sha256` equals the canonical digest of `behaviors`. A
     /// disagreement → `Error::integrity` (fail closed).
     pub fn into_domain(self) -> Result<DeploymentPlan> {
+        // The stored behavior digest must be a sha256 digest before it can
+        // even be compared with the digest derived from `behaviors` (fail
+        // closed: a tampered non-digest is refused on format, not just on
+        // disagreement).
+        BehaviorDigest::parse(&self.behavior_sha256).map_err(|_| {
+            Error::integrity(format!(
+                "plan {}: stored behavior_sha256 {:?} is not a sha256 digest",
+                self.deployment_id, self.behavior_sha256
+            ))
+        })?;
         let wire_slots: BTreeSet<&PlacementSlotId> = self.slot_ids.iter().collect();
         let keys: BTreeSet<&PlacementSlotId> = self.slots.keys().collect();
         if wire_slots != keys {
@@ -1886,13 +1957,13 @@ mod tests {
             target: TargetName::new("t1".to_string()),
             group: None,
             slot_ids: vec![slot(1)],
-            behavior_sha256: "sha256-r".to_string(),
+            behavior_sha256: crate::scalar::DIGEST_TEST_HEX_1.to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
             desired: BTreeMap::from([(slot(1), gen_ref_for(&slot(1)))]),
             pre_push: BTreeMap::from([(slot(1), None)]),
         };
         // The REPORT carries the observed per-slot actuals for display.
-        let mut report = LedgerIntentReport::from(&domain);
+        let mut report = LedgerIntentReport::from_intent(&domain).expect("verified intent parses");
         report.slots.insert(
             slot(1),
             SlotAttemptState {
@@ -2170,5 +2241,144 @@ mod tests {
             failed.into_domain().is_ok(),
             "a failed terminal without a rollback stays valid"
         );
+    }
+
+    // =====================================================================
+    // THE SCALAR PROPERTY: arbitrary raw scalar values convert iff the scalar
+    // =====================================================================
+
+    /// Arbitrary raw strings for a record scalar field: empty, whitespace,
+    /// format-violating, RFC3339-invalid, and valid forms.
+    fn arbitrary_wire_text() -> impl Strategy<Value = String> {
+        prop_oneof![
+            prop::sample::select(vec![
+                String::new(),
+                " ".to_string(),
+                "canary".to_string(),
+                "wave-1".to_string(),
+                " x".to_string(),
+                "2026-01-01T00:00:00Z".to_string(),
+                "2026-01-01T00:00:00.123+02:00".to_string(),
+                "yesterday".to_string(),
+                "2026-01-01".to_string(),
+                crate::scalar::DIGEST_TEST_HEX_1.to_string(),
+                "sha256-w".to_string(),
+            ]),
+            prop::collection::vec(prop::char::any(), 0..8).prop_map(|v| v.into_iter().collect()),
+        ]
+    }
+
+    /// A valid base intent wire for the scalar property: an agreeing
+    /// membership with a canonical digest and timestamp, whose group is
+    /// `None` (each mutation arms sets exactly ONE scalar field).
+    fn base_intent_wire() -> LedgerIntentWire {
+        let slot_ids = vec![slot(1), slot(2)];
+        let desired = slot_ids
+            .iter()
+            .map(|k| (k.clone(), gen_ref_for(k)))
+            .collect();
+        let pre_push: BTreeMap<PlacementSlotId, Option<SlotAttemptState>> =
+            slot_ids.iter().map(|k| (k.clone(), None)).collect();
+        LedgerIntentWire {
+            deployment_schema_version: crate::model::LEDGER_SCHEMA_VERSION,
+            deployment_id: DeploymentId::new("deploy-scalar".to_string()),
+            target: TargetName::new("t1".to_string()),
+            group: None,
+            slot_ids,
+            behavior_sha256: crate::scalar::DIGEST_TEST_HEX_1.to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            desired,
+            pre_push,
+            slots: BTreeMap::new(),
+        }
+    }
+
+    /// One records scalar-mutation case: a wire with EXACTLY ONE scalar
+    /// field set to an arbitrary raw value, paired with the scalar's own
+    /// parse verdict on that value.
+    #[derive(Debug)]
+    enum ScalarWire {
+        Intent(LedgerIntentWire),
+        Terminal(LedgerTerminalWire),
+        Report(LedgerIntent),
+    }
+
+    fn scalar_mutation_case() -> impl Strategy<Value = (ScalarWire, bool)> {
+        prop_oneof![
+            // intent attempted_at: RFC 3339 or rejected.
+            (Just(base_intent_wire()), arbitrary_wire_text()).prop_map(|(mut w, v)| {
+                let ok = Timestamp::parse(&v).is_ok();
+                w.attempted_at = v;
+                (ScalarWire::Intent(w), ok)
+            }),
+            // intent group: a valid group name or rejected.
+            (Just(base_intent_wire()), arbitrary_wire_text()).prop_map(|(mut w, v)| {
+                let ok = GroupName::parse(&v).is_ok();
+                w.group = Some(v);
+                (ScalarWire::Intent(w), ok)
+            }),
+            // terminal recorded_at: RFC3339 or rejected.
+            (Just(base_intent_wire()), arbitrary_wire_text()).prop_map(|(w, v)| {
+                let ok = Timestamp::parse(&v).is_ok();
+                let terminal = LedgerTerminalWire {
+                    deployment_id: w.deployment_id,
+                    target: w.target,
+                    status: DeploymentStatus::FailedRolledBack,
+                    recorded_at: v,
+                    outcomes: BTreeMap::new(),
+                    rollback: None,
+                    reason: None,
+                };
+                (ScalarWire::Terminal(terminal), ok)
+            }),
+            // report behavior digest: a sha256 digest or rejected (the
+            // in-memory REPORT is the domain record that carries the digest;
+            // its constructor parses it fail-closed).
+            (Just(base_intent_wire()), arbitrary_wire_text()).prop_map(|(w, v)| {
+                let ok = BehaviorDigest::parse(&v).is_ok();
+                let domain = w.into_domain().expect("base intent converts");
+                let mut with_digest = domain.clone();
+                with_digest.behavior_sha256 = v;
+                (ScalarWire::Report(with_digest), ok)
+            }),
+        ]
+    }
+
+    proptest! {
+        // THE PROPERTY: over ARBITRARY raw values for each records scalar
+        // field (empty, format-violating, RFC3339-invalid, valid), the
+        // wire -> domain conversion accepts EXACTLY the values the scalar
+        // accepts and rejects everything else with an integrity error (fail
+        // closed). Bounded 16 cases, fixed seed 0x5EED_5EED per house style.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn arbitrary_record_scalars_convert_fail_closed((wire, expected) in scalar_mutation_case()) {
+            let converted = match wire {
+                ScalarWire::Intent(w) => w.into_domain().map(|_| ()),
+                ScalarWire::Terminal(w) => w.into_domain().map(|_| ()),
+                ScalarWire::Report(d) => LedgerIntentReport::from_intent(&d).map(|_| ()),
+            };
+            match converted {
+                Ok(_) => {
+                    assert!(expected, "the conversion must accept exactly the values the scalar accepts");
+                }
+                Err(e) => {
+                    assert!(
+                        !expected,
+                        "the conversion must accept a value the scalar accepts, got: {e}"
+                    );
+                    assert!(
+                        matches!(e, Error::Integrity(_)),
+                        "the rejection must be an integrity error, got: {e}"
+                    );
+                }
+            }
+        }
     }
 }

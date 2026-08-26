@@ -1272,7 +1272,7 @@ pub(crate) mod test_remotes {
         move |s, _slot| {
             calls.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(CountingRemote::new(
-                base.join(&s.id),
+                base.join(s.id.as_str()),
                 calls.clone(),
             )?))
         }
