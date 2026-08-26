@@ -13,8 +13,9 @@ use crate::error::{Error, Result};
 use crate::history::{self, PushRef, RefExpr};
 use crate::layout;
 use crate::model::{
-    ArtifactRef, BehaviorContract, DeploymentId, GenerationId, GenerationRef, OperationId,
-    PlacementSlotId, ReleaseId, SCHEMA_VERSION, TargetName, TreeDigest, VariantName,
+    ArtifactRef, BehaviorContract, DeploymentId, GenerationId, GenerationRef,
+    LEDGER_SCHEMA_VERSION, OperationId, PlacementSlotId, ReleaseId, TargetName, TreeDigest,
+    VariantName,
 };
 use crate::push::capacity::capacity_preflight;
 use crate::push::lock::FileLock;
@@ -1006,7 +1007,7 @@ fn push_inner(
         })
         .collect();
     let attempt_intent = LedgerIntent {
-        deployment_schema_version: SCHEMA_VERSION,
+        deployment_schema_version: LEDGER_SCHEMA_VERSION,
         deployment_id: deployment_id.clone(),
         target: TargetName::new(target_name.to_string()),
         group: selection.group.clone(),
@@ -2808,7 +2809,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .append_intent(
                 target,
                 &LedgerIntent {
-                    deployment_schema_version: SCHEMA_VERSION,
+                    deployment_schema_version: LEDGER_SCHEMA_VERSION,
                     deployment_id: DeploymentId::new(deployment_id.to_string()),
                     target: TargetName::new(target.to_string()),
                     group: None,
@@ -3827,7 +3828,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let id_a = DeploymentId::new("deploy-inprogress-diverged".to_string());
         let desired_ref = baseline.desired[&PlacementSlotId::new("p1")].clone();
         let intent = LedgerIntent {
-            deployment_schema_version: SCHEMA_VERSION,
+            deployment_schema_version: LEDGER_SCHEMA_VERSION,
             deployment_id: id_a.clone(),
             target: TargetName::new("t1".to_string()),
             group: None,
@@ -4294,7 +4295,7 @@ interval_seconds = 0
         let id_a = DeploymentId::new("deploy-no-status".to_string());
         let desired_ref = baseline.desired[&PlacementSlotId::new("p1")].clone();
         let intent = LedgerIntent {
-            deployment_schema_version: SCHEMA_VERSION,
+            deployment_schema_version: LEDGER_SCHEMA_VERSION,
             deployment_id: id_a.clone(),
             target: TargetName::new("t1".to_string()),
             group: None,
@@ -4356,7 +4357,7 @@ interval_seconds = 0
         let desired_ref = baseline.desired[&PlacementSlotId::new("p1")].clone();
 
         let mk = |id: &str| LedgerIntent {
-            deployment_schema_version: SCHEMA_VERSION,
+            deployment_schema_version: LEDGER_SCHEMA_VERSION,
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new("t1".to_string()),
             group: None,

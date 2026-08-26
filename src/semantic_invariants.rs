@@ -67,7 +67,7 @@
 //! | Scope: rotation uses only the pushing target's policy | `scope_retained_is_union_of_member_policies`, `state_machine_scope_projection_and_rotation_union` |
 //! | Lifecycle: step-17 rotation `?` after commit | `state_machine_lifecycle_cleanup_failure_after_commit` |
 //! | Integrity: `verify_release_identity` trusts stored digest | `integrity_digest_unchanged_after_tamper_fails_closed`, `integrity_tampered_stored_release_blocks_historical_push`, `integrity_identity_field_change_fails_closed` |
-//! | Integrity: stored records carry only `SCHEMA_VERSION` | `integrity_stored_release_schema_version_tamper_fails_closed` |
+//! | Integrity: stored records carry only their own schema version | `integrity_stored_release_schema_version_tamper_fails_closed` |
 //! | Bounds: `need + reserve > available` wraps | `bounds_capacity_matches_u128_reference_over_grid` |
 
 use crate::config::{Config, SlotDef};

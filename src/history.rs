@@ -471,7 +471,8 @@ pub fn deployment_index(
 mod tests {
     use super::*;
     use crate::model::{
-        ArtifactRef, GenerationId, ReleaseId, SCHEMA_VERSION, ServerId, TreeDigest, VariantName,
+        ArtifactRef, GenerationId, LEDGER_SCHEMA_VERSION, ReleaseId, ServerId, TreeDigest,
+        VariantName,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
@@ -486,7 +487,7 @@ mod tests {
     /// A minimal but VALID intent for the target.
     fn intent(dep: &str) -> LedgerIntent {
         LedgerIntent {
-            deployment_schema_version: SCHEMA_VERSION,
+            deployment_schema_version: LEDGER_SCHEMA_VERSION,
             deployment_id: DeploymentId::new(dep.to_string()),
             target: TargetName::new("production".to_string()),
             group: None,

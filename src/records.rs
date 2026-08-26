@@ -124,8 +124,8 @@ pub struct SlotAttemptState {
 /// Every slot→assignment map is keyed by [`PlacementSlotId`]; `slot_ids` is
 /// the deployment's membership (mirroring the commit marker `slots`
 /// payload). The record carries `deployment_schema_version`, which must be
-/// exactly [`crate::model::SCHEMA_VERSION`]: writers emit the constant and
-/// readers (e.g. [`crate::store::local::LocalStore::read_ledger`]) refuse
+/// exactly [`crate::model::LEDGER_SCHEMA_VERSION`]: writers emit the
+/// constant and readers (e.g. [`crate::store::local::LocalStore::read_ledger`]) refuse
 /// any other version with an error naming the version (fail closed — a
 /// mismatched record is never silently interpreted). The current v1 shape is
 /// the canonical placement-slot-keyed form (`BTreeMap<PlacementSlotId, _>`

@@ -572,7 +572,7 @@ fn print_report(report: &PushReport) {
 mod tests {
     use super::*;
     use crate::model::{
-        DeploymentId, GenerationId, PlacementSlotId, ReleaseId, SCHEMA_VERSION, TargetName,
+        DeploymentId, GenerationId, LEDGER_SCHEMA_VERSION, PlacementSlotId, ReleaseId, TargetName,
         TreeDigest, VariantName,
     };
     use crate::records::{LedgerIntent, LedgerRollback, LedgerTerminal, ObservedSlot};
@@ -580,7 +580,7 @@ mod tests {
 
     fn pending_attempt(id: &str) -> LedgerIntent {
         LedgerIntent {
-            deployment_schema_version: SCHEMA_VERSION,
+            deployment_schema_version: LEDGER_SCHEMA_VERSION,
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new("production".to_string()),
             group: None,

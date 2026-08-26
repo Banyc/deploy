@@ -488,8 +488,8 @@ mod tests {
     use super::*;
     use crate::model::{
         ArtifactRef, BehaviorContract, CanonicalSlot, CanonicalSlots, DeploymentId, GenerationId,
-        GenerationRef, Provenance, RELEASE_RECORD_SCHEMA_VERSION, ReleaseRecord, SCHEMA_VERSION,
-        ServerId, TargetName, TreeDigest, VariantName,
+        GenerationRef, LEDGER_SCHEMA_VERSION, Provenance, RELEASE_RECORD_SCHEMA_VERSION,
+        ReleaseRecord, ServerId, TargetName, TreeDigest, VariantName,
     };
     use crate::records::{
         DeploymentStatus, LedgerIntent, LedgerRollback, LedgerTerminal, PhysicalBinding,
@@ -646,7 +646,7 @@ interval_seconds = 0
             .append_intent(
                 "t1",
                 &LedgerIntent {
-                    deployment_schema_version: SCHEMA_VERSION,
+                    deployment_schema_version: LEDGER_SCHEMA_VERSION,
                     deployment_id: id.clone(),
                     target: target.clone(),
                     group: None,

@@ -462,8 +462,8 @@ mod tests {
     use super::*;
     use crate::config::SlotDef;
     use crate::model::{
-        ArtifactRef, DeploymentId, GenerationId, GenerationRef, PlacementSlotAssignment,
-        PlacementSlotId, SCHEMA_VERSION, TargetName, TreeDigest, VariantName,
+        ArtifactRef, DeploymentId, GenerationId, GenerationRef, LEDGER_SCHEMA_VERSION,
+        PlacementSlotAssignment, PlacementSlotId, TargetName, TreeDigest, VariantName,
     };
     use crate::records::{
         DeploymentStatus, LedgerIntent, LedgerRollback, LedgerTerminal, ObservedSlot, Pins,
@@ -565,7 +565,7 @@ interval_seconds = 0
     /// rollback references `release` / `tree`.
     fn intent(id: &str) -> LedgerIntent {
         LedgerIntent {
-            deployment_schema_version: SCHEMA_VERSION,
+            deployment_schema_version: LEDGER_SCHEMA_VERSION,
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new(TARGET.to_string()),
             group: None,

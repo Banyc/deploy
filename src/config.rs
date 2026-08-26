@@ -23,7 +23,7 @@
 //! slot id), and every declared variant's tree binding.
 
 use crate::error::{Error, Result};
-use crate::model::{PlacementSlotId, SCHEMA_VERSION, ServerId};
+use crate::model::{CONFIG_SCHEMA_VERSION, PlacementSlotId, ServerId};
 use crate::records::PhysicalBinding;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -488,9 +488,9 @@ impl Config {
 
     /// Validate the configuration per schema version 1 rules.
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != SCHEMA_VERSION {
+        if self.schema_version != CONFIG_SCHEMA_VERSION {
             return Err(Error::config(format!(
-                "unsupported schema_version {} (expected {SCHEMA_VERSION})",
+                "unsupported schema_version {} (expected {CONFIG_SCHEMA_VERSION})",
                 self.schema_version
             )));
         }
@@ -987,6 +987,11 @@ pub fn resolved_mode(mode: &Option<String>) -> Result<Option<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{DeploymentId, LEDGER_SCHEMA_VERSION, TargetName};
+    use crate::records::{LedgerIntent, LedgerLine};
+    use crate::store::local::LocalStore;
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
     use std::path::Path;
 
     #[test]
@@ -2191,5 +2196,202 @@ interval_seconds = 0
             msg.contains("protect_nothing") && msg.contains("unknown field"),
             "error must name the unknown rotation field, got: {msg}"
         );
+    }
+
+    // ---- config vs ledger schema-version independence --------------------
+
+    /// The full candidate set the cross-version property ranges over: BOTH
+    /// supported versions (`CONFIG_SCHEMA_VERSION`, `LEDGER_SCHEMA_VERSION`),
+    /// each ±1, zero, and `u32::MAX`.
+    fn schema_version_candidates() -> Vec<u32> {
+        let mut v = vec![
+            CONFIG_SCHEMA_VERSION,
+            LEDGER_SCHEMA_VERSION,
+            CONFIG_SCHEMA_VERSION.wrapping_sub(1),
+            CONFIG_SCHEMA_VERSION.wrapping_add(1),
+            LEDGER_SCHEMA_VERSION.wrapping_sub(1),
+            LEDGER_SCHEMA_VERSION.wrapping_add(1),
+            0,
+            u32::MAX,
+        ];
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    fn schema_version_candidate() -> impl Strategy<Value = u32> {
+        prop::sample::select(schema_version_candidates())
+    }
+
+    /// A minimal but VALID ledger intent for target `t1`.
+    fn intended_intent(dep: &str) -> LedgerIntent {
+        LedgerIntent {
+            deployment_schema_version: LEDGER_SCHEMA_VERSION,
+            deployment_id: DeploymentId::new(dep.to_string()),
+            target: TargetName::new("t1".to_string()),
+            group: None,
+            slot_ids: vec![PlacementSlotId::new("p1".to_string())],
+            behavior_sha256: "sha256-aa".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            desired: std::collections::BTreeMap::new(),
+            pre_push: std::collections::BTreeMap::new(),
+            slots: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// The supported versions load together: a project config at
+    /// `CONFIG_SCHEMA_VERSION` and the same store's ledger at
+    /// `LEDGER_SCHEMA_VERSION` both decode.
+    #[test]
+    fn config_at_config_schema_and_ledger_at_ledger_schema_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        let p = project.join("deploy.toml");
+        std::fs::write(&p, deploy_toml("v1")).unwrap();
+        Config::load(&p).expect("a config at CONFIG_SCHEMA_VERSION must load");
+
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let line =
+            serde_json::to_string(&LedgerLine::Intent(intended_intent("deploy-ok"))).unwrap();
+        let lp = store.ledger_path("t1");
+        std::fs::create_dir_all(lp.parent().unwrap()).unwrap();
+        std::fs::write(&lp, format!("{line}\n")).unwrap();
+        let entries = store
+            .read_ledger("t1")
+            .expect("a ledger at LEDGER_SCHEMA_VERSION must read");
+        assert_eq!(entries.len(), 1);
+    }
+
+    /// Swapping the versions on either side fails THAT SIDE ONLY: a config
+    /// carrying a foreign `schema_version` fails the config reader while the
+    /// same store's ledger at `LEDGER_SCHEMA_VERSION` still decodes, and a
+    /// ledger carrying a foreign `deployment_schema_version` fails the
+    /// ledger reader while the config at `CONFIG_SCHEMA_VERSION` still
+    /// loads. The two gates are independent: tampering one side never
+    /// affects the other.
+    #[test]
+    fn schema_version_swap_fails_only_the_swapped_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        let p = project.join("deploy.toml");
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+
+        // CONFIG side tampered (a foreign version on the config field): the
+        // config reader fails closed ...
+        std::fs::write(
+            &p,
+            deploy_toml("v1").replace(
+                "schema_version = 2",
+                &format!("schema_version = {}", CONFIG_SCHEMA_VERSION.wrapping_add(1)),
+            ),
+        )
+        .unwrap();
+        let err = Config::load(&p).expect_err("a foreign config schema_version must fail closed");
+        assert!(
+            err.to_string().contains("schema_version"),
+            "the config error must name the version field, got: {err}"
+        );
+        // ... while the SAME store's ledger at LEDGER_SCHEMA_VERSION is
+        // untouched by the config tamper and still decodes.
+        let line = serde_json::to_string(&LedgerLine::Intent(intended_intent("deploy-a"))).unwrap();
+        let lp = store.ledger_path("t1");
+        std::fs::create_dir_all(lp.parent().unwrap()).unwrap();
+        std::fs::write(&lp, format!("{line}\n")).unwrap();
+        assert_eq!(
+            store.read_ledger("t1").unwrap().len(),
+            1,
+            "a config-side version tamper must not affect ledger decoding"
+        );
+
+        // Restore the config at CONFIG_SCHEMA_VERSION ...
+        std::fs::write(&p, deploy_toml("v1")).unwrap();
+        Config::load(&p).expect("the config at CONFIG_SCHEMA_VERSION still loads");
+        // ... and tamper ONLY the ledger line: the ledger reader fails
+        // closed, naming the version ...
+        let mut foreign = intended_intent("deploy-b");
+        foreign.deployment_schema_version = LEDGER_SCHEMA_VERSION.wrapping_add(1);
+        let line = serde_json::to_string(&LedgerLine::Intent(foreign)).unwrap();
+        std::fs::write(&lp, format!("{line}\n")).unwrap();
+        let err = store
+            .read_ledger("t1")
+            .expect_err("a foreign deployment_schema_version must fail closed");
+        assert!(
+            err.to_string().contains("deployment_schema_version"),
+            "the ledger error must name the version field, got: {err}"
+        );
+        // ... and the CONFIG is untouched by the ledger tamper.
+        Config::load(&p).expect("the config still loads after the ledger-side tamper");
+    }
+
+    proptest! {
+        // THE CROSS-VERSION INDEPENDENCE PROPERTY: the configuration and
+        // the deployment ledger version themselves on INDEPENDENT axes. For
+        // every (config_version, ledger_version) combination — ranging over
+        // BOTH supported values, each ±1, zero, and u32::MAX — each reader
+        // decodes exactly by its OWN constant: the config reader accepts the
+        // config iff `schema_version == CONFIG_SCHEMA_VERSION`, and the
+        // ledger reader accepts the ledger iff
+        // `deployment_schema_version == LEDGER_SCHEMA_VERSION`. Changing one
+        // side's version never affects the other side's decoding.
+        //
+        // Bounded 16 cases, fixed seed 0x5EED_5EED (house style), no
+        // failure persistence — the identical vectors on every run.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn config_and_ledger_schema_versions_decode_independently(
+            config_version in schema_version_candidate(),
+            ledger_version in schema_version_candidate(),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let project = dir.path().join("proj");
+            std::fs::create_dir_all(&project).unwrap();
+            write_standard_release(&project, "v1");
+            let p = project.join("deploy.toml");
+            std::fs::write(
+                &p,
+                deploy_toml("v1").replace(
+                    "schema_version = 2",
+                    &format!("schema_version = {config_version}"),
+                ),
+            )
+            .unwrap();
+
+            // The config reader accepts exactly CONFIG_SCHEMA_VERSION — a
+            // foreign value (including LEDGER_SCHEMA_VERSION once the two
+            // constants diverge) is refused, independently of the ledger.
+            let config_accepted = Config::load(&p).is_ok();
+            assert_eq!(
+                config_accepted,
+                config_version == CONFIG_SCHEMA_VERSION,
+                "config schema_version {config_version} must load iff it equals CONFIG_SCHEMA_VERSION"
+            );
+
+            // The ledger reader accepts exactly LEDGER_SCHEMA_VERSION on the
+            // intent line — a foreign value is refused, independently of the
+            // config.
+            let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+            let mut intent = intended_intent("deploy-x");
+            intent.deployment_schema_version = ledger_version;
+            let line = serde_json::to_string(&LedgerLine::Intent(intent)).unwrap();
+            let lp = store.ledger_path("t1");
+            std::fs::create_dir_all(lp.parent().unwrap()).unwrap();
+            std::fs::write(&lp, format!("{line}\n")).unwrap();
+            let ledger_accepted = store.read_ledger("t1").is_ok();
+            assert_eq!(
+                ledger_accepted,
+                ledger_version == LEDGER_SCHEMA_VERSION,
+                "ledger deployment_schema_version {ledger_version} must read iff it equals LEDGER_SCHEMA_VERSION"
+            );
+        }
     }
 }

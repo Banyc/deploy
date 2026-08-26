@@ -62,7 +62,7 @@
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::model::{
-    BehaviorContract, PlacementSlotId, ReleaseId, ReleaseRecord, SCHEMA_VERSION,
+    BehaviorContract, LEDGER_SCHEMA_VERSION, PlacementSlotId, ReleaseId, ReleaseRecord,
     TREE_SCHEMA_VERSION, TreeDigest, TreeMetadata,
 };
 
@@ -927,13 +927,13 @@ impl LocalStore {
             {
                 LedgerLine::Intent(intent) => {
                     // Fail closed on the record schema version: only
-                    // `SCHEMA_VERSION` is accepted, any other version is
-                    // refused with an error naming the version (a record
+                    // `LEDGER_SCHEMA_VERSION` is accepted, any other version
+                    // is refused with an error naming the version (a record
                     // from a different schema is never silently
                     // interpreted).
-                    if intent.deployment_schema_version != SCHEMA_VERSION {
+                    if intent.deployment_schema_version != LEDGER_SCHEMA_VERSION {
                         return Err(Error::store(format!(
-                            "intent {} carries unsupported deployment_schema_version {} (expected {SCHEMA_VERSION}): only SCHEMA_VERSION is accepted",
+                            "intent {} carries unsupported deployment_schema_version {} (expected {LEDGER_SCHEMA_VERSION}): only LEDGER_SCHEMA_VERSION is accepted",
                             intent.deployment_id, intent.deployment_schema_version
                         )));
                     }
@@ -1297,7 +1297,7 @@ mod tests {
 
     fn intent(id: &str, target: &str) -> LedgerIntent {
         LedgerIntent {
-            deployment_schema_version: SCHEMA_VERSION,
+            deployment_schema_version: LEDGER_SCHEMA_VERSION,
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new(target.to_string()),
             group: None,
@@ -1508,15 +1508,15 @@ mod tests {
     }
 
     /// A foreign `deployment_schema_version` on an intent line fails closed
-    /// (only `SCHEMA_VERSION` is accepted), and a malformed line is a store
+    /// (only `LEDGER_SCHEMA_VERSION` is accepted), and a malformed line is a store
     /// error, never a silent drop.
     #[test]
-    fn ledger_accepts_only_schema_version_and_rejects_malformed_lines() {
+    fn ledger_accepts_only_ledger_schema_version_and_rejects_malformed_lines() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
         let mut foreign = intent("deploy-x", target);
-        foreign.deployment_schema_version = SCHEMA_VERSION + 1;
+        foreign.deployment_schema_version = LEDGER_SCHEMA_VERSION + 1;
         let line = serde_json::to_string(&LedgerLine::Intent(foreign)).unwrap();
         let p = store.ledger_path(target);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();

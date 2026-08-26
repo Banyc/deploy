@@ -32,16 +32,26 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
-/// The schema version understood by this implementation.
+/// The configuration format version understood by this implementation
+/// (`Config.schema_version`, validated in
+/// [`crate::config::Config::validate`]). Every config writer emits exactly
+/// `CONFIG_SCHEMA_VERSION`; the config reader refuses any other version
+/// (fail closed — a `deploy.toml` from a different schema is never
+/// silently interpreted). This is INDEPENDENT of [`LEDGER_SCHEMA_VERSION`]:
+/// the configuration and the deployment records version themselves
+/// separately, so bumping one never invalidates the other.
 ///
-/// `SCHEMA_VERSION` is the SINGLE authoritative schema version for every
-/// versioned record family that uses it: the user-facing `deploy.toml`
-/// configuration (`Config.schema_version`, validated in
-/// [`crate::config::Config::validate`]) AND the deployment records
-/// (`LedgerIntent.deployment_schema_version`, validated on every read
-/// in [`crate::store::local::LocalStore::read_ledger`]). Every writer
-/// emits exactly `SCHEMA_VERSION`; every reader refuses any other version
-/// (fail closed — a mismatched record is never silently interpreted).
+/// The current format is version 2.
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+
+/// The deployment LEDGER format version — the version every deployment
+/// record carries (`LedgerIntent.deployment_schema_version`, validated on
+/// every read in [`crate::store::local::LocalStore::read_ledger`]). Every
+/// ledger writer emits exactly `LEDGER_SCHEMA_VERSION`; every ledger reader
+/// refuses any other version (fail closed — a mismatched record is never
+/// silently interpreted). This is INDEPENDENT of [`CONFIG_SCHEMA_VERSION`]:
+/// the deployment records version themselves separately from the
+/// configuration format, so bumping one never invalidates the other.
 ///
 /// The current format is version 2: deployment records use the canonical
 /// placement-slot-keyed shape (`BTreeMap<PlacementSlotId, _>` maps, nested
@@ -51,7 +61,7 @@ use uuid::Uuid;
 /// compatibility fallback. A hypothetical pre-rekeying shape that keyed
 /// these maps by server ID with flat artifact fields is NOT the current
 /// schema and never loads.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const LEDGER_SCHEMA_VERSION: u32 = 2;
 
 /// The canonical release identity PAYLOAD version
 /// (`CanonicalReleasePayload.schema_version`), FROZEN INTO the release

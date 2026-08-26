@@ -444,8 +444,8 @@ mod tests {
     use super::*;
 
     use crate::model::{
-        ArtifactRef, GenerationRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId,
-        SCHEMA_VERSION, ServerId, TargetName, TreeDigest, VariantName,
+        ArtifactRef, GenerationRef, LEDGER_SCHEMA_VERSION, PlacementSlotAssignment,
+        PlacementSlotId, ReleaseId, ServerId, TargetName, TreeDigest, VariantName,
     };
     use crate::records::{LedgerIntent, LedgerRollback, LedgerTerminal, ObservedSlot, Pins};
     use proptest::prelude::*;
@@ -456,7 +456,7 @@ mod tests {
 
     fn intent(id: &str, target: &str) -> LedgerIntent {
         LedgerIntent {
-            deployment_schema_version: SCHEMA_VERSION,
+            deployment_schema_version: LEDGER_SCHEMA_VERSION,
             deployment_id: DeploymentId::new(id.to_string()),
             target: TargetName::new(target.to_string()),
             group: None,

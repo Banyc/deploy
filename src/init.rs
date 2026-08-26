@@ -269,7 +269,7 @@ fn build_docs(
     deploy_dir: &Path,
 ) -> Result<ScaffoldDocs> {
     let manifest = ScaffoldManifest {
-        schema_version: crate::model::SCHEMA_VERSION,
+        schema_version: crate::model::CONFIG_SCHEMA_VERSION,
         application: name.to_string(),
         release: "v1".to_string(),
         servers: vec![ServerDef {

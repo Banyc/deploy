@@ -37,8 +37,8 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::layout;
 use crate::model::{
-    ArtifactRef, DeploymentId, GenerationId, PlacementSlotAssignment, PlacementSlotId, ReleaseId,
-    SCHEMA_VERSION, ServerId, TargetName, TreeDigest, VariantName,
+    ArtifactRef, DeploymentId, GenerationId, LEDGER_SCHEMA_VERSION, PlacementSlotAssignment,
+    PlacementSlotId, ReleaseId, ServerId, TargetName, TreeDigest, VariantName,
 };
 use crate::push::checkpoint::run_checkpoint_unlocked;
 use crate::push::engine::{PushOptions, push, retry_pending_sweep};
@@ -199,7 +199,7 @@ fn list_generations(helper: &RemoteHelper) -> Vec<String> {
 
 fn intent(id: &str, target: &str) -> LedgerIntent {
     LedgerIntent {
-        deployment_schema_version: SCHEMA_VERSION,
+        deployment_schema_version: LEDGER_SCHEMA_VERSION,
         deployment_id: DeploymentId::new(id.to_string()),
         target: TargetName::new(target.to_string()),
         group: None,
