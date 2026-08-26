@@ -222,8 +222,6 @@ fn terminal_for(id: &str, target: &str, release: &str, tree: &str) -> LedgerTerm
         recorded_at: "2026-01-01T00:00:00Z".to_string(),
         outcomes: BTreeMap::new(),
         rollback: Some(LedgerRollback {
-            behavior_sha256: "sha256-aa".to_string(),
-            release: ReleaseId::new(release.to_string()),
             slots: BTreeMap::from([(
                 PlacementSlotId::new("p1".to_string()),
                 crate::model::GenerationRef {

@@ -6,9 +6,9 @@
 //! starts as the durable INTENT (appended before any remote mutation) and its
 //! TERMINAL EVENT carries the status, the per-slot outcomes, and — when
 //! successful — the ROLLBACK STATE ([`crate::records::LedgerRollback`]:
-//! per-slot generation refs + behavior digest + physical bindings + the
-//! release the generations came from). The ledger's append order IS the
-//! history order; there is NO separate snapshot op log, NO floor marker, and
+//! per-slot generation refs + physical bindings). The ledger's append order
+//! IS the history order; there is NO separate snapshot op log, NO floor
+//! marker, and
 //! NO `refs/last-successful` ref file — the latest successful entry is
 //! DERIVED from the ledger.
 //!
@@ -262,7 +262,7 @@ pub fn finalize_successful_attempt(
     // The base for the complete snapshot: the latest successful snapshot
     // BEFORE this attempt (this attempt's terminal is not yet appended).
     let base = crate::push::plan::latest_successful_rollback(store, attempt.target.as_str())?;
-    let rollback = build_rollback(attempt, actuals, bindings, base.as_ref(), current_slot_ids);
+    let rollback = build_rollback(actuals, bindings, base.as_ref(), current_slot_ids);
     let terminal = LedgerTerminal {
         deployment_id: attempt.deployment_id.clone(),
         target: attempt.target.clone(),
@@ -285,14 +285,15 @@ pub fn finalize_successful_attempt(
 ///
 /// PARTIAL-ROLLOUT OVERLAY: the result is the COMPLETE target snapshot — the
 /// latest successful snapshot (`base`) with the SELECTED slots (the attempt's
-/// `slot_ids`) replaced by their actual assignments and current bindings,
-/// unselected slots carried forward unchanged, and slots absent from
-/// `current_slot_ids` (removed from the current target configuration)
+/// actual per-slot results) replaced by their actual assignments and current
+/// bindings, unselected slots carried forward unchanged, and slots absent
+/// from `current_slot_ids` (removed from the current target configuration)
 /// omitted. A full-target attempt replaces every slot, so the base is
-/// irrelevant. The recorded `release` is the release this attempt deployed
-/// (the selected slots' release), falling back to the base's release.
+/// irrelevant. There is NO snapshot-wide release/behavior: each slot's
+/// `GenerationRef` carries its OWN artifact (release/variant/tree), so a
+/// partial snapshot can span several releases (group pushes over time) and
+/// the referenced releases are the set derived from the per-slot bindings.
 pub fn build_rollback(
-    attempt: &LedgerIntent,
     actuals: &BTreeMap<PlacementSlotId, AttemptServer>,
     bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
     base: Option<&LedgerRollback>,
@@ -329,13 +330,6 @@ pub fn build_rollback(
     slots.retain(|k, _| current.contains(k.as_str()));
     out_bindings.retain(|k, _| current.contains(k.as_str()));
     LedgerRollback {
-        behavior_sha256: attempt.behavior_sha256.clone(),
-        release: actuals
-            .values()
-            .next()
-            .map(|s| s.artifact.release.clone())
-            .or_else(|| base.map(|b| b.release.clone()))
-            .unwrap_or_default(),
         slots,
         bindings: out_bindings,
     }
@@ -516,8 +510,6 @@ mod tests {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
             outcomes: BTreeMap::new(),
             rollback: Some(LedgerRollback {
-                behavior_sha256: "sha256-aa".to_string(),
-                release: ReleaseId::new(release.to_string()),
                 slots: BTreeMap::from([(
                     PlacementSlotId::new("p1".to_string()),
                     GenerationRef {
@@ -844,7 +836,6 @@ mod tests {
     #[test]
     fn build_rollback_records_each_slots_physical_binding() {
         let slot = PlacementSlotId::new("p1".to_string());
-        let attempt = intent("deploy-binding-map");
         let actuals = BTreeMap::from([(
             slot.clone(),
             AttemptServer {
@@ -860,13 +851,7 @@ mod tests {
             },
         )]);
 
-        let rollback = build_rollback(
-            &attempt,
-            &actuals,
-            &bindings,
-            None,
-            std::slice::from_ref(&slot),
-        );
+        let rollback = build_rollback(&actuals, &bindings, None, std::slice::from_ref(&slot));
         assert_eq!(
             rollback.bindings.get(&slot),
             Some(&PhysicalBinding {
@@ -881,7 +866,11 @@ mod tests {
 
     /// A legacy ledger line whose rollback has no `bindings` key must still
     /// deserialize; its `bindings` map defaults to empty, which rollback
-    /// treats as unverifiable rather than guessing the host/location.
+    /// treats as unverifiable rather than guessing the host/location. The
+    /// line ALSO carries the OLD snapshot-wide `behavior_sha256`/`release`
+    /// members — serde ignores the unknown fields, and the rollback payload
+    /// is interpreted purely through the per-slot bindings (legacy lines stay
+    /// readable after the snapshot-wide fields were removed).
     #[test]
     fn legacy_rollback_without_bindings_deserializes_with_empty_map() {
         let line = r#"{"kind":"terminal","deployment_id":"deploy-old","target":"production","status":"successful","recorded_at":"2026-01-01T00:00:00Z","outcomes":{},"rollback":{"behavior_sha256":"sha256-aa","release":"rel-sha256-old","slots":{}}}"#;

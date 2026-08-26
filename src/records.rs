@@ -57,7 +57,7 @@ use crate::model::{
 /// ACTUAL SERVER identity used for transport addressing ([`ServerId`]).
 pub type ServerName = ServerId;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -186,15 +186,25 @@ pub struct PhysicalBinding {
 /// The ROLLBACK STATE carried by the terminal event of a SUCCESSFUL
 /// deployment: the snapshot payload of the attempt — the complete per-slot
 /// [`GenerationRef`]s it advanced to (a successful terminal always has a
-/// generation per slot), the behavior digest the deployment was bound to,
-/// the physical bindings (`{server, deploy_dir}`) each slot had, and the
-/// release the generations came from (a coherent deployment carries one
-/// release across its slots).
+/// generation per slot) and the physical bindings (`{server, deploy_dir}`)
+/// each slot had.
+///
+/// THERE IS NO SNAPSHOT-WIDE RELEASE/BEHAVIOR: each slot's [`GenerationRef`]
+/// carries its OWN artifact binding (`release`, `variant`, `tree`), and a
+/// PARTIAL snapshot can legitimately carry slots from DIFFERENT releases
+/// (group pushes over time: group A pushed release R1, group B pushed
+/// release R2, and the overlay snapshot keeps each slot's own artifact). The
+/// referenced releases are DERIVED from `slots` (each slot's artifact's
+/// release) — never stored once per snapshot — and rollback resolves EACH
+/// SLOT's behavior from ITS OWN (release, variant) binding. Legacy ledger
+/// lines that still carry the old snapshot-wide `behavior_sha256`/`release`
+/// fields deserialize fine (serde ignores the unknown members) and are
+/// interpreted purely through the per-slot bindings.
 ///
 /// `bindings` records the COMPLETE PHYSICAL BINDING each slot had when the
-/// deployment ran. Exact rollback maps a terminal's generations to slots BY
-/// SLOT ID, so without this map a slot rebound to a different server — or
-/// moved to a different `deploy_dir` on the same server — in `deploy.toml`
+/// deployment ran. Exact rollback maps a terminal's generations to slots by
+/// SLOT, so without this map a slot that rebinds to a different server — or
+/// moves to a different `deploy_dir` on the same server — in `deploy.toml`
 /// would silently roll back onto the wrong host/location. A MISSING entry
 /// makes the binding unverifiable: rollback refuses rather than guessing the
 /// host. Kept as a separate `#[serde(default)]` field so the `slots` map and
@@ -203,17 +213,26 @@ pub struct PhysicalBinding {
 /// refuses).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerRollback {
-    pub behavior_sha256: String,
-    /// The release the generations came from (a coherent successful
-    /// deployment carries one release across its slots).
-    pub release: ReleaseId,
-    /// Per-slot generation refs, keyed by [`PlacementSlotId`].
+    /// Per-slot generation refs, keyed by [`PlacementSlotId`]. Each
+    /// generation ref's assignment carries the slot's OWN artifact binding
+    /// (`release`, `variant`, `tree`); the referenced releases are the set
+    /// derived from these bindings.
     pub slots: BTreeMap<PlacementSlotId, GenerationRef>,
     /// The complete physical binding (`{server, deploy_dir}`) each slot had
     /// at deployment time, keyed by [`PlacementSlotId`].
     #[serde(default)]
     pub bindings: BTreeMap<PlacementSlotId, PhysicalBinding>,
 }
+
+/// The per-release, per-variant behavior contracts an attempt is bound to:
+/// keyed by release id, then variant name. Historical and rollback pushes
+/// resolve EACH SLOT's behavior from ITS OWN artifact binding
+/// (`slot.assignment.artifact = {release, variant, tree}`) — the release
+/// record's stored per-variant contract, verified against the release's
+/// provenance digest — never a snapshot-wide single release. A partial
+/// snapshot's slots can carry artifacts from DIFFERENT releases, so the
+/// index spans every release the attempt's slots reference.
+pub type BehaviorIndex = BTreeMap<ReleaseId, BTreeMap<String, BehaviorContract>>;
 
 /// The TERMINAL EVENT of one deployment: the status the attempt ended with,
 /// the per-slot OUTCOMES ([`ServerResult`] map), and — when the status is
@@ -384,16 +403,20 @@ pub struct ServerPlan {
 pub struct DeploymentPlan {
     pub deployment_id: DeploymentId,
     pub target: TargetName,
+    /// The attempt's snapshot-wide behavior digest: the canonical digest of
+    /// the [`BehaviorIndex`] the attempt is bound to.
     pub behavior_sha256: String,
-    /// The frozen, name-keyed activation + verification contracts this attempt
-    /// is bound to, one per declared variant. Historical and rollback pushes
-    /// carry the historical contracts here rather than the caller's current
-    /// configuration.
-    pub behaviors: BTreeMap<String, BehaviorContract>,
+    /// The frozen, per-release name-keyed activation + verification contracts
+    /// this attempt is bound to, one per declared variant per referenced
+    /// release. Historical and rollback pushes carry the historical contracts
+    /// here rather than the caller's current configuration.
+    pub behaviors: BehaviorIndex,
     pub slot_ids: Vec<PlacementSlotId>,
     pub slots: BTreeMap<PlacementSlotId, ServerPlan>,
     pub source: PlanSource,
-    pub desired_release: ReleaseId,
+    /// The releases this attempt's slots reference (per-slot artifact
+    /// provenance: a partial snapshot can span several releases).
+    pub desired_releases: BTreeSet<ReleaseId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

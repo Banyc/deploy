@@ -595,7 +595,7 @@ mod tests {
 
     /// Seed the ledger with a successful deployment (intent + `Successful`
     /// terminal carrying a rollback state, so `sN`/log prefixes apply).
-    fn seed_successful(store: &LocalStore, id: &str, attempted_at: &str, release: &str) {
+    fn seed_successful(store: &LocalStore, id: &str, attempted_at: &str) {
         let mut it = pending_attempt(id);
         it.attempted_at = attempted_at.to_string();
         store.append_intent("production", &it).unwrap();
@@ -609,8 +609,6 @@ mod tests {
                     recorded_at: attempted_at.to_string(),
                     outcomes: BTreeMap::new(),
                     rollback: Some(LedgerRollback {
-                        behavior_sha256: "sha256-aa".to_string(),
-                        release: ReleaseId::new(release.to_string()),
                         slots: BTreeMap::new(),
                         bindings: BTreeMap::new(),
                     }),
@@ -669,12 +667,7 @@ mod tests {
 
         // Two deployments: the first succeeds (producing rollback ref s0);
         // the second fails in preflight (producing NO rollback state).
-        seed_successful(
-            &store,
-            "deploy-log-ok",
-            "2026-01-01T00:00:00Z",
-            "rel-sha256-ok",
-        );
+        seed_successful(&store, "deploy-log-ok", "2026-01-01T00:00:00Z");
         let mut a_failed = pending_attempt("deploy-log-failed");
         a_failed.attempted_at = "2026-01-02T00:00:00Z".to_string();
         store.append_intent("production", &a_failed).unwrap();
@@ -1047,12 +1040,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         // Seed a small history: deploy-0 (s0), deploy-1 (s1), deploy-2 (s2).
         for id in ["deploy-0", "deploy-1", "deploy-2"] {
-            seed_successful(
-                &store,
-                id,
-                "2026-01-01T00:00:00Z",
-                &format!("rel-sha256-{id}"),
-            );
+            seed_successful(&store, id, "2026-01-01T00:00:00Z");
             std::fs::create_dir_all(store.deployment_dir(id)).unwrap();
         }
 

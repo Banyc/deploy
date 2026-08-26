@@ -357,8 +357,6 @@ mod tests {
 
     fn rollback_for(release: &str) -> LedgerRollback {
         LedgerRollback {
-            behavior_sha256: "sha256-aa".to_string(),
-            release: ReleaseId::new(release.to_string()),
             slots: BTreeMap::from([(
                 PlacementSlotId::new("p1".to_string()),
                 GenerationRef {

@@ -420,8 +420,6 @@ interval_seconds = 0
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
             outcomes: BTreeMap::new(),
             rollback: Some(LedgerRollback {
-                behavior_sha256: "sha256-aa".to_string(),
-                release: ReleaseId::new(release.to_string()),
                 slots: BTreeMap::from([(
                     PlacementSlotId::new(SLOT.to_string()),
                     GenerationRef {

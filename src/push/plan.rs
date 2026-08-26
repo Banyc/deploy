@@ -246,8 +246,10 @@ pub(crate) fn validate_direct_release_membership(
 /// Resolve the desired assignment for each SELECTED slot given the push
 /// reference. The selection (target + optional group + exact slot IDs) is
 /// normalized once near command entry; planning consumes it instead of
-/// independently filtering slots. Returns the assignments, the release the
-/// attempt is bound to, and the plan source.
+/// independently filtering slots. Returns the assignments, the SET of
+/// releases the assignments reference (per-slot artifact provenance — a
+/// partial snapshot can span several releases, so there is NO single
+/// snapshot-wide release), and the plan source.
 pub fn plan_assignments(
     selection: &SlotSelection,
     pref: &PushRef,
@@ -255,7 +257,7 @@ pub fn plan_assignments(
     variant_trees: &BTreeMap<String, TreeDigest>,
     store: &LocalStore,
     config: &Config,
-) -> Result<(Vec<PlannedAssignment>, ReleaseId, PlanSource)> {
+) -> Result<(Vec<PlannedAssignment>, BTreeSet<ReleaseId>, PlanSource)> {
     if !config.targets.contains_key(selection.target.as_str()) {
         return Err(Error::not_found(format!("target '{}'", selection.target)));
     }
@@ -287,7 +289,11 @@ pub fn plan_assignments(
                     },
                 });
             }
-            Ok((out, local_release_id.clone(), PlanSource::Head))
+            Ok((
+                out,
+                BTreeSet::from([local_release_id.clone()]),
+                PlanSource::Head,
+            ))
         }
         PushRef::Deployment {
             target: ft,
@@ -338,18 +344,11 @@ pub fn plan_assignments(
                     )));
                 }
             }
-            // The release the snapshot's generations came from (a coherent
-            // snapshot carries one release across its slots).
-            let release = entry
-                .slots
-                .values()
-                .next()
-                .map(|g| g.assignment.artifact.release.clone())
-                .unwrap_or_else(|| local_release_id.clone());
-            // EXACT rollback always restores the snapshot's OWN historical
-            // artifact (variant + tree together), never the caller's current
-            // configuration: a variant renamed or re-declared after the
-            // snapshot was taken must not change what the rollback deploys.
+            // The releases the snapshot's slots reference, derived PER SLOT
+            // from each slot's OWN artifact binding: a partial snapshot can
+            // carry slots from DIFFERENT releases (group pushes over time —
+            // group A pushed R1, group B pushed R2), so there is no single
+            // snapshot-wide release.
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
                 let slot_id = PlacementSlotId::new(slot.id.clone());
@@ -361,9 +360,11 @@ pub fn plan_assignments(
                     artifact: g.assignment.artifact.clone(),
                 });
             }
+            let releases: BTreeSet<ReleaseId> =
+                out.iter().map(|a| a.artifact.release.clone()).collect();
             Ok((
                 out,
-                release,
+                releases,
                 PlanSource::DeploymentRef(deployment_id.clone()),
             ))
         }
@@ -431,20 +432,43 @@ pub fn plan_assignments(
             }
             Ok((
                 out,
-                release.clone(),
+                BTreeSet::from([release.clone()]),
                 PlanSource::ReleaseRef(release.clone()),
             ))
         }
     }
 }
 
+/// Load the frozen per-release, per-variant behavior contracts for EVERY
+/// release an attempt's slots reference. Historical and rollback pushes
+/// resolve EACH SLOT's behavior from ITS OWN (release, variant) binding — the
+/// release record's stored per-variant contract, verified against the
+/// release's provenance digest via [`LocalStore::read_release_behaviors`]. A
+/// partial snapshot's slots can carry artifacts from DIFFERENT releases
+/// (group pushes over time), so the index is keyed by release, then variant
+/// — there is NO snapshot-wide single release/behavior. Failures (a missing
+/// or tampered release record / behavior snapshot) propagate closed: a
+/// historical push never silently substitutes the caller's current
+/// configuration.
+pub fn release_behavior_index(
+    store: &LocalStore,
+    releases: &BTreeSet<ReleaseId>,
+) -> Result<crate::records::BehaviorIndex> {
+    let mut index = crate::records::BehaviorIndex::new();
+    for rid in releases {
+        let behaviors = store.read_release_behaviors(rid)?;
+        index.insert(rid.clone(), behaviors);
+    }
+    Ok(index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{
-        ArtifactRef, CanonicalSlot, CanonicalSlots, DeploymentId, GenerationId, GenerationRef,
-        Provenance, RELEASE_RECORD_SCHEMA_VERSION, ReleaseRecord, SCHEMA_VERSION, ServerId,
-        TargetName, TreeDigest, VariantName,
+        ArtifactRef, BehaviorContract, CanonicalSlot, CanonicalSlots, DeploymentId, GenerationId,
+        GenerationRef, Provenance, RELEASE_RECORD_SCHEMA_VERSION, ReleaseRecord, SCHEMA_VERSION,
+        ServerId, TargetName, TreeDigest, VariantName,
     };
     use crate::records::{
         DeploymentStatus, LedgerIntent, LedgerRollback, LedgerTerminal, PhysicalBinding,
@@ -585,9 +609,9 @@ interval_seconds = 0
     /// Seed a SUCCESSFUL ledger entry for `t1` (intent + `Successful`
     /// terminal carrying the rollback payload), mirroring the old
     /// `append_snapshot` test helper. The rollback payload carries the
-    /// snapshot's `slots`/`bindings`; the release is derived from the first
-    /// slot's artifact (a coherent deployment carries one release across its
-    /// slots).
+    /// snapshot's `slots`/`bindings`; there is NO snapshot-wide release —
+    /// each slot's generation ref carries its OWN artifact (release, variant,
+    /// tree), and a partial snapshot can span several releases.
     fn append_successful_snapshot(
         store: &LocalStore,
         deployment_id: &str,
@@ -597,11 +621,6 @@ interval_seconds = 0
     ) {
         let id = DeploymentId::new(deployment_id.to_string());
         let target = TargetName::new("t1".to_string());
-        let release = slots
-            .values()
-            .next()
-            .map(|g| g.assignment.artifact.release.clone())
-            .expect("a snapshot records at least one slot");
         store
             .append_intent(
                 "t1",
@@ -628,12 +647,7 @@ interval_seconds = 0
                     status: DeploymentStatus::Successful,
                     recorded_at: "2026-01-01T00:00:00Z".to_string(),
                     outcomes: BTreeMap::new(),
-                    rollback: Some(LedgerRollback {
-                        behavior_sha256: behavior_sha256.to_string(),
-                        release,
-                        slots,
-                        bindings,
-                    }),
+                    rollback: Some(LedgerRollback { slots, bindings }),
                     reason: None,
                 },
             )
@@ -738,7 +752,7 @@ interval_seconds = 0
             "the tree must come from the release's own variant bindings"
         );
         assert_eq!(a.artifact.release, release);
-        assert_eq!(desired, release);
+        assert_eq!(desired, BTreeSet::from([release.clone()]));
         assert_eq!(source, PlanSource::ReleaseRef(release));
     }
 
@@ -1062,7 +1076,7 @@ interval_seconds = 0
         .expect("physical binding drift must not block logical-membership planning");
         assert_eq!(assignments.len(), 1);
         assert_eq!(assignments[0].placement_slot, PlacementSlotId::new("p1"));
-        assert_eq!(desired, release);
+        assert_eq!(desired, BTreeSet::from([release.clone()]));
         assert_eq!(source, PlanSource::ReleaseRef(release));
     }
 
@@ -1249,7 +1263,7 @@ interval_seconds = 0
         assert_eq!(assignments[0].artifact.variant.as_str(), "old");
         assert_eq!(assignments[0].artifact.tree.as_str(), "tree-old");
         assert_eq!(assignments[0].artifact.release, release);
-        assert_eq!(desired, release);
+        assert_eq!(desired, BTreeSet::from([release.clone()]));
         assert_eq!(
             source,
             PlanSource::DeploymentRef(DeploymentId::new("deploy-snapshot-histvar".to_string()))
@@ -1498,7 +1512,7 @@ interval_seconds = 0
                     "the tree must come from the release's own variant bindings"
                 );
                 assert_eq!(a.artifact.release, release);
-                assert_eq!(desired, release);
+                assert_eq!(desired, BTreeSet::from([release.clone()]));
                 assert_eq!(source, PlanSource::ReleaseRef(release.clone()));
             }
 
@@ -1766,7 +1780,7 @@ interval_seconds = 0
                         assert_eq!(a.artifact.variant.as_str(), "standard");
                         assert_eq!(a.artifact.release, release);
                     }
-                    assert_eq!(desired, release);
+                    assert_eq!(desired, BTreeSet::from([release.clone()]));
                     assert_eq!(source, PlanSource::ReleaseRef(release.clone()));
                 }
                 // LOGICAL-ONLY: when the fixture realized a physical binding
@@ -1924,7 +1938,11 @@ interval_seconds = 0
             let stored = &slots[&PlacementSlotId::new("p1")];
             assert_eq!(a.placement_slot, PlacementSlotId::new("p1"));
             assert_eq!(a.artifact, stored.assignment.artifact, "the planned artifact must equal the snapshot's stored artifact");
-            assert_eq!(desired, snapshot_release, "the rollout release is the snapshot's release");
+            assert_eq!(
+                desired,
+                BTreeSet::from([snapshot_release.clone()]),
+                "the rollout releases are exactly the snapshot's referenced releases"
+            );
             assert_eq!(
                 source,
                 PlanSource::DeploymentRef(deployment_id.clone()),
@@ -1951,6 +1969,365 @@ interval_seconds = 0
                     || err.to_string().contains("deployment"),
                 "the refusal must name the missing deployment, got: {err}"
             );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // MULTI-RELEASE PARTIAL-SNAPSHOT ROLLBACK PROPERTY: a partial snapshot
+    // can carry slots from DIFFERENT releases (group pushes over time), and
+    // rollback must resolve EACH SLOT's behavior from ITS OWN (release,
+    // variant) binding — never a snapshot-wide single release/behavior.
+    // ---------------------------------------------------------------------
+
+    /// The two-group fixture variant: `p1` in `group-a` (server `s1`), `p2`
+    /// in `group-b` (server `s2`). The alternating partial pushes build their
+    /// multi-release snapshot on exactly this membership/bindings, so both
+    /// FULL and GROUP rollback selections plan against a stable placement
+    /// set.
+    const TWO_GROUP_VARIANT: &str = r#"
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+groups = ["group-a"]
+deploy_dir = "/srv/plan-a"
+
+[[slots]]
+id = "p2"
+server = "s2"
+target = "t1"
+groups = ["group-b"]
+deploy_dir = "/srv/plan-b"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+
+    /// The two-server config backing [`TWO_GROUP_VARIANT`] (one server per
+    /// group slot, so each slot's remote is its own host).
+    const TWO_GROUP_TOML: &str = r#"
+schema_version = 2
+application = "plan"
+release = "v1"
+
+[[servers]]
+id = "s1"
+address = "a"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s2"
+address = "b"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#;
+
+    fn two_group_project() -> (tempfile::TempDir, Config) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        std::fs::write(release_dir.join("standard.toml"), TWO_GROUP_VARIANT).unwrap();
+        let p = project.join("deploy.toml");
+        std::fs::write(&p, TWO_GROUP_TOML).unwrap();
+        let config = Config::load(&p).unwrap();
+        (dir, config)
+    }
+
+    /// Write a release record whose `standard` variant carries a DISTINCT
+    /// behavior contract (verification argv seeded by `seed`, so no two
+    /// releases share a contract digest) plus its identity-verified
+    /// `behavior.json` aux snapshot. The record's own canonical slot snapshot
+    /// records the current two-group membership/bindings (the rollback
+    /// property plans against that same config), and its identity is
+    /// recomputed from its own content ([`consistent`]) so the store's
+    /// recompute-and-verify reads succeed. Returns the release id.
+    fn seed_distinct_release(store: &LocalStore, seed: usize) -> ReleaseId {
+        let contract = BehaviorContract {
+            activation: crate::config::ActivationConfig::default(),
+            verification: crate::config::VerificationConfig {
+                adapter: "command".to_string(),
+                argv: vec![format!("verify-{seed}")],
+                timeout_seconds: 5,
+                ..Default::default()
+            },
+        };
+        let behaviors = BTreeMap::from([("standard".to_string(), contract)]);
+        let behavior_sha = crate::release::variant_behaviors_digest(&behaviors);
+        let mut rec = ReleaseRecord {
+            release_schema_version: RELEASE_RECORD_SCHEMA_VERSION,
+            release_id: String::new(),
+            release_sha256: String::new(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            provenance: Provenance {
+                git_revision: None,
+                mapping_sha256: format!("m-{seed}"),
+                behavior_sha256: behavior_sha,
+            },
+            variants: BTreeMap::from([("standard".to_string(), format!("tree-{seed}"))]),
+            slots: BTreeMap::from([(
+                "standard".to_string(),
+                CanonicalSlots {
+                    slots: vec![
+                        CanonicalSlot {
+                            id: "p1".to_string(),
+                            server: "s1".to_string(),
+                            deploy_dir: "/srv/plan-a".to_string(),
+                            target: "t1".to_string(),
+                            groups: vec!["group-a".to_string()],
+                        },
+                        CanonicalSlot {
+                            id: "p2".to_string(),
+                            server: "s2".to_string(),
+                            deploy_dir: "/srv/plan-b".to_string(),
+                            target: "t1".to_string(),
+                            groups: vec!["group-b".to_string()],
+                        },
+                    ],
+                },
+            )]),
+        };
+        let rid = consistent(&mut rec);
+        store.write_release(&rec).unwrap();
+        store
+            .write_release_aux(
+                &rid,
+                &format!("mapping-{seed}"),
+                &serde_json::to_value(&behaviors).unwrap(),
+            )
+            .unwrap();
+        rid
+    }
+
+    /// ONE multi-release rollback case (the user's property): ALTERNATE
+    /// PARTIAL PUSHES ACROSS GROUPS — each push deploys a release with a
+    /// DISTINGUISHABLE behavior contract (so the per-slot behavior digest is
+    /// a per-release fact) — then roll back an ARBITRARY FULL/GROUP snapshot
+    /// and assert EVERY SELECTED SLOT receives EXACTLY its stored (release,
+    /// tree, variant, behavior digest): the planned artifact equals the
+    /// snapshot's stored generation ref, and the per-slot behavior contract
+    /// (what the slot's publication/verification would run) resolves from the
+    /// slot's OWN (release, variant) — never another release's contract.
+    fn multi_release_rollback_case(
+        partial_groups: Vec<bool>,
+        rollback_pos: usize,
+        rollback_full: bool,
+    ) {
+        let (_dir, config) = two_group_project();
+        let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
+
+        let slot_a = PlacementSlotId::new("p1".to_string());
+        let slot_b = PlacementSlotId::new("p2".to_string());
+        let bindings: BTreeMap<PlacementSlotId, PhysicalBinding> = BTreeMap::from([
+            (
+                slot_a.clone(),
+                PhysicalBinding {
+                    server: ServerId::new("s1".to_string()),
+                    deploy_dir: "/srv/plan-a".to_string(),
+                },
+            ),
+            (
+                slot_b.clone(),
+                PhysicalBinding {
+                    server: ServerId::new("s2".to_string()),
+                    deploy_dir: "/srv/plan-b".to_string(),
+                },
+            ),
+        ]);
+
+        // Push 0 is the FULL first deployment (a partial group push needs a
+        // base snapshot carrying every unselected slot); every later push is
+        // a PARTIAL push of one group (its slots receive a fresh release with
+        // its own distinct contract). The per-slot state overlay mirrors
+        // `build_rollback`: selected slots are replaced, unselected slots are
+        // carried forward.
+        let mut expected_digests: BTreeMap<ReleaseId, String> = BTreeMap::new();
+        let mut state: BTreeMap<PlacementSlotId, ArtifactRef> = BTreeMap::new();
+        let mut chain: Vec<(DeploymentId, BTreeMap<PlacementSlotId, GenerationRef>)> = Vec::new();
+
+        let push_count = partial_groups.len() + 1;
+        for i in 0..push_count {
+            let rid = seed_distinct_release(&store, i);
+            let behaviors = store.read_release_behaviors(&rid).unwrap();
+            let digest = crate::release::behavior_contract_digest(&behaviors["standard"]);
+            expected_digests.insert(rid.clone(), digest);
+            let artifact = ArtifactRef {
+                release: rid.clone(),
+                variant: VariantName::new("standard".to_string()),
+                tree: TreeDigest::new(format!("tree-{i}")),
+            };
+            if i == 0 {
+                state.insert(slot_a.clone(), artifact.clone());
+                state.insert(slot_b.clone(), artifact);
+            } else if partial_groups[i - 1] {
+                // group-a: p1 only.
+                state.insert(slot_a.clone(), artifact);
+            } else {
+                // group-b: p2 only.
+                state.insert(slot_b.clone(), artifact);
+            }
+            let slots: BTreeMap<PlacementSlotId, GenerationRef> = state
+                .iter()
+                .map(|(slot, art)| {
+                    (
+                        slot.clone(),
+                        GenerationRef {
+                            generation: GenerationId::new(format!("gen-{i}")),
+                            assignment: PlacementSlotAssignment {
+                                placement_slot: slot.clone(),
+                                artifact: art.clone(),
+                            },
+                        },
+                    )
+                })
+                .collect();
+            let id = DeploymentId::new(format!("deploy-mr-{i}"));
+            append_successful_snapshot(
+                &store,
+                id.as_str(),
+                &format!("sha256-{i}"),
+                slots.clone(),
+                bindings.clone(),
+            );
+            chain.push((id, slots));
+        }
+
+        // The seeded contracts are pairwise DISTINGUISHABLE (the property's
+        // premise: per-slot digests are per-release facts).
+        let distinct: BTreeSet<&String> = expected_digests.values().collect();
+        assert_eq!(
+            distinct.len(),
+            expected_digests.len(),
+            "every seeded release must carry a DISTINGUISHABLE behavior digest"
+        );
+
+        // Roll back an ARBITRARY snapshot of the chain, FULL or GROUP.
+        let (rollback_id, snapshot_slots) = &chain[rollback_pos % chain.len()];
+        let selection = if rollback_full {
+            SlotSelection::normalize(&config, "t1", None).unwrap()
+        } else {
+            SlotSelection::normalize(&config, "t1", Some("group-a")).unwrap()
+        };
+        let (assignments, referenced, source) = plan_assignments(
+            &selection,
+            &PushRef::Deployment {
+                target: TargetName::new("t1".to_string()),
+                deployment_id: rollback_id.clone(),
+            },
+            &ReleaseId::new("unused".to_string()),
+            &BTreeMap::new(),
+            &store,
+            &config,
+        )
+        .expect("the deployment id must plan its stored state");
+
+        // The plan's referenced-releases set is EXACTLY the releases of the
+        // SELECTED slots' stored bindings (derived from the slot bindings,
+        // never a snapshot-wide single release): a full rollback references
+        // every slot's release, a group rollback only its selected slots'.
+        let selected_slots: BTreeSet<PlacementSlotId> = assignments
+            .iter()
+            .map(|a| a.placement_slot.clone())
+            .collect();
+        let stored_releases: BTreeSet<ReleaseId> = snapshot_slots
+            .iter()
+            .filter(|(s, _)| selected_slots.contains(*s))
+            .map(|(_, g)| g.assignment.artifact.release.clone())
+            .collect();
+        assert_eq!(referenced, stored_releases);
+        assert_eq!(
+            source,
+            PlanSource::DeploymentRef(rollback_id.clone()),
+            "the plan source records the deployment key"
+        );
+
+        // EVERY SELECTED SLOT: exactly its stored (release, tree, variant) and
+        // exactly its OWN (release, variant) behavior digest — the per-slot
+        // publication/verification matches the slot's artifact binding, never
+        // a snapshot-wide single release's contract.
+        let index = release_behavior_index(&store, &referenced).unwrap();
+        for a in &assignments {
+            let stored = &snapshot_slots[&a.placement_slot];
+            assert_eq!(
+                a.artifact, stored.assignment.artifact,
+                "slot {} must receive exactly its stored artifact",
+                a.placement_slot
+            );
+            let digest = crate::release::behavior_contract_digest(
+                &index[&a.artifact.release][a.artifact.variant.as_str()],
+            );
+            assert_eq!(
+                digest, expected_digests[&a.artifact.release],
+                "slot {} behavior must resolve from ITS OWN release's contract",
+                a.placement_slot
+            );
+            // A different release's contract must NEVER leak into this slot
+            // (the bug: a snapshot-wide single release applied to every
+            // slot).
+            for other in index.keys() {
+                if other != &a.artifact.release {
+                    let other_contract = &index[other][a.artifact.variant.as_str()];
+                    assert_ne!(
+                        crate::release::behavior_contract_digest(other_contract),
+                        digest,
+                        "slot {} must not receive release {other}'s contract",
+                        a.placement_slot
+                    );
+                }
+            }
+        }
+        // A GROUP rollback plans ONLY the selected slots (unselected slots
+        // stay at the latest current state); a FULL rollback plans every
+        // slot.
+        if rollback_full {
+            assert_eq!(assignments.len(), 2, "a full rollback plans both slots");
+        } else {
+            assert_eq!(
+                assignments.len(),
+                1,
+                "a group rollback plans only the selected slots"
+            );
+            assert_eq!(assignments[0].placement_slot, slot_a);
+        }
+    }
+
+    proptest! {
+        // THE USER'S MULTI-RELEASE PROPERTY: alternating partial pushes
+        // across groups with distinguishable behavior contracts, then an
+        // arbitrary FULL/GROUP rollback of an arbitrary snapshot. Bounded 16
+        // cases + the pinned 0x5EED_5EED seed (house style) keep the
+        // deterministic floor fast; each case is store-only (no remote).
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn multi_release_rollback_per_slot_behavior(
+            partial_groups in prop::collection::vec(any::<bool>(), 1..=4),
+            rollback_pos in any::<usize>(),
+            rollback_full in any::<bool>(),
+        ) {
+            multi_release_rollback_case(partial_groups, rollback_pos, rollback_full);
         }
     }
 }

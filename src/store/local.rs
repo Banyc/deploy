@@ -1290,8 +1290,6 @@ mod tests {
                 },
             )]),
             rollback: Some(LedgerRollback {
-                behavior_sha256: "sha256-aa".to_string(),
-                release: ReleaseId::new("rel-sha256-a".to_string()),
                 slots: BTreeMap::from([(
                     PlacementSlotId::new("p1".to_string()),
                     GenerationRef {
@@ -1417,6 +1415,9 @@ mod tests {
                 .rollback
                 .as_ref()
                 .unwrap()
+                .slots[&PlacementSlotId::new("p1")]
+                .assignment
+                .artifact
                 .release
                 .as_str(),
             "rel-sha256-a"

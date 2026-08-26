@@ -24,8 +24,8 @@ use crate::push::server::{
 };
 use crate::push::staging::{StagingCleanup, cleanup_dry_run_staging, remove_tree_restoring_write};
 use crate::records::{
-    AttemptServer, DeploymentPlan, DeploymentStatus, LedgerIntent, LedgerTerminal, ObservedServer,
-    ServerOutcomeKind, ServerPlan, ServerResult,
+    AttemptServer, BehaviorIndex, DeploymentPlan, DeploymentStatus, LedgerIntent, LedgerTerminal,
+    ObservedServer, ServerOutcomeKind, ServerPlan, ServerResult,
 };
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::transport::Remote;
@@ -34,7 +34,7 @@ use crate::store::local::LocalStore;
 #[cfg(test)]
 use crate::testutil::step17_hook::HookPhase;
 use crate::tree;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 pub struct PushOptions {
@@ -520,9 +520,14 @@ fn push_inner(
         None => history::resolve_ref_expr(ref_expr, target_name, store)?,
     };
 
-    // Historical and rollback pushes carry the bound release's own per-variant
-    // behavior contracts; they never fall back to the caller's current config.
-    let (local_release_id, desired_behaviors): (ReleaseId, BTreeMap<String, BehaviorContract>) = if matches!(
+    // Historical and rollback pushes carry EACH referenced release's own
+    // per-variant behavior contracts (the per-release, per-variant behavior
+    // index); they never fall back to the caller's current config. A rollback
+    // snapshot's slots can carry artifacts from DIFFERENT releases (partial
+    // pushes over time), so the index spans every release the ref references
+    // and each slot's behavior resolves from ITS OWN (release, variant)
+    // binding — never a snapshot-wide single release.
+    let (local_release_id, behavior_index): (ReleaseId, BehaviorIndex) = if matches!(
         &pref,
         PushRef::Head
     ) {
@@ -549,50 +554,71 @@ fn push_inner(
                     .insert(rid.clone(), (release_json, behavior_json.to_string()))
             });
         }
-        (rid, variant_behaviors)
+        (rid.clone(), BTreeMap::from([(rid, variant_behaviors)]))
     } else {
-        // Historical ref: resolve the bound release.
-        let rid = match &pref {
+        // Historical ref: the referenced releases are DERIVED from the ref. A
+        // rollback snapshot carries per-slot artifacts from DIFFERENT
+        // releases, so the set comes from the slots' own bindings — there is
+        // NO snapshot-wide single release.
+        let releases: BTreeSet<ReleaseId> = match &pref {
             PushRef::Deployment {
                 target: ft,
                 deployment_id,
-            } => history::resolve_deployment(store, ft, deployment_id)?.release,
-            PushRef::Release { release, .. } => release.clone(),
+            } => history::resolve_deployment(store, ft, deployment_id)?
+                .slots
+                .values()
+                .map(|g| g.assignment.artifact.release.clone())
+                .collect(),
+            PushRef::Release { release, .. } => BTreeSet::from([release.clone()]),
             PushRef::Head => unreachable!(),
         };
-        // Restore the historical per-variant behavior contracts from the
-        // release record, NOT the caller's current configuration. If that
-        // behavior is unavailable we fail closed (preflight) rather than
-        // silently deploying the caller's current configuration instead.
-        let hist_behaviors = store.read_release_behaviors(&rid).map_err(|e| {
-                Error::preflight(format!(
-                    "historical behavior for release {rid} unavailable (immutable behavior required): {e}"
-                ))
-            })?;
-        if !opts.dry_run {
-            let rec = store.read_release(&rid).map_err(|e| {
-                Error::preflight(format!("historical release {rid} not found: {e}"))
-            })?;
-            let release_json = serde_json::to_string(&rec)
-                .map_err(|e| Error::store(format!("serialize release: {e}")))?;
-            let hist_behaviors_json = serde_json::to_string(&hist_behaviors)
-                .map_err(|e| Error::store(format!("serialize behavior: {e}")))?;
-            REMOTE_RELEASE_JSON.with(|c| {
-                c.borrow_mut()
-                    .insert(rid.clone(), (release_json, hist_behaviors_json))
-            });
+        if releases.is_empty() {
+            return Err(Error::preflight(
+                "rollback snapshot carries no slots; cannot resolve behavior contracts (fail closed)",
+            ));
         }
-        (rid, hist_behaviors)
+        // Restore the historical per-release, per-variant behavior contracts
+        // from the release records, NOT the caller's current configuration.
+        // If any referenced release's behavior is unavailable we fail closed
+        // (preflight) rather than silently deploying the caller's current
+        // configuration instead.
+        let index = crate::push::plan::release_behavior_index(store, &releases).map_err(|e| {
+            Error::preflight(format!(
+                "historical behavior unavailable (immutable behavior required): {e}"
+            ))
+        })?;
+        if !opts.dry_run {
+            // Publish EVERY referenced release's record + behavior snapshot:
+            // each slot's server publishes ITS OWN slot's release, so a
+            // multi-release rollback must carry every referenced release into
+            // the publication cache — never only the first.
+            for rid in &releases {
+                let rec = store.read_release(rid).map_err(|e| {
+                    Error::preflight(format!("historical release {rid} not found: {e}"))
+                })?;
+                let release_json = serde_json::to_string(&rec)
+                    .map_err(|e| Error::store(format!("serialize release: {e}")))?;
+                let behaviors_json = serde_json::to_string(&index[rid])
+                    .map_err(|e| Error::store(format!("serialize behavior: {e}")))?;
+                REMOTE_RELEASE_JSON.with(|c| {
+                    c.borrow_mut()
+                        .insert(rid.clone(), (release_json, behaviors_json))
+                });
+            }
+        }
+        (releases.first().cloned().unwrap_or_default(), index)
     };
 
-    // The behavior digest this attempt is bound to: the frozen, name-keyed set of
-    // every declared variant's activation + verification contract. Historical
-    // and rollback pushes use the historical release's own contracts.
-    let desired_behavior_sha = crate::release::variant_behaviors_digest(&desired_behaviors);
+    // The behavior digest this attempt is bound to: the canonical digest of
+    // the frozen per-release, per-variant index (every referenced release's
+    // every declared variant's activation + verification contract).
+    // Historical and rollback pushes use the historical releases' own
+    // contracts.
+    let desired_behavior_sha = crate::release::behavior_index_digest(&behavior_index);
 
     // 5 & 7. Build the plan from the RESOLVED ref (post-reconciliation).
     // The plan covers exactly the SELECTED slots (the normalized selection).
-    let (assignments, desired_release, source) = crate::push::plan::plan_assignments(
+    let (assignments, desired_releases, source) = crate::push::plan::plan_assignments(
         selection,
         &pref,
         &local_release_id,
@@ -610,14 +636,16 @@ fn push_inner(
     // physical binding. A full-target push (no group) is always allowed.
     crate::push::plan::validate_partial_rollout(selection, config, store)?;
 
-    // Behavior coverage gate: every planned assignment's variant must have a
-    // frozen behavior contract BEFORE any remote state is touched (handshake,
-    // incoming cleanup, staging, publication). A historical behavior snapshot
-    // can be incomplete (a corrupted or truncated behavior.json parses fine but
-    // lacks a variant); without this gate the missing entry would panic
-    // mid-rollout, after remote trees had already been staged. Fail closed in
-    // preflight with context instead.
-    validate_behavior_coverage(&desired_behaviors, &assignments, &desired_release)?;
+    // Behavior coverage gate: EVERY planned assignment's (release, variant)
+    // must have a frozen behavior contract BEFORE any remote state is touched
+    // (handshake, incoming cleanup, staging, publication) — each slot's
+    // behavior resolves from ITS OWN artifact binding, never a snapshot-wide
+    // single release. A historical behavior snapshot can be incomplete (a
+    // corrupted or truncated behavior.json parses fine but lacks a variant);
+    // without this gate the missing entry would panic mid-rollout, after
+    // remote trees had already been staged. Fail closed in preflight with
+    // context instead.
+    validate_behavior_coverage(&behavior_index, &assignments)?;
 
     // Mutating remote phase (phase B), only behind the non-dry-run gate:
     // protocol handshake FIRST, then create the remote layout, clear
@@ -707,14 +735,14 @@ fn push_inner(
         deployment_id: deployment_id.clone(),
         target: TargetName::new(target_name.to_string()),
         behavior_sha256: desired_behavior_sha.clone(),
-        behaviors: desired_behaviors.clone(),
+        behaviors: behavior_index.clone(),
         slot_ids: assignments
             .iter()
             .map(|a| a.placement_slot.clone())
             .collect(),
         slots: plan_servers.clone(),
         source,
-        desired_release: desired_release.clone(),
+        desired_releases: desired_releases.clone(),
     };
 
     // ---- Dry-run: read-only planning, no mutation of store/remote/locks -----
@@ -821,7 +849,12 @@ fn push_inner(
             let mut verified = true;
             for a in &assignments {
                 let remote = remotes[&a.placement_slot].as_ref();
-                let Some(variant_behavior) = desired_behaviors.get(a.artifact.variant.as_str())
+                // PER-ASSIGNMENT behavior resolution: the slot's contract is
+                // its OWN artifact binding's (release, variant) — a partial
+                // snapshot can carry slots from DIFFERENT releases.
+                let Some(variant_behavior) = behavior_index
+                    .get(&a.artifact.release)
+                    .and_then(|m| m.get(a.artifact.variant.as_str()))
                 else {
                     // Coverage was validated before any remote mutation; a miss
                     // means the up-to-date claim cannot be established. Fall
@@ -982,8 +1015,9 @@ fn push_inner(
     // read from the caller's CURRENT `deploy.toml` (`ServerDef.capacity`), not
     // from any release snapshot: servers have no per-release history, so a
     // historical or rollback push applies the server's current headroom
-    // exactly as a HEAD push does. Only the variant behavior contract resolves
-    // from the immutable snapshot (see `desired_behaviors` above).
+    // exactly as a HEAD push does. Only the per-slot variant behavior
+    // contracts resolve from the immutable snapshots (see `behavior_index`
+    // above).
     //
     // Capacity AND staging form ONE pre-mutation result block: a failure in
     // EITHER phase happens AFTER the attempt intent and its initial
@@ -1067,12 +1101,16 @@ fn push_inner(
                 .iter()
                 .find(|x| &x.placement_slot == sid)
                 .unwrap();
-            // Select the assigned variant's frozen behavior contract (never the
-            // caller's current variant file) before activation/verification.
-            // Coverage was validated before any remote mutation, so a miss here
-            // is an internal invariant violation: record a per-slot failure
-            // instead of panicking.
-            let Some(variant_behavior) = desired_behaviors.get(a.artifact.variant.as_str()) else {
+            // Select the assigned slot's OWN (release, variant) frozen
+            // behavior contract (never the caller's current variant file, and
+            // never another release's contract) before
+            // activation/verification. Coverage was validated before any
+            // remote mutation, so a miss here is an internal invariant
+            // violation: record a per-slot failure instead of panicking.
+            let Some(variant_behavior) = behavior_index
+                .get(&a.artifact.release)
+                .and_then(|m| m.get(a.artifact.variant.as_str()))
+            else {
                 had_failure = true;
                 results.insert(
                     sid.clone(),
@@ -2094,23 +2132,31 @@ fn recover_if_missing(remote: &dyn Remote, store: &LocalStore, digest: &TreeDige
     Ok(())
 }
 
-/// Fail closed in preflight if any planned assignment's variant lacks a frozen
-/// behavior contract. Historical behavior snapshots can be incomplete (a
+/// Fail closed in preflight if any planned assignment's (release, variant)
+/// lacks a frozen behavior contract. EACH SLOT's behavior resolves from ITS
+/// OWN artifact binding (`slot.assignment.artifact = {release, variant,
+/// tree}`) — the per-release, per-variant index — never a snapshot-wide
+/// single release. Historical behavior snapshots can be incomplete (a
 /// corrupted or truncated `behavior.json` parses successfully but covers only
 /// some variants); reaching rollout with a missing entry previously panicked
 /// after trees were already staged onto servers. This gate runs before any
-/// remote mutation and names the snapshot, the missing variants, and the
+/// remote mutation and names the missing (release, variant) pairs and the
 /// affected servers.
 fn validate_behavior_coverage(
-    behaviors: &BTreeMap<String, BehaviorContract>,
+    index: &BehaviorIndex,
     assignments: &[crate::push::plan::PlannedAssignment],
-    desired_release: &ReleaseId,
 ) -> Result<()> {
-    let mut missing: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut missing: BTreeMap<(ReleaseId, String), Vec<&str>> = BTreeMap::new();
     for a in assignments {
-        if !behaviors.contains_key(a.artifact.variant.as_str()) {
+        let covered = index
+            .get(&a.artifact.release)
+            .is_some_and(|m| m.contains_key(a.artifact.variant.as_str()));
+        if !covered {
             missing
-                .entry(a.artifact.variant.as_str())
+                .entry((
+                    a.artifact.release.clone(),
+                    a.artifact.variant.as_str().to_string(),
+                ))
                 .or_default()
                 .push(a.placement_slot.as_str());
         }
@@ -2120,11 +2166,16 @@ fn validate_behavior_coverage(
     }
     let detail = missing
         .iter()
-        .map(|(variant, slots)| format!("variant '{variant}' (slots: {})", slots.join(", ")))
+        .map(|((release, variant), slots)| {
+            format!(
+                "release {release} variant '{variant}' (slots: {})",
+                slots.join(", ")
+            )
+        })
         .collect::<Vec<_>>()
         .join("; ");
     Err(Error::preflight(format!(
-        "behavior snapshot for release {desired_release} is incomplete: missing {detail}; \
+        "behavior snapshot incomplete: missing {detail}; \
          refusing to start before any remote state is changed"
     )))
 }
@@ -2198,6 +2249,162 @@ host_key_fingerprint = "SHA256:test"
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 "#;
+
+    /// The two-group variant for the multi-release harness: `p1` in
+    /// `group-a` (server `s1`), `p2` in `group-b` (server `s2`), verification
+    /// argv carrying the contract tag `a` (so contract B, produced by the
+    /// test's variant edit, digests DIFFERENTLY from contract A while both
+    /// pass `true`).
+    const TWO_SLOT_VARIANT: &str = r#"
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+groups = ["group-a"]
+deploy_dir = "/srv/eng-a"
+
+[[slots]]
+id = "p2"
+server = "s2"
+target = "t1"
+groups = ["group-b"]
+deploy_dir = "/srv/eng-b"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[[artifact.mappings]]
+from = "artifacts/deployment/common/"
+to = "app-common/"
+recursive = true
+
+[rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 1
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true", "a"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+
+    /// The two-server config backing [`TWO_SLOT_VARIANT`] (one server per
+    /// group slot, so each slot's remote is its own host).
+    const TWO_SERVER_TOML: &str = r#"
+schema_version = 2
+application = "eng"
+release = "v1"
+
+[[servers]]
+id = "s1"
+address = "a"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s2"
+address = "b"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#;
+
+    /// A two-group harness (slots `p1`/`p2` on their own servers, groups
+    /// `group-a`/`group-b`) so a test can build a REAL multi-release partial
+    /// snapshot: a full push establishes both slots under release R1, a
+    /// group-b push advances only `p2` to release R2, and the overlay
+    /// snapshot carries BOTH releases.
+    struct TwoSlotHarness {
+        _dir: tempfile::TempDir,
+        cfg_path: PathBuf,
+        config: Config,
+        store: LocalStore,
+        remotes_base: PathBuf,
+    }
+
+    impl TwoSlotHarness {
+        fn new() -> TwoSlotHarness {
+            let dir = tempfile::tempdir().unwrap();
+            let project = dir.path().join("proj");
+            std::fs::create_dir_all(&project).unwrap();
+            let release_dir = project.join("releases").join("v1");
+            std::fs::create_dir_all(&release_dir).unwrap();
+            std::fs::write(release_dir.join("standard.toml"), TWO_SLOT_VARIANT).unwrap();
+            std::fs::write(project.join("deploy.toml"), TWO_SERVER_TOML).unwrap();
+            let artifacts_dir = release_dir.join("artifacts");
+            for (p, c) in [
+                ("build/output/app/server", "v1\n"),
+                ("deployment/common/README", "common\n"),
+            ] {
+                let fp = artifacts_dir.join(p);
+                std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
+                std::fs::write(&fp, c).unwrap();
+            }
+            let cfg_path = project.join("deploy.toml");
+            let config = Config::load(&cfg_path).unwrap();
+            let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+            let remotes_base = dir.path().join("remotes");
+            std::fs::create_dir_all(&remotes_base).unwrap();
+            TwoSlotHarness {
+                _dir: dir,
+                cfg_path,
+                config,
+                store,
+                remotes_base,
+            }
+        }
+    }
+
+    /// One push against the two-slot harness with an explicit config, ref
+    /// expression, and rollout group.
+    fn two_slot_push(
+        h: &TwoSlotHarness,
+        config: &Config,
+        ref_expr: &RefExpr,
+        group: Option<&str>,
+        deployment_id: &DeploymentId,
+    ) -> Result<PushReport> {
+        let project_root = config.project_root(&h.cfg_path);
+        let target = config.targets.get("t1").expect("harness target");
+        let op_id = OperationId::new(format!("op-{}", deployment_id.as_str()));
+        let rf = h.remotes_base.clone();
+        let factory = move |s: &crate::config::ServerDef,
+                            _slot: &crate::config::SlotDef|
+              -> Result<Box<dyn Remote>> {
+            Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        };
+        push_inner(
+            &project_root,
+            &h.store,
+            &factory,
+            "t1",
+            &crate::push::plan::SlotSelection::normalize(config, "t1", group).unwrap(),
+            ref_expr,
+            None,
+            deployment_id,
+            &op_id,
+            config,
+            target,
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+                group: group.map(str::to_string),
+            },
+        )
+    }
 
     #[test]
     fn dry_run_removes_readonly_staging_tree() {
@@ -2586,7 +2793,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         target: &str,
         deployment_id: &str,
         behavior_sha256: &str,
-        release: &ReleaseId,
         slots: BTreeMap<PlacementSlotId, GenerationRef>,
         bindings: BTreeMap<PlacementSlotId, crate::records::PhysicalBinding>,
     ) {
@@ -2616,12 +2822,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     status: DeploymentStatus::Successful,
                     recorded_at: "2026-01-01T00:00:00Z".to_string(),
                     outcomes: BTreeMap::new(),
-                    rollback: Some(crate::records::LedgerRollback {
-                        behavior_sha256: behavior_sha256.to_string(),
-                        release: release.clone(),
-                        slots,
-                        bindings,
-                    }),
+                    rollback: Some(crate::records::LedgerRollback { slots, bindings }),
                     reason: None,
                 },
             )
@@ -3040,8 +3241,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     }
 
     /// The rollback payload of a successful ledger entry (the test view of
-    /// the old `DeploymentSnapshot` fields: `slots`, `bindings`,
-    /// `behavior_sha256`, `release`).
+    /// the `DeploymentSnapshot` fields: `slots`, `bindings`).
     fn rollback_of(entry: &LedgerEntry) -> &crate::records::LedgerRollback {
         entry
             .terminal
@@ -5764,7 +5964,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "t1",
             "deploy-hist-behavior-fixture",
             "sha256-aa",
-            &release,
             BTreeMap::from([(
                 PlacementSlotId::new("p1".to_string()),
                 GenerationRef {
@@ -5881,6 +6080,210 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             1,
             "the preflight failure must not append a snapshot"
         );
+    }
+
+    /// MULTI-RELEASE PARTIAL-SNAPSHOT ROLLBACK (the user's bug, end to end):
+    /// a successful snapshot can carry slots from DIFFERENT releases (group A
+    /// pushed R1, group B pushed R2 — the overlay snapshot keeps each slot's
+    /// OWN artifact), and a rollback of that snapshot must resolve EACH
+    /// SLOT's behavior from ITS OWN (release, variant) binding — never a
+    /// snapshot-wide single release.
+    ///
+    /// Drives the REAL push path on a two-group harness: a full push
+    /// establishes both slots under contract A (release R1), a group-b push
+    /// advances only `p2` to contract B (release R2), and the resulting
+    /// partial snapshot carries R1 on `p1` and R2 on `p2` with DISTINCT
+    /// contract digests. A FULL rollback of that snapshot must publish per
+    /// slot: `p1`'s new generation assignment carries R1's variant behavior
+    /// digest, `p2`'s carries R2's (each slot's OWN release — under the old
+    /// snapshot-wide behavior `p2` would receive R1's digest), and both
+    /// releases' records are published on their servers' remotes.
+    #[test]
+    fn multi_release_partial_snapshot_rollback_publishes_per_slot_behavior() {
+        let h = TwoSlotHarness::new();
+        let slot_a = PlacementSlotId::new("p1".to_string());
+        let slot_b = PlacementSlotId::new("p2".to_string());
+
+        // Push 1: FULL Head push under contract A (argv ["true", "a"]) —
+        // release R1 for BOTH slots; snapshot S0: p1=R1, p2=R1.
+        let id1 = DeploymentId::new("deploy-mr-baseline".to_string());
+        let r1 = two_slot_push(&h, &h.config, &RefExpr::Head, None, &id1).unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+        let var_a = h.config.variant("standard").unwrap();
+        let digest_a = crate::release::behavior_contract_digest(&BehaviorContract {
+            activation: var_a.activation.clone(),
+            verification: var_a.verification.clone(),
+        });
+        let attempt1 = r1.attempt.as_ref().expect("attempt recorded");
+        let r1_release = attempt1.desired[&slot_a]
+            .assignment
+            .artifact
+            .release
+            .clone();
+        assert_eq!(
+            attempt1.desired[&slot_b].assignment.artifact.release, r1_release,
+            "the full push deploys one release across both slots"
+        );
+
+        // Edit the variant to contract B (argv ["true", "b"]) AND a
+        // DIFFERENT artifact payload, then reload: a group-b Head push now
+        // builds a DISTINCT release R2.
+        let project_root = h.config.project_root(&h.cfg_path);
+        let variant_path = project_root
+            .join("releases")
+            .join("v1")
+            .join("standard.toml");
+        let v2 = std::fs::read_to_string(&variant_path)
+            .unwrap()
+            .replace("argv = [\"true\", \"a\"]", "argv = [\"true\", \"b\"]");
+        assert_ne!(
+            v2,
+            std::fs::read_to_string(&variant_path).unwrap(),
+            "the fixture must actually change the verification argv"
+        );
+        std::fs::write(&variant_path, v2).unwrap();
+        std::fs::write(
+            project_root
+                .join("releases")
+                .join("v1")
+                .join("artifacts")
+                .join("build/output/app/server"),
+            "v2\n",
+        )
+        .unwrap();
+        let config2 = Config::load(&h.cfg_path).unwrap();
+        let var_b = config2.variant("standard").unwrap();
+        let digest_b = crate::release::behavior_contract_digest(&BehaviorContract {
+            activation: var_b.activation.clone(),
+            verification: var_b.verification.clone(),
+        });
+        assert_ne!(
+            digest_a, digest_b,
+            "the two contracts must be DISTINGUISHABLE"
+        );
+
+        // Push 2: PARTIAL group-b push under contract B — p2 advances to R2,
+        // p1 stays R1; the overlay snapshot S1 carries TWO releases.
+        let id2 = DeploymentId::new("deploy-mr-group-b".to_string());
+        let r2 = two_slot_push(&h, &config2, &RefExpr::Head, Some("group-b"), &id2).unwrap();
+        assert_eq!(r2.status, Some(DeploymentStatus::Successful));
+        let attempt2 = r2.attempt.as_ref().expect("attempt recorded");
+        let r2_release = attempt2.desired[&slot_b]
+            .assignment
+            .artifact
+            .release
+            .clone();
+        assert_ne!(
+            r1_release, r2_release,
+            "the group push must produce a DISTINCT release"
+        );
+        assert_eq!(
+            attempt2.desired.len(),
+            1,
+            "a group push plans only its selected slots"
+        );
+        let snapshots = h.store.read_snapshots("t1").unwrap();
+        assert_eq!(
+            snapshots.len(),
+            2,
+            "baseline + the group-b partial snapshot"
+        );
+        let s1 = rollback_of(&snapshots[1]);
+        assert_eq!(
+            s1.slots[&slot_a].assignment.artifact.release, r1_release,
+            "the partial snapshot CARRIES the unselected slot's own release (R1)"
+        );
+        assert_eq!(
+            s1.slots[&slot_b].assignment.artifact.release, r2_release,
+            "the partial snapshot's selected slot advances to its own release (R2)"
+        );
+
+        // Push 3: FULL rollback of the TWO-RELEASE snapshot (deployment id2).
+        let id3 = DeploymentId::new("deploy-mr-rollback".to_string());
+        let r3 = two_slot_push(
+            &h,
+            &config2,
+            &history::parse_ref_expr(id2.as_str()).unwrap(),
+            None,
+            &id3,
+        )
+        .unwrap();
+        assert_eq!(r3.status, Some(DeploymentStatus::Successful));
+
+        // The persisted plan carries the frozen PER-RELEASE behavior index
+        // (both referenced releases, each with its own contract) and the
+        // referenced-release set derived from the snapshot's slots.
+        let plan: DeploymentPlan = serde_json::from_str(
+            &std::fs::read_to_string(h.store.deployment_dir(id3.as_str()).join("plan.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.desired_releases,
+            BTreeSet::from([r1_release.clone(), r2_release.clone()]),
+            "the plan references BOTH snapshot releases"
+        );
+        assert_eq!(
+            plan.behaviors.len(),
+            2,
+            "one frozen behavior block per release"
+        );
+        assert_eq!(
+            crate::release::behavior_contract_digest(&plan.behaviors[&r1_release]["standard"]),
+            digest_a
+        );
+        assert_eq!(
+            crate::release::behavior_contract_digest(&plan.behaviors[&r2_release]["standard"]),
+            digest_b
+        );
+
+        // EVERY SELECTED SLOT receives EXACTLY its own release's variant
+        // behavior: the live generation assignment published on p1's server
+        // carries digest A (R1), p2's carries digest B (R2) — never a
+        // snapshot-wide single release's contract.
+        for (server, slot, want_digest, want_release) in [
+            ("s1", &slot_a, &digest_a, &r1_release),
+            ("s2", &slot_b, &digest_b, &r2_release),
+        ] {
+            let remote = LocalTransport::new(h.remotes_base.join(server)).unwrap();
+            let helper = RemoteHelper::new(&remote);
+            let status = helper.status().unwrap();
+            let cur = status
+                .current_generation
+                .expect("the rollback must advance the slot");
+            let assignment: GenerationAssignment = serde_json::from_slice(
+                &remote
+                    .read(
+                        &crate::layout::generations()
+                            .join(&cur)
+                            .join("assignment.json"),
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                assignment.behavior_sha256.as_str(),
+                want_digest.as_str(),
+                "slot {slot} must publish ITS OWN release's variant behavior digest"
+            );
+            assert_eq!(assignment.artifact.release.as_str(), want_release.as_str());
+            assert!(
+                remote.exists(
+                    &crate::layout::remote_release(want_release.as_str()).join("release.json")
+                ),
+                "slot {slot}'s release record must be published on its server's remote"
+            );
+            assert!(
+                remote.exists(
+                    &crate::layout::remote_release(want_release.as_str()).join("behavior.json")
+                ),
+                "slot {slot}'s release behavior.json must be published on its server's remote"
+            );
+        }
+        // And the two digests are DISTINCT — the assertion above is not
+        // vacuous: a snapshot-wide single-release behavior would have applied
+        // the SAME digest to both slots.
+        assert_ne!(digest_a, digest_b);
     }
 
     /// OBSERVED-REFRESH UNKNOWN-ASSIGNMENT FALLBACK: when a live generation's
@@ -6762,7 +7165,6 @@ interval_seconds = 0
                    "t1",
                    &format!("deploy-relative-chain-{latest}-{i}"),
                    pending.behavior_sha256.as_str(),
-                   &pending_artifact.release,
                    BTreeMap::from([(
                        slot.clone(),
                        GenerationRef {
@@ -6967,7 +7369,6 @@ interval_seconds = 0
                     "t1",
                     &format!("deploy-fixture-{i}"),
                     "bb",
-                    &artifact.release,
                     BTreeMap::from([(
                         slot.clone(),
                         GenerationRef {

@@ -329,9 +329,11 @@ impl LocalStore {
                     out.releases.insert(s.artifact.release.as_str().to_string());
                     out.trees.insert(s.artifact.tree.as_str().to_string());
                 }
-                // The terminal's rollback payload (release + per-slot trees).
+                // The terminal's rollback payload: every slot's OWN artifact
+                // binding (release + tree). A partial snapshot can carry
+                // several releases, so reachability is derived per slot —
+                // there is no snapshot-wide release.
                 if let Some(rollback) = entry.terminal.as_ref().and_then(|t| t.rollback.clone()) {
-                    out.releases.insert(rollback.release.as_str().to_string());
                     for g in rollback.slots.values() {
                         out.releases
                             .insert(g.assignment.artifact.release.as_str().to_string());

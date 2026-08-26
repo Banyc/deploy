@@ -63,6 +63,21 @@ pub fn variant_behaviors_digest(contracts: &BTreeMap<String, BehaviorContract>) 
     sha256_bytes(&value)
 }
 
+/// Canonical digest over the PER-RELEASE, PER-VARIANT behavior index an
+/// attempt is bound to ([`crate::records::BehaviorIndex`]: release id ->
+/// variant name -> contract). An attempt whose slots reference several
+/// releases (a partial snapshot spans groups) carries ONE snapshot-wide
+/// behavior digest over the whole index; two attempts share it only when
+/// every referenced release's every declared variant behavior is identical.
+/// `serde_json` serializes `BTreeMap`s in sorted key order, so the digest is
+/// canonical (name-sorted, deterministic).
+pub fn behavior_index_digest(
+    index: &BTreeMap<ReleaseId, BTreeMap<String, BehaviorContract>>,
+) -> String {
+    let value = serde_json::to_vec(index).expect("behavior index serializes");
+    sha256_bytes(&value)
+}
+
 /// Reconstruct the name-keyed per-variant behavior map from serialized JSON.
 pub fn behavior_contracts_from_json(
     bytes: &[u8],
