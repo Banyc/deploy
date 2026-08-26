@@ -4,7 +4,7 @@
 //!
 //! ANY test that mutates the process-global environment must hold
 //! [`ENV_LOCK`] for the entire duration of the mutation — `PATH`,
-//! `XDG_CONFIG_HOME`, `DEPLOY_SSH_KNOWNHOSTS_DIR`,
+//! `XDG_CONFIG_HOME`, `DEPLOY_SSH_KNOWNHOSTS_DIR`, `TMPDIR`,
 //! `FAKE_SSH_ROOT` / `FAKE_SSH_REMOTE_PREFIX`, or anything else.
 //!
 //! All lib unit tests share one process, and edition-2024
@@ -20,6 +20,17 @@
 //! Per-test state that lives OUTSIDE the process env (e.g. each test's own
 //! `DEPLOY_SSH_KNOWNHOSTS_DIR` temp dir for the pin cache) stays isolated as
 //! before; the lock only serializes the env itself.
+//!
+//! The tests' temp root is `$TMPDIR` (defaulting to `/tmp` when unset):
+//! `tempfile::tempdir()` honors it natively (`tempfile` builds on
+//! `std::env::temp_dir()`, which reads `TMPDIR` on macOS/Linux), and the
+//! test-mode store base is `$TMPDIR/deploy-test` (`/tmp/deploy-test` when
+//! unset) — so every disk-writing test stays under the temp root, never
+//! `$HOME`/`$XDG_DATA_HOME`. Tests that need a hermetic per-test store base
+//! redirect `TMPDIR` to a fresh root under the REAL temp dir
+//! ([`hermetic_tmpdir_root`]); the root is never deleted by the test,
+//! because other tests' `tempfile::tempdir()` calls may land inside it while
+//! `TMPDIR` is redirected.
 //!
 //! Note: each integration-test *binary* (`tests/*.rs`) is a separate process
 //! and cannot race the lib tests, so it only needs its own lock to serialize
@@ -51,11 +62,31 @@
 //! method's consume hook converts to a one-line registry call:
 //! `self.fault_registry.consume(FaultKind::<Kind>, id)`.
 
+use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// THE lock guarding every env-mutating test in the lib test binary. See the
 /// module docs for the invariant.
 pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Create a fresh, unique root under the REAL temp dir for redirecting
+/// `TMPDIR` in tests. The root is deliberately never deleted by the caller:
+/// while `TMPDIR` is redirected, OTHER tests' `tempfile::tempdir()` calls
+/// may land inside it, so deleting it would delete their live tempdirs; the
+/// OS temp cleaner reclaims it. Callers must hold [`ENV_LOCK`], restore
+/// `TMPDIR` (e.g. `remove_var`) before releasing it, and may delete their
+/// own store data (`<root>/deploy-test`) once `TMPDIR` is restored.
+pub(crate) fn hermetic_tmpdir_root() -> PathBuf {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "deploy-test-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("create hermetic test temp root");
+    root
+}
 
 /// Test-only one-shot fault injection for crash-mid-finalization tests.
 ///

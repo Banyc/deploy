@@ -717,14 +717,13 @@ mod tests {
     #[test]
     fn store_key_property_places_store_under_base_plus_single_component() {
         // The property constructs REAL stores via `LocalStore::new`, so the
-        // process-global `XDG_DATA_HOME` is pointed at a hermetic temp dir
+        // process-global `$TMPDIR` is pointed at a hermetic temp root
         // for the whole run (ENV_LOCK serializes against every other
         // env-mutating test; the closure-form proptest runs all 16 cases in
         // this thread).
         let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let data_home = dir.path().join("data");
-        unsafe { std::env::set_var("XDG_DATA_HOME", &data_home) };
+        let store_root = crate::testutil::hermetic_tmpdir_root();
+        unsafe { std::env::set_var("TMPDIR", &store_root) };
         proptest!(ProptestConfig {
             cases: 16,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
@@ -781,7 +780,8 @@ mod tests {
                 }
             }
         });
-        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        unsafe { std::env::remove_var("TMPDIR") };
+        let _ = std::fs::remove_dir_all(store_root.join("deploy-test"));
     }
 
     /// The independent characterization of the deploy_dir rule: an absolute

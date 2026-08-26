@@ -86,14 +86,32 @@ use crate::testutil::test_faults::{FaultKind, FaultRegistry};
 #[cfg(test)]
 use std::sync::Arc;
 
+/// The store base: `<data>/simple-deploy` where `<data>` is `$XDG_DATA_HOME`
+/// (or `$HOME` when unset).
+///
+/// In TEST builds the base is hermetic: `$TMPDIR/deploy-test` (`/tmp/deploy-test`
+/// when `$TMPDIR` is unset) — every test-constructed store writes under the
+/// temp dir, never the user's real data/home directory.
 pub(crate) fn default_base() -> PathBuf {
-    let data = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("HOME").ok())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    data.join("simple-deploy")
+    #[cfg(test)]
+    {
+        let tmp = std::env::var("TMPDIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        tmp.join("deploy-test")
+    }
+    #[cfg(not(test))]
+    {
+        let data = std::env::var("XDG_DATA_HOME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("HOME").ok())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        data.join("simple-deploy")
+    }
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -1487,12 +1505,11 @@ mod tests {
     #[test]
     fn new_places_store_under_base_plus_single_component() {
         // Hermetic store base: `LocalStore::new` resolves `default_base()`
-        // from the process-global `XDG_DATA_HOME`, so it is pointed at a
-        // temp dir under ENV_LOCK (the house env-mutation invariant).
+        // from the process-global `$TMPDIR`, so it is pointed at a
+        // temp root under ENV_LOCK (the house env-mutation invariant).
         let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let data_home = dir.path().join("data");
-        unsafe { std::env::set_var("XDG_DATA_HOME", &data_home) };
+        let store_root = crate::testutil::hermetic_tmpdir_root();
+        unsafe { std::env::set_var("TMPDIR", &store_root) };
 
         // A clean name → Ok, and the store path is `<base>/<name>` with no
         // traversal: exactly ONE component (the key) appended.
@@ -1514,7 +1531,34 @@ mod tests {
             ApplicationStoreKey::parse(bad).expect_err("unsafe store key rejected");
         }
 
-        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        unsafe { std::env::remove_var("TMPDIR") };
+        let _ = std::fs::remove_dir_all(store_root.join("deploy-test"));
+    }
+
+    /// The test-mode `default_base()` is hermetic: it resolves under
+    /// `$TMPDIR` (or `/tmp` when unset) — never `$XDG_DATA_HOME`/`$HOME` —
+    /// and `$TMPDIR` overrides the root explicitly.
+    #[test]
+    fn test_mode_default_base_is_hermetic() {
+        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("TMPDIR") };
+        assert_eq!(
+            default_base(),
+            PathBuf::from("/tmp").join("deploy-test"),
+            "with TMPDIR unset the test-mode base must be /tmp/deploy-test"
+        );
+        // The override root is a fixed, never-deleted path under the real
+        // temp dir: while TMPDIR is redirected, other tests' tempdirs may
+        // land inside it, so it must never be deleted (their own drops
+        // clean them).
+        let override_root = std::env::temp_dir().join("deploy-test-override");
+        unsafe { std::env::set_var("TMPDIR", &override_root) };
+        assert_eq!(
+            default_base(),
+            override_root.join("deploy-test"),
+            "with TMPDIR set the test-mode base must be $TMPDIR/deploy-test"
+        );
+        unsafe { std::env::remove_var("TMPDIR") };
     }
 
     fn intent(id: &str, target: &str) -> DeploymentIntent {

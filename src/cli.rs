@@ -783,8 +783,8 @@ mod tests {
     /// unit tests cannot capture the harness-owned stdout sink.
     #[test]
     fn status_renders_observed_assignments() {
-        // The store lives under `XDG_DATA_HOME` and `run_with` reads the real
-        // process env, so the env-lock invariant applies.
+        // The store lives under `$TMPDIR` and `run_with` reads the
+        // real process env, so the env-lock invariant applies.
         let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
@@ -872,14 +872,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let cfg_path = project.join("deploy.toml");
         let config = ProjectConfig::load(&cfg_path).unwrap();
 
-        // Point the store at a hermetic `XDG_DATA_HOME` and seed the ONE
+        // Point the store at a hermetic `$TMPDIR` and seed the ONE
         // physical observed record per slot (`slots/<slot-id>/observed.json`)
         // with three slots: p1 has a full assignment, p2 has NO known
         // assignment (never observed / rotated away), and p3 has a known
         // generation but no known artifact (the assignment could not be read).
-        let data_home = dir.path().join("data");
-        unsafe { std::env::set_var("XDG_DATA_HOME", &data_home) };
-        let store = LocalStore::with_base(data_home.join("simple-deploy")).unwrap();
+        let store_root = crate::testutil::hermetic_tmpdir_root();
+        unsafe { std::env::set_var("TMPDIR", &store_root) };
+        let store = LocalStore::with_base(crate::store::local::default_base()).unwrap();
         store
             .write_slot_observed(
                 &SlotId::new("p1".to_string()),
@@ -930,7 +930,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // Restore the environment and release the env lock BEFORE any
         // assertion: a failing assertion must never poison the shared
         // `ENV_LOCK`.
-        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        unsafe { std::env::remove_var("TMPDIR") };
         drop(_lock);
 
         // The rendered lines are exactly what the CLI printed, one per slot
@@ -960,6 +960,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "generation-only slot must keep the artifact columns None: {}",
             lines[2]
         );
+
+        // Clean up the hermetic store data (the root itself is left for the
+        // OS temp cleaner: other tests' tempdirs may land inside it while
+        // TMPDIR was redirected).
+        let _ = std::fs::remove_dir_all(store_root.join("deploy-test"));
     }
 
     use clap::{CommandFactory, Parser};
@@ -1101,13 +1106,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         )
         .unwrap();
         let cfg_path = project.join("deploy.toml");
-        let data_home = dir.path().join("data");
-        unsafe { std::env::set_var("XDG_DATA_HOME", &data_home) };
+        let store_root = crate::testutil::hermetic_tmpdir_root();
+        unsafe { std::env::set_var("TMPDIR", &store_root) };
         // `run_with` resolves the store as
         // `LocalStore::new(&ApplicationStoreKey::parse("checkpoint-cli")?)`
-        // = XDG_DATA_HOME/simple-deploy/checkpoint-cli.
+        // = $TMPDIR/deploy-test/checkpoint-cli.
         let store =
-            LocalStore::with_base(data_home.join("simple-deploy").join("checkpoint-cli")).unwrap();
+            LocalStore::with_base(crate::store::local::default_base().join("checkpoint-cli"))
+                .unwrap();
 
         // Seed a small history: deploy-0 (s0), deploy-1 (s1), deploy-2 (s2).
         for id in ["deploy-0", "deploy-1", "deploy-2"] {
@@ -1183,7 +1189,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let entries2 = store.read_ledger("production").unwrap();
         assert_eq!(entries2, entries, "the retained suffix is unchanged");
 
-        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        unsafe { std::env::remove_var("TMPDIR") };
+        let _ = std::fs::remove_dir_all(store_root.join("deploy-test"));
         drop(_lock);
     }
 
