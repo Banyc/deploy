@@ -449,7 +449,7 @@ fn push_inner(
         variant_behaviors.insert(
             v.clone(),
             BehaviorContract {
-                activation: vcfg.activation.clone(),
+                activation: crate::config::ActivationConfig::from(vcfg.activation.clone()),
                 verification: vcfg.verification.clone(),
             },
         );
@@ -4449,7 +4449,7 @@ interval_seconds = 0
         // Behavior digest A (verification argv "true") frozen into s0.
         let var_a = h.config.variant("standard").unwrap();
         let a_digest = crate::release::behavior_contract_digest(&crate::model::BehaviorContract {
-            activation: var_a.activation.clone(),
+            activation: crate::config::ActivationConfig::from(var_a.activation.clone()),
             verification: var_a.verification.clone(),
         });
 
@@ -4478,7 +4478,7 @@ interval_seconds = 0
         let config2 = Config::load(&h.cfg_path).unwrap();
         let var_b = config2.variant("standard").unwrap();
         let b_digest = crate::release::behavior_contract_digest(&crate::model::BehaviorContract {
-            activation: var_b.activation.clone(),
+            activation: crate::config::ActivationConfig::from(var_b.activation.clone()),
             verification: var_b.verification.clone(),
         });
         assert_ne!(a_digest, b_digest, "behaviors must differ");
@@ -6305,7 +6305,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let var_a = h.config.variant("standard").unwrap();
         let digest_a = crate::release::behavior_contract_digest(&BehaviorContract {
-            activation: var_a.activation.clone(),
+            activation: crate::config::ActivationConfig::from(var_a.activation.clone()),
             verification: var_a.verification.clone(),
         });
         let attempt1 = r1.attempt.as_ref().expect("attempt recorded");
@@ -6348,7 +6348,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let config2 = Config::load(&h.cfg_path).unwrap();
         let var_b = config2.variant("standard").unwrap();
         let digest_b = crate::release::behavior_contract_digest(&BehaviorContract {
-            activation: var_b.activation.clone(),
+            activation: crate::config::ActivationConfig::from(var_b.activation.clone()),
             verification: var_b.verification.clone(),
         });
         assert_ne!(
@@ -7798,7 +7798,7 @@ interval_seconds = 0
         let variant_behaviors: BTreeMap<String, BehaviorContract> = BTreeMap::from([(
             "standard".to_string(),
             BehaviorContract {
-                activation: vcfg.activation.clone(),
+                activation: crate::config::ActivationConfig::from(vcfg.activation.clone()),
                 verification: vcfg.verification.clone(),
             },
         )]);
@@ -8146,7 +8146,7 @@ interval_seconds = 0
         let variant_behaviors: BTreeMap<String, BehaviorContract> = BTreeMap::from([(
             "standard".to_string(),
             BehaviorContract {
-                activation: vcfg.activation.clone(),
+                activation: crate::config::ActivationConfig::from(vcfg.activation.clone()),
                 verification: vcfg.verification.clone(),
             },
         )]);

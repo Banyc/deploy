@@ -62,18 +62,16 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
     // declares no slots (you add a slot with a `targets` list to bind it), so
     // the dry-run push stays adapter-agnostic.
     let systemd = config.variant("systemd")?;
-    assert_eq!(systemd.activation.adapter, "systemd");
-    assert_eq!(
-        systemd.activation.scope,
-        deploy::config::ActivationScope::User
-    );
-    assert!(systemd.activation.reconcile_managed_units);
-    assert_eq!(systemd.activation.units.len(), 1, "one managed unit");
-    assert_eq!(systemd.activation.units[0].name, "example.service");
-    assert_eq!(
-        systemd.activation.units[0].artifact_path,
-        "app/example.service"
-    );
+    let deploy::config::Activation::Systemd(sa) = &systemd.activation else {
+        return Err(deploy::error::Error::internal(
+            "systemd variant must carry the systemd activation",
+        ));
+    };
+    assert_eq!(sa.scope, deploy::config::ActivationScope::User);
+    assert!(sa.reconcile_managed_units);
+    assert_eq!(sa.units.len(), 1, "one managed unit");
+    assert_eq!(sa.units[0].name, "example.service");
+    assert_eq!(sa.units[0].artifact_path, "app/example.service");
     assert!(
         proj.join("releases/v1/artifacts/systemd/example.service")
             .is_file(),
@@ -84,11 +82,15 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
     assert_eq!(config.servers[1].capacity.reserve_bytes, 1_073_741_824);
     // SSH-shaped addresses carry exactly one host-identity source (the
     // placeholder fingerprint in the fixture), so the documented example stays
-    // valid under the exactly-one rule.
+    // valid under the exactly-one rule — the domain holds it as a single
+    // `HostIdentity::Fingerprint`, never an option pair.
     for s in &config.servers {
         assert!(
-            s.host_key_fingerprint.is_some() && s.known_hosts.is_none(),
-            "server '{}' must have exactly one identity source",
+            matches!(
+                s.host_identity(),
+                deploy::config::HostIdentity::Fingerprint(_)
+            ),
+            "server '{}' must have exactly one identity form",
             s.id
         );
     }

@@ -72,24 +72,23 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     let variant = config.variant("standard")?;
     assert_eq!(variant.verification.argv, vec!["true"]);
     assert_eq!(
-        variant.activation.adapter, "none",
+        variant.activation,
+        deploy::config::Activation::None,
         "activation none is the zero-infrastructure default"
     );
     // The scaffold also ships the `systemd` example variant with a real unit
     // artifact; it declares no slots, so the real push below stays
     // adapter-agnostic (no systemctl on the local endpoint).
     let systemd = config.variant("systemd")?;
-    assert_eq!(systemd.activation.adapter, "systemd");
-    assert_eq!(
-        systemd.activation.scope,
-        deploy::config::ActivationScope::User
-    );
-    assert_eq!(systemd.activation.units.len(), 1);
-    assert_eq!(systemd.activation.units[0].name, "example.service");
-    assert_eq!(
-        systemd.activation.units[0].artifact_path,
-        "app/example.service"
-    );
+    let deploy::config::Activation::Systemd(sa) = &systemd.activation else {
+        return Err(deploy::error::Error::internal(
+            "systemd variant must carry the systemd activation",
+        ));
+    };
+    assert_eq!(sa.scope, deploy::config::ActivationScope::User);
+    assert_eq!(sa.units.len(), 1);
+    assert_eq!(sa.units[0].name, "example.service");
+    assert_eq!(sa.units[0].artifact_path, "app/example.service");
     assert!(
         proj.join("releases/v1/artifacts/systemd/example.service")
             .is_file(),

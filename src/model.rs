@@ -33,8 +33,8 @@ use std::fmt;
 use uuid::Uuid;
 
 /// The configuration format version understood by this implementation
-/// (`Config.schema_version`, validated in
-/// [`crate::config::Config::validate`]). Every config writer emits exactly
+/// (`Config.schema_version`, validated by the raw -> domain conversion in
+/// [`crate::config::Config::load`]). Every config writer emits exactly
 /// `CONFIG_SCHEMA_VERSION`; the config reader refuses any other version
 /// (fail closed — a `deploy.toml` from a different schema is never
 /// silently interpreted). This is INDEPENDENT of [`LEDGER_SCHEMA_VERSION`]:

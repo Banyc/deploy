@@ -712,7 +712,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         fn behave(&self) -> BehaviorContract {
             let v = self.config.variant("standard").unwrap();
             BehaviorContract {
-                activation: v.activation.clone(),
+                activation: crate::config::ActivationConfig::from(v.activation.clone()),
                 verification: v.verification.clone(),
             }
         }

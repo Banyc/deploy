@@ -22,8 +22,8 @@
 
 use crate::config::{
     ActivationConfig, ActivationScope, ArtifactConfig, CapacityConfig, ConflictPolicy,
-    DeploymentRotation, Mapping, PerServerRotation, RolloutConfig, RotationConfig, ServerDef,
-    SlotDef, TargetDef, UnitDef, VariantConfig, VerificationConfig,
+    DeploymentRotation, Mapping, PerServerRotation, RolloutConfig, RotationConfig, SlotDef,
+    TargetDef, UnitDef, VerificationConfig,
 };
 use crate::error::{Error, Result};
 use serde::Serialize;
@@ -179,7 +179,8 @@ pub fn init_project(target: &Path, opts: &InitOptions) -> Result<InitReport> {
 }
 
 /// Reject option combinations the loader would reject, BEFORE any directory
-/// or file is created. This mirrors the rules `Config::validate` applies to
+/// or file is created. This mirrors the rules the config conversion
+/// (`Config::load`) applies to
 /// the surfaces the flags expose (SSH identity, `known_hosts`, fingerprint,
 /// `local://` endpoint). The fixed template parts (capacity 0/0, rollout,
 /// variant sanity) are covered by the typed round-trip in [`build_docs`] and,
@@ -239,21 +240,21 @@ struct ScaffoldDocs {
     writes: Vec<(PathBuf, String)>,
 }
 
-/// The serialized shape of the scaffolded `deploy.toml`. It mirrors the
-/// serializable surface of `config::Config` (schema_version, application,
-/// release, servers, targets; `pins` and the variant map are load-time
-/// only) so the emitted TOML round-trips through `Config::load` — which is
-/// exactly how the written project is re-validated in [`write_and_verify`].
-/// Slots are NOT a top-level surface anymore: they live inside the variant
-/// files (see [`standard_variant`]). Building it from the typed config structs
-/// (never formatting strings) guarantees the emitted keys match the parser's
-/// expectations (`deny_unknown_fields` included).
+/// The serialized shape of the scaffolded `deploy.toml`. It mirrors the raw
+/// serializable surface of `config::raw::RawConfig` (schema_version,
+/// application, release, servers, targets; `pins` and the variant map are
+/// load-time only) so the emitted TOML round-trips through `Config::load` —
+/// which is exactly how the written project is re-validated in
+/// [`write_and_verify`]. Slots are NOT a top-level surface anymore: they live
+/// inside the variant files (see [`standard_variant`]). Building it from the
+/// typed raw config structs (never formatting strings) guarantees the emitted
+/// keys match the parser's expectations (`deny_unknown_fields` included).
 #[derive(Serialize)]
 struct ScaffoldManifest {
     schema_version: u32,
     application: String,
     release: String,
-    servers: Vec<ServerDef>,
+    servers: Vec<crate::config::raw::RawServer>,
     targets: BTreeMap<String, TargetDef>,
 }
 
@@ -272,7 +273,7 @@ fn build_docs(
         schema_version: crate::model::CONFIG_SCHEMA_VERSION,
         application: name.to_string(),
         release: "v1".to_string(),
-        servers: vec![ServerDef {
+        servers: vec![crate::config::raw::RawServer {
             id: "server-01".to_string(),
             address: address.to_string(),
             user: opts.user.clone(),
@@ -317,17 +318,17 @@ fn build_docs(
     let manifest_toml = format!("{MANIFEST_DOC}\n{manifest_toml}");
     let standard_toml = format!("{STANDARD_DOC}\n{standard_toml}");
     let systemd_toml = format!("{SYSTEMD_DOC}\n{systemd_toml}");
-    toml::from_str::<crate::config::Config>(&manifest_toml).map_err(|e| {
+    toml::from_str::<crate::config::raw::RawConfig>(&manifest_toml).map_err(|e| {
         Error::config(format!(
             "scaffolded deploy.toml failed to round-trip through the strict loader: {e}"
         ))
     })?;
-    toml::from_str::<VariantConfig>(&standard_toml).map_err(|e| {
+    toml::from_str::<crate::config::raw::RawVariant>(&standard_toml).map_err(|e| {
         Error::config(format!(
             "scaffolded standard.toml failed to round-trip through the strict loader: {e}"
         ))
     })?;
-    toml::from_str::<VariantConfig>(&systemd_toml).map_err(|e| {
+    toml::from_str::<crate::config::raw::RawVariant>(&systemd_toml).map_err(|e| {
         Error::config(format!(
             "scaffolded systemd.toml failed to round-trip through the strict loader: {e}"
         ))
@@ -356,8 +357,8 @@ fn build_docs(
 /// scaffold's `deploy_dir` and to its ONE owning target `production` (a
 /// target's members are derived from the slots' `target` fields). The unit
 /// artifact and systemd activation live in the sibling `systemd` variant.
-fn standard_variant(deploy_dir: &Path) -> VariantConfig {
-    VariantConfig {
+fn standard_variant(deploy_dir: &Path) -> crate::config::raw::RawVariant {
+    crate::config::raw::RawVariant {
         description: Some("Standard deployment".to_string()),
         artifact: ArtifactConfig {
             mappings: vec![mapping("artifacts/build/output/app/", "app/")],
@@ -401,8 +402,8 @@ fn standard_variant(deploy_dir: &Path) -> VariantConfig {
 /// maps only its own unit tree — the `standard` variant's `app/` destination
 /// is deliberately not repeated here (repeating it would be a rejected
 /// overlap).
-fn systemd_variant() -> VariantConfig {
-    VariantConfig {
+fn systemd_variant() -> crate::config::raw::RawVariant {
+    crate::config::raw::RawVariant {
         description: Some("Systemd-managed deployment".to_string()),
         artifact: ArtifactConfig {
             mappings: vec![mapping("artifacts/systemd/", "app/")],
@@ -753,17 +754,13 @@ mod tests {
         // unit artifact; it is not bound to any slot, so pushes stay
         // adapter-agnostic.
         let systemd = config.variant("systemd").unwrap();
-        assert_eq!(systemd.activation.adapter, "systemd");
-        assert_eq!(
-            systemd.activation.scope,
-            crate::config::ActivationScope::User
-        );
-        assert_eq!(systemd.activation.units.len(), 1);
-        assert_eq!(systemd.activation.units[0].name, "example.service");
-        assert_eq!(
-            systemd.activation.units[0].artifact_path,
-            "app/example.service"
-        );
+        let crate::config::Activation::Systemd(sa) = &systemd.activation else {
+            panic!("systemd variant must carry the systemd activation");
+        };
+        assert_eq!(sa.scope, crate::config::ActivationScope::User);
+        assert_eq!(sa.units.len(), 1);
+        assert_eq!(sa.units[0].name, "example.service");
+        assert_eq!(sa.units[0].artifact_path, "app/example.service");
         assert!(
             report
                 .target
@@ -884,7 +881,7 @@ mod tests {
         assert!(err.to_string().contains("exactly one"), "got: {err}");
         assert!(!proj.exists(), "target must not even be created");
 
-        // A relative known_hosts is rejected (Config::validate requires
+        // A relative known_hosts is rejected (the config conversion requires
         // absolute).
         let proj = tmp.path().join("relative-known-hosts");
         let err = init_project(
@@ -939,18 +936,34 @@ mod tests {
         let config = crate::config::Config::load(&report.target.join("deploy.toml")).unwrap();
 
         // Re-serialize every typed payload into a fresh project and load it.
+        // The raw layer is the serializable surface (the domain model is
+        // private-construction), so the re-serialization goes through the raw
+        // shapes the loader parses.
         let reserialized = tmp.path().join("reserialized-app");
         let release_dir = reserialized.join("releases/v1");
         std::fs::create_dir_all(&release_dir).unwrap();
+        let manifest: crate::config::raw::RawConfig =
+            toml::from_str(&std::fs::read_to_string(report.target.join("deploy.toml")).unwrap())
+                .unwrap();
         std::fs::write(
             reserialized.join("deploy.toml"),
-            toml::to_string_pretty(&config).unwrap(),
+            toml::to_string_pretty(&manifest).unwrap(),
         )
         .unwrap();
         for name in ["standard", "systemd"] {
+            let variant: crate::config::raw::RawVariant = toml::from_str(
+                &std::fs::read_to_string(
+                    report
+                        .target
+                        .join("releases/v1")
+                        .join(format!("{name}.toml")),
+                )
+                .unwrap(),
+            )
+            .unwrap();
             std::fs::write(
                 release_dir.join(format!("{name}.toml")),
-                toml::to_string_pretty(config.variant(name).unwrap()).unwrap(),
+                toml::to_string_pretty(&variant).unwrap(),
             )
             .unwrap();
         }
@@ -975,13 +988,13 @@ mod tests {
             config.slot_defs()[0].deploy_dir
         );
         assert_eq!(
-            reloaded.variant("standard").unwrap().activation.adapter,
-            "none"
+            reloaded.variant("standard").unwrap().activation,
+            crate::config::Activation::None
         );
-        assert_eq!(
-            reloaded.variant("systemd").unwrap().activation.adapter,
-            "systemd"
-        );
+        assert!(matches!(
+            reloaded.variant("systemd").unwrap().activation,
+            crate::config::Activation::Systemd(_)
+        ));
         assert_eq!(
             reloaded.variant("standard").unwrap().artifact.mappings[0].from,
             "artifacts/build/output/app/"
