@@ -51,7 +51,7 @@
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::model::DeploymentId;
+use crate::model::{DeploymentId, ReleaseId};
 use crate::records::DeploymentStatus;
 use crate::store::atomic::{path_state, write_atomic_replace};
 use crate::store::local::LocalStore;
@@ -224,6 +224,15 @@ impl LocalStore {
     /// Bindings are `(release_id, variant, tree_digest)`; a pin marks every
     /// variant/tree of its release. `deployments/<id>/` dirs of the
     /// retained ledger entries AND observed `last_deployment`s are reachable.
+    ///
+    /// FAIL CLOSED on EVERY retention anchor: a PRESENT-but-unreadable
+    /// anchor — an unreadable ledger, an unreadable observed record, an
+    /// unreadable or malformed pins file, or a release record a pin names —
+    /// is an ERROR, never ABSENCE. An anchor that reads as absent shrinks
+    /// the retained set and the sweep would delete content the failed read
+    /// might have protected; the failed scan must abort the pass BEFORE any
+    /// unlink (extra garbage on disk is safe, a partial retained set is
+    /// not).
     pub(crate) fn reachable_set(&self, config: &Config) -> Result<ReachableSet> {
         let mut out = ReachableSet::default();
         let targets_dir = self.base().join("targets");
@@ -233,12 +242,24 @@ impl LocalStore {
                 .map_err(|e| Error::store(format!("read_dir targets: {e}")))?
             {
                 let dir = dir.map_err(|e| Error::store(format!("target entry: {e}")))?;
-                if dir.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                if dir
+                    .file_type()
+                    .map_err(|e| Error::store(format!("file_type {}: {e}", dir.path().display())))?
+                    .is_dir()
+                {
                     target_names.push(dir.file_name().to_string_lossy().into_owned());
                 }
             }
         }
         target_names.sort();
+        // The CURRENT OBSERVED artifacts + last deployments — the ONE global
+        // physical slot map (`slots/<slot-id>/observed.json`), read ONCE (it
+        // is store-global, not per-target; the per-target views are selection
+        // filters over it). Fail closed: an unreadable observed record must
+        // never read as "no observed state" — the scan would then drop the
+        // artifact a target is CURRENTLY running from the retained set and
+        // delete it.
+        let observed = self.read_global_observed()?;
         for name in &target_names {
             for entry in self.read_ledger(name)? {
                 // The entry's deployment dir (an in-flight entry without a
@@ -267,16 +288,13 @@ impl LocalStore {
                     }
                 }
             }
-            // The current OBSERVED artifacts + last deployments.
-            if let Ok(observed) = self.read_global_observed() {
-                for slot in observed.values() {
-                    if let Some(d) = &slot.last_deployment {
-                        out.deployments.insert(d.as_str().to_string());
-                    }
-                    if let Some(a) = &slot.artifact {
-                        out.releases.insert(a.release.as_str().to_string());
-                        out.trees.insert(a.tree.as_str().to_string());
-                    }
+            for slot in observed.values() {
+                if let Some(d) = &slot.last_deployment {
+                    out.deployments.insert(d.as_str().to_string());
+                }
+                if let Some(a) = &slot.artifact {
+                    out.releases.insert(a.release.as_str().to_string());
+                    out.trees.insert(a.tree.as_str().to_string());
                 }
             }
         }
@@ -284,31 +302,79 @@ impl LocalStore {
         // variant's tree. Config pins (`deploy.toml` `[[pins]]`) AND the
         // store-level pins (`pins.json` — [`crate::records::Pins`]) are both
         // retention anchors: the checkpoint is store-only by construction, but
-        // the CLI accepts both surfaces.
+        // the CLI accepts both surfaces. FAIL CLOSED: a pin that names a
+        // release with no record on disk, or whose record cannot be read or
+        // verified, is an INTEGRITY error (see [`LocalStore::honor_release_pin`])
+        // — the pin cannot be honored, so reachability is incomplete and the
+        // sweep must abort before any deletion.
         for pin in &config.pins {
             let rid = crate::model::ReleaseId::parse(&pin.release);
-            if let Ok(rec) = self.read_release(&rid) {
-                out.releases.insert(rec.release_id.clone());
-                for tree in rec.variants.values() {
-                    out.trees.insert(tree.clone());
-                }
-            }
+            self.honor_release_pin(&mut out, &rid, true)?;
         }
-        if let Ok(pins) = self.read_pins() {
-            for rid in &pins.releases {
-                out.releases.insert(rid.as_str().to_string());
-                if let Ok(rec) = self.read_release(rid) {
-                    for tree in rec.variants.values() {
-                        out.trees.insert(tree.clone());
-                    }
-                }
-            }
-            for b in &pins.bindings {
-                out.releases.insert(b.release.as_str().to_string());
-                out.trees.insert(b.tree.as_str().to_string());
-            }
+        // Store-level pins (`pins.json`): a MISSING file is the empty pin set
+        // (tri-state absent) — a PRESENT-but-unreadable or malformed pins
+        // file is an error, never "no pins" (a failed read must never shrink
+        // the retained set).
+        let pins = self.read_pins()?;
+        for rid in &pins.releases {
+            self.honor_release_pin(&mut out, rid, true)?;
+        }
+        for b in &pins.bindings {
+            // An exact-binding pin names a release too: the pin cannot be
+            // honored unless that release's record exists and reads clean
+            // (the binding's own (release, tree) is kept regardless).
+            self.honor_release_pin(&mut out, &b.release, false)?;
+            out.releases.insert(b.release.as_str().to_string());
+            out.trees.insert(b.tree.as_str().to_string());
         }
         Ok(out)
+    }
+
+    /// Honor ONE release pin: verify the named release's record exists and
+    /// reads clean (identity-verified via [`LocalStore::read_release`]), then
+    /// retain the record; when `expand_variants` (a WHOLE-RELEASE pin) also
+    /// retain every variant's tree from the record's `variants` map. An
+    /// EXACT-BINDING pin (`expand_variants = false`) keeps its own
+    /// (release, tree) at the call site.
+    ///
+    /// FAIL CLOSED — a pin-abort, before any deletion: a pin that names a
+    /// release with NO record on disk, or whose record cannot be read or
+    /// identity-verified, is an [`Error::integrity`] error. An un-honorable
+    /// pin means the reachability computation cannot expand the content the
+    /// pin protects, so the retained set is incomplete — the sweep must
+    /// abort rather than delete against it. (A missing record is tri-state
+    /// DETECTED here: a genuine NotFound on the record file is not "absent
+    /// pin" — it is a pin naming nothing on disk, an integrity violation.)
+    fn honor_release_pin(
+        &self,
+        out: &mut ReachableSet,
+        rid: &ReleaseId,
+        expand_release_variants: bool,
+    ) -> Result<()> {
+        let rec_path = self.release_dir(rid).join("release.json");
+        if !path_state(&rec_path)? {
+            return Err(Error::integrity(format!(
+                "pin names release {rid} which has no release record on disk: the pin cannot be honored, so reachability is incomplete — aborting the artifact sweep before any deletion"
+            )));
+        }
+        // Read + identity-verify the record; ANY failure (an unreadable
+        // file, malformed content, an identity mismatch) is an un-honorable
+        // pin and is normalized to [`Error::integrity`] (the underlying
+        // cause stays embedded in the message) — requirement: a pin that
+        // cannot be honored aborts the sweep with an integrity error
+        // whether the record is missing, unreadable, or unverifiable.
+        let rec = self.read_release(rid).map_err(|e| {
+            Error::integrity(format!(
+                "pin names release {rid} whose record cannot be read or verified ({e}): the pin cannot be honored, so reachability is incomplete — aborting the artifact GC before any deletion"
+            ))
+        })?;
+        out.releases.insert(rec.release_id.clone());
+        if expand_release_variants {
+            for tree in rec.variants.values() {
+                out.trees.insert(tree.clone());
+            }
+        }
+        Ok(())
     }
 
     /// Enumerate the unreachable deployment dirs, release dirs, and object
