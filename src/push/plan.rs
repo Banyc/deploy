@@ -39,13 +39,12 @@
 //! in the `PushRef::Release` branch of [`plan_assignments`] and recorded in
 //! [`crate::records::DeploymentPlan::rebinding`].
 
-use crate::config::Config;
+use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
 use crate::history::{PushRef, resolve_deployment};
 use crate::model::{
     ArtifactRef, DeploymentId, MatchingMembership, NonEmptySlotSet, PlacementSlotAssignment,
-    PlacementSlotId, ReleaseId, ReleaseRecord, ServerId, SlotSet, TargetName, TreeDigest,
-    VariantName,
+    ReleaseId, ReleaseRecord, ServerId, SlotId, SlotSet, TargetName, TreeDigest, VariantName,
 };
 use crate::records::{
     FrozenSlotTopology, LedgerRollback, PhysicalBinding, PlanSource, RebindingPlan,
@@ -112,7 +111,7 @@ impl ResolvedSelection {
     pub(crate) fn new(
         target: TargetName,
         source: ResolvedSelectionSource,
-        slots: impl IntoIterator<Item = PlacementSlotId>,
+        slots: impl IntoIterator<Item = SlotId>,
     ) -> Result<Self> {
         let slots = NonEmptySlotSet::try_new(slots).ok_or_else(|| {
             Error::plan(format!(
@@ -205,7 +204,7 @@ impl SlotSelection {
     /// groups and select the wrong slot IDs for a historical release whose
     /// frozen partition drifted. The target must exist in the current config
     /// (validated here, before any lock or remote access).
-    pub fn normalize(config: &Config, target: &str, group: Option<&str>) -> Result<Self> {
+    pub fn normalize(config: &ProjectConfig, target: &str, group: Option<&str>) -> Result<Self> {
         config
             .targets
             .get(target)
@@ -228,8 +227,8 @@ impl SlotSelection {
     /// variant's slots in file order.
     pub fn current_members<'a>(
         &self,
-        config: &'a Config,
-    ) -> Result<Vec<(&'a crate::config::SlotDef, &'a crate::config::ServerDef)>> {
+        config: &'a ProjectConfig,
+    ) -> Result<Vec<(&'a crate::config::SlotConfig, &'a crate::config::ServerDef)>> {
         match &self.group {
             Some(g) => config.target_group_slots(self.target.as_str(), g),
             None => config.target_slots(self.target.as_str()),
@@ -253,10 +252,10 @@ impl SlotSelection {
     /// selecting zero frozen slots is a configuration error as today.
     pub fn release_members<'a>(
         &self,
-        config: &'a Config,
+        config: &'a ProjectConfig,
         rec: &ReleaseRecord,
-    ) -> Result<Vec<(&'a crate::config::SlotDef, &'a crate::config::ServerDef)>> {
-        let frozen_ids: Vec<PlacementSlotId> = rec
+    ) -> Result<Vec<(&'a crate::config::SlotConfig, &'a crate::config::ServerDef)>> {
+        let frozen_ids: Vec<SlotId> = rec
             .slots
             .values()
             .flat_map(|cs| cs.slots.iter())
@@ -265,7 +264,7 @@ impl SlotSelection {
                 Some(g) => s.groups.iter().any(|x| x == g),
                 None => true,
             })
-            .map(|s| PlacementSlotId::new(s.id.clone()))
+            .map(|s| SlotId::new(s.id.clone()))
             .collect();
         if self.group.is_some() && frozen_ids.is_empty() {
             return Err(Error::config(format!(
@@ -339,8 +338,8 @@ pub(crate) fn latest_successful_rollback(
 /// slots the push actually selects against the current membership.
 pub(crate) fn validate_partial_rollout(
     selection: &SlotSelection,
-    selected: &[PlacementSlotId],
-    config: &Config,
+    selected: &[SlotId],
+    config: &ProjectConfig,
     store: &LocalStore,
 ) -> Result<()> {
     if selection.group.is_none() {
@@ -348,7 +347,7 @@ pub(crate) fn validate_partial_rollout(
     }
     let current = config.target_slots(selection.target.as_str())?;
     let selected: HashSet<&str> = selected.iter().map(|s| s.as_str()).collect();
-    let unselected: Vec<(&crate::config::SlotDef, &crate::config::ServerDef)> = current
+    let unselected: Vec<(&crate::config::SlotConfig, &crate::config::ServerDef)> = current
         .iter()
         .filter(|(s, _)| !selected.contains(s.id.as_str()))
         .copied()
@@ -376,7 +375,7 @@ pub(crate) fn validate_partial_rollout(
             // assignment in the base and its physical binding must still
             // match.
             for (slot, sdef) in &unselected {
-                let slot_id = PlacementSlotId::new(slot.id.clone());
+                let slot_id = SlotId::new(slot.id.clone());
                 let current_binding = PhysicalBinding {
                     server: ServerId::new(sdef.id.as_str().to_string()),
                     deploy_dir: slot.deploy_dir.to_string_lossy().into_owned(),
@@ -457,14 +456,14 @@ pub(crate) fn validate_direct_release_membership(
     target_name: &str,
     release: &ReleaseId,
     rec: &ReleaseRecord,
-    current_slot_ids: &[PlacementSlotId],
+    current_slot_ids: &[SlotId],
 ) -> Result<MatchingMembership> {
     let frozen: SlotSet = SlotSet::new(
         rec.slots
             .values()
             .flat_map(|cs| cs.slots.iter())
             .filter(|s| s.target == target_name)
-            .map(|s| PlacementSlotId::new(s.id.clone())),
+            .map(|s| SlotId::new(s.id.clone())),
     );
     let current: SlotSet = SlotSet::new(current_slot_ids.iter().cloned());
     MatchingMembership::verify(frozen.clone(), current.clone()).map_err(|_| {
@@ -510,7 +509,7 @@ pub fn plan_assignments(
     local_release_id: &ReleaseId,
     variant_trees: &BTreeMap<String, TreeDigest>,
     store: &LocalStore,
-    config: &Config,
+    config: &ProjectConfig,
 ) -> Result<PlannedResolution> {
     if !config.targets.contains_key(selection.target.as_str()) {
         return Err(Error::not_found(format!("target '{}'", selection.target)));
@@ -542,13 +541,11 @@ pub fn plan_assignments(
             let resolved = ResolvedSelection::new(
                 selection.target.clone(),
                 ResolvedSelectionSource::Head,
-                members
-                    .iter()
-                    .map(|(slot, _)| PlacementSlotId::new(slot.id.clone())),
+                members.iter().map(|(slot, _)| SlotId::new(slot.id.clone())),
             )?;
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
-                let slot_id = PlacementSlotId::new(slot.id.clone());
+                let slot_id = SlotId::new(slot.id.clone());
                 // The slot's variant is the variant file that declares it (the
                 // declaring file is the binding; there is no per-slot `variant`
                 // field).
@@ -592,13 +589,11 @@ pub fn plan_assignments(
             let resolved = ResolvedSelection::new(
                 selection.target.clone(),
                 ResolvedSelectionSource::Deployment(deployment_id.clone()),
-                members
-                    .iter()
-                    .map(|(slot, _)| PlacementSlotId::new(slot.id.clone())),
+                members.iter().map(|(slot, _)| SlotId::new(slot.id.clone())),
             )?;
-            let slot_ids: Vec<PlacementSlotId> = members
+            let slot_ids: Vec<SlotId> = members
                 .iter()
-                .map(|(slot, _)| PlacementSlotId::new(slot.id.clone()))
+                .map(|(slot, _)| SlotId::new(slot.id.clone()))
                 .collect();
             let entry = resolve_deployment(store, ft, deployment_id)?;
             let recorded: BTreeSet<String> =
@@ -625,7 +620,7 @@ pub fn plan_assignments(
             // unverifiable and refuses for the same reason. Unselected slots
             // are not planned (they remain at the latest current state).
             for (slot, sdef) in &members {
-                let slot_id = PlacementSlotId::new(slot.id.clone());
+                let slot_id = SlotId::new(slot.id.clone());
                 let current_binding = PhysicalBinding {
                     server: ServerId::new(sdef.id.as_str().to_string()),
                     deploy_dir: slot.deploy_dir.to_string_lossy().into_owned(),
@@ -652,7 +647,7 @@ pub fn plan_assignments(
             // snapshot-wide release.
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
-                let slot_id = PlacementSlotId::new(slot.id.clone());
+                let slot_id = SlotId::new(slot.id.clone());
                 let g = entry.slots.get(&slot_id).ok_or_else(|| {
                     Error::rollback(format!("slot {slot_id} missing in snapshot"))
                 })?;
@@ -687,10 +682,10 @@ pub fn plan_assignments(
             // validates the FULL set here (and in the engine gate) and then
             // plans ONLY the selected slots (the `members` loop below is
             // already group-aware).
-            let current_slot_ids: Vec<PlacementSlotId> = config
+            let current_slot_ids: Vec<SlotId> = config
                 .target_slots(selection.target.as_str())?
                 .into_iter()
-                .map(|(slot, _)| PlacementSlotId::new(slot.id.clone()))
+                .map(|(slot, _)| SlotId::new(slot.id.clone()))
                 .collect();
             // THE MEMBERSHIP GATE PRODUCES THE PROOF: the frozen and current
             // memberships verified EXACTLY EQUAL (the agreed non-empty slot
@@ -727,13 +722,11 @@ pub fn plan_assignments(
             let resolved = ResolvedSelection::new(
                 selection.target.clone(),
                 ResolvedSelectionSource::FrozenRelease(release.clone()),
-                members
-                    .iter()
-                    .map(|(slot, _)| PlacementSlotId::new(slot.id.clone())),
+                members.iter().map(|(slot, _)| SlotId::new(slot.id.clone())),
             )?;
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
-                let slot_id = PlacementSlotId::new(slot.id.clone());
+                let slot_id = SlotId::new(slot.id.clone());
                 // The variant ALWAYS comes from the release's OWN stored slot
                 // snapshot: a historical release resolves each slot's
                 // slot→variant binding against the slots it was materialized
@@ -796,13 +789,12 @@ pub fn plan_assignments(
             // onto (the PLANNED slots: a `--group` push narrows the
             // assignments — the membership check still covers the complete
             // set, composed with the engine's full-membership gate).
-            let mut frozen_topology: BTreeMap<PlacementSlotId, FrozenSlotTopology> =
-                BTreeMap::new();
+            let mut frozen_topology: BTreeMap<SlotId, FrozenSlotTopology> = BTreeMap::new();
             for (variant, cs) in &rec.slots {
                 for slot in &cs.slots {
                     if slot.target == selection.target.as_str() {
                         frozen_topology.insert(
-                            PlacementSlotId::new(slot.id.clone()),
+                            SlotId::new(slot.id.clone()),
                             FrozenSlotTopology {
                                 variant: variant.clone(),
                                 groups: slot.groups.clone(),
@@ -824,7 +816,7 @@ pub fn plan_assignments(
                     .iter()
                     .map(|(slot, sdef)| {
                         (
-                            PlacementSlotId::new(slot.id.clone()),
+                            SlotId::new(slot.id.clone()),
                             PhysicalBinding {
                                 server: ServerId::new(sdef.id.as_str().to_string()),
                                 deploy_dir: slot.deploy_dir.to_string_lossy().into_owned(),
@@ -940,12 +932,12 @@ from = "artifacts/build/output/"
 to = "app/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 1
 
 [activation]
@@ -980,12 +972,12 @@ from = "artifacts/build/output/"
 to = "app/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 1
 
 [activation]
@@ -999,7 +991,7 @@ attempts = 1
 interval_seconds = 0
 "#;
 
-    fn project_with_config() -> (tempfile::TempDir, Config) {
+    fn project_with_config() -> (tempfile::TempDir, ProjectConfig) {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
@@ -1008,7 +1000,7 @@ interval_seconds = 0
         std::fs::write(release_dir.join("standard.toml"), VARIANT_TOML).unwrap();
         let p = project.join("deploy.toml");
         std::fs::write(&p, DEPLOY_TOML).unwrap();
-        let config = Config::load(&p).unwrap();
+        let config = ProjectConfig::load(&p).unwrap();
         (dir, config)
     }
 
@@ -1022,13 +1014,13 @@ interval_seconds = 0
         store: &LocalStore,
         deployment_id: &str,
         behavior_sha256: &str,
-        slots: BTreeMap<PlacementSlotId, GenerationRef>,
-        bindings: BTreeMap<PlacementSlotId, PhysicalBinding>,
+        slots: BTreeMap<SlotId, GenerationRef>,
+        bindings: BTreeMap<SlotId, PhysicalBinding>,
     ) {
         let id = DeploymentId::new(deployment_id.to_string());
         let target = TargetName::new("t1".to_string());
         // ONE slot table: the membership + per-slot desired entries.
-        let slot_table: BTreeMap<PlacementSlotId, IntentSlot> = slots
+        let slot_table: BTreeMap<SlotId, IntentSlot> = slots
             .iter()
             .map(|(k, g)| {
                 (
@@ -1167,7 +1159,7 @@ interval_seconds = 0
 
         assert_eq!(assignments.len(), 1);
         let a = &assignments[0];
-        assert_eq!(a.placement_slot, PlacementSlotId::new("p1"));
+        assert_eq!(a.placement_slot, SlotId::new("p1"));
         assert_eq!(
             a.artifact.variant.as_str(),
             "standard",
@@ -1334,7 +1326,7 @@ interval_seconds = 0
             ),
         )
         .unwrap();
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
         assert_eq!(config.target_slot_ids("t1").unwrap(), ["p1", "p2"]);
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
@@ -1472,7 +1464,7 @@ interval_seconds = 0
             ),
         )
         .unwrap();
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
         // The release's OWN snapshot froze p1 at its ORIGINAL physical
@@ -1514,7 +1506,7 @@ interval_seconds = 0
         })
         .expect("physical binding drift must not block logical-membership planning");
         assert_eq!(assignments.len(), 1);
-        assert_eq!(assignments[0].placement_slot, PlacementSlotId::new("p1"));
+        assert_eq!(assignments[0].placement_slot, SlotId::new("p1"));
         assert_eq!(desired, BTreeSet::from([release.clone()]));
         assert_eq!(source, PlanSource::ReleaseRef(release));
         assert!(
@@ -1648,7 +1640,7 @@ interval_seconds = 0
         std::fs::write(release_dir.join("new.toml"), VARIANT_TOML).unwrap();
         let cfg_path = project.join("deploy.toml");
         std::fs::write(&cfg_path, DEPLOY_TOML).unwrap();
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
         assert_eq!(config.slot_variant("p1").unwrap(), "new");
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
@@ -1678,11 +1670,11 @@ interval_seconds = 0
             "deploy-snapshot-histvar",
             "sha256-aa",
             BTreeMap::from([(
-                PlacementSlotId::new("p1".to_string()),
+                SlotId::new("p1".to_string()),
                 GenerationRef {
                     generation: GenerationId::new("gen-old".to_string()),
                     assignment: PlacementSlotAssignment {
-                        placement_slot: PlacementSlotId::new("p1".to_string()),
+                        placement_slot: SlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
                             release: release.clone(),
                             variant: VariantName::new("old".to_string()),
@@ -1692,7 +1684,7 @@ interval_seconds = 0
                 },
             )]),
             BTreeMap::from([(
-                PlacementSlotId::new("p1".to_string()),
+                SlotId::new("p1".to_string()),
                 PhysicalBinding {
                     server: ServerId::new("s1".to_string()),
                     deploy_dir: "/srv/plan".to_string(),
@@ -1750,7 +1742,7 @@ interval_seconds = 0
         std::fs::write(release_dir.join("standard.toml"), VARIANT_TOML).unwrap();
         let cfg_path = project.join("deploy.toml");
         std::fs::write(&cfg_path, DEPLOY_TOML).unwrap();
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
         // A snapshot whose `slots` record the generation but whose `bindings`
@@ -1765,11 +1757,11 @@ interval_seconds = 0
             "deploy-legacy-snapshot",
             "sha256-aa",
             BTreeMap::from([(
-                PlacementSlotId::new("p1".to_string()),
+                SlotId::new("p1".to_string()),
                 GenerationRef {
                     generation: GenerationId::new("gen-legacy".to_string()),
                     assignment: PlacementSlotAssignment {
-                        placement_slot: PlacementSlotId::new("p1".to_string()),
+                        placement_slot: SlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
                             release: ReleaseId::new("rel-sha256-legacy".to_string()),
                             variant: VariantName::new("standard".to_string()),
@@ -1895,7 +1887,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 "#,
         )
         .unwrap();
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
         assert_eq!(config.target_slot_ids("t1").unwrap(), ["p1", "p2", "p3"]);
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
@@ -2030,7 +2022,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 "#,
         )
         .unwrap();
-        let drifted = Config::load(&cfg_path).unwrap();
+        let drifted = ProjectConfig::load(&cfg_path).unwrap();
         assert_eq!(
             drifted.target_slot_ids("t1").unwrap(),
             ["p1", "p2", "p3", "p4"]
@@ -2109,12 +2101,12 @@ from = "artifacts/build/output/"
 to = "app/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 1
 
 [activation]
@@ -2159,7 +2151,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 "#,
         )
         .unwrap();
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
         assert_eq!(config.target_slot_ids("t1").unwrap(), ["p1", "p2", "p3"]);
         assert_eq!(
             config.target_group_slots("t1", "G").unwrap().len(),
@@ -2295,7 +2287,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "the rebinding records exactly the frozen partition's slots"
         );
         for id in ["p1", "p3"] {
-            let got = &rp.current_physical_slots[&PlacementSlotId::new(id.to_string())];
+            let got = &rp.current_physical_slots[&SlotId::new(id.to_string())];
             assert_eq!(got.server.as_str(), format!("s{}", &id[1..]));
             assert_eq!(got.deploy_dir, format!("/srv/{id}"));
         }
@@ -2304,16 +2296,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // check records the FULL slot-ID sets (logical only).
         assert_eq!(rp.frozen_topology.len(), 3);
         assert_eq!(
-            rp.frozen_topology[&PlacementSlotId::new("p1".to_string())].groups,
+            rp.frozen_topology[&SlotId::new("p1".to_string())].groups,
             vec!["G".to_string()]
         );
         assert!(
-            rp.frozen_topology[&PlacementSlotId::new("p2".to_string())]
+            rp.frozen_topology[&SlotId::new("p2".to_string())]
                 .groups
                 .is_empty()
         );
         assert_eq!(
-            rp.frozen_topology[&PlacementSlotId::new("p3".to_string())].groups,
+            rp.frozen_topology[&SlotId::new("p3".to_string())].groups,
             vec!["G".to_string()]
         );
         // The rebinding's membership is the PROOF the gate produced: the
@@ -2338,7 +2330,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             VARIANT_G_CURRENT.replace("groups = [\"G\"]\n", ""),
         )
         .unwrap();
-        let config2 = Config::load(&cfg_path).unwrap();
+        let config2 = ProjectConfig::load(&cfg_path).unwrap();
         assert_eq!(config2.target_slot_ids("t1").unwrap(), ["p1", "p2", "p3"]);
         assert!(
             config2.target_group_slots("t1", "G").is_err(),
@@ -2456,7 +2448,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     fn group_partition_fixture(
         frozen_inc: [bool; 4],
         current_inc: [bool; 4],
-    ) -> (tempfile::TempDir, Config, LocalStore, ReleaseId) {
+    ) -> (tempfile::TempDir, ProjectConfig, LocalStore, ReleaseId) {
         const SLOTS: [&str; 4] = ["p1", "p2", "p3", "p4"];
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
@@ -2465,8 +2457,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         std::fs::create_dir_all(&release_dir).unwrap();
         let mut variant = String::from(
             "[[artifact.mappings]]\nfrom = \"artifacts/build/output/\"\nto = \"app/\"\nrecursive = true\n\n\
-             [rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n\
-             [rotation.deployment]\nprotect_deployments = 1\n\n\
+             [retention.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n\
+             [retention.deployment]\nprotect_deployments = 1\n\n\
              [activation]\nadapter = \"none\"\n\n\
              [verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
         );
@@ -2498,7 +2490,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             ),
         )
         .unwrap();
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
         // The release's OWN frozen snapshot: the SAME slot IDs with the
@@ -2645,7 +2637,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "the rebinding records the frozen partition's slots, rebound to current locations"
             );
             for id in &frozen {
-                let got = &rp.current_physical_slots[&PlacementSlotId::new(id.to_string())];
+                let got = &rp.current_physical_slots[&SlotId::new(id.to_string())];
                 assert_eq!(got.server.as_str(), &format!("s{}", &id[1..]));
                 assert_eq!(got.deploy_dir, format!("/srv/{id}"));
             }
@@ -2694,7 +2686,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// intentionally allowed).
     fn direct_release_fixture(
         old_binding: &(String, String),
-    ) -> (tempfile::TempDir, Config, LocalStore, ReleaseId) {
+    ) -> (tempfile::TempDir, ProjectConfig, LocalStore, ReleaseId) {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
@@ -2703,7 +2695,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         std::fs::write(release_dir.join("standard.toml"), VARIANT_TOML_TWO).unwrap();
         let cfg_path = project.join("deploy.toml");
         std::fs::write(&cfg_path, DEPLOY_TOML_TWO).unwrap();
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
         // The release's OWN stored slot-variant snapshot: p1 -> `standard`
@@ -2740,11 +2732,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "deploy-source",
             "sha256-aa",
             BTreeMap::from([(
-                PlacementSlotId::new("p1".to_string()),
+                SlotId::new("p1".to_string()),
                 GenerationRef {
                     generation: GenerationId::new("gen-old".to_string()),
                     assignment: PlacementSlotAssignment {
-                        placement_slot: PlacementSlotId::new("p1".to_string()),
+                        placement_slot: SlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
                             release: release.clone(),
                             variant: VariantName::new("standard".to_string()),
@@ -2754,7 +2746,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 },
             )]),
             BTreeMap::from([(
-                PlacementSlotId::new("p1".to_string()),
+                SlotId::new("p1".to_string()),
                 PhysicalBinding {
                     server: ServerId::new(old_binding.0.clone()),
                     deploy_dir: old_binding.1.clone(),
@@ -2817,7 +2809,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 assert_eq!(assignments.len(), 1, "one slot per target");
                 let a = &assignments[0];
                 let want_slot = if dest == "t1" { "p1" } else { "p2" };
-                assert_eq!(a.placement_slot, PlacementSlotId::new(want_slot));
+                assert_eq!(a.placement_slot, SlotId::new(want_slot));
                 assert_eq!(
                     a.artifact.variant.as_str(),
                     "standard",
@@ -2916,7 +2908,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         physical_drift: bool,
     ) -> (
         tempfile::TempDir,
-        Config,
+        ProjectConfig,
         LocalStore,
         ReleaseId,
         ReleaseRecord,
@@ -2957,7 +2949,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "/srv/phys",
         );
         variant.push_str(
-            "[[artifact.mappings]]\nfrom = \"artifacts/build/output/\"\nto = \"app/\"\nrecursive = true\n\n[rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n[rotation.deployment]\nprotect_deployments = 1\n\n[activation]\nadapter = \"none\"\n\n[verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
+            "[[artifact.mappings]]\nfrom = \"artifacts/build/output/\"\nto = \"app/\"\nrecursive = true\n\n[retention.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n[retention.deployment]\nprotect_deployments = 1\n\n[activation]\nadapter = \"none\"\n\n[verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
         );
         std::fs::write(release_dir.join("standard.toml"), variant).unwrap();
 
@@ -2978,7 +2970,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             ),
         )
         .unwrap();
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
         // The release's OWN frozen canonical snapshot: the generated
@@ -3124,7 +3116,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                         .expect("phys is frozen in the record");
                     let bindings = config.target_slot_bindings("t1").unwrap();
                     let cfg_phys = bindings
-                        .get(&PlacementSlotId::new("phys"))
+                        .get(&SlotId::new("phys"))
                         .expect("phys is a member of t1");
                     assert_ne!(
                         cfg_phys.server.as_str(),
@@ -3175,7 +3167,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     .map(|planned| (planned.assignments, planned.releases, planned.source, planned.rebinding))
                 .expect("t2's membership is unchanged, so it still plans");
                 assert_eq!(assignments.len(), 1);
-                assert_eq!(assignments[0].placement_slot, PlacementSlotId::new("iso"));
+                assert_eq!(assignments[0].placement_slot, SlotId::new("iso"));
             }
         }
     }
@@ -3217,11 +3209,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let deployment_id = DeploymentId::new("deploy-prop-plan".to_string());
             let snapshot_release = ReleaseId::new(format!("rel-sha256-{tree}"));
             let slots = BTreeMap::from([(
-                PlacementSlotId::new("p1".to_string()),
+                SlotId::new("p1".to_string()),
                 GenerationRef {
                     generation: GenerationId::new(format!("gen-{generation}")),
                     assignment: PlacementSlotAssignment {
-                        placement_slot: PlacementSlotId::new("p1".to_string()),
+                        placement_slot: SlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
                             release: snapshot_release.clone(),
                             variant: VariantName::new("standard".to_string()),
@@ -3236,7 +3228,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &format!("sha256-{behavior}"),
                 slots.clone(),
                 BTreeMap::from([(
-                    PlacementSlotId::new("p1".to_string()),
+                    SlotId::new("p1".to_string()),
                     PhysicalBinding {
                         server: ServerId::new("s1".to_string()),
                         deploy_dir: "/srv/plan".to_string(),
@@ -3263,8 +3255,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // GenerationRef.
             assert_eq!(assignments.len(), 1, "one member slot");
             let a = &assignments[0];
-            let stored = &slots[&PlacementSlotId::new("p1")];
-            assert_eq!(a.placement_slot, PlacementSlotId::new("p1"));
+            let stored = &slots[&SlotId::new("p1")];
+            assert_eq!(a.placement_slot, SlotId::new("p1"));
             assert_eq!(a.artifact, stored.assignment.artifact, "the planned artifact must equal the snapshot's stored artifact");
             assert_eq!(
                 desired,
@@ -3366,7 +3358,7 @@ host_key_fingerprint = "SHA256:test"
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 "#;
 
-    fn two_group_project() -> (tempfile::TempDir, Config) {
+    fn two_group_project() -> (tempfile::TempDir, ProjectConfig) {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
@@ -3375,7 +3367,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         std::fs::write(release_dir.join("standard.toml"), TWO_GROUP_VARIANT).unwrap();
         let p = project.join("deploy.toml");
         std::fs::write(&p, TWO_GROUP_TOML).unwrap();
-        let config = Config::load(&p).unwrap();
+        let config = ProjectConfig::load(&p).unwrap();
         (dir, config)
     }
 
@@ -3461,9 +3453,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let (_dir, config) = two_group_project();
         let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
 
-        let slot_a = PlacementSlotId::new("p1".to_string());
-        let slot_b = PlacementSlotId::new("p2".to_string());
-        let bindings: BTreeMap<PlacementSlotId, PhysicalBinding> = BTreeMap::from([
+        let slot_a = SlotId::new("p1".to_string());
+        let slot_b = SlotId::new("p2".to_string());
+        let bindings: BTreeMap<SlotId, PhysicalBinding> = BTreeMap::from([
             (
                 slot_a.clone(),
                 PhysicalBinding {
@@ -3487,8 +3479,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // `build_rollback`: selected slots are replaced, unselected slots are
         // carried forward.
         let mut expected_digests: BTreeMap<ReleaseId, String> = BTreeMap::new();
-        let mut state: BTreeMap<PlacementSlotId, ArtifactRef> = BTreeMap::new();
-        let mut chain: Vec<(DeploymentId, BTreeMap<PlacementSlotId, GenerationRef>)> = Vec::new();
+        let mut state: BTreeMap<SlotId, ArtifactRef> = BTreeMap::new();
+        let mut chain: Vec<(DeploymentId, BTreeMap<SlotId, GenerationRef>)> = Vec::new();
 
         let push_count = partial_groups.len() + 1;
         for i in 0..push_count {
@@ -3511,7 +3503,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 // group-b: p2 only.
                 state.insert(slot_b.clone(), artifact);
             }
-            let slots: BTreeMap<PlacementSlotId, GenerationRef> = state
+            let slots: BTreeMap<SlotId, GenerationRef> = state
                 .iter()
                 .map(|(slot, art)| {
                     (
@@ -3578,7 +3570,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // SELECTED slots' stored bindings (derived from the slot bindings,
         // never a snapshot-wide single release): a full rollback references
         // every slot's release, a group rollback only its selected slots'.
-        let selected_slots: BTreeSet<PlacementSlotId> = assignments
+        let selected_slots: BTreeSet<SlotId> = assignments
             .iter()
             .map(|a| a.placement_slot.clone())
             .collect();
@@ -3697,7 +3689,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         release_variant: bool,
         release_drift: bool,
         binding_drift: bool,
-    ) -> (tempfile::TempDir, Config, LocalStore, ReleaseId) {
+    ) -> (tempfile::TempDir, ProjectConfig, LocalStore, ReleaseId) {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
@@ -3723,12 +3715,12 @@ from = "artifacts/build/output/"
 to = "app/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 1
 
 [activation]
@@ -3768,7 +3760,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 "#,
         )
         .unwrap();
-        let config = Config::load(&p).unwrap();
+        let config = ProjectConfig::load(&p).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
         // The release's OWN frozen snapshot under the variant name
@@ -3813,13 +3805,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // physical bindings that either match the current config (`/srv/p1`)
         // or drift `p1`'s deploy_dir (`/srv/drifted` on the same server) —
         // the exact-binding check must refuse the drifted case.
-        let snapshot_slots: BTreeMap<PlacementSlotId, GenerationRef> = BTreeMap::from([
+        let snapshot_slots: BTreeMap<SlotId, GenerationRef> = BTreeMap::from([
             (
-                PlacementSlotId::new("p1".to_string()),
+                SlotId::new("p1".to_string()),
                 GenerationRef {
                     generation: GenerationId::new("gen-p1".to_string()),
                     assignment: PlacementSlotAssignment {
-                        placement_slot: PlacementSlotId::new("p1".to_string()),
+                        placement_slot: SlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
                             release: ReleaseId::new("rel-deploy".to_string()),
                             variant: VariantName::new("standard".to_string()),
@@ -3829,11 +3821,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 },
             ),
             (
-                PlacementSlotId::new("p2".to_string()),
+                SlotId::new("p2".to_string()),
                 GenerationRef {
                     generation: GenerationId::new("gen-p2".to_string()),
                     assignment: PlacementSlotAssignment {
-                        placement_slot: PlacementSlotId::new("p2".to_string()),
+                        placement_slot: SlotId::new("p2".to_string()),
                         artifact: ArtifactRef {
                             release: ReleaseId::new("rel-deploy".to_string()),
                             variant: VariantName::new("standard".to_string()),
@@ -3850,7 +3842,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             snapshot_slots,
             BTreeMap::from([
                 (
-                    PlacementSlotId::new("p1".to_string()),
+                    SlotId::new("p1".to_string()),
                     PhysicalBinding {
                         server: ServerId::new("s1".to_string()),
                         deploy_dir: if binding_drift {
@@ -3861,7 +3853,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     },
                 ),
                 (
-                    PlacementSlotId::new("p2".to_string()),
+                    SlotId::new("p2".to_string()),
                     PhysicalBinding {
                         server: ServerId::new("s2".to_string()),
                         deploy_dir: "/srv/p2".to_string(),
@@ -4028,10 +4020,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     assert!(topo.groups.is_empty());
                     assert!(matches!(slot.as_str(), "p1" | "p2"));
                 }
-                let p1 = &rp.current_physical_slots[&PlacementSlotId::new("p1".to_string())];
+                let p1 = &rp.current_physical_slots[&SlotId::new("p1".to_string())];
                 assert_eq!(p1.server.as_str(), "s1");
                 assert_eq!(p1.deploy_dir, "/srv/p1");
-                let p2 = &rp.current_physical_slots[&PlacementSlotId::new("p2".to_string())];
+                let p2 = &rp.current_physical_slots[&SlotId::new("p2".to_string())];
                 assert_eq!(p2.server.as_str(), "s2");
                 assert_eq!(p2.deploy_dir, "/srv/p2");
             }
@@ -4102,9 +4094,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // 0x5EED_5EED per house style, no failure persistence):
     //
     // (a) IMMUTABILITY — the validated domain's derived values are STABLE
-    //     after construction: [`Config::with_release`] with an INVALID name
+    //     after construction: [`ProjectConfig::with_release`] with an INVALID name
     //     returns `Err` and the original is unchanged; with a VALID name it
-    //     returns a NEW [`Config`] whose accessors reflect the new name while
+    //     returns a NEW [`ProjectConfig`] whose accessors reflect the new name while
     //     the original stays unchanged (the operation never mutates).
     // (b) PROOF TYPES — [`crate::model::MatchingMembership::verify`] returns
     //     `Ok` EXACTLY when the frozen and current slot-id sets are EQUAL
@@ -4144,7 +4136,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "parse must reject the invalid release name {invalid_name:?}"
             );
             // with_release on an INVALID name -> Err, and the ORIGINAL is
-            // unchanged (the operation returns a NEW Config or Err; it never
+            // unchanged (the operation returns a NEW ProjectConfig or Err; it never
             // mutates in place).
             let invalid = crate::config::ReleaseName::new(invalid_name.clone());
             assert!(
@@ -4156,7 +4148,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             assert_eq!(original.variant_names(), vec!["standard".to_string()]);
             assert_eq!(original.target_slot_ids("t1").unwrap(), vec!["p1".to_string()]);
 
-            // with_release on a VALID name -> a NEW Config whose accessors
+            // with_release on a VALID name -> a NEW ProjectConfig whose accessors
             // reflect the name; the ORIGINAL is unchanged and its derived
             // values stay stable.
             let valid = crate::config::ReleaseName::parse(&valid_name)
@@ -4177,13 +4169,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // (b) PROOF TYPES.
             // MatchingMembership::verify is Ok EXACTLY when the frozen and
             // current slot-id sets are EQUAL and non-empty, Err otherwise.
-            let frozen: Vec<PlacementSlotId> = frozen_ids
+            let frozen: Vec<SlotId> = frozen_ids
                 .iter()
-                .map(|s| PlacementSlotId::new(s.clone()))
+                .map(|s| SlotId::new(s.clone()))
                 .collect();
-            let current: Vec<PlacementSlotId> = current_ids
+            let current: Vec<SlotId> = current_ids
                 .iter()
-                .map(|s| PlacementSlotId::new(s.clone()))
+                .map(|s| SlotId::new(s.clone()))
                 .collect();
             let frozen_set = SlotSet::new(frozen);
             let current_set = SlotSet::new(current);
@@ -4252,7 +4244,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "the planner's resolution carries exactly the target's member slot"
             );
             assert_eq!(resolved.slots().len(), 1);
-            assert!(resolved.slots().contains(&PlacementSlotId::new("p1")));
+            assert!(resolved.slots().contains(&SlotId::new("p1")));
         }
     }
 }

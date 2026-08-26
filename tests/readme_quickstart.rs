@@ -4,7 +4,7 @@
 //! current schema (via a full dry-run push), so a schema change cannot silently
 //! invalidate the documented configuration.
 
-use deploy::config::Config;
+use deploy::config::ProjectConfig;
 use deploy::error::Result;
 use deploy::push::engine::{PushOptions, push};
 use deploy::remote::transport::{LocalTransport, Remote};
@@ -37,7 +37,7 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
     );
 
     let config_path = proj.join("deploy.toml");
-    let config = Config::load(&config_path)?;
+    let config = ProjectConfig::load(&config_path)?;
     assert_eq!(config.release().as_str(), "v1");
     assert!(
         config.release_root(&config_path).ends_with("releases/v1"),
@@ -102,7 +102,7 @@ fn quickstart_fixture_parses_and_plans() -> Result<()> {
     let remotes_base = tmp.path().join("remotes");
     std::fs::create_dir_all(&remotes_base).unwrap();
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(
             remotes_base.join(s.id.as_str()),

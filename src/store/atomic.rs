@@ -31,7 +31,7 @@
 //! stays [`Error::store`] — the class split a caller can always
 //! distinguish "this marker is corrupt" from "disk read failed".
 //! [`read_json`] folds both into [`Error::store`], which is correct for
-//! its non-marker callers (observed.json, rotation-debt.json, tree
+//! its non-marker callers (observed.json, retention-debt.json, tree
 //! metadata, ...); callers of [`read_json_marker`] must still perform
 //! their own schema-version check after a successful parse (also
 //! [`Error::integrity`]): an unsupported `schema_version` is a

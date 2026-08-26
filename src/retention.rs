@@ -1,4 +1,4 @@
-//! Retention and rotation.
+//! Retention: the slot-owned mark-and-sweep policy and pass.
 //!
 //! Retention is evaluated per server. For each server, the retained content set
 //! is the union of:
@@ -14,17 +14,17 @@
 //! policy of the slot's OWNING VARIANT (the variant file whose `[[slots]]`
 //! entry declares the slot). A slot may be a member of SEVERAL targets (the
 //! multi-target feature) but its state is shared — one physical observed
-//! record, one rotation policy — and targets are only selection views over
+//! record, one retention policy — and targets are only selection views over
 //! that slot state. There is NO per-target policy and NO union across member
 //! targets: the caller resolves the slot's single policy from its owning
-//! variant (`Config::slot_rotation`) and passes it here; every generation
+//! variant (`ProjectConfig::slot_retention`) and passes it here; every generation
 //! record on the server is evaluated under that one policy, so changing a
 //! slot's target membership never changes what is retained.
 //!
-//! Rotation is a mark-and-sweep operation: a tree object is deleted only when no
+//! Retention is a mark-and-sweep operation: a tree object is deleted only when no
 //! retained binding or applicable pin references it.
 
-use crate::config::{Pin, RotationConfig};
+use crate::config::{Pin, RetentionConfig};
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::model::{ReleaseId, TreeDigest};
@@ -42,9 +42,9 @@ struct GenRecord {
 }
 
 /// Compute the set of retained tree digests for one server under the slot's
-/// ONE policy: `rotation` is the retention policy of the slot's OWNING
+/// ONE policy: `retention` is the retention policy of the slot's OWNING
 /// VARIANT, resolved by the caller from the current configuration
-/// (`Config::slot_rotation`) — a single source, never a union across the
+/// (`ProjectConfig::slot_retention`) — a single source, never a union across the
 /// slot's member targets, so membership changes cannot change retention. The
 /// durable pins declared in `deploy.toml` protect whole releases as before.
 /// Capacity headroom, by contrast, is a per-server policy declared on the
@@ -54,7 +54,7 @@ pub fn compute_retained(
     helper: &RemoteHelper,
     pins: &[Pin],
     store: &LocalStore,
-    rotation: &RotationConfig,
+    retention: &RetentionConfig,
 ) -> Result<HashSet<String>> {
     let mut retained: HashSet<String> = HashSet::new();
     let status = helper.status()?;
@@ -64,7 +64,7 @@ pub fn compute_retained(
     // corrupt `assignment.json`), the current tree is UNKNOWN: sweeping
     // anything we cannot prove unreferenced would leave `current` pointing at
     // a deleted tree (a dangling commit pointer). Fail closed — retain every
-    // object present so rotation deletes nothing it cannot account for.
+    // object present so retention deletes nothing it cannot account for.
     let live_tree_unknown = status.current_generation.is_some() && status.current_tree.is_none();
     if live_tree_unknown {
         let obj_root = layout::objects();
@@ -111,7 +111,7 @@ pub fn compute_retained(
     // Apply the slot's ONE policy (from its owning variant) to ALL of the
     // server's records. No union, no membership lookup: the policy was
     // already resolved from the slot's owning variant by the caller.
-    retained.extend(retained_for_policy(helper, &status, &gens, rotation)?);
+    retained.extend(retained_for_policy(helper, &status, &gens, retention)?);
 
     // Durable pins. A pin protects the whole release: every variant's tree
     // recorded in the release record is retained, so the pinned release stays
@@ -125,10 +125,10 @@ pub fn compute_retained(
     // which recomputes-and-verifies the record's identity from its own content
     // and binds it to the requested release id). An un-honorable pin means the
     // retained set cannot expand the content the pin protects, so it is
-    // INCOMPLETE — rotation must ABORT BEFORE ANY DELETION, never treat the
-    // pin as absent and sweep the trees it protects. The rotation caller
-    // converts the abort into the rotation-debt machinery (a durable marker +
-    // warning, post-commit maintenance): the next push retries rotation once
+    // INCOMPLETE — retention must ABORT BEFORE ANY DELETION, never treat the
+    // pin as absent and sweep the trees it protects. The retention caller
+    // converts the abort into the retention-debt machinery (a durable marker +
+    // warning, post-commit maintenance): the next push retries retention once
     // the pinned release is repaired.
     for pin in pins {
         let rid = ReleaseId::parse(&pin.release);
@@ -136,7 +136,7 @@ pub fn compute_retained(
             Error::integrity(format!(
                 "pin names release {rid} whose record cannot be read or verified ({e}): \
                  the pin cannot be honored, so the retained set is incomplete — aborting \
-                 rotation before any tree deletion"
+                 retention before any tree deletion"
             ))
         })?;
         for tree in rec.variants.values() {
@@ -147,7 +147,7 @@ pub fn compute_retained(
     Ok(retained)
 }
 
-/// Apply the slot's ONE rotation policy (owned by its declaring variant) to
+/// Apply the slot's ONE retention policy (owned by its declaring variant) to
 /// every generation record on the server. The caller already resolved the
 /// policy from the slot's owning variant — there is no per-target policy and
 /// no union across member targets. The current generation's prior is
@@ -157,12 +157,12 @@ fn retained_for_policy(
     helper: &RemoteHelper,
     status: &RemoteStatus,
     gens: &[GenRecord],
-    rotation: &RotationConfig,
+    retention: &RetentionConfig,
 ) -> Result<HashSet<String>> {
     let mut retained: HashSet<String> = HashSet::new();
 
     // Prior distinct successful generation when protect_previous is true.
-    if rotation.per_server.protect_previous
+    if retention.per_server.protect_previous
         && let Some(cur) = &status.current_generation
         && let Ok(a) = helper.read_assignment(cur)
         && let Some(prior) = &a.prior_generation
@@ -185,12 +185,12 @@ fn retained_for_policy(
     let mut ordered: Vec<((String, String, String), Timestamp)> = distinct.into_iter().collect();
     ordered.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
 
-    let keep_distinct = rotation.per_server.keep_distinct_artifacts as usize;
+    let keep_distinct = retention.per_server.keep_distinct_artifacts as usize;
     for ((_, _, tree), _) in ordered.iter().take(keep_distinct) {
         retained.insert(tree.clone());
     }
 
-    let keep_days = rotation.per_server.keep_days;
+    let keep_days = retention.per_server.keep_days;
     if keep_days > 0 {
         let cutoff = Timestamp::now() - jiff::SignedDuration::from_hours(keep_days as i64 * 24);
         for ((_, _, tree), ts) in &ordered {
@@ -202,7 +202,7 @@ fn retained_for_policy(
 
     // Deployment window: newest `protect_deployments` distinct deployment IDs
     // among the server's records.
-    let protect_deployments = rotation.deployment.protect_deployments as usize;
+    let protect_deployments = retention.deployment.protect_deployments as usize;
     if protect_deployments > 0 {
         let mut depl: BTreeMap<String, Timestamp> = BTreeMap::new();
         for g in gens {
@@ -240,12 +240,10 @@ pub fn retained_summary(retained: &HashSet<String>) -> Vec<TreeDigest> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, SlotDef};
+    use crate::config::{ProjectConfig, SlotConfig};
     use crate::layout;
-    use crate::model::{
-        PlacementSlotId, RELEASE_RECORD_SCHEMA_VERSION, ReleaseRecord, VariantName,
-    };
-    use crate::push::engine::set_rotation_deferred;
+    use crate::model::{RELEASE_RECORD_SCHEMA_VERSION, ReleaseRecord, SlotId, VariantName};
+    use crate::push::engine::set_retention_deferred;
     use crate::release::build_release;
     use crate::remote::helper::{GenerationAssignment, RemoteHelper};
     use crate::remote::transport::LocalTransport;
@@ -254,7 +252,7 @@ mod tests {
     use proptest::test_runner::RngSeed;
     use std::path::PathBuf;
 
-    fn cfg() -> Config {
+    fn cfg() -> ProjectConfig {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
@@ -270,12 +268,12 @@ server = "s1"
 target = "t1"
 deploy_dir = "/srv"
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 1
 
 [activation]
@@ -305,14 +303,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 "#;
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml).unwrap();
-        Config::load(&p).unwrap()
+        ProjectConfig::load(&p).unwrap()
     }
 
     /// The slot's single retention policy, resolved from its OWNING VARIANT
     /// (`standard` declares slot `p1`): retention is slot-owned, never a
     /// per-target surface.
-    fn rot(c: &Config) -> &RotationConfig {
-        &c.variant("standard").unwrap().rotation
+    fn ret(c: &ProjectConfig) -> &RetentionConfig {
+        &c.variant("standard").unwrap().retention
     }
 
     #[test]
@@ -367,7 +365,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         helper.swap_current(None, "g2", "op").unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let c = cfg();
-        let retained = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap();
+        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
         assert!(retained.contains("t2"), "current tree retained");
         assert!(retained.contains("t1"), "previous tree retained");
     }
@@ -427,11 +425,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         }];
 
         // Without the pin the server has no history, so nothing is retained.
-        let bare = compute_retained(&helper, &[], &store, rot(&c)).unwrap();
+        let bare = compute_retained(&helper, &[], &store, ret(&c)).unwrap();
         assert!(bare.is_empty(), "no history and no pins retains nothing");
 
         // With the pin, BOTH variants' trees are protected.
-        let retained = compute_retained(&helper, &pinned, &store, rot(&c)).unwrap();
+        let retained = compute_retained(&helper, &pinned, &store, ret(&c)).unwrap();
         assert!(
             retained.contains("tree-a"),
             "variant a protected by the pin"
@@ -457,7 +455,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         target: Option<&str>,
     ) {
         // The tree object must resolve for `status()`/`exists` to follow the
-        // `current` symlink chain (mirrors the existing rotation tests).
+        // `current` symlink chain (mirrors the existing retention tests).
         helper
             .remote()
             .create_dir_all(&layout::tree_root(tree))
@@ -523,27 +521,27 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let mut c = cfg();
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .per_server
             .keep_distinct_artifacts = 2;
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .per_server
             .keep_days = 0;
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .deployment
             .protect_deployments = 0;
         // No prior chain, so protect_previous has nothing to add.
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .per_server
             .protect_previous = false;
 
-        let retained = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap();
+        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
         assert!(retained.contains("t3"), "current tree retained");
         assert!(retained.contains("t2"), "newest distinct binding retained");
         assert!(
@@ -569,26 +567,26 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let mut c = cfg();
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .per_server
             .keep_distinct_artifacts = 1;
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .per_server
             .keep_days = 30;
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .per_server
             .protect_previous = false;
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .deployment
             .protect_deployments = 0;
 
-        let retained = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap();
+        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
         assert!(retained.contains("t-recent"));
         assert!(
             !retained.contains("t-old"),
@@ -598,10 +596,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // Widen the window past the old artifact: it is retained again.
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .per_server
             .keep_days = 90;
-        let retained = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap();
+        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
         assert!(
             retained.contains("t-old"),
             "artifact inside keep_days must be retained"
@@ -649,26 +647,26 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let mut c = cfg();
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .per_server
             .keep_distinct_artifacts = 1;
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .per_server
             .keep_days = 0;
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .per_server
             .protect_previous = false;
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .deployment
             .protect_deployments = 2;
 
-        let retained = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap();
+        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
         assert!(retained.contains("t3"), "current deployment retained");
         assert!(
             retained.contains("t2"),
@@ -680,7 +678,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
     }
 
-    /// Rotation never deletes what rollback needs: with EVERY retention
+    /// Retention never deletes what rollback needs: with EVERY retention
     /// window zeroed (keep_distinct = 0, keep_days = 0, deployment = 0) and no
     /// pins, the current artifact and the protected previous artifact survive.
     #[test]
@@ -712,26 +710,26 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let mut c = cfg();
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .per_server
             .keep_distinct_artifacts = 0;
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .per_server
             .keep_days = 0;
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .per_server
             .protect_previous = true;
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .deployment
             .protect_deployments = 0;
 
-        let retained = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap();
+        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
         assert!(retained.contains("t2"), "current tree is never swept");
         assert!(
             retained.contains("t1"),
@@ -739,15 +737,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
     }
 
-    /// Rotation must NEVER sweep the tree behind a live `current` whose
+    /// Retention must NEVER sweep the tree behind a live `current` whose
     /// assignment cannot be read (a missing or corrupt `assignment.json`): the
     /// retained set always includes "the artifact referenced by the current
     /// generation" (requirement.md), and an unreadable assignment makes that
     /// artifact UNKNOWN. Failing open (sweeping) would leave `current`
     /// dangling. The engine hits this when a push fails pre-swap against a
-    /// corrupt live generation and then runs rotation.
+    /// corrupt live generation and then runs retention.
     #[test]
-    fn rotation_never_sweeps_when_live_assignment_is_unreadable() {
+    fn retention_never_sweeps_when_live_assignment_is_unreadable() {
         let dir = tempfile::tempdir().unwrap();
         let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
         let helper = RemoteHelper::new(&remote);
@@ -780,26 +778,26 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // sweep would delete the live tree.
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .per_server
             .keep_distinct_artifacts = 0;
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .per_server
             .keep_days = 0;
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .per_server
             .protect_previous = false;
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .deployment
             .protect_deployments = 0;
 
-        let retained = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap();
+        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
         assert!(
             retained.contains("t1"),
             "the live (unreadable) generation's tree must be retained fail-closed"
@@ -807,7 +805,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         helper.rotate(&retained, &HashSet::new()).unwrap();
         assert!(
             helper.remote().exists(&crate::layout::tree_root("t1")),
-            "rotation must not sweep the tree behind a live current with an unreadable assignment"
+            "retention must not sweep the tree behind a live current with an unreadable assignment"
         );
     }
 
@@ -816,7 +814,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// removing a rollout group in the slot's `groups` list (a config-level
     /// membership change — groups only SELECT slots, they never own policy)
     /// leaves the retained digest set IDENTICAL. The policy is resolved
-    /// through the same `Config::slot_rotation` path the engine uses, and the
+    /// through the same `ProjectConfig::slot_retention` path the engine uses, and the
     /// second config is a REAL reload of an edited slot declaration.
     #[test]
     fn group_membership_never_changes_retention() {
@@ -853,7 +851,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         helper.swap_current(None, "g3", "op").unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
-        // Config-level group change: rewrite `standard.toml` so slot `p1`
+        // ProjectConfig-level group change: rewrite `standard.toml` so slot `p1`
         // belongs to the `canary` group, then reload the project. The owning
         // variant — and therefore the slot's ONE policy — is unchanged.
         let project = tempfile::tempdir().unwrap();
@@ -872,12 +870,12 @@ target = "production"
 groups = ["canary"]
 deploy_dir = "/srv"
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 2
 
 [activation]
@@ -906,8 +904,8 @@ host_key_fingerprint = "SHA256:test"
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 "#;
         std::fs::write(proj.join("deploy.toml"), deploy_toml).unwrap();
-        let c = Config::load(&proj.join("deploy.toml")).unwrap();
-        let before = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap();
+        let c = ProjectConfig::load(&proj.join("deploy.toml")).unwrap();
+        let before = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
 
         // The config-level group change: ADD a new rollout group (`wave-1`)
         // to slot `p1`'s `groups` list, then reload. Groups are selection-only
@@ -918,20 +916,20 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap()
             .replace("groups = [\"canary\"]", "groups = [\"canary\", \"wave-1\"]");
         std::fs::write(&variant_path, edited).unwrap();
-        let c2 = Config::load(&proj.join("deploy.toml")).unwrap();
+        let c2 = ProjectConfig::load(&proj.join("deploy.toml")).unwrap();
         assert_eq!(
             c2.slot_variant("p1").unwrap(),
             "standard",
             "the owning variant is unchanged by group edits"
         );
-        let after = compute_retained(&helper, &c2.pins, &store, rot(&c2)).unwrap();
+        let after = compute_retained(&helper, &c2.pins, &store, ret(&c2)).unwrap();
         assert_eq!(
             before, after,
             "changing a slot's group membership must never change its retained set"
         );
         // And group membership cannot even influence the API: the policy
         // argument is the slot's single owning-variant policy.
-        assert_eq!(rot(&c), rot(&c2), "the slot's policy is unchanged");
+        assert_eq!(ret(&c), ret(&c2), "the slot's policy is unchanged");
     }
 
     /// LEGACY generation records (no originating target) predate attribution
@@ -978,26 +976,26 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let mut c = cfg();
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .per_server
             .keep_distinct_artifacts = 2;
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .per_server
             .keep_days = 0;
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .per_server
             .protect_previous = false;
         c.variant_mut("standard")
             .unwrap()
-            .rotation
+            .retention
             .deployment
             .protect_deployments = 0;
 
-        let retained = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap();
+        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
         assert!(retained.contains("t3"), "current live tree retained");
         assert!(
             retained.contains("t2"),
@@ -1009,13 +1007,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
     }
 
-    // ---- fail-closed pins: an un-honorable pinned release aborts rotation ----
+    // ---- fail-closed pins: an un-honorable pinned release aborts retention ----
 
     /// The three corruption classes for a pinned release's STORED record: the
     /// record file missing (a pin naming nothing on disk), the record file
     /// holding garbage bytes (unreadable as JSON), or a record whose stored
     /// identity fields do not match its content (the recompute-and-verify in
-    /// [`LocalStore::read_release`] fails). Every class must abort rotation
+    /// [`LocalStore::read_release`] fails). Every class must abort retention
     /// with an integrity error BEFORE any deletion — never treat the pin as
     /// absent — and must recover EXACTLY after the record is repaired.
     #[derive(Clone, Copy, Debug)]
@@ -1084,7 +1082,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &variants,
             &BTreeMap::from([(
                 "standard".to_string(),
-                vec![SlotDef {
+                vec![SlotConfig {
                     id: "p1".to_string(),
                     server: "s1".to_string(),
                     deploy_dir: PathBuf::from("/srv/pin"),
@@ -1154,7 +1152,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         // Sanity with the VALID record: the pin protects both variant trees
         // and the garbage object is unretained (sweepable).
-        let retained = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap();
+        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
         assert!(
             retained.contains("tree-pin-a"),
             "variant tree protected by the pin"
@@ -1178,35 +1176,35 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         // ABORT: an un-honorable pin is an integrity error — the pin is never
         // treated as absent (a silently-skipped pin would drop its trees from
-        // the retained set and let rotation delete them).
-        let err = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap_err();
+        // the retained set and let retention delete them).
+        let err = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap_err();
         assert!(
             matches!(err, Error::Integrity(_)),
-            "an un-honorable pin aborts rotation with an integrity error, got: {err}"
+            "an un-honorable pin aborts retention with an integrity error, got: {err}"
         );
         assert!(
             err.to_string().contains("pin names release"),
             "the integrity error names the pin, got: {err}"
         );
 
-        // ZERO DELETIONS: rotation never ran (the retained set was never
+        // ZERO DELETIONS: retention never ran (the retained set was never
         // computed), so the receiver inventory is byte-identical and every
         // tree — pin-only AND garbage — survives.
         let inventory_after = std::fs::read(&inv_path).unwrap();
         assert_eq!(
             inventory_after, inventory_before,
-            "the failed rotation must not delete a single tree object"
+            "the failed retention must not delete a single tree object"
         );
         for t in ["tree-pin-a", "tree-pin-b", "tree-garbage"] {
             assert!(
                 helper.remote().exists(&layout::tree_root(t)),
-                "tree {t} must survive the failed rotation"
+                "tree {t} must survive the failed retention"
             );
         }
 
-        // REPAIR the record, then RETRY the rotation.
+        // REPAIR the record, then RETRY the retention.
         repair_pin_record(&store, &rec);
-        let retained = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap();
+        let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
         assert!(
             retained.contains("tree-pin-a") && retained.contains("tree-pin-b"),
             "the repaired record restores the pin's protection"
@@ -1251,7 +1249,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // receiver inventory (random counts of pin-only trees and garbage
         // objects) with a randomly corrupted pinned release. The abort is
         // FAIL-CLOSED: `compute_retained` errors with an integrity class, the
-        // rotation-debt machinery records the durable marker, and ZERO trees
+        // retention-debt machinery records the durable marker, and ZERO trees
         // are deleted (the receiver inventory is byte-identical). After the
         // release record is REPAIRED, the retry deletes EXACTLY the genuinely
         // unretained trees (the pin-only trees survive; the garbage is
@@ -1296,7 +1294,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
             // Sanity: the valid record pins every variant tree; every garbage
             // object is unretained.
-            let retained = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap();
+            let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
             for t in &pin_trees {
                 assert!(retained.contains(t), "pin tree {t} retained via the pin");
             }
@@ -1312,7 +1310,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
             // ABORT before any deletion: an integrity error, never an absent
             // pin.
-            let err = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap_err();
+            let err = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap_err();
             assert!(matches!(err, Error::Integrity(_)));
             assert!(err.to_string().contains("pin names release"));
 
@@ -1320,17 +1318,17 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             assert_eq!(
                 std::fs::read(&inv_path).unwrap(),
                 inventory_before,
-                "the failed rotation must not delete a single tree object"
+                "the failed retention must not delete a single tree object"
             );
 
             // ROTATION DEBT: the engine's post-commit conversion records the
             // durable marker (the abort is a maintenance deferral, never a
             // hard push failure); the retry services it once the record is
             // repaired.
-            let slot = PlacementSlotId::new("p1".to_string());
-            let warnings = set_rotation_deferred(&store, "t1", &slot, &err.to_string());
+            let slot = SlotId::new("p1".to_string());
+            let warnings = set_retention_deferred(&store, "t1", &slot, &err.to_string());
             assert!(warnings.is_empty(), "the marker write must succeed: {warnings:?}");
-            let debt = store.read_rotation_debt("t1").unwrap();
+            let debt = store.read_retention_debt("t1").unwrap();
             assert_eq!(
                 debt.get("p1").map(|s| s.as_str()),
                 Some(err.to_string().as_str()),
@@ -1340,7 +1338,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // REPAIR + RETRY: exact deletions — pin trees and live trees
             // survive, the true garbage is removed — and the marker clears.
             repair_pin_record(&store, &rec);
-            let retained = compute_retained(&helper, &c.pins, &store, rot(&c)).unwrap();
+            let retained = compute_retained(&helper, &c.pins, &store, ret(&c)).unwrap();
             helper.rotate(&retained, &HashSet::new()).unwrap();
             for t in &pin_trees {
                 assert!(
@@ -1360,14 +1358,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     "garbage {t} is removed by the retry"
                 );
             }
-            let mut debt = store.read_rotation_debt("t1").unwrap();
+            let mut debt = store.read_retention_debt("t1").unwrap();
             assert!(
                 debt.remove("p1").is_some(),
-                "the retried rotation services the marker"
+                "the retried retention services the marker"
             );
-            store.write_rotation_debt("t1", &debt).unwrap();
+            store.write_retention_debt("t1", &debt).unwrap();
             assert!(
-                store.read_rotation_debt("t1").unwrap().is_empty(),
+                store.read_retention_debt("t1").unwrap().is_empty(),
                 "the debt marker is cleared once the retry succeeds"
             );
         }

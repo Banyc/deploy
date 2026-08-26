@@ -2,7 +2,7 @@
 //!
 //! The remote helper owns status inspection, locking, object publication,
 //! generation switching, transaction recovery, adapter invocation, and
-//! rotation. It performs a protocol-version handshake before mutation and every
+//! retention. It performs a protocol-version handshake before mutation and every
 //! mutating request carries an operation ID and is idempotent.
 //!
 //! Transport setup is split into two phases: [`Remote::prepare_identity`]

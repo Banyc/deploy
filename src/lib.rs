@@ -16,8 +16,8 @@ pub mod push;
 pub mod records;
 pub mod release;
 pub mod remote;
+pub mod retention;
 pub(crate) mod revset;
-pub mod rotation;
 pub mod scalar;
 pub mod store;
 #[cfg(test)]

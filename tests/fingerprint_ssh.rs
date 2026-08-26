@@ -6,7 +6,7 @@
 //! configured with ONLY a `host_key_fingerprint` (no `known_hosts`), covering
 //! the four scenarios: status, dry-run, first push, and repeat push.
 
-use deploy::config::Config;
+use deploy::config::ProjectConfig;
 use deploy::error::Result;
 use deploy::push::engine::{PushOptions, push};
 use deploy::records::DeploymentStatus;
@@ -260,12 +260,12 @@ from = "artifacts/deployment/common/"
 to = "app-common/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 2
 
 [activation]
@@ -309,7 +309,7 @@ rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_
 /// Set up a single-slot project (deploy.toml + variant file + artifact inputs),
 /// return the loaded config and the config path. The slot is declared inside
 /// the variant file and binds itself to `production` with its `targets` list.
-fn setup_project(proj: &Path, address: &str, deploy_dir: &str) -> (Config, PathBuf) {
+fn setup_project(proj: &Path, address: &str, deploy_dir: &str) -> (ProjectConfig, PathBuf) {
     write_file(&proj.join("deploy.toml"), &single_target_toml(address));
     let release_dir = proj.join("releases").join("v1");
     let slot_toml = format!(
@@ -323,7 +323,7 @@ fn setup_project(proj: &Path, address: &str, deploy_dir: &str) -> (Config, PathB
     write_file(&artifacts.join("build/output/app/server"), "server-v1\n");
     write_file(&artifacts.join("deployment/common/README"), "common\n");
     let p = proj.join("deploy.toml");
-    (Config::load(&p).unwrap(), p)
+    (ProjectConfig::load(&p).unwrap(), p)
 }
 
 /// Snapshot of a directory tree: sorted (relative path, kind+content) pairs,
@@ -384,7 +384,7 @@ fn fingerprint_only_dry_run_leaves_remote_untouched() -> Result<()> {
 
             let fp = fake.fingerprint.clone();
             let factory = move |s: &deploy::config::ServerDef,
-                                slot: &deploy::config::SlotDef|
+                                slot: &deploy::config::SlotConfig|
                   -> Result<Box<dyn Remote>> {
                 Ok(Box::new(SshTransport::new(
                     &s.user,
@@ -446,7 +446,7 @@ fn fingerprint_only_first_push_succeeds() -> Result<()> {
 
             let fp = fake.fingerprint.clone();
             let factory = move |s: &deploy::config::ServerDef,
-                                slot: &deploy::config::SlotDef|
+                                slot: &deploy::config::SlotConfig|
                   -> Result<Box<dyn Remote>> {
                 Ok(Box::new(SshTransport::new(
                     &s.user,
@@ -479,7 +479,7 @@ fn fingerprint_only_first_push_succeeds() -> Result<()> {
             assert!(
                 attempt
                     .slots
-                    .contains_key(&deploy::model::PlacementSlotId::new("p1"))
+                    .contains_key(&deploy::model::SlotId::new("p1"))
             );
 
             // The emulated remote now has the full layout: a generation under
@@ -529,7 +529,7 @@ fn fingerprint_only_repeat_push_is_idempotent() -> Result<()> {
 
             let fp = fake.fingerprint.clone();
             let factory = move |s: &deploy::config::ServerDef,
-                                slot: &deploy::config::SlotDef|
+                                slot: &deploy::config::SlotConfig|
                   -> Result<Box<dyn Remote>> {
                 Ok(Box::new(SshTransport::new(
                     &s.user,

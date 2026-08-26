@@ -43,8 +43,8 @@
 //! operation that must fail. Because the registry is per-fixture, the arm and
 //! the consuming push no longer need to be wrapped in a lock window.
 //!
-//! Mechanical conversion for sibling fault work (e.g. the rotation-debt arms
-//! `arm_read_rotation_debt` / `arm_write_rotation_debt`): the registry keeps
+//! Mechanical conversion for sibling fault work (e.g. the retention-debt arms
+//! `arm_read_retention_debt` / `arm_write_retention_debt`): the registry keeps
 //! the historical `arm_<kind>(id)` (and `arm_<kind>(id, target)`) method
 //! surface, so a call site `test_faults::arm_<kind>(id)` converts by changing
 //! only the receiver: `store.fault_registry().arm_<kind>(id)`. The store
@@ -80,8 +80,8 @@ pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// ahead of the target lock — the crash-at-mkdir boundary, leaving NO target
 /// directory), the post-commit observed-refresh faults ([`FaultKind::WriteServer`],
 /// [`FaultKind::WriteObserved`], keyed additionally by TARGET), and the
-/// rotation-maintenance arms ([`FaultKind::ReadRotationDebt`],
-/// [`FaultKind::WriteRotationDebt`], keyed by TARGET). The CHECKPOINT kinds
+/// retention-maintenance arms ([`FaultKind::ReadRetentionDebt`],
+/// [`FaultKind::WriteRetentionDebt`], keyed by TARGET). The CHECKPOINT kinds
 /// are keyed by TARGET: the ledger replacement's before/after slots
 /// ([`FaultKind::LedgerReplaceBefore`] / [`FaultKind::LedgerReplaceAfter`])
 /// and the three best-effort sweep stages ([`FaultKind::SweepDeployments`],
@@ -159,12 +159,12 @@ pub(crate) mod test_faults {
         /// observed state, never replicated per target), keyed by
         /// (deployment id, SLOT id).
         WriteObserved,
-        /// `read_rotation_debt` (rotation maintenance debt read), keyed by
+        /// `read_retention_debt` (retention maintenance debt read), keyed by
         /// target.
-        ReadRotationDebt,
-        /// `write_rotation_debt` (rotation maintenance debt write), keyed by
+        ReadRetentionDebt,
+        /// `write_retention_debt` (retention maintenance debt write), keyed by
         /// target.
-        WriteRotationDebt,
+        WriteRetentionDebt,
         /// `read_sweep_debt` (the store-global sweep-debt read), keyed by the
         /// empty global key (the sweep debt is store-global, not
         /// target-keyed). Post-commit maintenance: a failure is a warning,
@@ -441,18 +441,18 @@ pub(crate) mod test_faults {
             self.arm_target(FaultKind::WriteObserved, deployment_id, slot);
         }
 
-        /// Arm the next `read_rotation_debt` call for `target` to fail once
-        /// (rotation-maintenance debt, keyed by target). Absorbs the
-        /// debt-I/O sibling agent's `arm_read_rotation_debt`.
-        pub(crate) fn arm_read_rotation_debt(&self, target: &str) {
-            self.arm(FaultKind::ReadRotationDebt, target);
+        /// Arm the next `read_retention_debt` call for `target` to fail once
+        /// (retention-maintenance debt, keyed by target). Absorbs the
+        /// debt-I/O sibling agent's `arm_read_retention_debt`.
+        pub(crate) fn arm_read_retention_debt(&self, target: &str) {
+            self.arm(FaultKind::ReadRetentionDebt, target);
         }
 
-        /// Arm the next `write_rotation_debt` call for `target` to fail once
-        /// (rotation-maintenance debt, keyed by target). Absorbs the
-        /// debt-I/O sibling agent's `arm_write_rotation_debt`.
-        pub(crate) fn arm_write_rotation_debt(&self, target: &str) {
-            self.arm(FaultKind::WriteRotationDebt, target);
+        /// Arm the next `write_retention_debt` call for `target` to fail once
+        /// (retention-maintenance debt, keyed by target). Absorbs the
+        /// debt-I/O sibling agent's `arm_write_retention_debt`.
+        pub(crate) fn arm_write_retention_debt(&self, target: &str) {
+            self.arm(FaultKind::WriteRetentionDebt, target);
         }
 
         /// Arm the next checkpoint ATOMIC LEDGER REPLACEMENT for `target` to
@@ -607,14 +607,14 @@ pub(crate) mod step17_hook {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum HookPhase {
         /// The deferred-maintenance retry ([`crate::push::engine`]'s
-        /// `retry_deferred_rotations`): the engine reads the rotation debt
+        /// `retry_deferred_retentions`): the engine reads the retention debt
         /// FIRST (before this park), then services each slot under the
         /// mutation lock. Runs on later pushes — before the fresh step-17
-        /// rotation on the normal path and at the no-op return — whenever a
+        /// retention on the normal path and at the no-op return — whenever a
         /// prior push left a debt marker.
         DeferredRetry,
-        /// The fresh per-slot rotation of THIS push (step 17): the
-        /// post-commit rotation of every slot the push's target belongs to.
+        /// The fresh per-slot retention of THIS push (step 17): the
+        /// post-commit retention of every slot the push's target belongs to.
         /// Its contended else-branch defers the maintenance as a debt
         /// marker (a debt read-modify-write) — the phase where a debt-I/O
         /// fault is meant to fire.
@@ -647,7 +647,7 @@ pub(crate) mod step17_hook {
         /// TEST-facing handle. The engine of a push carrying THIS deployment
         /// id will now signal + park at EVERY step-17-equivalent lock
         /// acquisition (the deferred-maintenance retry AND the fresh step-17
-        /// rotation), each signal carrying its [`HookPhase`]; the test receives
+        /// retention), each signal carrying its [`HookPhase`]; the test receives
         /// each signal, holds the competing lock guard (and may arm per-phase
         /// faults), then releases the engine via [`HookHandle::release`].
         pub(crate) fn arm(hook: &Arc<Self>, deployment_id: &str) -> HookHandle {
@@ -1070,8 +1070,8 @@ pub(crate) mod test_remotes {
     /// write once (the last step of `RemoteHelper::rotate`), letting a test
     /// inject a post-commit ROTATION failure deterministically: the
     /// mark-and-sweep deletions have already happened, then the inventory
-    /// write errors — exactly the "rotation failed after commit" window the
-    /// engine defers as durable rotation debt. Mirrors the
+    /// write errors — exactly the "retention failed after commit" window the
+    /// engine defers as durable retention debt. Mirrors the
     /// `FailOnceMarkerRemote` pattern: the fault fires on the first `write`
     /// whose path is exactly `state/inventory.json` and disarms itself,
     /// while every other call passes through untouched.
@@ -1106,7 +1106,7 @@ pub(crate) mod test_remotes {
             if self.fail_inventory(rel) {
                 self.armed.store(false, Ordering::SeqCst);
                 return Err(Error::remote(
-                    "FailOnceInventoryRemote: rotation inventory write forced to fail (once)",
+                    "FailOnceInventoryRemote: retention inventory write forced to fail (once)",
                 ));
             }
             self.inner.write(rel, data, mode)
@@ -1267,7 +1267,7 @@ pub(crate) mod test_remotes {
     pub(crate) fn recording_factory(
         base: PathBuf,
         calls: Arc<AtomicUsize>,
-    ) -> impl Fn(&crate::config::ServerDef, &crate::config::SlotDef) -> Result<Box<dyn Remote>>
+    ) -> impl Fn(&crate::config::ServerDef, &crate::config::SlotConfig) -> Result<Box<dyn Remote>>
     {
         move |s, _slot| {
             calls.fetch_add(1, Ordering::SeqCst);

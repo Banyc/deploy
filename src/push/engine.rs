@@ -5,16 +5,16 @@
 //! preflight capacity, staging, batched per-server publication with a
 //! compare-and-swap precondition, atomic `current` swap, activation,
 //! verification, compensation, commit markers, history, rollback, and
-//! per-server rotation.
+//! per-server retention.
 
 use crate::adapter::verify::run_verification;
-use crate::config::{Config, FailurePolicy, Mapping, RotationConfig, SlotDef};
+use crate::config::{FailurePolicy, Mapping, ProjectConfig, RetentionConfig, SlotConfig};
 use crate::error::{Error, Result};
 use crate::history::{self, PushRef, RefExpr};
 use crate::layout;
 use crate::model::{
-    ArtifactRef, BehaviorContract, DeploymentId, GenerationId, OperationId, PlacementSlotId,
-    ReleaseId, TargetName, TreeDigest, VariantName,
+    ArtifactRef, BehaviorContract, DeploymentId, GenerationId, OperationId, ReleaseId, SlotId,
+    TargetName, TreeDigest, VariantName,
 };
 use crate::push::capacity::capacity_preflight;
 use crate::push::lock::FileLock;
@@ -26,12 +26,12 @@ use crate::push::staging::{StagingCleanup, cleanup_dry_run_staging, remove_tree_
 use crate::records::{
     BehaviorIndex, DeploymentIntent, DeploymentPlan, DeploymentStatus, DesiredGeneration,
     IntentSlot, LedgerIntentReport, LedgerTerminal, NonEmptySlotTable, ObservedSlot, PlanSource,
-    PreviousGeneration, ServerOutcomeKind, SlotAttemptState, SlotPlan, SlotResult, SlotTable,
+    PreviousGeneration, SlotAttemptState, SlotOutcomeKind, SlotPlan, SlotResult, SlotTable,
     TerminalDisposition,
 };
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::transport::Remote;
-use crate::rotation::compute_retained;
+use crate::retention::compute_retained;
 use crate::store::local::LocalStore;
 #[cfg(test)]
 use crate::testutil::step17_hook::HookPhase;
@@ -59,7 +59,7 @@ pub struct PushReport {
     pub attempt: Option<LedgerIntentReport>,
     pub message: String,
     /// Warning about post-commit maintenance deferred on this push (e.g. a
-    /// per-slot rotation that failed after the deployment already committed).
+    /// per-slot retention that failed after the deployment already committed).
     /// The push itself is unaffected — its status/attempt are the real
     /// outcome — and the deferred work is retried on later pushes, including
     /// no-ops. `None` when no maintenance is outstanding.
@@ -68,7 +68,7 @@ pub struct PushReport {
 }
 
 type RemoteFactory =
-    dyn Fn(&crate::config::ServerDef, &crate::config::SlotDef) -> Result<Box<dyn Remote>>;
+    dyn Fn(&crate::config::ServerDef, &crate::config::SlotConfig) -> Result<Box<dyn Remote>>;
 
 /// Build the template context for one placement slot from the ARTIFACT being
 /// processed: `release`/`variant`/`tree` are the assigned artifact's own
@@ -86,10 +86,10 @@ type RemoteFactory =
 /// them (e.g. the reconciliation loop) pass `None`, and a template referencing
 /// such a variable there fails loudly.
 fn slot_vars(
-    members: &[(&crate::config::SlotDef, &crate::config::ServerDef)],
-    config: &Config,
+    members: &[(&crate::config::SlotConfig, &crate::config::ServerDef)],
+    config: &ProjectConfig,
     target_name: &str,
-    slot_id: &PlacementSlotId,
+    slot_id: &SlotId,
     artifact: &ArtifactRef,
     deployment_id: Option<&DeploymentId>,
     generation: Option<&GenerationId>,
@@ -130,7 +130,7 @@ pub fn push(
     store: &LocalStore,
     factory: &RemoteFactory,
     target_name: &str,
-    config: &Config,
+    config: &ProjectConfig,
     opts: &PushOptions,
 ) -> Result<PushReport> {
     let deployment_id = DeploymentId::generate();
@@ -213,10 +213,10 @@ pub fn push(
         let rec = store
             .read_release(release)
             .map_err(|_| Error::rollback(format!("release {release} not available locally")))?;
-        let current_slot_ids: Vec<PlacementSlotId> = config
+        let current_slot_ids: Vec<SlotId> = config
             .target_slots(target_name)?
             .into_iter()
-            .map(|(slot, _)| PlacementSlotId::new(slot.id.clone()))
+            .map(|(slot, _)| SlotId::new(slot.id.clone()))
             .collect();
         crate::push::plan::validate_direct_release_membership(
             target_name,
@@ -295,7 +295,7 @@ pub(crate) fn push_with_id(
     store: &LocalStore,
     factory: &RemoteFactory,
     target_name: &str,
-    config: &Config,
+    config: &ProjectConfig,
     opts: &PushOptions,
     deployment_id: &DeploymentId,
 ) -> Result<PushReport> {
@@ -337,7 +337,7 @@ pub(crate) fn push_ref_with_id(
     store: &LocalStore,
     factory: &RemoteFactory,
     target_name: &str,
-    config: &Config,
+    config: &ProjectConfig,
     opts: &PushOptions,
     deployment_id: &DeploymentId,
 ) -> Result<PushReport> {
@@ -397,8 +397,8 @@ fn push_inner(
     resolved: Option<PushRef>,
     deployment_id: &DeploymentId,
     op_id: &OperationId,
-    config: &Config,
-    target: &crate::config::TargetDef,
+    config: &ProjectConfig,
+    target: &crate::config::TargetConfig,
     opts: &PushOptions,
 ) -> Result<PushReport> {
     // 3. Materialize every declared variant. Mappings resolve from the release
@@ -463,11 +463,11 @@ fn push_inner(
     // NOT part of the release: it is a per-server policy resolved from the
     // caller's current `deploy.toml` at preflight time (servers have no
     // per-release history), so a server-capacity change never produces a new
-    // release. Rotation is target-wide configuration read from `deploy.toml` at
+    // release. Retention is target-wide configuration read from `deploy.toml` at
     // push time, so it is not snapshotted per variant either.
     let mut variant_mappings: BTreeMap<String, Vec<Mapping>> = BTreeMap::new();
     let mut variant_behaviors: BTreeMap<String, BehaviorContract> = BTreeMap::new();
-    let mut variant_slots: BTreeMap<String, Vec<SlotDef>> = BTreeMap::new();
+    let mut variant_slots: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::new();
     for v in config.variant_names() {
         let vcfg = config.variant(&v)?;
         variant_mappings.insert(v.clone(), vcfg.artifact.mappings.clone());
@@ -496,7 +496,7 @@ fn push_inner(
     // the post-reconciliation chain).
     //
     // The helpers/statuses cover ALL of the target's member slots (a pending
-    // attempt may involve any of them, and deferred-rotation debt for any of
+    // attempt may involve any of them, and deferred-retention debt for any of
     // them is serviced from here); the SELECTED slots — the per-branch
     // resolution of the {target, group} selection — are the ones this push
     // plans, mutates, and refreshes, derived from the plan's assignments
@@ -505,17 +505,16 @@ fn push_inner(
     // `release:<id>` from the release's FROZEN topology rebound to the
     // current physical slots).
     let all_members = config.target_slots(target_name)?;
-    let mut remotes: HashMap<PlacementSlotId, Box<dyn Remote>> = HashMap::new();
-    let mut helpers: HashMap<PlacementSlotId, RemoteHelper> = HashMap::new();
-    let mut statuses: HashMap<PlacementSlotId, crate::remote::helper::RemoteStatus> =
-        HashMap::new();
+    let mut remotes: HashMap<SlotId, Box<dyn Remote>> = HashMap::new();
+    let mut helpers: HashMap<SlotId, RemoteHelper> = HashMap::new();
+    let mut statuses: HashMap<SlotId, crate::remote::helper::RemoteStatus> = HashMap::new();
     for (slot, s) in &all_members {
-        let slot_id = PlacementSlotId::new(slot.id.clone());
+        let slot_id = SlotId::new(slot.id.clone());
         let remote = factory(s, slot)?;
         remotes.insert(slot_id, remote);
     }
     for (slot, _s) in &all_members {
-        let slot_id = PlacementSlotId::new(slot.id.clone());
+        let slot_id = SlotId::new(slot.id.clone());
         let r = remotes.get(&slot_id).unwrap();
         let helper = RemoteHelper::new(r.as_ref());
         // Prepare the host identity (verify/pin the host key) BEFORE any status
@@ -702,7 +701,7 @@ fn push_inner(
     // is consumed by accessor: the planner built it (target + declared
     // temporal source + the non-empty resolved slot set), the engine never
     // constructs one.
-    let members: Vec<(&crate::config::SlotDef, &crate::config::ServerDef)> = assignments
+    let members: Vec<(&crate::config::SlotConfig, &crate::config::ServerDef)> = assignments
         .iter()
         .map(|a| {
             all_members
@@ -729,7 +728,7 @@ fn push_inner(
     // planner's PROOF-BEARING [`crate::push::plan::ResolvedSelection`] by
     // accessor (`planned.resolved().slots()`), the exact non-empty slot set
     // the planner resolved against the reference's declared temporal source.
-    let planned_slot_ids: Vec<PlacementSlotId> = resolved.slots().iter().cloned().collect();
+    let planned_slot_ids: Vec<SlotId> = resolved.slots().iter().cloned().collect();
     crate::push::plan::validate_partial_rollout(selection, &planned_slot_ids, config, store)?;
 
     // Behavior coverage gate: EVERY planned assignment's (release, variant)
@@ -753,7 +752,7 @@ fn push_inner(
     // written.
     if !opts.dry_run {
         for (slot, _s) in &members {
-            let slot_id = PlacementSlotId::new(slot.id.clone());
+            let slot_id = SlotId::new(slot.id.clone());
             let helper = &helpers[&slot_id];
             let status = &statuses[&slot_id];
             helper.handshake()?;
@@ -779,9 +778,9 @@ fn push_inner(
     }
 
     // Build the per-slot plan with expected (pre-push) generation.
-    let mut plan_servers: BTreeMap<PlacementSlotId, SlotPlan> = BTreeMap::new();
-    let mut new_gen: HashMap<PlacementSlotId, GenerationId> = HashMap::new();
-    let mut pre_push: BTreeMap<PlacementSlotId, Option<SlotAttemptState>> = BTreeMap::new();
+    let mut plan_servers: BTreeMap<SlotId, SlotPlan> = BTreeMap::new();
+    let mut new_gen: HashMap<SlotId, GenerationId> = HashMap::new();
+    let mut pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> = BTreeMap::new();
     for a in &assignments {
         let slot_id = &a.placement_slot;
         let expected = statuses
@@ -895,7 +894,7 @@ fn push_inner(
         // (deployment_id/generation_id/artifact) — the running service was
         // deployed with those, and the no-op creates no records, so the NEW
         // deployment/generation ids would be fabricated.
-        let mut existing: BTreeMap<PlacementSlotId, GenerationAssignment> = BTreeMap::new();
+        let mut existing: BTreeMap<SlotId, GenerationAssignment> = BTreeMap::new();
         let mut all_match = true;
         for a in &assignments {
             let st = statuses.get(&a.placement_slot).expect("status present");
@@ -976,7 +975,7 @@ fn push_inner(
             }
             if verified {
                 // Post-commit maintenance hook for the no-op path: a no-op push
-                // creates no records and skips step 17, so any rotation debt
+                // creates no records and skips step 17, so any retention debt
                 // left by an earlier push would never be serviced here — retry
                 // it explicitly before reporting "Everything up to date".
                 // Best-effort: a failure stays as the marker and surfaces as a
@@ -984,7 +983,7 @@ fn push_inner(
                 // NON-FALLIBLE (post-commit maintenance): every debt read/write
                 // failure is collected into the returned warnings, never an
                 // `Err` — the no-op report stays "Everything up to date".
-                let deferred = retry_deferred_rotations(
+                let deferred = retry_deferred_retentions(
                     store,
                     config,
                     target_name,
@@ -1007,7 +1006,7 @@ fn push_inner(
                 // per the post-commit lifecycle: a refresh failure warns but
                 // never converts the no-op into an error — the report below
                 // stays "Everything up to date".
-                let mut observed_servers: BTreeMap<PlacementSlotId, ObservedSlot> = BTreeMap::new();
+                let mut observed_servers: BTreeMap<SlotId, ObservedSlot> = BTreeMap::new();
                 for (slot_id, asn) in &existing {
                     observed_servers.insert(
                         slot_id.clone(),
@@ -1074,7 +1073,7 @@ fn push_inner(
     // The DOMAIN intent stores ONE slot table (the membership + the
     // desired/pre-push entries are the same table — the exact-key-set
     // invariant is structural); the wire re-expands it on serialization.
-    let intent_slots: BTreeMap<PlacementSlotId, IntentSlot> = assignments
+    let intent_slots: BTreeMap<SlotId, IntentSlot> = assignments
         .iter()
         .map(|a| {
             (
@@ -1184,12 +1183,12 @@ fn push_inner(
     let failure_policy = target.rollout.failure_policy;
     let stop_on_failure = target.rollout.stop_on_failure;
 
-    let mut results: BTreeMap<PlacementSlotId, SlotResult> = BTreeMap::new();
-    let mut advanced: Vec<PlacementSlotId> = Vec::new();
-    let mut compensated: Vec<PlacementSlotId> = Vec::new();
+    let mut results: BTreeMap<SlotId, SlotResult> = BTreeMap::new();
+    let mut advanced: Vec<SlotId> = Vec::new();
+    let mut compensated: Vec<SlotId> = Vec::new();
     let mut had_failure = false;
 
-    let servers_order: Vec<PlacementSlotId> = assignments
+    let servers_order: Vec<SlotId> = assignments
         .iter()
         .map(|a| a.placement_slot.clone())
         .collect();
@@ -1216,7 +1215,7 @@ fn push_inner(
                     sid.clone(),
                     SlotResult {
                         slot_id: sid.clone(),
-                        outcome: ServerOutcomeKind::Failed,
+                        outcome: SlotOutcomeKind::Failed,
                         generation: Some(new_gen[sid].clone()),
                         compensated: false,
                         error: Some(format!(
@@ -1262,7 +1261,7 @@ fn push_inner(
                 did_compensate,
                 error,
             } = outcome;
-            if kind == ServerOutcomeKind::Failed {
+            if kind == SlotOutcomeKind::Failed {
                 had_failure = true;
             }
             if did_compensate {
@@ -1306,7 +1305,7 @@ fn push_inner(
                 a.placement_slot.clone(),
                 SlotResult {
                     slot_id: a.placement_slot.clone(),
-                    outcome: ServerOutcomeKind::Skipped,
+                    outcome: SlotOutcomeKind::Skipped,
                     generation: cur,
                     compensated: false,
                     error: None,
@@ -1359,7 +1358,7 @@ fn push_inner(
                         compensated.push(sid.clone());
                         if let Some(r) = results.get_mut(sid) {
                             r.compensated = true;
-                            r.outcome = ServerOutcomeKind::Restored;
+                            r.outcome = SlotOutcomeKind::Restored;
                         }
                     }
                 }
@@ -1479,7 +1478,7 @@ fn push_inner(
     if commit_status == DeploymentStatus::Successful {
         for sid in &servers_order {
             if let Some(r) = results.get(sid)
-                && r.outcome == ServerOutcomeKind::Activated
+                && r.outcome == SlotOutcomeKind::Activated
                 && r.error.is_some()
             {
                 commit_status = DeploymentStatus::PendingCommit;
@@ -1489,13 +1488,13 @@ fn push_inner(
         }
     }
 
-    // 16 & 17. Record attempt, history, rotation.
+    // 16 & 17. Record attempt, history, retention.
     //
     // `actual_servers` reflects each slot's *real* final state, read from the
     // remote generation it currently points at, rather than the desired plan
     // values. Failed/skipped/restored slots therefore report their actual
     // artifact instead of the desired one.
-    let mut actual_servers: BTreeMap<PlacementSlotId, SlotAttemptState> = BTreeMap::new();
+    let mut actual_servers: BTreeMap<SlotId, SlotAttemptState> = BTreeMap::new();
     for a in &assignments {
         let sid = &a.placement_slot;
         let helper = &helpers[sid];
@@ -1530,7 +1529,7 @@ fn push_inner(
     // persisted as part of the immutable intent (`attempt_intent`); it is not
     // recomputed here.
 
-    // 16 & 17. Record outcomes, finalize, history, rotation. The ledger's
+    // 16 & 17. Record outcomes, finalize, history, retention. The ledger's
     // intent line (persisted BEFORE the mutation loop) keeps only the
     // immutable intent; the ACTUAL per-slot outcomes and the terminal status
     // are appended as the deployment's TERMINAL EVENT (the ledger's
@@ -1540,7 +1539,7 @@ fn push_inner(
     // never part of the verified intent object.
     let mut attempt = LedgerIntentReport::from_intent(&attempt_intent)?;
     attempt.slots = actual_servers.clone();
-    let outcomes_map: BTreeMap<PlacementSlotId, SlotResult> = results.clone();
+    let outcomes_map: BTreeMap<SlotId, SlotResult> = results.clone();
 
     // Finalize the attempt's terminal event. A SUCCESSFUL attempt goes
     // through the SAME shared finalizer as recovery
@@ -1566,9 +1565,9 @@ fn push_inner(
         // The CURRENT target slot set: the complete snapshot omits slots
         // removed from the current configuration and carries every current
         // unselected slot forward from the base.
-        let current_slot_ids: Vec<PlacementSlotId> = all_members
+        let current_slot_ids: Vec<SlotId> = all_members
             .iter()
-            .map(|(slot, _)| PlacementSlotId::new(slot.id.clone()))
+            .map(|(slot, _)| SlotId::new(slot.id.clone()))
             .collect();
         history::finalize_successful_attempt(
             store,
@@ -1608,10 +1607,10 @@ fn push_inner(
                 // generation) — never stored. The derivation must be
                 // NON-EMPTY (a Degraded terminal with nothing remaining is
                 // a payload mismatch).
-                let remaining: BTreeMap<PlacementSlotId, GenerationId> = outcomes
+                let remaining: BTreeMap<SlotId, GenerationId> = outcomes
                     .iter()
                     .filter(|(_, r)| {
-                        r.outcome != ServerOutcomeKind::Restored && r.generation.is_some()
+                        r.outcome != SlotOutcomeKind::Restored && r.generation.is_some()
                     })
                     .map(|(k, r)| {
                         (
@@ -1667,10 +1666,10 @@ fn push_inner(
     // A local store fault in this block (a `write_server`, `read_slot_observed`,
     // or `write_slot_observed` failure) must therefore NEVER turn the push into
     // an `Err`: it is recorded as a warning on the report (merged into the same
-    // `maintenance` channel as rotation) and the push still returns `Ok` with
+    // `maintenance` channel as retention) and the push still returns `Ok` with
     // the committed status.
     //
-    // Unlike rotation there is deliberately NO persistent debt marker. The
+    // Unlike retention there is deliberately NO persistent debt marker. The
     // observed records are exactly that — PROJECTIONS of already-durable
     // facts (generations, artifacts, deployments), none of which depend on
     // this refresh — so a failure is only a projection lag. Convergence needs
@@ -1700,9 +1699,9 @@ fn push_inner(
     // carries its PRIOR physical observed record over verbatim (never
     // fabricated, never re-stamped).
     let mut observed_warnings: Vec<String> = Vec::new();
-    let mut observed_servers: BTreeMap<PlacementSlotId, ObservedSlot> = BTreeMap::new();
+    let mut observed_servers: BTreeMap<SlotId, ObservedSlot> = BTreeMap::new();
     for (slot, _sdef) in &members {
-        let slot_id = PlacementSlotId::new(slot.id.clone());
+        let slot_id = SlotId::new(slot.id.clone());
         // The slot's LIVE remote assignment. `status` is a read; under the
         // one-shot pre-swap arm it has already fired and been consumed inside
         // `process_server`, so this read reflects the true post-mutation
@@ -1746,14 +1745,14 @@ fn push_inner(
         &mut observed_warnings,
     );
 
-    // 17. Per-slot rotation under each slot's mutation lock. Rotation uses
+    // 17. Per-slot retention under each slot's mutation lock. Retention uses
     // the slot's ACTUAL final assignment (read after any compensation), not
     // the desired plan: a compensated slot restored its prior variant.
     //
     // RETENTION IS SLOT-OWNED: each slot has ONE policy — the policy of its
     // OWNING VARIANT (the variant file whose `[[slots]]` entry declares the
     // slot), resolved from the caller's current `deploy.toml` via
-    // `Config::slot_rotation` (retention is never part of a release
+    // `ProjectConfig::slot_retention` (retention is never part of a release
     // snapshot). There is NO per-target policy and NO union across the
     // slot's member targets: a slot shared across targets rotates under its
     // single owning-variant policy, so which target triggered this push (or
@@ -1761,21 +1760,21 @@ fn push_inner(
     //
     // POST-COMMIT MAINTENANCE: by this point the deployment has ALREADY
     // committed (servers advanced, snapshot recorded, attempt recorded), so a
-    // rotation failure must NOT change the reported outcome — the push still
+    // retention failure must NOT change the reported outcome — the push still
     // returns `Ok` with the real `commit_status`. A failure is instead
     // recorded as a PERSISTENT debt marker (per target+slot, under the local
     // store) and surfaced as a warning on the report; later pushes —
     // including no-ops — retry the maintenance and clear the marker once the
-    // rotation succeeds. The capacity-path preflight rotation in
+    // retention succeeds. The capacity-path preflight retention in
     // `capacity.rs` is already best-effort with `.ok()`; this step-17 path is
-    // what used to propagate rotation errors as push failures.
+    // what used to propagate retention errors as push failures.
     //
-    // The mutation lock is held via an RAII guard for the whole rotation
+    // The mutation lock is held via an RAII guard for the whole retention
     // block, so an error from `compute_retained` or `rotate` releases the
     // lock on drop instead of leaking it (a manual acquire/release pair would
     // strand every later operation on this slot with "mutation lock held by
     // ..."). A lock acquisition conflict (held by another operation) NEVER
-    // skips silently: it defers the maintenance the same way a rotation
+    // skips silently: it defers the maintenance the same way a retention
     // failure does — a best-effort debt marker plus an explicit warning
     // naming the slot — so after a successful push every slot is either
     // ROTATED or carries debt + a warning, and a later push (including a
@@ -1783,16 +1782,16 @@ fn push_inner(
     //
     let mut maintenance: Vec<String> = Vec::new();
     // Observed-refresh deferrals (post-commit projection lag) ride the same
-    // warning channel as rotation; unlike rotation there is no debt marker to
+    // warning channel as retention; unlike retention there is no debt marker to
     // retry — the next real push re-projects from durable facts.
     maintenance.extend(observed_warnings);
     // Retry any debt left by earlier pushes FIRST (before this push's own
-    // rotation), so a marker that succeeds here is cleared without re-rotating
+    // retention), so a marker that succeeds here is cleared without re-rotating
     // the same slot immediately after a fresh step-17 failure. The retry is
     // NON-FALLIBLE (post-commit maintenance): every debt read/write failure is
     // a warning entry in the returned vec, never an `Err` — a debt-file fault
     // must not change the outcome of a deployment that already committed.
-    maintenance.extend(retry_deferred_rotations(
+    maintenance.extend(retry_deferred_retentions(
         store,
         config,
         target_name,
@@ -1812,12 +1811,12 @@ fn push_inner(
         let helper = &helpers[sid];
         // The slot's ONE retention policy, from its OWNING VARIANT (the
         // variant that declares the slot) — never a member-target union.
-        let slot_rotation = config
-            .slot_rotation(sid.as_str())
+        let slot_retention = config
+            .slot_retention(sid.as_str())
             .expect("every planned slot is declared by some variant");
         // TEST-ONLY step-17 phase hook: when a test armed the barrier for
         // THIS deployment id, signal "at step-17 lock acquisition" (with the
-        // FRESH-STEP-17 phase — this push's own per-slot rotation, whose
+        // FRESH-STEP-17 phase — this push's own per-slot retention, whose
         // contended else-branch defers the maintenance as a debt marker) and
         // park until the test releases the engine (the fixture holds the
         // competing guard meanwhile) — per-slot lock contention becomes
@@ -1827,13 +1826,13 @@ fn push_inner(
         #[cfg(test)]
         store.step17_hook_barrier(deployment_id, HookPhase::FreshStep17);
         if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
-            match rotate_slot_locked(helper, store, config, slot_rotation, deployment_id) {
+            match rotate_slot_locked(helper, store, config, slot_retention, deployment_id) {
                 Ok(()) => {
                     // Maintenance done for this slot: clear any marker left by
-                    // an earlier push whose rotation failed after commit. The
+                    // an earlier push whose retention failed after commit. The
                     // clear is NON-FALLIBLE post-commit maintenance: a debt
                     // read/write failure becomes a warning, never an `Err`.
-                    maintenance.extend(clear_rotation_deferred(store, target_name, sid));
+                    maintenance.extend(clear_retention_deferred(store, target_name, sid));
                 }
                 Err(e) => {
                     // The deployment already committed; defer the maintenance
@@ -1841,21 +1840,21 @@ fn push_inner(
                     // deferral is NON-FALLIBLE: a debt read/write failure here
                     // (e.g. the marker cannot be persisted) is a warning, never
                     // an `Err` — the committed outcome is unchanged.
-                    maintenance.extend(set_rotation_deferred(
+                    maintenance.extend(set_retention_deferred(
                         store,
                         target_name,
                         sid,
                         &e.to_string(),
                     ));
                     maintenance.push(format!(
-                        "rotation deferred for slot '{}': {e}",
+                        "retention deferred for slot '{}': {e}",
                         sid.as_str()
                     ));
                 }
             }
         } else {
             // The slot's mutation lock is CONTENDED (held by another
-            // operation), so the rotation cannot run now. The deployment has
+            // operation), so the retention cannot run now. The deployment has
             // already committed, so this must NEVER fail the push: record the
             // deferral as best-effort debt (persistence faults are
             // warning-only per the post-commit lifecycle) and surface an
@@ -1864,7 +1863,7 @@ fn push_inner(
             // no-op) services the maintenance once the lock is free and
             // clears the marker.
             maintenance.push(format!(
-                "rotation deferred for slot '{}': slot lock held by another operation",
+                "retention deferred for slot '{}': slot lock held by another operation",
                 sid.as_str()
             ));
             // Best-effort debt record; NEVER propagates an error out of
@@ -1872,11 +1871,11 @@ fn push_inner(
             // a warning in the returned vec (merged into the report's
             // `maintenance` channel), never an `Err` — the committed outcome
             // is unchanged. On persistence failure there is no marker, but
-            // the explicit "rotation debt maintenance deferred" warning
+            // the explicit "retention debt maintenance deferred" warning
             // names the slot, so the report distinguishes a retryable
             // deferral (marker persisted) from one that must be re-deferred
             // by a later push.
-            maintenance.extend(set_rotation_deferred(
+            maintenance.extend(set_retention_deferred(
                 store,
                 target_name,
                 sid,
@@ -1902,32 +1901,32 @@ fn push_inner(
     })
 }
 
-/// Run one slot's rotation — retained-set computation plus mark-and-sweep —
+/// Run one slot's retention — retained-set computation plus mark-and-sweep —
 /// for a caller already holding the slot's mutation lock (RAII guard). The
-/// single rotation block shared by step 17 and by deferred-maintenance
+/// single retention block shared by step 17 and by deferred-maintenance
 /// retries, so both paths apply the same retention semantics and the same
 /// lock discipline. `deployment_id` marks this operation's incoming
-/// directory as active so rotation never sweeps a deployment currently being
-/// published. `rotation` is the slot's ONE policy, already resolved from its
-/// OWNING VARIANT by the caller (`Config::slot_rotation`) — retention is
+/// directory as active so retention never sweeps a deployment currently being
+/// published. `retention` is the slot's ONE policy, already resolved from its
+/// OWNING VARIANT by the caller (`ProjectConfig::slot_retention`) — retention is
 /// slot-owned, never a per-target surface. Pins are the config's own pins
 /// (policy lives in the caller-supplied `config` settings object, never a
 /// separate argument).
 fn rotate_slot_locked(
     helper: &RemoteHelper,
     store: &LocalStore,
-    config: &Config,
-    rotation: &RotationConfig,
+    config: &ProjectConfig,
+    retention: &RetentionConfig,
     deployment_id: &DeploymentId,
 ) -> Result<()> {
-    let retained = compute_retained(helper, &config.pins, store, rotation)?;
+    let retained = compute_retained(helper, &config.pins, store, retention)?;
     let active_incoming = HashSet::from([deployment_id.as_str().to_string()]);
     helper.rotate(&retained, &active_incoming)?;
     Ok(())
 }
 
-/// Record a deferred-rotation debt marker for one slot (keyed by
-/// target+slot). Called only when the rotation failed after the deployment
+/// Record a deferred-retention debt marker for one slot (keyed by
+/// target+slot). Called only when the retention failed after the deployment
 /// already committed — POST-COMMIT MAINTENANCE, so this function is
 /// NON-FALLIBLE: every debt I/O failure (a read or write of the marker file)
 /// becomes a WARNING returned here (merged into the report's `maintenance`
@@ -1936,60 +1935,56 @@ fn rotate_slot_locked(
 /// the OTHER slots' existing markers — and the returned warning names the
 /// deferral, so the maintenance is explicitly warned even though this slot's
 /// marker was not persisted.
-pub(crate) fn set_rotation_deferred(
+pub(crate) fn set_retention_deferred(
     store: &LocalStore,
     target: &str,
-    slot: &PlacementSlotId,
+    slot: &SlotId,
     reason: &str,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
-    let mut debt = match store.read_rotation_debt(target) {
+    let mut debt = match store.read_retention_debt(target) {
         Ok(debt) => debt,
         Err(e) => {
             warnings.push(format!(
-                "rotation debt maintenance deferred: failed to read rotation debt for \
+                "retention debt maintenance deferred: failed to read retention debt for \
                  '{target}': {e}"
             ));
             return warnings;
         }
     };
     debt.insert(slot.as_str().to_string(), reason.to_string());
-    if let Err(e) = store.write_rotation_debt(target, &debt) {
+    if let Err(e) = store.write_retention_debt(target, &debt) {
         warnings.push(format!(
-            "rotation debt maintenance deferred: failed to write rotation debt for \
+            "retention debt maintenance deferred: failed to write retention debt for \
              '{target}': {e}"
         ));
     }
     warnings
 }
 
-/// Clear a slot's deferred-rotation debt marker once the rotation succeeded.
+/// Clear a slot's deferred-retention debt marker once the retention succeeded.
 /// POST-COMMIT MAINTENANCE, so this is NON-FALLIBLE: a debt read failure
 /// leaves the marker in place (a later push retries it) and a write/remove
 /// failure keeps the stale marker — both become WARNING entries returned to
 /// the caller (merged into the report's `maintenance` channel), never an
 /// `Err`.
-fn clear_rotation_deferred(
-    store: &LocalStore,
-    target: &str,
-    slot: &PlacementSlotId,
-) -> Vec<String> {
+fn clear_retention_deferred(store: &LocalStore, target: &str, slot: &SlotId) -> Vec<String> {
     let mut warnings = Vec::new();
-    let mut debt = match store.read_rotation_debt(target) {
+    let mut debt = match store.read_retention_debt(target) {
         Ok(debt) => debt,
         Err(e) => {
             warnings.push(format!(
-                "rotation debt maintenance deferred: failed to read rotation debt for \
+                "retention debt maintenance deferred: failed to read retention debt for \
                  '{target}': {e}"
             ));
             return warnings;
         }
     };
     if debt.remove(slot.as_str()).is_some()
-        && let Err(e) = store.write_rotation_debt(target, &debt)
+        && let Err(e) = store.write_retention_debt(target, &debt)
     {
         warnings.push(format!(
-            "rotation debt maintenance deferred: failed to clear rotation debt for \
+            "retention debt maintenance deferred: failed to clear retention debt for \
              '{target}': {e}"
         ));
     }
@@ -2032,12 +2027,12 @@ fn clear_rotation_deferred(
 fn refresh_observed(
     store: &LocalStore,
     target_name: &str,
-    members: &[(&crate::config::SlotDef, &crate::config::ServerDef)],
-    observed_servers: &BTreeMap<PlacementSlotId, ObservedSlot>,
+    members: &[(&crate::config::SlotConfig, &crate::config::ServerDef)],
+    observed_servers: &BTreeMap<SlotId, ObservedSlot>,
     observed_warnings: &mut Vec<String>,
 ) {
     for (slot, sdef) in members {
-        let slot_id = PlacementSlotId::new(slot.id.clone());
+        let slot_id = SlotId::new(slot.id.clone());
         let Some(observed_server) = observed_servers.get(&slot_id) else {
             continue;
         };
@@ -2070,34 +2065,34 @@ fn refresh_observed(
     }
 }
 
-/// Retry deferred post-commit rotation maintenance for `target_name`: every slot
-/// carrying a debt marker gets its rotation re-attempted under the slot's
+/// Retry deferred post-commit retention maintenance for `target_name`: every slot
+/// carrying a debt marker gets its retention re-attempted under the slot's
 /// mutation lock (the same RAII-guarded block as step 17). Success clears the
 /// marker; failure keeps it and refreshes its reason. Runs on later pushes —
 /// before step 17 on the normal path and at the no-op return — because
-/// rotation is maintenance that must never change a deployment's reported
+/// retention is maintenance that must never change a deployment's reported
 /// outcome. NON-FALLIBLE by contract: this function never returns `Err` — a
 /// debt I/O failure (a read treated as empty debt, or a write/remove of the
 /// marker) becomes a WARNING entry in the returned vec, so a debt-file fault
 /// can never turn a push (real or no-op) into an error after the deployment
 /// durably committed. Returns the slots still deferred, for the push report's
 /// warning.
-pub(crate) fn retry_deferred_rotations(
+pub(crate) fn retry_deferred_retentions(
     store: &LocalStore,
-    config: &Config,
+    config: &ProjectConfig,
     target_name: &str,
-    helpers: &HashMap<PlacementSlotId, RemoteHelper>,
+    helpers: &HashMap<SlotId, RemoteHelper>,
     op_id: &OperationId,
     deployment_id: &DeploymentId,
 ) -> Vec<String> {
     // A debt READ failure is treated as empty debt: nothing can be serviced
     // this push, and the marker file (if any) is left untouched for a later
     // push to retry — the warning keeps the deferral explicit.
-    let mut debt = match store.read_rotation_debt(target_name) {
+    let mut debt = match store.read_retention_debt(target_name) {
         Ok(debt) => debt,
         Err(e) => {
             return vec![format!(
-                "rotation debt maintenance deferred: failed to read rotation debt for \
+                "retention debt maintenance deferred: failed to read retention debt for \
                  '{target_name}': {e}"
             )];
         }
@@ -2108,20 +2103,20 @@ pub(crate) fn retry_deferred_rotations(
     let mut still_deferred: Vec<String> = Vec::new();
     let mut serviced: Vec<String> = Vec::new();
     for slot_str in debt.keys().cloned().collect::<Vec<_>>() {
-        let sid = PlacementSlotId::new(slot_str.clone());
+        let sid = SlotId::new(slot_str.clone());
         let Some(helper) = helpers.get(&sid) else {
-            // The slot is no longer a member of this target, so its rotation
+            // The slot is no longer a member of this target, so its retention
             // cannot be serviced from here; keep the marker and say so.
             still_deferred.push(format!(
-                "rotation still deferred for slot '{slot_str}' (no longer a member of target \
+                "retention still deferred for slot '{slot_str}' (no longer a member of target \
                  '{target_name}')"
             ));
             continue;
         };
         // TEST-ONLY phase hook: the deferred-maintenance retry shares the
-        // same RAII-guarded rotation block as step 17, so it signals + parks
+        // same RAII-guarded retention block as step 17, so it signals + parks
         // at the SAME barrier, tagged with the DEFERRED-RETRY phase (it runs
-        // BEFORE the fresh step-17 rotation and reads the debt FIRST — a test
+        // BEFORE the fresh step-17 retention and reads the debt FIRST — a test
         // that arms the debt fault only at the fresh step-17 phase therefore
         // does NOT arm it here). A test that armed the step-17 hook for this
         // deployment id gets deterministic contention at the retry too (the
@@ -2133,31 +2128,31 @@ pub(crate) fn retry_deferred_rotations(
             // The slot's ONE retention policy, from its OWNING VARIANT
             // (resolved from the current config — retention is never a
             // member-target union).
-            let slot_rotation = match config.slot_rotation(slot_str.as_str()) {
-                Ok(rotation) => rotation,
+            let slot_retention = match config.slot_retention(slot_str.as_str()) {
+                Ok(retention) => retention,
                 Err(e) => {
                     // The slot is no longer declared by any variant: its
-                    // rotation cannot be serviced from here; keep the marker
+                    // retention cannot be serviced from here; keep the marker
                     // and say so.
                     still_deferred.push(format!(
-                        "rotation still deferred for slot '{slot_str}': {e}"
+                        "retention still deferred for slot '{slot_str}': {e}"
                     ));
                     continue;
                 }
             };
-            match rotate_slot_locked(helper, store, config, slot_rotation, deployment_id) {
+            match rotate_slot_locked(helper, store, config, slot_retention, deployment_id) {
                 Ok(()) => serviced.push(slot_str.clone()),
                 Err(e) => {
                     // Keep the marker with the fresh reason.
                     debt.insert(slot_str.clone(), e.to_string());
                     still_deferred.push(format!(
-                        "rotation still deferred for slot '{slot_str}': {e}"
+                        "retention still deferred for slot '{slot_str}': {e}"
                     ));
                 }
             }
         } else {
             still_deferred.push(format!(
-                "rotation still deferred for slot '{slot_str}': slot lock held by another \
+                "retention still deferred for slot '{slot_str}': slot lock held by another \
                  operation"
             ));
         }
@@ -2167,11 +2162,11 @@ pub(crate) fn retry_deferred_rotations(
     }
     // A debt WRITE/REMOVE failure (the marker could not be persisted or
     // removed) is post-commit maintenance: warn and leave the marker file as
-    // it is — the rotation itself succeeded, but a later push retries and
+    // it is — the retention itself succeeded, but a later push retries and
     // converges. Never an `Err`.
-    if let Err(e) = store.write_rotation_debt(target_name, &debt) {
+    if let Err(e) = store.write_retention_debt(target_name, &debt) {
         still_deferred.push(format!(
-            "rotation debt maintenance deferred: failed to write rotation debt for \
+            "retention debt maintenance deferred: failed to write retention debt for \
              '{target_name}': {e}"
         ));
     }
@@ -2192,7 +2187,7 @@ pub(crate) fn retry_deferred_rotations(
 /// pending-sweep warnings for the push report's maintenance channel.
 pub(crate) fn retry_pending_sweep(
     store: &LocalStore,
-    config: &Config,
+    config: &ProjectConfig,
     anchor: &str,
 ) -> Vec<String> {
     // A debt READ failure is treated as no debt: nothing can be serviced
@@ -2384,12 +2379,12 @@ from = "artifacts/deployment/common/"
 to = "app-common/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 1
 
 [activation]
@@ -2448,12 +2443,12 @@ from = "artifacts/deployment/common/"
 to = "app-common/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 1
 
 [activation]
@@ -2498,7 +2493,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     struct TwoSlotHarness {
         _dir: tempfile::TempDir,
         cfg_path: PathBuf,
-        config: Config,
+        config: ProjectConfig,
         store: LocalStore,
         remotes_base: PathBuf,
     }
@@ -2522,7 +2517,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 std::fs::write(&fp, c).unwrap();
             }
             let cfg_path = project.join("deploy.toml");
-            let config = Config::load(&cfg_path).unwrap();
+            let config = ProjectConfig::load(&cfg_path).unwrap();
             let store = LocalStore::with_base(dir.path().join("store")).unwrap();
             let remotes_base = dir.path().join("remotes");
             std::fs::create_dir_all(&remotes_base).unwrap();
@@ -2540,7 +2535,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// expression, and rollout group.
     fn two_slot_push(
         h: &TwoSlotHarness,
-        config: &Config,
+        config: &ProjectConfig,
         ref_expr: &RefExpr,
         group: Option<&str>,
         deployment_id: &DeploymentId,
@@ -2550,7 +2545,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let op_id = OperationId::new(format!("op-{}", deployment_id.as_str()));
         let rf = h.remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
-                            _slot: &crate::config::SlotDef|
+                            _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
@@ -2612,12 +2607,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         .unwrap();
 
         let config_path = project.join("deploy.toml");
-        let config = Config::load(&config_path).unwrap();
+        let config = ProjectConfig::load(&config_path).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let remotes_base = dir.path().join("remotes");
         std::fs::create_dir_all(&remotes_base).unwrap();
         let factory = move |_s: &crate::config::ServerDef,
-                            _slot: &crate::config::SlotDef|
+                            _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(
                 LocalTransport::new(remotes_base.join("s1")).unwrap(),
@@ -2686,14 +2681,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         }
 
         let config_path = project.join("deploy.toml");
-        let config = Config::load(&config_path).unwrap();
+        let config = ProjectConfig::load(&config_path).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let remotes_base = dir.path().join("remotes");
         std::fs::create_dir_all(&remotes_base).unwrap();
         let remote_path = remotes_base.join("s1");
         let factory_path = remote_path.clone();
         let factory = move |_s: &crate::config::ServerDef,
-                            _slot: &crate::config::SlotDef|
+                            _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(LocalTransport::new(factory_path.clone()).unwrap()))
         };
@@ -2726,7 +2721,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .expect("first push records an attempt")
             .deployment_id
             .clone();
-        let tree = r0.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")]
+        let tree = r0.attempt.expect("attempt recorded").slots[&SlotId::new("p1")]
             .artifact
             .tree
             .clone();
@@ -2839,7 +2834,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         std::fs::write(project_root_file, "PROJECT-ROOT\n").unwrap();
 
         let cfg_path = project.join("deploy.toml");
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let release_root = config.release_root(&cfg_path);
         let vcfg = config.variant("standard").unwrap();
@@ -2904,7 +2899,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     struct RecoveryHarness {
         _dir: tempfile::TempDir,
         cfg_path: PathBuf,
-        config: Config,
+        config: ProjectConfig,
         store: LocalStore,
         remotes_base: PathBuf,
     }
@@ -2934,7 +2929,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 std::fs::write(&fp, c).unwrap();
             }
             let cfg_path = project.join("deploy.toml");
-            let config = Config::load(&cfg_path).unwrap();
+            let config = ProjectConfig::load(&cfg_path).unwrap();
             let store = LocalStore::with_base(dir.path().join("store")).unwrap();
             let remotes_base = dir.path().join("remotes");
             std::fs::create_dir_all(&remotes_base).unwrap();
@@ -2961,11 +2956,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         target: &str,
         deployment_id: &str,
         behavior_sha256: &str,
-        slots: BTreeMap<PlacementSlotId, GenerationRef>,
-        bindings: BTreeMap<PlacementSlotId, crate::records::PhysicalBinding>,
+        slots: BTreeMap<SlotId, GenerationRef>,
+        bindings: BTreeMap<SlotId, crate::records::PhysicalBinding>,
     ) {
         // ONE slot table: the membership + the desired entries.
-        let slot_table: BTreeMap<PlacementSlotId, IntentSlot> = slots
+        let slot_table: BTreeMap<SlotId, IntentSlot> = slots
             .iter()
             .map(|(k, g)| {
                 (
@@ -3015,7 +3010,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let armed_for_factory = armed.clone();
         let rf = h.remotes_base.clone();
         let fault_factory = move |s: &crate::config::ServerDef,
-                                  _slot: &crate::config::SlotDef|
+                                  _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             FailOnceMarkerRemote::build(rf.join(s.id.as_str()), armed_for_factory.clone())
         };
@@ -3137,7 +3132,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     fn push_clean(h: &RecoveryHarness) -> Result<PushReport> {
         let rf = h.remotes_base.clone();
         let clean_factory = move |s: &crate::config::ServerDef,
-                                  _slot: &crate::config::SlotDef|
+                                  _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
@@ -3225,7 +3220,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &variants,
             &BTreeMap::from([(
                 "standard".to_string(),
-                vec![SlotDef {
+                vec![SlotConfig {
                     id: "p1".to_string(),
                     server: "s1".to_string(),
                     deploy_dir: PathBuf::from("/srv/pin"),
@@ -3240,20 +3235,20 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     }
 
     /// ENGINE-LEVEL wiring for the fail-closed pin abort: a post-commit
-    /// step-17 rotation whose pinned release record is unreadable must abort
-    /// before ANY deletion, and the rotation caller must convert the abort
-    /// into the rotation-debt machinery — the push still reports SUCCESS with
+    /// step-17 retention whose pinned release record is unreadable must abort
+    /// before ANY deletion, and the retention caller must convert the abort
+    /// into the retention-debt machinery — the push still reports SUCCESS with
     /// a deferred-maintenance warning and a durable debt marker (never a hard
     /// push failure), and the NEXT push's maintenance retry services the
     /// marker once the record is repaired, deleting EXACTLY the genuinely
     /// unretained trees: the pin-only trees survive and the true garbage is
     /// removed. (All three corruption classes — missing / malformed /
     /// unverifiable — produce the SAME integrity abort and are each covered
-    /// deterministically in the rotation unit tests plus the 16-case
+    /// deterministically in the retention unit tests plus the 16-case
     /// property; this engine test proves the debt/warning/retry wiring with
     /// the missing-record class.)
     #[test]
-    fn pin_abort_defers_rotation_and_retry_after_repair_deletes_exactly() {
+    fn pin_abort_defers_retention_and_retry_after_repair_deletes_exactly() {
         let mut h = RecoveryHarness::new();
 
         // Push 1 (no pins yet): the first deployment establishes the
@@ -3286,8 +3281,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         std::fs::remove_file(&path).unwrap();
 
         // Push 2 (a REAL push — changed artifact content promotes a new
-        // generation, so step-17 rotation runs): the pin abort must NOT fail
-        // the push. It is converted into rotation debt + a warning, and
+        // generation, so step-17 retention runs): the pin abort must NOT fail
+        // the push. It is converted into retention debt + a warning, and
         // NOTHING is deleted.
         let artifacts = h
             .cfg_path
@@ -3314,12 +3309,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let warning = r2
             .warning
             .as_ref()
-            .expect("the push must warn about the deferred rotation");
+            .expect("the push must warn about the deferred retention");
         assert!(
-            warning.contains("rotation deferred"),
-            "the warning describes the deferred rotation, got: {warning}"
+            warning.contains("retention deferred"),
+            "the warning describes the deferred retention, got: {warning}"
         );
-        let debt = h.store.read_rotation_debt("t1").unwrap();
+        let debt = h.store.read_retention_debt("t1").unwrap();
         let reason = debt
             .get("p1")
             .expect("a durable debt marker for slot p1 must be recorded");
@@ -3334,7 +3329,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         for t in ["tree-pin-a", "tree-pin-b", "tree-garbage"] {
             assert!(
                 inventory_after.contains(&t.to_string()),
-                "tree {t} must survive the failed rotation"
+                "tree {t} must survive the failed retention"
             );
         }
 
@@ -3344,17 +3339,17 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         h.store.write_release(&rec).unwrap();
 
         // Push 3 (up-to-date no-op): the deferred-maintenance retry
-        // services the marker — the rotation now succeeds, deleting
+        // services the marker — the retention now succeeds, deleting
         // EXACTLY the genuinely unretained trees — and clears the marker.
         let r3 = push_clean(&h).unwrap();
         assert_eq!(r3.message, "Everything up to date");
         assert!(
             r3.warning.is_none(),
-            "the retried rotation succeeded: no warning remains, got {:?}",
+            "the retried retention succeeded: no warning remains, got {:?}",
             r3.warning
         );
         assert!(
-            h.store.read_rotation_debt("t1").unwrap().is_empty(),
+            h.store.read_retention_debt("t1").unwrap().is_empty(),
             "the debt marker is cleared once the retry succeeds"
         );
         let inventory = helper.status().unwrap().inventory;
@@ -3570,7 +3565,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let op_id = OperationId::new(format!("op-{}", deployment_id.as_str()));
         let rf = h.remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
-                            _slot: &crate::config::SlotDef|
+                            _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
@@ -3691,7 +3686,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let armed_for_factory = armed.clone();
         let rf = h.remotes_base.clone();
         let fault_factory = move |s: &crate::config::ServerDef,
-                                  _slot: &crate::config::SlotDef|
+                                  _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             FailOnceMarkerRemote::build(rf.join(s.id.as_str()), armed_for_factory.clone())
         };
@@ -3711,9 +3706,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(r2.status, Some(DeploymentStatus::PendingCommit));
         let attempt = r2.attempt.expect("attempt recorded");
         let dep2 = attempt.deployment_id.clone();
-        let gen_v2 = attempt.desired[&PlacementSlotId::new("p1")]
-            .generation
-            .clone();
+        let gen_v2 = attempt.desired[&SlotId::new("p1")].generation.clone();
         assert_eq!(
             h.store.read_snapshots("t1").unwrap().len(),
             1,
@@ -3880,10 +3873,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // report, never in the persisted intent). The ONE slot table carries
         // the planned (desired) + observed (pre_push) entries per member.
         assert!(
-            intent
-                .intent
-                .slots
-                .contains_key(&PlacementSlotId::new("p1")),
+            intent.intent.slots.contains_key(&SlotId::new("p1")),
             "the intent's one slot table carries the planned (desired) + observed (pre_push) entries"
         );
         assert!(
@@ -3911,8 +3901,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_finalized(&h, &intent);
         let snap = h.store.read_snapshots("t1").unwrap();
         assert_eq!(snap.len(), 1);
-        let g = &rollback_of(&snap[0]).slots[&PlacementSlotId::new("p1")];
-        let desired = &intent.desired[&PlacementSlotId::new("p1")];
+        let g = &rollback_of(&snap[0]).slots[&SlotId::new("p1")];
+        let desired = &intent.desired[&SlotId::new("p1")];
         assert_eq!(
             g.generation.as_str(),
             desired.generation.as_str(),
@@ -4000,7 +3990,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // and the remote's current points elsewhere.
         let target_a = GenerationId::generate();
         let id_a = DeploymentId::new("deploy-inprogress-diverged".to_string());
-        let desired_ref = baseline.desired[&PlacementSlotId::new("p1")].clone();
+        let desired_ref = baseline.desired[&SlotId::new("p1")].clone();
         let intent = DeploymentIntent {
             deployment_id: id_a.clone(),
             target: TargetName::new("t1".to_string()),
@@ -4008,7 +3998,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             behavior_sha256: baseline.behavior_sha256.as_str().to_string(),
             attempted_at: crate::remote::helper::now_rfc3339(),
             slots: NonEmptySlotTable::build(BTreeMap::from([(
-                PlacementSlotId::new("p1".to_string()),
+                SlotId::new("p1".to_string()),
                 IntentSlot {
                     desired: DesiredGeneration {
                         generation: target_a,
@@ -4097,8 +4087,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // outcome and the persisted intent carries NO outcomes.
         let results = h.store.read_results(id.as_str()).unwrap();
         assert_eq!(
-            results[&PlacementSlotId::new("p1")].outcome,
-            ServerOutcomeKind::Activated
+            results[&SlotId::new("p1")].outcome,
+            SlotOutcomeKind::Activated
         );
         let attempt = single_attempt(&h);
         assert!(
@@ -4113,15 +4103,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(snapshots.len(), 1);
         let snap = &snapshots[0];
         assert_eq!(
-            rollback_of(snap).slots[&PlacementSlotId::new("p1")].generation,
-            results[&PlacementSlotId::new("p1")]
-                .generation
-                .clone()
-                .unwrap()
+            rollback_of(snap).slots[&SlotId::new("p1")].generation,
+            results[&SlotId::new("p1")].generation.clone().unwrap()
         );
-        let actual = &r.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")];
+        let actual = &r.attempt.as_ref().unwrap().slots[&SlotId::new("p1")];
         assert_eq!(
-            rollback_of(snap).slots[&PlacementSlotId::new("p1")]
+            rollback_of(snap).slots[&SlotId::new("p1")]
                 .assignment
                 .artifact,
             actual.artifact
@@ -4141,7 +4128,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let armed_for_factory = armed.clone();
         let rf = h.remotes_base.clone();
         let fault_factory = move |s: &crate::config::ServerDef,
-                                  _slot: &crate::config::SlotDef|
+                                  _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             FailOnceGenerationRemote::build(rf.join(s.id.as_str()), armed_for_factory.clone())
         };
@@ -4184,10 +4171,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             DeploymentStatus::FailedRolledBack
         );
         let results = h.store.read_results(id.as_str()).unwrap();
-        assert_eq!(
-            results[&PlacementSlotId::new("p1")].outcome,
-            ServerOutcomeKind::Failed
-        );
+        assert_eq!(results[&SlotId::new("p1")].outcome, SlotOutcomeKind::Failed);
 
         // The remote never advanced: no `current`, no durable generation
         // record (the mid-mutation fault fired before the assignment write, so
@@ -4255,8 +4239,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // Observed still reflects the successful push.
         let observed = h.store.read_observed("t1", &h.config).unwrap();
         assert_eq!(
-            observed.slots[&PlacementSlotId::new("p1")].generation,
-            r1.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")].generation
+            observed.slots[&SlotId::new("p1")].generation,
+            r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")].generation
         );
     }
 
@@ -4306,7 +4290,7 @@ interval_seconds = 0
         let rf = h.remotes_base.clone();
         let recorded = executed.clone();
         let factory = move |s: &crate::config::ServerDef,
-                            _slot: &crate::config::SlotDef|
+                            _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(RecordingRemote::new(
                 rf.join(s.id.as_str()),
@@ -4439,9 +4423,7 @@ interval_seconds = 0
         );
         let observed = h.store.read_observed("t1", &h.config).unwrap();
         assert_eq!(
-            observed.slots[&PlacementSlotId::new("p1")]
-                .generation
-                .as_ref(),
+            observed.slots[&SlotId::new("p1")].generation.as_ref(),
             Some(&assignment.generation_id),
             "observed.json must be unchanged"
         );
@@ -4463,10 +4445,10 @@ interval_seconds = 0
         // Craft an intent with NO transition appended: eligibility treats the
         // absent status file as eligible (a just-recorded attempt).
         let id_a = DeploymentId::new("deploy-no-status".to_string());
-        let desired_ref = baseline.desired[&PlacementSlotId::new("p1")].clone();
+        let desired_ref = baseline.desired[&SlotId::new("p1")].clone();
         let intent = DeploymentIntent {
             slots: NonEmptySlotTable::build(BTreeMap::from([(
-                PlacementSlotId::new("p1".to_string()),
+                SlotId::new("p1".to_string()),
                 IntentSlot {
                     desired: DesiredGeneration {
                         generation: desired_ref.generation.clone(),
@@ -4530,7 +4512,7 @@ interval_seconds = 0
         let r1 = push_main_with_id(&h, &id_b).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let baseline = r1.attempt.as_ref().expect("attempt recorded");
-        let desired_ref = baseline.desired[&PlacementSlotId::new("p1")].clone();
+        let desired_ref = baseline.desired[&SlotId::new("p1")].clone();
 
         let mk = |id: &str| DeploymentIntent {
             deployment_id: DeploymentId::new(id.to_string()),
@@ -4539,7 +4521,7 @@ interval_seconds = 0
             behavior_sha256: baseline.behavior_sha256.as_str().to_string(),
             attempted_at: crate::remote::helper::now_rfc3339(),
             slots: NonEmptySlotTable::build(BTreeMap::from([(
-                PlacementSlotId::new("p1".to_string()),
+                SlotId::new("p1".to_string()),
                 IntentSlot {
                     desired: DesiredGeneration {
                         generation: desired_ref.generation.clone(),
@@ -4614,9 +4596,8 @@ interval_seconds = 0
         let id1 = DeploymentId::new("deploy-verify-fail-baseline".to_string());
         let r1 = push_main_with_id(&h, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-        let prior = r1.attempt.as_ref().expect("attempt recorded").slots
-            [&PlacementSlotId::new("p1")]
-            .clone();
+        let prior =
+            r1.attempt.as_ref().expect("attempt recorded").slots[&SlotId::new("p1")].clone();
         let prior_gen = prior.generation.clone().expect("prior generation");
         let prior_tree = prior.artifact.tree.clone();
         let prior_release = prior.artifact.release.clone();
@@ -4649,7 +4630,7 @@ interval_seconds = 0
             "v2\n",
         )
         .unwrap();
-        let config2 = Config::load(&h.cfg_path).unwrap();
+        let config2 = ProjectConfig::load(&h.cfg_path).unwrap();
         let var_b = config2.variant("standard").unwrap();
         let b_digest = crate::release::behavior_contract_digest(&crate::model::BehaviorContract {
             activation: crate::config::ActivationConfig::from(var_b.activation.clone()),
@@ -4662,7 +4643,7 @@ interval_seconds = 0
         let op_id = OperationId::new(format!("op-{}", id2.as_str()));
         let rf = h.remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
-                            _slot: &crate::config::SlotDef|
+                            _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
@@ -4694,8 +4675,7 @@ interval_seconds = 0
 
         // The report's ACTUAL per-slot state reflects the restored PRIOR
         // generation and artifact, never the desired v2 tree.
-        let actual =
-            &r2.attempt.as_ref().expect("attempt recorded").slots[&PlacementSlotId::new("p1")];
+        let actual = &r2.attempt.as_ref().expect("attempt recorded").slots[&SlotId::new("p1")];
         assert_eq!(actual.generation, Some(prior_gen.clone()));
         assert_eq!(
             actual.artifact.tree, prior_tree,
@@ -4707,8 +4687,8 @@ interval_seconds = 0
         // with `compensated: true`, at the PRIOR generation. (`Restored` is
         // reserved for Activated slots compensated by the failure-policy pass.)
         let results = h.store.read_results(id2.as_str()).unwrap();
-        let res = &results[&PlacementSlotId::new("p1")];
-        assert_eq!(res.outcome, ServerOutcomeKind::Failed);
+        let res = &results[&SlotId::new("p1")];
+        assert_eq!(res.outcome, SlotOutcomeKind::Failed);
         assert!(res.compensated);
         assert_eq!(res.generation, Some(prior_gen.clone()));
 
@@ -4744,7 +4724,7 @@ interval_seconds = 0
         // the failed deployment re-stamped onto a generation it did not
         // create.
         let observed = h.store.read_observed("t1", &h.config).unwrap();
-        let os = &observed.slots[&PlacementSlotId::new("p1")];
+        let os = &observed.slots[&SlotId::new("p1")];
         assert_eq!(os.generation, Some(prior_gen.clone()));
         let oa = os.artifact.as_ref().expect("observed artifact");
         assert_eq!(
@@ -4752,7 +4732,7 @@ interval_seconds = 0
             "observed tree must be the restored prior tree"
         );
         assert_eq!(oa.release, prior_release);
-        let desired_tree = r2.attempt.as_ref().unwrap().desired[&PlacementSlotId::new("p1")]
+        let desired_tree = r2.attempt.as_ref().unwrap().desired[&SlotId::new("p1")]
             .assignment
             .artifact
             .tree
@@ -4843,7 +4823,7 @@ rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "rollback_c
         // Variant `good` (sorts first, so its slots come first in the plan)
         // declares p1/p2 with PASSING verification; variant `z-failing`
         // declares p3/p4 with FAILING verification. BOTH own the retention
-        // policy of the slots they declare (rotation lives in the slot's
+        // policy of the slots they declare (retention lives in the slot's
         // owning variant file).
         let good = r#"
 [[slots]]
@@ -4863,12 +4843,12 @@ from = "artifacts/build/output/"
 to = "app/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 2
 
 [activation]
@@ -4899,12 +4879,12 @@ from = "artifacts/build/output/"
 to = "app/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 2
 
 [activation]
@@ -4925,7 +4905,7 @@ interval_seconds = 0
 
         let cfg_path = project.join("deploy.toml");
         std::fs::write(&cfg_path, BATCHED_TOML).unwrap();
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let remotes_base = dir.path().join("remotes");
         std::fs::create_dir_all(&remotes_base).unwrap();
@@ -4936,7 +4916,7 @@ interval_seconds = 0
         let op_id = OperationId::new(format!("op-{}", id.as_str()));
         let rf = remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
-                            _slot: &crate::config::SlotDef|
+                            _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
@@ -4971,7 +4951,7 @@ interval_seconds = 0
         assert_eq!(attempt.slot_ids.len(), 4);
         for sid in ["p1", "p2", "p3", "p4"] {
             assert!(
-                attempt.slots.contains_key(&PlacementSlotId::new(sid)),
+                attempt.slots.contains_key(&SlotId::new(sid)),
                 "slot {sid} missing from attempt"
             );
         }
@@ -4980,23 +4960,20 @@ interval_seconds = 0
         // The first batch advanced, then compensated back (no prior state ->
         // `current` removed): Restored.
         assert_eq!(
-            results[&PlacementSlotId::new("p1")].outcome,
-            ServerOutcomeKind::Restored
+            results[&SlotId::new("p1")].outcome,
+            SlotOutcomeKind::Restored
         );
         assert_eq!(
-            results[&PlacementSlotId::new("p2")].outcome,
-            ServerOutcomeKind::Restored
+            results[&SlotId::new("p2")].outcome,
+            SlotOutcomeKind::Restored
         );
         // The failing slot of the second batch.
-        assert_eq!(
-            results[&PlacementSlotId::new("p3")].outcome,
-            ServerOutcomeKind::Failed
-        );
+        assert_eq!(results[&SlotId::new("p3")].outcome, SlotOutcomeKind::Failed);
         // The slot after the failing one in the same/later batch was never
         // started.
         assert_eq!(
-            results[&PlacementSlotId::new("p4")].outcome,
-            ServerOutcomeKind::Skipped
+            results[&SlotId::new("p4")].outcome,
+            SlotOutcomeKind::Skipped
         );
 
         // The never-started server (p4) was left untouched: no `current`
@@ -5086,7 +5063,7 @@ interval_seconds = 0
             "fixture must actually change the declared slot"
         );
         std::fs::write(&variant_path, rebind_variant).unwrap();
-        let config2 = Config::load(&h.cfg_path).unwrap();
+        let config2 = ProjectConfig::load(&h.cfg_path).unwrap();
         let members2 = config2.target_slots("t1").unwrap();
         assert_eq!(members2.len(), 1);
         assert_eq!(members2[0].0.id, "p2", "current membership is now p2");
@@ -5099,7 +5076,7 @@ interval_seconds = 0
         let observed_before = h.store.read_observed("t1", &h.config).unwrap();
         let rf = h.remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
-                            _slot: &crate::config::SlotDef|
+                            _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
@@ -5163,7 +5140,7 @@ interval_seconds = 0
         let id1 = DeploymentId::new("deploy-hist-dry-s0".to_string());
         let r1 = push_main_with_id(&h, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-        let s0 = &r1.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")];
+        let s0 = &r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")];
         let s0_tree = s0.artifact.tree.clone();
         let s0_gen = s0.generation.clone().expect("s0 generation");
 
@@ -5171,7 +5148,7 @@ interval_seconds = 0
         let remotes_before = snapshot_files(&h.remotes_base);
         let rf = h.remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
-                            _slot: &crate::config::SlotDef|
+                            _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
@@ -5225,8 +5202,7 @@ interval_seconds = 0
         assert_eq!(h.store.read_attempts("t1").unwrap().len(), 1);
         assert_eq!(h.store.read_snapshots("t1").unwrap().len(), 1);
         assert_eq!(
-            h.store.read_observed("t1", &h.config).unwrap().slots[&PlacementSlotId::new("p1")]
-                .generation,
+            h.store.read_observed("t1", &h.config).unwrap().slots[&SlotId::new("p1")].generation,
             Some(s0_gen),
             "observed state untouched by the dry run"
         );
@@ -5238,14 +5214,14 @@ interval_seconds = 0
         let id1 = DeploymentId::new("deploy-hist-dry-rel".to_string());
         let r1 = push_main_with_id(&h, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-        let s0 = &r1.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")];
+        let s0 = &r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")];
         let tree = s0.artifact.tree.clone();
 
         let store_before = snapshot_files(h.store.base());
         let remotes_before = snapshot_files(&h.remotes_base);
         let rf = h.remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
-                            _slot: &crate::config::SlotDef|
+                            _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
@@ -5414,7 +5390,7 @@ interval_seconds = 0
     struct SysdHarness {
         _dir: tempfile::TempDir,
         cfg_path: PathBuf,
-        config: Config,
+        config: ProjectConfig,
         store: LocalStore,
         remotes_base: PathBuf,
     }
@@ -5441,7 +5417,7 @@ interval_seconds = 0
                 std::fs::write(&fp, c).unwrap();
             }
             let cfg_path = project.join("deploy.toml");
-            let config = Config::load(&cfg_path).unwrap();
+            let config = ProjectConfig::load(&cfg_path).unwrap();
             let store = LocalStore::with_base(dir.path().join("store")).unwrap();
             let remotes_base = dir.path().join("remotes");
             std::fs::create_dir_all(&remotes_base).unwrap();
@@ -5460,7 +5436,7 @@ interval_seconds = 0
             let op_id = OperationId::new(format!("op-{}", deployment_id.as_str()));
             let rf = self.remotes_base.clone();
             let factory = move |s: &crate::config::ServerDef,
-                                _slot: &crate::config::SlotDef|
+                                _slot: &crate::config::SlotConfig|
                   -> Result<Box<dyn Remote>> {
                 Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
             };
@@ -5500,7 +5476,7 @@ interval_seconds = 0
         let id1 = DeploymentId::new("deploy-act-fail-baseline".to_string());
         let r1 = h.push_head(&id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-        let prior = r1.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")].clone();
+        let prior = r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")].clone();
         let prior_gen = prior.generation.clone().expect("prior generation");
         let prior_tree = prior.artifact.tree.clone();
         let prior_release = prior.artifact.release.clone();
@@ -5552,8 +5528,7 @@ interval_seconds = 0
 
         // The report's ACTUAL per-slot state reflects the restored PRIOR
         // generation and artifact, never the desired v2 tree.
-        let actual =
-            &r2.attempt.as_ref().expect("attempt recorded").slots[&PlacementSlotId::new("p1")];
+        let actual = &r2.attempt.as_ref().expect("attempt recorded").slots[&SlotId::new("p1")];
         assert_eq!(actual.generation, Some(prior_gen.clone()));
         assert_eq!(
             actual.artifact.tree, prior_tree,
@@ -5564,8 +5539,8 @@ interval_seconds = 0
         // and was compensated inside the per-server pipeline at the PRIOR
         // generation.
         let results = h.store.read_results(id2.as_str()).unwrap();
-        let res = &results[&PlacementSlotId::new("p1")];
-        assert_eq!(res.outcome, ServerOutcomeKind::Failed);
+        let res = &results[&SlotId::new("p1")];
+        assert_eq!(res.outcome, SlotOutcomeKind::Failed);
         assert!(res.compensated, "activation failure must be compensated");
         assert_eq!(res.generation, Some(prior_gen.clone()));
 
@@ -5600,7 +5575,7 @@ interval_seconds = 0
         // tree, and the failed attempt must not be re-stamped onto a slot it
         // did not leave live.
         let observed = h.store.read_observed("t1", &h.config).unwrap();
-        let os = &observed.slots[&PlacementSlotId::new("p1")];
+        let os = &observed.slots[&SlotId::new("p1")];
         assert_eq!(os.generation, Some(prior_gen.clone()));
         let oa = os.artifact.as_ref().expect("observed artifact");
         assert_eq!(
@@ -5608,7 +5583,7 @@ interval_seconds = 0
             "observed tree must be the restored prior tree"
         );
         assert_eq!(oa.release, prior_release);
-        let desired_tree = r2.attempt.as_ref().unwrap().desired[&PlacementSlotId::new("p1")]
+        let desired_tree = r2.attempt.as_ref().unwrap().desired[&SlotId::new("p1")]
             .assignment
             .artifact
             .tree
@@ -5656,11 +5631,11 @@ interval_seconds = 0
         let id1 = DeploymentId::new("deploy-act-compfail-baseline".to_string());
         let r1 = h.push_head(&id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-        let prior_gen = r1.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")]
+        let prior_gen = r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")]
             .generation
             .clone()
             .expect("prior generation");
-        let prior_tree = r1.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")]
+        let prior_tree = r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")]
             .artifact
             .tree
             .clone();
@@ -5698,8 +5673,8 @@ interval_seconds = 0
         // stayed on the DESIRED generation (the compensation swap-back could
         // not re-activate the prior service).
         let results = h.store.read_results(id2.as_str()).unwrap();
-        let res = &results[&PlacementSlotId::new("p1")];
-        assert_eq!(res.outcome, ServerOutcomeKind::Failed);
+        let res = &results[&SlotId::new("p1")];
+        assert_eq!(res.outcome, SlotOutcomeKind::Failed);
         assert!(
             !res.compensated,
             "the failed compensation must not be recorded as compensated"
@@ -5730,7 +5705,7 @@ interval_seconds = 0
             "the compensation swap-back is visible on the remote current"
         );
         let observed = h.store.read_observed("t1", &h.config).unwrap();
-        let os = &observed.slots[&PlacementSlotId::new("p1")];
+        let os = &observed.slots[&SlotId::new("p1")];
         assert_eq!(os.generation, Some(prior_gen.clone()));
         assert_eq!(
             os.artifact.as_ref().expect("observed artifact").tree,
@@ -5881,8 +5856,8 @@ interval_seconds = 0
         // the compensation result are both recorded, step 11) at the advanced
         // (then removed) generation.
         let results = h.store.read_results(id.as_str()).unwrap();
-        let res = &results[&PlacementSlotId::new("p1")];
-        assert_eq!(res.outcome, ServerOutcomeKind::Failed);
+        let res = &results[&SlotId::new("p1")];
+        assert_eq!(res.outcome, SlotOutcomeKind::Failed);
         assert!(
             res.compensated,
             "first-deploy compensation must be recorded as compensated"
@@ -5917,7 +5892,7 @@ interval_seconds = 0
         // Deterministic capacity: the remote reports 100 bytes available and
         // the server policy reserves 1 MiB, so the first deployment cannot
         // fit its tree.
-        let mut config = Config::load(&h.cfg_path).unwrap();
+        let mut config = ProjectConfig::load(&h.cfg_path).unwrap();
         config.servers[0].capacity = crate::config::CapacityConfig {
             reserve_bytes: 1024 * 1024,
             reserve_percent: crate::scalar::CapacityPercent::new(0).expect("0 is in range"),
@@ -5927,7 +5902,7 @@ interval_seconds = 0
         let op_id = OperationId::new(format!("op-{}", id.as_str()));
         let rf = h.remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
-                            _slot: &crate::config::SlotDef|
+                            _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             FakeCapacityRemote::build(rf.join(s.id.as_str()), 100)
         };
@@ -6021,7 +5996,7 @@ interval_seconds = 0
         let armed_for_factory = armed.clone();
         let rf = h.remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
-                            _slot: &crate::config::SlotDef|
+                            _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             FailOnceStagingRemote::build(rf.join(s.id.as_str()), armed_for_factory.clone())
         };
@@ -6173,7 +6148,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 "#;
         let cfg_path = project.join("deploy.toml");
         std::fs::write(&cfg_path, two_slot_toml).unwrap();
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let remotes_base = dir.path().join("remotes");
         std::fs::create_dir_all(&remotes_base).unwrap();
@@ -6188,7 +6163,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let armed_for_factory = armed.clone();
         let rf = remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
-                            _slot: &crate::config::SlotDef|
+                            _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             let arm = if s.id.as_str() == "s2" {
                 armed_for_factory.clone()
@@ -6330,11 +6305,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "deploy-hist-behavior-fixture",
             "sha256-aa",
             BTreeMap::from([(
-                PlacementSlotId::new("p1".to_string()),
+                SlotId::new("p1".to_string()),
                 GenerationRef {
                     generation: GenerationId::new("gen-hist".to_string()),
                     assignment: crate::model::PlacementSlotAssignment {
-                        placement_slot: PlacementSlotId::new("p1".to_string()),
+                        placement_slot: SlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
                             release: release.clone(),
                             variant: VariantName::new("standard".to_string()),
@@ -6349,7 +6324,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // MISSING BEHAVIOR SNAPSHOT, so the payload must be otherwise
             // valid for the ledger to load at all.
             BTreeMap::from([(
-                PlacementSlotId::new("p1".to_string()),
+                SlotId::new("p1".to_string()),
                 crate::records::PhysicalBinding {
                     server: crate::model::ServerId::new("s1".to_string()),
                     deploy_dir: "/srv/eng".to_string(),
@@ -6363,7 +6338,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let id = DeploymentId::new("deploy-hist-behavior".to_string());
         let rf = h.remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
-                            _slot: &crate::config::SlotDef|
+                            _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
@@ -6477,8 +6452,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn multi_release_partial_snapshot_rollback_publishes_per_slot_behavior() {
         let h = TwoSlotHarness::new();
-        let slot_a = PlacementSlotId::new("p1".to_string());
-        let slot_b = PlacementSlotId::new("p2".to_string());
+        let slot_a = SlotId::new("p1".to_string());
+        let slot_b = SlotId::new("p2".to_string());
 
         // Push 1: FULL Head push under contract A (argv ["true", "a"]) —
         // release R1 for BOTH slots; snapshot S0: p1=R1, p2=R1.
@@ -6527,7 +6502,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "v2\n",
         )
         .unwrap();
-        let config2 = Config::load(&h.cfg_path).unwrap();
+        let config2 = ProjectConfig::load(&h.cfg_path).unwrap();
         let var_b = config2.variant("standard").unwrap();
         let digest_b = crate::release::behavior_contract_digest(&BehaviorContract {
             activation: crate::config::ActivationConfig::from(var_b.activation.clone()),
@@ -6676,15 +6651,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let id1 = DeploymentId::new("deploy-obs-fallback-baseline".to_string());
         let r1 = push_main_with_id(&h, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-        let gen1 = r1.attempt.as_ref().expect("attempt").slots[&PlacementSlotId::new("p1")]
+        let gen1 = r1.attempt.as_ref().expect("attempt").slots[&SlotId::new("p1")]
             .generation
             .clone()
             .expect("baseline generation");
         // The baseline's REAL live assignment: the truth the prior observed
         // record carries (an unreadable assignment must fall back to it, not
         // to a fabricated/unknown marker).
-        let gen1_artifact = r1.attempt.as_ref().expect("attempt").slots
-            [&PlacementSlotId::new("p1")]
+        let gen1_artifact = r1.attempt.as_ref().expect("attempt").slots[&SlotId::new("p1")]
             .artifact
             .clone();
         eprintln!("DEBUG gen1={gen1}");
@@ -6721,7 +6695,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let armed_for_factory = armed.clone();
         let rf = h.remotes_base.clone();
         let fault_factory = move |s: &crate::config::ServerDef,
-                                  _slot: &crate::config::SlotDef|
+                                  _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             FailOnceGenerationRemote::build(rf.join(s.id.as_str()), armed_for_factory.clone())
         };
@@ -6765,7 +6739,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // baseline push recorded — never the desired v2 artifact, never an
         // unknown (default) marker, never the failed deployment re-stamped.
         let observed = h.store.read_observed("t1", &h.config).unwrap();
-        let os = &observed.slots[&PlacementSlotId::new("p1")];
+        let os = &observed.slots[&SlotId::new("p1")];
         assert_eq!(
             os.generation,
             Some(gen1.clone()),
@@ -6776,8 +6750,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             oa, &gen1_artifact,
             "the prior observed record's REAL artifact must be preserved verbatim, got: {oa:?}"
         );
-        let desired_art = &r2.attempt.as_ref().expect("attempt").desired
-            [&PlacementSlotId::new("p1")]
+        let desired_art = &r2.attempt.as_ref().expect("attempt").desired[&SlotId::new("p1")]
             .assignment
             .artifact;
         assert_ne!(
@@ -6797,7 +6770,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(attempts.len(), 2);
         let intent2 = &attempts[1];
         assert_eq!(intent2.deployment_id, id2);
-        let pp = intent2.intent.slots[&PlacementSlotId::new("p1")]
+        let pp = intent2.intent.slots[&SlotId::new("p1")]
             .pre_push
             .as_ref()
             .expect("pre_push present");
@@ -6811,10 +6784,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // results.json records the pre-swap failure; the failed attempt
         // produced no snapshot/ref and the baseline ref is untouched.
         let results = h.store.read_results(id2.as_str()).unwrap();
-        assert_eq!(
-            results[&PlacementSlotId::new("p1")].outcome,
-            ServerOutcomeKind::Failed
-        );
+        assert_eq!(results[&SlotId::new("p1")].outcome, SlotOutcomeKind::Failed);
         assert_eq!(
             latest_status(&h, id2.as_str()),
             DeploymentStatus::FailedRolledBack
@@ -6878,7 +6848,7 @@ rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "leave_chan
         // Variant `good` (sorts first) declares p1/p2 with PASSING
         // verification; variant `z-failing` declares p3/p4 with FAILING
         // verification. BOTH variants own the retention policy of the slots
-        // they declare (rotation lives in the slot's owning variant file).
+        // they declare (retention lives in the slot's owning variant file).
         let good = r#"
 [[slots]]
 id = "p1"
@@ -6897,12 +6867,12 @@ from = "artifacts/build/output/"
 to = "app/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 2
 
 [activation]
@@ -6933,12 +6903,12 @@ from = "artifacts/build/output/"
 to = "app/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 2
 
 [activation]
@@ -6959,7 +6929,7 @@ interval_seconds = 0
 
         let cfg_path = project.join("deploy.toml");
         std::fs::write(&cfg_path, LEAVE_TOML).unwrap();
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let remotes_base = dir.path().join("remotes");
         std::fs::create_dir_all(&remotes_base).unwrap();
@@ -6970,7 +6940,7 @@ interval_seconds = 0
         let op_id = OperationId::new(format!("op-{}", id.as_str()));
         let rf = remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
-                            _slot: &crate::config::SlotDef|
+                            _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
@@ -7026,24 +6996,21 @@ interval_seconds = 0
         // Per-slot outcomes: advanced, failed(+compensated), skipped.
         let results = store.read_results(id.as_str()).unwrap();
         assert_eq!(
-            results[&PlacementSlotId::new("p1")].outcome,
-            ServerOutcomeKind::Activated
+            results[&SlotId::new("p1")].outcome,
+            SlotOutcomeKind::Activated
         );
         assert_eq!(
-            results[&PlacementSlotId::new("p2")].outcome,
-            ServerOutcomeKind::Activated
+            results[&SlotId::new("p2")].outcome,
+            SlotOutcomeKind::Activated
         );
-        assert_eq!(
-            results[&PlacementSlotId::new("p3")].outcome,
-            ServerOutcomeKind::Failed
-        );
+        assert_eq!(results[&SlotId::new("p3")].outcome, SlotOutcomeKind::Failed);
         assert!(
-            results[&PlacementSlotId::new("p3")].compensated,
+            results[&SlotId::new("p3")].compensated,
             "the failing slot's in-process compensation is recorded"
         );
         assert_eq!(
-            results[&PlacementSlotId::new("p4")].outcome,
-            ServerOutcomeKind::Skipped
+            results[&SlotId::new("p4")].outcome,
+            SlotOutcomeKind::Skipped
         );
 
         // No snapshot/ref for a degraded attempt.
@@ -7069,14 +7036,14 @@ interval_seconds = 0
         let id1 = DeploymentId::new("deploy-bare-atf".to_string());
         let r1 = push_main_with_id(&h, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-        let s0_tree = r1.attempt.as_ref().unwrap().slots[&PlacementSlotId::new("p1")]
+        let s0_tree = r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")]
             .artifact
             .tree
             .clone();
 
         let rf = h.remotes_base.clone();
         let factory = move |s: &crate::config::ServerDef,
-                            _slot: &crate::config::SlotDef|
+                            _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
         };
@@ -7237,7 +7204,7 @@ interval_seconds = 0
         }
 
         let cfg_path = project.join("deploy.toml");
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
         assert_eq!(config.slot_variant("p1").unwrap(), "standard");
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let remotes_base = dir.path().join("remotes");
@@ -7246,7 +7213,7 @@ interval_seconds = 0
         let rf = remotes_base.clone();
         let recorded = executed.clone();
         let factory = move |s: &crate::config::ServerDef,
-                            _slot: &crate::config::SlotDef|
+                            _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(RecordingRemote::new(
                 rf.join(s.id.as_str()),
@@ -7271,7 +7238,7 @@ interval_seconds = 0
         .unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let first_attempt = r1.attempt.as_ref().expect("attempt recorded");
-        let first_slot = &first_attempt.slots[&PlacementSlotId::new("p1")];
+        let first_slot = &first_attempt.slots[&SlotId::new("p1")];
         assert_eq!(first_slot.artifact.variant.as_str(), "standard");
         let first_tree = first_slot.artifact.tree.clone();
         let first_gen = first_slot.generation.clone().expect("generation minted");
@@ -7289,7 +7256,7 @@ interval_seconds = 0
         // resolves to variant `other` with the SAME tree bytes as `standard`.
         std::fs::write(release_dir.join("standard.toml"), STD_VARIANT_NO_SLOTS).unwrap();
         std::fs::write(release_dir.join("other.toml"), OTHER_VARIANT_WITH_SLOTS).unwrap();
-        let config2 = Config::load(&cfg_path).unwrap();
+        let config2 = ProjectConfig::load(&cfg_path).unwrap();
         assert_eq!(config2.slot_variant("p1").unwrap(), "other");
 
         // Push 2: the variant changed (standard -> other) even though the
@@ -7321,7 +7288,7 @@ interval_seconds = 0
         );
         assert_eq!(r2.status, Some(DeploymentStatus::Successful));
         let second_attempt = r2.attempt.as_ref().expect("attempt recorded");
-        let second_slot = &second_attempt.slots[&PlacementSlotId::new("p1")];
+        let second_slot = &second_attempt.slots[&SlotId::new("p1")];
         assert_eq!(second_slot.artifact.variant.as_str(), "other");
         assert_eq!(
             second_slot.artifact.tree, first_tree,
@@ -7333,7 +7300,7 @@ interval_seconds = 0
             "the switch must mint a NEW generation, never reuse the standard one"
         );
         assert_eq!(
-            second_attempt.desired[&PlacementSlotId::new("p1")]
+            second_attempt.desired[&SlotId::new("p1")]
                 .assignment
                 .artifact
                 .variant
@@ -7489,7 +7456,7 @@ interval_seconds = 0
             }),
         ) {
             let h = RecoveryHarness::new();
-            let slot = PlacementSlotId::new("p1".to_string());
+            let slot = SlotId::new("p1".to_string());
 
             // (c) A concurrent/reconciled append: a pending-commit attempt
             // whose reconciliation will append EXACTLY ONE snapshot during
@@ -7502,7 +7469,7 @@ interval_seconds = 0
             let armed_for_factory = armed.clone();
             let rf = h.remotes_base.clone();
             let fault_factory = move |s: &crate::config::ServerDef,
-                                      _slot: &crate::config::SlotDef|
+                                      _slot: &crate::config::SlotConfig|
                      -> Result<Box<dyn Remote>> {
                 FailOnceMarkerRemote::build(rf.join(s.id.as_str()), armed_for_factory.clone())
             };
@@ -7631,7 +7598,7 @@ interval_seconds = 0
            // mutation loop.
             let rf2 = h.remotes_base.clone();
             let clean_factory = move |s: &crate::config::ServerDef,
-                                      _slot: &crate::config::SlotDef|
+                                      _slot: &crate::config::SlotConfig|
                      -> Result<Box<dyn Remote>> {
                 Ok(Box::new(LocalTransport::new(rf2.join(s.id.as_str()))?))
             };
@@ -7730,7 +7697,7 @@ interval_seconds = 0
             // fail in resolution, before any planning reads the snapshots'
             // artifacts.
             let h = RecoveryHarness::new();
-            let slot = PlacementSlotId::new("p1".to_string());
+            let slot = SlotId::new("p1".to_string());
             let artifact = ArtifactRef {
                 release: ReleaseId::new("rel-sha256-1111".to_string()),
                 variant: VariantName::new("p1".to_string()),
@@ -7841,7 +7808,13 @@ interval_seconds = 0
         release_inc: [bool; 3],
         current_inc: [bool; 3],
         physical_drift: bool,
-    ) -> (tempfile::TempDir, PathBuf, Config, LocalStore, ReleaseId) {
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        ProjectConfig,
+        LocalStore,
+        ReleaseId,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
@@ -7881,8 +7854,8 @@ interval_seconds = 0
         variant.push_str(
             "[[artifact.mappings]]\nfrom = \"artifacts/build/output/\"\nto = \"app/\"\nrecursive = true\n\n\
              [[artifact.mappings]]\nfrom = \"artifacts/deployment/common/\"\nto = \"app-common/\"\nrecursive = true\n\n\
-             [rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n\
-             [rotation.deployment]\nprotect_deployments = 1\n\n\
+             [retention.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n\
+             [retention.deployment]\nprotect_deployments = 1\n\n\
              [activation]\nadapter = \"none\"\n\n\
              [verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
         );
@@ -7916,7 +7889,7 @@ interval_seconds = 0
             std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
             std::fs::write(&fp, c).unwrap();
         }
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let remotes_base = dir.path().join("remotes");
         std::fs::create_dir_all(&remotes_base).unwrap();
@@ -8257,8 +8230,8 @@ interval_seconds = 0
         variant.push_str(
             "[[artifact.mappings]]\nfrom = \"artifacts/build/output/\"\nto = \"app/\"\nrecursive = true\n\n\
              [[artifact.mappings]]\nfrom = \"artifacts/deployment/common/\"\nto = \"app-common/\"\nrecursive = true\n\n\
-             [rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n\
-             [rotation.deployment]\nprotect_deployments = 1\n\n\
+             [retention.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n\
+             [retention.deployment]\nprotect_deployments = 1\n\n\
              [activation]\nadapter = \"none\"\n\n\
              [verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
         );
@@ -8300,7 +8273,7 @@ interval_seconds = 0
     ) -> (
         tempfile::TempDir,
         PathBuf,
-        Config,
+        ProjectConfig,
         LocalStore,
         ReleaseId,
         String,
@@ -8317,7 +8290,7 @@ interval_seconds = 0
         .unwrap();
         let cfg_path = project.join("deploy.toml");
         std::fs::write(&cfg_path, group_config_string()).unwrap();
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let remotes_base = dir.path().join("remotes");
         std::fs::create_dir_all(&remotes_base).unwrap();
@@ -8402,12 +8375,12 @@ interval_seconds = 0
             variant: VariantName::new("standard".to_string()),
             tree: TreeDigest::new("tree-group".to_string()),
         };
-        let slots: BTreeMap<PlacementSlotId, GenerationRef> = config
+        let slots: BTreeMap<SlotId, GenerationRef> = config
             .target_slots("t1")
             .unwrap()
             .into_iter()
             .map(|(slot, _)| {
-                let slot_id = PlacementSlotId::new(slot.id.clone());
+                let slot_id = SlotId::new(slot.id.clone());
                 (
                     slot_id.clone(),
                     GenerationRef {
@@ -8442,7 +8415,7 @@ interval_seconds = 0
         group_inc: [bool; 3],
         extra_inc: [bool; 3],
         mutation: MembershipMutation,
-    ) -> Config {
+    ) -> ProjectConfig {
         let variant_path = dir
             .path()
             .join("proj")
@@ -8459,7 +8432,7 @@ interval_seconds = 0
             group_variant_string(group_inc, extra_inc, phys_id, add_slot),
         )
         .unwrap();
-        Config::load(cfg_path).unwrap()
+        ProjectConfig::load(cfg_path).unwrap()
     }
 
     // THE USER'S DIRECT-RELEASE GROUP PROPERTY: for generated MATCHING

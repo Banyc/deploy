@@ -8,13 +8,13 @@
 
 use crate::adapter::systemd::{run_activation, validate_artifact_paths};
 use crate::adapter::verify::run_verification;
-use crate::config::Config;
+use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::model::{
     ArtifactRef, BehaviorContract, DeploymentId, GenerationId, OperationId, ReleaseId, TargetName,
 };
-use crate::records::ServerOutcomeKind;
+use crate::records::SlotOutcomeKind;
 use crate::remote::helper::RemoteHelper;
 use crate::remote::transport::Remote;
 use crate::store::local::LocalStore;
@@ -24,7 +24,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 pub(crate) struct ServerProc {
-    pub(crate) kind: ServerOutcomeKind,
+    pub(crate) kind: SlotOutcomeKind,
     pub(crate) generation: GenerationId,
     /// True when this slot's `current` was advanced (the per-slot commit point
     /// was moved to the new generation) at some point during the attempt —
@@ -61,7 +61,7 @@ pub(crate) fn process_server(
     behavior: &BehaviorContract,
     behavior_sha256: &str,
     template_vars: &crate::template::TemplateVars,
-    config: &Config,
+    config: &ProjectConfig,
 ) -> Result<ServerProc> {
     // Acquire the slot's mutation lock via an RAII guard so every return path
     // (including errors) releases it.
@@ -69,7 +69,7 @@ pub(crate) fn process_server(
         Ok(g) => g,
         Err(e) => {
             return Ok(ServerProc {
-                kind: ServerOutcomeKind::Failed,
+                kind: SlotOutcomeKind::Failed,
                 generation: new_gen.clone(),
                 did_advance: false,
                 did_compensate: false,
@@ -83,7 +83,7 @@ pub(crate) fn process_server(
         Ok(s) => s,
         Err(e) => {
             return Ok(ServerProc {
-                kind: ServerOutcomeKind::Failed,
+                kind: SlotOutcomeKind::Failed,
                 generation: new_gen.clone(),
                 did_advance: false,
                 did_compensate: false,
@@ -95,7 +95,7 @@ pub(crate) fn process_server(
         && status.current_generation.as_deref() != Some(exp.as_str())
     {
         return Ok(ServerProc {
-            kind: ServerOutcomeKind::Skipped,
+            kind: SlotOutcomeKind::Skipped,
             generation: exp.clone(),
             did_advance: false,
             did_compensate: false,
@@ -109,7 +109,7 @@ pub(crate) fn process_server(
     // 1. Publish the staged tree (from incoming), reusing an existing object.
     if let Err(e) = helper.publish_from_incoming(deployment_id.as_str(), artifact.tree.as_str()) {
         return Ok(ServerProc {
-            kind: ServerOutcomeKind::Failed,
+            kind: SlotOutcomeKind::Failed,
             generation: new_gen.clone(),
             did_advance: false,
             did_compensate: false,
@@ -123,7 +123,7 @@ pub(crate) fn process_server(
         Ok(t) => t,
         Err(e) => {
             return Ok(ServerProc {
-                kind: ServerOutcomeKind::Failed,
+                kind: SlotOutcomeKind::Failed,
                 generation: new_gen.clone(),
                 did_advance: false,
                 did_compensate: false,
@@ -134,7 +134,7 @@ pub(crate) fn process_server(
     let object_rel = layout::tree_root(artifact.tree.as_str());
     if let Err(e) = download_tree_to_host(remote, &object_rel, verify_tmp.path()) {
         return Ok(ServerProc {
-            kind: ServerOutcomeKind::Failed,
+            kind: SlotOutcomeKind::Failed,
             generation: new_gen.clone(),
             did_advance: false,
             did_compensate: false,
@@ -145,7 +145,7 @@ pub(crate) fn process_server(
         Ok(m) => m,
         Err(e) => {
             return Ok(ServerProc {
-                kind: ServerOutcomeKind::Failed,
+                kind: SlotOutcomeKind::Failed,
                 generation: new_gen.clone(),
                 did_advance: false,
                 did_compensate: false,
@@ -155,7 +155,7 @@ pub(crate) fn process_server(
     };
     if meta.tree_sha256 != artifact.tree.as_str() {
         return Ok(ServerProc {
-            kind: ServerOutcomeKind::Failed,
+            kind: SlotOutcomeKind::Failed,
             generation: new_gen.clone(),
             did_advance: false,
             did_compensate: false,
@@ -169,7 +169,7 @@ pub(crate) fn process_server(
     // 3. Validate all declared artifact paths and types before changing current.
     if let Err(e) = validate_artifact_paths(remote, &object_rel, &behavior.activation) {
         return Ok(ServerProc {
-            kind: ServerOutcomeKind::Failed,
+            kind: SlotOutcomeKind::Failed,
             generation: new_gen.clone(),
             did_advance: false,
             did_compensate: false,
@@ -184,7 +184,7 @@ pub(crate) fn process_server(
             helper.publish_release(artifact.release.as_str(), &release_json, &behavior_json)
     {
         return Ok(ServerProc {
-            kind: ServerOutcomeKind::Failed,
+            kind: SlotOutcomeKind::Failed,
             generation: new_gen.clone(),
             did_advance: false,
             did_compensate: false,
@@ -202,7 +202,7 @@ pub(crate) fn process_server(
     };
     if let Err(e) = helper.create_generation(op_id.as_str(), &assignment) {
         return Ok(ServerProc {
-            kind: ServerOutcomeKind::Failed,
+            kind: SlotOutcomeKind::Failed,
             generation: new_gen.clone(),
             did_advance: false,
             did_compensate: false,
@@ -211,7 +211,7 @@ pub(crate) fn process_server(
     }
     if let Err(e) = helper.transaction_record(op_id.as_str(), "prepared") {
         return Ok(ServerProc {
-            kind: ServerOutcomeKind::Failed,
+            kind: SlotOutcomeKind::Failed,
             generation: new_gen.clone(),
             did_advance: false,
             did_compensate: false,
@@ -229,7 +229,7 @@ pub(crate) fn process_server(
         Ok(()) => {}
         Err(e) => {
             return Ok(ServerProc {
-                kind: ServerOutcomeKind::Failed,
+                kind: SlotOutcomeKind::Failed,
                 generation: new_gen.clone(),
                 did_advance: false,
                 did_compensate: false,
@@ -271,7 +271,7 @@ pub(crate) fn process_server(
             new_gen.clone()
         };
         return Ok(ServerProc {
-            kind: ServerOutcomeKind::Failed,
+            kind: SlotOutcomeKind::Failed,
             generation,
             // The desired swap already moved `current` to the new generation:
             // this slot WAS advanced by the attempt, even if compensation
@@ -305,7 +305,7 @@ pub(crate) fn process_server(
             new_gen.clone()
         };
         return Ok(ServerProc {
-            kind: ServerOutcomeKind::Failed,
+            kind: SlotOutcomeKind::Failed,
             generation,
             did_advance: true,
             did_compensate: did_comp,
@@ -326,7 +326,7 @@ pub(crate) fn process_server(
         .is_err()
     {
         return Ok(ServerProc {
-            kind: ServerOutcomeKind::Activated,
+            kind: SlotOutcomeKind::Activated,
             generation: new_gen.clone(),
             did_advance: true,
             did_compensate: false,
@@ -337,7 +337,7 @@ pub(crate) fn process_server(
         });
     }
     Ok(ServerProc {
-        kind: ServerOutcomeKind::Activated,
+        kind: SlotOutcomeKind::Activated,
         generation: new_gen.clone(),
         did_advance: true,
         did_compensate: false,
@@ -365,7 +365,7 @@ pub(crate) fn compensate_server(
     _deployment_id: &DeploymentId,
     prior_gen: Option<&GenerationId>,
     advanced_gen: &GenerationId,
-    _config: &Config,
+    _config: &ProjectConfig,
     template_vars: &crate::template::TemplateVars,
 ) -> Result<bool> {
     // Hold the slot's mutation lock for the duration of compensation. Re-acquiring
@@ -505,12 +505,12 @@ from = "artifacts/deployment/common/"
 to = "app-common/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 1
 
 [activation]
@@ -561,12 +561,12 @@ from = "artifacts/units/"
 to = "integration/systemd/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 1
 
 [activation]
@@ -649,7 +649,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     struct Harness {
         _dir: tempfile::TempDir,
-        config: Config,
+        config: ProjectConfig,
         store: LocalStore,
         _project: PathBuf,
         tree: TreeDigest,
@@ -674,7 +674,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
                 std::fs::write(&fp, c).unwrap();
             }
-            let config = Config::load(&cfg_path).unwrap();
+            let config = ProjectConfig::load(&cfg_path).unwrap();
             let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
             // Materialize from the release directory, not the project root.
@@ -815,7 +815,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             ],
         );
         let proc = h.run(None);
-        assert_eq!(proc.kind, ServerOutcomeKind::Activated);
+        assert_eq!(proc.kind, SlotOutcomeKind::Activated);
         assert!(!proc.did_compensate);
         assert!(h.remote.exists(layout::current()));
     }
@@ -831,7 +831,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             ],
         );
         let first = h.run(None);
-        assert_eq!(first.kind, ServerOutcomeKind::Activated);
+        assert_eq!(first.kind, SlotOutcomeKind::Activated);
 
         // Corrupt the already-published remote object's content.
         let obj_file = h
@@ -848,7 +848,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // A second generation reuses the corrupted object and must detect the
         // digest mismatch before advancing `current`.
         let second = h.run(Some(first.generation.clone()));
-        assert_eq!(second.kind, ServerOutcomeKind::Failed);
+        assert_eq!(second.kind, SlotOutcomeKind::Failed);
         assert!(second.error.unwrap().contains("integrity"));
     }
 
@@ -867,7 +867,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         std::fs::write(&local_file, "CORRUPT-LOCAL").unwrap();
 
         let proc = h.run(None);
-        assert_eq!(proc.kind, ServerOutcomeKind::Failed);
+        assert_eq!(proc.kind, SlotOutcomeKind::Failed);
         assert!(proc.error.unwrap().contains("integrity"));
     }
 
@@ -884,7 +884,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             ],
         );
         let proc = h.run(None);
-        assert_eq!(proc.kind, ServerOutcomeKind::Failed);
+        assert_eq!(proc.kind, SlotOutcomeKind::Failed);
         assert!(proc.error.unwrap().contains("missing"));
         assert!(!h.remote.exists(layout::current()));
     }
@@ -902,7 +902,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             ],
         );
         let proc = h.run(None);
-        assert_eq!(proc.kind, ServerOutcomeKind::Failed);
+        assert_eq!(proc.kind, SlotOutcomeKind::Failed);
         assert!(proc.error.unwrap().to_lowercase().contains("type"));
     }
 
@@ -966,7 +966,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // Activated.
             assert_eq!(
                 proc.kind,
-                ServerOutcomeKind::Activated,
+                SlotOutcomeKind::Activated,
                 "activation failed (root/root double-join?): {:?}",
                 proc.error
             );
@@ -1074,7 +1074,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let first = h.run(None);
             assert_eq!(
                 first.kind,
-                ServerOutcomeKind::Activated,
+                SlotOutcomeKind::Activated,
                 "first deploy must activate: {:?}",
                 first.error
             );
@@ -1220,7 +1220,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         // First deploy: the PRIOR generation g1 is live.
         let first = h.run(None);
-        assert_eq!(first.kind, ServerOutcomeKind::Activated);
+        assert_eq!(first.kind, SlotOutcomeKind::Activated);
         let helper = h.helper();
 
         // The failed push advanced to g2 (its generation record exists, and

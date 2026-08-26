@@ -9,7 +9,7 @@
 //! reads backing `deploy log`/`deploy status` are asserted at the end.
 
 use deploy::cli;
-use deploy::config::Config;
+use deploy::config::ProjectConfig;
 use deploy::error::Result;
 use deploy::layout;
 use deploy::push::engine::{PushOptions, push};
@@ -62,7 +62,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     // 3. The scaffolded config loads and validates (strict rules: absolute
     // deploy_dir, unique server ids, known variant, non-empty target).
     let config_path = proj.join("deploy.toml");
-    let config = Config::load(&config_path)?;
+    let config = ProjectConfig::load(&config_path)?;
     assert_eq!(config.application.as_str(), "roundtrip-app");
     assert_eq!(config.release().as_str(), "v1");
     // Membership is derived from the slots' `targets` lists (the slot is
@@ -108,7 +108,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     // 4. Dry-run: plans the deployment, touches neither store nor endpoint.
     let store = LocalStore::with_base(tmp.path().join("store"))?;
     let factory = move |s: &deploy::config::ServerDef,
-                        slot: &deploy::config::SlotDef|
+                        slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> { create_remote(s, &slot.deploy_dir) };
 
     let r_dry = push(
@@ -157,7 +157,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     );
     let attempt = r.attempt.expect("attempt recorded");
     assert_eq!(attempt.slot_ids.len(), 1);
-    let srv = &attempt.slots[&deploy::model::PlacementSlotId::new("app-1")];
+    let srv = &attempt.slots[&deploy::model::SlotId::new("app-1")];
     let generation = srv.generation.as_ref().expect("generation assigned");
 
     // 6. Remote state: the local endpoint now carries the full layout, the
@@ -229,7 +229,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     );
 
     let observed = store.read_observed("production", &config)?;
-    let obs = &observed.slots[&deploy::model::PlacementSlotId::new("app-1")];
+    let obs = &observed.slots[&deploy::model::SlotId::new("app-1")];
     assert_eq!(
         obs.generation.as_ref(),
         Some(generation),
@@ -284,7 +284,7 @@ fn cli_init_flags_reach_config() -> Result<()> {
         "--user",
         "ops",
     ])?;
-    let config = Config::load(&proj.join("deploy.toml"))?;
+    let config = ProjectConfig::load(&proj.join("deploy.toml"))?;
     assert_eq!(config.application.as_str(), "backend");
     assert_eq!(config.servers[0].user, "ops");
     Ok(())

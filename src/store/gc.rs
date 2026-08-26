@@ -86,7 +86,7 @@
 //! garbage on disk (never less), which the retry reclaims once the store is
 //! readable again.
 
-use crate::config::Config;
+use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::model::ReleaseId;
@@ -184,7 +184,7 @@ impl LocalStore {
     pub(crate) fn gc_artifacts(
         &self,
         anchor: &str,
-        config: &Config,
+        config: &ProjectConfig,
         ledger_override: Option<&LedgerOverride>,
     ) -> Result<GcOutcome> {
         // Fault hook: the SCAN itself aborts before any deletion (a failed
@@ -460,10 +460,10 @@ impl LocalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SlotDef;
+    use crate::config::SlotConfig;
     use crate::model::{
-        ArtifactRef, DeploymentId, GenerationId, GenerationRef, PlacementSlotAssignment,
-        PlacementSlotId, TargetName, TreeDigest, VariantName,
+        ArtifactRef, DeploymentId, GenerationId, GenerationRef, PlacementSlotAssignment, SlotId,
+        TargetName, TreeDigest, VariantName,
     };
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
@@ -479,7 +479,7 @@ mod tests {
 
     /// A minimal but VALID variant file (the config loader requires a real
     /// variant: mappings, activation, verification, and the slot's ONE
-    /// rotation policy).
+    /// retention policy).
     const VARIANT_TOML: &str = r#"
 [artifact]
 mappings = []
@@ -491,12 +491,12 @@ target = "t1"
 groups = []
 deploy_dir = "/srv"
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 1
 
 [activation]
@@ -512,7 +512,7 @@ interval_seconds = 0
 
     /// The project file for the fixtures: one server, one target, and —
     /// when `pinned` is given — a durable `[[pins]]` entry naming a release.
-    fn config_with_pin(base: &std::path::Path, pinned: Option<&ReleaseId>) -> Config {
+    fn config_with_pin(base: &std::path::Path, pinned: Option<&ReleaseId>) -> ProjectConfig {
         let project = base.join("proj");
         std::fs::create_dir_all(project.join("releases").join("v1")).unwrap();
         std::fs::write(
@@ -531,7 +531,7 @@ interval_seconds = 0
             ));
         }
         std::fs::write(project.join("deploy.toml"), deploy).unwrap();
-        Config::load(&project.join("deploy.toml")).unwrap()
+        ProjectConfig::load(&project.join("deploy.toml")).unwrap()
     }
 
     /// Write a REAL release record (content-derived id) with one variant
@@ -547,7 +547,7 @@ interval_seconds = 0
             )]),
             &BTreeMap::from([(
                 "standard".to_string(),
-                vec![SlotDef {
+                vec![SlotConfig {
                     id: SLOT.to_string(),
                     server: "s1".to_string(),
                     deploy_dir: PathBuf::from("/srv/deploy/p1"),
@@ -568,7 +568,7 @@ interval_seconds = 0
     /// rollback references `release` / `tree`. The intent satisfies EXACT
     /// key-set equality (`slot_ids == desired == pre_push`).
     fn intent(id: &str) -> DeploymentIntent {
-        let p1 = PlacementSlotId::new(SLOT.to_string());
+        let p1 = SlotId::new(SLOT.to_string());
         // ONE slot table (the membership + desired/pre-push entries).
         let slots = BTreeMap::from([(
             p1.clone(),
@@ -602,11 +602,11 @@ interval_seconds = 0
             disposition: TerminalDisposition::Successful {
                 rollback: LedgerRollback {
                     slots: BTreeMap::from([(
-                        PlacementSlotId::new(SLOT.to_string()),
+                        SlotId::new(SLOT.to_string()),
                         GenerationRef {
                             generation: GenerationId::new("gen-1".to_string()),
                             assignment: PlacementSlotAssignment {
-                                placement_slot: PlacementSlotId::new(SLOT.to_string()),
+                                placement_slot: SlotId::new(SLOT.to_string()),
                                 artifact: ArtifactRef {
                                     release: ReleaseId::new(release.to_string()),
                                     variant: VariantName::new("standard".to_string()),
@@ -619,7 +619,7 @@ interval_seconds = 0
                     // (the wire → domain conversion refuses a rollback whose
                     // bindings omit a slotted generation).
                     bindings: BTreeMap::from([(
-                        PlacementSlotId::new(SLOT.to_string()),
+                        SlotId::new(SLOT.to_string()),
                         crate::records::PhysicalBinding {
                             server: crate::model::ServerId::new("s1".to_string()),
                             deploy_dir: "/srv/eng".to_string(),
@@ -683,7 +683,7 @@ interval_seconds = 0
     /// CORRUPT each anchor class and then REPAIR it.
     struct Fixture {
         store: LocalStore,
-        config: Config,
+        config: ProjectConfig,
         /// The release the deploy.toml pin names (real record on disk).
         cfg_pin: ReleaseId,
         /// The release pins.json pins (real record on disk).
@@ -734,9 +734,9 @@ interval_seconds = 0
             last_deployment: Some(DeploymentId::new("deploy-obs".to_string())),
         };
         store
-            .write_slot_observed(&PlacementSlotId::new(SLOT.to_string()), &observed)
+            .write_slot_observed(&SlotId::new(SLOT.to_string()), &observed)
             .unwrap();
-        let observed_path = store.slot_observed_path(&PlacementSlotId::new(SLOT.to_string()));
+        let observed_path = store.slot_observed_path(&SlotId::new(SLOT.to_string()));
         let observed_bytes = std::fs::read(&observed_path).unwrap();
 
         // Store-level pins: a whole-release pin on `store_pin` AND an exact
@@ -859,9 +859,7 @@ interval_seconds = 0
                 std::fs::write(f.store.ledger_path(TARGET), "{ not json !\n").unwrap();
             }
             AnchorClass::Observed => {
-                let p = f
-                    .store
-                    .slot_observed_path(&PlacementSlotId::new(SLOT.to_string()));
+                let p = f.store.slot_observed_path(&SlotId::new(SLOT.to_string()));
                 std::fs::write(&p, "{ not json !\n").unwrap();
             }
             AnchorClass::PinsJson => {
@@ -888,9 +886,7 @@ interval_seconds = 0
                 std::fs::write(f.store.ledger_path(TARGET), &f.ledger_text).unwrap();
             }
             AnchorClass::Observed => {
-                let p = f
-                    .store
-                    .slot_observed_path(&PlacementSlotId::new(SLOT.to_string()));
+                let p = f.store.slot_observed_path(&SlotId::new(SLOT.to_string()));
                 std::fs::write(&p, &f.observed_bytes).unwrap();
             }
             AnchorClass::PinsJson => {

@@ -1,7 +1,7 @@
 //! Canonical on-server layout paths.
 //!
 //! Every path inside a server's deployment directory is defined exactly once,
-//! here. `remote/helper.rs`, `push/engine.rs`, and `rotation.rs` must never
+//! here. `remote/helper.rs`, `push/engine.rs`, and `retention.rs` must never
 //! hand-build these strings: renaming a directory becomes a one-line change in
 //! this module instead of a silent three-way breakage. All functions return
 //! paths *relative* to the deployment directory root; transports anchor them.

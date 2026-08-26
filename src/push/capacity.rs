@@ -4,34 +4,34 @@
 //! tree-size walker (`tree_size_on_host`), resolved from the caller's current
 //! `deploy.toml` capacity policy. Extracted from `push::engine`.
 
-use crate::config::Config;
+use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
-use crate::model::{DeploymentId, OperationId, PlacementSlotId};
+use crate::model::{DeploymentId, OperationId, SlotId};
 use crate::remote::helper::RemoteHelper;
 use crate::remote::transport::FsBytes;
-use crate::rotation::compute_retained;
+use crate::retention::compute_retained;
 use crate::store::local::LocalStore;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Coarse capacity preflight: ensure each server has room for the new trees plus
-/// the configured safety headroom, running protected rotation first if needed.
+/// the configured safety headroom, running protected retention first if needed.
 ///
 /// Capacity headroom is a per-server policy declared on the top-level
 /// `[[servers]]` entry (`ServerDef.capacity`) and is ALWAYS resolved from the
 /// caller's current `deploy.toml` — for HEAD pushes and historical/rollback
 /// pushes alike. Servers have no per-release history, so capacity is never
 /// part of the release snapshot: the release identity covers mappings,
-/// behavior, and trees only. Rotation (used for the protected pre-rotation) is
+/// behavior, and trees only. Retention (used for the protected pre-retention) is
 /// target-level configuration from `deploy.toml`; a shared slot's retained set
 /// is the union of every member target's policy.
 pub(crate) fn capacity_preflight(
     store: &LocalStore,
     assignments: &[crate::push::plan::PlannedAssignment],
-    helpers: &HashMap<PlacementSlotId, RemoteHelper>,
+    helpers: &HashMap<SlotId, RemoteHelper>,
     op_id: &OperationId,
     deployment_id: &DeploymentId,
-    config: &Config,
+    config: &ProjectConfig,
 ) -> Result<()> {
     for a in assignments {
         // Resolve the server's CURRENT capacity policy for this assignment.
@@ -71,36 +71,36 @@ pub(crate) fn capacity_preflight(
         // or panicking in a debug build. `capacity_fits` never adds (see the
         // helper for the disjunctive form).
         if !capacity_fits(need, reserve, fs.available) {
-            // Run protected rotation under the slot's ONE policy — the
+            // Run protected retention under the slot's ONE policy — the
             // policy of the slot's OWNING VARIANT (a slot has exactly one
             // retention policy; its member targets own rollout behavior
             // only), then recheck capacity directly rather than failing the
-            // restore. Best-effort by design: rotation is only an
+            // restore. Best-effort by design: retention is only an
             // optimization to free capacity, and the hard capacity check below
-            // decides the outcome — a rotation failure (compute_retained
+            // decides the outcome — a retention failure (compute_retained
             // abort or mark-and-sweep failure) is not recoverable at this
             // point, so it is skipped and the recheck fails the push loudly
             // if space is genuinely short. A compute_retained abort — e.g. an
             // un-honorable pinned release whose record is missing, unreadable,
             // or identity-unverifiable — must NEVER hard-fail the push here:
-            // the post-commit step-17 rotation defers it to the rotation-debt
+            // the post-commit step-17 retention defers it to the retention-debt
             // machinery (a durable marker + warning, retried on the next push
             // once the pinned release is repaired).
             //
             // The mutation lock is held via an RAII guard for the whole
-            // rotation block, so EVERY exit path releases it on drop. A manual
+            // retention block, so EVERY exit path releases it on drop. A manual
             // acquire/release pair would leak the lock, stranding every later
             // operation on this slot with "mutation lock held by ...".
             if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
-                let rotation = config
-                    .slot_rotation(&slot.id)
+                let retention = config
+                    .slot_retention(&slot.id)
                     .expect("the assignment's slot is declared by its owning variant");
                 // Best-effort by design (compute_retained failure INCLUDED):
-                // rotation is only an optimization to free capacity, and the
+                // retention is only an optimization to free capacity, and the
                 // hard capacity check below decides the outcome. The recheck
                 // below still fails the push loudly if space is genuinely
                 // short.
-                if let Ok(retained) = compute_retained(helper, &config.pins, store, rotation) {
+                if let Ok(retained) = compute_retained(helper, &config.pins, store, retention) {
                     let active = HashSet::from([deployment_id.as_str().to_string()]);
                     helper.rotate(&retained, &active).ok();
                 }
@@ -152,7 +152,7 @@ fn tree_size_on_host(root: &Path) -> u64 {
 mod tests {
     use super::*;
     use crate::model::{
-        ArtifactRef, DeploymentId, OperationId, PlacementSlotId, ReleaseId, TreeDigest, VariantName,
+        ArtifactRef, DeploymentId, OperationId, ReleaseId, SlotId, TreeDigest, VariantName,
     };
     use crate::push::plan::PlannedAssignment;
     use crate::remote::helper::RemoteHelper;
@@ -238,7 +238,7 @@ mod tests {
         }
     }
 
-    fn cfg() -> Config {
+    fn cfg() -> ProjectConfig {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
@@ -254,12 +254,12 @@ server = "s1"
 target = "t1"
 deploy_dir = "/srv"
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 1
 
 [activation]
@@ -289,7 +289,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 "#;
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml).unwrap();
-        Config::load(&p).unwrap()
+        ProjectConfig::load(&p).unwrap()
     }
 
     /// The capacity headroom is the LARGER of `reserve_bytes` and
@@ -314,16 +314,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         std::fs::write(obj_root.join("app/file"), vec![b'x'; 6000]).unwrap();
 
         // A remote reporting a 100000-byte filesystem with 10000 bytes
-        // available; provisioned so the protected-rotation pass inside the
+        // available; provisioned so the protected-retention pass inside the
         // failing branch can run.
         let remote = FakeCapacityRemote::build(dir.path().join("remote"), 100_000, 10_000).unwrap();
         remote.provision_layout().unwrap();
         let helper = RemoteHelper::new(remote.as_ref());
-        let helpers = HashMap::from([(PlacementSlotId::new("p1".to_string()), helper)]);
+        let helpers = HashMap::from([(SlotId::new("p1".to_string()), helper)]);
 
         let mut config = cfg();
         let assignment = PlannedAssignment {
-            placement_slot: PlacementSlotId::new("p1".to_string()),
+            placement_slot: SlotId::new("p1".to_string()),
             artifact: ArtifactRef {
                 release: ReleaseId::new("rel-sha256-cap".to_string()),
                 variant: VariantName::new("standard".to_string()),
@@ -413,7 +413,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     /// Run `capacity_preflight` against a fresh 6000-byte tree with the given
     /// filesystem total/available bytes and capacity policy, returning the
-    /// result. The fake remote reports fixed bytes, so rotation's recheck sees
+    /// result. The fake remote reports fixed bytes, so retention's recheck sees
     /// the same numbers as the primary check.
     fn run_preflight(
         total: u64,
@@ -432,7 +432,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let remote = FakeCapacityRemote::build(dir.path().join("remote"), total, avail).unwrap();
         remote.provision_layout().unwrap();
         let helper = RemoteHelper::new(remote.as_ref());
-        let helpers = HashMap::from([(PlacementSlotId::new("p1".to_string()), helper)]);
+        let helpers = HashMap::from([(SlotId::new("p1".to_string()), helper)]);
 
         let mut config = cfg();
         config.servers[0].capacity = crate::config::CapacityConfig {
@@ -441,7 +441,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 .expect("fixture percent in range"),
         };
         let assignment = PlannedAssignment {
-            placement_slot: PlacementSlotId::new("p1".to_string()),
+            placement_slot: SlotId::new("p1".to_string()),
             artifact: ArtifactRef {
                 release: ReleaseId::new("rel-sha256-cap".to_string()),
                 variant: VariantName::new("standard".to_string()),
@@ -465,7 +465,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// debug build, silently pass in a release build) and let an impossible
     /// push through. The overflow-free form `reserve > available || need >
     /// available - reserve` fails immediately because MAX > available, and
-    /// the rotation recheck reports the same fixed available bytes.
+    /// the retention recheck reports the same fixed available bytes.
     #[test]
     fn reserve_u64_max_fails_without_overflow() {
         let err = run_preflight(100_000, 10_000, u64::MAX, 0)

@@ -32,7 +32,7 @@
 //! <base>/
 //!   objects/sha256/<digest>/root/ , tree.json
 //!   releases/<release-id>/mapping.toml, behavior.json, release.json
-//!   targets/<target>/observed.json, rotation-debt.json, ledger.jsonl
+//!   targets/<target>/observed.json, retention-debt.json, ledger.jsonl
 //!   slots/<slot-id>/observed.json   (the slot's ONE physical observed state)
 //!   servers/<server-id>.json
 //!   deployments/<deployment-id>/plan.json
@@ -62,8 +62,8 @@
 use crate::error::{Error, Result};
 use crate::layout;
 use crate::model::{
-    BehaviorContract, DeploymentId, LEDGER_SCHEMA_VERSION, PlacementSlotId, ReleaseId,
-    ReleaseRecord, TREE_SCHEMA_VERSION, TreeDigest, TreeMetadata,
+    BehaviorContract, DeploymentId, LEDGER_SCHEMA_VERSION, ReleaseId, ReleaseRecord, SlotId,
+    TREE_SCHEMA_VERSION, TreeDigest, TreeMetadata,
 };
 use crate::records::{
     DeploymentIntent, DeploymentStatus, LedgerEntry, LedgerIntentWire, LedgerLine, LedgerTerminal,
@@ -259,10 +259,10 @@ impl LocalStore {
     }
 
     /// ENGINE-side step-17 phase barrier, called immediately BEFORE a
-    /// step-17-equivalent lock acquisition (the per-slot rotation block and
+    /// step-17-equivalent lock acquisition (the per-slot retention block and
     /// the deferred-maintenance retry that shares it), tagged with the
     /// [`HookPhase`] being entered so the test can tell the fresh step-17
-    /// rotation from the deferred-maintenance retry. A no-op in unarmed
+    /// retention from the deferred-maintenance retry. A no-op in unarmed
     /// stores and non-matching deployment ids; the call sites in
     /// `src/push/engine.rs` are `#[cfg(test)]`, so production builds never
     /// reach this method.
@@ -563,7 +563,7 @@ impl LocalStore {
     /// ONCE per placement slot — never replicated per target: targets are
     /// selection views over the global slot map (see
     /// [`LocalStore::read_observed`]).
-    pub fn slot_observed_path(&self, slot: &PlacementSlotId) -> PathBuf {
+    pub fn slot_observed_path(&self, slot: &SlotId) -> PathBuf {
         self.base
             .join("slots")
             .join(sanitize(slot.as_str()))
@@ -581,11 +581,7 @@ impl LocalStore {
     /// reported as a maintenance warning by the engine, never a push error.
     /// The fault is keyed by (deployment id, SLOT id) — one write selects
     /// exactly one slot's physical record.
-    pub fn write_slot_observed(
-        &self,
-        slot: &PlacementSlotId,
-        observed: &ObservedSlot,
-    ) -> Result<()> {
+    pub fn write_slot_observed(&self, slot: &SlotId, observed: &ObservedSlot) -> Result<()> {
         #[cfg(test)]
         if let Some(d) = observed.last_deployment.as_ref()
             && self.fault_registry.consume_target(
@@ -611,7 +607,7 @@ impl LocalStore {
     /// only a genuine NotFound is "no observed record"; a stat failure
     /// propagates as a Store error (a permission error on the record must
     /// not read as "never observed").
-    pub fn read_slot_observed(&self, slot: &PlacementSlotId) -> Result<Option<ObservedSlot>> {
+    pub fn read_slot_observed(&self, slot: &SlotId) -> Result<Option<ObservedSlot>> {
         let p = self.slot_observed_path(slot);
         if path_state(&p)? {
             read_json(&p).map(Some)
@@ -621,10 +617,10 @@ impl LocalStore {
     }
 
     /// The GLOBAL physical slot map: every placement slot's single observed
-    /// record (`slots/<slot-id>/observed.json`), keyed by [`PlacementSlotId`].
+    /// record (`slots/<slot-id>/observed.json`), keyed by [`SlotId`].
     /// This is the ONE physical state the per-target views are filtered
     /// from — a shared slot exists here exactly once.
-    pub fn read_global_observed(&self) -> Result<BTreeMap<PlacementSlotId, ObservedSlot>> {
+    pub fn read_global_observed(&self) -> Result<BTreeMap<SlotId, ObservedSlot>> {
         let root = self.base.join("slots");
         let mut out = BTreeMap::new();
         let entries = match std::fs::read_dir(&root) {
@@ -640,7 +636,7 @@ impl LocalStore {
             }
             let observed: ObservedSlot = read_json(&rec)?;
             out.insert(
-                PlacementSlotId::new(entry.file_name().to_string_lossy().into_owned()),
+                SlotId::new(entry.file_name().to_string_lossy().into_owned()),
                 observed,
             );
         }
@@ -659,7 +655,7 @@ impl LocalStore {
     pub fn read_observed(
         &self,
         target: &str,
-        config: &crate::config::Config,
+        config: &crate::config::ProjectConfig,
     ) -> Result<ObservedTarget> {
         let members: std::collections::HashSet<&str> = config
             .slot_defs()
@@ -678,40 +674,40 @@ impl LocalStore {
         })
     }
 
-    // ---- rotation maintenance debt ---------------------------------------
+    // ---- retention maintenance debt ---------------------------------------
 
-    /// Path of the target's deferred-rotation debt marker file.
+    /// Path of the target's deferred-retention debt marker file.
     ///
-    /// Rotation is POST-COMMIT maintenance: a rotation failure after the
+    /// Retention is POST-COMMIT maintenance: a retention failure after the
     /// deployment already committed must not change the reported outcome.
     /// Instead the failure is recorded here — keyed by target (the file's
     /// location under `targets/<target>/`) and by placement slot (the map
     /// key) — so later pushes retry the maintenance and clear the marker
-    /// once the rotation succeeds. The marker is intentionally a separate,
+    /// once the retention succeeds. The marker is intentionally a separate,
     /// small record: it does not ride along in `observed.json` (which
     /// describes the deployed state, not pending controller work) and it
     /// survives across pushes.
-    pub fn rotation_debt_path(&self, target: &str) -> PathBuf {
-        self.target_dir(target).join("rotation-debt.json")
+    pub fn retention_debt_path(&self, target: &str) -> PathBuf {
+        self.target_dir(target).join("retention-debt.json")
     }
 
-    /// Read the target's deferred-rotation markers: a map of placement slot
-    /// id to the reason the rotation was deferred. Empty when no maintenance
+    /// Read the target's deferred-retention markers: a map of placement slot
+    /// id to the reason the retention was deferred. Empty when no maintenance
     /// is pending.
-    pub fn read_rotation_debt(&self, target: &str) -> Result<BTreeMap<String, String>> {
+    pub fn read_retention_debt(&self, target: &str) -> Result<BTreeMap<String, String>> {
         // Post-commit maintenance fault injection, keyed by target (the debt
         // file lives under `targets/<target>/`). Absorbs the debt-I/O
-        // sibling agent's `arm_read_rotation_debt`.
+        // sibling agent's `arm_read_retention_debt`.
         #[cfg(test)]
         if self
             .fault_registry
-            .consume(FaultKind::ReadRotationDebt, target)
+            .consume(FaultKind::ReadRetentionDebt, target)
         {
             return Err(Error::store(
-                "test fault: read_rotation_debt forced to fail once",
+                "test fault: read_retention_debt forced to fail once",
             ));
         }
-        let p = self.rotation_debt_path(target);
+        let p = self.retention_debt_path(target);
         // Tri-state: only a genuine NotFound is "no maintenance debt" (the
         // empty map); a stat failure propagates as a Store error (an
         // unreadable debt marker must not read as "no debt").
@@ -722,28 +718,32 @@ impl LocalStore {
         }
     }
 
-    /// Persist the target's deferred-rotation markers. An EMPTY map removes
+    /// Persist the target's deferred-retention markers. An EMPTY map removes
     /// the marker file, so a fully-serviced target leaves no trace.
-    pub fn write_rotation_debt(&self, target: &str, debt: &BTreeMap<String, String>) -> Result<()> {
+    pub fn write_retention_debt(
+        &self,
+        target: &str,
+        debt: &BTreeMap<String, String>,
+    ) -> Result<()> {
         // Post-commit maintenance write fault, keyed by target. Absorbs the
-        // debt-I/O sibling agent's `arm_write_rotation_debt`.
+        // debt-I/O sibling agent's `arm_write_retention_debt`.
         #[cfg(test)]
         if self
             .fault_registry
-            .consume(FaultKind::WriteRotationDebt, target)
+            .consume(FaultKind::WriteRetentionDebt, target)
         {
             return Err(Error::store(
-                "test fault: write_rotation_debt forced to fail once",
+                "test fault: write_retention_debt forced to fail once",
             ));
         }
-        let p = self.rotation_debt_path(target);
+        let p = self.retention_debt_path(target);
         if debt.is_empty() {
             // Tri-state removal decision: a genuine NotFound is nothing to
             // remove; any other stat error propagates (an unreadable marker
             // must not silently survive as a stale "debt" record).
             if path_state(&p)? {
                 std::fs::remove_file(&p).map_err(|e| {
-                    Error::store(format!("remove rotation debt {}: {e}", p.display()))
+                    Error::store(format!("remove retention debt {}: {e}", p.display()))
                 })?;
             }
             return Ok(());
@@ -1096,10 +1096,8 @@ impl LocalStore {
                     // would let a consumer absorb only some members — is
                     // always refused.
                     if !terminal.outcomes.is_empty() {
-                        let outcome_keys: BTreeSet<&PlacementSlotId> =
-                            terminal.outcomes.keys().collect();
-                        let membership: BTreeSet<&PlacementSlotId> =
-                            entry.intent.slots.keys().collect();
+                        let outcome_keys: BTreeSet<&SlotId> = terminal.outcomes.keys().collect();
+                        let membership: BTreeSet<&SlotId> = entry.intent.slots.keys().collect();
                         if outcome_keys != membership {
                             return Err(Error::integrity(format!(
                                 "ledger of target '{target}': terminal for deployment '{id}' carries outcomes for slots {outcome_keys:?} but its intent's slot_ids are {membership:?} — every member slot has exactly one outcome, no extras"
@@ -1427,22 +1425,22 @@ pub fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::ProjectConfig;
     use crate::model::{
-        ArtifactRef, GenerationId, GenerationRef, PlacementSlotAssignment, PlacementSlotId,
-        ReleaseId, ServerId, TargetName, VariantName,
+        ArtifactRef, GenerationId, GenerationRef, PlacementSlotAssignment, ReleaseId, ServerId,
+        SlotId, TargetName, VariantName,
     };
     use crate::push::lock::FileLock;
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerIntentWire, LedgerLine,
         LedgerRollback, LedgerTerminal, LedgerTerminalWire, NonEmptySlotTable, PhysicalBinding,
-        PreviousGeneration, ServerOutcomeKind, SlotResult, SlotTable, TerminalDisposition,
+        PreviousGeneration, SlotOutcomeKind, SlotResult, SlotTable, TerminalDisposition,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
 
     fn intent(id: &str, target: &str) -> DeploymentIntent {
-        let p1 = PlacementSlotId::new("p1".to_string());
+        let p1 = SlotId::new("p1".to_string());
         // ONE slot table: the membership AND the desired/pre-push entries
         // (the exact-key-set invariant is structural in the domain).
         let slots = BTreeMap::from([(
@@ -1474,10 +1472,10 @@ mod tests {
         LedgerTerminal {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
             outcomes: SlotTable::from_map(BTreeMap::from([(
-                PlacementSlotId::new("p1".to_string()),
+                SlotId::new("p1".to_string()),
                 SlotResult {
-                    slot_id: PlacementSlotId::new("p1".to_string()),
-                    outcome: ServerOutcomeKind::Activated,
+                    slot_id: SlotId::new("p1".to_string()),
+                    outcome: SlotOutcomeKind::Activated,
                     generation: Some(GenerationId::new("gen-1".to_string())),
                     compensated: false,
                     error: None,
@@ -1488,11 +1486,11 @@ mod tests {
             disposition: TerminalDisposition::Successful {
                 rollback: LedgerRollback {
                     slots: BTreeMap::from([(
-                        PlacementSlotId::new("p1".to_string()),
+                        SlotId::new("p1".to_string()),
                         GenerationRef {
                             generation: GenerationId::new("gen-1".to_string()),
                             assignment: PlacementSlotAssignment {
-                                placement_slot: PlacementSlotId::new("p1".to_string()),
+                                placement_slot: SlotId::new("p1".to_string()),
                                 artifact: ArtifactRef {
                                     release: ReleaseId::new("rel-sha256-a".to_string()),
                                     variant: VariantName::new("standard".to_string()),
@@ -1502,7 +1500,7 @@ mod tests {
                         },
                     )]),
                     bindings: BTreeMap::from([(
-                        PlacementSlotId::new("p1".to_string()),
+                        SlotId::new("p1".to_string()),
                         crate::records::PhysicalBinding {
                             server: crate::model::ServerId::new("s1".to_string()),
                             deploy_dir: "/srv/deploy/p1".to_string(),
@@ -1548,7 +1546,7 @@ mod tests {
         // record lives at `slots/<slot-id>/observed.json`).
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let evil = PlacementSlotId::new("..".to_string());
+        let evil = SlotId::new("..".to_string());
         assert_eq!(
             store.slot_observed_path(&evil),
             dir.path()
@@ -1575,7 +1573,7 @@ mod tests {
         );
         let global = store.read_global_observed().unwrap();
         assert_eq!(
-            global.get(&PlacementSlotId::new("_".to_string())),
+            global.get(&SlotId::new("_".to_string())),
             Some(&observed),
             "the global slot map keys by the SANITIZED slot directory name"
         );
@@ -1606,15 +1604,15 @@ mod tests {
             DeploymentStatus::Successful
         );
         assert_eq!(
-            entries[0].terminal.as_ref().unwrap().outcomes[&PlacementSlotId::new("p1")].outcome,
-            ServerOutcomeKind::Activated
+            entries[0].terminal.as_ref().unwrap().outcomes[&SlotId::new("p1")].outcome,
+            SlotOutcomeKind::Activated
         );
         assert_eq!(
             match &entries[0].terminal.as_ref().unwrap().disposition {
                 TerminalDisposition::Successful { rollback } => rollback,
                 _ => panic!("the successful terminal carries its rollback"),
             }
-            .slots[&PlacementSlotId::new("p1")]
+            .slots[&SlotId::new("p1")]
                 .assignment
                 .artifact
                 .release
@@ -1718,11 +1716,11 @@ mod tests {
         // A DISAGREEING intent: `desired` names a slot the membership omits.
         let mut wire = LedgerIntentWire::from(&intent("deploy-x", target));
         wire.desired.insert(
-            PlacementSlotId::new("not-a-member".to_string()),
+            SlotId::new("not-a-member".to_string()),
             GenerationRef {
                 generation: GenerationId::new("gen-1".to_string()),
                 assignment: PlacementSlotAssignment {
-                    placement_slot: PlacementSlotId::new("not-a-member".to_string()),
+                    placement_slot: SlotId::new("not-a-member".to_string()),
                     artifact: ArtifactRef {
                         release: ReleaseId::new("rel-1".to_string()),
                         variant: VariantName::new("standard".to_string()),
@@ -1743,7 +1741,7 @@ mod tests {
         // slot joins slot_ids AND both per-slot maps (EXACT key-set equality
         // — every member slot has exactly one desired + one pre_push entry).
         let mut wire = LedgerIntentWire::from(&intent("deploy-x", target));
-        let extra = PlacementSlotId::new("not-a-member".to_string());
+        let extra = SlotId::new("not-a-member".to_string());
         wire.slot_ids.push(extra.clone());
         wire.desired.insert(
             extra.clone(),
@@ -1793,10 +1791,10 @@ mod tests {
                     // Degraded disposition's non-empty remaining changes
                     // from it.
                     outcomes: SlotTable::from_map(BTreeMap::from([(
-                        PlacementSlotId::new("p1".to_string()),
+                        SlotId::new("p1".to_string()),
                         SlotResult {
-                            slot_id: PlacementSlotId::new("p1".to_string()),
-                            outcome: ServerOutcomeKind::Skipped,
+                            slot_id: SlotId::new("p1".to_string()),
+                            outcome: SlotOutcomeKind::Skipped,
                             generation: Some(GenerationId::new("gen-1".to_string())),
                             compensated: false,
                             error: None,
@@ -1902,9 +1900,9 @@ mod tests {
             crate::model::VariantName::new("standard"),
             TreeDigest::new("t1"),
         )]);
-        let slots: BTreeMap<String, Vec<crate::config::SlotDef>> = BTreeMap::from([(
+        let slots: BTreeMap<String, Vec<crate::config::SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
-            vec![crate::config::SlotDef {
+            vec![crate::config::SlotConfig {
                 id: "p1".to_string(),
                 server: "s1".to_string(),
                 deploy_dir: std::path::PathBuf::from("/srv/deploy/p1"),
@@ -3084,7 +3082,7 @@ mod tests {
     // ---- terminal cross-field / cross-record invariants -------------------
 
     /// A canonical generation ref whose assignment names its own map key.
-    fn gen_ref(slot: &PlacementSlotId) -> GenerationRef {
+    fn gen_ref(slot: &SlotId) -> GenerationRef {
         GenerationRef {
             generation: GenerationId::new(format!("gen-{}", slot.as_str())),
             assignment: PlacementSlotAssignment {
@@ -3095,7 +3093,7 @@ mod tests {
     }
 
     /// A binding for a slot (server `s1`, the canonical deploy dir).
-    fn binding_for(slot: &PlacementSlotId) -> PhysicalBinding {
+    fn binding_for(slot: &SlotId) -> PhysicalBinding {
         PhysicalBinding {
             server: ServerId::new("s1".to_string()),
             deploy_dir: format!("/srv/eng/{}", slot.as_str()),
@@ -3107,8 +3105,8 @@ mod tests {
     /// the exact-key-set invariant is STRUCTURAL): `slot_count` members,
     /// every member desired + pre-push.
     fn exact_intent(id: &str, target: &str, slot_count: u32) -> DeploymentIntent {
-        let slot_ids: Vec<PlacementSlotId> = (0..slot_count)
-            .map(|i| PlacementSlotId::new(format!("slot-{i}")))
+        let slot_ids: Vec<SlotId> = (0..slot_count)
+            .map(|i| SlotId::new(format!("slot-{i}")))
             .collect();
         let slots = slot_ids
             .iter()
@@ -3149,7 +3147,7 @@ mod tests {
         id: &str,
         successful: bool,
     ) -> LedgerTerminal {
-        let outcomes: BTreeMap<PlacementSlotId, SlotResult> = intent
+        let outcomes: BTreeMap<SlotId, SlotResult> = intent
             .slots
             .keys()
             .cloned()
@@ -3158,7 +3156,7 @@ mod tests {
                     k.clone(),
                     SlotResult {
                         slot_id: k,
-                        outcome: ServerOutcomeKind::Activated,
+                        outcome: SlotOutcomeKind::Activated,
                         generation: Some(GenerationId::new(format!("gen-{id}"))),
                         compensated: false,
                         error: None,
@@ -3229,12 +3227,12 @@ mod tests {
     /// The minimal project config the consumer checks need (the GC
     /// reachability scan reads `config.pins` — an empty pin set here). One
     /// config per test case; every store of the case reuses it.
-    fn consumer_config(base: &std::path::Path) -> Config {
+    fn consumer_config(base: &std::path::Path) -> ProjectConfig {
         let project = base.join("proj");
         std::fs::create_dir_all(project.join("releases").join("v1")).unwrap();
         std::fs::write(
             project.join("releases").join("v1").join("standard.toml"),
-            "[artifact]\nmappings = []\n\n[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntarget = \"t1\"\ngroups = []\ndeploy_dir = \"/srv\"\n\n[rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n[rotation.deployment]\nprotect_deployments = 1\n\n[activation]\nadapter = \"none\"\n\n[verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",        )
+            "[artifact]\nmappings = []\n\n[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntarget = \"t1\"\ngroups = []\ndeploy_dir = \"/srv\"\n\n[retention.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n[retention.deployment]\nprotect_deployments = 1\n\n[activation]\nadapter = \"none\"\n\n[verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",        )
         .unwrap();
         std::fs::write(
             project.join("deploy.toml"),
@@ -3243,7 +3241,7 @@ mod tests {
              [targets.t1]\nrollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }\n",
         )
         .unwrap();
-        Config::load(&project.join("deploy.toml")).unwrap()
+        ProjectConfig::load(&project.join("deploy.toml")).unwrap()
     }
 
     /// Every consumer of a target's ledger goes through the SAME read
@@ -3254,7 +3252,7 @@ mod tests {
     /// the failure messages.
     fn assert_consumers_refuse_with_integrity(
         store: &LocalStore,
-        config: &Config,
+        config: &ProjectConfig,
         target: &str,
         id: &str,
         why: &str,
@@ -3300,7 +3298,7 @@ mod tests {
                 unreachable!("cloned above");
             };
             rollback.bindings.insert(
-                PlacementSlotId::new("ghost-slot".to_string()),
+                SlotId::new("ghost-slot".to_string()),
                 PhysicalBinding {
                     server: ServerId::new("s9".to_string()),
                     deploy_dir: "/srv/ghost".to_string(),
@@ -3328,7 +3326,7 @@ mod tests {
             let value = rollback.bindings.remove(&first).unwrap();
             rollback
                 .bindings
-                .insert(PlacementSlotId::new("renamed-slot".to_string()), value);
+                .insert(SlotId::new("renamed-slot".to_string()), value);
             out.push((t, "binding key RENAMED (missing + extra pair)".to_string()));
         }
         // (2) OUTCOME KEY — rename an outcome's KEY (its value keeps naming
@@ -3338,7 +3336,7 @@ mod tests {
             let mut t = terminal.clone();
             let mut map = t.outcomes.clone().into_map();
             let result = map.remove(key).unwrap();
-            map.insert(PlacementSlotId::new("renamed-outcome".to_string()), result);
+            map.insert(SlotId::new("renamed-outcome".to_string()), result);
             t.outcomes = SlotTable::from_map(map);
             out.push((
                 t,
@@ -3499,10 +3497,10 @@ mod tests {
         let mut bad = terminal.clone();
         let mut outcomes = bad.outcomes.clone().into_map();
         outcomes.insert(
-            PlacementSlotId::new("extra-slot".to_string()),
+            SlotId::new("extra-slot".to_string()),
             SlotResult {
-                slot_id: PlacementSlotId::new("extra-slot".to_string()),
-                outcome: ServerOutcomeKind::Activated,
+                slot_id: SlotId::new("extra-slot".to_string()),
+                outcome: SlotOutcomeKind::Activated,
                 generation: Some(GenerationId::new("gen-x".to_string())),
                 compensated: false,
                 error: None,
@@ -3516,7 +3514,7 @@ mod tests {
         let mut map = bad.outcomes.clone().into_map();
         let first = map.keys().next().cloned().unwrap();
         let result = map.remove(&first).unwrap();
-        map.insert(PlacementSlotId::new("renamed-outcome".to_string()), result);
+        map.insert(SlotId::new("renamed-outcome".to_string()), result);
         bad.outcomes = SlotTable::from_map(map);
         assert_terminal_refused(&tmp, target, &intent, &bad, "f");
         // (g) TARGET EQUALITY, intent leg: the intent names a different

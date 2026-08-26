@@ -47,7 +47,7 @@
 //! every run is reproducible). The model tracks, purely from the actions, the
 //! invariants' ground truth — the remote current generation, every member
 //! target's observed projection, the per-target snapshot and
-//! deployment-attempt logs, pending-commit and rotation-debt state — and
+//! deployment-attempt logs, pending-commit and retention-debt state — and
 //! [`assert_semantic_invariants`] cross-checks it against the system's
 //! observable state after every action while re-evaluating all five
 //! invariant groups. Random vectors with shrinking find interleaving bugs the
@@ -64,18 +64,18 @@
 //! | Mutant | Killer(s) |
 //! |---|---|
 //! | Identity: no-op compares tree+release only | `identity_artifact_component_change_prevents_noop` |
-//! | Scope: rotation uses only the pushing target's policy | `scope_retained_is_union_of_member_policies`, `state_machine_scope_projection_and_rotation_union` |
-//! | Lifecycle: step-17 rotation `?` after commit | `state_machine_lifecycle_cleanup_failure_after_commit` |
+//! | Scope: retention uses only the pushing target's policy | `scope_retained_is_union_of_member_policies`, `state_machine_scope_projection_and_retention_union` |
+//! | Lifecycle: step-17 retention `?` after commit | `state_machine_lifecycle_cleanup_failure_after_commit` |
 //! | Integrity: `verify_release_identity` trusts stored digest | `integrity_digest_unchanged_after_tamper_fails_closed`, `integrity_tampered_stored_release_blocks_historical_push`, `integrity_identity_field_change_fails_closed` |
 //! | Integrity: stored records carry only their own schema version | `integrity_stored_release_schema_version_tamper_fails_closed` |
 //! | Bounds: `need + reserve > available` wraps | `bounds_capacity_matches_u128_reference_over_grid` |
 
-use crate::config::{Config, FailurePolicy, SlotDef};
+use crate::config::{FailurePolicy, ProjectConfig, SlotConfig};
 use crate::error::Result;
 use crate::history;
 use crate::layout;
 use crate::model::{
-    ArtifactRef, DeploymentId, GenerationId, OperationId, PlacementSlotId, ReleaseId, TreeDigest,
+    ArtifactRef, DeploymentId, GenerationId, OperationId, ReleaseId, SlotId, TreeDigest,
     VariantName,
 };
 use crate::push::capacity::capacity_fits;
@@ -83,7 +83,7 @@ use crate::push::checkpoint::{CheckpointReport, run_checkpoint_unlocked};
 use crate::push::engine::{PushOptions, PushReport, push, push_with_id};
 use crate::records::DeploymentStatus;
 use crate::records::LedgerEntry;
-use crate::records::ServerOutcomeKind;
+use crate::records::SlotOutcomeKind;
 use crate::release::{
     canonicalize_slots, release_digest, variant_slots_digest, verify_release_identity,
 };
@@ -91,7 +91,7 @@ use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::transport::{
     ExecOutcome, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
 };
-use crate::rotation::compute_retained;
+use crate::retention::compute_retained;
 use crate::store::local::LocalStore;
 use crate::testutil::step17_hook;
 use proptest::prelude::*;
@@ -141,9 +141,9 @@ interval_seconds = 0
 /// target, so `t2`'s records and observed state are never touched by a
 /// `t1` push (and vice versa) — the cross-target isolation the new model
 /// guarantees. Plus the single-member slot `pdx` (target `debtfx`) used
-/// ONLY by the rotation-debt fault-matrix test. `debtfx`'s name is unique
+/// ONLY by the retention-debt fault-matrix test. `debtfx`'s name is unique
 /// to that test (no other test pushes it), so the TARGET-keyed debt fault
-/// arms (`arm_read_rotation_debt` / `arm_write_rotation_debt`) cannot be
+/// arms (`arm_read_retention_debt` / `arm_write_retention_debt`) cannot be
 /// consumed by a concurrent test's push — the fixture's `t1`/`t2` pushes
 /// stay untouched.
 const SLOT_BODY: &str = r#"
@@ -179,12 +179,12 @@ deploy_dir = "/srv/si-debt"
 /// neither `t1` nor `t2` has a retention surface, and membership changes
 /// never change what a slot retains.
 const ROTATION_BODY: &str = r#"
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 5
 keep_days = 30
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 2
 "#;
 
@@ -194,7 +194,7 @@ protect_deployments = 2
 /// target (`t1` owns `p1`/`p2`, `t2` owns `p3`, `debtfx` owns `pdx`) and
 /// rotates under that ONE policy regardless of which target pushes it:
 /// neither `t1` nor `t2` — nor the `debtfx` single-member target — carries
-/// a rotation surface here.
+/// a retention surface here.
 const DEPLOY_TOML: &str = r#"
 schema_version = 2
 application = "si"
@@ -252,8 +252,8 @@ fn deploy_toml_with_failure_policy(policy: FailurePolicy) -> String {
 pub(crate) enum FailureStep {
     /// commit marker write on the remote (`state/commits/<id>.json`).
     CommitMarkerWrite,
-    /// Post-commit rotation's inventory write (`state/inventory.json`).
-    RotationInventoryWrite,
+    /// Post-commit retention's inventory write (`state/inventory.json`).
+    RetentionInventoryWrite,
     /// Local intent persist (`append_attempt`) — BEFORE any remote mutation.
     IntentPersist,
     /// Local outcomes store (`write_results`) — after servers advanced.
@@ -276,16 +276,16 @@ pub(crate) enum FailureStep {
     /// Post-commit observed-refresh `write_slot_observed` for the SECOND
     /// advanced slot (`p2`) — the other physical slot record write.
     ObservedOtherWrite,
-    /// Post-commit rotation-debt READ (`LocalStore::read_rotation_debt`,
-    /// target-keyed) — the marker read during the deferred-rotation retry or
+    /// Post-commit retention-debt READ (`LocalStore::read_retention_debt`,
+    /// target-keyed) — the marker read during the deferred-retention retry or
     /// the step-17 clear/defer, after the durable commit point.
     DebtRead,
-    /// Post-commit rotation-debt WRITE/REMOVE
-    /// (`LocalStore::write_rotation_debt`, target-keyed) — the marker's
+    /// Post-commit retention-debt WRITE/REMOVE
+    /// (`LocalStore::write_retention_debt`, target-keyed) — the marker's
     /// persist, and the empty-map removal that clears a serviced marker.
     DebtWrite,
     /// The "debt remove" arm of the matrix: the cleared-marker removal is the
-    /// same `write_rotation_debt` call, so this maps onto [`DebtWrite`]'s arm
+    /// same `write_retention_debt` call, so this maps onto [`DebtWrite`]'s arm
     /// (kept as a distinct step so the {read, write, remove} matrix is
     /// explicit).
     DebtRemove,
@@ -344,7 +344,7 @@ impl FailOnceRemote {
         if let Some(marker) = &f.fail_write_once {
             let rel = rel.to_string_lossy().to_string();
             // Commit-marker faults name the `state/commits/` DIRECTORY
-            // (prefix match); the rotation-inventory fault names the exact
+            // (prefix match); the retention-inventory fault names the exact
             // file. The fault is consumed ONLY by a matching write — a write
             // to any other path must leave it armed.
             if rel.starts_with(marker) || rel.ends_with(marker) {
@@ -487,7 +487,7 @@ pub(crate) enum Action {
     Retry(&'static str),
     /// Roll the target back to snapshot index `n`.
     Rollback(&'static str, u64),
-    /// Run a standalone rotation pass under the FULL member policy union.
+    /// Run a standalone retention pass under the FULL member policy union.
     Rotate,
     /// Establish a checkpoint history floor on the target at the deployment
     /// whose snapshot is the `k`-th of the target's VISIBLE snapshots (the
@@ -567,7 +567,7 @@ pub(crate) enum Disposition {
     NoAttempt,
     /// The deployment durably committed: report status `Successful` (attempt,
     /// snapshot, `refs/last-successful`, and the terminal transition all
-    /// durable). Post-commit maintenance warnings (rotation, observed
+    /// durable). Post-commit maintenance warnings (retention, observed
     /// refresh, debt I/O) ride on the SAME report and never change the class.
     Successful,
     /// Recorded but NOT durably committed: report status `PendingCommit`
@@ -630,9 +630,9 @@ pub(crate) enum FailureClass {
     /// Remote commit marker write fails: the attempt reports
     /// `PendingCommit` (recoverable; a later push reconciles it).
     CommitMarker,
-    /// Remote post-commit rotation inventory write fails: the rotation is
+    /// Remote post-commit retention inventory write fails: the retention is
     /// deferred (debt marker + warning) after the durable commit.
-    RotationInventory,
+    RetentionInventory,
     /// Local intent persist (`append_attempt`) fails BEFORE any remote
     /// mutation: the push returns `Err` with nothing recorded.
     IntentPersist,
@@ -664,17 +664,17 @@ pub(crate) enum FailureClass {
     /// SECOND advanced slot (`p2`): that slot's ONE physical record stays
     /// stale — in every member target's view.
     ObservedOtherWrite,
-    /// Rotation-debt marker READ fails (target-keyed: the store's debt
+    /// Retention-debt marker READ fails (target-keyed: the store's debt
     /// methods carry no deployment id, so the arm lands on the pushed
-    /// target's `rotation-debt.json`). Post-commit maintenance is
+    /// target's `retention-debt.json`). Post-commit maintenance is
     /// NON-FALLIBLE — a warning, never an `Err` — so the committed outcome
     /// class is unchanged and the marker effect the model tracks is
     /// deterministic.
     DebtRead,
-    /// Rotation-debt marker WRITE fails (the same `write_rotation_debt`
+    /// Retention-debt marker WRITE fails (the same `write_retention_debt`
     /// call as the remove). Warning-only; non-fallible.
     DebtWrite,
-    /// Rotation-debt marker REMOVE — the same `write_rotation_debt` call as
+    /// Retention-debt marker REMOVE — the same `write_retention_debt` call as
     /// the write; kept as a distinct class so the {read, write, remove}
     /// matrix is explicit. Warning-only; non-fallible.
     DebtRemove,
@@ -685,40 +685,40 @@ pub(crate) enum FailureClass {
     /// recorded or mutated.
     LockContention,
     /// The slot's mutation lock is CONTENDED ONLY AT STEP 17 (the
-    /// post-commit per-slot rotation), via the test-only step-17 phase hook
+    /// post-commit per-slot retention), via the test-only step-17 phase hook
     /// ([`crate::testutil::step17_hook`]): the engine parks immediately
     /// before its per-slot `acquire_lock_guard`, the fixture holds the
-    /// competing guard, then releases the engine — so the rotation
+    /// competing guard, then releases the engine — so the retention
     /// deterministically defers (debt marker + warning naming the slot), the
     /// push still reports `Successful` (it already committed — the outcome
     /// class is `Ok` + `Successful`, NEVER `Err`), and a later clean no-op
     /// services the marker once the lock is free. The pre-commit lock checks
     /// (preflight, reconcile, commit) run while the lock is FREE: the
     /// fixture only grabs the guard the moment the engine parks at a
-    /// step-17-equivalent lock acquisition — the push's own step-17 rotation
+    /// step-17-equivalent lock acquisition — the push's own step-17 retention
     /// AND, when prior debt exists, the deferred-maintenance retry that runs
     /// before it (the fixture services every park, so both contend). The
     /// park signal is PHASE-DISTINGUISHED ([`step17_hook::HookPhase`]): the
     /// retry is the [`step17_hook::HookPhase::DeferredRetry`] phase, the
-    /// push's own rotation the [`step17_hook::HookPhase::FreshStep17`]
+    /// push's own retention the [`step17_hook::HookPhase::FreshStep17`]
     /// phase.
     Step17Contended,
-    /// [`FailureClass::Step17Contended`] combined with a rotation-debt
+    /// [`FailureClass::Step17Contended`] combined with a retention-debt
     /// marker READ fault in the same push, armed by the fixture ONLY at the
     /// FRESH step-17 park ([`step17_hook::HookPhase::FreshStep17`]) — never
     /// at the deferred-maintenance retry ([`step17_hook::HookPhase::DeferredRetry`]),
     /// which reads the debt FIRST and must pass unarmed. The fresh contended
-    /// deferral's `set_rotation_deferred` read then fails (explicit "rotation
+    /// deferral's `set_retention_deferred` read then fails (explicit "retention
     /// debt maintenance deferred: failed to read" warning): NO new marker is
     /// persisted, and a PREEXISTING marker is preserved untouched. A later
     /// push re-defers. Warning-only; non-fallible.
     Step17ContentionDebtRead,
-    /// [`FailureClass::Step17Contended`] combined with a rotation-debt
+    /// [`FailureClass::Step17Contended`] combined with a retention-debt
     /// marker WRITE fault (in the same push), armed by the fixture ONLY at
     /// the FRESH phase park — the retry's earlier debt write (preexisting
     /// marker) passes unarmed. The fresh contended deferral's
-    /// `set_rotation_deferred` cannot persist the marker — explicit
-    /// "rotation debt maintenance deferred: failed to write" warning, NO
+    /// `set_retention_deferred` cannot persist the marker — explicit
+    /// "retention debt maintenance deferred: failed to write" warning, NO
     /// new marker (no automatic retryability claim) and any PREEXISTING
     /// marker preserved byte-identical (the failed write leaves the file
     /// untouched). Warning-only; non-fallible.
@@ -745,14 +745,15 @@ pub(crate) enum FailureClass {
 /// marker-persisted "retryable" claim the model asserts for the contention
 /// combinations (a later push services the marker once the lock is free).
 const STEP17_CONTENTION_WARNING: &str =
-    "rotation deferred for slot 'p1': slot lock held by another operation";
+    "retention deferred for slot 'p1': slot lock held by another operation";
 /// The explicit debt-I/O failure notice — the marker was NOT persisted /
 /// maintenance deferred WITHOUT a marker, so no automatic retryability is
-/// claimed. `set_rotation_deferred` (and the retry's I/O) emit exactly this
+/// claimed. `set_retention_deferred` (and the retry's I/O) emit exactly this
 /// shape on a read/write failure.
-const DEBT_READ_WARNING: &str = "rotation debt maintenance deferred: failed to read rotation debt";
+const DEBT_READ_WARNING: &str =
+    "retention debt maintenance deferred: failed to read retention debt";
 const DEBT_WRITE_WARNING: &str =
-    "rotation debt maintenance deferred: failed to write rotation debt";
+    "retention debt maintenance deferred: failed to write retention debt";
 
 /// Classify an ACTUAL [`Outcome`] into the two-dimension [`OutcomeClass`] the
 /// model must have predicted. `Push(Ok(report))` is classified by the report's
@@ -876,7 +877,7 @@ pub(crate) struct Fixture {
     _dir: tempfile::TempDir,
     project: PathBuf,
     cfg_path: PathBuf,
-    config: Config,
+    config: ProjectConfig,
     store: LocalStore,
     remotes_base: PathBuf,
     fault: Arc<Mutex<RemoteFault>>,
@@ -929,7 +930,7 @@ impl Fixture {
         let common_dir = artifacts_dir.join("deployment/common");
         std::fs::create_dir_all(&common_dir).unwrap();
         std::fs::write(common_dir.join("README"), "common\n").unwrap();
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let remotes_base = dir.path().join("remotes");
         std::fs::create_dir_all(&remotes_base).unwrap();
@@ -973,11 +974,11 @@ impl Fixture {
 
     fn remote_factory(
         &self,
-    ) -> impl Fn(&crate::config::ServerDef, &crate::config::SlotDef) -> Result<Box<dyn Remote>> + 'static
-    {
+    ) -> impl Fn(&crate::config::ServerDef, &crate::config::SlotConfig) -> Result<Box<dyn Remote>>
+    + 'static {
         let rf = self.remotes_base.clone();
         let fault = self.fault.clone();
-        move |s: &crate::config::ServerDef, _slot: &crate::config::SlotDef| {
+        move |s: &crate::config::ServerDef, _slot: &crate::config::SlotConfig| {
             FailOnceRemote::build(rf.join(s.id.as_str()), fault.clone())
         }
     }
@@ -1043,7 +1044,7 @@ impl Fixture {
     /// artifact + the assignment's OWN minting deployment id). A slot whose
     /// server has no current generation, or whose assignment cannot be read,
     /// is absent.
-    fn current_assignments(&self) -> BTreeMap<PlacementSlotId, GenerationAssignment> {
+    fn current_assignments(&self) -> BTreeMap<SlotId, GenerationAssignment> {
         let mut out = BTreeMap::new();
         for slot in ["p1", "p2", "p3"] {
             let asn = self.with_slot_helper(slot, |helper| {
@@ -1052,7 +1053,7 @@ impl Fixture {
                 helper.read_assignment(&g).ok()
             });
             if let Some(a) = asn {
-                out.insert(PlacementSlotId::new(slot.to_string()), a);
+                out.insert(SlotId::new(slot.to_string()), a);
             }
         }
         out
@@ -1150,10 +1151,10 @@ impl Fixture {
     fn arm_prop_fault(&self, class: FailureClass, pushed: &str, id: &DeploymentId) {
         let reg = self.store.fault_registry();
         match class {
-            FailureClass::CommitMarker | FailureClass::RotationInventory => {
+            FailureClass::CommitMarker | FailureClass::RetentionInventory => {
                 self.set_remote_fault(match class {
                     FailureClass::CommitMarker => FailureStep::CommitMarkerWrite,
-                    _ => FailureStep::RotationInventoryWrite,
+                    _ => FailureStep::RetentionInventoryWrite,
                 })
             }
             FailureClass::IntentPersist => reg.arm_append_attempt(id.as_str()),
@@ -1171,9 +1172,9 @@ impl Fixture {
             // slot's physical record stale in EVERY member target's view.
             FailureClass::ObservedPrimaryWrite => reg.arm_write_observed(id.as_str(), "p1"),
             FailureClass::ObservedOtherWrite => reg.arm_write_observed(id.as_str(), "p2"),
-            FailureClass::DebtRead => reg.arm_read_rotation_debt(pushed),
+            FailureClass::DebtRead => reg.arm_read_retention_debt(pushed),
             FailureClass::DebtWrite | FailureClass::DebtRemove => {
-                reg.arm_write_rotation_debt(pushed)
+                reg.arm_write_retention_debt(pushed)
             }
             FailureClass::RemoteStatusPreSwap => self.set_remote_read_fault(),
             // `None`, `LockContention` and `Step17Contended` need no registry
@@ -1238,7 +1239,7 @@ impl Fixture {
         let _ = helper.release_lock(op);
     }
 
-    /// Simulate STEP-17 lock contention (the post-commit rotation the action
+    /// Simulate STEP-17 lock contention (the post-commit retention the action
     /// with a fixed deployment id, then disarm every one-shot fault (the
     /// classes are step-scoped). Invariant checks are NOT run here — the
     /// oracle runs them only when the model reports the step left the state
@@ -1406,7 +1407,7 @@ impl Fixture {
     /// arm the hook for the step's deployment id, run the push in a scoped
     /// thread, and the instant the engine parks at a step-17-equivalent lock
     /// acquisition, acquire the slot's mutation lock via a SECOND helper and
-    /// hold it until the push returns — the engine's own rotation then
+    /// hold it until the push returns — the engine's own retention then
     /// deterministically CONTENDS (deferred: debt marker + warning naming the
     /// slot), never silent and never via a race on the lock file.
     ///
@@ -1414,7 +1415,7 @@ impl Fixture {
     /// [`step17_hook::HookPhase`]. The fixture services EVERY park with the
     /// same held guard, but arms the DEBT FAULT ONLY at the
     /// [`step17_hook::HookPhase::FreshStep17`] park — the engine's own
-    /// per-slot rotation, whose contended else-branch runs the debt
+    /// per-slot retention, whose contended else-branch runs the debt
     /// read-modify-write that must fault. The
     /// [`step17_hook::HookPhase::DeferredRetry`] park (reached only when a
     /// PRIOR push left a marker: the retry reads the debt FIRST, before this
@@ -1467,7 +1468,7 @@ impl Fixture {
             // Service EVERY park, not just the first: with prior debt the
             // engine parks at the deferred-maintenance RETRY first (the
             // [`step17_hook::HookPhase::DeferredRetry`] phase) and AGAIN at
-            // its own step-17 rotation ([`step17_hook::HookPhase::FreshStep17`])
+            // its own step-17 retention ([`step17_hook::HookPhase::FreshStep17`])
             // — each is a step-17-equivalent lock acquisition, so each must
             // find the guard held. The first park acquires the competing
             // guard (deterministically — the engine cannot race it while
@@ -1501,9 +1502,11 @@ impl Fixture {
                         // read/write inside the contended else-branch after
                         // the release below.
                         match class {
-                            FailureClass::Step17ContentionDebtRead => reg.arm_read_rotation_debt(t),
+                            FailureClass::Step17ContentionDebtRead => {
+                                reg.arm_read_retention_debt(t)
+                            }
                             FailureClass::Step17ContentionDebtWrite => {
-                                reg.arm_write_rotation_debt(t)
+                                reg.arm_write_retention_debt(t)
                             }
                             _ => {}
                         }
@@ -1528,7 +1531,7 @@ impl Fixture {
             }
             Action::Rotate => {
                 self.rotate_slot_policy()
-                    .expect("standalone rotation succeeds");
+                    .expect("standalone retention succeeds");
                 Outcome::Ok
             }
             Action::Tamper(kind) => {
@@ -1561,13 +1564,13 @@ impl Fixture {
             FailureStep::ObservedWriteServer => reg.arm_write_server(id.as_str(), "t1"),
             FailureStep::ObservedPrimaryWrite => reg.arm_write_observed(id.as_str(), "p1"),
             FailureStep::ObservedOtherWrite => reg.arm_write_observed(id.as_str(), "p2"),
-            // The rotation-debt faults are keyed by the TARGET only (the debt
+            // The retention-debt faults are keyed by the TARGET only (the debt
             // methods carry no deployment id) and fire on `debtfx` — the
             // fixture target no other test pushes — so no concurrent test's
             // push can consume the arm.
-            FailureStep::DebtRead => reg.arm_read_rotation_debt("debtfx"),
+            FailureStep::DebtRead => reg.arm_read_retention_debt("debtfx"),
             FailureStep::DebtWrite | FailureStep::DebtRemove => {
-                reg.arm_write_rotation_debt("debtfx")
+                reg.arm_write_retention_debt("debtfx")
             }
             other => panic!("{other:?} is a remote step, not a store step"),
         }
@@ -1576,7 +1579,7 @@ impl Fixture {
     fn set_remote_fault(&self, step: FailureStep) {
         let suffix = match step {
             FailureStep::CommitMarkerWrite => "state/commits/".to_string(),
-            FailureStep::RotationInventoryWrite => "state/inventory.json".to_string(),
+            FailureStep::RetentionInventoryWrite => "state/inventory.json".to_string(),
             other => panic!("{other:?} is a store step, not a remote step"),
         };
         self.fault.lock().unwrap().fail_write_once = Some(suffix);
@@ -1689,7 +1692,7 @@ impl Fixture {
             }
             Action::Rotate => {
                 self.rotate_slot_policy()
-                    .expect("standalone rotation succeeds");
+                    .expect("standalone retention succeeds");
                 Outcome::Ok
             }
             Action::Checkpoint(t, k) => {
@@ -1725,18 +1728,19 @@ impl Fixture {
         )
     }
 
-    /// Standalone rotation under each slot's ONE policy — the policy of the
+    /// Standalone retention under each slot's ONE policy — the policy of the
     /// slot's OWNING VARIANT (`standard` declares `p1`/`p2`/`p3`; retention
     /// is slot-owned, never a member-target union), exactly as step 17 runs
     /// it (mutation lock + the single policy's retained set), for EVERY
     /// slot's server.
     fn rotate_slot_policy(&self) -> Result<()> {
-        let rotation = &self.config.variant("standard").unwrap().rotation;
+        let retention = &self.config.variant("standard").unwrap().retention;
         for server in ["s1", "s2", "s3"] {
             self.with_helper_for(server, |helper| {
                 let op = OperationId::generate();
                 let _guard = helper.acquire_lock_guard(op.as_str())?;
-                let retained = compute_retained(&helper, &self.config.pins, &self.store, rotation)?;
+                let retained =
+                    compute_retained(&helper, &self.config.pins, &self.store, retention)?;
                 helper.rotate(&retained, &HashSet::new())
             })?;
         }
@@ -1906,7 +1910,7 @@ impl Fixture {
     /// entry must exist; (2) each shared slot's retained set is computed
     /// under its ONE policy (the slot's OWNING VARIANT — never a member
     /// union); (3) every tree that policy retains actually survives the
-    /// post-push rotation.
+    /// post-push retention.
     fn check_scope(&self) {
         self.check_scope_ctx("")
     }
@@ -1950,17 +1954,17 @@ impl Fixture {
                 // The slot's ONE policy, resolved from its OWNING VARIANT
                 // (`standard` declares the shared slots) — never a union of
                 // member-target policies.
-                let rotation = &self.config.variant("standard").unwrap().rotation;
-                compute_retained(&helper, &self.config.pins, &self.store, rotation)
+                let retention = &self.config.variant("standard").unwrap().retention;
+                compute_retained(&helper, &self.config.pins, &self.store, retention)
                     .expect("retained under the slot's owning-variant policy")
             });
             // Every tree the single policy retains must actually survive the
-            // rotation the last push (or standalone rotate) performed.
+            // retention the last push (or standalone rotate) performed.
             let remote = self.remote_for(server);
             for tree in &retained {
                 assert!(
                     remote.exists(&layout::tree_root(tree)),
-                    "policy-retained tree {tree} on {server} must survive rotation"
+                    "policy-retained tree {tree} on {server} must survive retention"
                 );
             }
         }
@@ -2171,7 +2175,7 @@ fn identity_artifact_component_change_prevents_noop() {
     // push keeps the history consistent, so the invariant checks still hold).
     let f = Fixture::new();
     let r1 = f.push("t1").expect("push v1");
-    let first_tree = r1.attempt.as_ref().expect("attempt").slots[&PlacementSlotId::new("p1")]
+    let first_tree = r1.attempt.as_ref().expect("attempt").slots[&SlotId::new("p1")]
         .artifact
         .tree
         .clone();
@@ -2201,11 +2205,11 @@ fn identity_artifact_component_change_prevents_noop() {
 
 /// Scope: interleaved pushes over the shared slot; after EVERY action the
 /// observed projection in both member targets equals the remote assignment and
-/// every union-retained tree survives rotation. The final push runs under the
+/// every union-retained tree survives retention. The final push runs under the
 /// AGGRESSIVE target `t1`, whose policy alone would sweep the trees the
 /// conservative member `t2` retains — the union check catches exactly that.
 #[test]
-fn state_machine_scope_projection_and_rotation_union() {
+fn state_machine_scope_projection_and_retention_union() {
     let f = Fixture::new();
     for (version, target) in [
         (1u32, "t1"),
@@ -2234,23 +2238,23 @@ fn state_machine_scope_projection_and_rotation_union() {
 }
 
 /// Lifecycle mutant: after the deployment has durably committed, a post-commit
-/// rotation failure must NOT turn the deployment into a deployment failure —
+/// retention failure must NOT turn the deployment into a deployment failure —
 /// the push still returns Ok with the committed status, records a persistent
 /// debt marker, and warns. The mutant (`?` instead of debt-marker+warning)
 /// would make this push return Err.
 #[test]
 fn state_machine_lifecycle_cleanup_failure_after_commit() {
     let f = Fixture::new();
-    f.apply(Action::InjectFailure(FailureStep::RotationInventoryWrite));
+    f.apply(Action::InjectFailure(FailureStep::RetentionInventoryWrite));
     let Outcome::Push(res) = f.apply(Action::Push("t1")) else {
         panic!("expected a push outcome");
     };
     let r1 =
-        res.expect("a committed deployment must never fail because its cleanup rotation failed");
+        res.expect("a committed deployment must never fail because its cleanup retention failed");
     assert_eq!(
         r1.status,
         Some(DeploymentStatus::Successful),
-        "the deployment committed; step-17 rotation failure must not change its outcome"
+        "the deployment committed; step-17 retention failure must not change its outcome"
     );
     assert!(
         r1.attempt.is_some(),
@@ -2259,13 +2263,13 @@ fn state_machine_lifecycle_cleanup_failure_after_commit() {
     let warning = r1
         .warning
         .as_ref()
-        .expect("the push must warn about the deferred rotation");
+        .expect("the push must warn about the deferred retention");
     assert!(
-        warning.contains("rotation deferred"),
-        "the warning describes the deferred rotation, got: {warning}"
+        warning.contains("retention deferred"),
+        "the warning describes the deferred retention, got: {warning}"
     );
     assert!(
-        !f.store.read_rotation_debt("t1").unwrap().is_empty(),
+        !f.store.read_retention_debt("t1").unwrap().is_empty(),
         "a persistent debt marker must be recorded"
     );
 
@@ -2279,20 +2283,20 @@ fn state_machine_lifecycle_cleanup_failure_after_commit() {
         "the maintenance succeeded on the no-op retry, so no warning remains"
     );
     assert!(
-        f.store.read_rotation_debt("t1").unwrap().is_empty(),
-        "the debt marker must be cleared once the rotation succeeds"
+        f.store.read_retention_debt("t1").unwrap().is_empty(),
+        "the debt marker must be cleared once the retention succeeds"
     );
     f.check_invariants();
 }
 
-/// Lifecycle: a FRESH step-17 rotation whose slot mutation lock is CONTENDED
+/// Lifecycle: a FRESH step-17 retention whose slot mutation lock is CONTENDED
 /// (held by another operation) must never be skipped SILENTLY. The push still
 /// succeeds (the deployment already committed), records a best-effort debt
-/// marker, and surfaces a warning naming the slot — "rotation deferred for
+/// marker, and surfaces a warning naming the slot — "retention deferred for
 /// slot 'p1': slot lock held by another operation". Then the maintenance
 /// lifecycle over the same marker: an up-to-date no-op whose retry ALSO finds
 /// the lock held stays deferred and keeps warning; the FIRST no-op with the
-/// lock FREE services the rotation (marker cleared) and reports no warning.
+/// lock FREE services the retention (marker cleared) and reports no warning.
 ///
 /// Determinism: NO thread ever races on the lock file. The test arms the
 /// test-only step-17 phase hook ([`crate::testutil::step17_hook`]) for the
@@ -2303,9 +2307,9 @@ fn state_machine_lifecycle_cleanup_failure_after_commit() {
 /// afterwards fails deterministically. No spin, no retry, no oracle branch:
 /// the deferred outcome is guaranteed. The no-op step is deterministic the
 /// same way: the no-op's deferred-maintenance retry shares the step-17
-/// RAII-guarded rotation block, so it parks at the SAME barrier.
+/// RAII-guarded retention block, so it parks at the SAME barrier.
 #[test]
-fn state_machine_lifecycle_rotation_lock_contention_defers_not_silent() {
+fn state_machine_lifecycle_retention_lock_contention_defers_not_silent() {
     let id = DeploymentId::new("si-lockcont-push".to_string());
     let holder = "op-lockcont-holder";
     let f = Fixture::new();
@@ -2316,8 +2320,8 @@ fn state_machine_lifecycle_rotation_lock_contention_defers_not_silent() {
     // on. Arm the phase hook, run the push in a scoped thread, and at EVERY
     // step-17-equivalent park hold the competing guard via the second helper
     // (the fixture acquires it at the FIRST park — the first shared slot's
-    // fresh rotation — and holds it until the push returns; the SECOND
-    // shared slot's rotation parks on its OWN free server and succeeds). Each
+    // fresh retention — and holds it until the push returns; the SECOND
+    // shared slot's retention parks on its OWN free server and succeeds). Each
     // parked engine is then released — its own `acquire_lock_guard` on the
     // contended server now deterministically fails, so the maintenance is
     // deferred (debt + warning), never silent, never an `Err`.
@@ -2327,7 +2331,7 @@ fn state_machine_lifecycle_rotation_lock_contention_defers_not_silent() {
             let push = s.spawn(|| f.push_with_id("t1", &id));
             let mut guard: Option<crate::remote::helper::LockGuard<'_>> = None;
             // Service EVERY park (the 2-slot fixture parks at each shared
-            // slot's step-17 rotation), holding the s1 guard at the first
+            // slot's step-17 retention), holding the s1 guard at the first
             // park; `recv_timeout` sleeps, never spins.
             while !push.is_finished() {
                 if let Ok(_phase) = hook.wait_at_step17_bounded(std::time::Duration::from_millis(5))
@@ -2355,12 +2359,12 @@ fn state_machine_lifecycle_rotation_lock_contention_defers_not_silent() {
     );
     let warning1 = report1.warning.as_deref().unwrap_or("");
     assert!(
-        warning1.contains("rotation deferred for slot 'p1'")
+        warning1.contains("retention deferred for slot 'p1'")
             && warning1.contains("slot lock held by another operation"),
         "the contended push must warn naming the slot (never silent), got: {warning1}"
     );
     assert!(
-        !f.store.read_rotation_debt("t1").unwrap().is_empty(),
+        !f.store.read_retention_debt("t1").unwrap().is_empty(),
         "the contended push must record the debt marker"
     );
     // Step 1's guard drops here (lock released).
@@ -2370,7 +2374,7 @@ fn state_machine_lifecycle_rotation_lock_contention_defers_not_silent() {
     // step-17-equivalent lock acquisition is the deferred-maintenance retry
     // of the marked slot, so the same hook fires there: the fixture holds
     // the guard while the engine is parked, releases the hook, and the
-    // retry's acquire fails — "rotation still deferred", marker kept,
+    // retry's acquire fails — "retention still deferred", marker kept,
     // warning kept.
     let report2 = {
         let hook = step17_hook::Step17Hook::arm(f.store.step17_hook(), id.as_str());
@@ -2400,18 +2404,18 @@ fn state_machine_lifecycle_rotation_lock_contention_defers_not_silent() {
     assert_eq!(report2.status, None, "the contended no-op is a no-op");
     let warning2 = report2.warning.as_deref().unwrap_or("");
     assert!(
-        warning2.contains("rotation still deferred for slot 'p1'")
+        warning2.contains("retention still deferred for slot 'p1'")
             && warning2.contains("slot lock held by another operation"),
-        "the held-lock no-op must keep warning that the rotation is deferred, got: {warning2}"
+        "the held-lock no-op must keep warning that the retention is deferred, got: {warning2}"
     );
     assert!(
-        !f.store.read_rotation_debt("t1").unwrap().is_empty(),
+        !f.store.read_retention_debt("t1").unwrap().is_empty(),
         "the held-lock no-op must keep the debt marker"
     );
     // Step 2's guard drops here (lock released).
 
     // ---- Step 3: the FIRST no-op with the lock FREE services the
-    // deferred rotation: the marker is cleared, no warning remains.
+    // deferred retention: the marker is cleared, no warning remains.
     let report3 = f.push("t1").expect("the retrying push succeeds");
     assert_eq!(report3.message, "Everything up to date");
     assert_eq!(
@@ -2423,8 +2427,8 @@ fn state_machine_lifecycle_rotation_lock_contention_defers_not_silent() {
         "the maintenance succeeded on the unlocked no-op, so no warning remains"
     );
     assert!(
-        f.store.read_rotation_debt("t1").unwrap().is_empty(),
-        "the debt marker must be cleared once the rotation succeeds"
+        f.store.read_retention_debt("t1").unwrap().is_empty(),
+        "the debt marker must be cleared once the retention succeeds"
     );
     f.check_invariants();
 }
@@ -2743,7 +2747,7 @@ fn observed_scope_crash_before_refresh_recovered_by_noop_retry() {
     for t in ["t1", "t2"] {
         let observed = f.store.read_observed(t, &f.config).unwrap();
         assert!(
-            !observed.slots.contains_key(&PlacementSlotId::new("p1")),
+            !observed.slots.contains_key(&SlotId::new("p1")),
             "{t}: the crash window must leave the shared slot's observed entry absent"
         );
     }
@@ -2909,7 +2913,7 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
         .read_observed("t1", &f.config)
         .unwrap()
         .slots
-        .get(&PlacementSlotId::new("p1"))
+        .get(&SlotId::new("p1"))
         .expect("observed p1 exists from the earlier push")
         .generation
         .clone();
@@ -2922,7 +2926,7 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     assert!(err.to_string().contains("test fault"), "{err}");
     let after_crash = f
         .current_assignments()
-        .get(&PlacementSlotId::new("p1"))
+        .get(&SlotId::new("p1"))
         .expect("remote advanced")
         .generation_id
         .clone();
@@ -2988,7 +2992,7 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
     );
     f.assert_observed_scope_property();
 
-    // Wrap up with a standalone rotation under each slot's ONE policy.
+    // Wrap up with a standalone retention under each slot's ONE policy.
     f.apply(Action::Rotate);
     f.check_invariants();
 }
@@ -3170,7 +3174,7 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
         // The observed projection mirrors the live remote generation.
         let observed_gen = observed
             .slots
-            .get(&PlacementSlotId::new(sid.to_string()))
+            .get(&SlotId::new(sid.to_string()))
             .and_then(|o| o.generation.clone());
         assert_eq!(
             observed_gen.as_ref(),
@@ -3180,7 +3184,7 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
         // The ledger outcome for this slot.
         let out = terminal
             .outcomes
-            .get(&PlacementSlotId::new(sid.to_string()))
+            .get(&SlotId::new(sid.to_string()))
             .unwrap_or_else(|| panic!("slot {sid} must appear in the terminal outcomes"));
 
         match (policy, i.cmp(&position)) {
@@ -3190,7 +3194,7 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
                 assert_eq!(live, &baseline[sid], "slot {sid} must be compensated back");
                 assert_eq!(
                     out.outcome,
-                    ServerOutcomeKind::Restored,
+                    SlotOutcomeKind::Restored,
                     "slot {sid}: compensation upgrades the outcome to Restored"
                 );
                 assert!(
@@ -3206,7 +3210,7 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
                 );
                 assert_eq!(
                     out.outcome,
-                    ServerOutcomeKind::Activated,
+                    SlotOutcomeKind::Activated,
                     "slot {sid}: the advance is retained"
                 );
                 assert!(!out.compensated, "slot {sid}: no compensation pass ran");
@@ -3221,7 +3225,7 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
                 );
                 assert_eq!(
                     out.outcome,
-                    ServerOutcomeKind::Failed,
+                    SlotOutcomeKind::Failed,
                     "slot {sid}: batch {position} is recorded failed"
                 );
                 assert!(
@@ -3234,7 +3238,7 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
                 assert_eq!(live, &baseline[sid], "slot {sid}: skipped, untouched");
                 assert_eq!(
                     out.outcome,
-                    ServerOutcomeKind::Skipped,
+                    SlotOutcomeKind::Skipped,
                     "slot {sid}: the later batch is skipped"
                 );
                 assert!(
@@ -3306,8 +3310,8 @@ proptest! {
 // Property tests — Identity
 // ===========================================================================
 
-fn sdef(id: &str, server: &str, dir: &str, target: &str) -> SlotDef {
-    SlotDef {
+fn sdef(id: &str, server: &str, dir: &str, target: &str) -> SlotConfig {
+    SlotConfig {
         id: id.to_string(),
         server: server.to_string(),
         deploy_dir: PathBuf::from(dir),
@@ -3319,7 +3323,7 @@ fn sdef(id: &str, server: &str, dir: &str, target: &str) -> SlotDef {
 /// Reordering slots, variants, or a slot's targets list preserves the digest.
 #[test]
 fn identity_reordering_preserves_digest() {
-    let mut a: BTreeMap<String, Vec<SlotDef>> = BTreeMap::new();
+    let mut a: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::new();
     a.insert(
         "standard".to_string(),
         vec![
@@ -3334,7 +3338,7 @@ fn identity_reordering_preserves_digest() {
 
     // Same declarations: slots in the opposite file order, targets lists in
     // the opposite order, variants inserted in the opposite order.
-    let mut b: BTreeMap<String, Vec<SlotDef>> = BTreeMap::new();
+    let mut b: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::new();
     b.insert(
         "canary".to_string(),
         vec![sdef("c1", "s3", "/srv/c1", "t3")],
@@ -3368,7 +3372,7 @@ fn identity_reordering_preserves_digest() {
 /// as the deduplicated list.
 #[test]
 fn identity_duplicates_are_rejected_and_canonicalize_identically() {
-    // Config-level rejection: a slot with a duplicated GROUP name in its
+    // ProjectConfig-level rejection: a slot with a duplicated GROUP name in its
     // `groups` list is rejected (a duplicate adds no membership yet would
     // change the release identity).
     let dir = tempfile::tempdir().unwrap();
@@ -3381,17 +3385,17 @@ fn identity_duplicates_are_rejected_and_canonicalize_identically() {
     std::fs::write(release_dir.join("standard.toml"), dup_variant).unwrap();
     std::fs::write(project.join("deploy.toml"), DEPLOY_TOML).unwrap();
     assert!(
-        Config::load(&project.join("deploy.toml")).is_err(),
+        ProjectConfig::load(&project.join("deploy.toml")).is_err(),
         "a slot with a duplicated group name must be rejected"
     );
 
     // Digest-level: duplicate group names in the list canonicalize to the
     // same identity as the deduplicated list (the canonical form sorts and
     // dedups defensively).
-    let mut dedup: BTreeMap<String, Vec<SlotDef>> = BTreeMap::new();
+    let mut dedup: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::new();
     dedup.insert(
         "standard".to_string(),
-        vec![SlotDef {
+        vec![SlotConfig {
             id: "p1".to_string(),
             server: "s1".to_string(),
             deploy_dir: PathBuf::from("/srv/si"),
@@ -3399,10 +3403,10 @@ fn identity_duplicates_are_rejected_and_canonicalize_identically() {
             groups: vec!["canary".to_string(), "wave-1".to_string()],
         }],
     );
-    let mut dup: BTreeMap<String, Vec<SlotDef>> = BTreeMap::new();
+    let mut dup: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::new();
     dup.insert(
         "standard".to_string(),
-        vec![SlotDef {
+        vec![SlotConfig {
             id: "p1".to_string(),
             server: "s1".to_string(),
             deploy_dir: PathBuf::from("/srv/si"),
@@ -3461,7 +3465,7 @@ fn identity_canonical_serialization_round_trips() {
 
 /// The shared slot's retained set is computed under its ONE policy — the
 /// slot's OWNING VARIANT (`standard` declares the shared slots), resolved
-/// via the same `Config::slot_rotation` path the engine uses. Membership is
+/// via the same `ProjectConfig::slot_retention` path the engine uses. Membership is
 /// irrelevant: `t1` and `t2` both view the same physical slot, and the
 /// retained set is identical whether the slot is thought of as a `t1` slot
 /// or a `t2` slot — there is no per-target policy to union.
@@ -3478,7 +3482,7 @@ fn scope_retained_is_the_owning_variants_single_policy() {
             &helper,
             &f.config.pins,
             &f.store,
-            f.config.slot_rotation("p1").unwrap(),
+            f.config.slot_retention("p1").unwrap(),
         )
         .unwrap()
     });
@@ -3487,7 +3491,7 @@ fn scope_retained_is_the_owning_variants_single_policy() {
             &helper,
             &f.config.pins,
             &f.store,
-            f.config.slot_rotation("p2").unwrap(),
+            f.config.slot_retention("p2").unwrap(),
         )
         .unwrap()
     });
@@ -3514,13 +3518,13 @@ fn scope_strengthening_policy_never_reduces_retained() {
         f.apply(Action::Build(v));
         f.apply(Action::Push(t));
     }
-    let baseline = |cfg: &Config| -> HashSet<String> {
+    let baseline = |cfg: &ProjectConfig| -> HashSet<String> {
         f.with_helper(|helper| {
             compute_retained(
                 &helper,
                 &cfg.pins,
                 &f.store,
-                cfg.slot_rotation("p1").unwrap(),
+                cfg.slot_retention("p1").unwrap(),
             )
             .unwrap()
         })
@@ -3532,9 +3536,9 @@ fn scope_strengthening_policy_never_reduces_retained() {
     // fixture's conservative values, so widen the strongest window instead.
     let mut strong_config = f.config.clone();
     let r = strong_config.variant_mut("standard").unwrap();
-    r.rotation.per_server.keep_distinct_artifacts = 5;
-    r.rotation.per_server.protect_previous = true;
-    r.rotation.deployment.protect_deployments = 2;
+    r.retention.per_server.keep_distinct_artifacts = 5;
+    r.retention.per_server.protect_previous = true;
+    r.retention.deployment.protect_deployments = 2;
     let strong = baseline(&strong_config);
     assert!(
         strong.is_superset(&weak),
@@ -3546,7 +3550,7 @@ fn scope_strengthening_policy_never_reduces_retained() {
     wider
         .variant_mut("standard")
         .unwrap()
-        .rotation
+        .retention
         .per_server
         .keep_days = 90;
     let wider_retained = baseline(&wider);
@@ -3664,7 +3668,7 @@ fn lifecycle_store_fault_matrix_recovers_without_duplicate_history() {
 /// attempt, and terminal transition recorded BEFORE the refresh runs), so the
 /// push returns `Ok` with that status and the report carries a warning naming
 /// the deferred observed refresh. No persistent debt marker is needed (unlike
-/// rotation): the observed maps are projections of already-durable facts, and
+/// retention): the observed maps are projections of already-durable facts, and
 /// a clean no-op retry converges WITHOUT duplicate history — snapshot count,
 /// attempt count, transition stream, and `refs/last-successful` all stay
 /// exactly-once.
@@ -3736,7 +3740,7 @@ fn lifecycle_observed_refresh_faults_never_fail_after_commit() {
             "{step:?}: refs/last-successful points at the committed attempt"
         );
         assert!(
-            f.store.read_rotation_debt("t1").unwrap().is_empty(),
+            f.store.read_retention_debt("t1").unwrap().is_empty(),
             "{step:?}: observed refresh needs no persistent debt marker — the next real push \
              re-projects from durable facts"
         );
@@ -3785,11 +3789,11 @@ fn lifecycle_observed_refresh_faults_never_fail_after_commit() {
     }
 }
 
-/// Lifecycle: the rotation-debt maintenance I/O is POST-COMMIT maintenance —
+/// Lifecycle: the retention-debt maintenance I/O is POST-COMMIT maintenance —
 /// every debt read/write/remove failure must never turn a push into an `Err`
 /// once the deployment is durably committed. The matrix generates
 /// {real push, no-op} × {debt read, debt write, debt remove} × {empty,
-/// existing debt}. The "debt remove" arm is the same `write_rotation_debt`
+/// existing debt}. The "debt remove" arm is the same `write_retention_debt`
 /// call as the write (the cleared marker's removal is the empty-map write), so
 /// it shares the write arm — the matrix keeps the third column explicit.
 ///
@@ -3802,14 +3806,14 @@ fn lifecycle_observed_refresh_faults_never_fail_after_commit() {
 /// (c) MAINTENANCE EITHER CONVERGES OR REMAINS EXPLICITLY WARNED/DEFERRED:
 ///     every case that leaves the marker in place must carry a warning naming
 ///     the deferred debt maintenance (never silently lost, never silently
-///     deferred), and a real push whose step-17 rotation succeeded clears the
+///     deferred), and a real push whose step-17 retention succeeded clears the
 ///     pre-seeded marker even when the earlier retry's debt I/O faulted (the
 ///     fault is one-shot, so the later clear write succeeds) — the warning
 ///     from the faulted retry stays on the report.
 ///
 /// The `debtfx` fixture target is pushed ONLY by this test, so the
-/// target-keyed one-shot arms (`arm_read_rotation_debt` /
-/// `arm_write_rotation_debt`) cannot be consumed by a concurrent test's
+/// target-keyed one-shot arms (`arm_read_retention_debt` /
+/// `arm_write_retention_debt`) cannot be consumed by a concurrent test's
 /// push. Each case arms THIS fixture's per-fixture registry (a fresh store
 /// per case), so no arm can leak between cases or tests either — no lock
 /// window and no global slots.
@@ -3837,7 +3841,7 @@ fn lifecycle_debt_fault_matrix_never_fails_after_commit() {
                 let id = DeploymentId::new(format!("si-debt-fault-{i}-{j}"));
                 if have_debt {
                     f.store
-                        .write_rotation_debt(
+                        .write_retention_debt(
                             "debtfx",
                             &BTreeMap::from([(SLOT.to_string(), "seeded".to_string())]),
                         )
@@ -3889,7 +3893,7 @@ fn lifecycle_debt_fault_matrix_never_fails_after_commit() {
                 // a warning must name the debt maintenance; the real push's
                 // step-17 clear always converges the marker (the one-shot
                 // fault is spent by the retry's I/O).
-                let debt = f.store.read_rotation_debt("debtfx").unwrap();
+                let debt = f.store.read_retention_debt("debtfx").unwrap();
                 let expect_warning = !matches!(
                     (step, have_debt),
                     (FailureStep::DebtWrite | FailureStep::DebtRemove, false)
@@ -3907,7 +3911,7 @@ fn lifecycle_debt_fault_matrix_never_fails_after_commit() {
                 );
                 assert!(
                     debt.is_empty(),
-                    "{ctx}: the real push's step-17 rotation succeeded, so the (pre-seeded) \
+                    "{ctx}: the real push's step-17 retention succeeded, so the (pre-seeded) \
                      marker must be cleared — the one-shot fault was spent by the retry"
                 );
                 // A retained marker must never be silent: no case here keeps
@@ -3933,7 +3937,7 @@ fn lifecycle_debt_fault_matrix_never_fails_after_commit() {
                 assert_eq!(r0.status, Some(DeploymentStatus::Successful));
                 if have_debt {
                     f.store
-                        .write_rotation_debt(
+                        .write_retention_debt(
                             "debtfx",
                             &BTreeMap::from([(SLOT.to_string(), "seeded".to_string())]),
                         )
@@ -3977,7 +3981,7 @@ fn lifecycle_debt_fault_matrix_never_fails_after_commit() {
                 // marker and a read fault the report warns about the failed
                 // read; with no marker and a write/remove fault nothing is
                 // written, the arm never fires, and nothing is warned.
-                let debt = f.store.read_rotation_debt("debtfx").unwrap();
+                let debt = f.store.read_retention_debt("debtfx").unwrap();
                 let expect_warning = !matches!(
                     (step, have_debt),
                     (FailureStep::DebtWrite | FailureStep::DebtRemove, false)
@@ -4522,8 +4526,8 @@ fn bounds_capacity_edge_corners_fail_safely() {
 /// * pending-commit state — a CommitMarker-write fault leaves the attempt
 ///   un-finalized until the next push of that target reconciles it (or
 ///   degrades it, when the remote current has since diverged);
-/// * rotation-debt markers — an inventory-write fault after commit defers
-///   the post-commit rotation to a later push (including no-ops, which
+/// * retention-debt markers — an inventory-write fault after commit defers
+///   the post-commit retention to a later push (including no-ops, which
 ///   service the marker);
 /// * the tamper flag — [`Action::Tamper`] deliberately breaks the live
 ///   assignment's identity until the next real push replaces the record.
@@ -4575,7 +4579,7 @@ struct CheckpointExpectation {
 /// slot, the (content version, minting deployment id) the target's filtered
 /// view of the ONE physical slot map must show, or `None` before the first
 /// completed mutation.
-type ObservedView = BTreeMap<PlacementSlotId, Option<(u32, String)>>;
+type ObservedView = BTreeMap<SlotId, Option<(u32, String)>>;
 
 #[derive(Clone, Debug)]
 struct Model {
@@ -4599,7 +4603,7 @@ struct Model {
     /// pre-swap failure advances none), so one (version, deployment) pair
     /// describes each slot; slots of DIFFERENT targets advance independently
     /// (a slot has exactly one owning target).
-    current: BTreeMap<PlacementSlotId, (u32, String)>,
+    current: BTreeMap<SlotId, (u32, String)>,
     /// A [`Action::Tamper`] edited the live assignment: the current's
     /// identity is deliberately inconsistent and the identity comparison
     /// defers until the next real push replaces the record. The tamper
@@ -4664,7 +4668,7 @@ struct Model {
     /// advances `t2`'s slots, so it must not invalidate a `t2` pending
     /// attempt.
     current_gen: BTreeMap<&'static str, u64>,
-    /// Expected rotation-debt marker presence per target.
+    /// Expected retention-debt marker presence per target.
     debt: BTreeMap<&'static str, bool>,
     /// The crash window PER TARGET: an open post-mutation fault state where
     /// the observed projections legitimately disagree with the remote
@@ -4681,9 +4685,9 @@ struct Model {
     /// substring per entry, EVERY one asserted against the actual report's
     /// `warning`. Set ONLY by the step-17 contention classes (see
     /// [`FailureClass::Step17Contended`] and its debt combinations) so the
-    /// oracle asserts the retryable-vs-not distinction — "rotation deferred
+    /// oracle asserts the retryable-vs-not distinction — "retention deferred
     /// for slot" (the marker-persisted claim) plus, on a debt read/write
-    /// fault, the explicit "rotation debt maintenance deferred: failed to
+    /// fault, the explicit "retention debt maintenance deferred: failed to
     /// ..." notice that says the marker was NOT persisted (no automatic
     /// retryability). `None` for every other class (their warnings are not
     /// cross-checked).
@@ -4707,13 +4711,13 @@ impl Model {
                 (
                     "t1",
                     BTreeMap::from([
-                        (PlacementSlotId::new("p1".to_string()), None),
-                        (PlacementSlotId::new("p2".to_string()), None),
+                        (SlotId::new("p1".to_string()), None),
+                        (SlotId::new("p2".to_string()), None),
                     ]),
                 ),
                 (
                     "t2",
-                    BTreeMap::from([(PlacementSlotId::new("p3".to_string()), None)]),
+                    BTreeMap::from([(SlotId::new("p3".to_string()), None)]),
                 ),
             ]),
             raw_snapshots: BTreeMap::from([("t1", Vec::new()), ("t2", Vec::new())]),
@@ -4745,13 +4749,10 @@ impl Model {
     /// target): `t1` owns `p1`/`p2` (two slots — the pre-swap skip
     /// scenario), `t2` owns `p3`. A target's slots advance together on its
     /// pushes and are never touched by another target's.
-    fn target_slots(t: &str) -> Vec<PlacementSlotId> {
+    fn target_slots(t: &str) -> Vec<SlotId> {
         match t {
-            "t1" => vec![
-                PlacementSlotId::new("p1".to_string()),
-                PlacementSlotId::new("p2".to_string()),
-            ],
-            "t2" => vec![PlacementSlotId::new("p3".to_string())],
+            "t1" => vec![SlotId::new("p1".to_string()), SlotId::new("p2".to_string())],
+            "t2" => vec![SlotId::new("p3".to_string())],
             other => panic!("unknown fixture target {other}"),
         }
     }
@@ -4863,10 +4864,7 @@ impl Model {
                 }
             }
             Action::Tamper(_) => {
-                if self
-                    .current
-                    .contains_key(&PlacementSlotId::new("p1".to_string()))
-                {
+                if self.current.contains_key(&SlotId::new("p1".to_string())) {
                     // The fixture requires a live generation to tamper; with
                     // none, the property test skips the action entirely. The
                     // tamper always targets the `s1` slot (`p1`).
@@ -5101,7 +5099,7 @@ impl Model {
         }
         let Some(v) = version else {
             // Up-to-date no-op: no records. The deferred-maintenance hook
-            // services rotation debt, and the no-op path refreshes observed
+            // services retention debt, and the no-op path refreshes observed
             // from the EXISTING generation into the target's OWN slots (the
             // crash-window recovery path), closing any open window. The
             // no-op re-projects each slot's ONE physical record from the
@@ -5163,7 +5161,7 @@ impl Model {
                 .or_default()
                 .push((id.clone(), v));
             // The maintenance block still runs (the remote is reachable again
-            // post-arm): any preexisting rotation debt is retried and cleared.
+            // post-arm): any preexisting retention debt is retried and cleared.
             self.debt.insert(t, false);
             return (
                 OutcomeClass::Push {
@@ -5234,17 +5232,17 @@ impl Model {
                 // commit marker write fails: the deployment is recorded
                 // PendingCommit; current advanced and observed refreshed, but
                 // the snapshot/ref finalization defers to the next push of
-                // this target. Step-17 rotation still succeeds (the fault is
+                // this target. Step-17 retention still succeeds (the fault is
                 // spent), so no debt.
                 self.pending.insert(t, (id.clone(), v, gen_val, false));
                 self.debt.insert(t, false);
             }
-            Some(FailureClass::RotationInventory) => {
+            Some(FailureClass::RetentionInventory) => {
                 // Post-commit maintenance: step 17 retries an EXISTING debt
                 // marker FIRST — that servicing write consumes the fault and
-                // fails, then the push's own slot rotation succeeds and
+                // fails, then the push's own slot retention succeeds and
                 // CLEARS the marker. With no prior marker, the fault hits the
-                // push's own rotation, which defers it as a new marker.
+                // push's own retention, which defers it as a new marker.
                 self.append_snapshot(t, &id, v);
                 self.debt.insert(t, !had_debt);
             }
@@ -5253,11 +5251,11 @@ impl Model {
                 // the phase hook: the fixture holds the guard while the
                 // engine is parked at every step-17-equivalent lock
                 // acquisition). The deployment already committed, so the
-                // outcome class is unchanged; the rotation is DEFERRED — the
+                // outcome class is unchanged; the retention is DEFERRED — the
                 // marker is ALWAYS set (both the deferred-maintenance retry,
                 // when prior debt exists, and the push's own step-17
-                // rotation run while the guard is held), with the explicit
-                // "rotation deferred for slot 'p1'" warning naming the slot,
+                // retention run while the guard is held), with the explicit
+                // "retention deferred for slot 'p1'" warning naming the slot,
                 // never silent. A later clean unlocked no-op services the
                 // marker.
                 self.append_snapshot(t, &id, v);
@@ -5266,7 +5264,7 @@ impl Model {
                 // has exactly one owning target, so a t1 push defers 'p1'
                 // and a t2 push defers 'p3').
                 self.expected_warning = Some(vec![format!(
-                    "rotation deferred for slot '{}': slot lock held by another operation",
+                    "retention deferred for slot '{}': slot lock held by another operation",
                     Self::target_slots(t)[0]
                 )]);
             }
@@ -5288,8 +5286,8 @@ impl Model {
                 // read/write is a warning, never an `Err`), so the committed
                 // outcome class is unchanged. The marker itself is
                 // deterministic: the step-17 retry's faulted I/O only
-                // DEFERS, and the push's OWN successful rotation then clears
-                // any marker via `clear_rotation_deferred` (its later debt
+                // DEFERS, and the push's OWN successful retention then clears
+                // any marker via `clear_retention_deferred` (its later debt
                 // write passes — the one-shot arm was already consumed by
                 // the retry).
                 self.append_snapshot(t, &id, v);
@@ -5316,9 +5314,9 @@ impl Model {
             Some(FailureClass::Step17ContentionDebtRead)
             | Some(FailureClass::Step17ContentionDebtWrite) => {
                 // STEP-17 LOCK CONTENTION (post-commit, via the phase hook)
-                // combined with a rotation-debt I/O fault: the commit
-                // succeeded and the slot's rotation lock is contended, so the
-                // step-17 loop defers the rotation as a debt marker. The
+                // combined with a retention-debt I/O fault: the commit
+                // succeeded and the slot's retention lock is contended, so the
+                // step-17 loop defers the retention as a debt marker. The
                 // deferral I/O is NON-FALLIBLE — a debt read/write failure
                 // warns but never changes the committed outcome.
                 self.append_snapshot(t, &id, v);
@@ -5331,15 +5329,15 @@ impl Model {
                         // unarmed, so a preexisting marker's read succeeds
                         // and its contended retry keeps the marker. The arm
                         // then fires at the FRESH phase's contended deferral
-                        // (`set_rotation_deferred`'s read-modify-write): the
+                        // (`set_retention_deferred`'s read-modify-write): the
                         // read fails, nothing is persisted, and the explicit
-                        // "failed to read rotation debt" notice appears —
+                        // "failed to read retention debt" notice appears —
                         // a preexisting marker is PRESERVED untouched, and a
                         // fresh push with no marker creates NONE.
                         self.debt.insert(t, had_debt);
                         self.expected_warning = Some(vec![
                             format!(
-                                "rotation deferred for slot '{}': slot lock held by another operation",
+                                "retention deferred for slot '{}': slot lock held by another operation",
                                 Self::target_slots(t)[0]
                             ),
                             DEBT_READ_WARNING.to_string(),
@@ -5349,8 +5347,8 @@ impl Model {
                         // The debt WRITE arm is armed ONLY at the fresh
                         // step-17 park (the retry's earlier debt write passes
                         // unarmed): the fresh contended deferral's
-                        // `set_rotation_deferred` cannot persist the marker —
-                        // explicit "rotation debt maintenance deferred:
+                        // `set_retention_deferred` cannot persist the marker —
+                        // explicit "retention debt maintenance deferred:
                         // failed to write" notice — so NO new marker is
                         // created and any PREEXISTING marker is preserved
                         // (the failed write leaves the file untouched). The
@@ -5358,7 +5356,7 @@ impl Model {
                         self.debt.insert(t, had_debt);
                         self.expected_warning = Some(vec![
                             format!(
-                                "rotation deferred for slot '{}': slot lock held by another operation",
+                                "retention deferred for slot '{}': slot lock held by another operation",
                                 Self::target_slots(t)[0]
                             ),
                             DEBT_WRITE_WARNING.to_string(),
@@ -5426,27 +5424,27 @@ impl Model {
         (class, window)
     }
 
-    /// The no-op retry path: `retry_deferred_rotations` services the debt
+    /// The no-op retry path: `retry_deferred_retentions` services the debt
     /// marker (writing the inventory), and that write consumes an armed
-    /// [`FailureClass::RotationInventory`] — failing, the marker stays.
-    /// Commit-marker faults do not match the inventory write, so the rotation
+    /// [`FailureClass::RetentionInventory`] — failing, the marker stays.
+    /// Commit-marker faults do not match the inventory write, so the retention
     /// succeeds and clears the debt. Under contention the retry's lock
     /// acquisition fails first: the marker stays (both trunks agree).
     fn noop_maintenance(&mut self, t: &'static str) {
-        // A no-op never reaches the FRESH step-17 rotation, and the step-17
+        // A no-op never reaches the FRESH step-17 retention, and the step-17
         // DEBT COMBINATIONS arm their debt fault ONLY at that phase (the
         // fixture leaves the deferred-maintenance retry unarmed), so the
         // one-shot can never fire on the no-op: no "failed to read/write
-        // rotation debt" notice is expected. The no-op's only
+        // retention debt" notice is expected. The no-op's only
         // step-17-equivalent park is the DeferredRetry phase, whose lock
         // acquisition contends on the fixture's held guard.
         if !self.debt.get(t).copied().unwrap_or(false) {
             return;
         }
         match self.armed_fault {
-            Some(FailureClass::RotationInventory) => {
+            Some(FailureClass::RetentionInventory) => {
                 self.armed_fault = None;
-                // rotation failed; the debt marker stays
+                // retention failed; the debt marker stays
             }
             Some(FailureClass::LockContention) => {
                 // the retry cannot acquire the lock: the marker stays
@@ -5475,12 +5473,12 @@ impl Model {
             }
             Some(FailureClass::RemoteStatusPreSwap) => {
                 // The pre-swap status-read arm is a READ fault: on the no-op
-                // path the deferred-maintenance retry is a REAL rotation
+                // path the deferred-maintenance retry is a REAL retention
                 // (`rotate_slot_locked` under the maintenance mutation lock)
                 // whose first `current`-link read is exactly the
                 // pre-swap-moment read the arm targets — with no
                 // `process_server` on the no-op path, that read is the one
-                // that fires the one-shot: the rotation fails with the
+                // that fires the one-shot: the retention fails with the
                 // injected transport error and the debt marker STAYS
                 // (re-recorded with the error reason). The arm is consumed;
                 // the marker is not cleared.
@@ -5488,12 +5486,12 @@ impl Model {
             }
             Some(FailureClass::Step17ContentionDebtRead)
             | Some(FailureClass::Step17ContentionDebtWrite) => {
-                // The no-op path runs no FRESH step-17 rotation, so the
+                // The no-op path runs no FRESH step-17 retention, so the
                 // debt arm (which the fixture places ONLY at the FreshStep17
                 // park) can never fire here: the retry — the DeferredRetry
                 // phase — reads and re-persists the marker unarmed, and its
                 // lock acquisition contends on the fixture's held guard, so
-                // the marker STAYS. No "failed to ... rotation debt" notice
+                // the marker STAYS. No "failed to ... retention debt" notice
                 // is expected (the debt I/O never faulted). The fault is
                 // dropped step-scoped.
                 self.armed_fault = None;
@@ -5571,7 +5569,7 @@ fn action_strategy() -> impl Strategy<Value = Action> {
         // Rollback to snapshot index 0 or 1 of the target.
         2 => (prop::sample::select(["t1", "t2"].as_slice()), 0u64..2)
             .prop_map(|(t, i)| Action::Rollback(t, i)),
-        // Standalone rotation under the full member-policy union.
+        // Standalone retention under the full member-policy union.
         1 => Just(Action::Rotate),
         // Checkpoint history floor at a randomly chosen recorded successful
         // deployment of the target (the selector `k` is resolved against the
@@ -5604,7 +5602,7 @@ fn action_strategy() -> impl Strategy<Value = Action> {
 /// tracked debt/warning state; and the commit marker failure yields
 /// `Ok` + `Pending`. Lock contention demotes the whole attempt
 /// (`LockContention`, pre-intent: `Err` + `NoAttempt`) or only the step-17
-/// rotation (`Step17Contended`, deferred via the phase hook: debt + warning,
+/// retention (`Step17Contended`, deferred via the phase hook: debt + warning,
 /// the committed outcome — `Ok` + `Successful` — unchanged). Weights: the
 /// clean path dominates so the vectors stay realistic; every fault class is
 /// reachable.
@@ -5613,7 +5611,7 @@ fn failure_class_strategy() -> impl Strategy<Value = FailureClass> {
         12 => Just(FailureClass::None),
         // remote, suffix-armed
         1 => Just(FailureClass::CommitMarker),
-        1 => Just(FailureClass::RotationInventory),
+        1 => Just(FailureClass::RetentionInventory),
         // local persistence, id-armed
         1 => Just(FailureClass::IntentPersist),
         1 => Just(FailureClass::ResultsWrite),
@@ -5640,11 +5638,11 @@ fn failure_class_strategy() -> impl Strategy<Value = FailureClass> {
         1 => Just(FailureClass::RemoteStatusPreSwap),
         // step-17 lock contention (deterministic via the test-only phase
         // hook: the fixture holds the guard while the engine is parked at its
-        // step-17 lock acquisition), alone and combined with a rotation-debt
+        // step-17 lock acquisition), alone and combined with a retention-debt
         // read/write fault in the same push. The outcome oracle predicts the
         // committed push stays `Ok` + `Successful` (never `Err`); successful
         // persistence (contention alone) leaves a debt marker + warning, while
-        // a coincident debt read/write failure produces the explicit "rotation
+        // a coincident debt read/write failure produces the explicit "retention
         // debt maintenance deferred" notice (no automatic retryability claim).
         // The combined weights are bounded so the vector count does not grow.
         1 => Just(FailureClass::Step17Contended),
@@ -5702,7 +5700,7 @@ fn learn_artifact(
 /// (b) cross-check the model's expected state against the system's
 /// observable state: the remote current generation (existence + artifact
 /// identity), every member target's observed projection, the per-target
-/// snapshot/attempt logs, pending-commit state, and rotation-debt markers.
+/// snapshot/attempt logs, pending-commit state, and retention-debt markers.
 ///
 /// The version→artifact identity join comes from the SYSTEM's durable
 /// records (snapshots and attempts carry the deployed [`ArtifactRef`]): every
@@ -5948,16 +5946,16 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
         }
     }
 
-    // Rotation-debt markers per target.
+    // Retention-debt markers per target.
     for t in ["t1", "t2"] {
         let sys_debt = !system
             .store
-            .read_rotation_debt(t)
+            .read_retention_debt(t)
             .unwrap_or_default()
             .is_empty();
         assert_eq!(
             model.debt[t], sys_debt,
-            "{ctx}: rotation-debt marker for {t}"
+            "{ctx}: retention-debt marker for {t}"
         );
     }
 }
@@ -6146,7 +6144,7 @@ fn run_semantic_state_case(steps: Vec<(Action, FailureClass)>) {
         let outcome = system.apply_prop(&action, fault);
         // The HARD POST-COMMIT RULE, asserted explicitly: once the deployment
         // durably committed (the model expects `Ok` + `Successful`), the push
-        // must NEVER return `Err` — the observed refresh, rotation, and debt
+        // must NEVER return `Err` — the observed refresh, retention, and debt
         // I/O are warning-only after the durable commit. This binds the
         // post-commit lifecycle + maintenance properties into the result
         // comparison.
@@ -6194,10 +6192,10 @@ fn run_semantic_state_case(steps: Vec<(Action, FailureClass)>) {
             ),
         }
         // THE REPORT'S WARNING CHANNEL (asserts the ACTUAL report text per
-        // step-17 contention combination): the marker-persisted "rotation
+        // step-17 contention combination): the marker-persisted "retention
         // deferred for slot 'p1'" claim — the retryable deferral a later push
         // services once the lock is free — plus, on the debt combinations,
-        // the explicit "rotation debt maintenance deferred: failed to ..."
+        // the explicit "retention debt maintenance deferred: failed to ..."
         // notice (the marker was NOT persisted / maintenance deferred without
         // a marker, so no automatic retryability is claimed). Every expected
         // substring must appear in the actual report's warning. Under the
@@ -6222,7 +6220,7 @@ fn run_semantic_state_case(steps: Vec<(Action, FailureClass)>) {
             }
         }
         // THE CONVERGENCE ORACLE: the first CLEAN unlocked no-op services
-        // the deferred rotation — the marker is cleared (cross-checked by
+        // the deferred retention — the marker is cleared (cross-checked by
         // `assert_semantic_invariants`) and no warning remains on the report.
         if fault == FailureClass::None
             && expected
@@ -6236,7 +6234,7 @@ fn run_semantic_state_case(steps: Vec<(Action, FailureClass)>) {
             assert!(
                 report.warning.is_none(),
                 "after action {}: a clean no-op must report no warning once the deferred \
-                 rotation converged; got: {:?}",
+                 retention converged; got: {:?}",
                 model.index,
                 report.warning,
             );
@@ -6387,9 +6385,9 @@ proptest! {
 /// matrix — and every combination runs as a GUARANTEED non-no-op push.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContentionDebtFault {
-    /// The fresh deferral's `set_rotation_deferred` READ faults.
+    /// The fresh deferral's `set_retention_deferred` READ faults.
     Read,
-    /// The fresh deferral's `set_rotation_deferred` WRITE faults.
+    /// The fresh deferral's `set_retention_deferred` WRITE faults.
     Write,
 }
 
@@ -6403,7 +6401,7 @@ enum ContentionDebtFault {
 /// push runs under the test-only step-17 phase hook with the fixture holding
 /// the slot's mutation guard at EVERY park; the debt fault is armed ONLY at
 /// the FreshStep17 park ([`step17_hook::HookPhase::FreshStep17`] — the
-/// fixture's own per-slot rotation, whose contended else-branch runs the
+/// fixture's own per-slot retention, whose contended else-branch runs the
 /// debt read-modify-write that must fault), so the deferred-maintenance
 /// retry (which, with a preexisting marker, reads the debt FIRST — before
 /// its park — and must pass unarmed at the
@@ -6413,12 +6411,12 @@ enum ContentionDebtFault {
 /// Per combination asserts the post-commit contract:
 /// (a) the push returns `Ok` with `Successful` — NEVER `Err`;
 /// (b) BOTH required warnings present — the contention warning
-///     (`rotation deferred for slot 'p1'`) AND the debt-I/O notice
-///     (`failed to read` / `failed to write rotation debt`, per fault);
+///     (`retention deferred for slot 'p1'`) AND the debt-I/O notice
+///     (`failed to read` / `failed to write retention debt`, per fault);
 /// (c) FAILED PERSISTENCE creates NO new debt marker while PRESERVING any
 ///     preexisting one: `Some(reason)` leaves the marker file BYTE-IDENTICAL
 ///     (the faulted read/write leaves the file untouched) and the reason
-///     round-trips exactly through [`crate::store::local::LocalStore::read_rotation_debt`];
+///     round-trips exactly through [`crate::store::local::LocalStore::read_retention_debt`];
 ///     `None` leaves no marker file at all.
 fn run_step17_contention_debt_case(preexisting_reason: Option<&str>, fault: ContentionDebtFault) {
     let ctx = format!("preexisting_reason={preexisting_reason:?}, fault={fault:?}");
@@ -6429,10 +6427,10 @@ fn run_step17_contention_debt_case(preexisting_reason: Option<&str>, fault: Cont
     // Seed the preexisting debt marker with the ARBITRARY reason and
     // snapshot it BEFORE the push: a failed persistence must leave it
     // byte-identical.
-    let marker_path = f.store.rotation_debt_path(TARGET);
+    let marker_path = f.store.retention_debt_path(TARGET);
     let before = if let Some(reason) = preexisting_reason {
         f.store
-            .write_rotation_debt(
+            .write_retention_debt(
                 TARGET,
                 &BTreeMap::from([(SLOT.to_string(), reason.to_string())]),
             )
@@ -6467,7 +6465,7 @@ fn run_step17_contention_debt_case(preexisting_reason: Option<&str>, fault: Cont
     let warning = report.warning.as_deref().unwrap_or("");
     assert!(
         warning.contains(STEP17_CONTENTION_WARNING),
-        "{ctx}: the report must carry the contention warning 'rotation deferred for slot \
+        "{ctx}: the report must carry the contention warning 'retention deferred for slot \
          'p1''; got: {warning:?}"
     );
     let debt_notice = match fault {
@@ -6489,7 +6487,7 @@ fn run_step17_contention_debt_case(preexisting_reason: Option<&str>, fault: Cont
             after, before,
             "{ctx}: the preexisting debt marker must be preserved byte-identical"
         );
-        let debt = f.store.read_rotation_debt(TARGET).unwrap();
+        let debt = f.store.read_retention_debt(TARGET).unwrap();
         assert_eq!(
             debt.get(SLOT).map(String::as_str),
             Some(reason),
@@ -6613,7 +6611,7 @@ proptest! {
 ///     with it by construction;
 /// (2) CHANGING MEMBERSHIP (adding/removing a target in a slot's `targets`
 ///     list — a config-level membership change, reloaded through
-///     `Config::load`) does NOT change RETENTION: the retained digest set is
+///     `ProjectConfig::load`) does NOT change RETENTION: the retained digest set is
 ///     computed under the slot's OWNING VARIANT policy (the single source),
 ///     so the set before and after the membership edit is IDENTICAL.
 /// The three overlapping targets of the slot-view property.
@@ -6680,8 +6678,8 @@ fn run_slot_view_property(members: Vec<Vec<bool>>, pushes: Vec<usize>) {
     }
     variant.push_str(
         "[[artifact.mappings]]\nfrom = \"artifacts/build/output/\"\nto = \"app/\"\nrecursive = true\n\n\
-         [rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = false\n\n\
-         [rotation.deployment]\nprotect_deployments = 1\n\n\
+         [retention.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = false\n\n\
+         [retention.deployment]\nprotect_deployments = 1\n\n\
          [activation]\nadapter = \"none\"\n\n\
          [verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
     );
@@ -6703,7 +6701,7 @@ fn run_slot_view_property(members: Vec<Vec<bool>>, pushes: Vec<usize>) {
     );
     let cfg_path = project.join("deploy.toml");
     std::fs::write(&cfg_path, deploy_toml).unwrap();
-    let config = Config::load(&cfg_path).unwrap();
+    let config = ProjectConfig::load(&cfg_path).unwrap();
     for t in VIEW_TARGETS {
         assert!(
             !config.target_slots(t).unwrap().is_empty(),
@@ -6716,7 +6714,7 @@ fn run_slot_view_property(members: Vec<Vec<bool>>, pushes: Vec<usize>) {
     std::fs::create_dir_all(&remotes_base).unwrap();
     let rf = remotes_base.clone();
     let factory = move |s: &crate::config::ServerDef,
-                        _slot: &crate::config::SlotDef|
+                        _slot: &crate::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
     };
@@ -6730,7 +6728,7 @@ fn run_slot_view_property(members: Vec<Vec<bool>>, pushes: Vec<usize>) {
     for (step, ti) in pushes.into_iter().enumerate() {
         content_version += 1;
         std::fs::write(artifacts.join("server"), format!("v{content_version}\n")).unwrap();
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
         let t = VIEW_TARGETS[ti % 3];
         let r = push(
             &cfg_path,
@@ -6769,7 +6767,7 @@ fn run_slot_view_property(members: Vec<Vec<bool>>, pushes: Vec<usize>) {
 /// (`slots/<slot-id>/observed.json`) — the view is the global map filtered
 /// to the target's member slots, so shared slots appear once, physically, and
 /// every member target's view agrees with it by construction.
-fn assert_views_match_physical(store: &LocalStore, config: &Config) {
+fn assert_views_match_physical(store: &LocalStore, config: &ProjectConfig) {
     let physical = store.read_global_observed().unwrap();
     for t in config.targets.keys() {
         let view = store.read_observed(t, config).unwrap();
@@ -6794,15 +6792,15 @@ fn assert_views_match_physical(store: &LocalStore, config: &Config) {
 
 /// (2) MEMBERSHIP NEVER CHANGES RETENTION: the retained digest set is
 /// computed under the slot's OWNING VARIANT policy (the single source; see
-/// `Config::slot_rotation`), so a config-level membership edit — adding or
+/// `ProjectConfig::slot_retention`), so a config-level membership edit — adding or
 /// removing a rollout GROUP in a slot's `groups` list, reloaded through
-/// `Config::load` — leaves the retained set IDENTICAL. Groups are
+/// `ProjectConfig::load` — leaves the retained set IDENTICAL. Groups are
 /// selection-only (they never own state, policy, history, or checkpoints),
 /// so a membership change cannot move retention.
 fn assert_membership_never_changes_retention(
     store: &LocalStore,
     cfg_path: &std::path::Path,
-    config: &Config,
+    config: &ProjectConfig,
     release_dir: &std::path::Path,
     remotes_base: &std::path::Path,
 ) {
@@ -6813,14 +6811,14 @@ fn assert_membership_never_changes_retention(
     let slot_def = config.slot_defs()[0];
     let slot_id = &slot_def.id;
     let groups0 = &slot_def.groups;
-    let retained = |cfg: &Config| -> HashSet<String> {
+    let retained = |cfg: &ProjectConfig| -> HashSet<String> {
         let remote = LocalTransport::new(remotes_base.join("h1")).unwrap();
         let helper = RemoteHelper::new(&remote);
         compute_retained(
             &helper,
             &cfg.pins,
             store,
-            cfg.slot_rotation(slot_id).unwrap(),
+            cfg.slot_retention(slot_id).unwrap(),
         )
         .unwrap()
     };
@@ -6858,7 +6856,7 @@ fn assert_membership_never_changes_retention(
     };
     let variant2 = format!("{head}{edited_list}{rest}");
     std::fs::write(&variant_path, variant2).unwrap();
-    let config2 = Config::load(cfg_path).unwrap();
+    let config2 = ProjectConfig::load(cfg_path).unwrap();
     // The membership edit may not have changed the slot's OWNING VARIANT.
     assert_eq!(
         config2.slot_variant(slot_id).unwrap(),

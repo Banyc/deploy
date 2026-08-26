@@ -1,7 +1,7 @@
 # The `standard` variant: its artifact mappings plus deployment policies —
 # and its deployment slots. `from` paths resolve inside the release directory
 # (`releases/<name>/` — the project structure is forced), so artifact sources
-# live under `releases/v1/artifacts/`. Rotation is not a variant setting: it
+# live under `releases/v1/artifacts/`. Retention is not a variant setting: it
 # belongs to the target.
 description = "Standard deployment"
 
@@ -28,14 +28,14 @@ from = "artifacts/build/output/"
 to = "app/"
 recursive = true
 
-# Retention (rotation) — the slot-owned policy applied on every rotation of
+# Retention — the slot-owned policy applied on every retention pass of
 # the slots this variant file declares. How aggressively its servers rotate.
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 5   # keep the newest 5 distinct artifacts per server
 keep_days = 14                # ...and everything activated in the last 14 days
 protect_previous = true       # never delete the artifact `current` can roll back to
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 2       # keep each server's artifacts of the newest 2 successful deployments
 
 # Activation: what happens after `current` is atomically swapped.

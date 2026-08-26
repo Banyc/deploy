@@ -1,11 +1,11 @@
-//! The two-sided sweep contract: receiver = rotation, pusher = checkpoint.
+//! The two-sided sweep contract: receiver = retention, pusher = checkpoint.
 //!
 //! The Constitution's "No disk usage leak" rule is served by TWO sweep
 //! mechanisms, one per side of the push:
 //!
 //! * RECEIVER side (every server's deployment root): swept by ROTATION. The
 //!   slot's single owning-variant retention policy computes the retained
-//!   digest set ([`crate::rotation::compute_retained`]); the mark-and-sweep
+//!   digest set ([`crate::retention::compute_retained`]); the mark-and-sweep
 //!   pass ([`crate::remote::helper::RemoteHelper::rotate`]) deletes every
 //!   tree object NOT in the retained set and every abandoned incoming
 //!   directory. Generation/release/commit metadata is small and kept by
@@ -22,8 +22,8 @@
 //! failure (or a sweep that has not run) never blocks or rolls back the
 //! operation that triggered it and never reports an ordinary failure — it
 //! records DURABLE DEBT and the NEXT PUSH (real or no-op) fires the pending
-//! sweep. The receiver's rotation debt is `targets/<target>/rotation-debt.json`
-//! (serviced by [`crate::push::engine::retry_deferred_rotations`]); the
+//! sweep. The receiver's retention debt is `targets/<target>/retention-debt.json`
+//! (serviced by [`crate::push::engine::retry_deferred_retentions`]); the
 //! pusher's sweep debt is `<base>/sweep-debt.json` (serviced by
 //! [`crate::push::engine::retry_pending_sweep`]). Both reports surface a
 //! pending sweep as a WARNING, never an error.
@@ -33,12 +33,12 @@
 //! discipline (faulted sweeps still succeed, debt is recorded, and the next
 //! push converges).
 
-use crate::config::Config;
+use crate::config::ProjectConfig;
 use crate::error::Result;
 use crate::layout;
 use crate::model::{
-    ArtifactRef, DeploymentId, GenerationId, PlacementSlotAssignment, PlacementSlotId, ReleaseId,
-    ServerId, TargetName, TreeDigest, VariantName,
+    ArtifactRef, DeploymentId, GenerationId, PlacementSlotAssignment, ReleaseId, ServerId, SlotId,
+    TargetName, TreeDigest, VariantName,
 };
 use crate::push::checkpoint::run_checkpoint_unlocked;
 use crate::push::engine::{PushOptions, push, retry_pending_sweep};
@@ -48,7 +48,7 @@ use crate::records::{
 };
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::transport::{LocalTransport, Remote};
-use crate::rotation::compute_retained;
+use crate::retention::compute_retained;
 use crate::store::local::LocalStore;
 use crate::testutil::test_faults::FaultKind;
 use crate::testutil::test_remotes::FailOnceInventoryRemote;
@@ -62,7 +62,7 @@ use std::sync::atomic::AtomicBool;
 const TARGET: &str = "t1";
 
 /// A minimal but VALID variant file (the config loader requires a real
-/// variant: mappings, activation, verification, and the slot's ONE rotation
+/// variant: mappings, activation, verification, and the slot's ONE retention
 /// policy).
 const VARIANT_TOML: &str = r#"
 [artifact]
@@ -75,12 +75,12 @@ target = "t1"
 groups = []
 deploy_dir = "/srv"
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 1
 
 [activation]
@@ -96,7 +96,7 @@ interval_seconds = 0
 
 /// The project file for the sweep fixtures: one server, one target, and —
 /// when `pinned` is given — a durable `[[pins]]` entry protecting a release.
-fn config_for(dir: &tempfile::TempDir, pinned: Option<&ReleaseId>) -> Config {
+fn config_for(dir: &tempfile::TempDir, pinned: Option<&ReleaseId>) -> ProjectConfig {
     let project = dir.path().join("proj");
     std::fs::create_dir_all(project.join("releases").join("v1")).unwrap();
     std::fs::write(
@@ -115,7 +115,7 @@ fn config_for(dir: &tempfile::TempDir, pinned: Option<&ReleaseId>) -> Config {
         ));
     }
     std::fs::write(project.join("deploy.toml"), deploy).unwrap();
-    Config::load(&project.join("deploy.toml")).unwrap()
+    ProjectConfig::load(&project.join("deploy.toml")).unwrap()
 }
 
 /// Write a REAL release record (content-derived id) with one variant tree
@@ -131,7 +131,7 @@ fn seed_real_release(store: &LocalStore) -> ReleaseId {
         )]),
         &BTreeMap::from([(
             "standard".to_string(),
-            vec![crate::config::SlotDef {
+            vec![crate::config::SlotConfig {
                 id: "p1".to_string(),
                 server: "s1".to_string(),
                 deploy_dir: PathBuf::from("/srv/deploy/p1"),
@@ -146,7 +146,7 @@ fn seed_real_release(store: &LocalStore) -> ReleaseId {
     id
 }
 
-// ---- receiver (rotation) fixture helpers -----------------------------------
+// ---- receiver (retention) fixture helpers -----------------------------------
 
 /// Create one generation record (tree + assignment) on the receiver without
 /// touching `current`. The tree object must exist for `status()` to follow
@@ -201,7 +201,7 @@ fn list_generations(helper: &RemoteHelper) -> Vec<String> {
 // ---- pusher (checkpoint) fixture helpers -----------------------------------
 
 fn intent(id: &str, target: &str) -> DeploymentIntent {
-    let p1 = PlacementSlotId::new("p1".to_string());
+    let p1 = SlotId::new("p1".to_string());
     // ONE slot table (the membership + desired/pre-push entries).
     let slots = BTreeMap::from([(
         p1.clone(),
@@ -236,11 +236,11 @@ fn terminal_for(release: &str, tree: &str) -> LedgerTerminal {
         disposition: TerminalDisposition::Successful {
             rollback: LedgerRollback {
                 slots: BTreeMap::from([(
-                    PlacementSlotId::new("p1".to_string()),
+                    SlotId::new("p1".to_string()),
                     crate::model::GenerationRef {
                         generation: GenerationId::new("gen-1".to_string()),
                         assignment: PlacementSlotAssignment {
-                            placement_slot: PlacementSlotId::new("p1".to_string()),
+                            placement_slot: SlotId::new("p1".to_string()),
                             artifact: ArtifactRef {
                                 release: ReleaseId::new(release.to_string()),
                                 variant: VariantName::new("standard".to_string()),
@@ -250,7 +250,7 @@ fn terminal_for(release: &str, tree: &str) -> LedgerTerminal {
                     },
                 )]),
                 bindings: BTreeMap::from([(
-                    PlacementSlotId::new("p1".to_string()),
+                    SlotId::new("p1".to_string()),
                     crate::records::PhysicalBinding {
                         server: ServerId::new("s1".to_string()),
                         deploy_dir: "/srv/deploy/p1".to_string(),
@@ -327,11 +327,11 @@ fn seed_unreachable(store: &LocalStore, deployment: &str, release: &str, tree: &
 }
 
 // ---------------------------------------------------------------------------
-// THE NO-LEAK CONTRACT (clean path): after a rotation pass the receiver
+// THE NO-LEAK CONTRACT (clean path): after a retention pass the receiver
 // retains EXACTLY the policy-retained trees (stale ones gone, pins/retained
 // content survive); after a checkpoint the pusher retains EXACTLY the
 // reachable artifacts (unreachable releases/objects/deployment dirs gone,
-// pins survive); and the two sides are independent (rotation never touches
+// pins survive); and the two sides are independent (retention never touches
 // the pusher's ledger; checkpoint never touches the receiver's generations).
 // ---------------------------------------------------------------------------
 
@@ -377,22 +377,22 @@ fn run_no_leak_case(
     // The slot's ONE policy, tuned by the generated window.
     cfg.variant_mut("standard")
         .unwrap()
-        .rotation
+        .retention
         .per_server
         .keep_distinct_artifacts = keep_distinct as u32;
     cfg.variant_mut("standard")
         .unwrap()
-        .rotation
+        .retention
         .per_server
         .keep_days = 0;
     cfg.variant_mut("standard")
         .unwrap()
-        .rotation
+        .retention
         .per_server
         .protect_previous = true;
     cfg.variant_mut("standard")
         .unwrap()
-        .rotation
+        .retention
         .deployment
         .protect_deployments = 1;
     let ids = seed_history(&store, TARGET, "deploy", &pusher_history);
@@ -407,9 +407,9 @@ fn run_no_leak_case(
     let ledger_before = store.read_ledger_lines(TARGET).unwrap();
     let gens_before = list_generations(&helper);
 
-    // ---- receiver sweep: rotation -----------------------------------------
-    let rotation = &cfg.variant("standard").unwrap().rotation;
-    let retained = compute_retained(&helper, &cfg.pins, &store, rotation).unwrap();
+    // ---- receiver sweep: retention -----------------------------------------
+    let retention = &cfg.variant("standard").unwrap().retention;
+    let retained = compute_retained(&helper, &cfg.pins, &store, retention).unwrap();
     helper.rotate(&retained, &HashSet::new()).unwrap();
     // The receiver retains EXACTLY the policy-retained trees: stale ones are
     // gone, retained + pinned content survives.
@@ -425,11 +425,11 @@ fn run_no_leak_case(
         helper.remote().exists(&layout::tree_root("tree-pinned")),
         "pinned content survives on the receiver"
     );
-    // Independence: rotation never touches the pusher's ledger.
+    // Independence: retention never touches the pusher's ledger.
     assert_eq!(
         store.read_ledger_lines(TARGET).unwrap(),
         ledger_before,
-        "rotation must never touch the pusher's ledger"
+        "retention must never touch the pusher's ledger"
     );
 
     // ---- pusher sweep: checkpoint -----------------------------------------
@@ -731,7 +731,7 @@ fn sweep_debt_io_faults_are_warnings_not_errors() {
 struct PushHarness {
     _dir: tempfile::TempDir,
     cfg_path: PathBuf,
-    config: Config,
+    config: ProjectConfig,
     store: LocalStore,
     remotes_base: PathBuf,
 }
@@ -763,7 +763,7 @@ impl PushHarness {
             std::fs::write(&fp, c).unwrap();
         }
         let cfg_path = project.join("deploy.toml");
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let remotes_base = dir.path().join("remotes");
         std::fs::create_dir_all(&remotes_base).unwrap();
@@ -777,20 +777,20 @@ impl PushHarness {
     }
 }
 
-/// RECEIVER-side maintenance, end to end: the rotation's inventory write
+/// RECEIVER-side maintenance, end to end: the retention's inventory write
 /// fails once AFTER the deployment already committed. The push must STILL
-/// SUCCEED (maintenance, not correction) — the rotation is deferred as
-/// durable rotation debt plus a warning, never an Err — and the NEXT PUSH
-/// (a no-op) fires the pending rotation, succeeds, and clears the debt.
+/// SUCCEED (maintenance, not correction) — the retention is deferred as
+/// durable retention debt plus a warning, never an Err — and the NEXT PUSH
+/// (a no-op) fires the pending retention, succeeds, and clears the debt.
 #[test]
-fn receiver_rotation_failure_is_maintenance_not_correction() {
+fn receiver_retention_failure_is_maintenance_not_correction() {
     let h = PushHarness::new();
-    // Push 1: the rotation's `state/inventory.json` write fails once.
+    // Push 1: the retention's `state/inventory.json` write fails once.
     let armed = Arc::new(AtomicBool::new(true));
     let armed_for_factory = armed.clone();
     let rf = h.remotes_base.clone();
     let fault_factory = move |s: &crate::config::ServerDef,
-                              _slot: &crate::config::SlotDef|
+                              _slot: &crate::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         FailOnceInventoryRemote::build(rf.join(&s.id), armed_for_factory.clone())
     };
@@ -806,7 +806,7 @@ fn receiver_rotation_failure_is_maintenance_not_correction() {
             ref_token: None,
         },
     )
-    .expect("the push succeeds despite the rotation failure");
+    .expect("the push succeeds despite the retention failure");
     assert_eq!(
         r1.status,
         Some(DeploymentStatus::Successful),
@@ -815,22 +815,22 @@ fn receiver_rotation_failure_is_maintenance_not_correction() {
     let warning = r1
         .warning
         .as_deref()
-        .expect("the rotation deferral is surfaced as a warning, never an error");
+        .expect("the retention deferral is surfaced as a warning, never an error");
     assert!(
-        warning.contains("rotation deferred"),
-        "the warning names the deferred rotation: {warning}"
+        warning.contains("retention deferred"),
+        "the warning names the deferred retention: {warning}"
     );
-    let debt = h.store.read_rotation_debt("t1").unwrap();
+    let debt = h.store.read_retention_debt("t1").unwrap();
     assert!(
         debt.contains_key("p1"),
-        "durable rotation debt is recorded: {debt:?}"
+        "durable retention debt is recorded: {debt:?}"
     );
 
-    // Push 2 (no-op): the NEXT PUSH fires the pending rotation — the retry
+    // Push 2 (no-op): the NEXT PUSH fires the pending retention — the retry
     // succeeds and clears the debt.
     let rf2 = h.remotes_base.clone();
     let clean_factory = move |s: &crate::config::ServerDef,
-                              _slot: &crate::config::SlotDef|
+                              _slot: &crate::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf2.join(&s.id)).unwrap()))
     };
@@ -850,7 +850,7 @@ fn receiver_rotation_failure_is_maintenance_not_correction() {
     assert_eq!(r2.status, None, "the second push is a no-op");
     assert!(r2.message.contains("Everything up to date"));
     assert!(
-        h.store.read_rotation_debt("t1").unwrap().is_empty(),
-        "the next push clears the rotation debt"
+        h.store.read_retention_debt("t1").unwrap().is_empty(),
+        "the next push clears the retention debt"
     );
 }

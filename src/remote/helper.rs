@@ -2,7 +2,7 @@
 //!
 //! Implements status inspection, locking, object publication, generation
 //! switching with a compare-and-swap precondition, transaction records,
-//! history, adapter invocation, and rotation. Every mutating operation is
+//! history, adapter invocation, and retention. Every mutating operation is
 //! keyed by an operation ID and is idempotent.
 
 use crate::error::{Error, Result};
@@ -479,7 +479,7 @@ impl<'a> RemoteHelper<'a> {
         Ok(())
     }
 
-    /// Mark-and-sweep rotation: delete tree objects whose digest is not in the
+    /// Mark-and-sweep retention: delete tree objects whose digest is not in the
     /// retained set, and remove abandoned incoming directories.
     pub fn rotate(
         &self,
@@ -507,7 +507,7 @@ impl<'a> RemoteHelper<'a> {
     }
 
     /// Stage a tree into a deployment-specific incoming directory (invisible to
-    /// activation and rotation until published).
+    /// activation and retention until published).
     pub fn stage_incoming(&self, deployment_id: &str, digest: &str, host_src: &Path) -> Result<()> {
         let dest = layout::staged_tree(deployment_id, digest);
         copy_host_tree_to_remote(host_src, &dest, self.remote)
@@ -783,10 +783,10 @@ mod tests {
             crate::model::VariantName::new("standard"),
             crate::model::TreeDigest::new("t1"),
         )]);
-        let slots: std::collections::BTreeMap<String, Vec<crate::config::SlotDef>> =
+        let slots: std::collections::BTreeMap<String, Vec<crate::config::SlotConfig>> =
             std::collections::BTreeMap::from([(
                 "standard".to_string(),
-                vec![crate::config::SlotDef {
+                vec![crate::config::SlotConfig {
                     id: "p1".to_string(),
                     server: "s1".to_string(),
                     deploy_dir: std::path::PathBuf::from("/srv/deploy/p1"),
@@ -1180,7 +1180,7 @@ mod tests {
     /// when the guarded block exits through an error path (no explicit
     /// release): after the guard drops, a fresh operation can acquire the
     /// lock again and the lock file is gone. This is the property the two
-    /// rotation paths rely on — a manual acquire/release pair would leak the
+    /// retention paths rely on — a manual acquire/release pair would leak the
     /// lock on a `?` error and strand every later operation on the slot.
     #[test]
     fn lock_guard_releases_on_drop_after_error() {

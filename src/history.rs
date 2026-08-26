@@ -65,7 +65,7 @@
 
 use crate::error::{Error, Result};
 use crate::model::{
-    DeploymentId, GenerationRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, TargetName,
+    DeploymentId, GenerationRef, PlacementSlotAssignment, ReleaseId, SlotId, TargetName,
 };
 use crate::records::{
     DeploymentIntent, DeploymentStatus, LedgerEntry, LedgerRollback, LedgerTerminal,
@@ -245,11 +245,11 @@ pub fn ref_name(target: &TargetName, deployment_id: &DeploymentId) -> String {
 pub fn finalize_successful_attempt(
     store: &LocalStore,
     attempt: &DeploymentIntent,
-    outcomes: &BTreeMap<PlacementSlotId, SlotResult>,
-    actuals: &BTreeMap<PlacementSlotId, SlotAttemptState>,
+    outcomes: &BTreeMap<SlotId, SlotResult>,
+    actuals: &BTreeMap<SlotId, SlotAttemptState>,
     reason: &str,
-    bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
-    current_slot_ids: &[PlacementSlotId],
+    bindings: &BTreeMap<SlotId, PhysicalBinding>,
+    current_slot_ids: &[SlotId],
 ) -> Result<()> {
     let entries = store.read_ledger(attempt.target.as_str())?;
     if let Some(e) = entries
@@ -293,16 +293,16 @@ pub fn finalize_successful_attempt(
 /// partial snapshot can span several releases (group pushes over time) and
 /// the referenced releases are the set derived from the per-slot bindings.
 pub fn build_rollback(
-    actuals: &BTreeMap<PlacementSlotId, SlotAttemptState>,
-    bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
+    actuals: &BTreeMap<SlotId, SlotAttemptState>,
+    bindings: &BTreeMap<SlotId, PhysicalBinding>,
     base: Option<&LedgerRollback>,
-    current_slot_ids: &[PlacementSlotId],
+    current_slot_ids: &[SlotId],
 ) -> LedgerRollback {
     // Start from the base (or empty): unselected slots are carried forward
     // unchanged.
-    let mut slots: BTreeMap<PlacementSlotId, GenerationRef> =
+    let mut slots: BTreeMap<SlotId, GenerationRef> =
         base.map(|b| b.slots.clone()).unwrap_or_default();
-    let mut out_bindings: BTreeMap<PlacementSlotId, PhysicalBinding> =
+    let mut out_bindings: BTreeMap<SlotId, PhysicalBinding> =
         base.map(|b| b.bindings.clone()).unwrap_or_default();
     // Replace the SELECTED slots with their actual successful assignments
     // and current physical bindings.
@@ -346,8 +346,8 @@ pub fn build_rollback(
 pub fn recovery_outcomes(
     attempt: &DeploymentIntent,
 ) -> (
-    BTreeMap<PlacementSlotId, SlotResult>,
-    BTreeMap<PlacementSlotId, SlotAttemptState>,
+    BTreeMap<SlotId, SlotResult>,
+    BTreeMap<SlotId, SlotAttemptState>,
 ) {
     let mut outcomes = BTreeMap::new();
     let mut actuals = BTreeMap::new();
@@ -358,7 +358,7 @@ pub fn recovery_outcomes(
             sid.clone(),
             SlotResult {
                 slot_id: sid.clone(),
-                outcome: crate::records::ServerOutcomeKind::Activated,
+                outcome: crate::records::SlotOutcomeKind::Activated,
                 generation: Some(slot.desired.generation.clone()),
                 compensated: false,
                 error: None,
@@ -442,7 +442,7 @@ pub fn successful_index(
 
 /// Collect the distinct placement slot IDs referenced across a set of
 /// intent entries.
-pub fn attempt_slot_ids(attempt: &DeploymentIntent) -> Vec<PlacementSlotId> {
+pub fn attempt_slot_ids(attempt: &DeploymentIntent) -> Vec<SlotId> {
     // The membership is the ONE table's key set (deployment order).
     attempt.slots.keys().cloned().collect()
 }
@@ -485,7 +485,7 @@ mod tests {
     /// A minimal but VALID intent for the target (EXACT key-set equality:
     /// `slot_ids == desired.keys() == pre_push.keys()`).
     fn intent(dep: &str) -> DeploymentIntent {
-        let p1 = PlacementSlotId::new("p1".to_string());
+        let p1 = SlotId::new("p1".to_string());
         // ONE slot table (the membership + desired/pre-push entries).
         let slots = BTreeMap::from([(
             p1.clone(),
@@ -522,11 +522,11 @@ mod tests {
             disposition: TerminalDisposition::Successful {
                 rollback: LedgerRollback {
                     slots: BTreeMap::from([(
-                        PlacementSlotId::new("p1".to_string()),
+                        SlotId::new("p1".to_string()),
                         GenerationRef {
                             generation: GenerationId::new(format!("gen-{dep}")),
                             assignment: PlacementSlotAssignment {
-                                placement_slot: PlacementSlotId::new("p1".to_string()),
+                                placement_slot: SlotId::new("p1".to_string()),
                                 artifact: ArtifactRef {
                                     release: ReleaseId::new(release.to_string()),
                                     variant: VariantName::new("standard".to_string()),
@@ -536,7 +536,7 @@ mod tests {
                         },
                     )]),
                     bindings: BTreeMap::from([(
-                        PlacementSlotId::new("p1".to_string()),
+                        SlotId::new("p1".to_string()),
                         PhysicalBinding {
                             server: ServerId::new("server-01".to_string()),
                             deploy_dir: "/srv/deploy/p1".to_string(),
@@ -676,9 +676,7 @@ mod tests {
         // recent rollback" of anything.
         let rollback = resolve_deployment(&store, &target, &DeploymentId::new(&ids[2])).unwrap();
         assert_eq!(
-            rollback.slots[&PlacementSlotId::new("p1")]
-                .generation
-                .as_str(),
+            rollback.slots[&SlotId::new("p1")].generation.as_str(),
             "gen-deploy-2"
         );
     }
@@ -784,8 +782,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         let target = TargetName::new("production".to_string());
-        let bindings: BTreeMap<PlacementSlotId, PhysicalBinding> = BTreeMap::from([(
-            PlacementSlotId::new("p1"),
+        let bindings: BTreeMap<SlotId, PhysicalBinding> = BTreeMap::from([(
+            SlotId::new("p1"),
             PhysicalBinding {
                 server: ServerId::new("server-01"),
                 deploy_dir: "/srv/deploy/p1".to_string(),
@@ -794,17 +792,17 @@ mod tests {
         let attempt = intent("deploy-idempotent");
         store.append_intent(target.as_str(), &attempt).unwrap();
         let actuals = BTreeMap::from([(
-            PlacementSlotId::new("p1".to_string()),
+            SlotId::new("p1".to_string()),
             SlotAttemptState {
                 artifact: ArtifactRef::default(),
                 generation: Some(GenerationId::new("gen-1".to_string())),
             },
         )]);
         let outcomes = BTreeMap::from([(
-            PlacementSlotId::new("p1".to_string()),
+            SlotId::new("p1".to_string()),
             SlotResult {
-                slot_id: PlacementSlotId::new("p1".to_string()),
-                outcome: crate::records::ServerOutcomeKind::Activated,
+                slot_id: SlotId::new("p1".to_string()),
+                outcome: crate::records::SlotOutcomeKind::Activated,
                 generation: Some(GenerationId::new("gen-1".to_string())),
                 compensated: false,
                 error: None,
@@ -818,7 +816,7 @@ mod tests {
             &actuals,
             "push completed",
             &bindings,
-            &[PlacementSlotId::new("p1".to_string())],
+            &[SlotId::new("p1".to_string())],
         )
         .unwrap();
         let entries = store.read_ledger(target.as_str()).unwrap();
@@ -838,7 +836,7 @@ mod tests {
             &actuals,
             "push completed",
             &bindings,
-            &[PlacementSlotId::new("p1".to_string())],
+            &[SlotId::new("p1".to_string())],
         )
         .unwrap();
         let entries = store.read_ledger(target.as_str()).unwrap();
@@ -848,7 +846,7 @@ mod tests {
     /// `build_rollback` records each slot's complete physical binding.
     #[test]
     fn build_rollback_records_each_slots_physical_binding() {
-        let slot = PlacementSlotId::new("p1".to_string());
+        let slot = SlotId::new("p1".to_string());
         let actuals = BTreeMap::from([(
             slot.clone(),
             SlotAttemptState {
@@ -856,7 +854,7 @@ mod tests {
                 generation: Some(GenerationId::new("gen-x".to_string())),
             },
         )]);
-        let bindings: BTreeMap<PlacementSlotId, PhysicalBinding> = BTreeMap::from([(
+        let bindings: BTreeMap<SlotId, PhysicalBinding> = BTreeMap::from([(
             slot.clone(),
             PhysicalBinding {
                 server: ServerId::new("server-01"),

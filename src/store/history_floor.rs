@@ -55,7 +55,7 @@
 //! — the ledger already IS the suffix) and re-runs the sweep to convergence.
 //! Sweeps are best-effort and are NOT secure erasure.
 
-use crate::config::Config;
+use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
 // KEEP-BOTH (merge): the gc side's `ReleaseId` (pins honored by name in the
 // reachability scan) and the preview side's `LedgerEntry` (the override
@@ -68,7 +68,7 @@ use crate::store::local::LocalStore;
 use std::collections::BTreeSet;
 
 #[cfg(test)]
-use crate::model::PlacementSlotId;
+use crate::model::SlotId;
 #[cfg(test)]
 use crate::records::{
     DeploymentIntent, DeploymentStatus, LedgerRollback, LedgerTerminal, SlotResult, SlotTable,
@@ -308,7 +308,7 @@ impl LocalStore {
     /// identical retained set.
     pub(crate) fn reachable_set(
         &self,
-        config: &Config,
+        config: &ProjectConfig,
         ledger_override: Option<&LedgerOverride>,
     ) -> Result<ReachableSet> {
         let mut out = ReachableSet::default();
@@ -392,7 +392,7 @@ impl LocalStore {
             }
         }
         // Durable pins: a pin marks the WHOLE release — its record and every
-        // variant's tree. Config pins (`deploy.toml` `[[pins]]`) AND the
+        // variant's tree. ProjectConfig pins (`deploy.toml` `[[pins]]`) AND the
         // store-level pins (`pins.json` — [`crate::records::Pins`]) are both
         // retention anchors: the checkpoint is store-only by construction, but
         // the CLI accepts both surfaces. FAIL CLOSED: a pin that names a
@@ -481,7 +481,7 @@ impl LocalStore {
     /// only after the suffix replacement.
     pub(crate) fn sweep_discards(
         &self,
-        config: &Config,
+        config: &ProjectConfig,
         ledger_override: Option<&LedgerOverride>,
     ) -> Result<LedgerDiscards> {
         // POST-COMMIT SWEEP READ FAULT HOOK (test-only, global key): the
@@ -582,7 +582,7 @@ impl LocalStore {
     /// for the push-side debt retry (current ledgers as-is).
     pub(crate) fn run_sweep(
         &self,
-        config: &Config,
+        config: &ProjectConfig,
         anchor: &str,
         ledger_override: Option<&LedgerOverride>,
     ) -> Result<(LedgerDiscards, bool)> {
@@ -768,7 +768,7 @@ impl LocalStore {
     /// TEST-ONLY: the per-slot outcomes of a deployment's terminal event (the
     /// old `deployments/<id>/results.json`). An absent terminal is an error
     /// (the outcomes store never existed for it), mirroring the old read.
-    pub fn read_results(&self, id: &str) -> Result<BTreeMap<PlacementSlotId, SlotResult>> {
+    pub fn read_results(&self, id: &str) -> Result<BTreeMap<SlotId, SlotResult>> {
         self.latest_transition(id)?
             .map(|t| t.outcomes.into_map())
             .ok_or_else(|| Error::store(format!("no results for deployment '{id}'")))

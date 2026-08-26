@@ -10,12 +10,12 @@
 //! finalizes replay-safely through the SAME shared finalizer as the main
 //! success path ([`crate::history::finalize_successful_attempt`]).
 
-use crate::config::Config;
+use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
 use crate::history;
-use crate::model::{GenerationId, OperationId, PlacementSlotId};
+use crate::model::{GenerationId, OperationId, SlotId};
 use crate::records::{
-    DeploymentIntent, LedgerTerminal, NonEmptySlotTable, ServerOutcomeKind, SlotResult, SlotTable,
+    DeploymentIntent, LedgerTerminal, NonEmptySlotTable, SlotOutcomeKind, SlotResult, SlotTable,
     TerminalDisposition,
 };
 use crate::remote::helper::RemoteHelper;
@@ -61,10 +61,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// healthy services.
 pub(crate) fn reconcile_pending_commits(
     store: &LocalStore,
-    config: &Config,
+    config: &ProjectConfig,
     target_name: &str,
     op_id: &OperationId,
-    helpers: &HashMap<PlacementSlotId, RemoteHelper>,
+    helpers: &HashMap<SlotId, RemoteHelper>,
 ) -> Result<()> {
     // Eligible attempts: ledger entries WITHOUT a terminal event (the intent
     // is durable; finalization never completed). An entry WITH a terminal
@@ -104,7 +104,7 @@ pub(crate) fn reconcile_pending_commits(
         }
 
         // 2. Generation verification against fresh remote status reads.
-        let mut recorded: BTreeMap<PlacementSlotId, GenerationId> = BTreeMap::new();
+        let mut recorded: BTreeMap<SlotId, GenerationId> = BTreeMap::new();
         let mut all_match = true;
         let mut unverifiable = false;
         for sid in attempt.slots.keys() {
@@ -209,10 +209,8 @@ pub(crate) fn reconcile_pending_commits(
         // The CURRENT target slot set: the complete snapshot omits slots
         // removed from the current configuration and carries every current
         // unselected slot forward from the base.
-        let current_slot_ids: Vec<PlacementSlotId> = members
-            .iter()
-            .map(|m| PlacementSlotId::new(m.clone()))
-            .collect();
+        let current_slot_ids: Vec<SlotId> =
+            members.iter().map(|m| SlotId::new(m.clone())).collect();
         history::finalize_successful_attempt(
             store,
             &attempt,
@@ -242,7 +240,7 @@ fn append_degraded(
     // advanced) — so the read-back conversion derives a NON-EMPTY
     // remaining-changes set (a Degraded terminal with nothing remaining is
     // a payload mismatch).
-    let outcomes: BTreeMap<PlacementSlotId, SlotResult> = attempt
+    let outcomes: BTreeMap<SlotId, SlotResult> = attempt
         .slots
         .iter()
         .map(|(sid, slot)| {
@@ -250,7 +248,7 @@ fn append_degraded(
                 sid.clone(),
                 SlotResult {
                     slot_id: sid.clone(),
-                    outcome: ServerOutcomeKind::Skipped,
+                    outcome: SlotOutcomeKind::Skipped,
                     generation: Some(slot.desired.generation.clone()),
                     compensated: false,
                     error: None,
@@ -261,7 +259,7 @@ fn append_degraded(
     let outcomes = SlotTable::from_map(outcomes);
     // Verify the derivation is NON-EMPTY (fail fast — the read path derives
     // the same set and refuses an empty one).
-    let remaining_changes: BTreeMap<PlacementSlotId, GenerationId> = outcomes
+    let remaining_changes: BTreeMap<SlotId, GenerationId> = outcomes
         .iter()
         .map(|(sid, r)| (sid.clone(), r.generation.clone().expect("recorded above")))
         .collect();

@@ -6,7 +6,7 @@
 //! examples. Run `deploy --help`, `deploy help <cmd>`, or `deploy <cmd> --help`
 //! to see it.
 
-use crate::config::Config;
+use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
 use crate::init::{InitOptions, init_project};
 use crate::model::DeploymentId;
@@ -26,7 +26,7 @@ use std::path::PathBuf;
     long_about = "Deploy your local files to every server in a named target with one command.\n\
 \n\
 PROJECT STRUCTURE (forced):\n\
-  deploy.toml                    names the active release, servers, targets (rollout + rotation)\n\
+  deploy.toml                    names the active release, servers, targets (rollout + retention)\n\
   releases/<name>/              the release directory named by `release:` in deploy.toml\n\
   releases/<name>/<variant>.toml   every *.toml file here is a variant (file stem = name);\n\
                                   each variant declares its own [[slots]] (server, deploy_dir, target)\n\
@@ -57,7 +57,7 @@ enum Command {
 \n\
 Creates (never clobbers; the target must not already contain deploy.toml or a\n\
 releases/ tree):\n\
-  deploy.toml                        schema v1 config: one server, target `production` (rollout+rotation)\n\
+  deploy.toml                        schema v1 config: one server, target `production` (rollout+retention)\n\
   releases/v1/standard.toml          the `standard` variant (mappings + its slot + policies)\n\
   releases/v1/systemd.toml           example `systemd` activation variant with a real unit\n\
   releases/v1/artifacts/build/output/app/hello   placeholder artifact source\n\
@@ -71,7 +71,7 @@ carries the project's one slot (app-1 -> server-01, bound to target\n\
 slots, they do not list them).\n\
 \n\
 The generated files are typed TOML serialized from the same config structs\n\
-`Config::load` parses into — not formatted strings. Init validates the flags\n\
+`ProjectConfig::load` parses into — not formatted strings. Init validates the flags\n\
 BEFORE creating anything, re-loads the written project through the strict\n\
 loader, and removes the scaffold if that load fails: success always means\n\
 the generated project is valid.\n\
@@ -294,7 +294,7 @@ where
     T: Into<std::ffi::OsString> + Clone,
 {
     let cli = Cli::parse_from(args);
-    // Absolutize the config path so `Config::load` can canonicalize the
+    // Absolutize the config path so `ProjectConfig::load` can canonicalize the
     // project root: with a bare `./deploy.toml` the parent would be empty.
     let config_path = cli.config.unwrap_or_else(|| PathBuf::from("deploy.toml"));
     let config_path = if config_path.is_absolute() {
@@ -346,13 +346,13 @@ where
             config_path.display()
         )));
     }
-    let config = Config::load(&config_path)?;
+    let config = ProjectConfig::load(&config_path)?;
     let store = LocalStore::new(config.application.as_str())?;
     let remotes_base = store.base().join("remotes");
     std::fs::create_dir_all(&remotes_base).ok();
 
     let factory = move |s: &crate::config::ServerDef,
-                        slot: &crate::config::SlotDef|
+                        slot: &crate::config::SlotConfig|
           -> Result<Box<dyn Remote>> { create_remote(s, &slot.deploy_dir) };
 
     match cli.command {
@@ -579,8 +579,8 @@ fn print_report(report: &PushReport) {
 mod tests {
     use super::*;
     use crate::model::{
-        ArtifactRef, DeploymentId, GenerationId, PlacementSlotId, ReleaseId, TargetName,
-        TreeDigest, VariantName,
+        ArtifactRef, DeploymentId, GenerationId, ReleaseId, SlotId, TargetName, TreeDigest,
+        VariantName,
     };
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
@@ -589,7 +589,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn pending_attempt(id: &str) -> DeploymentIntent {
-        let p1 = PlacementSlotId::new("p1".to_string());
+        let p1 = SlotId::new("p1".to_string());
         // ONE slot table (the membership + desired/pre-push entries).
         let slots = BTreeMap::from([(
             p1.clone(),
@@ -755,10 +755,10 @@ mod tests {
         let project = dir.path().join("proj");
         let release_dir = project.join("releases").join("v1");
         std::fs::create_dir_all(&release_dir).unwrap();
-        // A minimal but VALID project: `Config::load` requires the release
+        // A minimal but VALID project: `ProjectConfig::load` requires the release
         // directory to exist with at least one variant file. The variant
         // declares the three rendered slots (all members of `production`) and
-        // owns their retention policy (rotation lives in the variant file,
+        // owns their retention policy (retention lives in the variant file,
         // not on the target).
         std::fs::write(
             release_dir.join("standard.toml"),
@@ -785,12 +785,12 @@ from = "artifacts/build/output/"
 to = "app/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 1
 
 [activation]
@@ -835,7 +835,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         )
         .unwrap();
         let cfg_path = project.join("deploy.toml");
-        let config = Config::load(&cfg_path).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
 
         // Point the store at a hermetic `XDG_DATA_HOME` and seed the ONE
         // physical observed record per slot (`slots/<slot-id>/observed.json`)
@@ -847,7 +847,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let store = LocalStore::with_base(data_home.join("simple-deploy")).unwrap();
         store
             .write_slot_observed(
-                &PlacementSlotId::new("p1".to_string()),
+                &SlotId::new("p1".to_string()),
                 &ObservedSlot {
                     generation: Some(GenerationId::new("gen-41da".to_string())),
                     artifact: Some(crate::model::ArtifactRef {
@@ -861,7 +861,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap();
         store
             .write_slot_observed(
-                &PlacementSlotId::new("p2".to_string()),
+                &SlotId::new("p2".to_string()),
                 &ObservedSlot {
                     generation: None,
                     artifact: None,
@@ -871,7 +871,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .unwrap();
         store
             .write_slot_observed(
-                &PlacementSlotId::new("p3".to_string()),
+                &SlotId::new("p3".to_string()),
                 &ObservedSlot {
                     generation: Some(GenerationId::new("gen-9f00".to_string())),
                     artifact: None,

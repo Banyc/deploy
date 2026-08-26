@@ -16,7 +16,7 @@
 //! IDs (UUIDv7 in schema version 1). They identify events and are never used
 //! as content identity.
 //!
-//! Identity model: [`PlacementSlotId`] is the DEPLOYMENT-LOCATION identity —
+//! Identity model: [`SlotId`] is the DEPLOYMENT-LOCATION identity —
 //! the key of every slot→assignment relationship (plans, attempts, observed
 //! state, snapshots, commit markers). [`ServerId`] is the ACTUAL SERVER
 //! identity used for transport addressing (user@host lives on `ServerDef`).
@@ -24,7 +24,7 @@
 //! and a slot may be a member of several targets (each carrying its own
 //! `deploy_dir`). Today one target runs at most one slot per server, so the
 //! two ID spaces are interchangeable within a target, but the model keys
-//! assignments by [`PlacementSlotId`] and addresses transports by
+//! assignments by [`SlotId`] and addresses transports by
 //! [`ServerId`].
 
 use crate::config::{ActivationConfig, VerificationConfig};
@@ -35,8 +35,8 @@ use std::fmt;
 use uuid::Uuid;
 
 /// The configuration format version understood by this implementation
-/// (`Config.schema_version`, validated by the raw -> domain conversion in
-/// [`crate::config::Config::load`]). Every config writer emits exactly
+/// (`ProjectConfig.schema_version`, validated by the raw -> domain conversion in
+/// [`crate::config::ProjectConfig::load`]). Every config writer emits exactly
 /// `CONFIG_SCHEMA_VERSION`; the config reader refuses any other version
 /// (fail closed — a `deploy.toml` from a different schema is never
 /// silently interpreted). This is INDEPENDENT of [`LEDGER_SCHEMA_VERSION`]:
@@ -56,7 +56,7 @@ pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 /// configuration format, so bumping one never invalidates the other.
 ///
 /// The current format is version 2: deployment records use the canonical
-/// placement-slot-keyed shape (`BTreeMap<PlacementSlotId, _>` maps, nested
+/// placement-slot-keyed shape (`BTreeMap<SlotId, _>` maps, nested
 /// artifact/generation refs) and carry the exclusive owning target + the
 /// optional rollout group of the attempt. Version 1 records (the
 /// multi-target `targets` membership shape) are REJECTED on read — no
@@ -195,9 +195,8 @@ id_newtype!(DeploymentId);
 id_newtype!(GenerationId);
 id_newtype!(OperationId);
 id_newtype!(ServerId);
-id_newtype!(PlacementSlotId);
+id_newtype!(SlotId);
 id_newtype!(TargetName);
-id_newtype!(GroupName);
 id_newtype!(VariantName);
 id_newtype!(TreeDigest);
 
@@ -261,7 +260,7 @@ pub struct CanonicalBehavior {
 }
 
 /// One canonical slot declaration: the identity-bearing fields of a
-/// [`crate::config::SlotDef`], with `deploy_dir` reduced to a lexically
+/// [`crate::config::SlotConfig`], with `deploy_dir` reduced to a lexically
 /// normalized absolute path string, the ONE owning `target` kept verbatim,
 /// and `groups` SORTED and DEDUPLICATED (the canonical form — and therefore
 /// the release identity digest — must be order-independent). Server-level
@@ -386,7 +385,7 @@ pub struct ArtifactRef {
 /// [`GenerationRef`] assignments).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementSlotAssignment {
-    pub placement_slot: PlacementSlotId,
+    pub placement_slot: SlotId,
     pub artifact: ArtifactRef,
 }
 
@@ -422,14 +421,14 @@ pub struct GenerationRef {
 
 /// A slot-ID set (possibly EMPTY) — the INPUT form of a membership
 /// verification ([`MatchingMembership::verify`]). A plain set of
-/// [`PlacementSlotId`]s; emptiness is legal here (the non-empty requirement
+/// [`SlotId`]s; emptiness is legal here (the non-empty requirement
 /// applies to the PROOF result, never to the inputs being compared).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub(crate) struct SlotSet(BTreeSet<PlacementSlotId>);
+pub(crate) struct SlotSet(BTreeSet<SlotId>);
 
 impl SlotSet {
     /// Build a slot set from slot ids; duplicate ids collapse (a set).
-    pub(crate) fn new(ids: impl IntoIterator<Item = PlacementSlotId>) -> Self {
+    pub(crate) fn new(ids: impl IntoIterator<Item = SlotId>) -> Self {
         SlotSet(ids.into_iter().collect())
     }
 
@@ -443,7 +442,7 @@ impl SlotSet {
     }
 
     /// The distinct slot ids in sorted (deterministic) order.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &PlacementSlotId> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &SlotId> {
         self.0.iter()
     }
 }
@@ -457,13 +456,13 @@ impl SlotSet {
 /// records-shape work carries the companion [`NonEmptySlotTable`]-shaped
 /// (map-keyed) non-empty tables the records use.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct NonEmptySlotSet(BTreeSet<PlacementSlotId>);
+pub(crate) struct NonEmptySlotSet(BTreeSet<SlotId>);
 
 impl NonEmptySlotSet {
     /// Build from slot ids; `None` when the input is EMPTY (a non-empty set
     /// cannot be built from nothing). Duplicate ids are deduplicated (a set).
-    pub(crate) fn try_new(ids: impl IntoIterator<Item = PlacementSlotId>) -> Option<Self> {
-        let ids: BTreeSet<PlacementSlotId> = ids.into_iter().collect();
+    pub(crate) fn try_new(ids: impl IntoIterator<Item = SlotId>) -> Option<Self> {
+        let ids: BTreeSet<SlotId> = ids.into_iter().collect();
         (!ids.is_empty()).then_some(NonEmptySlotSet(ids))
     }
 
@@ -474,19 +473,19 @@ impl NonEmptySlotSet {
     }
 
     /// The distinct slot ids in sorted (deterministic) order.
-    pub fn iter(&self) -> impl Iterator<Item = &PlacementSlotId> {
+    pub fn iter(&self) -> impl Iterator<Item = &SlotId> {
         self.0.iter()
     }
 
     /// Whether the set contains the slot id.
     #[cfg(test)]
-    pub fn contains(&self, id: &PlacementSlotId) -> bool {
+    pub fn contains(&self, id: &SlotId) -> bool {
         self.0.contains(id)
     }
 
     /// The backing set as a read-only view (composes with the sibling
     /// records-shape non-empty tables, which carry the same slot keys).
-    pub fn as_set(&self) -> &BTreeSet<PlacementSlotId> {
+    pub fn as_set(&self) -> &BTreeSet<SlotId> {
         &self.0
     }
 }
@@ -562,7 +561,7 @@ impl<'de> Deserialize<'de> for MatchingMembership {
     where
         D: serde::Deserializer<'de>,
     {
-        let ids: BTreeSet<PlacementSlotId> = Deserialize::deserialize(deserializer)?;
+        let ids: BTreeSet<SlotId> = Deserialize::deserialize(deserializer)?;
         let slots = NonEmptySlotSet::try_new(ids).ok_or_else(|| {
             serde::de::Error::custom("a membership proof must carry a non-empty slot set")
         })?;

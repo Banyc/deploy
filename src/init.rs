@@ -11,18 +11,18 @@
 //! directory.
 //!
 //! The scaffolded files are TYPED TOML, not formatting strings: every file is
-//! built from the same config structs `Config::load` parses into
-//! (`ServerDef`, `SlotDef`, `TargetDef`, `VariantConfig`, ...) and serialized
+//! built from the same config structs `ProjectConfig::load` parses into
+//! (`ServerDef`, `SlotConfig`, `TargetConfig`, `VariantConfig`, ...) and serialized
 //! with `toml::to_string_pretty`, so the emitted keys match the parser's
 //! expectations exactly (`deny_unknown_fields` and all). Init validates the
 //! options and the typed payload BEFORE anything is created, and re-loads the
-//! written project through `Config::load` BEFORE reporting success — a failed
+//! written project through `ProjectConfig::load` BEFORE reporting success — a failed
 //! init removes everything it created, so success always means the generated
 //! project is valid.
 
 use crate::config::{
-    ActivationConfig, ActivationScope, ArtifactConfig, ConflictPolicy, DeploymentRotation,
-    FailurePolicy, Mapping, PerServerRotation, RotationConfig, SlotDef, UnitDef,
+    ActivationConfig, ActivationScope, ArtifactConfig, ConflictPolicy, DeploymentRetention,
+    FailurePolicy, Mapping, PerServerRetention, RetentionConfig, SlotConfig, UnitDef,
     VerificationConfig,
 };
 use crate::error::{Error, Result};
@@ -86,9 +86,9 @@ pub struct InitReport {
 ///    absolute, a fingerprint must be `SHA256:...`, and a `local://` address
 ///    must name an absolute path (it doubles as the slot's `deploy_dir`).
 /// 2. The typed scaffold is assembled and serialized; the emitted TOML must
-///    round-trip through the strict parsers `Config::load` uses.
+///    round-trip through the strict parsers `ProjectConfig::load` uses.
 /// 3. After every file is written, the project is RE-LOADED through
-///    `Config::load` (parse + validate + variant discovery). On failure the
+///    `ProjectConfig::load` (parse + validate + variant discovery). On failure the
 ///    just-created tree is removed (best effort) and the load error returned,
 ///    so a failed init never leaves a half-written project.
 ///
@@ -180,11 +180,11 @@ pub fn init_project(target: &Path, opts: &InitOptions) -> Result<InitReport> {
 
 /// Reject option combinations the loader would reject, BEFORE any directory
 /// or file is created. This mirrors the rules the config conversion
-/// (`Config::load`) applies to
+/// (`ProjectConfig::load`) applies to
 /// the surfaces the flags expose (SSH identity, `known_hosts`, fingerprint,
 /// `local://` endpoint). The fixed template parts (capacity 0/0, rollout,
 /// variant sanity) are covered by the typed round-trip in [`build_docs`] and,
-/// authoritatively, by the post-write `Config::load`.
+/// authoritatively, by the post-write `ProjectConfig::load`.
 fn validate_init_options(opts: &InitOptions) -> Result<()> {
     let has_known_hosts = opts.known_hosts.is_some();
     let has_fingerprint = opts.host_key_fingerprint.is_some();
@@ -243,7 +243,7 @@ struct ScaffoldDocs {
 /// The serialized shape of the scaffolded `deploy.toml`. It mirrors the raw
 /// serializable surface of `config::raw::RawConfig` (schema_version,
 /// application, release, servers, targets; `pins` and the variant map are
-/// load-time only) so the emitted TOML round-trips through `Config::load` —
+/// load-time only) so the emitted TOML round-trips through `ProjectConfig::load` —
 /// which is exactly how the written project is re-validated in
 /// [`write_and_verify`]. Slots are NOT a top-level surface anymore: they live
 /// inside the variant files (see [`standard_variant`]). Building it from the
@@ -255,13 +255,13 @@ struct ScaffoldManifest {
     application: String,
     release: String,
     servers: Vec<crate::config::raw::RawServer>,
-    targets: BTreeMap<String, crate::config::raw::RawTargetDef>,
+    targets: BTreeMap<String, crate::config::raw::RawTargetConfig>,
 }
 
 /// Build the typed scaffold documents and serialize them with
 /// `toml::to_string_pretty`. The serialized payloads are then re-parsed with
-/// the exact strict schemas `Config::load` uses (`deny_unknown_fields`,
-/// snake_case enums, typed ports/rollout/rotation) as a round-trip backstop:
+/// the exact strict schemas `ProjectConfig::load` uses (`deny_unknown_fields`,
+/// snake_case enums, typed ports/rollout/retention) as a round-trip backstop:
 /// the emitted TOML must parse back before anything is written.
 fn build_docs(
     name: &str,
@@ -292,7 +292,7 @@ fn build_docs(
             // Targets own ROLLOUT behavior only; retention is slot-owned
             // (it lives in the slot's OWNING VARIANT file, see
             // [`standard_variant`]).
-            crate::config::raw::RawTargetDef {
+            crate::config::raw::RawTargetConfig {
                 rollout: crate::config::raw::RawRolloutConfig {
                     batch_size: 1,
                     stop_on_failure: true,
@@ -375,7 +375,7 @@ fn standard_variant(deploy_dir: &Path) -> crate::config::raw::RawVariant {
             units: Vec::new(),
         },
         verification: command_verification(),
-        slots: vec![SlotDef {
+        slots: vec![SlotConfig {
             id: "app-1".to_string(),
             server: "server-01".to_string(),
             deploy_dir: deploy_dir.to_path_buf(),
@@ -385,13 +385,13 @@ fn standard_variant(deploy_dir: &Path) -> crate::config::raw::RawVariant {
         // The slot's ONE retention policy: the standard variant file owns the
         // policy of the slot it declares (app-1). A slot's owning variant is
         // its single retention source — never a per-target policy.
-        rotation: RotationConfig {
-            per_server: PerServerRotation {
+        retention: RetentionConfig {
+            per_server: PerServerRetention {
                 keep_distinct_artifacts: 5,
                 keep_days: 14,
                 protect_previous: true,
             },
-            deployment: DeploymentRotation {
+            deployment: DeploymentRetention {
                 protect_deployments: 2,
             },
         },
@@ -428,7 +428,7 @@ fn systemd_variant() -> crate::config::raw::RawVariant {
         slots: Vec::new(),
         // The systemd example declares no slots, so no slot owns it as a
         // retention source; its (unused) policy is the default.
-        rotation: RotationConfig::default(),
+        retention: RetentionConfig::default(),
     }
 }
 
@@ -457,7 +457,7 @@ fn command_verification() -> VerificationConfig {
 }
 
 /// Educational doc header prepended to the serialized `deploy.toml` as TOML
-/// comments (comments are legal TOML and ignored by `Config::load`; typed
+/// comments (comments are legal TOML and ignored by `ProjectConfig::load`; typed
 /// serialization itself cannot emit them).
 const MANIFEST_DOC: &str = "\
 # deploy.toml — generated by `deploy init`. Schema version 1.
@@ -579,7 +579,7 @@ struct CreatedTree {
 }
 
 /// Write every scaffolded file, then require the generated project to load
-/// through [`Config::load`] (re-parse + re-validate + variant discovery). On a
+/// through [`ProjectConfig::load`] (re-parse + re-validate + variant discovery). On a
 /// load failure the just-created tree is removed (best effort — restore
 /// owner-write, then remove, mirroring the engine's cleanup convention) and
 /// the load error is returned: a failed init never leaves a half-written
@@ -604,7 +604,7 @@ fn write_and_verify(
     for (rel, content) in writes {
         write_project_file(target, rel, content, &mut created)?;
     }
-    if let Err(e) = crate::config::Config::load(&target.join("deploy.toml")) {
+    if let Err(e) = crate::config::ProjectConfig::load(&target.join("deploy.toml")) {
         cleanup_created(target, &created);
         return Err(e);
     }
@@ -746,7 +746,8 @@ mod tests {
         // The scaffolded config must pass full validation (strict rules:
         // absolute deploy_dir, unique server ids, known variant, non-empty
         // target, verified variant file).
-        let config = crate::config::Config::load(&report.target.join("deploy.toml")).unwrap();
+        let config =
+            crate::config::ProjectConfig::load(&report.target.join("deploy.toml")).unwrap();
         assert_eq!(config.application.as_str(), "my-app");
         assert_eq!(config.release().as_str(), "v1");
         assert_eq!(config.target_slot_ids("production").unwrap(), vec!["app-1"]);
@@ -826,7 +827,8 @@ mod tests {
             ..Default::default()
         };
         let report = init_project(&proj, &fp_opts).unwrap();
-        let config = crate::config::Config::load(&report.target.join("deploy.toml")).unwrap();
+        let config =
+            crate::config::ProjectConfig::load(&report.target.join("deploy.toml")).unwrap();
         assert_eq!(
             config.servers[0].host_key_fingerprint.as_deref(),
             Some("SHA256:abc")
@@ -851,7 +853,8 @@ mod tests {
             host_key_fingerprint: None,
         };
         let report = init_project(&proj, &opts).unwrap();
-        let config = crate::config::Config::load(&report.target.join("deploy.toml")).unwrap();
+        let config =
+            crate::config::ProjectConfig::load(&report.target.join("deploy.toml")).unwrap();
         assert_eq!(config.application.as_str(), "prod");
         let s = &config.servers[0];
         assert_eq!(s.address, "app.example.com");
@@ -932,13 +935,14 @@ mod tests {
 
     // The scaffold is TYPED TOML: serializing the loaded config (and each
     // variant) again with toml::to_string_pretty must yield a project that
-    // still loads through the strict Config::load with identical semantics.
+    // still loads through the strict ProjectConfig::load with identical semantics.
     #[test]
     fn scaffold_is_typed_toml_and_serializes_to_the_same_config() {
         let tmp = tempfile::tempdir().unwrap();
         let proj = tmp.path().join("typed-app");
         let report = init_project(&proj, &opts()).unwrap();
-        let config = crate::config::Config::load(&report.target.join("deploy.toml")).unwrap();
+        let config =
+            crate::config::ProjectConfig::load(&report.target.join("deploy.toml")).unwrap();
 
         // Re-serialize every typed payload into a fresh project and load it.
         // The raw layer is the serializable surface (the domain model is
@@ -972,7 +976,7 @@ mod tests {
             )
             .unwrap();
         }
-        let reloaded = crate::config::Config::load(&reserialized.join("deploy.toml"))
+        let reloaded = crate::config::ProjectConfig::load(&reserialized.join("deploy.toml"))
             .expect("re-serialized typed payload must load");
 
         // The re-serialized project carries the same semantics as the
@@ -1006,7 +1010,7 @@ mod tests {
         );
     }
 
-    // A post-write Config::load failure removes the just-created tree: the
+    // A post-write ProjectConfig::load failure removes the just-created tree: the
     // factored write+verify helper gets an injected bad config that parses
     // options but fails the loader, and asserts nothing is left behind.
     #[test]
@@ -1015,7 +1019,7 @@ mod tests {
         let proj = tmp.path().join("bad-load");
 
         // The writes look scaffold-shaped but the deploy.toml is malformed
-        // TOML, so the post-write Config::load must fail and the helper must
+        // TOML, so the post-write ProjectConfig::load must fail and the helper must
         // remove every file and directory it created.
         let writes = vec![
             (
@@ -1064,7 +1068,8 @@ mod tests {
             ..Default::default()
         };
         let report = init_project(&proj, &opts).unwrap();
-        let config = crate::config::Config::load(&report.target.join("deploy.toml")).unwrap();
+        let config =
+            crate::config::ProjectConfig::load(&report.target.join("deploy.toml")).unwrap();
         assert_eq!(config.servers[0].user, "ops");
         assert_eq!(
             config.servers[0].known_hosts.as_deref(),

@@ -77,7 +77,7 @@
 //! `--dry-run` preview takes NO locks, writes NOTHING, and enumerates
 //! exactly what the replacement + sweep would discard.
 
-use crate::config::Config;
+use crate::config::ProjectConfig;
 use crate::error::Result;
 use crate::model::{DeploymentId, OperationId};
 use crate::push::lock::FileLock;
@@ -134,7 +134,7 @@ pub struct CheckpointReport {
 /// commit), then the global unreachable-content sweep runs best-effort.
 pub fn run_checkpoint(
     store: &LocalStore,
-    config: &Config,
+    config: &ProjectConfig,
     target: &str,
     deployment_id: &DeploymentId,
     dry_run: bool,
@@ -174,7 +174,7 @@ pub fn run_checkpoint(
 #[cfg(test)]
 pub(crate) fn run_checkpoint_unlocked(
     store: &LocalStore,
-    config: &Config,
+    config: &ProjectConfig,
     target: &str,
     deployment_id: &DeploymentId,
 ) -> Result<CheckpointReport> {
@@ -202,7 +202,7 @@ pub(crate) fn run_checkpoint_unlocked(
 /// (nothing was committed).
 fn checkpoint_inner(
     store: &LocalStore,
-    config: &Config,
+    config: &ProjectConfig,
     target: &str,
     deployment_id: &DeploymentId,
 ) -> Result<CheckpointReport> {
@@ -314,7 +314,7 @@ fn checkpoint_inner(
 /// artifacts that become unreachable only when the ledger is shortened).
 fn preview_checkpoint(
     store: &LocalStore,
-    config: &Config,
+    config: &ProjectConfig,
     target: &str,
     deployment_id: &DeploymentId,
 ) -> Result<CheckpointReport> {
@@ -449,8 +449,8 @@ mod tests {
     use super::*;
 
     use crate::model::{
-        ArtifactRef, DeploymentId, GenerationId, GenerationRef, PlacementSlotAssignment,
-        PlacementSlotId, ReleaseId, ServerId, TargetName, TreeDigest, VariantName,
+        ArtifactRef, DeploymentId, GenerationId, GenerationRef, PlacementSlotAssignment, ReleaseId,
+        ServerId, SlotId, TargetName, TreeDigest, VariantName,
     };
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
@@ -463,7 +463,7 @@ mod tests {
     const TARGET: &str = "t1";
 
     fn intent(id: &str, target: &str) -> DeploymentIntent {
-        let p1 = PlacementSlotId::new("p1".to_string());
+        let p1 = SlotId::new("p1".to_string());
         // ONE slot table (the membership + desired/pre-push entries).
         let slots = BTreeMap::from([(
             p1.clone(),
@@ -493,11 +493,11 @@ mod tests {
     fn rollback_for(release: &str) -> LedgerRollback {
         LedgerRollback {
             slots: BTreeMap::from([(
-                PlacementSlotId::new("p1".to_string()),
+                SlotId::new("p1".to_string()),
                 GenerationRef {
                     generation: crate::model::GenerationId::new("gen-1".to_string()),
                     assignment: PlacementSlotAssignment {
-                        placement_slot: PlacementSlotId::new("p1".to_string()),
+                        placement_slot: SlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
                             release: ReleaseId::new(release.to_string()),
                             variant: VariantName::new("standard".to_string()),
@@ -507,7 +507,7 @@ mod tests {
                 },
             )]),
             bindings: BTreeMap::from([(
-                PlacementSlotId::new("p1".to_string()),
+                SlotId::new("p1".to_string()),
                 crate::records::PhysicalBinding {
                     server: ServerId::new("s1".to_string()),
                     deploy_dir: "/srv/deploy/p1".to_string(),
@@ -590,7 +590,7 @@ attempts = 1
 interval_seconds = 0
 "#;
 
-    fn config_for(dir: &tempfile::TempDir) -> Config {
+    fn config_for(dir: &tempfile::TempDir) -> ProjectConfig {
         let project = dir.path().join("proj");
         std::fs::create_dir_all(project.join("releases").join("v1")).unwrap();
         std::fs::write(
@@ -607,7 +607,7 @@ interval_seconds = 0
             ),
         )
         .unwrap();
-        Config::load(&project.join("deploy.toml")).unwrap()
+        ProjectConfig::load(&project.join("deploy.toml")).unwrap()
     }
 
     /// Seed an UNREACHABLE deployment dir + release record + object dir (not
@@ -638,7 +638,7 @@ interval_seconds = 0
             )]),
             &BTreeMap::from([(
                 "standard".to_string(),
-                vec![crate::config::SlotDef {
+                vec![crate::config::SlotConfig {
                     id: "p1".to_string(),
                     server: "s1".to_string(),
                     deploy_dir: std::path::PathBuf::from("/srv/deploy/p1"),
@@ -670,7 +670,7 @@ interval_seconds = 0
             )]),
             &std::collections::BTreeMap::from([(
                 "standard".to_string(),
-                vec![crate::config::SlotDef {
+                vec![crate::config::SlotConfig {
                     id: "p1".to_string(),
                     server: "s1".to_string(),
                     deploy_dir: std::path::PathBuf::from("/srv/deploy/p1"),
@@ -904,7 +904,7 @@ interval_seconds = 0
             ),
         )
         .unwrap();
-        let cfg = Config::load(&project.join("deploy.toml")).unwrap();
+        let cfg = ProjectConfig::load(&project.join("deploy.toml")).unwrap();
 
         // t1's ledger references rel-sha256-a; t2's ledger references
         // rel-sha256-other (reachable from ANOTHER target's ledger).
@@ -1033,7 +1033,7 @@ interval_seconds = 0
             ),
         )
         .unwrap();
-        let cfg = Config::load(&project.join("deploy.toml")).unwrap();
+        let cfg = ProjectConfig::load(&project.join("deploy.toml")).unwrap();
         // History: successful deployments deploy-0..deploy-5; checkpoint at
         // index `at`. Unreachable ghost content to sweep.
         let ids = seed_history(&store, TARGET, "deploy", &[true; 6]);
@@ -1299,11 +1299,11 @@ interval_seconds = 0
     ];
     const PROPERTY_TREES: [&str; 4] = ["tree-p0", "tree-p1", "tree-p2", "tree-p3"];
 
-    /// Config for the parity property: TWO targets (t1 + t2), each with its
+    /// ProjectConfig for the parity property: TWO targets (t1 + t2), each with its
     /// own slot (the loader requires every declared target to have at least
     /// one member slot). No config `[[pins]]` — the property pins via the
     /// store-level `pins.json` surface instead.
-    fn config_for_property(dir: &tempfile::TempDir) -> Config {
+    fn config_for_property(dir: &tempfile::TempDir) -> ProjectConfig {
         let project = dir.path().join("proj");
         std::fs::create_dir_all(project.join("releases").join("v1")).unwrap();
         std::fs::write(
@@ -1358,7 +1358,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 "#,
         )
         .unwrap();
-        Config::load(&project.join("deploy.toml")).unwrap()
+        ProjectConfig::load(&project.join("deploy.toml")).unwrap()
     }
 
     /// Run ONE parity case: seed two targets' histories (t1's entry 0 always
@@ -1407,7 +1407,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let obs_rel = seed_named_release(&store, "obs");
         store
             .write_slot_observed(
-                &PlacementSlotId::new("s-obs".to_string()),
+                &SlotId::new("s-obs".to_string()),
                 &ObservedSlot {
                     generation: None,
                     artifact: Some(ArtifactRef {

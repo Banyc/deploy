@@ -6,7 +6,7 @@
 //! [`crate::model::PlacementSlotAssignment`], [`crate::model::GenerationRef`])
 //! rather than re-declared per record. Every slot→assignment map (ledger
 //! intent `desired` / `pre_push`, terminal `outcomes`, the rollback payload)
-//! is keyed by [`crate::model::PlacementSlotId`] — the deployment-location
+//! is keyed by [`crate::model::SlotId`] — the deployment-location
 //! identity — while [`crate::model::ServerId`] remains the actual-server
 //! identity used for transport addressing (`ServerState`, config `ServerDef`).
 //!
@@ -92,7 +92,7 @@
 use crate::error::{Error, Result};
 use crate::model::{
     ArtifactRef, BehaviorContract, DeploymentId, GenerationId, GenerationRef, MatchingMembership,
-    PlacementSlotAssignment, PlacementSlotId, ReleaseId, ServerId, TargetName, TreeDigest,
+    PlacementSlotAssignment, ReleaseId, ServerId, SlotId, TargetName, TreeDigest,
 };
 use crate::scalar::{BehaviorDigest, GroupName, Timestamp};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -114,7 +114,7 @@ use std::ops::Deref;
 // exactly as before.
 
 /// A possibly-empty ordered slot→value table keyed by
-/// [`PlacementSlotId`] — the domain's keyed-by-slot collection type
+/// [`SlotId`] — the domain's keyed-by-slot collection type
 /// (the possibly-empty variant of [`NonEmptySlotTable`], used for the
 /// terminal's per-slot OUTCOMES, which are legitimately empty for a
 /// pre-mutation failure). Uniqueness is structural (`BTreeMap` keys); the
@@ -122,18 +122,18 @@ use std::ops::Deref;
 /// indexing / iteration / `get` work transparently.
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct SlotTable<T>(BTreeMap<PlacementSlotId, T>);
+pub struct SlotTable<T>(BTreeMap<SlotId, T>);
 
 impl<T> SlotTable<T> {
     pub fn new() -> Self {
         Self(BTreeMap::new())
     }
 
-    pub fn from_map(map: BTreeMap<PlacementSlotId, T>) -> Self {
+    pub fn from_map(map: BTreeMap<SlotId, T>) -> Self {
         Self(map)
     }
 
-    pub fn into_map(self) -> BTreeMap<PlacementSlotId, T> {
+    pub fn into_map(self) -> BTreeMap<SlotId, T> {
         self.0
     }
 
@@ -147,13 +147,13 @@ impl<T> SlotTable<T> {
 }
 
 impl<T> Deref for SlotTable<T> {
-    type Target = BTreeMap<PlacementSlotId, T>;
+    type Target = BTreeMap<SlotId, T>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-/// A NON-EMPTY ordered slot→value table keyed by [`PlacementSlotId`] — the
+/// A NON-EMPTY ordered slot→value table keyed by [`SlotId`] — the
 /// domain's authoritative membership-bearing collection type (the
 /// non-empty variant of [`SlotTable`], used for the deployment intent's
 /// slots and the degraded disposition's remaining changes). The domain
@@ -164,14 +164,14 @@ impl<T> Deref for SlotTable<T> {
 /// state exists in the domain: a member slot always carries its desired +
 /// pre-push entry, and no entry exists for a non-member.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NonEmptySlotTable<T>(BTreeMap<PlacementSlotId, T>);
+pub struct NonEmptySlotTable<T>(BTreeMap<SlotId, T>);
 
 impl<T> NonEmptySlotTable<T> {
     /// The VERIFIED constructor: refuse the empty map (fail closed — the
     /// domain cannot represent an empty deployment membership or an empty
     /// remaining-changes set). Uniqueness needs no check (`BTreeMap` keys
     /// are unique by construction).
-    pub fn build(map: BTreeMap<PlacementSlotId, T>) -> Result<Self> {
+    pub fn build(map: BTreeMap<SlotId, T>) -> Result<Self> {
         if map.is_empty() {
             return Err(Error::integrity(
                 "a non-empty slot table cannot be empty — the domain refuses an empty deployment membership / remaining-changes set",
@@ -180,7 +180,7 @@ impl<T> NonEmptySlotTable<T> {
         Ok(Self(map))
     }
 
-    pub fn get(&self, key: &PlacementSlotId) -> Option<&T> {
+    pub fn get(&self, key: &SlotId) -> Option<&T> {
         self.0.get(key)
     }
 
@@ -192,11 +192,11 @@ impl<T> NonEmptySlotTable<T> {
         false
     }
 
-    pub fn keys(&self) -> impl Iterator<Item = &PlacementSlotId> {
+    pub fn keys(&self) -> impl Iterator<Item = &SlotId> {
         self.0.keys()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&PlacementSlotId, &T)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&SlotId, &T)> {
         self.0.iter()
     }
 
@@ -204,13 +204,13 @@ impl<T> NonEmptySlotTable<T> {
         self.0.values()
     }
 
-    pub fn into_map(self) -> BTreeMap<PlacementSlotId, T> {
+    pub fn into_map(self) -> BTreeMap<SlotId, T> {
         self.0
     }
 }
 
 impl<T> Deref for NonEmptySlotTable<T> {
-    type Target = BTreeMap<PlacementSlotId, T>;
+    type Target = BTreeMap<SlotId, T>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -245,15 +245,15 @@ impl DeploymentStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ServerOutcomeKind {
+pub enum SlotOutcomeKind {
     Activated,
     Failed,
     /// Reserved: never emitted today. In-process compensation (a post-swap
     /// activation/verification failure restored by the per-server pipeline,
-    /// step 11) is recorded as [`ServerOutcomeKind::Failed`] with
+    /// step 11) is recorded as [`SlotOutcomeKind::Failed`] with
     /// `SlotResult.compensated = true` — "record both the failure and the
     /// compensation result" — and failure-policy compensation (step 13)
-    /// upgrades the slot to [`ServerOutcomeKind::Restored`].
+    /// upgrades the slot to [`SlotOutcomeKind::Restored`].
     Compensated,
     Skipped,
     Restored,
@@ -299,24 +299,24 @@ pub struct LedgerIntentWire {
     /// `desired` / `pre_push` maps' key sets must EQUAL it EXACTLY (every
     /// member slot has exactly one desired + one pre_push entry), verified by
     /// the wire → domain conversion.
-    pub slot_ids: Vec<PlacementSlotId>,
+    pub slot_ids: Vec<SlotId>,
     pub behavior_sha256: String,
     pub attempted_at: String,
     /// Desired per-slot assignments (what the plan intended): each slot's
     /// minted generation for its planned artifact. The key set must equal
     /// `slot_ids` EXACTLY, and each `GenerationRef`'s assignment must name
     /// its own map key.
-    pub desired: BTreeMap<PlacementSlotId, GenerationRef>,
+    pub desired: BTreeMap<SlotId, GenerationRef>,
     /// Pre-push per-slot state before mutation (`None` if first deployment).
     /// The key set must equal `slot_ids` EXACTLY.
-    pub pre_push: BTreeMap<PlacementSlotId, Option<SlotAttemptState>>,
+    pub pre_push: BTreeMap<SlotId, Option<SlotAttemptState>>,
     /// Actual per-slot result after the attempt. The persisted ledger intent
     /// keeps this map EMPTY (outcomes are recorded in the terminal event's
     /// `outcomes` map); the in-memory REPORT ([`LedgerIntentReport`]) carries
     /// the observed actuals for display — the verified domain [`DeploymentIntent`]
     /// does NOT carry this map, so it is not part of the intent's key-set
     /// invariant. Every key must be a member of `slot_ids`.
-    pub slots: BTreeMap<PlacementSlotId, SlotAttemptState>,
+    pub slots: BTreeMap<SlotId, SlotAttemptState>,
 }
 
 impl LedgerIntentWire {
@@ -368,7 +368,7 @@ impl LedgerIntentWire {
         // DUPLICATE-FREE: a duplicated member would silently weaken the
         // key-set equality below (a set collapses the duplicate, so the
         // duplicated id would never be checked against the maps).
-        let mut seen: BTreeSet<&PlacementSlotId> = BTreeSet::new();
+        let mut seen: BTreeSet<&SlotId> = BTreeSet::new();
         for sid in &self.slot_ids {
             if !seen.insert(sid) {
                 return Err(Error::integrity(format!(
@@ -377,9 +377,9 @@ impl LedgerIntentWire {
                 )));
             }
         }
-        let membership: BTreeSet<&PlacementSlotId> = self.slot_ids.iter().collect();
-        let desired_keys: BTreeSet<&PlacementSlotId> = self.desired.keys().collect();
-        let pre_push_keys: BTreeSet<&PlacementSlotId> = self.pre_push.keys().collect();
+        let membership: BTreeSet<&SlotId> = self.slot_ids.iter().collect();
+        let desired_keys: BTreeSet<&SlotId> = self.desired.keys().collect();
+        let pre_push_keys: BTreeSet<&SlotId> = self.pre_push.keys().collect();
         // EXACT KEY-SET EQUALITY: every member slot has exactly one desired +
         // one pre_push entry, and neither map carries a slot the membership
         // omits — a missing OR extra key fails the conversion (an incomplete
@@ -433,7 +433,7 @@ impl LedgerIntentWire {
         // key owns the slot identity, so the domain stores each fact exactly
         // once (`DesiredGeneration` carries no redundant slot id, and
         // `PreviousGeneration` has no map-key claim of its own).
-        let mut slots: BTreeMap<PlacementSlotId, IntentSlot> = BTreeMap::new();
+        let mut slots: BTreeMap<SlotId, IntentSlot> = BTreeMap::new();
         for (key, desired) in &self.desired {
             let pre_push =
                 self.pre_push
@@ -550,7 +550,7 @@ pub struct DeploymentIntent {
 impl DeploymentIntent {
     /// The deployment's membership: the AUTHORITATIVE selected placement
     /// slots (in deployment order — the table's key order).
-    pub fn membership(&self) -> Vec<PlacementSlotId> {
+    pub fn membership(&self) -> Vec<SlotId> {
         self.slots.keys().cloned().collect()
     }
 
@@ -570,8 +570,8 @@ impl From<&DeploymentIntent> for LedgerIntentWire {
         // Re-expand the ONE table into the wire's split shape (slot_ids +
         // desired + pre_push) for serialization; the reader re-collapses it.
         // The member order is the table's key order (deployment order).
-        let slot_ids: Vec<PlacementSlotId> = i.slots.keys().cloned().collect();
-        let desired: BTreeMap<PlacementSlotId, GenerationRef> = i
+        let slot_ids: Vec<SlotId> = i.slots.keys().cloned().collect();
+        let desired: BTreeMap<SlotId, GenerationRef> = i
             .slots
             .iter()
             .map(|(key, s)| {
@@ -587,7 +587,7 @@ impl From<&DeploymentIntent> for LedgerIntentWire {
                 )
             })
             .collect();
-        let pre_push: BTreeMap<PlacementSlotId, Option<SlotAttemptState>> = i
+        let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> = i
             .slots
             .iter()
             .map(|(key, s)| {
@@ -635,7 +635,7 @@ pub struct LedgerIntentReport {
     /// The optional rollout group this attempt selected, as a validated
     /// [`GroupName`] (parsed from the verified intent's group string).
     pub group: Option<GroupName>,
-    pub slot_ids: Vec<PlacementSlotId>,
+    pub slot_ids: Vec<SlotId>,
     /// The attempt's behavior digest, as a validated [`BehaviorDigest`]
     /// (parsed from the wire's `behavior_sha256` string).
     pub behavior_sha256: BehaviorDigest,
@@ -643,11 +643,11 @@ pub struct LedgerIntentReport {
     pub attempted_at: Timestamp,
     /// Desired per-slot assignments, re-expanded from the domain table (the
     /// report is display-facing and keeps the wire's split shape).
-    pub desired: BTreeMap<PlacementSlotId, GenerationRef>,
-    pub pre_push: BTreeMap<PlacementSlotId, Option<SlotAttemptState>>,
+    pub desired: BTreeMap<SlotId, GenerationRef>,
+    pub pre_push: BTreeMap<SlotId, Option<SlotAttemptState>>,
     /// Actual per-slot result after the attempt, for display. The report is
     /// in-memory only — the persisted intent never carries this map.
-    pub slots: BTreeMap<PlacementSlotId, SlotAttemptState>,
+    pub slots: BTreeMap<SlotId, SlotAttemptState>,
 }
 
 impl LedgerIntentReport {
@@ -669,8 +669,8 @@ impl LedgerIntentReport {
             None => None,
         };
         // Re-expand the ONE table into the display-facing split maps.
-        let slot_ids: Vec<PlacementSlotId> = i.slots.keys().cloned().collect();
-        let desired: BTreeMap<PlacementSlotId, GenerationRef> = i
+        let slot_ids: Vec<SlotId> = i.slots.keys().cloned().collect();
+        let desired: BTreeMap<SlotId, GenerationRef> = i
             .slots
             .iter()
             .map(|(key, s)| {
@@ -686,7 +686,7 @@ impl LedgerIntentReport {
                 )
             })
             .collect();
-        let pre_push: BTreeMap<PlacementSlotId, Option<SlotAttemptState>> = i
+        let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> = i
             .slots
             .iter()
             .map(|(key, s)| {
@@ -800,17 +800,17 @@ pub struct PhysicalBinding {
 /// conversion then refuses any payload whose slots are non-empty).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerRollback {
-    /// Per-slot generation refs, keyed by [`PlacementSlotId`]. Each
+    /// Per-slot generation refs, keyed by [`SlotId`]. Each
     /// generation ref's assignment carries the slot's OWN artifact binding
     /// (`release`, `variant`, `tree`); the referenced releases are the set
     /// derived from these bindings ([`LedgerRollback::releases`]).
-    pub slots: BTreeMap<PlacementSlotId, GenerationRef>,
+    pub slots: BTreeMap<SlotId, GenerationRef>,
     /// The complete physical binding (`{server, deploy_dir}`) each slot had
-    /// at deployment time, keyed by [`PlacementSlotId`]. Every binding key
+    /// at deployment time, keyed by [`SlotId`]. Every binding key
     /// must be a slotted generation (verified by the wire → domain
     /// conversion).
     #[serde(default)]
-    pub bindings: BTreeMap<PlacementSlotId, PhysicalBinding>,
+    pub bindings: BTreeMap<SlotId, PhysicalBinding>,
 }
 
 impl LedgerRollback {
@@ -831,9 +831,9 @@ impl LedgerRollback {
 /// so pre-refactor ledger lines still deserialize; writers never emit them).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerRollbackWire {
-    pub slots: BTreeMap<PlacementSlotId, GenerationRef>,
+    pub slots: BTreeMap<SlotId, GenerationRef>,
     #[serde(default)]
-    pub bindings: BTreeMap<PlacementSlotId, PhysicalBinding>,
+    pub bindings: BTreeMap<SlotId, PhysicalBinding>,
     /// Legacy snapshot-wide behavior digest. NOT derivable from the per-slot
     /// payload (behavior contracts are not stored) — carried only for wire
     /// parseability, never interpreted (per-slot behavior resolution governs).
@@ -871,13 +871,11 @@ impl LedgerRollbackWire {
         // REFUSED here, at conversion time, before rollback resolution can
         // consume the payload (a hand-constructed or tampered record can
         // never be read as whichever projection a consumer happens to use).
-        let slot_keys: BTreeSet<&PlacementSlotId> = self.slots.keys().collect();
-        let binding_keys: BTreeSet<&PlacementSlotId> = self.bindings.keys().collect();
+        let slot_keys: BTreeSet<&SlotId> = self.slots.keys().collect();
+        let binding_keys: BTreeSet<&SlotId> = self.bindings.keys().collect();
         if slot_keys != binding_keys {
-            let missing: Vec<&PlacementSlotId> =
-                slot_keys.difference(&binding_keys).copied().collect();
-            let extra: Vec<&PlacementSlotId> =
-                binding_keys.difference(&slot_keys).copied().collect();
+            let missing: Vec<&SlotId> = slot_keys.difference(&binding_keys).copied().collect();
+            let extra: Vec<&SlotId> = binding_keys.difference(&slot_keys).copied().collect();
             return Err(Error::integrity(format!(
                 "rollback: bindings must key EXACTLY the slotted generations (missing bindings for {missing:?}; extra bindings for {extra:?})"
             )));
@@ -1081,10 +1079,10 @@ impl LedgerTerminal {
         if !matches!(self.disposition, TerminalDisposition::Degraded) {
             return None;
         }
-        let remaining: BTreeMap<PlacementSlotId, GenerationId> = self
+        let remaining: BTreeMap<SlotId, GenerationId> = self
             .outcomes
             .iter()
-            .filter(|(_, r)| r.outcome != ServerOutcomeKind::Restored && r.generation.is_some())
+            .filter(|(_, r)| r.outcome != SlotOutcomeKind::Restored && r.generation.is_some())
             .map(|(k, r)| {
                 (
                     k.clone(),
@@ -1128,7 +1126,7 @@ pub struct LedgerTerminalWire {
     pub target: TargetName,
     pub status: DeploymentStatus,
     pub recorded_at: String,
-    pub outcomes: BTreeMap<PlacementSlotId, SlotResult>,
+    pub outcomes: BTreeMap<SlotId, SlotResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback: Option<LedgerRollbackWire>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1202,7 +1200,7 @@ impl LedgerTerminalWire {
                 // implied state vs the recorded outcome).
                 if let Some(r) = outcomes
                     .values()
-                    .find(|r| r.outcome != ServerOutcomeKind::Activated)
+                    .find(|r| r.outcome != SlotOutcomeKind::Activated)
                 {
                     return Err(Error::integrity(format!(
                         "terminal {}: status Successful requires every outcome Activated — slot '{}' records {:?}",
@@ -1255,10 +1253,10 @@ impl LedgerTerminalWire {
                 // every slot restored — or with no recorded outcome — has no
                 // remaining change and is refused: a status whose payload
                 // does not match its disposition).
-                let remaining: BTreeMap<PlacementSlotId, GenerationId> = outcomes
+                let remaining: BTreeMap<SlotId, GenerationId> = outcomes
                     .iter()
                     .filter(|(_, r)| {
-                        r.outcome != ServerOutcomeKind::Restored && r.generation.is_some()
+                        r.outcome != SlotOutcomeKind::Restored && r.generation.is_some()
                     })
                     .map(|(key, r)| {
                         (
@@ -1367,10 +1365,10 @@ pub struct LedgerEntry {
 /// collector ([`crate::store::gc`]) folds every pin into the retained
 /// binding set BEFORE it unlinks anything, so a pinned release record and
 /// tree object are never deleted. These STORE-LEVEL pins are DISTINCT from
-/// the rotation subsystem's project-file `[[pins]]`
+/// the retention subsystem's project-file `[[pins]]`
 /// ([`crate::config::Pin`]): the checkpoint flow is store-only (it never
 /// loads the caller's `deploy.toml`), so its retention anchors live in the
-/// store, while rotation's config pins protect the REMOTE retained set and
+/// store, while retention's config pins protect the REMOTE retained set and
 /// are never consulted by the local GC.
 ///
 /// PINS RETAIN ARTIFACT CONTENT ONLY. A pin is a pure retention anchor for
@@ -1424,13 +1422,13 @@ pub struct ObservedSlot {
 pub struct ObservedTarget {
     pub target: TargetName,
     #[serde(default)]
-    pub slots: BTreeMap<PlacementSlotId, ObservedSlot>,
+    pub slots: BTreeMap<SlotId, ObservedSlot>,
 }
 
 /// Persisted per-server local record (`servers/<id>.json`). Keyed by the
 /// ACTUAL server identity ([`ServerId`], transport addressing); the
 /// slot→assignment maps live in [`ObservedTarget`] keyed by
-/// [`PlacementSlotId`].
+/// [`SlotId`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ServerState {
     pub id: ServerId,
@@ -1518,7 +1516,7 @@ pub struct RebindingPlan {
     /// destination target (from the release record's OWN canonical slot
     /// snapshot). Complete regardless of group selection: a `--group` push
     /// narrows the PLANNED assignments, never the recorded topology.
-    pub frozen_topology: BTreeMap<PlacementSlotId, FrozenSlotTopology>,
+    pub frozen_topology: BTreeMap<SlotId, FrozenSlotTopology>,
     /// The membership PROOF that ran before planning (see
     /// [`MatchingMembership`]): `frozen == current` verified (slot IDs only;
     /// physical bindings may differ). For a group push this is the COMPLETE
@@ -1530,14 +1528,14 @@ pub struct RebindingPlan {
     /// current configuration. A group selection records exactly the selected
     /// slots (the group-filtered assignments); a full push records every
     /// member slot.
-    pub current_physical_slots: BTreeMap<PlacementSlotId, PhysicalBinding>,
+    pub current_physical_slots: BTreeMap<SlotId, PhysicalBinding>,
 }
 
 /// Per-slot plan for one placement slot: its slot identity, the artifact it
 /// should run, and the compare-and-swap preconditions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotPlan {
-    pub slot_id: PlacementSlotId,
+    pub slot_id: SlotId,
     pub artifact: ArtifactRef,
     /// Pre-push generation that must match for the compare-and-swap precondition.
     pub expected_generation: Option<GenerationId>,
@@ -1566,8 +1564,8 @@ pub struct DeploymentPlanWire {
     pub behaviors: BehaviorIndex,
     /// The selected placement slots; the DEDUPLICATED SET must equal the
     /// `slots` map's key set (the authoritative membership).
-    pub slot_ids: Vec<PlacementSlotId>,
-    pub slots: BTreeMap<PlacementSlotId, SlotPlan>,
+    pub slot_ids: Vec<SlotId>,
+    pub slots: BTreeMap<SlotId, SlotPlan>,
     pub source: PlanSource,
     /// When the plan was built from a DIRECT release reference
     /// (`PlanSource::ReleaseRef`), the explicit rebinding context: the
@@ -1602,8 +1600,8 @@ impl DeploymentPlanWire {
                 self.deployment_id, self.behavior_sha256
             ))
         })?;
-        let wire_slots: BTreeSet<&PlacementSlotId> = self.slot_ids.iter().collect();
-        let keys: BTreeSet<&PlacementSlotId> = self.slots.keys().collect();
+        let wire_slots: BTreeSet<&SlotId> = self.slot_ids.iter().collect();
+        let keys: BTreeSet<&SlotId> = self.slots.keys().collect();
         if wire_slots != keys {
             return Err(Error::integrity(format!(
                 "plan {}: slot_ids {:?} disagrees with the per-slot plan keys {:?}",
@@ -1687,7 +1685,7 @@ pub struct DeploymentPlan {
     /// THE AUTHORITATIVE PER-SLOT COLLECTION: the selected slots (the map
     /// keys are the membership) and their plans (their artifacts are the
     /// release source).
-    pub slots: BTreeMap<PlacementSlotId, SlotPlan>,
+    pub slots: BTreeMap<SlotId, SlotPlan>,
     pub source: PlanSource,
     /// When the plan was built from a DIRECT release reference
     /// (`PlanSource::ReleaseRef`), the explicit rebinding context: the
@@ -1700,7 +1698,7 @@ pub struct DeploymentPlan {
 impl DeploymentPlan {
     /// The plan's membership: the selected placement slots, DERIVED from the
     /// authoritative `slots` map (its keys) — never stored separately.
-    pub fn membership(&self) -> impl Iterator<Item = &PlacementSlotId> {
+    pub fn membership(&self) -> impl Iterator<Item = &SlotId> {
         self.slots.keys()
     }
 
@@ -1744,8 +1742,8 @@ impl<'de> Deserialize<'de> for DeploymentPlan {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotResult {
-    pub slot_id: PlacementSlotId,
-    pub outcome: ServerOutcomeKind,
+    pub slot_id: SlotId,
+    pub outcome: SlotOutcomeKind,
     /// The generation this slot advanced to, or `None` if it never started.
     pub generation: Option<GenerationId>,
     pub compensated: bool,
@@ -1762,15 +1760,15 @@ mod tests {
 
     // ---- fixtures ----------------------------------------------------------
 
-    fn slot(i: u32) -> PlacementSlotId {
-        PlacementSlotId::new(format!("slot-{i}"))
+    fn slot(i: u32) -> SlotId {
+        SlotId::new(format!("slot-{i}"))
     }
 
-    fn slot_strategy() -> impl Strategy<Value = PlacementSlotId> {
+    fn slot_strategy() -> impl Strategy<Value = SlotId> {
         (0u32..6).prop_map(slot)
     }
 
-    fn binding(sid: &PlacementSlotId) -> PhysicalBinding {
+    fn binding(sid: &SlotId) -> PhysicalBinding {
         PhysicalBinding {
             server: ServerId::new("s1".to_string()),
             deploy_dir: format!("/srv/deploy/{}", sid.as_str()),
@@ -1779,7 +1777,7 @@ mod tests {
 
     /// A generation ref whose assignment names its own key (the agreeing
     /// form); the artifact's release is derived from the slot id.
-    fn gen_ref_for(key: &PlacementSlotId) -> GenerationRef {
+    fn gen_ref_for(key: &SlotId) -> GenerationRef {
         GenerationRef {
             generation: GenerationId::new(format!("gen-{}", key.as_str())),
             assignment: PlacementSlotAssignment {
@@ -1806,10 +1804,10 @@ mod tests {
     // mutates ONE field at a time and asserts the conversion / reader fails
     // closed on EVERY tamper while accepting the untampered record.
 
-    fn agreeing_intent(keys: &[PlacementSlotId]) -> LedgerIntentWire {
-        let desired: BTreeMap<PlacementSlotId, GenerationRef> =
+    fn agreeing_intent(keys: &[SlotId]) -> LedgerIntentWire {
+        let desired: BTreeMap<SlotId, GenerationRef> =
             keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
-        let pre_push: BTreeMap<PlacementSlotId, Option<SlotAttemptState>> =
+        let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> =
             keys.iter().map(|k| (k.clone(), None)).collect();
         LedgerIntentWire {
             deployment_schema_version: crate::model::LEDGER_SCHEMA_VERSION,
@@ -1825,8 +1823,8 @@ mod tests {
         }
     }
 
-    fn outcome_for(key: &PlacementSlotId, kind: ServerOutcomeKind) -> SlotResult {
-        let compensated = matches!(&kind, ServerOutcomeKind::Restored);
+    fn outcome_for(key: &SlotId, kind: SlotOutcomeKind) -> SlotResult {
+        let compensated = matches!(&kind, SlotOutcomeKind::Restored);
         SlotResult {
             slot_id: key.clone(),
             outcome: kind,
@@ -1842,7 +1840,7 @@ mod tests {
     /// FailedPreflight (no outcomes, no rollback), 2 FailedRolledBack
     /// (outcomes = the compensation report), 3 Degraded (non-restored
     /// outcomes over the membership → non-empty remaining changes).
-    fn agreeing_terminal(keys: &[PlacementSlotId], status_idx: u32) -> LedgerTerminalWire {
+    fn agreeing_terminal(keys: &[SlotId], status_idx: u32) -> LedgerTerminalWire {
         let deployment_id = DeploymentId::new("deploy-w".to_string());
         let target = TargetName::new("t1".to_string());
         match status_idx {
@@ -1856,7 +1854,7 @@ mod tests {
                 recorded_at: "2026-01-01T00:00:00Z".to_string(),
                 outcomes: keys
                     .iter()
-                    .map(|k| (k.clone(), outcome_for(k, ServerOutcomeKind::Activated)))
+                    .map(|k| (k.clone(), outcome_for(k, SlotOutcomeKind::Activated)))
                     .collect(),
                 rollback: Some(LedgerRollbackWire {
                     slots: keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect(),
@@ -1885,7 +1883,7 @@ mod tests {
                 recorded_at: "2026-01-01T00:00:00Z".to_string(),
                 outcomes: keys
                     .iter()
-                    .map(|k| (k.clone(), outcome_for(k, ServerOutcomeKind::Restored)))
+                    .map(|k| (k.clone(), outcome_for(k, SlotOutcomeKind::Restored)))
                     .collect(),
                 rollback: None,
                 reason: Some("rolled back".to_string()),
@@ -1899,7 +1897,7 @@ mod tests {
                 recorded_at: "2026-01-01T00:00:00Z".to_string(),
                 outcomes: keys
                     .iter()
-                    .map(|k| (k.clone(), outcome_for(k, ServerOutcomeKind::Skipped)))
+                    .map(|k| (k.clone(), outcome_for(k, SlotOutcomeKind::Skipped)))
                     .collect(),
                 rollback: None,
                 reason: Some("degraded".to_string()),
@@ -1913,7 +1911,7 @@ mod tests {
     fn agreeing_pair() -> impl Strategy<Value = (LedgerIntentWire, LedgerTerminalWire)> {
         (prop::collection::btree_set(slot_strategy(), 1..4), 0u32..4).prop_map(
             |(keys, status_idx)| {
-                let keys: Vec<PlacementSlotId> = keys.into_iter().collect();
+                let keys: Vec<SlotId> = keys.into_iter().collect();
                 (
                     agreeing_intent(keys.as_slice()),
                     agreeing_terminal(keys.as_slice(), status_idx),
@@ -1982,7 +1980,7 @@ mod tests {
     fn assert_domain_shape(
         intent: &DeploymentIntent,
         terminal: &LedgerTerminal,
-        keys: &[PlacementSlotId],
+        keys: &[SlotId],
         status_idx: u32,
     ) {
         assert!(!intent.slots.is_empty(), "the membership is non-empty");
@@ -2038,7 +2036,7 @@ mod tests {
                 assert!(
                     compensation
                         .iter()
-                        .all(|(_, r)| r.outcome == ServerOutcomeKind::Restored),
+                        .all(|(_, r)| r.outcome == SlotOutcomeKind::Restored),
                     "the compensation records the restored slots"
                 );
             }
@@ -2106,12 +2104,12 @@ mod tests {
             // No outcomes (FailedPreflight): add one whose value names a
             // different placement than its key.
             t.outcomes
-                .insert(slot(0), outcome_for(&slot(9), ServerOutcomeKind::Activated));
+                .insert(slot(0), outcome_for(&slot(9), SlotOutcomeKind::Activated));
         }
     }
     fn outcome_outside_membership(t: &mut LedgerTerminalWire) {
         t.outcomes
-            .insert(slot(9), outcome_for(&slot(9), ServerOutcomeKind::Activated));
+            .insert(slot(9), outcome_for(&slot(9), SlotOutcomeKind::Activated));
     }
     fn outcome_status_vs_disposition(t: &mut LedgerTerminalWire) {
         match &t.status {
@@ -2119,20 +2117,20 @@ mod tests {
                 // The Degraded disposition implies non-restored remaining
                 // changes; an all-restored outcome table is a disagreement.
                 for r in t.outcomes.values_mut() {
-                    r.outcome = ServerOutcomeKind::Restored;
+                    r.outcome = SlotOutcomeKind::Restored;
                 }
             }
             DeploymentStatus::FailedPreflight => {
                 // A pre-mutation failure touched no slot; any outcome is a
                 // disagreement.
                 t.outcomes
-                    .insert(slot(0), outcome_for(&slot(0), ServerOutcomeKind::Activated));
+                    .insert(slot(0), outcome_for(&slot(0), SlotOutcomeKind::Activated));
             }
             DeploymentStatus::Successful => {
                 // The Successful disposition implies every slot activated; a
                 // failed outcome is a disagreement.
                 if let Some(r) = t.outcomes.values_mut().next() {
-                    r.outcome = ServerOutcomeKind::Failed;
+                    r.outcome = SlotOutcomeKind::Failed;
                 }
             }
             DeploymentStatus::FailedRolledBack => {
@@ -2212,7 +2210,7 @@ mod tests {
         fn wire_pair_mutations_fail_before_any_consumer_and_valid_pairs_shape(
             (intent, terminal) in agreeing_pair()
         ) {
-            let keys: Vec<PlacementSlotId> = intent.slot_ids.clone();
+            let keys: Vec<SlotId> = intent.slot_ids.clone();
             let status_idx = match terminal.status {
                 DeploymentStatus::Successful => 0,
                 DeploymentStatus::FailedPreflight => 1,
@@ -2488,7 +2486,7 @@ mod tests {
         );
         let mut bad = agreeing_terminal(&keys, 1); // FailedPreflight
         bad.outcomes
-            .insert(slot(1), outcome_for(&slot(1), ServerOutcomeKind::Activated));
+            .insert(slot(1), outcome_for(&slot(1), SlotOutcomeKind::Activated));
         assert!(
             bad.into_domain().is_err(),
             "FailedPreflight with outcomes is refused"
@@ -2512,7 +2510,7 @@ mod tests {
         );
         let mut bad = agreeing_terminal(&keys, 3); // Degraded
         for r in bad.outcomes.values_mut() {
-            r.outcome = ServerOutcomeKind::Restored;
+            r.outcome = SlotOutcomeKind::Restored;
         }
         assert!(
             bad.into_domain().is_err(),
@@ -2522,7 +2520,7 @@ mod tests {
         // slots (an outcome key the rollback does not cover).
         let mut bad = agreeing_terminal(&keys, 0); // Successful
         bad.outcomes
-            .insert(slot(9), outcome_for(&slot(9), ServerOutcomeKind::Activated));
+            .insert(slot(9), outcome_for(&slot(9), SlotOutcomeKind::Activated));
         assert!(
             bad.into_domain().is_err(),
             "a Successful outcome outside the rollback's slots is refused"
@@ -2530,7 +2528,7 @@ mod tests {
         // A Successful wire whose outcome status disagrees with the
         // disposition's implied state (every slot activated).
         let mut bad = agreeing_terminal(&keys, 0); // Successful
-        bad.outcomes.get_mut(&slot(1)).unwrap().outcome = ServerOutcomeKind::Failed;
+        bad.outcomes.get_mut(&slot(1)).unwrap().outcome = SlotOutcomeKind::Failed;
         assert!(
             bad.into_domain().is_err(),
             "a Successful terminal with a failed outcome is refused"
@@ -2566,7 +2564,7 @@ mod tests {
         let mut terminal = agreeing_terminal(&keys, 0);
         terminal
             .outcomes
-            .insert(slot(9), outcome_for(&slot(9), ServerOutcomeKind::Activated));
+            .insert(slot(9), outcome_for(&slot(9), SlotOutcomeKind::Activated));
         assert!(pair_to_domain(&(intent.clone(), terminal)).is_err());
         // An outcome value naming a different slot than its key.
         let mut terminal = agreeing_terminal(&keys, 0);
@@ -2658,7 +2656,7 @@ mod tests {
         };
         let outcome = || SlotResult {
             slot_id: slot(1),
-            outcome: ServerOutcomeKind::Activated,
+            outcome: SlotOutcomeKind::Activated,
             generation: Some(GenerationId::new("gen-1".to_string())),
             compensated: false,
             error: None,
@@ -2781,7 +2779,7 @@ mod tests {
             .iter()
             .map(|k| (k.clone(), gen_ref_for(k)))
             .collect();
-        let pre_push: BTreeMap<PlacementSlotId, Option<SlotAttemptState>> =
+        let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> =
             slot_ids.iter().map(|k| (k.clone(), None)).collect();
         LedgerIntentWire {
             deployment_schema_version: crate::model::LEDGER_SCHEMA_VERSION,

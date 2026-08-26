@@ -58,7 +58,7 @@ carries the project's one slot (`app-1` → `server-01`, bound to the
 from the slots, they do not list them).
 
 The generated files are typed TOML serialized from the same config structs
-`Config::load` parses into — not formatted strings. `deploy init` validates
+`ProjectConfig::load` parses into — not formatted strings. `deploy init` validates
 the flags before creating anything, re-loads the written project through the
 strict loader, and removes the scaffold if that load fails: a reported
 success always means the generated project is valid.
@@ -244,7 +244,7 @@ deploy push production deploy-20260821T102000Z   # the checkpoint deployment sta
   the affected directories so filesystem space can be reclaimed — NOT secure
   physical erasure: SSD firmware, copy-on-write filesystems, snapshots,
   journals, and backups may retain old blocks. The sweep never contacts
-  servers; remote artifact cleanup remains rotation's responsibility.
+  servers; remote artifact cleanup remains retention's responsibility.
 - Checkpointing one target never changes another target's history: the
   retention is per-target for history and global only for the shared artifact
   store (where another target's ledger references protect shared content).
@@ -273,7 +273,7 @@ releases/<name>/artifacts/    # artifact sources referenced by variant mappings
   each server appears at most once. A **target** carries ROLLOUT behavior
   only; its member slots are DERIVED from the slots' `targets` lists —
   targets do not list their slots.
-- Retention (`rotation`) belongs to the SLOT, not the target: the variant
+- Retention belongs to the SLOT, not the target: the variant
   file that declares the slot owns its one retention policy, so a slot shared
   across several targets keeps exactly one policy and membership changes never
   change retention.
@@ -337,12 +337,12 @@ timeout_seconds = 5
 attempts = 1
 interval_seconds = 0
 
-[rotation.per_server]         # SLOT-OWNED retention (the slot's one policy;
+[retention.per_server]         # SLOT-OWNED retention (the slot's one policy;
 keep_distinct_artifacts = 5   # targets carry rollout only, so membership
 keep_days = 14                # changes never change retention)
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 2
 ```
 

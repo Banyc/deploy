@@ -1,9 +1,9 @@
 //! End-to-end integration test exercising the full push transaction against a
 //! local (filesystem) transport that mirrors the SSH remote layout.
 
-use deploy::config::Config;
+use deploy::config::ProjectConfig;
 use deploy::error::Result;
-use deploy::model::{PlacementSlotId, ServerId, TreeDigest};
+use deploy::model::{ServerId, SlotId, TreeDigest};
 use deploy::push::engine::{PushOptions, push};
 use deploy::records::{DeploymentStatus, LedgerEntry, LedgerRollback, PhysicalBinding};
 use deploy::remote::transport::{FsBytes, LocalTransport, Remote};
@@ -43,7 +43,7 @@ fn rollback_of(e: &LedgerEntry) -> &LedgerRollback {
 /// only variable the template module exposes at materialization (trees are
 /// content-addressed and shared across slots) — so the same file content
 /// describes both the `standard` and `high-capacity` variants; their trees
-/// differ via `deployment/variants/<variant>/`. Rotation is not a variant
+/// differ via `deployment/variants/<variant>/`. Retention is not a variant
 /// setting: it lives at the top level of `deploy.toml`.
 const VARIANT_BODY: &str = r#"
 [[artifact.mappings]]
@@ -61,12 +61,12 @@ from = "artifacts/deployment/variants/{{ variant }}/"
 to = "app-variant/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 2
 
 [activation]
@@ -173,7 +173,7 @@ fn write_variant_file(proj: &Path, name: &str, body: &str) {
     write_file(&release_dir.join(format!("{name}.toml")), body);
 }
 
-fn setup(proj: &Path) -> (Config, std::path::PathBuf) {
+fn setup(proj: &Path) -> (ProjectConfig, std::path::PathBuf) {
     write_file(&proj.join("deploy.toml"), CONFIG);
     // Each variant file declares its own slots (slots live in the variant
     // files and declare their target).
@@ -191,7 +191,7 @@ fn setup(proj: &Path) -> (Config, std::path::PathBuf) {
         &artifacts.join("deployment/variants/high-capacity/extra"),
         "hc\n",
     );
-    let config = Config::load(&proj.join("deploy.toml")).unwrap();
+    let config = ProjectConfig::load(&proj.join("deploy.toml")).unwrap();
     (config, proj.join("deploy.toml"))
 }
 
@@ -208,7 +208,7 @@ fn end_to_end_push_rollback() -> Result<()> {
     let store = LocalStore::with_base(store_base.clone())?;
 
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         let p = remotes_base.join(&s.id);
         Ok(Box::new(LocalTransport::new(p)?))
@@ -233,14 +233,8 @@ fn end_to_end_push_rollback() -> Result<()> {
         "first push should succeed"
     );
     let attempt0 = r0.attempt.expect("attempt recorded");
-    let std_v1: TreeDigest = attempt0.slots[&PlacementSlotId::new("p1")]
-        .artifact
-        .tree
-        .clone();
-    let hc_v1: TreeDigest = attempt0.slots[&PlacementSlotId::new("p3")]
-        .artifact
-        .tree
-        .clone();
+    let std_v1: TreeDigest = attempt0.slots[&SlotId::new("p1")].artifact.tree.clone();
+    let hc_v1: TreeDigest = attempt0.slots[&SlotId::new("p3")].artifact.tree.clone();
     assert_ne!(std_v1, hc_v1, "standard and high-capacity trees differ");
 
     // Up-to-date push should be a no-op (no attempt created).
@@ -283,10 +277,7 @@ fn end_to_end_push_rollback() -> Result<()> {
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
     let attempt1 = r1.attempt.expect("attempt recorded");
-    let std_v2: TreeDigest = attempt1.slots[&PlacementSlotId::new("p1")]
-        .artifact
-        .tree
-        .clone();
+    let std_v2: TreeDigest = attempt1.slots[&SlotId::new("p1")].artifact.tree.clone();
     assert_ne!(
         std_v1, std_v2,
         "standard tree changed after editing content"
@@ -313,13 +304,13 @@ fn end_to_end_push_rollback() -> Result<()> {
         "rollback succeeds"
     );
     let observed = store.read_observed("production", &config)?;
-    let restored = observed.slots[&PlacementSlotId::new("p1")]
+    let restored = observed.slots[&SlotId::new("p1")]
         .artifact
         .as_ref()
         .map(|a| a.tree.clone())
         .unwrap();
     assert_eq!(restored, std_v1, "server-01 rolled back to original tree");
-    let hc_restored = observed.slots[&PlacementSlotId::new("p3")]
+    let hc_restored = observed.slots[&SlotId::new("p3")]
         .artifact
         .as_ref()
         .map(|a| a.tree.clone())
@@ -358,7 +349,7 @@ fn snapshot_records_each_slots_physical_binding() -> Result<()> {
     let (config, config_path) = setup(&proj);
     let store = LocalStore::with_base(store_base.clone())?;
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(remotes_base.join(&s.id))?))
     };
@@ -387,21 +378,15 @@ fn snapshot_records_each_slots_physical_binding() -> Result<()> {
         deploy_dir: "/srv/deploy/example".to_string(),
     };
     assert_eq!(
-        rollback_of(&snapshots[0])
-            .bindings
-            .get(&PlacementSlotId::new("p1")),
+        rollback_of(&snapshots[0]).bindings.get(&SlotId::new("p1")),
         Some(&binding("server-01"))
     );
     assert_eq!(
-        rollback_of(&snapshots[0])
-            .bindings
-            .get(&PlacementSlotId::new("p2")),
+        rollback_of(&snapshots[0]).bindings.get(&SlotId::new("p2")),
         Some(&binding("server-02"))
     );
     assert_eq!(
-        rollback_of(&snapshots[0])
-            .bindings
-            .get(&PlacementSlotId::new("p3")),
+        rollback_of(&snapshots[0]).bindings.get(&SlotId::new("p3")),
         Some(&binding("server-03"))
     );
     assert_eq!(rollback_of(&snapshots[0]).bindings.len(), 3);
@@ -463,13 +448,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let store = LocalStore::with_base(store_base.clone())?;
     let factory_base = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(factory_base.join(&s.id))?))
     };
 
     // Deploy s0 with the slot on server-01.
-    let config = Config::load(&config_path)?;
+    let config = ProjectConfig::load(&config_path)?;
     let r0 = push(
         &config_path,
         &store,
@@ -488,9 +473,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // The rollback ref is the deployment id (the snapshot's key).
     let dep0 = latest_deployment_id(&store, "production");
     assert_eq!(
-        rollback_of(&snapshots[0])
-            .bindings
-            .get(&PlacementSlotId::new("p1")),
+        rollback_of(&snapshots[0]).bindings.get(&SlotId::new("p1")),
         Some(&PhysicalBinding {
             server: ServerId::new("server-01"),
             deploy_dir: "/srv/deploy/rebind".to_string(),
@@ -511,7 +494,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-02\"\ntarget = \"production\"\ndeploy_dir = \"/srv/deploy/rebind\"\n"
     );
     write_variant_file(&proj, "standard", &rebound_variant);
-    let config2 = Config::load(&config_path)?;
+    let config2 = ProjectConfig::load(&config_path)?;
 
     // Exact rollback to s0 must FAIL with the binding mismatch named, and
     // must not touch the new server's remote root (no current, no
@@ -634,13 +617,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let store = LocalStore::with_base(store_base.clone())?;
     let factory_base = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(factory_base.join(&s.id))?))
     };
 
     // Deploy s0 with the slot at deploy_dir A on server-01.
-    let config = Config::load(&config_path)?;
+    let config = ProjectConfig::load(&config_path)?;
     let r0 = push(
         &config_path,
         &store,
@@ -657,9 +640,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let snapshots = successful_entries(&store, "production")?;
     assert_eq!(snapshots.len(), 1);
     assert_eq!(
-        rollback_of(&snapshots[0])
-            .bindings
-            .get(&PlacementSlotId::new("p1")),
+        rollback_of(&snapshots[0]).bindings.get(&SlotId::new("p1")),
         Some(&PhysicalBinding {
             server: ServerId::new("server-01"),
             deploy_dir: "/srv/move/movedir-a".to_string(),
@@ -678,7 +659,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "{VARIANT_BODY}\n[[slots]]\nid = \"p1\"\nserver = \"server-01\"\ntarget = \"production\"\ndeploy_dir = \"/srv/move/movedir-b\"\n"
     );
     write_variant_file(&proj, "standard", &moved_variant);
-    let config2 = Config::load(&config_path)?;
+    let config2 = ProjectConfig::load(&config_path)?;
 
     // Exact rollback to s0 must FAIL with the binding mismatch naming the
     // directory change, and must not touch the remote state at either
@@ -831,11 +812,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     write_file(&artifacts.join("deployment/common/README"), "common\n");
     write_file(&artifacts.join("deployment/variants/old/extra"), "old\n");
 
-    let config0 = Config::load(&config_path)?;
+    let config0 = ProjectConfig::load(&config_path)?;
     let store = LocalStore::with_base(store_base)?;
     let rf = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
     };
@@ -854,7 +835,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
     let attempt0 = r0.attempt.expect("attempt recorded");
-    let old_server = &attempt0.slots[&PlacementSlotId::new("p1")];
+    let old_server = &attempt0.slots[&SlotId::new("p1")];
     let old_tree = old_server.artifact.tree.clone();
     let old_release = old_server.artifact.release.clone();
 
@@ -872,7 +853,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     );
     write_file(&artifacts.join("deployment/variants/new/extra"), "new\n");
     std::fs::remove_file(proj.join("releases").join("v1").join("old.toml")).unwrap();
-    let config1 = Config::load(&config_path)?;
+    let config1 = ProjectConfig::load(&config_path)?;
     assert!(
         config1.variant("old").is_err(),
         "current configuration no longer declares `old`"
@@ -892,7 +873,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-    let new_tree = r1.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")]
+    let new_tree = r1.attempt.expect("attempt recorded").slots[&SlotId::new("p1")]
         .artifact
         .tree
         .clone();
@@ -921,7 +902,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "exact rollback must succeed after the variant was renamed"
     );
     let observed = store.read_observed("production", &config0)?;
-    let restored = &observed.slots[&PlacementSlotId::new("p1")];
+    let restored = &observed.slots[&SlotId::new("p1")];
     assert_eq!(
         restored.artifact.as_ref().map(|a| &a.tree),
         Some(&old_tree),
@@ -951,7 +932,7 @@ fn dry_run_reports_plan() -> Result<()> {
 
     let (config, config_path) = setup(&proj);
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         let p = remotes_base.join(&s.id);
         Ok(Box::new(LocalTransport::new(p)?))
@@ -985,7 +966,7 @@ fn dry_run_reports_plan() -> Result<()> {
 // Additional tests for the hardening findings (1, 2, 4, 5, 6).
 // ===========================================================================
 
-use deploy::records::ServerOutcomeKind;
+use deploy::records::SlotOutcomeKind;
 use deploy::release;
 use deploy::remote::create_remote;
 use deploy::remote::helper::{GenerationAssignment, RemoteHelper};
@@ -1351,13 +1332,13 @@ impl Remote for FailOnceMarkerRemote {
 /// A remote that reports a FIXED number of available bytes and fails ONE
 /// specific remote call exactly once (the first matching call errors, then the
 /// wrapper behaves normally). Lets a test inject a transient failure into a
-/// rotation step — `compute_retained`'s remote reads (a `list` of the
+/// retention step — `compute_retained`'s remote reads (a `list` of the
 /// generations root) or `rotate`'s inventory write — and then verify the
 /// mutation lock was released on the error path (a manual acquire/release pair
 /// would leak it, stranding every later operation on the slot). Lock
 /// acquisition writes `state/operation.lock` — a different path — so locking
 /// is unaffected.
-struct FailOnceRotationRemote {
+struct FailOnceRetentionRemote {
     inner: LocalTransport,
     armed: Arc<AtomicBool>,
     fail_path: &'static str,
@@ -1366,7 +1347,7 @@ struct FailOnceRotationRemote {
     avail: u64,
 }
 
-impl FailOnceRotationRemote {
+impl FailOnceRetentionRemote {
     fn build(
         base: std::path::PathBuf,
         armed: Arc<AtomicBool>,
@@ -1375,7 +1356,7 @@ impl FailOnceRotationRemote {
         fail_write: bool,
         avail: u64,
     ) -> Result<Box<dyn Remote>> {
-        Ok(Box::new(FailOnceRotationRemote {
+        Ok(Box::new(FailOnceRetentionRemote {
             inner: LocalTransport::new(base)?,
             armed,
             fail_path,
@@ -1389,7 +1370,7 @@ impl FailOnceRotationRemote {
     }
 }
 
-impl Remote for FailOnceRotationRemote {
+impl Remote for FailOnceRetentionRemote {
     fn root(&self) -> &Path {
         self.inner.root()
     }
@@ -1403,7 +1384,7 @@ impl Remote for FailOnceRotationRemote {
         if self.fail_write && self.should_fail(rel) {
             self.armed.store(false, Ordering::SeqCst);
             return Err(deploy::error::Error::remote(format!(
-                "FailOnceRotationRemote: write of {} forced to fail (once)",
+                "FailOnceRetentionRemote: write of {} forced to fail (once)",
                 rel.display()
             )));
         }
@@ -1428,7 +1409,7 @@ impl Remote for FailOnceRotationRemote {
         if self.fail_list && self.should_fail(rel) {
             self.armed.store(false, Ordering::SeqCst);
             return Err(deploy::error::Error::remote(format!(
-                "FailOnceRotationRemote: list of {} forced to fail (once)",
+                "FailOnceRetentionRemote: list of {} forced to fail (once)",
                 rel.display()
             )));
         }
@@ -1590,12 +1571,12 @@ from = "artifacts/deployment/common/"
 to = "app-common/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 2
 
 [activation]
@@ -1612,8 +1593,8 @@ interval_seconds = 0
 }
 
 /// Minimal deploy.toml body with a single `standard` variant and
-/// `activation: none`. Rotation is a top-level setting of `deploy.toml`;
-/// targets carry rollout + rotation only (their members are derived from the
+/// `activation: none`. Retention is a top-level setting of `deploy.toml`;
+/// targets carry rollout + retention only (their members are derived from the
 /// slots' `targets` lists).
 fn single_target_toml(stop_on_failure: bool, batch_size: u32) -> String {
     format!(
@@ -1636,7 +1617,12 @@ rollout = {{ batch_size = {batch_size}, stop_on_failure = {stop_on_failure}, fai
 
 /// Build the single-variant project (deploy.toml + `standard.toml` variant
 /// file + source inputs) and load its config.
-fn setup_single(proj: &Path, verify_argv: &str, stop_on_failure: bool, batch_size: u32) -> Config {
+fn setup_single(
+    proj: &Path,
+    verify_argv: &str,
+    stop_on_failure: bool,
+    batch_size: u32,
+) -> ProjectConfig {
     let p = write_string(
         &proj.join("deploy.toml"),
         &single_target_toml(stop_on_failure, batch_size),
@@ -1645,7 +1631,7 @@ fn setup_single(proj: &Path, verify_argv: &str, stop_on_failure: bool, batch_siz
     let artifacts = proj.join("releases").join("v1").join("artifacts");
     write_file(&artifacts.join("build/output/app/server"), "v1\n");
     write_file(&artifacts.join("deployment/common/README"), "common\n");
-    Config::load(&p).unwrap()
+    ProjectConfig::load(&p).unwrap()
 }
 
 // ---- Finding 1: production CLI must target the configured remote endpoint --
@@ -1662,7 +1648,7 @@ fn cli_reaches_configured_endpoint() -> Result<()> {
     std::fs::create_dir_all(&endpoints).unwrap();
 
     // Addresses are explicit `local://` paths: the configured endpoint, NOT the
-    // application store's `remotes/` directory. Rotation is a top-level setting
+    // application store's `remotes/` directory. Retention is a top-level setting
     // of `deploy.toml`.
     let config_toml = r#"
 schema_version = 2
@@ -1689,12 +1675,12 @@ from = "artifacts/build/output/"
 to = "app/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 2
 
 [activation]
@@ -1713,7 +1699,7 @@ interval_seconds = 0
     write_file(&artifacts.join("build/output/app/server"), "v1\n");
     write_file(&artifacts.join("deployment/common/README"), "common\n");
 
-    let mut config = Config::load(&proj.join("deploy.toml"))?;
+    let mut config = ProjectConfig::load(&proj.join("deploy.toml"))?;
     let store = LocalStore::with_base(store_base.clone())?;
 
     // Plug the real endpoint directory into the server address and use the real
@@ -1727,7 +1713,7 @@ interval_seconds = 0
         .address = format!("local://{}", endpoints.join("server-01").display());
 
     let factory = move |s: &deploy::config::ServerDef,
-                        slot: &deploy::config::SlotDef|
+                        slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> { create_remote(s, &slot.deploy_dir) };
 
     let r = push(
@@ -1776,7 +1762,7 @@ fn dry_run_does_not_mutate() -> Result<()> {
     let rb = remote_base.clone();
     let factory =
         move |s: &deploy::config::ServerDef,
-              _slot: &deploy::config::SlotDef|
+              _slot: &deploy::config::SlotConfig|
               -> Result<Box<dyn Remote>> { SpyRemote::build(rb.join(&s.id), m.clone()) };
 
     let r = push(
@@ -1857,7 +1843,7 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
 
     let rb = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rb.join(&s.id))?))
     };
@@ -1929,7 +1915,7 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
         .as_ref()
         .unwrap()
         .slots
-        .get(&PlacementSlotId::new("p1"))
+        .get(&SlotId::new("p1"))
         .unwrap()
         .artifact
         .release
@@ -1972,7 +1958,7 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
 
     let rb = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rb.join(&s.id))?))
     };
@@ -1997,7 +1983,7 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
         .as_ref()
         .unwrap()
         .slots
-        .get(&PlacementSlotId::new("p1"))
+        .get(&SlotId::new("p1"))
         .unwrap()
         .artifact
         .release
@@ -2097,7 +2083,7 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
 
     let rb = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rb.join(&s.id))?))
     };
@@ -2120,7 +2106,7 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
         .as_ref()
         .unwrap()
         .slots
-        .get(&PlacementSlotId::new("p1"))
+        .get(&SlotId::new("p1"))
         .unwrap()
         .artifact
         .release
@@ -2255,12 +2241,12 @@ from = "artifacts/build/output/"
 to = "app/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 2
 
 [activation]
@@ -2278,10 +2264,10 @@ interval_seconds = 0
     let artifacts = proj.join("releases").join("v1").join("artifacts");
     write_file(&artifacts.join("build/output/app/server"), "v1\n");
 
-    let config = Config::load(&proj.join("deploy.toml"))?;
+    let config = ProjectConfig::load(&proj.join("deploy.toml"))?;
     let rf = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
     };
@@ -2318,22 +2304,19 @@ interval_seconds = 0
     assert_eq!(attempt.slot_ids.len(), 3);
     for sid in ["p1", "p2", "p3"] {
         assert!(
-            attempt.slots.contains_key(&PlacementSlotId::new(sid)),
+            attempt.slots.contains_key(&SlotId::new(sid)),
             "slot {sid} missing from attempt"
         );
     }
     // First slot failed; later slots were never started (Skipped).
+    assert_eq!(results[&SlotId::new("p1")].outcome, SlotOutcomeKind::Failed);
     assert_eq!(
-        results[&PlacementSlotId::new("p1")].outcome,
-        ServerOutcomeKind::Failed
+        results[&SlotId::new("p2")].outcome,
+        SlotOutcomeKind::Skipped
     );
     assert_eq!(
-        results[&PlacementSlotId::new("p2")].outcome,
-        ServerOutcomeKind::Skipped
-    );
-    assert_eq!(
-        results[&PlacementSlotId::new("p3")].outcome,
-        ServerOutcomeKind::Skipped
+        results[&SlotId::new("p3")].outcome,
+        SlotOutcomeKind::Skipped
     );
     // Later servers were left untouched (no `current` pointer was ever created).
     assert!(!remotes_base.join("server-02/current").exists());
@@ -2370,7 +2353,7 @@ fn post_lock_failure_releases_lock_and_records() -> Result<()> {
     let at = attempted.clone();
     let remotes_for_factory = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         FaultRemote::build(
             remotes_for_factory.join(&s.id),
@@ -2418,24 +2401,24 @@ fn post_lock_failure_releases_lock_and_records() -> Result<()> {
     Ok(())
 }
 
-// ---- Rotation lock discipline: the protected rotation in the capacity
-// preflight (step 8) and the per-slot rotation after a successful push (step
+// ---- Retention lock discipline: the protected retention in the capacity
+// preflight (step 8) and the per-slot retention after a successful push (step
 // 17) hold the server mutation lock via an RAII guard, so the lock is
 // released on EVERY block exit — after a best-effort failure in the capacity
-// preflight, or on an error in step 17's post-commit rotation. A manual
+// preflight, or on an error in step 17's post-commit retention. A manual
 // acquire/release pair would leak it, stranding every later operation on the
 // slot with "mutation lock held by ...".
 
-/// A capacity preflight whose protected rotation fails inside
+/// A capacity preflight whose protected retention fails inside
 /// `compute_retained` (a transient remote read error on the generations root)
-/// must NOT fail the push on the rotation error — the protected rotation is
+/// must NOT fail the push on the retention error — the protected retention is
 /// BEST-EFFORT (it exists only to free capacity), so the failure skips the
 /// sweep and the HARD capacity re-check decides the outcome: with space still
 /// short, the push fails with the preflight error. Either way the server
 /// mutation lock is released on the block exit (the RAII guard drops it), so
 /// a later operation can acquire the lock again.
 #[test]
-fn capacity_rotation_compute_retained_failure_releases_lock() -> Result<()> {
+fn capacity_retention_compute_retained_failure_releases_lock() -> Result<()> {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
@@ -2444,7 +2427,7 @@ fn capacity_rotation_compute_retained_failure_releases_lock() -> Result<()> {
     std::fs::create_dir_all(&remotes_base).unwrap();
 
     let (mut config, config_path) = setup(&proj);
-    // Force the capacity preflight to trigger protected rotation: the remote
+    // Force the capacity preflight to trigger protected retention: the remote
     // reports 100 bytes available and every server policy reserves 1 MiB, so
     // need + reserve > avail on every slot.
     for s in &mut config.servers {
@@ -2455,15 +2438,15 @@ fn capacity_rotation_compute_retained_failure_releases_lock() -> Result<()> {
     }
 
     // Inject a one-shot failure into `compute_retained`'s remote read of the
-    // generations root (`rotation::compute_retained` lists `generations/`;
+    // generations root (`retention::compute_retained` lists `generations/`;
     // nothing else in the push touches that path before the preflight).
     let armed = Arc::new(AtomicBool::new(true));
     let armed_for_factory = armed.clone();
     let rf = remotes_base.clone();
     let fault_factory = move |s: &deploy::config::ServerDef,
-                              _slot: &deploy::config::SlotDef|
+                              _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        FailOnceRotationRemote::build(
+        FailOnceRetentionRemote::build(
             rf.join(&s.id),
             armed_for_factory.clone(),
             "generations",
@@ -2473,8 +2456,8 @@ fn capacity_rotation_compute_retained_failure_releases_lock() -> Result<()> {
         )
     };
 
-    // The push fails — NOT on the injected rotation read error (the
-    // preflight rotation is best-effort, so the failure is swallowed) but on
+    // The push fails — NOT on the injected retention read error (the
+    // preflight retention is best-effort, so the failure is swallowed) but on
     // the HARD capacity re-check: with the sweep skipped, the 100-byte
     // remote still cannot fit need + reserve.
     let err = push(
@@ -2492,13 +2475,13 @@ fn capacity_rotation_compute_retained_failure_releases_lock() -> Result<()> {
     .expect_err("the hard capacity re-check must fail the push");
     assert!(
         err.to_string().contains("insufficient capacity"),
-        "rotation is best-effort in the preflight: the hard capacity re-check must fail the \
+        "retention is best-effort in the preflight: the hard capacity re-check must fail the \
          push, got: {err}"
     );
 
     // The mutation lock was released on the error path: no server carries a
     // lock file, and a fresh operation on every slot can acquire the lock.
-    // (The rotation runs on the FIRST assignment in plan order, so check all
+    // (The retention runs on the FIRST assignment in plan order, so check all
     // three servers rather than assuming a specific slot.)
     for server in ["server-01", "server-02", "server-03"] {
         let remote = LocalTransport::new(remotes_base.join(server))?;
@@ -2516,11 +2499,11 @@ fn capacity_rotation_compute_retained_failure_releases_lock() -> Result<()> {
     Ok(())
 }
 
-/// A successful push whose step-17 per-slot rotation fails inside `rotate` (a
+/// A successful push whose step-17 per-slot retention fails inside `rotate` (a
 /// transient inventory-write error) must NOT fail the push nor leak the server
-/// mutation lock. Rotation is POST-COMMIT maintenance: the deployment already
+/// mutation lock. Retention is POST-COMMIT maintenance: the deployment already
 /// committed (servers advanced, snapshot and attempt recorded) before step 17
-/// runs, so a rotation failure changes nothing about the outcome. It defers
+/// runs, so a retention failure changes nothing about the outcome. It defers
 /// the maintenance — a PERSISTENT debt marker is written under the local
 /// store (keyed by target+slot) and the report carries a warning — and the
 /// push returns `Ok` with the real `Successful` status. A later push (here an
@@ -2529,7 +2512,7 @@ fn capacity_rotation_compute_retained_failure_releases_lock() -> Result<()> {
 /// warning. The mutation lock must be released on the error path: the RAII
 /// guard drops it, so a later operation can re-acquire it.
 #[test]
-fn step17_rotation_failure_defers_maintenance_until_noop_retry() -> Result<()> {
+fn step17_retention_failure_defers_maintenance_until_noop_retry() -> Result<()> {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
@@ -2542,14 +2525,14 @@ fn step17_rotation_failure_defers_maintenance_until_noop_retry() -> Result<()> {
     // Inject a one-shot failure into `rotate`'s inventory write
     // (`RemoteHelper::rotate` ends with `write_inventory`, which writes
     // `state/inventory.json`; nothing else in the push writes that path, and
-    // the default 0/0 capacity never triggers the preflight rotation).
+    // the default 0/0 capacity never triggers the preflight retention).
     let armed = Arc::new(AtomicBool::new(true));
     let armed_for_factory = armed.clone();
     let rf = remotes_base.clone();
     let fault_factory = move |s: &deploy::config::ServerDef,
-                              _slot: &deploy::config::SlotDef|
+                              _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        FailOnceRotationRemote::build(
+        FailOnceRetentionRemote::build(
             rf.join(&s.id),
             armed_for_factory.clone(),
             "state/inventory.json",
@@ -2562,7 +2545,7 @@ fn step17_rotation_failure_defers_maintenance_until_noop_retry() -> Result<()> {
     // Push 1: the deployment COMMITS, but the first slot's step-17 `rotate`
     // hits the injected inventory-write failure. The push must still return
     // Ok with the committed status — a completed deployment is never reported
-    // as failed because its cleanup rotation failed.
+    // as failed because its cleanup retention failed.
     let r1 = push(
         &config_path,
         &store,
@@ -2578,7 +2561,7 @@ fn step17_rotation_failure_defers_maintenance_until_noop_retry() -> Result<()> {
     assert_eq!(
         r1.status,
         Some(DeploymentStatus::Successful),
-        "the deployment committed; a step-17 rotation failure must not change its outcome"
+        "the deployment committed; a step-17 retention failure must not change its outcome"
     );
     assert!(
         r1.attempt.is_some(),
@@ -2587,10 +2570,10 @@ fn step17_rotation_failure_defers_maintenance_until_noop_retry() -> Result<()> {
     let warning1 = r1
         .warning
         .as_ref()
-        .expect("the push must warn about the deferred rotation");
+        .expect("the push must warn about the deferred retention");
     assert!(
-        warning1.contains("rotation deferred"),
-        "the warning describes the deferred rotation, got: {warning1}"
+        warning1.contains("retention deferred"),
+        "the warning describes the deferred retention, got: {warning1}"
     );
     assert!(
         warning1.contains("inventory.json"),
@@ -2599,17 +2582,17 @@ fn step17_rotation_failure_defers_maintenance_until_noop_retry() -> Result<()> {
 
     // The debt marker is PERSISTENT (a file under the store, keyed by
     // target+slot) and records the failure reason, so a later push can retry.
-    let debt = store.read_rotation_debt("production")?;
+    let debt = store.read_retention_debt("production")?;
     assert!(
         !debt.is_empty(),
-        "a debt marker must be recorded when step-17 rotation fails"
+        "a debt marker must be recorded when step-17 retention fails"
     );
     assert!(
         debt.values().any(|v| v.contains("inventory.json")),
         "the marker records the failure reason, got: {debt:?}"
     );
     assert!(
-        store.rotation_debt_path("production").exists(),
+        store.retention_debt_path("production").exists(),
         "the marker survives across pushes as a file under the store"
     );
 
@@ -2657,23 +2640,23 @@ fn step17_rotation_failure_defers_maintenance_until_noop_retry() -> Result<()> {
         r2.warning
     );
     assert!(
-        store.read_rotation_debt("production")?.is_empty(),
-        "the debt marker must be cleared once the rotation succeeds"
+        store.read_retention_debt("production")?.is_empty(),
+        "the debt marker must be cleared once the retention succeeds"
     );
     assert!(
-        !store.rotation_debt_path("production").exists(),
+        !store.retention_debt_path("production").exists(),
         "a cleared debt marker leaves no file behind"
     );
     Ok(())
 }
 
-/// The no-op maintenance retry is best-effort: if the deferred rotation STILL
+/// The no-op maintenance retry is best-effort: if the deferred retention STILL
 /// fails (the fault is re-armed), the no-op still reports "Everything up to
 /// date" with a warning and the marker is KEPT; a later no-op (fault consumed)
-/// retries again and finally clears it. At no point does a rotation failure
+/// retries again and finally clears it. At no point does a retention failure
 /// turn a push into an error.
 #[test]
-fn noop_retry_keeps_marker_until_rotation_succeeds() -> Result<()> {
+fn noop_retry_keeps_marker_until_retention_succeeds() -> Result<()> {
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
@@ -2687,9 +2670,9 @@ fn noop_retry_keeps_marker_until_rotation_succeeds() -> Result<()> {
     let armed_for_factory = armed.clone();
     let rf = remotes_base.clone();
     let fault_factory = move |s: &deploy::config::ServerDef,
-                              _slot: &deploy::config::SlotDef|
+                              _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        FailOnceRotationRemote::build(
+        FailOnceRetentionRemote::build(
             rf.join(&s.id),
             armed_for_factory.clone(),
             "state/inventory.json",
@@ -2699,7 +2682,7 @@ fn noop_retry_keeps_marker_until_rotation_succeeds() -> Result<()> {
         )
     };
 
-    // Push 1: the deployment commits but step-17 rotation fails; maintenance
+    // Push 1: the deployment commits but step-17 retention fails; maintenance
     // is deferred with a marker and a warning.
     let r1 = push(
         &config_path,
@@ -2716,10 +2699,10 @@ fn noop_retry_keeps_marker_until_rotation_succeeds() -> Result<()> {
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
     assert!(
         r1.warning.is_some(),
-        "push 1 must warn about the deferred rotation"
+        "push 1 must warn about the deferred retention"
     );
     assert!(
-        !store.read_rotation_debt("production")?.is_empty(),
+        !store.read_retention_debt("production")?.is_empty(),
         "push 1 must record the debt marker"
     );
 
@@ -2744,13 +2727,13 @@ fn noop_retry_keeps_marker_until_rotation_succeeds() -> Result<()> {
     let warning2 = r2
         .warning
         .as_ref()
-        .expect("a still-failing retry must keep warning about the deferred rotation");
+        .expect("a still-failing retry must keep warning about the deferred retention");
     assert!(
-        warning2.contains("rotation still deferred"),
+        warning2.contains("retention still deferred"),
         "the warning says the maintenance is still deferred, got: {warning2}"
     );
     assert!(
-        !store.read_rotation_debt("production")?.is_empty(),
+        !store.read_retention_debt("production")?.is_empty(),
         "a failed retry must keep the debt marker"
     );
 
@@ -2776,8 +2759,8 @@ fn noop_retry_keeps_marker_until_rotation_succeeds() -> Result<()> {
         r3.warning
     );
     assert!(
-        store.read_rotation_debt("production")?.is_empty(),
-        "the marker must be cleared once the rotation succeeds"
+        store.read_retention_debt("production")?.is_empty(),
+        "the marker must be cleared once the retention succeeds"
     );
     Ok(())
 }
@@ -2801,7 +2784,7 @@ fn committed_txn_write_failure_pends_commit() -> Result<()> {
     let at = attempted.clone();
     let remotes_for_factory = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         FaultRemote::build_committed_fault(remotes_for_factory.join(&s.id), at.clone())
     };
@@ -2862,7 +2845,7 @@ fn commit_marker_write_failure_pends_commit() -> Result<()> {
     let at = attempted.clone();
     let remotes_for_factory = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         FaultRemote::build_commit_marker_fault(remotes_for_factory.join(&s.id), at.clone())
     };
@@ -2921,7 +2904,7 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
     let armed_for_factory = armed.clone();
     let rf = remotes_base.clone();
     let fault_factory = move |s: &deploy::config::ServerDef,
-                              _slot: &deploy::config::SlotDef|
+                              _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         FailOnceMarkerRemote::build(rf.join(&s.id), armed_for_factory.clone())
     };
@@ -2965,7 +2948,7 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
     // and finalize -- even though this push itself is an up-to-date no-op.
     let rf2 = remotes_base.clone();
     let clean_factory = move |s: &deploy::config::ServerDef,
-                              _slot: &deploy::config::SlotDef|
+                              _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf2.join(&s.id))?))
     };
@@ -2997,7 +2980,7 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
         "marker must carry the ORIGINAL pending attempt's deployment id"
     );
     assert_eq!(marker_json["committed"].as_bool(), Some(true));
-    let recorded_gen = &attempt1.desired[&PlacementSlotId::new("p1")].generation;
+    let recorded_gen = &attempt1.desired[&SlotId::new("p1")].generation;
     assert_eq!(
         marker_json["generation"].as_str().unwrap(),
         recorded_gen.as_str(),
@@ -3087,7 +3070,7 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
     let armed_for_factory = armed.clone();
     let rf = remotes_base.clone();
     let fault_factory = move |s: &deploy::config::ServerDef,
-                              _slot: &deploy::config::SlotDef|
+                              _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         FailOnceMarkerRemote::build(rf.join(&s.id), armed_for_factory.clone())
     };
@@ -3132,7 +3115,7 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
     // proceeds as a normal deployment of v2.
     let rf2 = remotes_base.clone();
     let clean_factory = move |s: &deploy::config::ServerDef,
-                              _slot: &deploy::config::SlotDef|
+                              _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf2.join(&s.id))?))
     };
@@ -3207,7 +3190,7 @@ fn conflicting_marker_on_main_push_is_degraded_not_pending() -> Result<()> {
     let armed_for_factory = armed.clone();
     let rf = remotes_base.clone();
     let conflict_factory = move |s: &deploy::config::ServerDef,
-                                 _slot: &deploy::config::SlotDef|
+                                 _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         ConflictingMarkerRemote::build(rf.join(&s.id), armed_for_factory.clone())
     };
@@ -3273,7 +3256,7 @@ fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result
     let armed_for_factory = armed.clone();
     let rf = remotes_base.clone();
     let fault_factory = move |s: &deploy::config::ServerDef,
-                              _slot: &deploy::config::SlotDef|
+                              _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         FailOnceMarkerRemote::build(rf.join(&s.id), armed_for_factory.clone())
     };
@@ -3317,7 +3300,7 @@ fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result
     // finalize attempt 1 as Degraded instead of leaving it pending forever.
     let rf2 = remotes_base.clone();
     let clean_factory = move |s: &deploy::config::ServerDef,
-                              _slot: &deploy::config::SlotDef|
+                              _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf2.join(&s.id))?))
     };
@@ -3358,7 +3341,7 @@ fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result
     // to Successful or grow the snapshot log — it stays Degraded.
     let rf3 = remotes_base.clone();
     let clean_factory3 = move |s: &deploy::config::ServerDef,
-                               _slot: &deploy::config::SlotDef|
+                               _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf3.join(&s.id))?))
     };
@@ -3424,12 +3407,12 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
         let artifacts = proj.join("releases").join("v1").join("artifacts");
         write_file(&artifacts.join("build/output/app/server"), "v1\n");
         write_file(&artifacts.join("deployment/common/README"), "common\n");
-        (Config::load(&p).unwrap(), p)
+        (ProjectConfig::load(&p).unwrap(), p)
     };
     let store = LocalStore::with_base(store_base.clone())?;
     let rf = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
     };
@@ -3448,7 +3431,7 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
-    let first = r0.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")].clone();
+    let first = r0.attempt.expect("attempt recorded").slots[&SlotId::new("p1")].clone();
     assert_eq!(first.artifact.variant.as_str(), "standard");
 
     // Capacity-only change: identical inputs except the server's `capacity`.
@@ -3459,7 +3442,7 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
     );
     assert_ne!(body, changed, "capacity line must be insertable");
     std::fs::write(&config_path, changed).unwrap();
-    let config2 = Config::load(&config_path)?;
+    let config2 = ProjectConfig::load(&config_path)?;
     assert_eq!(config2.servers[0].capacity.reserve_bytes, 4096);
 
     let r1 = push(
@@ -3505,7 +3488,7 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
             .join("build/output/app/server"),
         "v2\n",
     );
-    let config3 = Config::load(&config_path)?;
+    let config3 = ProjectConfig::load(&config_path)?;
     let r2 = push(
         &config_path,
         &store,
@@ -3519,7 +3502,7 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
         },
     )?;
     assert_eq!(r2.status, Some(DeploymentStatus::Successful));
-    let third = r2.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")].clone();
+    let third = r2.attempt.expect("attempt recorded").slots[&SlotId::new("p1")].clone();
 
     assert_ne!(
         third.artifact.release, first.artifact.release,
@@ -3550,12 +3533,12 @@ from = "artifacts/deployment/common/"
 to = "app-common/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 2
 
 [activation]
@@ -3613,12 +3596,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     write_file(&artifacts.join("build/output/app/server"), "v1\n");
     write_file(&artifacts.join("deployment/common/README"), "common\n");
     let config_path = proj.join("deploy.toml");
-    let config = Config::load(&config_path)?;
+    let config = ProjectConfig::load(&config_path)?;
 
     let store = LocalStore::with_base(store_base.clone())?;
     let rf = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
     };
@@ -3637,14 +3620,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
-    let first = r0.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")].clone();
+    let first = r0.attempt.expect("attempt recorded").slots[&SlotId::new("p1")].clone();
     let old_release = first.artifact.release.clone();
     let tree = first.artifact.tree.clone();
 
     // Slot-only change: rebind p1 to server-02. No content, mapping, behavior,
     // or capacity change anywhere else.
     write_variant_file(&proj, "standard", &slot_only_variant_body("server-02"));
-    let config2 = Config::load(&config_path)?;
+    let config2 = ProjectConfig::load(&config_path)?;
     let r1 = push(
         &config_path,
         &store,
@@ -3658,7 +3641,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-    let second = r1.attempt.expect("attempt").slots[&PlacementSlotId::new("p1")].clone();
+    let second = r1.attempt.expect("attempt").slots[&SlotId::new("p1")].clone();
     assert_ne!(
         second.artifact.release, old_release,
         "a slot-only change must produce a new release identity"
@@ -3720,12 +3703,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let artifacts = proj.join("releases").join("v1").join("artifacts");
     write_file(&artifacts.join("build/output/app/server"), "v1\n");
     write_file(&artifacts.join("deployment/common/README"), "common\n");
-    let config0 = Config::load(&config_path)?;
+    let config0 = ProjectConfig::load(&config_path)?;
 
     let store = LocalStore::with_base(store_base.clone())?;
     let rf = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
     };
@@ -3750,7 +3733,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         .deployment_id
         .as_str()
         .to_string();
-    let first = r0.attempt.expect("attempt").slots[&PlacementSlotId::new("p1")].clone();
+    let first = r0.attempt.expect("attempt").slots[&SlotId::new("p1")].clone();
     let old_release = first.artifact.release.clone();
     let old_tree = first.artifact.tree.clone();
 
@@ -3767,7 +3750,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &artifacts.join("deployment/variants/canary/extra"),
         "canary\n",
     );
-    let config1 = Config::load(&config_path)?;
+    let config1 = ProjectConfig::load(&config_path)?;
     assert_eq!(config1.slot_variant("p1").unwrap(), "canary");
     let r1 = push(
         &config_path,
@@ -3782,7 +3765,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-    let current = r1.attempt.expect("attempt").slots[&PlacementSlotId::new("p1")].clone();
+    let current = r1.attempt.expect("attempt").slots[&SlotId::new("p1")].clone();
     assert_eq!(current.artifact.variant.as_str(), "canary");
     assert_ne!(current.artifact.release, old_release);
 
@@ -3802,7 +3785,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(rh.status, Some(DeploymentStatus::Successful));
-    let hist = rh.attempt.expect("attempt").slots[&PlacementSlotId::new("p1")].clone();
+    let hist = rh.attempt.expect("attempt").slots[&SlotId::new("p1")].clone();
     assert_eq!(hist.artifact.release, old_release);
     assert_eq!(
         hist.artifact.variant.as_str(),
@@ -3828,9 +3811,9 @@ fn rollback_preflight_uses_current_server_capacity() -> Result<()> {
     let remotes_base = tmp.path().join("remotes");
     std::fs::create_dir_all(&remotes_base).unwrap();
 
-    // Aggressive rotation: after s1 only the newest tree stays on the server,
+    // Aggressive retention: after s1 only the newest tree stays on the server,
     // so the s0 rollback below must re-upload T0 and pass through preflight.
-    // The policy is the slot's OWNING VARIANT's (rotation lives in the
+    // The policy is the slot's OWNING VARIANT's (retention lives in the
     // variant file, never on the target).
     let deploy_toml = r#"
 schema_version = 2
@@ -3851,19 +3834,19 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &proj,
         "standard",
         &single_variant_body("true").replace(
-            "[rotation.per_server]\nkeep_distinct_artifacts = 5\nkeep_days = 14\nprotect_previous = true\n\n[rotation.deployment]\nprotect_deployments = 2",
-            "[rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = false\n\n[rotation.deployment]\nprotect_deployments = 1",
+            "[retention.per_server]\nkeep_distinct_artifacts = 5\nkeep_days = 14\nprotect_previous = true\n\n[retention.deployment]\nprotect_deployments = 2",
+            "[retention.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = false\n\n[retention.deployment]\nprotect_deployments = 1",
         ),
     );
     let artifacts = proj.join("releases").join("v1").join("artifacts");
     write_file(&artifacts.join("build/output/app/server"), "v1\n");
     write_file(&artifacts.join("deployment/common/README"), "common\n");
 
-    let config0 = Config::load(&config_path)?;
+    let config0 = ProjectConfig::load(&config_path)?;
     let store = LocalStore::with_base(store_base.clone())?;
     let rf = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
     };
@@ -3882,7 +3865,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
-    let t0 = r0.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")]
+    let t0 = r0.attempt.expect("attempt recorded").slots[&SlotId::new("p1")]
         .artifact
         .tree
         .clone();
@@ -3896,7 +3879,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .join("build/output/app/server"),
         "v2\n",
     );
-    let config1 = Config::load(&config_path)?;
+    let config1 = ProjectConfig::load(&config_path)?;
     let r1 = push(
         &config_path,
         &store,
@@ -3915,7 +3898,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .join("server-01/objects/sha256")
             .join(t0.as_str())
             .exists(),
-        "aggressive rotation must drop T0 from the server so the rollback re-uploads it"
+        "aggressive retention must drop T0 from the server so the rollback re-uploads it"
     );
     let current_before = std::fs::read_link(remotes_base.join("server-01/current"))?;
 
@@ -3928,7 +3911,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "user = \"deploy\"\ncapacity = { reserve_bytes = 1099511627776, reserve_percent = 0 }",
     );
     std::fs::write(&config_path, huge).unwrap();
-    let config_huge = Config::load(&config_path)?;
+    let config_huge = ProjectConfig::load(&config_path)?;
 
     let err = push(
         &config_path,
@@ -3960,7 +3943,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "capacity = { reserve_bytes = 0, reserve_percent = 0 }",
     );
     std::fs::write(&config_path, low).unwrap();
-    let config_low = Config::load(&config_path)?;
+    let config_low = ProjectConfig::load(&config_path)?;
     let r2 = push(
         &config_path,
         &store,
@@ -3980,7 +3963,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     );
     let observed = store.read_observed("production", &config0)?;
     assert_eq!(
-        observed.slots[&PlacementSlotId::new("p1")]
+        observed.slots[&SlotId::new("p1")]
             .artifact
             .as_ref()
             .map(|a| &a.tree),
@@ -4008,7 +3991,7 @@ fn dry_run_leaves_no_trace_fingerprint() -> Result<()> {
     let rb = root.join("remotes");
 
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rb.join(&s.id))?))
     };
@@ -4091,7 +4074,7 @@ fn dry_run_factory_failure_mutates_nothing() -> Result<()> {
     let store = LocalStore::with_base(root.join("store"))?;
 
     let factory = |_s: &deploy::config::ServerDef,
-                   _slot: &deploy::config::SlotDef|
+                   _slot: &deploy::config::SlotConfig|
      -> Result<Box<dyn Remote>> {
         Err(deploy::error::Error::remote("factory forced failure"))
     };
@@ -4138,7 +4121,7 @@ fn server_policy_change_does_not_change_release_identity() -> Result<()> {
     let store = LocalStore::with_base(store_base.clone())?;
     let rf = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
     };
@@ -4157,7 +4140,7 @@ fn server_policy_change_does_not_change_release_identity() -> Result<()> {
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
-    let first = r0.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")].clone();
+    let first = r0.attempt.expect("attempt recorded").slots[&SlotId::new("p1")].clone();
 
     // Policy-only change: identical inputs except the server's user + address.
     let body = std::fs::read_to_string(proj.join("deploy.toml"))?;
@@ -4169,7 +4152,7 @@ fn server_policy_change_does_not_change_release_identity() -> Result<()> {
         );
     assert_ne!(body, changed, "policy line must be replaceable");
     std::fs::write(proj.join("deploy.toml"), changed).unwrap();
-    let config2 = Config::load(&proj.join("deploy.toml"))?;
+    let config2 = ProjectConfig::load(&proj.join("deploy.toml"))?;
     assert_eq!(config2.servers[0].user, "deployer");
 
     let r1 = push(
@@ -4232,12 +4215,12 @@ from = "artifacts/deployment/common/"
 to = "app-common/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 2
 
 [activation]
@@ -4252,12 +4235,12 @@ interval_seconds = 0
 "#;
     write_variant_file(&proj, "mirror", mirror);
 
-    let config = Config::load(&proj.join("deploy.toml"))?;
+    let config = ProjectConfig::load(&proj.join("deploy.toml"))?;
     assert_eq!(config.variant_names().len(), 2);
     let store = LocalStore::with_base(store_base.clone())?;
     let rf = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
     };
@@ -4275,7 +4258,7 @@ interval_seconds = 0
         },
     )?;
     assert_eq!(r.status, Some(DeploymentStatus::Successful));
-    let slot = &r.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")];
+    let slot = &r.attempt.expect("attempt recorded").slots[&SlotId::new("p1")];
 
     // Both variants bind to the SAME tree digest in the release record.
     let rec = store.read_release(&slot.artifact.release)?;
@@ -4330,12 +4313,12 @@ from = "artifacts/build/output/"
 to = "app/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 2
 
 [activation]
@@ -4378,7 +4361,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let artifacts = proj.join("releases").join("v1").join("artifacts");
     write_file(&artifacts.join("build/output/app/server"), "server-v1\n");
 
-    let config = Config::load(&proj.join("deploy.toml"))?;
+    let config = ProjectConfig::load(&proj.join("deploy.toml"))?;
     // Each target owns exactly its own slot.
     assert_eq!(config.target_slot_ids("production")?, vec!["p1"]);
     assert_eq!(config.target_slot_ids("staging")?, vec!["p2"]);
@@ -4386,7 +4369,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let store = LocalStore::with_base(store_base.clone())?;
     let rf = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
     };
@@ -4406,7 +4389,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &push_opt("production"),
     )?;
     assert_eq!(rp.status, Some(DeploymentStatus::Successful));
-    let prod_slot = &rp.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")];
+    let prod_slot = &rp.attempt.expect("attempt recorded").slots[&SlotId::new("p1")];
     let prod_v1 = prod_slot.artifact.tree.clone();
     let prod_gen = prod_slot
         .generation
@@ -4417,7 +4400,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // carries p1's actual assignment, and staging's view is EMPTY (its own
     // slot p2 was never pushed — no cross-target propagation exists).
     let obs_prod = store.read_observed("production", &config)?;
-    let os = &obs_prod.slots[&PlacementSlotId::new("p1")];
+    let os = &obs_prod.slots[&SlotId::new("p1")];
     assert_eq!(
         os.artifact.as_ref().expect("observed artifact").tree,
         prod_v1,
@@ -4445,7 +4428,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &push_opt("staging"),
     )?;
     assert_eq!(rs.status, Some(DeploymentStatus::Successful));
-    let staging_slot = &rs.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p2")];
+    let staging_slot = &rs.attempt.expect("attempt recorded").slots[&SlotId::new("p2")];
     let staging_v2 = staging_slot.artifact.tree.clone();
     let staging_gen = staging_slot
         .generation
@@ -4462,14 +4445,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // has one owner): production's p1 still carries its own v1 assignment,
     // and staging's p2 carries its fresh v2 actual.
     let obs_prod = store.read_observed("production", &config)?;
-    let os = &obs_prod.slots[&PlacementSlotId::new("p1")];
+    let os = &obs_prod.slots[&SlotId::new("p1")];
     assert_eq!(
         os.artifact.as_ref().expect("observed artifact").tree,
         prod_v1,
         "production observed must be untouched by the staging push"
     );
     let obs_staging = store.read_observed("staging", &config)?;
-    let os = &obs_staging.slots[&PlacementSlotId::new("p2")];
+    let os = &obs_staging.slots[&SlotId::new("p2")];
     assert_eq!(
         os.artifact.as_ref().expect("observed artifact").tree,
         staging_v2,
@@ -4498,11 +4481,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(rrb_prod.status, Some(DeploymentStatus::Successful));
-    let restored_prod_slot =
-        &rrb_prod.attempt.expect("attempt recorded").slots[&PlacementSlotId::new("p1")];
+    let restored_prod_slot = &rrb_prod.attempt.expect("attempt recorded").slots[&SlotId::new("p1")];
     let restored_prod = store.read_observed("production", &config)?;
     assert_eq!(
-        restored_prod.slots[&PlacementSlotId::new("p1")]
+        restored_prod.slots[&SlotId::new("p1")]
             .artifact
             .as_ref()
             .unwrap()
@@ -4511,14 +4493,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "production rolled back to its own s0 tree"
     );
     assert_eq!(
-        restored_prod.slots[&PlacementSlotId::new("p1")].generation,
+        restored_prod.slots[&SlotId::new("p1")].generation,
         restored_prod_slot.generation,
         "production's observed generation is the actual restored generation"
     );
     // The production rollback does NOT touch staging's observed state.
     let obs_staging = store.read_observed("staging", &config)?;
     assert_eq!(
-        obs_staging.slots[&PlacementSlotId::new("p2")]
+        obs_staging.slots[&SlotId::new("p2")]
             .artifact
             .as_ref()
             .unwrap()
@@ -4542,7 +4524,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     assert_eq!(rrb_staging.status, Some(DeploymentStatus::Successful));
     let restored_staging = store.read_observed("staging", &config)?;
     assert_eq!(
-        restored_staging.slots[&PlacementSlotId::new("p2")]
+        restored_staging.slots[&SlotId::new("p2")]
             .artifact
             .as_ref()
             .unwrap()
@@ -4578,7 +4560,7 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
         .join("build/output/app/server");
     let rf = remotes_base.clone();
     let factory = move |s: &deploy::config::ServerDef,
-                        _slot: &deploy::config::SlotDef|
+                        _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
     };
@@ -4641,7 +4623,7 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
         )?;
         assert_eq!(r.status, Some(DeploymentStatus::Successful));
         let attempt = r.attempt.expect("attempt recorded");
-        let slot = &attempt.slots[&PlacementSlotId::new("p1")];
+        let slot = &attempt.slots[&SlotId::new("p1")];
         trees.push(slot.artifact.tree.clone());
         deploys.push(attempt.deployment_id.clone());
         releases.push(slot.artifact.release.clone());
@@ -4649,7 +4631,7 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
     let tree_at = |idx: usize| trees[idx].clone();
     let observed_tree = |store: &LocalStore| -> Result<Option<TreeDigest>> {
         Ok(
-            store.read_observed("production", &config)?.slots[&PlacementSlotId::new("p1")]
+            store.read_observed("production", &config)?.slots[&SlotId::new("p1")]
                 .artifact
                 .as_ref()
                 .map(|a| a.tree.clone()),

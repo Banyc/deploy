@@ -9,10 +9,10 @@
 //!    the file says — `known_hosts` and `host_key_fingerprint` as a plain
 //!    `Option` pair, activation as a bare `adapter` string — and refuse
 //!    unknown fields (`deny_unknown_fields`). They are crate-internal: the
-//!    only entry point into a validated configuration is [`Config::load`]
+//!    only entry point into a validated configuration is [`ProjectConfig::load`]
 //!    (parse -> convert) or the crate-internal conversion
-//!    [`Config::from_raw_parts`].
-//! 2. [`Config`] (`DomainConfig`) — the VALIDATED domain model, public but
+//!    [`ProjectConfig::from_raw_parts`].
+//! 2. [`ProjectConfig`] (`DomainConfig`) — the VALIDATED domain model, public but
 //!    privately constructed: the conversion performs every validity rule
 //!    (identifier validity, reference resolution, exactly-one host identity,
 //!    the activation adapter space, mapping collision rules, the schema
@@ -34,7 +34,7 @@
 //! `releases/<name>/artifacts/`. Capacity is a per-server policy declared on
 //! the server entry. Servers and targets are declared once at the top level of
 //! `deploy.toml`; targets carry ROLLOUT only, and their member slots are
-//! DERIVED from the slots' `target` fields. Retention (rotation) is owned by
+//! DERIVED from the slots' `target` fields. Retention is owned by
 //! the SLOT, resolved from the slot's OWNING VARIANT file (the `*.toml` that
 //! declares the slot's `[[slots]]` entry) — one policy per slot, never a
 //! per-target policy union.
@@ -46,7 +46,7 @@
 //! slot id), and every declared variant's tree binding.
 
 use crate::error::{Error, Result};
-use crate::model::{CONFIG_SCHEMA_VERSION, PlacementSlotId, ServerId};
+use crate::model::{CONFIG_SCHEMA_VERSION, ServerId, SlotId};
 use crate::records::PhysicalBinding;
 use crate::scalar::{
     AbsoluteDeployDir, ApplicationName, BatchSize, CapacityPercent, GroupName, Identifier,
@@ -237,7 +237,7 @@ pub struct CapacityConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
-pub struct PerServerRotation {
+pub struct PerServerRetention {
     #[serde(default = "default_keep_distinct")]
     pub keep_distinct_artifacts: u32,
     #[serde(default = "default_keep_days")]
@@ -255,7 +255,7 @@ fn default_keep_days() -> u64 {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
-pub struct DeploymentRotation {
+pub struct DeploymentRetention {
     #[serde(default)]
     pub protect_deployments: u32,
 }
@@ -268,15 +268,15 @@ pub struct DeploymentRotation {
 /// change retention.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
-pub struct RotationConfig {
+pub struct RetentionConfig {
     #[serde(default)]
-    pub per_server: PerServerRotation,
+    pub per_server: PerServerRetention,
     #[serde(default)]
-    pub deployment: DeploymentRotation,
+    pub deployment: DeploymentRetention,
 }
 
 /// Durable protection for one whole release: every variant's artifact in the
-/// pinned release is retained forever; rotation never sweeps it.
+/// pinned release is retained forever; retention never sweeps it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Pin {
@@ -290,8 +290,8 @@ pub struct Pin {
 /// The name carries the single-directory-component invariant
 /// ([`ReleaseName::parse`] is the production constructor; the raw
 /// deserialization path is re-validated by the raw -> domain conversion and by
-/// [`Config::with_release`], so an invalid name can never enter a validated
-/// [`Config`]).
+/// [`ProjectConfig::with_release`], so an invalid name can never enter a validated
+/// [`ProjectConfig`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct ReleaseName(String);
@@ -301,7 +301,7 @@ impl ReleaseName {
     /// (the forced structure is `<project>/releases/<name>/`), so the name
     /// can never escape the release directory. This is the PRODUCTION
     /// constructor for a validated release name; the deserialization path
-    /// stays raw and the conversion / [`Config::with_release`] re-validate.
+    /// stays raw and the conversion / [`ProjectConfig::with_release`] re-validate.
     pub fn parse(s: &str) -> Result<ReleaseName> {
         validate_release_name(s)?;
         Ok(ReleaseName(s.to_string()))
@@ -328,8 +328,8 @@ impl fmt::Display for ReleaseName {
 /// A release name must be exactly ONE directory component (the forced
 /// structure is `<project>/releases/<name>/<variant>.toml`), so it can never
 /// escape the release directory. Shared by the raw -> domain conversion
-/// ([`Config::try_from`]), [`ReleaseName::parse`], and the validated
-/// release-switch operation [`Config::with_release`].
+/// ([`ProjectConfig::try_from`]), [`ReleaseName::parse`], and the validated
+/// release-switch operation [`ProjectConfig::with_release`].
 fn validate_release_name(name: &str) -> Result<()> {
     let single_component = matches!(
         Path::new(name).components().collect::<Vec<_>>().as_slice(),
@@ -528,10 +528,10 @@ fn default_ssh_port() -> u16 {
 /// This is both the raw serialization shape of a slot and the domain record:
 /// its validity (id non-empty/unique, references resolvable, groups clean,
 /// location unique) is enforced by the raw -> domain conversion; a slot can
-/// never enter a [`Config`] graph except through that conversion.
+/// never enter a [`ProjectConfig`] graph except through that conversion.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct SlotDef {
+pub struct SlotConfig {
     pub id: String,
     /// The ID of the top-level server this slot deploys onto.
     pub server: String,
@@ -540,7 +540,7 @@ pub struct SlotDef {
     pub deploy_dir: PathBuf,
     /// The slot's EXACTLY ONE owning target: a physical slot has one owner
     /// that governs its history, checkpoints, observed state, rollout
-    /// policy, and rotation policy. Required and must reference an existing
+    /// policy, and retention policy. Required and must reference an existing
     /// top-level `[targets.<name>]` key. TOML form: `target = "production"`.
     pub target: String,
     /// The rollout groups this slot belongs to, scoped to its owning target:
@@ -557,12 +557,12 @@ pub struct SlotDef {
 
 /// The DOMAIN target: ROLLOUT behavior only (batch_size, stop_on_failure,
 /// failure_policy). Retention is NOT a target surface: a slot's retention
-/// comes from its owning variant (see [`VariantConfig::rotation`]), so a
+/// comes from its owning variant (see [`VariantConfig::retention`]), so a
 /// target that shares a slot with other targets can never change that slot's
 /// policy. Built ONLY by the raw -> domain conversion; the raw serialization
-/// shape is [`raw::RawTargetDef`] (bare integer batch size).
+/// shape is [`raw::RawTargetConfig`] (bare integer batch size).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TargetDef {
+pub struct TargetConfig {
     pub rollout: RolloutConfig,
 }
 
@@ -570,7 +570,7 @@ pub struct TargetDef {
 // The RAW layer: exactly the serialized shapes, nothing else.
 // `deny_unknown_fields` makes the parse gate fail closed, and the conversion
 // makes the domain gate fail closed. These types are crate-internal: callers
-// reach the validated domain through [`Config::load`].
+// reach the validated domain through [`ProjectConfig::load`].
 // ---------------------------------------------------------------------------
 
 pub(crate) mod raw {
@@ -579,7 +579,7 @@ pub(crate) mod raw {
     /// The raw `deploy.toml` manifest shape. Holds whatever the file says —
     /// `known_hosts`/`host_key_fingerprint` as a plain option pair, no
     /// validation, unknown fields refused at parse. Converted to the
-    /// validated [`DomainConfig`] by [`super::Config::from_raw_parts`].
+    /// validated [`DomainConfig`] by [`super::ProjectConfig::from_raw_parts`].
     #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     pub(crate) struct RawConfig {
@@ -589,7 +589,7 @@ pub(crate) mod raw {
         #[serde(default)]
         pub pins: Vec<Pin>,
         pub servers: Vec<RawServer>,
-        pub targets: BTreeMap<String, RawTargetDef>,
+        pub targets: BTreeMap<String, RawTargetConfig>,
     }
 
     /// One raw `[[servers]]` entry: the raw host-identity option PAIR. The
@@ -628,12 +628,12 @@ pub(crate) mod raw {
 
     /// The raw `[targets.<name>]` entry: rollout with a BARE integer
     /// `batch_size`. The conversion parses it into the validated NONZERO
-    /// [`super::BatchSize`] and builds the domain [`super::TargetDef`]; the
+    /// [`super::BatchSize`] and builds the domain [`super::TargetConfig`]; the
     /// raw shape keeps the bare integer so an arbitrary (including zero)
     /// value remains constructible for the fail-closed property.
     #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
     #[serde(deny_unknown_fields)]
-    pub(crate) struct RawTargetDef {
+    pub(crate) struct RawTargetConfig {
         #[serde(default)]
         pub rollout: RawRolloutConfig,
     }
@@ -679,9 +679,9 @@ pub(crate) mod raw {
         pub activation: ActivationConfig,
         pub verification: VerificationConfig,
         #[serde(default)]
-        pub slots: Vec<SlotDef>,
+        pub slots: Vec<SlotConfig>,
         #[serde(default)]
-        pub rotation: RotationConfig,
+        pub retention: RetentionConfig,
     }
 
     impl RawConfig {
@@ -920,8 +920,8 @@ impl ServerDef {
 
 /// A validated per-variant deployment policy: artifact mappings, the typed
 /// activation enum, verification, the variant's slot declarations, and its
-/// slot-owned rotation policy. Obtained only through the raw -> domain
-/// conversion (or [`Config::variant`]).
+/// slot-owned retention policy. Obtained only through the raw -> domain
+/// conversion (or [`ProjectConfig::variant`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VariantConfig {
     pub description: Option<String>,
@@ -932,11 +932,11 @@ pub struct VariantConfig {
     pub verification: VerificationConfig,
     /// This variant's deployment slots, declared inside its own file. The
     /// declaring variant file is the slot's variant binding.
-    pub slots: Vec<SlotDef>,
-    /// The retention policy applied on every rotation of EVERY slot this
+    pub slots: Vec<SlotConfig>,
+    /// The retention policy applied on every retention pass of EVERY slot this
     /// variant file declares. A slot's owning variant is its SINGLE retention
     /// source.
-    pub rotation: RotationConfig,
+    pub retention: RetentionConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -944,15 +944,15 @@ pub struct VariantConfig {
 // ---------------------------------------------------------------------------
 
 /// The validated domain configuration. Privately constructed: the ONLY ways
-/// to obtain a [`Config`] are [`Config::load`] (parse + discover + convert)
-/// and the crate-internal conversion [`Config::from_raw_parts`], both of
+/// to obtain a [`ProjectConfig`] are [`ProjectConfig::load`] (parse + discover + convert)
+/// and the crate-internal conversion [`ProjectConfig::from_raw_parts`], both of
 /// which run the full validation and fail closed on any invalid input. The
 /// variants map is private, so a hand-built graph cannot enter the domain.
 ///
 /// IMMUTABLE VALIDATED DOMAIN: the invariant-bearing fields are private and
-/// read-only ([`Config::schema_version`], [`Config::release`]); the ONLY
-/// mutation path is a VALIDATED operation returning a NEW [`Config`] —
-/// [`Config::with_release`] (re-validates the release-name invariant; the
+/// read-only ([`ProjectConfig::schema_version`], [`ProjectConfig::release`]); the ONLY
+/// mutation path is a VALIDATED operation returning a NEW [`ProjectConfig`] —
+/// [`ProjectConfig::with_release`] (re-validates the release-name invariant; the
 /// original is never mutated). Fields without invariants (application, pins,
 /// servers, targets) stay public per the "don't overdo" rule — their inner
 /// invariant-bearing fields (e.g. [`ServerDef`]'s host identity) are already
@@ -961,11 +961,11 @@ pub struct VariantConfig {
 /// The name [`DomainConfig`] aliases this type (the two-layer story: raw
 /// serde shapes -> validated domain).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Config {
+pub struct ProjectConfig {
     /// The configuration format version this config was validated as: ALWAYS
     /// [`CONFIG_SCHEMA_VERSION`] by construction (the raw -> domain
     /// conversion refuses any other value). Private + read-only
-    /// ([`Config::schema_version`]): the format identity is invariant.
+    /// ([`ProjectConfig::schema_version`]): the format identity is invariant.
     schema_version: u32,
     /// The deployment application name: a validated NON-EMPTY [`ApplicationName`]
     /// parsed by the raw -> domain conversion (an empty or whitespace-only
@@ -974,38 +974,38 @@ pub struct Config {
     /// The active release: the name of a directory directly beneath
     /// `releases/` in the project root (`release: v1` -> `releases/v1/`).
     /// INVARIANT-BEARING (a single directory component) — private and
-    /// read-only ([`Config::release`]); change it through the validated
-    /// [`Config::with_release`] operation, which returns a NEW [`Config`].
+    /// read-only ([`ProjectConfig::release`]); change it through the validated
+    /// [`ProjectConfig::with_release`] operation, which returns a NEW [`ProjectConfig`].
     release: ReleaseName,
-    /// Durable retention pins applied on every rotation.
+    /// Durable retention pins applied on every retention pass.
     pub pins: Vec<Pin>,
     /// Every validated server; a server's host identity is exactly one form
     /// by construction ([`ServerDef::host_identity`]).
     pub servers: Vec<ServerDef>,
-    pub targets: BTreeMap<String, TargetDef>,
+    pub targets: BTreeMap<String, TargetConfig>,
     /// Validated variants, keyed by name. Private: the domain graph cannot
     /// be hand-built — variants only enter through the conversion.
     variants: BTreeMap<String, VariantConfig>,
 }
 
-/// The validated domain model (alias of [`Config`]): the public name of the
-/// layer that the engine, planner, rotation, and mapper consume.
-pub type DomainConfig = Config;
+/// The validated domain model (alias of [`ProjectConfig`]): the public name of the
+/// layer that the engine, planner, retention, and mapper consume.
+pub type DomainConfig = ProjectConfig;
 
-impl Config {
+impl ProjectConfig {
     /// Load and validate a configuration from a `deploy.toml` path. The
     /// project root is the directory containing the file. Variant files are
     /// discovered inside `<project>/releases/<release>/` (the release
     /// directory named by `release:`), parsed into the raw layer, and the
     /// whole raw input is converted into the validated domain — any invalid
     /// identifier, reference, or option combination fails the load.
-    pub fn load(path: &Path) -> Result<Config> {
+    pub fn load(path: &Path) -> Result<ProjectConfig> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| Error::config(format!("reading {}: {e}", path.display())))?;
         let manifest: raw::RawConfig = toml::from_str(&text)
             .map_err(|e| Error::config(format!("parsing deploy.toml: {e}")))?;
         let variants = manifest.load_variant_files(path)?;
-        Config::from_raw_parts(manifest, variants)
+        ProjectConfig::from_raw_parts(manifest, variants)
     }
 
     /// Total-fail-closed conversion of the raw deserialized input: every
@@ -1014,12 +1014,12 @@ impl Config {
     /// scoping, exactly-one host identity, the activation enum, mapping
     /// collision detection) is checked here and ANY violation rejects the
     /// conversion. Crate-internal: the raw layer is private, so the public
-    /// entry to a validated domain is [`Config::load`].
+    /// entry to a validated domain is [`ProjectConfig::load`].
     pub(crate) fn from_raw_parts(
         manifest: raw::RawConfig,
         variants: BTreeMap<String, raw::RawVariant>,
-    ) -> Result<Config> {
-        Config::try_from(RawProject { manifest, variants })
+    ) -> Result<ProjectConfig> {
+        ProjectConfig::try_from(RawProject { manifest, variants })
     }
 
     pub fn project_root(&self, config_path: &Path) -> PathBuf {
@@ -1040,22 +1040,22 @@ impl Config {
     /// The active release: the name of a directory directly beneath
     /// `releases/` in the project root. Read-only accessor: the release is
     /// an invariant-bearing field (a single directory component); change it
-    /// through the validated [`Config::with_release`] operation, never by
+    /// through the validated [`ProjectConfig::with_release`] operation, never by
     /// assignment.
     pub fn release(&self) -> &ReleaseName {
         &self.release
     }
 
-    /// The VALIDATED release-switch operation: returns a NEW [`Config`]
+    /// The VALIDATED release-switch operation: returns a NEW [`ProjectConfig`]
     /// whose active release is `release`, re-validating the invariant (the
     /// name must be exactly one directory component; otherwise `Err` and the
     /// original is unchanged — the operation never mutates). All other
     /// fields are carried over unchanged: variants, servers, targets, pins,
     /// and the schema identity are already validated, and the single
     /// directory-component rule is the only release-name invariant.
-    pub fn with_release(self, release: ReleaseName) -> Result<Config> {
+    pub fn with_release(self, release: ReleaseName) -> Result<ProjectConfig> {
         validate_release_name(release.as_str())?;
-        Ok(Config { release, ..self })
+        Ok(ProjectConfig { release, ..self })
     }
 
     /// Absolute release directory: forced to `<project>/releases/<release>`.
@@ -1087,7 +1087,7 @@ impl Config {
     /// `[[slots]]` entries in deterministic order — variants in name order
     /// (the `BTreeMap` is already sorted), then each variant's slots in file
     /// order.
-    pub fn slot_defs(&self) -> Vec<&SlotDef> {
+    pub fn slot_defs(&self) -> Vec<&SlotConfig> {
         self.variants
             .values()
             .flat_map(|v| v.slots.iter())
@@ -1108,14 +1108,14 @@ impl Config {
         )))
     }
 
-    /// The slot's ONE retention policy: the rotation config of the slot's
+    /// The slot's ONE retention policy: the retention config of the slot's
     /// OWNING VARIANT (the file that declares the slot). Retention is
     /// slot-owned — a shared slot's policy is resolved here, from a single
     /// source, regardless of how many targets the slot is a member of, so
     /// membership changes never change retention.
-    pub fn slot_rotation(&self, slot_id: &str) -> Result<&RotationConfig> {
+    pub fn slot_retention(&self, slot_id: &str) -> Result<&RetentionConfig> {
         let variant_name = self.slot_variant(slot_id)?;
-        Ok(&self.variant(variant_name)?.rotation)
+        Ok(&self.variant(variant_name)?.retention)
     }
 
     /// Resolve a target's member slots, pairing each slot with its declared
@@ -1123,7 +1123,7 @@ impl Config {
     /// (targets do not list their slots): every slot whose ONE owning
     /// `target` equals `target_name`, in deterministic order — variants in
     /// name order, then each variant's slots in file order.
-    pub fn target_slots(&self, target_name: &str) -> Result<Vec<(&SlotDef, &ServerDef)>> {
+    pub fn target_slots(&self, target_name: &str) -> Result<Vec<(&SlotConfig, &ServerDef)>> {
         self.targets
             .get(target_name)
             .ok_or_else(|| Error::not_found(format!("target '{target_name}'")))?;
@@ -1150,16 +1150,16 @@ impl Config {
     /// Resolve the slots of `target_name` selected by a rollout group: every
     /// slot whose ONE owning `target` equals `target_name` AND whose `groups`
     /// list contains `group`, in the same deterministic order as
-    /// [`Config::target_slots`]. An unknown group, or a group selecting zero
+    /// [`ProjectConfig::target_slots`]. An unknown group, or a group selecting zero
     /// slots, is a configuration error (the caller's current configuration is
     /// the selection source, including for historical references).
     pub fn target_group_slots(
         &self,
         target_name: &str,
         group: &str,
-    ) -> Result<Vec<(&SlotDef, &ServerDef)>> {
+    ) -> Result<Vec<(&SlotConfig, &ServerDef)>> {
         let all = self.target_slots(target_name)?;
-        let selected: Vec<(&SlotDef, &ServerDef)> = all
+        let selected: Vec<(&SlotConfig, &ServerDef)> = all
             .into_iter()
             .filter(|(slot, _)| slot.groups.iter().any(|g| g == group))
             .collect();
@@ -1172,7 +1172,7 @@ impl Config {
     }
 
     /// The slot IDs of a target's members, in the same deterministic order as
-    /// [`Config::target_slots`].
+    /// [`ProjectConfig::target_slots`].
     pub fn target_slot_ids(&self, target_name: &str) -> Result<Vec<String>> {
         Ok(self
             .target_slots(target_name)?
@@ -1193,13 +1193,13 @@ impl Config {
     pub fn target_slot_bindings(
         &self,
         target_name: &str,
-    ) -> Result<BTreeMap<PlacementSlotId, PhysicalBinding>> {
+    ) -> Result<BTreeMap<SlotId, PhysicalBinding>> {
         Ok(self
             .target_slots(target_name)?
             .into_iter()
             .map(|(slot, server)| {
                 (
-                    PlacementSlotId::new(slot.id.clone()),
+                    SlotId::new(slot.id.clone()),
                     PhysicalBinding {
                         server: ServerId::new(server.id.as_str().to_string()),
                         deploy_dir: slot.deploy_dir.to_string_lossy().into_owned(),
@@ -1241,10 +1241,10 @@ fn valid_identifier(id: &str) -> bool {
 /// * group names (non-empty, unique per slot), deploy_dir absoluteness,
 /// * one-slot-per-server-per-target, a target without slots, duplicate
 ///   (server, deploy_dir) locations, mapping destination collisions.
-impl TryFrom<RawProject> for Config {
+impl TryFrom<RawProject> for ProjectConfig {
     type Error = Error;
 
-    fn try_from(project: RawProject) -> Result<Config> {
+    fn try_from(project: RawProject) -> Result<ProjectConfig> {
         let RawProject { manifest, variants } = project;
 
         // The schema version is a hard gate: an unrecognized version is
@@ -1359,7 +1359,7 @@ impl TryFrom<RawProject> for Config {
                     activation,
                     verification: variant.verification.clone(),
                     slots: variant.slots.clone(),
-                    rotation: variant.rotation.clone(),
+                    retention: variant.retention.clone(),
                 },
             );
         }
@@ -1531,7 +1531,7 @@ impl TryFrom<RawProject> for Config {
                 })?;
             domain_targets.insert(
                 tname.clone(),
-                TargetDef {
+                TargetConfig {
                     rollout: RolloutConfig {
                         batch_size,
                         stop_on_failure: raw_target.rollout.stop_on_failure,
@@ -1567,7 +1567,7 @@ impl TryFrom<RawProject> for Config {
             }
         }
 
-        Ok(Config {
+        Ok(ProjectConfig {
             schema_version: manifest.schema_version,
             application,
             release: manifest.release,
@@ -1711,7 +1711,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml).unwrap();
         assert!(
-            Config::load(&p).is_err(),
+            ProjectConfig::load(&p).is_err(),
             "escaping mapping `to` must be rejected"
         );
     }
@@ -1754,7 +1754,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
              [verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
         )
         .unwrap();
-        let err = Config::load(&p).expect_err("identical destinations must be rejected");
+        let err = ProjectConfig::load(&p).expect_err("identical destinations must be rejected");
         assert!(
             err.to_string().contains("overlap"),
             "error must name the overlap, got: {err}"
@@ -1769,7 +1769,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
              [verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
         )
         .unwrap();
-        let err = Config::load(&p).expect_err("nested destinations must be rejected");
+        let err = ProjectConfig::load(&p).expect_err("nested destinations must be rejected");
         assert!(
             err.to_string().contains("overlap"),
             "error must name the overlap, got: {err}"
@@ -1784,7 +1784,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
              [verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
         )
         .unwrap();
-        Config::load(&p).expect("non-overlapping destinations load");
+        ProjectConfig::load(&p).expect("non-overlapping destinations load");
     }
 
     #[test]
@@ -1809,12 +1809,12 @@ from = "build/output/"
 to = "app/"
 recursive = true
 
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 5
 keep_days = 14
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 2
 
 [activation]
@@ -1868,13 +1868,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml).unwrap();
 
-        let cfg = Config::load(&p).expect("config loads with sibling variant files");
+        let cfg = ProjectConfig::load(&p).expect("config loads with sibling variant files");
         // Retention is SLOT-OWNED: the policy lives on the owning variant
         // (`standard` declares slot `p1`), never on the target.
         assert_eq!(
             cfg.variant("standard")
                 .unwrap()
-                .rotation
+                .retention
                 .per_server
                 .keep_distinct_artifacts,
             5
@@ -1882,18 +1882,18 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(
             cfg.variant("standard")
                 .unwrap()
-                .rotation
+                .retention
                 .deployment
                 .protect_deployments,
             2
         );
         assert_eq!(
-            cfg.slot_rotation("p1")
+            cfg.slot_retention("p1")
                 .unwrap()
                 .per_server
                 .keep_distinct_artifacts,
             5,
-            "slot_rotation resolves the owning variant's policy"
+            "slot_retention resolves the owning variant's policy"
         );
         let names = cfg.variant_names();
         assert_eq!(names.len(), 2);
@@ -1956,12 +1956,12 @@ deploy_dir = "/srv/forced"
     /// source for its declared slot `p1` (a slot's owning variant owns its
     /// policy; targets carry rollout only).
     const STANDARD_ROTATION: &str = r#"
-[rotation.per_server]
+[retention.per_server]
 keep_distinct_artifacts = 1
 keep_days = 0
 protect_previous = true
 
-[rotation.deployment]
+[retention.deployment]
 protect_deployments = 1
 "#;
 
@@ -1988,7 +1988,7 @@ rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_
         let release_dir = project.join("releases").join(release);
         std::fs::create_dir_all(&release_dir).unwrap();
         // The standard variant file declares the `p1` slot the `deploy_toml()`
-        // target references AND owns its retention policy (rotation lives in
+        // target references AND owns its retention policy (retention lives in
         // the variant file, not on the target).
         std::fs::write(
             release_dir.join("standard.toml"),
@@ -2016,7 +2016,7 @@ rollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = "rollback_
 
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml("v1")).unwrap();
-        let cfg = Config::load(&p).expect("config loads from the forced structure");
+        let cfg = ProjectConfig::load(&p).expect("config loads from the forced structure");
         assert_eq!(cfg.release().as_str(), "v1");
         assert_eq!(
             cfg.variant_names(),
@@ -2056,7 +2056,7 @@ slots = ["p1"]
 "#;
         let p = project.join("deploy.toml");
         std::fs::write(&p, legacy_toml).unwrap();
-        let err = Config::load(&p).expect_err("old release map form must be rejected");
+        let err = ProjectConfig::load(&p).expect_err("old release map form must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("release: <name>"),
@@ -2074,7 +2074,7 @@ slots = ["p1"]
             let p = project.join("deploy.toml");
             std::fs::write(&p, deploy_toml(bad)).unwrap();
             assert!(
-                Config::load(&p).is_err(),
+                ProjectConfig::load(&p).is_err(),
                 "release name '{bad}' must be rejected"
             );
         }
@@ -2087,7 +2087,7 @@ slots = ["p1"]
         std::fs::create_dir_all(&project).unwrap();
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml("v9")).unwrap();
-        let err = Config::load(&p).expect_err("missing release dir must fail");
+        let err = ProjectConfig::load(&p).expect_err("missing release dir must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("releases/v9") || msg.contains("releases") && msg.contains("v9"),
@@ -2103,7 +2103,7 @@ slots = ["p1"]
         std::fs::create_dir_all(project.join("releases/v1")).unwrap();
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml("v1")).unwrap();
-        let err = Config::load(&p).expect_err("empty release dir must fail");
+        let err = ProjectConfig::load(&p).expect_err("empty release dir must fail");
         assert!(
             err.to_string().contains("no variants"),
             "error must mention the missing variant files, got: {err}"
@@ -2126,7 +2126,7 @@ slots = ["p1"]
             "{MINIMAL_VARIANT}\n[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntarget = \"ghost\"\ndeploy_dir = \"/srv/forced\"\n"
         );
         std::fs::write(project.join("releases/v1/standard.toml"), bad_variant).unwrap();
-        let err = Config::load(&p).expect_err("unknown target reference must fail");
+        let err = ProjectConfig::load(&p).expect_err("unknown target reference must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("references unknown target 'ghost'") && msg.contains("variant 'standard'"),
@@ -2154,7 +2154,7 @@ slots = ["p1"]
         std::fs::write(project.join("releases/v1/standard.toml"), standard_toml).unwrap();
         let t2 = "\n[targets.t2]\nrollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }\n";
         std::fs::write(&p, format!("{}{}", deploy_toml("v1"), t2)).unwrap();
-        let cfg = Config::load(&p).expect("slots spread across targets are valid");
+        let cfg = ProjectConfig::load(&p).expect("slots spread across targets are valid");
         assert_eq!(cfg.targets.len(), 2);
         assert_eq!(cfg.slot_defs().len(), 2);
         // Membership is derived from each slot's declared targets list.
@@ -2167,7 +2167,7 @@ slots = ["p1"]
             "{MINIMAL_VARIANT}\n[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntarget = \"t1\"\ngroups = [\"canary\"]\ndeploy_dir = \"/srv/forced\"\n\n[[slots]]\nid = \"p2\"\nserver = \"s1\"\ntarget = \"t2\"\ndeploy_dir = \"/srv/forced-2\"\n"
         );
         std::fs::write(project.join("releases/v1/standard.toml"), grouped).unwrap();
-        let cfg = Config::load(&p).expect("a slot with a rollout group is valid");
+        let cfg = ProjectConfig::load(&p).expect("a slot with a rollout group is valid");
         assert_eq!(cfg.target_slot_ids("t1").unwrap(), vec!["p1"]);
         assert_eq!(
             cfg.target_group_slots("t1", "canary").unwrap().len(),
@@ -2182,7 +2182,7 @@ slots = ["p1"]
         // A target with NO member slot is rejected.
         let t3 = "\n[targets.t3]\nrollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }\n";
         std::fs::write(&p, format!("{}{}{}", deploy_toml("v1"), t2, t3)).unwrap();
-        let err = Config::load(&p).expect_err("target without slots must fail");
+        let err = ProjectConfig::load(&p).expect_err("target without slots must fail");
         assert!(
             err.to_string().contains("target 't3' has no slots"),
             "error must name the empty target, got: {err}"
@@ -2206,7 +2206,7 @@ slots = ["p1"]
             "{MINIMAL_VARIANT}\n[[slots]]\nid = \"p1\"\nserver = \"s1\"\ndeploy_dir = \"/srv/forced\"\n"
         );
         std::fs::write(project.join("releases/v1/standard.toml"), no_target).unwrap();
-        let err = Config::load(&p).expect_err("slot without a target must fail");
+        let err = ProjectConfig::load(&p).expect_err("slot without a target must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("missing field `target`") && msg.contains("variant 'standard'"),
@@ -2233,7 +2233,7 @@ slots = ["p1"]
             "{MINIMAL_VARIANT}\n[[slots]]\nid = \"p1\"\nserver = \"ghost\"\ntarget = \"t1\"\ndeploy_dir = \"/srv/forced\"\n"
         );
         std::fs::write(project.join("releases/v1/standard.toml"), bad_variant).unwrap();
-        let err = Config::load(&p).expect_err("slot with unknown server must fail");
+        let err = ProjectConfig::load(&p).expect_err("slot with unknown server must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("references unknown server 'ghost'") && msg.contains("variant 'standard'"),
@@ -2247,7 +2247,7 @@ slots = ["p1"]
             format!("{MINIMAL_VARIANT}\n{STANDARD_SLOTS}"),
         )
         .unwrap();
-        let cfg = Config::load(&p).unwrap();
+        let cfg = ProjectConfig::load(&p).unwrap();
         assert_eq!(cfg.slot_variant("p1").unwrap(), "standard");
         assert!(cfg.slot_variant("ghost-slot").is_err());
     }
@@ -2264,7 +2264,7 @@ slots = ["p1"]
         std::fs::write(project.join("releases/v1/high-capacity.toml"), dup).unwrap();
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml("v1")).unwrap();
-        let err = Config::load(&p).expect_err("duplicate slot id across variants must fail");
+        let err = ProjectConfig::load(&p).expect_err("duplicate slot id across variants must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("duplicate slot id 'p1'") && msg.contains("variant 'standard'"),
@@ -2286,7 +2286,7 @@ slots = ["p1"]
         std::fs::write(project.join("releases/v1/standard.toml"), dup).unwrap();
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml("v1")).unwrap();
-        let err = Config::load(&p).expect_err("duplicate group name in a slot must fail");
+        let err = ProjectConfig::load(&p).expect_err("duplicate group name in a slot must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("duplicate group 'canary'") && msg.contains("slot 'p1'"),
@@ -2309,7 +2309,7 @@ slots = ["p1"]
         );
         std::fs::write(project.join("releases/v1/standard.toml"), dup).unwrap();
         std::fs::write(&p, deploy_toml("v1")).unwrap();
-        let err = Config::load(&p).expect_err("shared server+deploy_dir must fail");
+        let err = ProjectConfig::load(&p).expect_err("shared server+deploy_dir must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("same location") && msg.contains("p1") && msg.contains("p2"),
@@ -2331,7 +2331,7 @@ slots = ["p1"]
         std::fs::write(project.join("releases/v1/other.toml"), other).unwrap();
         let t2 = "\n[targets.t2]\nrollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }\n";
         std::fs::write(&p, format!("{}{}", deploy_toml("v1"), t2)).unwrap();
-        let cfg = Config::load(&p).expect("distinct deploy_dir on the same server is valid");
+        let cfg = ProjectConfig::load(&p).expect("distinct deploy_dir on the same server is valid");
         assert_eq!(cfg.slot_defs().len(), 2);
     }
 
@@ -2347,7 +2347,7 @@ slots = ["p1"]
         toml = toml.replacen("[targets.t1]", &format!("{dup}[targets.t1]"), 1);
         let p = project.join("deploy.toml");
         std::fs::write(&p, toml).unwrap();
-        let err = Config::load(&p).expect_err("duplicate server id must fail");
+        let err = ProjectConfig::load(&p).expect_err("duplicate server id must fail");
         assert!(
             err.to_string().contains("duplicate server id 's1'"),
             "error must name the duplicated id, got: {err}"
@@ -2364,7 +2364,7 @@ slots = ["p1"]
 
         // Omitted capacity defaults to 0/0.
         std::fs::write(&p, deploy_toml("v1")).unwrap();
-        let cfg = Config::load(&p).expect("server without capacity loads");
+        let cfg = ProjectConfig::load(&p).expect("server without capacity loads");
         assert_eq!(cfg.servers[0].capacity, CapacityConfig::default());
 
         // reserve_percent above 100 is rejected at load time.
@@ -2373,7 +2373,7 @@ slots = ["p1"]
             "user = \"u\"\ncapacity = { reserve_bytes = 1, reserve_percent = 101 }",
         );
         std::fs::write(&p, bad).unwrap();
-        let err = Config::load(&p).expect_err("reserve_percent > 100 must fail");
+        let err = ProjectConfig::load(&p).expect_err("reserve_percent > 100 must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("reserve_percent must be within 0..=100") && msg.contains("server 's1'"),
@@ -2386,7 +2386,7 @@ slots = ["p1"]
             "user = \"u\"\ncapacity = { reserve_bytes = 4096, reserve_percent = 10 }\nhost_key_fingerprint",
         );
         std::fs::write(&p, ok).unwrap();
-        let cfg = Config::load(&p).expect("inline server capacity parses");
+        let cfg = ProjectConfig::load(&p).expect("inline server capacity parses");
         assert_eq!(cfg.servers[0].capacity.reserve_bytes, 4096);
         assert_eq!(cfg.servers[0].capacity.reserve_percent.get(), 10);
     }
@@ -2408,7 +2408,7 @@ slots = ["p1"]
             deploy_toml("v1").replace("host_key_fingerprint = \"SHA256:test\"\n", ""),
         )
         .unwrap();
-        let err = Config::load(&p).expect_err("SSH address without identity must fail");
+        let err = ProjectConfig::load(&p).expect_err("SSH address without identity must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("server 's1'")
@@ -2423,7 +2423,7 @@ slots = ["p1"]
             "host_key_fingerprint = \"SHA256:test\"\nknown_hosts = \"/etc/ssh/known_hosts\"",
         );
         std::fs::write(&p, both).unwrap();
-        let err = Config::load(&p).expect_err("SSH address with both identities must fail");
+        let err = ProjectConfig::load(&p).expect_err("SSH address with both identities must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("server 's1'")
@@ -2437,12 +2437,12 @@ slots = ["p1"]
             .replace("address = \"a\"", "address = \"local:///srv/forced\"")
             .replace("host_key_fingerprint = \"SHA256:test\"\n", "");
         std::fs::write(&p, local).unwrap();
-        let cfg = Config::load(&p).expect("local:// address needs no identity");
+        let cfg = ProjectConfig::load(&p).expect("local:// address needs no identity");
         assert!(cfg.servers[0].address.starts_with("local://"));
 
         // SSH address + exactly one source: valid.
         std::fs::write(&p, deploy_toml("v1")).unwrap();
-        let cfg = Config::load(&p).expect("SSH address with exactly one identity is valid");
+        let cfg = ProjectConfig::load(&p).expect("SSH address with exactly one identity is valid");
         assert_eq!(
             cfg.servers[0].host_key_fingerprint.as_deref(),
             Some("SHA256:test")
@@ -2452,7 +2452,7 @@ slots = ["p1"]
             "known_hosts = \"/etc/ssh/known_hosts\"",
         );
         std::fs::write(&p, kh_only).unwrap();
-        let cfg = Config::load(&p).expect("known_hosts-only SSH address is valid");
+        let cfg = ProjectConfig::load(&p).expect("known_hosts-only SSH address is valid");
         assert_eq!(
             cfg.servers[0].known_hosts.as_deref(),
             Some(Path::new("/etc/ssh/known_hosts"))
@@ -2480,7 +2480,7 @@ slots = ["p1"]
 
         // local:// with no identity: Local.
         std::fs::write(&p, local.clone()).unwrap();
-        let cfg = Config::load(&p).expect("local:// without identity loads");
+        let cfg = ProjectConfig::load(&p).expect("local:// without identity loads");
         assert!(cfg.servers[0].address.starts_with("local://"));
         assert_eq!(cfg.servers[0].host_identity(), &HostIdentity::Local);
 
@@ -2491,7 +2491,7 @@ slots = ["p1"]
             "user = \"u\"\nknown_hosts = \"/etc/ssh/known_hosts\"",
         );
         std::fs::write(&p, with_kh).unwrap();
-        let cfg = Config::load(&p).expect("local:// + known_hosts is allowed");
+        let cfg = ProjectConfig::load(&p).expect("local:// + known_hosts is allowed");
         assert_eq!(cfg.servers[0].host_identity(), &HostIdentity::Local);
 
         // local:// + host_key_fingerprint: allowed, still Local.
@@ -2500,7 +2500,7 @@ slots = ["p1"]
             "user = \"u\"\nhost_key_fingerprint = \"SHA256:test\"",
         );
         std::fs::write(&p, with_fp).unwrap();
-        let cfg = Config::load(&p).expect("local:// + fingerprint is allowed");
+        let cfg = ProjectConfig::load(&p).expect("local:// + fingerprint is allowed");
         assert_eq!(cfg.servers[0].host_identity(), &HostIdentity::Local);
 
         // local:// + BOTH identity sources: still allowed — the ambiguity
@@ -2514,7 +2514,7 @@ slots = ["p1"]
                 "host_key_fingerprint = \"SHA256:test\"\nknown_hosts = \"/etc/ssh/known_hosts\"",
             );
         std::fs::write(&p, with_both).unwrap();
-        let cfg = Config::load(&p).expect("local:// + both identities is allowed");
+        let cfg = ProjectConfig::load(&p).expect("local:// + both identities is allowed");
         assert_eq!(cfg.servers[0].host_identity(), &HostIdentity::Local);
     }
 
@@ -2539,7 +2539,7 @@ slots = ["p1"]
             ),
         )
         .unwrap();
-        let err = Config::load(&p).expect_err("unknown top-level key must fail");
+        let err = ProjectConfig::load(&p).expect_err("unknown top-level key must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("adapterr") && msg.contains("unknown field"),
@@ -2552,7 +2552,7 @@ slots = ["p1"]
             base.replace("user = \"u\"", "user = \"u\"\nreserve_byts = 1"),
         )
         .unwrap();
-        let err = Config::load(&p).expect_err("unknown server field must fail");
+        let err = ProjectConfig::load(&p).expect_err("unknown server field must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("reserve_byts") && msg.contains("unknown field"),
@@ -2563,7 +2563,7 @@ slots = ["p1"]
         let bad_variant =
             MINIMAL_VARIANT.replace("adapter = \"none\"", "adapter = \"none\"\nreserve_byts = 1");
         std::fs::write(project.join("releases/v1/standard.toml"), bad_variant).unwrap();
-        let err = Config::load(&p).expect_err("unknown activation field must fail");
+        let err = ProjectConfig::load(&p).expect_err("unknown activation field must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("reserve_byts") && msg.contains("unknown field"),
@@ -2576,7 +2576,7 @@ slots = ["p1"]
             "{MINIMAL_VARIANT}\n[[slots]]\nid = \"p1\"\nserver = \"s1\"\nreserve_byts = 1\ndeploy_dir = \"/srv/forced\"\n"
         );
         std::fs::write(project.join("releases/v1/standard.toml"), bad_slot_variant).unwrap();
-        let err = Config::load(&p).expect_err("unknown slot field must fail");
+        let err = ProjectConfig::load(&p).expect_err("unknown slot field must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("reserve_byts") && msg.contains("unknown field"),
@@ -2589,7 +2589,7 @@ slots = ["p1"]
             "{base}\n[[slots]]\nid = \"p1\"\nserver = \"s1\"\ndeploy_dir = \"/srv/forced\"\n"
         );
         std::fs::write(&p, with_top_slots).unwrap();
-        let err = Config::load(&p).expect_err("top-level [[slots]] must be rejected");
+        let err = ProjectConfig::load(&p).expect_err("top-level [[slots]] must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("slots") && msg.contains("unknown field"),
@@ -2629,7 +2629,7 @@ slots = ["p1"]
             format!("{MINIMAL_VARIANT}\n{STANDARD_SLOTS}"),
         )
         .unwrap();
-        Config::load(&fixture).expect("known-good config still loads");
+        ProjectConfig::load(&fixture).expect("known-good config still loads");
     }
 
     /// One server runs exactly one generation, so two member slots of the same
@@ -2649,7 +2649,8 @@ slots = ["p1"]
         std::fs::write(project.join("releases/v1/standard.toml"), dup).unwrap();
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml("v1")).unwrap();
-        let err = Config::load(&p).expect_err("two slots of one target on one server must fail");
+        let err =
+            ProjectConfig::load(&p).expect_err("two slots of one target on one server must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("target 't1' has multiple slots on server 's1'"),
@@ -2667,7 +2668,7 @@ slots = ["p1"]
             1,
         );
         std::fs::write(&p, two_servers).unwrap();
-        let cfg = Config::load(&p).expect("two slots on distinct servers are valid");
+        let cfg = ProjectConfig::load(&p).expect("two slots on distinct servers are valid");
         assert_eq!(cfg.target_slot_ids("t1").unwrap(), vec!["p1", "p2"]);
     }
 
@@ -2692,7 +2693,8 @@ slots = ["p1"]
             "{MINIMAL_VARIANT}\n{STANDARD_SLOTS}\n[[slots]]\nid = \"p2\"\nserver = \"s1\"\ntarget = \"t2\"\ndeploy_dir = \"/srv/forced-2\"\n"
         );
         std::fs::write(project.join("releases/v1/standard.toml"), split).unwrap();
-        let cfg = Config::load(&p).expect("two slots on one server in different targets are valid");
+        let cfg = ProjectConfig::load(&p)
+            .expect("two slots on one server in different targets are valid");
         assert_eq!(cfg.target_slot_ids("t1").unwrap(), vec!["p1"]);
         assert_eq!(cfg.target_slot_ids("t2").unwrap(), vec!["p2"]);
 
@@ -2702,7 +2704,8 @@ slots = ["p1"]
             "{MINIMAL_VARIANT}\n{STANDARD_SLOTS}\n[[slots]]\nid = \"p2\"\nserver = \"s1\"\ntarget = \"t1\"\ndeploy_dir = \"/srv/forced-2\"\n"
         );
         std::fs::write(project.join("releases/v1/standard.toml"), same).unwrap();
-        let err = Config::load(&p).expect_err("two slots of one target on one server must fail");
+        let err =
+            ProjectConfig::load(&p).expect_err("two slots of one target on one server must fail");
         assert!(
             err.to_string()
                 .contains("target 't1' has multiple slots on server 's1'"),
@@ -2716,7 +2719,8 @@ slots = ["p1"]
             "{MINIMAL_VARIANT}\n[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntarget = \"t1\"\ndeploy_dir = \"/srv/forced\"\n\n[[slots]]\nid = \"p2\"\nserver = \"s1\"\ntarget = \"t2\"\ndeploy_dir = \"/srv/forced-2\"\n"
         );
         std::fs::write(project.join("releases/v1/standard.toml"), two).unwrap();
-        let cfg = Config::load(&p).expect("two slots on one server in different targets is valid");
+        let cfg =
+            ProjectConfig::load(&p).expect("two slots on one server in different targets is valid");
         assert_eq!(cfg.target_slot_ids("t1").unwrap(), vec!["p1"]);
         assert_eq!(cfg.target_slot_ids("t2").unwrap(), vec!["p2"]);
     }
@@ -2734,7 +2738,7 @@ slots = ["p1"]
         std::fs::write(project.join("releases/v1/standard.toml"), bad).unwrap();
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml("v1")).unwrap();
-        let err = Config::load(&p).expect_err("[capacity] inside a variant must fail");
+        let err = ProjectConfig::load(&p).expect_err("[capacity] inside a variant must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("capacity") && msg.contains("unknown field"),
@@ -2755,7 +2759,7 @@ slots = ["p1"]
 
         // Omitted port defaults to 22.
         std::fs::write(&p, deploy_toml("v1")).unwrap();
-        let cfg = Config::load(&p).expect("config loads");
+        let cfg = ProjectConfig::load(&p).expect("config loads");
         assert_eq!(cfg.servers[0].port, 22, "default SSH port is 22");
 
         // `port` alone does not satisfy the exactly-one identity rule.
@@ -2763,7 +2767,7 @@ slots = ["p1"]
             .replace("host_key_fingerprint = \"SHA256:test\"\n", "")
             .replace("user = \"u\"", "user = \"u\"\nport = 2200");
         std::fs::write(&p, port_only).unwrap();
-        let err = Config::load(&p).expect_err("port-only server must still be rejected");
+        let err = ProjectConfig::load(&p).expect_err("port-only server must still be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("exactly one of known_hosts or host_key_fingerprint"),
@@ -2773,16 +2777,16 @@ slots = ["p1"]
         // An explicit port WITH exactly one identity loads and is carried.
         let with_port = deploy_toml("v1").replace("user = \"u\"", "user = \"u\"\nport = 2200");
         std::fs::write(&p, with_port).unwrap();
-        let cfg = Config::load(&p).expect("explicit port with one identity is valid");
+        let cfg = ProjectConfig::load(&p).expect("explicit port with one identity is valid");
         assert_eq!(cfg.servers[0].port, 2200);
     }
 
     /// `deny_unknown_fields` extends to the remaining user-written surfaces:
     /// the variant's `[verification]` table, the top-level `[targets.t1.rollout]`
-    /// table, a variant's `[[artifact.mappings]]` entries, and the rotation
+    /// table, a variant's `[[artifact.mappings]]` entries, and the retention
     /// policy tables.
     #[test]
-    fn unknown_fields_rejected_in_verification_rollout_mapping_and_rotation() {
+    fn unknown_fields_rejected_in_verification_rollout_mapping_and_retention() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
@@ -2797,7 +2801,7 @@ slots = ["p1"]
         );
         std::fs::write(project.join("releases/v1/standard.toml"), bad_ver).unwrap();
         std::fs::write(&p, base.clone()).unwrap();
-        let err = Config::load(&p).expect_err("unknown verification field must fail");
+        let err = ProjectConfig::load(&p).expect_err("unknown verification field must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("retries") && msg.contains("unknown field"),
@@ -2811,7 +2815,7 @@ slots = ["p1"]
         );
         std::fs::write(project.join("releases/v1/standard.toml"), MINIMAL_VARIANT).unwrap();
         std::fs::write(&p, bad_rollout).unwrap();
-        let err = Config::load(&p).expect_err("unknown rollout field must fail");
+        let err = ProjectConfig::load(&p).expect_err("unknown rollout field must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("max_parallel") && msg.contains("unknown field"),
@@ -2837,28 +2841,28 @@ interval_seconds = 0
 "#;
         std::fs::write(project.join("releases/v1/standard.toml"), mapping_variant).unwrap();
         std::fs::write(&p, base).unwrap();
-        let err = Config::load(&p).expect_err("unknown mapping field must fail");
+        let err = ProjectConfig::load(&p).expect_err("unknown mapping field must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("conflic") && msg.contains("unknown field"),
             "error must name the unknown mapping field, got: {msg}"
         );
 
-        // Unknown field inside the variant's [rotation] tables (retention is
+        // Unknown field inside the variant's [retention] tables (retention is
         // slot-owned — it lives in the slot's owning variant file).
-        let bad_rotation = format!("{MINIMAL_VARIANT}\n{STANDARD_SLOTS}\n{STANDARD_ROTATION}")
+        let bad_retention = format!("{MINIMAL_VARIANT}\n{STANDARD_SLOTS}\n{STANDARD_ROTATION}")
             .replacen(
-                "[rotation.per_server]",
-                "[rotation]\nprotect_nothing = 1\n\n[rotation.per_server]",
+                "[retention.per_server]",
+                "[retention]\nprotect_nothing = 1\n\n[retention.per_server]",
                 1,
             );
-        std::fs::write(project.join("releases/v1/standard.toml"), bad_rotation).unwrap();
+        std::fs::write(project.join("releases/v1/standard.toml"), bad_retention).unwrap();
         std::fs::write(&p, deploy_toml("v1")).unwrap();
-        let err = Config::load(&p).expect_err("unknown rotation field must fail");
+        let err = ProjectConfig::load(&p).expect_err("unknown retention field must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("protect_nothing") && msg.contains("unknown field"),
-            "error must name the unknown rotation field, got: {msg}"
+            "error must name the unknown retention field, got: {msg}"
         );
     }
 
@@ -2890,7 +2894,7 @@ interval_seconds = 0
     /// A minimal but VALID ledger intent for target `t1` (EXACT key-set
     /// equality: `slot_ids == desired.keys() == pre_push.keys()`).
     fn intended_intent(dep: &str) -> DeploymentIntent {
-        let p1 = PlacementSlotId::new("p1".to_string());
+        let p1 = SlotId::new("p1".to_string());
         // ONE slot table (the membership + desired/pre-push entries).
         let slots = std::collections::BTreeMap::from([(
             p1.clone(),
@@ -2928,7 +2932,7 @@ interval_seconds = 0
         write_standard_release(&project, "v1");
         let p = project.join("deploy.toml");
         std::fs::write(&p, deploy_toml("v1")).unwrap();
-        Config::load(&p).expect("a config at CONFIG_SCHEMA_VERSION must load");
+        ProjectConfig::load(&p).expect("a config at CONFIG_SCHEMA_VERSION must load");
 
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let line = serde_json::to_string(&LedgerLine::Intent(LedgerIntentWire::from(
@@ -2970,7 +2974,8 @@ interval_seconds = 0
             ),
         )
         .unwrap();
-        let err = Config::load(&p).expect_err("a foreign config schema_version must fail closed");
+        let err =
+            ProjectConfig::load(&p).expect_err("a foreign config schema_version must fail closed");
         assert!(
             err.to_string().contains("schema_version"),
             "the config error must name the version field, got: {err}"
@@ -2992,7 +2997,7 @@ interval_seconds = 0
 
         // Restore the config at CONFIG_SCHEMA_VERSION ...
         std::fs::write(&p, deploy_toml("v1")).unwrap();
-        Config::load(&p).expect("the config at CONFIG_SCHEMA_VERSION still loads");
+        ProjectConfig::load(&p).expect("the config at CONFIG_SCHEMA_VERSION still loads");
         // ... and tamper ONLY the ledger line: the ledger reader fails
         // closed, naming the version ... (the version is a WIRE member — the
         // domain no longer carries it, so the tamper sets it on the wire
@@ -3010,7 +3015,7 @@ interval_seconds = 0
             "the ledger error must name the version field, got: {err}"
         );
         // ... and the CONFIG is untouched by the ledger tamper.
-        Config::load(&p).expect("the config still loads after the ledger-side tamper");
+        ProjectConfig::load(&p).expect("the config still loads after the ledger-side tamper");
     }
 
     proptest! {
@@ -3055,7 +3060,7 @@ interval_seconds = 0
             // The config reader accepts exactly CONFIG_SCHEMA_VERSION — a
             // foreign value (including LEDGER_SCHEMA_VERSION once the two
             // constants diverge) is refused, independently of the ledger.
-            let config_accepted = Config::load(&p).is_ok();
+            let config_accepted = ProjectConfig::load(&p).is_ok();
             assert_eq!(
                 config_accepted,
                 config_version == CONFIG_SCHEMA_VERSION,
@@ -3114,7 +3119,7 @@ interval_seconds = 0
                 }],
                 targets: BTreeMap::from([(
                     "t1".to_string(),
-                    raw::RawTargetDef {
+                    raw::RawTargetConfig {
                         rollout: raw::RawRolloutConfig::default(),
                     },
                 )]),
@@ -3142,20 +3147,21 @@ interval_seconds = 0
                 attempts: 1,
                 interval_seconds: 0,
             },
-            slots: vec![SlotDef {
+            slots: vec![SlotConfig {
                 id: "p1".to_string(),
                 server: "s1".to_string(),
                 deploy_dir: PathBuf::from("/srv/p1"),
                 target: "t1".to_string(),
                 groups: Vec::new(),
             }],
-            rotation: RotationConfig::default(),
+            retention: RetentionConfig::default(),
         }
     }
 
     /// Mutate the minimal project and require the conversion to fail.
     fn expect_conversion_err(project: RawProject, rule: &str) {
-        let err = Config::from_raw_parts(project.manifest, project.variants).expect_err(rule);
+        let err =
+            ProjectConfig::from_raw_parts(project.manifest, project.variants).expect_err(rule);
         assert!(
             !err.to_string().is_empty(),
             "conversion error must carry a message for {rule}"
@@ -3184,7 +3190,7 @@ interval_seconds = 0
             let mut p = minimal_raw_project();
             p.manifest.targets = BTreeMap::from([(
                 id.to_string(),
-                raw::RawTargetDef {
+                raw::RawTargetConfig {
                     rollout: raw::RawRolloutConfig::default(),
                 },
             )]);
@@ -3377,7 +3383,7 @@ interval_seconds = 0
         let mut p = minimal_raw_project();
         p.manifest.targets.insert(
             "empty".to_string(),
-            raw::RawTargetDef {
+            raw::RawTargetConfig {
                 rollout: raw::RawRolloutConfig::default(),
             },
         );
@@ -3385,27 +3391,35 @@ interval_seconds = 0
 
         // Two slots of one target on one server.
         let mut p = minimal_raw_project();
-        p.variants.get_mut("standard").unwrap().slots.push(SlotDef {
-            id: "p2".to_string(),
-            server: "s1".to_string(),
-            deploy_dir: PathBuf::from("/srv/p2"),
-            target: "t1".to_string(),
-            groups: Vec::new(),
-        });
+        p.variants
+            .get_mut("standard")
+            .unwrap()
+            .slots
+            .push(SlotConfig {
+                id: "p2".to_string(),
+                server: "s1".to_string(),
+                deploy_dir: PathBuf::from("/srv/p2"),
+                target: "t1".to_string(),
+                groups: Vec::new(),
+            });
         expect_conversion_err(p, "two slots of one target on one server");
 
         // Two slots bound to the same (server, deploy_dir) location.
         let mut p = minimal_raw_project();
-        p.variants.get_mut("standard").unwrap().slots.push(SlotDef {
-            id: "p2".to_string(),
-            server: "s1".to_string(),
-            deploy_dir: PathBuf::from("/srv/p1"),
-            target: "t2".to_string(),
-            groups: Vec::new(),
-        });
+        p.variants
+            .get_mut("standard")
+            .unwrap()
+            .slots
+            .push(SlotConfig {
+                id: "p2".to_string(),
+                server: "s1".to_string(),
+                deploy_dir: PathBuf::from("/srv/p1"),
+                target: "t2".to_string(),
+                groups: Vec::new(),
+            });
         p.manifest.targets.insert(
             "t2".to_string(),
-            raw::RawTargetDef {
+            raw::RawTargetConfig {
                 rollout: raw::RawRolloutConfig::default(),
             },
         );
@@ -3424,7 +3438,8 @@ interval_seconds = 0
     #[test]
     fn conversion_accepts_minimal_and_invariants_hold() {
         let p = minimal_raw_project();
-        let cfg = Config::from_raw_parts(p.manifest, p.variants).expect("minimal project converts");
+        let cfg = ProjectConfig::from_raw_parts(p.manifest, p.variants)
+            .expect("minimal project converts");
 
         // The manifest surface is carried through.
         assert_eq!(cfg.schema_version, CONFIG_SCHEMA_VERSION);
@@ -3438,7 +3453,7 @@ interval_seconds = 0
         assert!(cfg.servers[0].address.starts_with("local://"));
 
         // The variant carries the typed activation enum (none here), its
-        // slot, and its slot-owned rotation.
+        // slot, and its slot-owned retention.
         assert_eq!(cfg.variant_names(), vec!["standard"]);
         assert_eq!(
             cfg.variant("standard").unwrap().activation,
@@ -3450,7 +3465,10 @@ interval_seconds = 0
         // the declaring variant owns the slot and the slot owns its target.
         assert_eq!(cfg.slot_variant("p1").unwrap(), "standard");
         assert!(cfg.slot_variant("ghost").is_err());
-        assert_eq!(cfg.slot_rotation("p1").unwrap(), &RotationConfig::default());
+        assert_eq!(
+            cfg.slot_retention("p1").unwrap(),
+            &RetentionConfig::default()
+        );
         assert_eq!(cfg.target_slot_ids("t1").unwrap(), vec!["p1"]);
         let (slot, server) = cfg.target_slots("t1").unwrap()[0];
         assert_eq!(slot.id, "p1");
@@ -3466,8 +3484,8 @@ interval_seconds = 0
         let mut p = minimal_raw_project();
         p.manifest.servers[0].address = "db.example.com".to_string();
         p.manifest.servers[0].host_key_fingerprint = Some("SHA256:abc".to_string());
-        let cfg =
-            Config::from_raw_parts(p.manifest, p.variants).expect("fingerprint server converts");
+        let cfg = ProjectConfig::from_raw_parts(p.manifest, p.variants)
+            .expect("fingerprint server converts");
         let HostIdentity::Fingerprint(fp) = cfg.servers[0].host_identity() else {
             panic!("SSH + fingerprint must produce HostIdentity::Fingerprint");
         };
@@ -3486,8 +3504,8 @@ interval_seconds = 0
         let mut p = minimal_raw_project();
         p.manifest.servers[0].address = "db.example.com".to_string();
         p.manifest.servers[0].known_hosts = Some(PathBuf::from("/etc/ssh/known_hosts"));
-        let cfg =
-            Config::from_raw_parts(p.manifest, p.variants).expect("known_hosts identity converts");
+        let cfg = ProjectConfig::from_raw_parts(p.manifest, p.variants)
+            .expect("known_hosts identity converts");
         assert_eq!(
             cfg.servers[0].host_identity(),
             &HostIdentity::KnownHosts(PathBuf::from("/etc/ssh/known_hosts"))
@@ -3516,7 +3534,8 @@ interval_seconds = 0
                 restart: true,
             }],
         };
-        let cfg = Config::from_raw_parts(p.manifest, p.variants).expect("systemd variant converts");
+        let cfg = ProjectConfig::from_raw_parts(p.manifest, p.variants)
+            .expect("systemd variant converts");
         let Activation::Systemd(sa) = &cfg.variant("standard").unwrap().activation else {
             panic!("systemd adapter must convert to Activation::Systemd");
         };
@@ -3717,7 +3736,7 @@ interval_seconds = 0
             })
     }
 
-    fn arbitrary_slot() -> impl Strategy<Value = SlotDef> {
+    fn arbitrary_slot() -> impl Strategy<Value = SlotConfig> {
         (
             arbitrary_identifier(),
             arbitrary_identifier(),
@@ -3725,7 +3744,7 @@ interval_seconds = 0
             arbitrary_identifier(),
             prop::collection::vec(arbitrary_identifier(), 0..2),
         )
-            .prop_map(|(id, server, deploy_dir, target, groups)| SlotDef {
+            .prop_map(|(id, server, deploy_dir, target, groups)| SlotConfig {
                 id,
                 server,
                 deploy_dir,
@@ -3760,13 +3779,13 @@ interval_seconds = 0
                         activation,
                         verification,
                         slots,
-                        rotation: RotationConfig {
-                            per_server: PerServerRotation {
+                        retention: RetentionConfig {
+                            per_server: PerServerRetention {
                                 keep_distinct_artifacts: keep_distinct,
                                 keep_days,
                                 protect_previous: true,
                             },
-                            deployment: DeploymentRotation {
+                            deployment: DeploymentRetention {
                                 protect_deployments: 0,
                             },
                         },
@@ -3775,9 +3794,9 @@ interval_seconds = 0
             )
     }
 
-    fn arbitrary_target() -> impl Strategy<Value = raw::RawTargetDef> {
+    fn arbitrary_target() -> impl Strategy<Value = raw::RawTargetConfig> {
         (any::<u32>(), any::<bool>(), arbitrary_failure_policy()).prop_map(
-            |(batch_size, stop_on_failure, failure_policy)| raw::RawTargetDef {
+            |(batch_size, stop_on_failure, failure_policy)| raw::RawTargetConfig {
                 rollout: raw::RawRolloutConfig {
                     batch_size,
                     stop_on_failure,
@@ -3839,7 +3858,7 @@ interval_seconds = 0
     /// (and the derived view fields consistent with it), the activation
     /// enum covers the space, and the per-target graph rules hold. This
     /// inspects the DomainConfig itself — it never re-runs the validation.
-    fn assert_domain_invariants(cfg: &Config) {
+    fn assert_domain_invariants(cfg: &ProjectConfig) {
         let mut server_ids = HashSet::new();
         for s in &cfg.servers {
             assert!(
@@ -3962,7 +3981,7 @@ interval_seconds = 0
 
         #[test]
         fn arbitrary_raw_config_converts_fail_closed(project in arbitrary_raw_project()) {
-            if let Ok(cfg) = Config::from_raw_parts(project.manifest, project.variants) {
+            if let Ok(cfg) = ProjectConfig::from_raw_parts(project.manifest, project.variants) {
                 assert_domain_invariants(&cfg);
             }
             // fail-closed: rejection is a valid outcome for arbitrary input
@@ -3979,7 +3998,7 @@ interval_seconds = 0
     // rolling back). The policy is now a typed enum whose parse is STRICT
     // EXACT — the parse-table test below pins every supported spelling, the
     // load-level test pins the fail-closed rejection through the real
-    // `Config::load` path, and the arbitrary-strings property pins the
+    // `ProjectConfig::load` path, and the arbitrary-strings property pins the
     // accept-only-the-supported-spellings contract over the whole space.
 
     /// The STRICT parse table: the exact supported spellings
@@ -4040,7 +4059,7 @@ interval_seconds = 0
     }
 
     /// THE BUG end-to-end: an unknown `failure_policy` spelling in a real
-    /// `deploy.toml` is rejected at `Config::load` (the merged raw -> domain
+    /// `deploy.toml` is rejected at `ProjectConfig::load` (the merged raw -> domain
     /// conversion) with a config error naming the valid options — it can
     /// NEVER silently behave as "leave changed".
     #[test]
@@ -4054,11 +4073,11 @@ interval_seconds = 0
         // whole load with the strict parse error.
         for ok in ["rollback_changed", "leave_changed"] {
             std::fs::write(&p, deploy_toml("v1").replace("rollback_changed", ok)).unwrap();
-            Config::load(&p).expect("supported spelling loads");
+            ProjectConfig::load(&p).expect("supported spelling loads");
         }
         for bad in ["rollback", "leave", "RollbackChanged", "ROLLBACK"] {
             std::fs::write(&p, deploy_toml("v1").replace("rollback_changed", bad)).unwrap();
-            let err = Config::load(&p).expect_err("unsupported spelling must fail the load");
+            let err = ProjectConfig::load(&p).expect_err("unsupported spelling must fail the load");
             let msg = err.to_string();
             assert!(
                 msg.contains("failure_policy") && msg.contains(bad),
@@ -4088,7 +4107,7 @@ interval_seconds = 0
         let minimal_rollout =
             deploy_toml("v1").replace(", failure_policy = \"rollback_changed\" }", " }");
         std::fs::write(&p, minimal_rollout).unwrap();
-        let cfg = Config::load(&p).expect("omitted failure_policy defaults");
+        let cfg = ProjectConfig::load(&p).expect("omitted failure_policy defaults");
         assert_eq!(
             cfg.targets["t1"].rollout.failure_policy,
             FailurePolicy::RollbackChanged
@@ -4236,7 +4255,7 @@ interval_seconds = 0
 
         #[test]
         fn arbitrary_scalar_values_convert_fail_closed((project, expected) in scalar_mutation_project()) {
-            match Config::from_raw_parts(project.manifest, project.variants) {
+            match ProjectConfig::from_raw_parts(project.manifest, project.variants) {
                 Ok(cfg) => {
                     assert!(
                         expected,

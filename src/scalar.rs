@@ -106,7 +106,7 @@ name_scalar!(
     "A validated identifier (a server, slot, target, or variant name): \
      non-empty, no surrounding whitespace, no control characters. Used for \
      the id-bearing domain fields that have no dedicated id type; fields \
-     with a dedicated type (DeploymentId, PlacementSlotId, ServerId, \
+     with a dedicated type (DeploymentId, SlotId, ServerId, \
      ReleaseId, ...) keep it.",
     valid_name
 );

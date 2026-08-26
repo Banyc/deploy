@@ -9,7 +9,7 @@
 //! (rebind a server, move a `deploy_dir`, retarget) are part of the identity;
 //! per-server capacity policy is not.
 
-use crate::config::{ActivationConfig, Mapping, SlotDef, VerificationConfig};
+use crate::config::{ActivationConfig, Mapping, SlotConfig, VerificationConfig};
 use crate::digest::sha256_bytes;
 use crate::error::{Error, Result};
 use crate::model::{
@@ -146,7 +146,7 @@ pub fn normalize_deploy_dir(path: &Path) -> String {
 }
 
 /// Canonicalize a variant's declared `[[slots]]` into the sorted, normalized
-/// identity form: the identity-bearing fields of [`SlotDef`] (`id`, `server`,
+/// identity form: the identity-bearing fields of [`SlotConfig`] (`id`, `server`,
 /// `deploy_dir` as a lexically-normalized absolute path string, the ONE
 /// owning `target` verbatim, `groups` SORTED and DEDUPLICATED), sorted by
 /// slot id. The `groups` dedup is defensive: a duplicate name adds no
@@ -165,7 +165,7 @@ pub fn normalize_deploy_dir(path: &Path) -> String {
 /// function of the declared slot set — the same slots written in any order
 /// canonicalize identically, even for the degenerate duplicate-id
 /// declarations a record that slipped past validation can carry.
-pub fn canonicalize_slots(slots: &[SlotDef]) -> CanonicalSlots {
+pub fn canonicalize_slots(slots: &[SlotConfig]) -> CanonicalSlots {
     let mut out: Vec<CanonicalSlot> = slots
         .iter()
         .map(|s| CanonicalSlot {
@@ -204,7 +204,7 @@ pub fn canonicalize_slots(slots: &[SlotDef]) -> CanonicalSlots {
 /// of variants, or of a slot's `groups` list, or duplicate names in it —
 /// deduplicated away) does not. Server-level policy (user/address/port/
 /// capacity) is not part of it.
-pub fn variant_slots_digest(slots: &BTreeMap<String, Vec<SlotDef>>) -> String {
+pub fn variant_slots_digest(slots: &BTreeMap<String, Vec<SlotConfig>>) -> String {
     let canonical: BTreeMap<String, CanonicalSlots> = slots
         .iter()
         .map(|(v, defs)| (v.clone(), canonicalize_slots(defs)))
@@ -254,7 +254,7 @@ pub fn build_release(
     mapping_sha: &str,
     behavior_sha: &str,
     variants: &BTreeMap<VariantName, TreeDigest>,
-    variant_slots: &BTreeMap<String, Vec<SlotDef>>,
+    variant_slots: &BTreeMap<String, Vec<SlotConfig>>,
     root: &Path,
 ) -> ReleaseRecord {
     let bindings: BTreeMap<String, String> = variants
@@ -297,10 +297,10 @@ pub fn recompute_release_digest(rec: &ReleaseRecord) -> Option<ReleaseDigest> {
         return None;
     }
     // Rebuild the per-variant slot declarations from the record's canonical
-    // snapshot (the four identity fields map 1:1 onto `SlotDef`) and re-run
+    // snapshot (the four identity fields map 1:1 onto `SlotConfig`) and re-run
     // the same component digest `build_release` uses, so any change to the
     // canonical slot digest inputs merges mechanically.
-    let slots: BTreeMap<String, Vec<SlotDef>> = rec
+    let slots: BTreeMap<String, Vec<SlotConfig>> = rec
         .slots
         .iter()
         .map(|(v, cs)| {
@@ -308,7 +308,7 @@ pub fn recompute_release_digest(rec: &ReleaseRecord) -> Option<ReleaseDigest> {
                 v.clone(),
                 cs.slots
                     .iter()
-                    .map(|s| SlotDef {
+                    .map(|s| SlotConfig {
                         id: s.id.clone(),
                         server: s.server.clone(),
                         deploy_dir: PathBuf::from(&s.deploy_dir),
@@ -387,8 +387,8 @@ pub fn verify_release_identity(rec: &ReleaseRecord) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn sdef(id: &str, server: &str, deploy_dir: &str, target: &str) -> SlotDef {
-        SlotDef {
+    fn sdef(id: &str, server: &str, deploy_dir: &str, target: &str) -> SlotConfig {
+        SlotConfig {
             id: id.to_string(),
             server: server.to_string(),
             deploy_dir: PathBuf::from(deploy_dir),
@@ -402,7 +402,7 @@ mod tests {
     /// deploy_dir strings hash identically.
     #[test]
     fn variant_slots_digest_is_order_independent() {
-        let mut a: BTreeMap<String, Vec<SlotDef>> = BTreeMap::new();
+        let mut a: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::new();
         a.insert(
             "standard".to_string(),
             vec![
@@ -418,7 +418,7 @@ mod tests {
         // Same declarations: per-variant file order reversed (p1 before p2), a
         // textually different but lexically identical deploy_dir (double slash,
         // trailing slash), and the variants inserted in the opposite order.
-        let mut b: BTreeMap<String, Vec<SlotDef>> = BTreeMap::new();
+        let mut b: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::new();
         b.insert(
             "canary".to_string(),
             vec![sdef("c1", "s3", "/srv/edge/c1", "edge")],
@@ -441,7 +441,7 @@ mod tests {
     /// policy fields are not part of the input at all.
     #[test]
     fn variant_slots_digest_is_sensitive_to_each_field() {
-        let base: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+        let base: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
             vec![sdef("p1", "server-01", "/srv/deploy/example", "production")],
         )]);
@@ -484,9 +484,9 @@ mod tests {
     /// not (the canonical form sorts it).
     #[test]
     fn variant_slots_digest_is_sensitive_to_targets_list() {
-        let base: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+        let base: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
-            vec![SlotDef {
+            vec![SlotConfig {
                 id: "p1".to_string(),
                 server: "server-01".to_string(),
                 deploy_dir: PathBuf::from("/srv/deploy/example"),
@@ -497,9 +497,9 @@ mod tests {
         let base_sha = variant_slots_digest(&base);
 
         // Changing the slot's ONE owning target changes the digest.
-        let retargeted: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+        let retargeted: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
-            vec![SlotDef {
+            vec![SlotConfig {
                 id: "p1".to_string(),
                 server: "server-01".to_string(),
                 deploy_dir: PathBuf::from("/srv/deploy/example"),
@@ -514,9 +514,9 @@ mod tests {
         );
 
         // Reordering the same list canonicalizes identically.
-        let reordered: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+        let reordered: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
-            vec![SlotDef {
+            vec![SlotConfig {
                 id: "p1".to_string(),
                 server: "server-01".to_string(),
                 deploy_dir: PathBuf::from("/srv/deploy/example"),
@@ -539,9 +539,9 @@ mod tests {
     /// digest.
     #[test]
     fn variant_slots_digest_dedups_duplicate_groups() {
-        let single: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+        let single: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
-            vec![SlotDef {
+            vec![SlotConfig {
                 id: "p1".to_string(),
                 server: "server-01".to_string(),
                 deploy_dir: PathBuf::from("/srv/deploy/example"),
@@ -549,9 +549,9 @@ mod tests {
                 groups: vec!["canary".to_string()],
             }],
         )]);
-        let duplicated: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+        let duplicated: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
-            vec![SlotDef {
+            vec![SlotConfig {
                 id: "p1".to_string(),
                 server: "server-01".to_string(),
                 deploy_dir: PathBuf::from("/srv/deploy/example"),
@@ -566,9 +566,9 @@ mod tests {
         );
 
         // A change that DOES alter membership still changes the digest.
-        let retargeted: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+        let retargeted: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
-            vec![SlotDef {
+            vec![SlotConfig {
                 id: "p1".to_string(),
                 server: "server-01".to_string(),
                 deploy_dir: PathBuf::from("/srv/deploy/example"),
@@ -612,11 +612,11 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.as_str().to_string(), v.as_str().to_string()))
             .collect();
-        let slot_a: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+        let slot_a: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
             vec![sdef("p1", "server-01", "/srv/deploy/example", "production")],
         )]);
-        let slot_b: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+        let slot_b: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
             vec![sdef("p1", "server-02", "/srv/deploy/example", "production")],
         )]);
@@ -644,7 +644,7 @@ mod tests {
     /// address, port, capacity) is not even an input to the digest function.
     #[test]
     fn release_digest_sensitivity_matrix() {
-        let base_slots: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+        let base_slots: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
             vec![sdef("p1", "server-01", "/srv/deploy/example", "production")],
         )]);
@@ -713,7 +713,7 @@ mod tests {
         // Canonical-slot change -> new digest (already asserted per-field by
         // `variant_slots_digest_is_sensitive_to_each_field`, folded into the
         // full digest here).
-        let s2: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+        let s2: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
             vec![sdef("p1", "server-02", "/srv/deploy/example", "production")],
         )]);
@@ -731,9 +731,9 @@ mod tests {
 
         // Owning-target change -> new digest: a slot-only change to the
         // `target` field creates a new ReleaseId.
-        let s3: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+        let s3: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
-            vec![SlotDef {
+            vec![SlotConfig {
                 id: "p1".to_string(),
                 server: "server-01".to_string(),
                 deploy_dir: PathBuf::from("/srv/deploy/example"),
@@ -784,7 +784,7 @@ mod tests {
     fn verify_release_identity_recomputes_from_content() {
         let variants: BTreeMap<VariantName, TreeDigest> =
             BTreeMap::from([(VariantName::new("standard"), TreeDigest::new("t1"))]);
-        let slots: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+        let slots: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
             vec![sdef("p1", "server-01", "/srv/deploy/example", "production")],
         )]);
@@ -846,7 +846,7 @@ mod tests {
     fn verify_release_identity_rejects_empty_slot_snapshot_even_with_retained_digests() {
         let variants: BTreeMap<VariantName, TreeDigest> =
             BTreeMap::from([(VariantName::new("standard"), TreeDigest::new("t1"))]);
-        let slots: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+        let slots: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
             vec![sdef("p1", "server-01", "/srv/deploy/example", "production")],
         )]);
@@ -943,7 +943,7 @@ mod tests {
     fn verify_release_identity_accepts_only_record_schema_version() {
         let variants: BTreeMap<VariantName, TreeDigest> =
             BTreeMap::from([(VariantName::new("standard"), TreeDigest::new("t1"))]);
-        let slots: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+        let slots: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
             vec![sdef("p1", "server-01", "/srv/deploy/example", "production")],
         )]);
@@ -995,7 +995,7 @@ mod tests {
     fn verify_release_identity_accepts_only_payload_schema_version() {
         let variants: BTreeMap<VariantName, TreeDigest> =
             BTreeMap::from([(VariantName::new("standard"), TreeDigest::new("t1"))]);
-        let slots: BTreeMap<String, Vec<SlotDef>> = BTreeMap::from([(
+        let slots: BTreeMap<String, Vec<SlotConfig>> = BTreeMap::from([(
             "standard".to_string(),
             vec![sdef("p1", "server-01", "/srv/deploy/example", "production")],
         )]);
@@ -1107,7 +1107,7 @@ mod tests {
         /// `variant -> tree digest` bindings (name-sorted map).
         variants: BTreeMap<String, String>,
         /// Raw per-variant slot declarations, pre-canonicalization.
-        variant_slots: BTreeMap<String, Vec<SlotDef>>,
+        variant_slots: BTreeMap<String, Vec<SlotConfig>>,
     }
 
     fn variant_name_strategy() -> impl Strategy<Value = String> {
@@ -1164,7 +1164,7 @@ mod tests {
         ])
     }
 
-    fn slot_strategy() -> impl Strategy<Value = SlotDef> {
+    fn slot_strategy() -> impl Strategy<Value = SlotConfig> {
         (
             slot_id_strategy(),
             server_strategy(),
@@ -1172,7 +1172,7 @@ mod tests {
             target_strategy(),
             prop::collection::vec(group_strategy(), 0..3),
         )
-            .prop_map(|(id, server, deploy_dir, target, groups)| SlotDef {
+            .prop_map(|(id, server, deploy_dir, target, groups)| SlotConfig {
                 id,
                 server,
                 deploy_dir: PathBuf::from(deploy_dir),
@@ -1429,7 +1429,7 @@ mod tests {
         // whose identity was derived from any other payload version fails the
         // recompute-and-verify check (the recompute always uses the canonical
         // payload version).
-        let raw_slots: BTreeMap<String, Vec<SlotDef>> = rec
+        let raw_slots: BTreeMap<String, Vec<SlotConfig>> = rec
             .slots
             .iter()
             .map(|(v, cs)| {
@@ -1437,7 +1437,7 @@ mod tests {
                     v.clone(),
                     cs.slots
                         .iter()
-                        .map(|s| SlotDef {
+                        .map(|s| SlotConfig {
                             id: s.id.clone(),
                             server: s.server.clone(),
                             deploy_dir: PathBuf::from(&s.deploy_dir),
@@ -1489,11 +1489,11 @@ mod tests {
         // lexically-equivalently. C: each slot's `targets` list gets its first
         // name appended again (a duplicate — deduplicated away by the
         // canonical form).
-        let b_slots: BTreeMap<String, Vec<SlotDef>> = c
+        let b_slots: BTreeMap<String, Vec<SlotConfig>> = c
             .variant_slots
             .iter()
             .map(|(v, defs)| {
-                let mut out: Vec<SlotDef> = defs.iter().rev().cloned().collect();
+                let mut out: Vec<SlotConfig> = defs.iter().rev().cloned().collect();
                 for (i, s) in out.iter_mut().enumerate() {
                     s.groups.reverse();
                     let n = normalize_deploy_dir(&s.deploy_dir);
@@ -1502,11 +1502,11 @@ mod tests {
                 (v.clone(), out)
             })
             .collect();
-        let c_slots: BTreeMap<String, Vec<SlotDef>> = c
+        let c_slots: BTreeMap<String, Vec<SlotConfig>> = c
             .variant_slots
             .iter()
             .map(|(v, defs)| {
-                let out: Vec<SlotDef> = defs
+                let out: Vec<SlotConfig> = defs
                     .iter()
                     .map(|s| {
                         let mut dup = s.clone();
