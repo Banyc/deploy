@@ -69,7 +69,7 @@ use crate::model::{
 };
 use crate::records::{
     DeploymentIntent, DeploymentStatus, LedgerEntry, LedgerRollback, LedgerTerminal,
-    PhysicalBinding, SlotAttemptState, SlotResult, SlotTable, TerminalDisposition,
+    PhysicalBinding, SlotAttemptState, SlotOutcome, SlotResult, SlotTable, TerminalDisposition,
 };
 use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
@@ -265,10 +265,19 @@ pub fn finalize_successful_attempt(
     let rollback = build_rollback(actuals, bindings, base.as_ref(), current_slot_ids);
     let terminal = LedgerTerminal {
         recorded_at: crate::remote::helper::now_rfc3339(),
-        outcomes: SlotTable::from_map(outcomes.clone()),
         // The Successful disposition ALWAYS carries the complete rollback
-        // payload (the truth table is structural in the domain).
-        disposition: TerminalDisposition::Successful { rollback },
+        // payload (the truth table is structural in the domain) AND its OWN
+        // outcomes table (the wire-shaped outcomes' redundant `slot_id` is
+        // dropped into the key — the domain value carries no slot).
+        disposition: TerminalDisposition::Successful {
+            rollback,
+            outcomes: SlotTable::from_map(
+                outcomes
+                    .iter()
+                    .map(|(k, r)| (k.clone(), SlotOutcome::from(r.clone())))
+                    .collect(),
+            ),
+        },
         reason: Some(reason.to_string()),
     };
     store.append_terminal(attempt.target.as_str(), &attempt.deployment_id, &terminal)
@@ -414,7 +423,7 @@ pub fn resolve_deployment(
         ))
     })?;
     match &terminal.disposition {
-        TerminalDisposition::Successful { rollback } => Ok(rollback.clone()),
+        TerminalDisposition::Successful { rollback, .. } => Ok(rollback.clone()),
         other => Err(Error::r#ref(format!(
             "deployment '{deployment_id}' on target '{target}' ended {:?} — only successful deployments carry a rollback state",
             other.status()
@@ -455,7 +464,7 @@ pub fn deployment_index(
 ) -> Result<BTreeMap<String, LedgerRollback>> {
     let mut out = BTreeMap::new();
     for e in successful_deployments(store, target)? {
-        if let TerminalDisposition::Successful { rollback } =
+        if let TerminalDisposition::Successful { rollback, .. } =
             &e.terminal.as_ref().unwrap().disposition
         {
             out.insert(ref_name(target, &e.deployment_id), rollback.clone());
@@ -524,16 +533,9 @@ mod tests {
     fn successful_terminal(dep: &str, release: &str) -> LedgerTerminal {
         LedgerTerminal {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
-            outcomes: SlotTable::from_map(BTreeMap::from([(
-                SlotId::new("p1".to_string()),
-                SlotResult {
-                    slot_id: SlotId::new("p1".to_string()),
-                    outcome: crate::records::SlotOutcomeKind::Activated,
-                    generation: Some(test_generation_id(&format!("gen-{dep}"))),
-                    compensated: false,
-                    error: None,
-                },
-            )])),
+            // The EXACT-EQUAL shape: one Activated outcome per slotted
+            // generation (the four-set equality is enforced by the
+            // conversion).
             disposition: TerminalDisposition::Successful {
                 rollback: LedgerRollback {
                     slots: BTreeMap::from([(
@@ -558,6 +560,16 @@ mod tests {
                         },
                     )]),
                 },
+                outcomes: SlotTable::from_map(BTreeMap::from([(
+                    SlotId::new("p1".to_string()),
+                    SlotResult {
+                        slot_id: SlotId::new("p1".to_string()),
+                        outcome: crate::records::SlotOutcomeKind::Activated,
+                        generation: Some(test_generation_id(&format!("gen-{dep}"))),
+                        compensated: false,
+                        error: None,
+                    },
+                )])),
             },
             reason: None,
         }
@@ -973,7 +985,7 @@ mod tests {
             .filter_map(|e| {
                 e.terminal
                     .and_then(|t| match &t.disposition {
-                        TerminalDisposition::Successful { rollback } => Some(rollback.clone()),
+                        TerminalDisposition::Successful { rollback, .. } => Some(rollback.clone()),
                         _ => None,
                     })
                     .map(|rb| (e.deployment_id.as_str().to_string(), rb))
@@ -1054,17 +1066,18 @@ mod tests {
                             // The FailedRolledBack compensation report IS the
                             // outcome table — it must EXACTLY cover the
                             // membership (the status-specific outcome rule).
-                            outcomes: SlotTable::from_map(BTreeMap::from([(
-                                SlotId::new("p1".to_string()),
-                                SlotResult {
-                                    slot_id: SlotId::new("p1".to_string()),
-                                    outcome: crate::records::SlotOutcomeKind::Restored,
-                                    generation: Some(test_generation_id("gen-1")),
-                                    compensated: true,
-                                    error: None,
-                                },
-                            )])),
-                            disposition: TerminalDisposition::FailedRolledBack,
+                            disposition: TerminalDisposition::FailedRolledBack {
+                                outcomes: SlotTable::from_map(BTreeMap::from([(
+                                    SlotId::new("p1".to_string()),
+                                    SlotResult {
+                                        slot_id: SlotId::new("p1".to_string()),
+                                        outcome: crate::records::SlotOutcomeKind::Restored,
+                                        generation: Some(test_generation_id("gen-1")),
+                                        compensated: true,
+                                        error: None,
+                                    },
+                                )])),
+                            },
                             reason: None,
                         },
                     )

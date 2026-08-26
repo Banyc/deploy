@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::history;
 use crate::model::{GenerationId, OperationId, SlotId};
 use crate::records::{
-    DeploymentIntent, LedgerTerminal, SlotOutcome, SlotOutcomeKind, SlotResult, SlotTable,
+    DeploymentIntent, LedgerTerminal, SlotOutcome, SlotOutcomeKind, SlotTable, SlotTransition,
     TerminalDisposition,
 };
 use crate::remote::helper::RemoteHelper;
@@ -236,7 +236,6 @@ fn append_degraded(
     reason: &str,
 ) -> Result<()> {
     // The Degraded disposition's REMAINING CHANGES are DERIVED from the
-    // The Degraded disposition's REMAINING CHANGES are DERIVED from the
     // outcomes (the slots whose FINAL OBSERVED STATE differs from their
     // pre_push state) — never stored. The wire record therefore records the
     // pending changes — the attempt's desired generations, each as an
@@ -244,18 +243,18 @@ fn append_degraded(
     // compensation: the advance outcome is unknown, and the outcome's
     // observed generation differs from the intent's pre_push, so the
     // derived remaining-changes set is non-empty).
-    let outcomes: BTreeMap<SlotId, SlotResult> = attempt
+    let outcomes: BTreeMap<SlotId, SlotOutcome> = attempt
         .slots
         .iter()
         .map(|(sid, slot)| {
             (
                 sid.clone(),
-                SlotResult {
-                    slot_id: sid.clone(),
+                SlotOutcome {
                     outcome: SlotOutcomeKind::Failed,
                     generation: Some(slot.desired.generation.clone()),
                     compensated: false,
                     error: None,
+                    transition: SlotTransition::AdvanceUnknown,
                 },
             )
         })
@@ -278,8 +277,7 @@ fn append_degraded(
         &attempt.deployment_id,
         &LedgerTerminal {
             recorded_at: crate::remote::helper::now_rfc3339(),
-            outcomes,
-            disposition: TerminalDisposition::Degraded,
+            disposition: TerminalDisposition::Degraded { outcomes },
             reason: Some(reason.to_string()),
         },
     )

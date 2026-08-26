@@ -299,7 +299,7 @@ pub(crate) fn latest_successful_rollback(
 ) -> Result<Option<LedgerRollback>> {
     for entry in store.read_ledger(target)?.into_iter().rev() {
         if let Some(t) = entry.terminal
-            && let crate::records::TerminalDisposition::Successful { rollback } = t.disposition
+            && let crate::records::TerminalDisposition::Successful { rollback, .. } = t.disposition
         {
             return Ok(Some(rollback));
         }
@@ -1135,25 +1135,28 @@ interval_seconds = 0
                     // The EXACT-EQUAL shape: one Activated outcome per
                     // slotted generation (the four-set equality is enforced
                     // by the conversion).
-                    outcomes: SlotTable::from_map(
-                        slots
-                            .iter()
-                            .map(|(k, g)| {
-                                (
-                                    k.clone(),
-                                    SlotResult {
-                                        slot_id: k.clone(),
-                                        outcome: SlotOutcomeKind::Activated,
-                                        generation: Some(g.generation.clone()),
-                                        compensated: false,
-                                        error: None,
-                                    },
-                                )
-                            })
-                            .collect(),
-                    ),
                     disposition: TerminalDisposition::Successful {
-                        rollback: LedgerRollback { slots, bindings },
+                        rollback: LedgerRollback {
+                            slots: slots.clone(),
+                            bindings,
+                        },
+                        outcomes: SlotTable::from_map(
+                            slots
+                                .iter()
+                                .map(|(k, g)| {
+                                    (
+                                        k.clone(),
+                                        SlotResult {
+                                            slot_id: k.clone(),
+                                            outcome: SlotOutcomeKind::Activated,
+                                            generation: Some(g.generation.clone()),
+                                            compensated: false,
+                                            error: None,
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        ),
                     },
                     reason: None,
                 },

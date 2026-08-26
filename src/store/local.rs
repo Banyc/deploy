@@ -1126,7 +1126,9 @@ impl LocalStore {
                     // always refused.
                     // outcome leg), BY STATUS: the terminal's outcome key
                     // set must agree with the intent's AUTHORITATIVE
-                    // membership EXACTLY —
+                    // membership EXACTLY — the outcomes are the
+                    // disposition's OWN table ([`LedgerTerminal::outcomes`]
+                    // — a FailedPreflight terminal yields an empty table):
                     // - Successful: the four sets (outcomes, rollback
                     //   slots, rollback bindings, intent membership) are
                     //   EXACTLY EQUAL and NON-EMPTY — the terminal-local
@@ -1138,7 +1140,7 @@ impl LocalStore {
                     //   Degraded): the outcomes EXACTLY COVER the
                     //   membership — every member slot has one outcome, no
                     //   extras, no missing.
-                    let outcome_keys: BTreeSet<&SlotId> = terminal.outcomes.keys().collect();
+                    let outcome_keys: BTreeSet<&SlotId> = terminal.outcomes().keys().collect();
                     let membership: BTreeSet<&SlotId> = entry.intent.slots.keys().collect();
                     match terminal.status() {
                         DeploymentStatus::Successful => {
@@ -1494,7 +1496,8 @@ mod tests {
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerIntentWire, LedgerLine,
         LedgerRollback, LedgerTerminal, LedgerTerminalWire, NonEmptySlotTable, PhysicalBinding,
-        PreviousGeneration, SlotOutcomeKind, SlotResult, SlotTable, TerminalDisposition,
+        PreviousGeneration, SlotOutcome, SlotOutcomeKind, SlotTable, SlotTransition,
+        TerminalDisposition,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
@@ -1595,18 +1598,10 @@ mod tests {
     fn successful_terminal() -> LedgerTerminal {
         LedgerTerminal {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
-            outcomes: SlotTable::from_map(BTreeMap::from([(
-                SlotId::new("p1".to_string()),
-                SlotResult {
-                    slot_id: SlotId::new("p1".to_string()),
-                    outcome: SlotOutcomeKind::Activated,
-                    generation: Some(test_generation_id("1")),
-                    compensated: false,
-                    error: None,
-                },
-            )])),
             // A Successful disposition ALWAYS carries its complete rollback
-            // payload (the truth table is structural in the domain).
+            // payload (the truth table is structural in the domain) AND its
+            // OWN outcomes table (every outcome Activated, each key covered
+            // by the rollback's slots).
             disposition: TerminalDisposition::Successful {
                 rollback: LedgerRollback {
                     slots: BTreeMap::from([(
@@ -1631,6 +1626,16 @@ mod tests {
                         },
                     )]),
                 },
+                outcomes: SlotTable::from_map(BTreeMap::from([(
+                    SlotId::new("p1".to_string()),
+                    SlotOutcome {
+                        outcome: SlotOutcomeKind::Activated,
+                        generation: Some(test_generation_id("1")),
+                        compensated: false,
+                        error: None,
+                        transition: SlotTransition::Advanced,
+                    },
+                )])),
             },
             reason: None,
         }
@@ -1724,12 +1729,12 @@ mod tests {
             DeploymentStatus::Successful
         );
         assert_eq!(
-            entries[0].terminal.as_ref().unwrap().outcomes[&SlotId::new("p1")].outcome,
+            entries[0].terminal.as_ref().unwrap().outcomes()[&SlotId::new("p1")].outcome,
             SlotOutcomeKind::Activated
         );
         assert_eq!(
             match &entries[0].terminal.as_ref().unwrap().disposition {
-                TerminalDisposition::Successful { rollback } => rollback,
+                TerminalDisposition::Successful { rollback, .. } => rollback,
                 _ => panic!("the successful terminal carries its rollback"),
             }
             .slots[&SlotId::new("p1")]
@@ -1909,18 +1914,19 @@ mod tests {
                     // The degraded terminal records the slot that REMAINS
                     // changed (never restored): the conversion derives the
                     // Degraded disposition's non-empty remaining changes
-                    // from it.
-                    outcomes: SlotTable::from_map(BTreeMap::from([(
-                        SlotId::new("p1".to_string()),
-                        SlotResult {
-                            slot_id: SlotId::new("p1".to_string()),
-                            outcome: SlotOutcomeKind::Skipped,
-                            generation: Some(test_generation_id("1")),
-                            compensated: false,
-                            error: None,
-                        },
-                    )])),
-                    disposition: TerminalDisposition::Degraded,
+                    // from the disposition's OWN outcomes.
+                    disposition: TerminalDisposition::Degraded {
+                        outcomes: SlotTable::from_map(BTreeMap::from([(
+                            SlotId::new("p1".to_string()),
+                            SlotOutcome {
+                                outcome: SlotOutcomeKind::Skipped,
+                                generation: Some(test_generation_id("1")),
+                                compensated: false,
+                                error: None,
+                                transition: SlotTransition::NeverAdvanced,
+                            },
+                        )])),
+                    },
                     reason: Some("boom".to_string()),
                 },
             )
@@ -1980,17 +1986,18 @@ mod tests {
                     // The FailedRolledBack compensation report IS the outcome
                     // table — it must EXACTLY cover the membership (the
                     // status-specific outcome rule).
-                    outcomes: SlotTable::from_map(BTreeMap::from([(
-                        SlotId::new("p1".to_string()),
-                        SlotResult {
-                            slot_id: SlotId::new("p1".to_string()),
-                            outcome: SlotOutcomeKind::Restored,
-                            generation: Some(test_generation_id("gen-1")),
-                            compensated: true,
-                            error: None,
-                        },
-                    )])),
-                    disposition: TerminalDisposition::FailedRolledBack,
+                    disposition: TerminalDisposition::FailedRolledBack {
+                        outcomes: SlotTable::from_map(BTreeMap::from([(
+                            SlotId::new("p1".to_string()),
+                            SlotOutcome {
+                                outcome: SlotOutcomeKind::Restored,
+                                generation: Some(test_generation_id("gen-1")),
+                                compensated: true,
+                                error: None,
+                                transition: SlotTransition::Restored,
+                            },
+                        )])),
+                    },
                     reason: None,
                 },
             )
@@ -3309,23 +3316,24 @@ mod tests {
         id: &str,
         successful: bool,
     ) -> LedgerTerminal {
-        let outcomes: BTreeMap<SlotId, SlotResult> = intent
+        let outcomes: BTreeMap<SlotId, SlotOutcome> = intent
             .slots
             .keys()
             .cloned()
             .map(|k| {
                 (
-                    k.clone(),
-                    SlotResult {
-                        slot_id: k,
+                    k,
+                    SlotOutcome {
                         outcome: SlotOutcomeKind::Activated,
                         generation: Some(test_generation_id(id)),
                         compensated: false,
                         error: None,
+                        transition: SlotTransition::Advanced,
                     },
                 )
             })
             .collect();
+        let outcomes = SlotTable::from_map(outcomes);
         let disposition = if successful {
             TerminalDisposition::Successful {
                 rollback: LedgerRollback {
@@ -3340,13 +3348,13 @@ mod tests {
                         .map(|k| (k.clone(), binding_for(k)))
                         .collect(),
                 },
+                outcomes,
             }
         } else {
-            TerminalDisposition::FailedRolledBack
+            TerminalDisposition::FailedRolledBack { outcomes }
         };
         LedgerTerminal {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
-            outcomes: SlotTable::from_map(outcomes),
             disposition,
             reason: None,
         }
@@ -3452,11 +3460,11 @@ mod tests {
         let mut out: Vec<(LedgerTerminal, String)> = Vec::new();
         // (1) BINDING KEY — add one, remove one, move (rename) one. Only
         // meaningful when the disposition carries a rollback.
-        if let TerminalDisposition::Successful { rollback } = &terminal.disposition {
+        if let TerminalDisposition::Successful { rollback, .. } = &terminal.disposition {
             let first = rollback.bindings.keys().next().cloned().unwrap();
             // (1a) an EXTRA binding key (no generation for it)
             let mut t = terminal.clone();
-            let TerminalDisposition::Successful { rollback } = &mut t.disposition else {
+            let TerminalDisposition::Successful { rollback, .. } = &mut t.disposition else {
                 unreachable!("cloned above");
             };
             rollback.bindings.insert(
@@ -3472,7 +3480,7 @@ mod tests {
             ));
             // (1b) a MISSING binding key (a generation without its binding)
             let mut t = terminal.clone();
-            let TerminalDisposition::Successful { rollback } = &mut t.disposition else {
+            let TerminalDisposition::Successful { rollback, .. } = &mut t.disposition else {
                 unreachable!("cloned above");
             };
             rollback.bindings.remove(&first);
@@ -3482,7 +3490,7 @@ mod tests {
             ));
             // (1c) a binding key RENAMED (moved out of the slot set)
             let mut t = terminal.clone();
-            let TerminalDisposition::Successful { rollback } = &mut t.disposition else {
+            let TerminalDisposition::Successful { rollback, .. } = &mut t.disposition else {
                 unreachable!("cloned above");
             };
             let value = rollback.bindings.remove(&first).unwrap();
@@ -3491,18 +3499,28 @@ mod tests {
                 .insert(SlotId::new("renamed-slot".to_string()), value);
             out.push((t, "binding key RENAMED (missing + extra pair)".to_string()));
         }
-        // (2) OUTCOME KEY — rename an outcome's KEY (its value keeps naming
-        // the old slot: the outcome own-key agreement fails, and the key set
-        // no longer matches the intent's membership).
-        if let Some((key, _)) = terminal.outcomes.iter().next() {
+        // (2) OUTCOME KEY — rename an outcome's KEY. The domain value
+        // carries no slot (the table key owns identity), so the renamed key
+        // is re-attached as the wire outcome's `slot_id` on serialization;
+        // the refusal comes from the CROSS-RECORD agreement — the renamed
+        // key is no longer a member of the intent's membership.
+        if let Some((key, _)) = terminal.outcomes().iter().next() {
             let mut t = terminal.clone();
-            let mut map = t.outcomes.clone().into_map();
+            let mut map = t.outcomes().clone().into_map();
             let result = map.remove(key).unwrap();
             map.insert(SlotId::new("renamed-outcome".to_string()), result);
-            t.outcomes = SlotTable::from_map(map);
+            let outcomes = SlotTable::from_map(map);
+            match &mut t.disposition {
+                TerminalDisposition::Successful { outcomes: o, .. } => *o = outcomes,
+                TerminalDisposition::FailedRolledBack { outcomes: o } => *o = outcomes,
+                TerminalDisposition::Degraded { outcomes: o } => *o = outcomes,
+                TerminalDisposition::FailedPreflight => {
+                    unreachable!("a preflight terminal carries no outcomes to rename")
+                }
+            }
             out.push((
                 t,
-                "outcome key RENAMED (the value still names its old slot)".to_string(),
+                "outcome key RENAMED (outside the intent's membership)".to_string(),
             ));
         }
         out
@@ -3647,38 +3665,47 @@ mod tests {
         assert_wire_terminal_refused(&tmp, target, &intent, &bad, "c");
         // (d) EXACT BINDING KEYS: a generation without its binding.
         let mut bad = terminal.clone();
-        let TerminalDisposition::Successful { rollback } = &mut bad.disposition else {
+        let TerminalDisposition::Successful { rollback, .. } = &mut bad.disposition else {
             unreachable!("the fixture terminal is Successful");
         };
         let first = rollback.bindings.keys().next().cloned().unwrap();
         rollback.bindings.remove(&first);
         assert_terminal_refused(&tmp, target, &intent, &bad, "d");
         // (e) OUTCOME KEY SET == membership: an outcome for a non-member
-        // slot (extra — the value names its own key, so only the
+        // slot (extra — the domain value carries no slot, so only the
         // cross-record equality fails).
         let mut bad = terminal.clone();
-        let mut outcomes = bad.outcomes.clone().into_map();
+        let mut outcomes = bad.outcomes().clone().into_map();
         outcomes.insert(
             SlotId::new("extra-slot".to_string()),
-            SlotResult {
-                slot_id: SlotId::new("extra-slot".to_string()),
+            SlotOutcome {
                 outcome: SlotOutcomeKind::Activated,
                 generation: Some(test_generation_id("x")),
                 compensated: false,
                 error: None,
-            }
-            .into(),
+                transition: SlotTransition::Advanced,
+            },
         );
-        bad.outcomes = SlotTable::from_map(outcomes);
+        let TerminalDisposition::Successful { outcomes: o, .. } = &mut bad.disposition else {
+            unreachable!("the fixture terminal is Successful");
+        };
+        *o = SlotTable::from_map(outcomes);
         assert_terminal_refused(&tmp, target, &intent, &bad, "e");
-        // (f) OUTCOME OWN-KEY: an outcome whose value names a DIFFERENT
-        // slot than its map key.
+        // (f) OUTCOME KEY RENAMED: the domain value carries no slot (the
+        // table key owns identity), so an own-key violation is
+        // UNREPRESENTABLE in the domain — the renamed key is re-attached as
+        // the wire outcome's `slot_id` on serialization, and the refusal
+        // comes from the cross-record agreement (the renamed key is no
+        // longer a member of the intent's membership).
         let mut bad = terminal.clone();
-        let mut map = bad.outcomes.clone().into_map();
+        let mut map = bad.outcomes().clone().into_map();
         let first = map.keys().next().cloned().unwrap();
         let result = map.remove(&first).unwrap();
         map.insert(SlotId::new("renamed-outcome".to_string()), result);
-        bad.outcomes = SlotTable::from_map(map);
+        let TerminalDisposition::Successful { outcomes: o, .. } = &mut bad.disposition else {
+            unreachable!("the fixture terminal is Successful");
+        };
+        *o = SlotTable::from_map(map);
         assert_terminal_refused(&tmp, target, &intent, &bad, "f");
         // (g) TARGET EQUALITY, intent leg: the intent names a different
         // target than the path.

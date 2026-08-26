@@ -34,7 +34,7 @@ fn rollback_of(e: &LedgerEntry) -> &LedgerRollback {
         .expect("a successful entry has a terminal")
         .disposition
     {
-        deploy::records::TerminalDisposition::Successful { rollback } => rollback,
+        deploy::records::TerminalDisposition::Successful { rollback, .. } => rollback,
         _ => panic!("a successful entry carries a rollback state"),
     }
 }
@@ -2324,7 +2324,7 @@ interval_seconds = 0
         .terminal
         .as_ref()
         .expect("the deployment has a terminal event")
-        .outcomes
+        .outcomes()
         .clone();
     // All three slots appear in the attempt.
     assert_eq!(attempt.slot_ids.len(), 3);

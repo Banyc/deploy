@@ -524,18 +524,18 @@ mod tests {
             // The EXACT-EQUAL shape: one Activated outcome per slotted
             // generation (the four-set equality is enforced by the
             // conversion).
-            outcomes: SlotTable::from_map(BTreeMap::from([(
-                SlotId::new("p1".to_string()),
-                SlotResult {
-                    slot_id: SlotId::new("p1".to_string()),
-                    outcome: SlotOutcomeKind::Activated,
-                    generation: Some(test_generation_id("gen-1")),
-                    compensated: false,
-                    error: None,
-                },
-            )])),
             disposition: TerminalDisposition::Successful {
                 rollback: rollback_for(release),
+                outcomes: SlotTable::from_map(BTreeMap::from([(
+                    SlotId::new("p1".to_string()),
+                    SlotResult {
+                        slot_id: SlotId::new("p1".to_string()),
+                        outcome: SlotOutcomeKind::Activated,
+                        generation: Some(test_generation_id("gen-1")),
+                        compensated: false,
+                        error: None,
+                    },
+                )])),
             },
             reason: None,
         }
@@ -571,17 +571,18 @@ mod tests {
                             // The FailedRolledBack compensation report IS the
                             // outcome table — it must EXACTLY cover the
                             // membership (the status-specific outcome rule).
-                            outcomes: SlotTable::from_map(BTreeMap::from([(
-                                SlotId::new("p1".to_string()),
-                                SlotResult {
-                                    slot_id: SlotId::new("p1".to_string()),
-                                    outcome: SlotOutcomeKind::Restored,
-                                    generation: Some(test_generation_id("gen-1")),
-                                    compensated: true,
-                                    error: None,
-                                },
-                            )])),
-                            disposition: TerminalDisposition::FailedRolledBack,
+                            disposition: TerminalDisposition::FailedRolledBack {
+                                outcomes: SlotTable::from_map(BTreeMap::from([(
+                                    SlotId::new("p1".to_string()),
+                                    SlotResult {
+                                        slot_id: SlotId::new("p1".to_string()),
+                                        outcome: SlotOutcomeKind::Restored,
+                                        generation: Some(test_generation_id("gen-1")),
+                                        compensated: true,
+                                        error: None,
+                                    },
+                                )])),
+                            },
                             reason: None,
                         },
                     )
@@ -751,7 +752,7 @@ interval_seconds = 0
         let mut term = terminal_for(release);
         // Rewrite the rollback's per-slot tree to the caller's tree.
         let rollback = match &mut term.disposition {
-            TerminalDisposition::Successful { rollback } => rollback,
+            TerminalDisposition::Successful { rollback, .. } => rollback,
             _ => unreachable!("seed_success always builds a Successful terminal"),
         };
         for g in rollback.slots.values_mut() {

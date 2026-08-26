@@ -602,16 +602,6 @@ interval_seconds = 0
             // The EXACT-EQUAL shape: one Activated outcome per slotted
             // generation (the four-set equality is enforced by the
             // conversion).
-            outcomes: SlotTable::from_map(BTreeMap::from([(
-                SlotId::new(SLOT.to_string()),
-                SlotResult {
-                    slot_id: SlotId::new(SLOT.to_string()),
-                    outcome: SlotOutcomeKind::Activated,
-                    generation: Some(test_generation_id("gen-1")),
-                    compensated: false,
-                    error: None,
-                },
-            )])),
             disposition: TerminalDisposition::Successful {
                 rollback: LedgerRollback {
                     slots: BTreeMap::from([(
@@ -639,6 +629,16 @@ interval_seconds = 0
                         },
                     )]),
                 },
+                outcomes: SlotTable::from_map(BTreeMap::from([(
+                    SlotId::new(SLOT.to_string()),
+                    SlotResult {
+                        slot_id: SlotId::new(SLOT.to_string()),
+                        outcome: SlotOutcomeKind::Activated,
+                        generation: Some(test_generation_id("gen-1")),
+                        compensated: false,
+                        error: None,
+                    },
+                )])),
             },
             reason: None,
         }

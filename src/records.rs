@@ -59,15 +59,17 @@
 //!   append-attempt contract) and never edited. It carries NO status, NO
 //!   outcomes, and NO rollback state.
 //! * [`LedgerLine::Terminal`] — the TERMINAL EVENT of one deployment
-//!   ([`LedgerTerminalWire`] → verified [`LedgerTerminal`]): the status, the
-//!   per-slot OUTCOMES (the AUTHORITATIVE per-slot facts — the disposition's
-//!   per-slot projections, the Degraded remaining changes and the
-//!   FailedRolledBack compensation report, are DERIVED from them, never
-//!   stored twice), and — when the deployment was SUCCESSFUL — the ROLLBACK
-//!   STATE ([`LedgerRollbackWire`] → verified [`LedgerRollback`], the
-//!   snapshot payload: per-slot generation refs + physical bindings, the ONE
-//!   fact the outcomes cannot express). Appended once, after the mutation
-//!   loop, and never edited.
+//!   ([`LedgerTerminalWire`] → verified [`LedgerTerminal`]): the status and
+//!   the DISPOSITION ([`TerminalDisposition`]) — the enum whose variants
+//!   carry exactly their payload. Each disposition OWNS its per-slot
+//!   OUTCOMES table (the AUTHORITATIVE per-slot facts — the Degraded
+//!   remaining changes and the FailedRolledBack compensation report are
+//!   DERIVED from the disposition's OWN table, never stored twice, so they
+//!   can never disagree with it), and a SUCCESSFUL disposition additionally
+//!   carries the ROLLBACK STATE ([`LedgerRollbackWire`] → verified
+//!   [`LedgerRollback`], the snapshot payload: per-slot generation refs +
+//!   physical bindings, the ONE fact the outcomes cannot express). Appended
+//!   once, after the mutation loop, and never edited.
 //!
 //! A merged [`LedgerEntry`] (intent + optional terminal) is the deployment's
 //! full history record. The ledger's APPEND ORDER is the HISTORY ORDER: the
@@ -145,8 +147,11 @@ impl<T> Default for OrderedSlotMap<T> {
 }
 
 impl<T> OrderedSlotMap<T> {
-    fn new() -> Self {
-        Self::default()
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            index: BTreeMap::new(),
+        }
     }
 
     fn from_map(map: BTreeMap<SlotId, T>) -> Self {
@@ -220,7 +225,7 @@ impl<T> Index<&SlotId> for OrderedSlotMap<T> {
 pub struct SlotTable<T>(OrderedSlotMap<T>);
 
 impl<T> SlotTable<T> {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self(OrderedSlotMap::new())
     }
 
@@ -1124,18 +1129,17 @@ pub enum SlotTransition {
 }
 
 /// The per-slot OUTCOME of one slot during a deployment's mutation loop —
-/// the DOMAIN form of the wire's [`SlotResult`]: the wire's status/outcome
-/// fields PLUS the per-slot TRANSITION STATE ([`SlotTransition`]) the
-/// remaining-changes derivation is based on. The WIRE keeps the current
-/// on-disk shape ([`SlotResult`]); the wire → domain conversion derives the
-/// transition from the wire's status/outcome fields
-/// ([`SlotOutcome::from_wire`]). The OUTCOME OWN-KEY agreement — each
-/// outcome's `slot_id` names its own table key — is verified by the wire →
-/// domain conversion and by the ledger read, per the cross-field-invariants
-/// work.
+/// the DOMAIN value of the wire's [`SlotResult`] with the REDUNDANT
+/// `slot_id` DROPPED: the enclosing [`SlotTable`] key owns the slot
+/// identity, so the value stores each fact exactly once (the wire keeps the
+/// on-disk shape — the wire outcome carries the slot; the wire → domain
+/// conversion verifies the outcome names its own key and then drops it into
+/// the key). The value ALSO carries the per-slot TRANSITION STATE
+/// ([`SlotTransition`]) the remaining-changes derivation is based on (the
+/// wire keeps the current on-disk shape; the wire → domain conversion
+/// derives the transition from the wire's status/outcome fields).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotOutcome {
-    pub slot_id: SlotId,
     pub outcome: SlotOutcomeKind,
     /// The generation this slot advanced to, or `None` if it never started.
     pub generation: Option<GenerationId>,
@@ -1176,7 +1180,6 @@ impl SlotOutcome {
             SlotOutcomeKind::Compensated => SlotTransition::Restored,
         };
         SlotOutcome {
-            slot_id: r.slot_id,
             outcome: r.outcome,
             generation: r.generation,
             compensated: r.compensated,
@@ -1187,21 +1190,25 @@ impl SlotOutcome {
 }
 
 impl From<SlotResult> for SlotOutcome {
+    /// Drop the wire outcome's redundant `slot_id` (the table key owns the
+    /// slot identity — the wire → domain conversion verifies the outcome
+    /// named its own key before dropping it) and derive the per-slot
+    /// TRANSITION STATE from the wire's status/outcome fields.
     fn from(r: SlotResult) -> SlotOutcome {
         SlotOutcome::from_wire(r)
     }
 }
 
-impl From<SlotOutcome> for SlotResult {
-    /// The WIRE form of a domain outcome: the transition state is a DOMAIN
-    /// fact (the wire keeps the current on-disk shape) and is dropped.
-    fn from(o: SlotOutcome) -> SlotResult {
+impl SlotResult {
+    /// Re-attach the table key as the wire outcome's `slot_id` (the wire
+    /// keeps the on-disk shape; the domain value carries no slot).
+    pub fn from_outcome(key: &SlotId, o: &SlotOutcome) -> Self {
         SlotResult {
-            slot_id: o.slot_id,
-            outcome: o.outcome,
-            generation: o.generation,
+            slot_id: key.clone(),
+            outcome: o.outcome.clone(),
+            generation: o.generation.clone(),
             compensated: o.compensated,
-            error: o.error,
+            error: o.error.clone(),
         }
     }
 }
@@ -1213,12 +1220,12 @@ impl From<SlotOutcome> for SlotResult {
 pub type CompleteRollback = LedgerRollback;
 
 /// The COMPENSATION REPORT of a [`TerminalDisposition::FailedRolledBack`]
-/// terminal — the existing per-slot outcomes table under the disposition's
-/// name: each slot's result during the failed-then-rolled-back attempt
-/// (which slots were compensated back and which compensation failed). The
-/// report is DERIVED from the terminal's authoritative outcomes table
-/// ([`LedgerTerminal::compensation`]) — never stored as a duplicate that
-/// could disagree with the outcomes.
+/// terminal — the disposition's OWN per-slot outcomes table under the
+/// disposition's name: each slot's result during the failed-then-rolled-back
+/// attempt (which slots were compensated back and which compensation
+/// failed). The report IS the disposition's outcomes table
+/// ([`LedgerTerminal::compensation`]) — never a stored duplicate that could
+/// disagree with the outcomes.
 pub type CompensationReport = SlotTable<SlotOutcome>;
 
 /// The DISPOSITION of a deployment's terminal event — the DOMAIN replaces
@@ -1230,23 +1237,30 @@ pub type CompensationReport = SlotTable<SlotOutcome>;
 /// * [`TerminalDisposition::Successful`] ALWAYS carries its complete
 ///   rollback payload (a successful deployment always records its rollback
 ///   state — the generation refs + physical bindings, the ONE fact the
-///   per-slot outcomes cannot express). The outcomes keys, the rollback's
+///   per-slot outcomes cannot express) AND its OWN per-slot outcomes table
+///   (every outcome Activated, each key covered by the rollback's slots —
+///   enforced by the conversion). The outcomes keys, the rollback's
 ///   slots keys, and the rollback's bindings keys are EXACTLY EQUAL and
 ///   NON-EMPTY (enforced by the conversion; the intent's membership is the
 ///   fourth equal set, enforced where the terminal merges into its entry).
 /// * [`TerminalDisposition::FailedPreflight`] carries NOTHING — a
-///   pre-mutation failure cannot carry a rollback, and no slot was touched.
-/// * [`TerminalDisposition::FailedRolledBack`] carries NOTHING — its
-///   COMPENSATION REPORT (the per-slot results of the compensation pass) IS
-///   the terminal's authoritative outcomes table, DERIVED via
+///   pre-mutation failure cannot carry a rollback, and no slot was touched
+///   (the conversion refuses outcomes).
+/// * [`TerminalDisposition::FailedRolledBack`] carries its OWN per-slot
+///   outcomes table — the COMPENSATION REPORT (the per-slot results of the
+///   compensation pass) IS that table, exposed via
 ///   [`LedgerTerminal::compensation`], never stored twice.
-/// * [`TerminalDisposition::Degraded`] carries NOTHING — its REMAINING
-///   CHANGES (the slots that did not reach a restored state, each mapped to
-///   the generation it recorded) are DERIVED from the authoritative
-///   outcomes via [`LedgerTerminal::remaining_changes`], never stored twice.
+/// * [`TerminalDisposition::Degraded`] carries its OWN per-slot outcomes
+///   table — its REMAINING CHANGES (the slots that did not reach a restored
+///   state, each mapped to the generation it recorded) are DERIVED from that
+///   table via [`LedgerTerminal::remaining_changes`], never stored twice
+///   (NON-EMPTY by construction — the conversion refuses a Degraded wire
+///   whose outcomes show all-restored).
 ///
-/// STORE EACH FACT EXACTLY ONCE: the per-slot OUTCOMES are the authoritative
-/// per-slot facts; the disposition carries ONLY what the outcomes cannot
+/// LET EACH DISPOSITION OWN ITS OUTCOME TABLE: the per-slot OUTCOMES are
+/// the authoritative per-slot facts and they live ONCE, INSIDE the
+/// disposition — there is no separate `LedgerTerminal.outcomes` field to
+/// disagree with. The disposition carries ONLY what the outcomes cannot
 /// express (the Successful rollback payload). The WIRE keeps the current
 /// `status` + `rollback` shape; the wire → domain conversion maps every
 /// status to EXACTLY ONE disposition and refuses a status whose payload does
@@ -1259,27 +1273,32 @@ pub type CompensationReport = SlotTable<SlotOutcome>;
 pub enum TerminalDisposition {
     /// The deployment succeeded: the complete rollback payload (the full
     /// snapshot: per-slot generations + physical bindings — the ONE fact
-    /// the per-slot outcomes cannot express; the outcomes' keys must agree
-    /// with the rollback's slots, enforced by the conversion).
-    Successful { rollback: CompleteRollback },
+    /// the per-slot outcomes cannot express) AND the disposition's OWN
+    /// per-slot outcomes table (every outcome Activated, each outcome key
+    /// covered by the rollback's slots — enforced by the conversion).
+    Successful {
+        rollback: CompleteRollback,
+        outcomes: SlotTable<SlotOutcome>,
+    },
     /// The attempt failed before any slot mutation: no payload (no
     /// rollback — and the conversion also refuses outcomes, since a
     /// pre-mutation failure touched no slot).
     FailedPreflight,
-    /// The attempt failed after mutating slots and was rolled back: no
-    /// payload — the compensation report (each slot's per-slot result of
-    /// the compensation pass: which slots were restored and which
-    /// compensation failed) IS the terminal's authoritative outcomes table,
-    /// derived via [`LedgerTerminal::compensation`].
-    FailedRolledBack,
+    /// The attempt failed after mutating slots and was rolled back: the
+    /// disposition's OWN per-slot outcomes table — the compensation report
+    /// (each slot's per-slot result of the compensation pass: which slots
+    /// were restored and which compensation failed) IS that table, exposed
+    /// via [`LedgerTerminal::compensation`].
+    FailedRolledBack { outcomes: SlotTable<SlotOutcome> },
     /// The attempt ended degraded (some slots advanced and were not
-    /// restored, or the commit could not be finalized): no payload — the
-    /// REMAINING CHANGES (the slots that did not reach a restored state,
-    /// each mapped to the generation it recorded) are DERIVED from the
-    /// authoritative outcomes via [`LedgerTerminal::remaining_changes`]
-    /// (NON-EMPTY by construction — the conversion refuses a Degraded wire
-    /// whose outcomes show all-restored).
-    Degraded,
+    /// restored, or the commit could not be finalized): the disposition's
+    /// OWN per-slot outcomes table — the REMAINING CHANGES (the slots that
+    /// did not reach a restored state, each mapped to the generation it
+    /// recorded) are DERIVED from that table via
+    /// [`LedgerTerminal::remaining_changes`] (NON-EMPTY by construction —
+    /// the conversion refuses a Degraded wire whose outcomes show
+    /// all-restored).
+    Degraded { outcomes: SlotTable<SlotOutcome> },
 }
 
 impl TerminalDisposition {
@@ -1290,8 +1309,8 @@ impl TerminalDisposition {
         match self {
             TerminalDisposition::Successful { .. } => DeploymentStatus::Successful,
             TerminalDisposition::FailedPreflight => DeploymentStatus::FailedPreflight,
-            TerminalDisposition::FailedRolledBack => DeploymentStatus::FailedRolledBack,
-            TerminalDisposition::Degraded => DeploymentStatus::Degraded,
+            TerminalDisposition::FailedRolledBack { .. } => DeploymentStatus::FailedRolledBack,
+            TerminalDisposition::Degraded { .. } => DeploymentStatus::Degraded,
         }
     }
 
@@ -1313,36 +1332,38 @@ impl TerminalDisposition {
 /// status/rollback TRUTH TABLE is STRUCTURAL (see [`TerminalDisposition`])
 /// — an invalid status/payload combination is unrepresentable.
 ///
-/// STORE EACH FACT EXACTLY ONCE: the per-slot OUTCOMES are the authoritative
-/// per-slot facts; the disposition carries ONLY what the outcomes cannot
-/// express (the Successful rollback payload). The disposition's per-slot
-/// projections — the Degraded REMAINING CHANGES and the FailedRolledBack
-/// COMPENSATION REPORT — are DERIVED from the outcomes
-/// ([`LedgerTerminal::remaining_changes`], [`LedgerTerminal::compensation`]),
-/// never stored twice, so they can never disagree with the outcomes.
-/// `reason` carries optional human context (e.g. "push completed", "recovery
-/// finalized", "preflight failed") — a free-form human NOTE, not a fact: it
-/// never participates in any invariant (the disposition IS the machine fact).
+/// LET EACH DISPOSITION OWN ITS OUTCOME TABLE: the per-slot OUTCOMES are
+/// the authoritative per-slot facts and they live ONCE, INSIDE the
+/// disposition ([`TerminalDisposition`]) — there is NO separate
+/// `LedgerTerminal.outcomes` field to disagree with. The disposition's
+/// per-slot projections — the Degraded REMAINING CHANGES and the
+/// FailedRolledBack COMPENSATION REPORT — are DERIVED from the
+/// disposition's OWN table ([`LedgerTerminal::remaining_changes`],
+/// [`LedgerTerminal::compensation`]), never stored twice, so they can never
+/// disagree with the outcomes. `reason` carries optional human context
+/// (e.g. "push completed", "recovery finalized", "preflight failed") — a
+/// free-form human NOTE, not a fact: it never participates in any invariant
+/// (the disposition IS the machine fact).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LedgerTerminal {
     /// When the terminal event was recorded (RFC 3339).
     pub recorded_at: String,
-    /// Actual per-slot outcomes after the mutation loop, the domain
-    /// [`SlotTable`] (possibly empty — a pre-mutation failure touched no
-    /// slot). THE AUTHORITATIVE per-slot facts: the disposition's per-slot
-    /// projections (the Degraded remaining changes, the FailedRolledBack
-    /// compensation report) are DERIVED from this table, never stored
-    /// separately.
-    pub outcomes: SlotTable<SlotOutcome>,
     /// HOW the attempt ended — the enum whose variants carry exactly their
-    /// payload (the truth table is structural; the per-slot projections are
-    /// derived from `outcomes`).
+    /// payload: each disposition OWNS its per-slot outcomes table (the
+    /// truth table is structural; the per-slot projections are derived from
+    /// the disposition's OWN table).
     pub disposition: TerminalDisposition,
     /// Optional human context: why this terminal event happened. A
     /// free-form NOTE, not a fact — it never participates in invariants
     /// (the disposition is the machine fact).
     pub reason: Option<String>,
 }
+
+/// The empty outcomes table a [`TerminalDisposition::FailedPreflight`]
+/// terminal yields through [`LedgerTerminal::outcomes`] — the disposition
+/// carries NO outcomes (a pre-mutation failure touched no slot), so the
+/// accessor yields an empty table rather than `None`.
+static EMPTY_OUTCOMES: SlotTable<SlotOutcome> = SlotTable::new();
 
 impl LedgerTerminal {
     /// The terminal's status, DERIVED from its disposition (never stored
@@ -1351,15 +1372,30 @@ impl LedgerTerminal {
         self.disposition.status()
     }
 
+    /// The terminal's per-slot outcomes — the disposition's OWN table (each
+    /// disposition carries its outcomes; a
+    /// [`TerminalDisposition::FailedPreflight`] terminal carries none, so
+    /// the accessor yields an empty table). THE AUTHORITATIVE per-slot
+    /// facts live ONCE, inside the disposition — there is no separate
+    /// outcomes field to disagree with.
+    pub fn outcomes(&self) -> &SlotTable<SlotOutcome> {
+        match &self.disposition {
+            TerminalDisposition::Successful { outcomes, .. } => outcomes,
+            TerminalDisposition::FailedPreflight => &EMPTY_OUTCOMES,
+            TerminalDisposition::FailedRolledBack { outcomes } => outcomes,
+            TerminalDisposition::Degraded { outcomes } => outcomes,
+        }
+    }
+
     /// The REMAINING CHANGES of a [`TerminalDisposition::Degraded`] terminal
-    /// — DERIVED from the authoritative per-slot outcomes (the slots whose
-    /// FINAL OBSERVED STATE differs from their pre_push state, each mapped
-    /// to the generation it is on), never stored. `None` for any non-Degraded
-    /// disposition. For a Degraded terminal the set may be EMPTY (a
-    /// `leave_changed` failure that advanced nothing — e.g. a pre-swap
-    /// failure with every slot skipped — is Degraded with no remaining
-    /// change); the conversion refuses only a Degraded wire whose outcomes
-    /// are ALL restored (a fully-compensated attempt must be
+    /// — DERIVED from the disposition's OWN per-slot outcomes (the slots
+    /// whose FINAL OBSERVED STATE differs from their pre_push state, each
+    /// mapped to the generation it is on), never stored. `None` for any
+    /// non-Degraded disposition. For a Degraded terminal the set may be
+    /// EMPTY (a `leave_changed` failure that advanced nothing — e.g. a
+    /// pre-swap failure with every slot skipped — is Degraded with no
+    /// remaining change); the conversion refuses only a Degraded wire whose
+    /// outcomes are ALL restored (a fully-compensated attempt must be
     /// `FailedRolledBack`, never Degraded).
     ///
     /// THE DERIVATION IS THE TRANSITION STATE, NOT THE OUTCOME'S GENERATION
@@ -1373,11 +1409,11 @@ impl LedgerTerminal {
     /// the desired one) differs from pre_push. The intent's `pre_push` per
     /// slot is the comparison baseline.
     pub fn remaining_changes(&self, intent: &DeploymentIntent) -> Option<SlotTable<GenerationId>> {
-        if !matches!(self.disposition, TerminalDisposition::Degraded) {
+        if !matches!(self.disposition, TerminalDisposition::Degraded { .. }) {
             return None;
         }
         let remaining: BTreeMap<SlotId, GenerationId> = self
-            .outcomes
+            .outcomes()
             .iter()
             .filter(|(sid, r)| match r.transition {
                 SlotTransition::NeverAdvanced | SlotTransition::Restored => false,
@@ -1413,13 +1449,16 @@ impl LedgerTerminal {
     }
 
     /// The COMPENSATION REPORT of a [`TerminalDisposition::FailedRolledBack`]
-    /// terminal — the authoritative per-slot outcomes table itself (the
+    /// terminal — the disposition's OWN per-slot outcomes table itself (the
     /// record of what the compensation pass did to each slot: which slots
     /// were restored and which compensation failed), never a stored
     /// duplicate. `None` for any other disposition.
     pub fn compensation(&self) -> Option<&CompensationReport> {
-        if matches!(self.disposition, TerminalDisposition::FailedRolledBack) {
-            Some(&self.outcomes)
+        if matches!(
+            self.disposition,
+            TerminalDisposition::FailedRolledBack { .. }
+        ) {
+            Some(self.outcomes())
         } else {
             None
         }
@@ -1455,19 +1494,20 @@ impl LedgerTerminalWire {
     /// converted through [`LedgerRollbackWire::into_domain`] (which fails
     /// closed on any disagreement), the STATUS/ROLLBACK TRUTH TABLE is
     /// enforced (`Successful` always records its rollback state; every other
-    /// status never carries one), each outcome's value must name its OWN
-    /// map key (the outcome's `slot_id` is the placement slot it records),
-    /// and the disposition's duplicated projections must AGREE with the
-    /// authoritative outcomes, BY STATUS: a `Successful` wire's outcomes
-    /// keys, rollback slots keys, and rollback bindings keys must be
-    /// EXACTLY EQUAL and NON-EMPTY (every outcome must also be Activated),
-    /// a `FailedPreflight` wire must carry NO outcomes (a pre-mutation
-    /// failure touched no slot), and a `Degraded` wire's outcomes must
-    /// derive a NON-EMPTY remaining-changes set (all-restored outcomes are
-    /// refused). A disagreement → `Error::integrity`. The cross-record
-    /// claims (the outcome key set vs the intent's `slot_ids` — the
-    /// membership leg of the four-set equality — and the `target` field vs
-    /// the read path / intent) are enforced by the ledger read that merges
+    /// status never carries one), each wire outcome's value must name its OWN
+    /// map key (the outcome's `slot_id` is the placement slot it records —
+    /// the redundant slot is then DROPPED into the key, since the domain
+    /// value carries no slot), and the disposition's duplicated projections
+    /// must AGREE with the authoritative outcomes, BY STATUS: a `Successful`
+    /// wire's outcomes keys, rollback slots keys, and rollback bindings keys
+    /// must be EXACTLY EQUAL and NON-EMPTY (every outcome must also be
+    /// Activated), a `FailedPreflight` wire must carry NO outcomes (a
+    /// pre-mutation failure touched no slot), and a `Degraded` wire's
+    /// outcomes must derive a NON-EMPTY remaining-changes set (all-restored
+    /// outcomes are refused). A disagreement → `Error::integrity`. The
+    /// cross-record claims (the outcome key set vs the intent's `slot_ids` —
+    /// the membership leg of the four-set equality — and the `target` field
+    /// vs the read path / intent) are enforced by the ledger read that merges
     /// the intent and the terminal
     /// ([`crate::store::local::LocalStore::read_ledger`]).
     pub fn into_domain(self) -> Result<LedgerTerminal> {
@@ -1482,11 +1522,11 @@ impl LedgerTerminalWire {
             Some(wire) => Some(wire.into_domain()?),
             None => None,
         };
-        // OUTCOME OWN-KEY AGREEMENT (self-contained half): each outcome's
-        // value names ITS OWN map key — an outcome for a different slot is a
-        // disagreement. (The other half — the outcome KEY SET vs the
-        // intent's authoritative membership — is cross-record and lives in
-        // the ledger read that merges intent + terminal.)
+        // OUTCOME OWN-KEY AGREEMENT (self-contained half): each wire
+        // outcome's value names ITS OWN map key — an outcome for a different
+        // slot is a disagreement. (The other half — the outcome KEY SET vs
+        // the intent's authoritative membership — is cross-record and lives
+        // in the ledger read that merges intent + terminal.)
         for (key, result) in &self.outcomes {
             if &result.slot_id != key {
                 return Err(Error::integrity(format!(
@@ -1497,9 +1537,10 @@ impl LedgerTerminalWire {
         }
         // The wire outcomes are converted to the DOMAIN outcomes, deriving
         // each slot's TRANSITION STATE from the wire's status/outcome fields
-        // ([`SlotOutcome::from_wire`]) — the wire keeps the current on-disk
-        // shape; the transition is the per-slot fact the domain outcomes
-        // carry.
+        // ([`SlotOutcome::from_wire`]) and DROPPING the wire outcome's
+        // redundant `slot_id` into the key (the domain value carries no slot
+        // — the table key owns identity; the own-key agreement above
+        // verified the wire's claim before the drop).
         let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(self.outcomes);
         // STATUS → DISPOSITION: each status maps to exactly one disposition,
         // and a status whose payload does not match its disposition is a
@@ -1538,16 +1579,16 @@ impl LedgerTerminalWire {
                 // A Successful deployment implies every slot activated: a
                 // non-activated outcome is a disagreement (the disposition's
                 // implied state vs the recorded outcome).
-                if let Some(r) = outcomes
-                    .values()
-                    .find(|r| r.outcome != SlotOutcomeKind::Activated)
+                if let Some((key, r)) = outcomes
+                    .iter()
+                    .find(|(_, r)| r.outcome != SlotOutcomeKind::Activated)
                 {
                     return Err(Error::integrity(format!(
-                        "terminal {}: status Successful requires every outcome Activated — slot '{}' records {:?}",
-                        self.deployment_id, r.slot_id, r.outcome
+                        "terminal {}: status Successful requires every outcome Activated — slot '{key}' records {:?}",
+                        self.deployment_id, r.outcome
                     )));
                 }
-                TerminalDisposition::Successful { rollback }
+                TerminalDisposition::Successful { rollback, outcomes }
             }
             (DeploymentStatus::Successful, None) => {
                 return Err(Error::integrity(format!(
@@ -1571,12 +1612,11 @@ impl LedgerTerminalWire {
                 )));
             }
             (DeploymentStatus::FailedRolledBack, None) => {
-                // The compensation report IS the outcome table: the record
-                // of what the compensation pass did to each slot — DERIVED
-                // from the authoritative outcomes
-                // ([`LedgerTerminal::compensation`]), never stored as a
-                // duplicate that could disagree with them.
-                TerminalDisposition::FailedRolledBack
+                // The compensation report IS the disposition's outcome table:
+                // the record of what the compensation pass did to each slot
+                // — exposed via [`LedgerTerminal::compensation`], never
+                // stored as a duplicate that could disagree with them.
+                TerminalDisposition::FailedRolledBack { outcomes }
             }
             (DeploymentStatus::FailedRolledBack, Some(_)) => {
                 return Err(Error::integrity(format!(
@@ -1608,7 +1648,7 @@ impl LedgerTerminalWire {
                         self.deployment_id
                     )));
                 }
-                TerminalDisposition::Degraded
+                TerminalDisposition::Degraded { outcomes }
             }
             (DeploymentStatus::Degraded, Some(_)) => {
                 return Err(Error::integrity(format!(
@@ -1625,7 +1665,6 @@ impl LedgerTerminalWire {
         };
         Ok(LedgerTerminal {
             recorded_at: self.recorded_at,
-            outcomes,
             disposition,
             reason: self.reason,
         })
@@ -1641,7 +1680,7 @@ impl LedgerTerminalWire {
         t: &LedgerTerminal,
     ) -> Self {
         let rollback = match &t.disposition {
-            TerminalDisposition::Successful { rollback } => {
+            TerminalDisposition::Successful { rollback, .. } => {
                 Some(LedgerRollbackWire::from(rollback))
             }
             _ => None,
@@ -1652,11 +1691,13 @@ impl LedgerTerminalWire {
             status: t.disposition.status(),
             recorded_at: t.recorded_at.clone(),
             // The WIRE keeps the current on-disk shape: the domain outcomes'
-            // transition state is a DOMAIN fact and is dropped here.
+            // transition state is a DOMAIN fact and is dropped here, and each
+            // outcome's table key is re-attached as the wire value's
+            // `slot_id` (the domain value carries no slot).
             outcomes: t
-                .outcomes
+                .outcomes()
                 .iter()
-                .map(|(k, r)| (k.clone(), SlotResult::from(r.clone())))
+                .map(|(k, o)| (k.clone(), SlotResult::from_outcome(k, o)))
                 .collect(),
             rollback,
             reason: t.reason.clone(),
@@ -2335,6 +2376,11 @@ impl<'de> Deserialize<'de> for DeploymentPlan {
     }
 }
 
+/// The WIRE outcome of one slot during a deployment's mutation loop — the
+/// RAW serde form the ledger's JSONL carries, with the REDUNDANT `slot_id`
+/// next to its map key (the wire keeps the on-disk shape; the wire → domain
+/// conversion verifies the outcome names its own key and then DROPS the
+/// slot into the key — the domain value [`SlotOutcome`] carries no slot).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotResult {
     pub slot_id: SlotId,
@@ -2580,7 +2626,7 @@ mod tests {
         // STATUS-SPECIFIC OUTCOME AGREEMENT (the membership leg of the
         // four-set equality — the same rules `read_ledger` enforces when it
         // merges the terminal into its entry).
-        let outcome_keys: BTreeSet<&SlotId> = terminal.outcomes.keys().collect();
+        let outcome_keys: BTreeSet<&SlotId> = terminal.outcomes().keys().collect();
         let membership: BTreeSet<&SlotId> = intent.slots.keys().collect();
         match terminal.status() {
             DeploymentStatus::Successful => {
@@ -2630,8 +2676,9 @@ mod tests {
 
     /// Inspect the DOMAIN shapes produced from a VALID pair: the intent's
     /// ONE table (non-empty, unique keys, every member carries its desired +
-    /// pre_push), the terminal's outcomes table, and the disposition's
-    /// structural payloads.
+    /// pre_push), and the terminal's disposition — each disposition OWNS its
+    /// outcomes table (the accessor returns the disposition's OWN table; a
+    /// FailedPreflight terminal carries none).
     fn assert_domain_shape(
         intent: &DeploymentIntent,
         terminal: &LedgerTerminal,
@@ -2660,11 +2707,8 @@ mod tests {
             // `None` for a first deployment) — there is no member without
             // its per-slot data.
         }
-        for (key, result) in terminal.outcomes.iter() {
-            assert_eq!(&result.slot_id, key, "each outcome names its own key");
-        }
         match (&terminal.disposition, status_idx) {
-            (TerminalDisposition::Successful { rollback }, 0) => {
+            (TerminalDisposition::Successful { rollback, outcomes }, 0) => {
                 assert_eq!(
                     rollback.slots.len(),
                     keys.len(),
@@ -2675,13 +2719,35 @@ mod tests {
                     keys.len(),
                     "every slotted generation carries its physical binding"
                 );
+                // The Successful disposition OWNS its outcome table: the
+                // accessor returns the disposition's OWN table, and every
+                // outcome is Activated (the conversion's agreement).
+                assert_eq!(
+                    terminal.outcomes(),
+                    outcomes,
+                    "the accessor reads the disposition's OWN table"
+                );
+                assert_eq!(
+                    outcomes.len(),
+                    keys.len(),
+                    "the Successful disposition owns one outcome per member"
+                );
+                assert!(
+                    outcomes
+                        .values()
+                        .all(|o| o.outcome == SlotOutcomeKind::Activated),
+                    "a Successful disposition's outcomes are all Activated"
+                );
             }
             (TerminalDisposition::FailedPreflight, 1) => {
-                assert!(terminal.outcomes.is_empty(), "preflight touched no slot");
+                assert!(
+                    terminal.outcomes().is_empty(),
+                    "preflight touched no slot (the disposition carries no outcomes)"
+                );
             }
-            (TerminalDisposition::FailedRolledBack, 2) => {
+            (TerminalDisposition::FailedRolledBack { .. }, 2) => {
                 let compensation = terminal.compensation().expect(
-                    "a FailedRolledBack terminal derives its compensation report from the outcomes",
+                    "a FailedRolledBack terminal's compensation report IS its own outcomes table",
                 );
                 assert_eq!(
                     compensation.len(),
@@ -2695,7 +2761,7 @@ mod tests {
                     "the compensation records the restored slots"
                 );
             }
-            (TerminalDisposition::Degraded, 3) => {
+            (TerminalDisposition::Degraded { .. }, 3) => {
                 let remaining_changes = terminal
                     .remaining_changes(intent)
                     .expect("a Degraded terminal derives its remaining changes from the outcomes");
@@ -2707,6 +2773,17 @@ mod tests {
                     remaining_changes.len(),
                     keys.len(),
                     "every non-restored slot is a remaining change"
+                );
+                // The Degraded disposition OWNS its outcome table: the
+                // accessor returns the disposition's OWN table (the
+                // remaining changes derive from it).
+                let TerminalDisposition::Degraded { outcomes } = &terminal.disposition else {
+                    unreachable!("matched above");
+                };
+                assert_eq!(
+                    terminal.outcomes(),
+                    outcomes,
+                    "the accessor reads the disposition's OWN table"
                 );
             }
             (d, s) => panic!("disposition {d:?} does not match the wire status index {s}"),
@@ -3362,37 +3439,48 @@ mod tests {
     #[test]
     fn terminal_status_maps_to_exactly_one_disposition() {
         let keys = vec![slot(1), slot(2)];
-        // Successful + complete rollback → Successful { rollback }.
+        // Successful + complete rollback → Successful { rollback, outcomes }.
         let wire = agreeing_terminal(&keys, 0);
         let d = wire.into_domain().unwrap();
         assert_eq!(d.status(), DeploymentStatus::Successful);
-        let TerminalDisposition::Successful { rollback } = d.disposition else {
-            panic!("Successful maps to Successful {{ rollback }}");
+        let TerminalDisposition::Successful { rollback, outcomes } = d.disposition else {
+            panic!("Successful maps to Successful {{ rollback, outcomes }}");
         };
         assert_eq!(rollback.slots.len(), 2, "the complete rollback payload");
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "the Successful disposition owns its outcome table"
+        );
 
         // FailedPreflight + no outcomes → FailedPreflight (nothing).
         let wire = agreeing_terminal(&keys, 1);
         let d = wire.into_domain().unwrap();
         assert_eq!(d.disposition, TerminalDisposition::FailedPreflight);
 
-        // FailedRolledBack → the outcome table is the compensation report
-        // (derived, never stored twice).
+        // FailedRolledBack → the disposition's outcome table IS the
+        // compensation report (exposed, never stored twice).
         let wire = agreeing_terminal(&keys, 2);
         let d = wire.into_domain().unwrap();
-        assert_eq!(d.disposition, TerminalDisposition::FailedRolledBack);
+        assert!(matches!(
+            d.disposition,
+            TerminalDisposition::FailedRolledBack { .. }
+        ));
         assert_eq!(
             d.compensation().expect("derived compensation report").len(),
             2,
-            "the compensation report is the outcome table"
+            "the compensation report is the disposition's outcome table"
         );
 
         // Degraded → the non-restored outcomes ARE the remaining changes
-        // (derived, never stored twice).
+        // (derived from the disposition's own table, never stored twice).
         let wire = agreeing_terminal(&keys, 3);
         let d = wire.into_domain().unwrap();
         let intent = agreeing_intent(&keys).into_domain().unwrap();
-        assert_eq!(d.disposition, TerminalDisposition::Degraded);
+        assert!(matches!(
+            d.disposition,
+            TerminalDisposition::Degraded { .. }
+        ));
         assert_eq!(
             d.remaining_changes(&intent)
                 .expect("derived remaining changes")
@@ -3487,11 +3575,11 @@ mod tests {
             .expect("the exact-equal Successful pair converts");
         assert_eq!(d_terminal.status(), DeploymentStatus::Successful);
         assert_eq!(
-            d_terminal.outcomes.len(),
+            d_terminal.outcomes().len(),
             d_intent.slots.len(),
             "the outcomes exactly cover the membership"
         );
-        let TerminalDisposition::Successful { rollback } = &d_terminal.disposition else {
+        let TerminalDisposition::Successful { rollback, .. } = &d_terminal.disposition else {
             panic!("Successful disposition");
         };
         assert_eq!(rollback.slots.len(), d_intent.slots.len());
@@ -3854,6 +3942,350 @@ mod tests {
             failed.into_domain().is_ok(),
             "a failed terminal without a rollback stays valid"
         );
+    }
+
+    // =====================================================================
+    // DISPOSITION-OWNED OUTCOMES: each disposition owns its table; the
+    // accessors read the disposition's OWN table
+    // =====================================================================
+
+    /// LET EACH DISPOSITION OWN ITS OUTCOME TABLE: the outcomes live ONCE,
+    /// inside the disposition — the accessor returns the disposition's OWN
+    /// table (no separate `LedgerTerminal.outcomes` field exists to disagree
+    /// with), and a FailedPreflight terminal carries none (the accessor
+    /// yields an empty table).
+    #[test]
+    fn each_disposition_owns_its_outcome_table() {
+        let keys = vec![slot(1), slot(2)];
+        let intent = agreeing_intent(&keys).into_domain().unwrap();
+        // Successful: the disposition owns its outcomes next to the rollback.
+        let d = agreeing_terminal(&keys, 0).into_domain().unwrap();
+        let TerminalDisposition::Successful { rollback, outcomes } = &d.disposition else {
+            panic!("Successful carries rollback + outcomes");
+        };
+        assert_eq!(
+            d.outcomes(),
+            outcomes,
+            "the accessor reads the disposition's OWN table"
+        );
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes
+                .values()
+                .all(|o| o.outcome == SlotOutcomeKind::Activated)
+        );
+        for key in outcomes.keys() {
+            assert!(
+                rollback.slots.contains_key(key),
+                "every outcome key is covered by the rollback"
+            );
+        }
+        // FailedPreflight: no outcomes — the accessor yields an empty table.
+        let d = agreeing_terminal(&keys, 1).into_domain().unwrap();
+        assert!(matches!(
+            d.disposition,
+            TerminalDisposition::FailedPreflight
+        ));
+        assert!(
+            d.outcomes().is_empty(),
+            "a preflight failure carries no outcomes"
+        );
+        // FailedRolledBack: the disposition owns the compensation report.
+        let d = agreeing_terminal(&keys, 2).into_domain().unwrap();
+        let TerminalDisposition::FailedRolledBack { outcomes } = &d.disposition else {
+            panic!("FailedRolledBack carries its outcomes");
+        };
+        assert_eq!(
+            d.outcomes(),
+            outcomes,
+            "the accessor reads the disposition's OWN table"
+        );
+        assert_eq!(
+            d.compensation().unwrap(),
+            outcomes,
+            "compensation() IS the disposition's table"
+        );
+        // Degraded: the disposition owns the remaining-changes source.
+        let d = agreeing_terminal(&keys, 3).into_domain().unwrap();
+        let TerminalDisposition::Degraded { outcomes } = &d.disposition else {
+            panic!("Degraded carries its outcomes");
+        };
+        assert_eq!(
+            d.outcomes(),
+            outcomes,
+            "the accessor reads the disposition's OWN table"
+        );
+        assert_eq!(
+            d.remaining_changes(&intent).unwrap().len(),
+            outcomes.len(),
+            "the remaining changes derive from the disposition's OWN outcomes"
+        );
+    }
+
+    /// The accessors agree with the disposition's table: `compensation()`
+    /// IS the FailedRolledBack disposition's outcomes table,
+    /// `remaining_changes()` derives from the Degraded disposition's OWN
+    /// outcomes, and both are `None` for every other disposition.
+    #[test]
+    fn accessors_agree_with_the_disposition_table() {
+        let keys = vec![slot(1)];
+        let intent = agreeing_intent(&keys).into_domain().unwrap();
+        // Successful: neither accessor applies.
+        let d = agreeing_terminal(&keys, 0).into_domain().unwrap();
+        assert!(d.compensation().is_none());
+        assert!(d.remaining_changes(&intent).is_none());
+        // FailedPreflight: neither accessor applies.
+        let d = agreeing_terminal(&keys, 1).into_domain().unwrap();
+        assert!(d.compensation().is_none());
+        assert!(d.remaining_changes(&intent).is_none());
+        // FailedRolledBack: compensation() IS the disposition's table.
+        let d = agreeing_terminal(&keys, 2).into_domain().unwrap();
+        let TerminalDisposition::FailedRolledBack { outcomes } = &d.disposition else {
+            panic!("FailedRolledBack carries its outcomes");
+        };
+        assert_eq!(d.compensation().unwrap(), outcomes);
+        assert!(d.remaining_changes(&intent).is_none());
+        // Degraded: remaining_changes() derives from the disposition's OWN
+        // outcomes (every non-restored outcome with a recorded generation).
+        let d = agreeing_terminal(&keys, 3).into_domain().unwrap();
+        let TerminalDisposition::Degraded { outcomes } = &d.disposition else {
+            panic!("Degraded carries its outcomes");
+        };
+        assert!(d.compensation().is_none());
+        let remaining = d.remaining_changes(&intent).unwrap();
+        let expected: BTreeMap<SlotId, GenerationId> = outcomes
+            .iter()
+            .filter(|(_, o)| o.outcome != SlotOutcomeKind::Restored && o.generation.is_some())
+            .map(|(k, o)| (k.clone(), o.generation.clone().unwrap()))
+            .collect();
+        assert_eq!(
+            remaining.into_map(),
+            expected,
+            "the derivation matches the disposition's own table"
+        );
+    }
+
+    // =====================================================================
+    // THE DOMAIN ROUND-TRIP PROPERTY: arbitrary domain terminals survive
+    // the wire exactly
+    // =====================================================================
+
+    /// An arbitrary domain outcome value (any kind, optional generation,
+    /// any compensation flag, optional error note).
+    fn arbitrary_outcome() -> impl Strategy<Value = SlotOutcome> {
+        (
+            prop_oneof![
+                Just(SlotOutcomeKind::Activated),
+                Just(SlotOutcomeKind::Failed),
+                Just(SlotOutcomeKind::Compensated),
+                Just(SlotOutcomeKind::Skipped),
+                Just(SlotOutcomeKind::Restored),
+            ],
+            prop::option::of((0u32..6).prop_map(|i| GenerationId::new(format!("gen-{i}")))),
+            any::<bool>(),
+            prop::option::of(prop::sample::select(vec![
+                "boom".to_string(),
+                "verification failed".to_string(),
+            ])),
+        )
+            .prop_map(|(outcome, generation, compensated, error)| {
+                let transition = match &outcome {
+                    SlotOutcomeKind::Restored => SlotTransition::Restored,
+                    SlotOutcomeKind::Skipped => SlotTransition::NeverAdvanced,
+                    SlotOutcomeKind::Activated => SlotTransition::Advanced,
+                    SlotOutcomeKind::Failed => {
+                        if compensated {
+                            SlotTransition::Restored
+                        } else {
+                            SlotTransition::AdvanceUnknown
+                        }
+                    }
+                    SlotOutcomeKind::Compensated => SlotTransition::Restored,
+                };
+                SlotOutcome {
+                    outcome,
+                    generation,
+                    compensated,
+                    error,
+                    transition,
+                }
+            })
+    }
+
+    /// An arbitrary rollback payload: arbitrary slotted generations (each
+    /// assignment naming its own key) with EXACT bindings (the wire
+    /// conversion refuses a rollback whose bindings omit a slotted
+    /// generation).
+    fn arbitrary_rollback() -> impl Strategy<Value = LedgerRollback> {
+        prop::collection::btree_set(slot_strategy(), 1..4).prop_map(|keys| {
+            let slots: BTreeMap<SlotId, GenerationRef> =
+                keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
+            let bindings: BTreeMap<SlotId, PhysicalBinding> =
+                slots.keys().map(|k| (k.clone(), binding(k))).collect();
+            LedgerRollback { slots, bindings }
+        })
+    }
+
+    /// An arbitrary SUCCESSFUL domain terminal: an arbitrary rollback plus
+    /// the disposition's OWN outcomes — every outcome Activated, each key
+    /// covered by the rollback's slots (the conversion's agreement).
+    fn arbitrary_successful() -> impl Strategy<Value = LedgerTerminal> {
+        arbitrary_rollback().prop_map(|rollback| {
+            // The four-set equality: the Successful disposition's outcomes
+            // EXACTLY cover the rollback's slots (one Activated outcome per
+            // slotted generation).
+            let outcomes: BTreeMap<SlotId, SlotOutcome> = rollback
+                .slots
+                .keys()
+                .map(|k| {
+                    (
+                        k.clone(),
+                        SlotOutcome {
+                            outcome: SlotOutcomeKind::Activated,
+                            generation: Some(GenerationId::new(format!("gen-{}", k.as_str()))),
+                            compensated: false,
+                            error: None,
+                            transition: SlotTransition::Advanced,
+                        },
+                    )
+                })
+                .collect();
+            LedgerTerminal {
+                recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                disposition: TerminalDisposition::Successful {
+                    rollback,
+                    outcomes: SlotTable::from_map(outcomes),
+                },
+                reason: None,
+            }
+        })
+    }
+
+    /// An arbitrary FAILEDROLLEDBACK domain terminal: the disposition's OWN
+    /// outcomes table is arbitrary (any kinds, any keys — the compensation
+    /// report IS that table).
+    fn arbitrary_failed_rolled_back() -> impl Strategy<Value = LedgerTerminal> {
+        prop::collection::btree_map(slot_strategy(), arbitrary_outcome(), 0..4).prop_map(
+            |outcomes| LedgerTerminal {
+                recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                disposition: TerminalDisposition::FailedRolledBack {
+                    outcomes: SlotTable::from_map(outcomes),
+                },
+                reason: None,
+            },
+        )
+    }
+
+    /// An outcome that is GUARANTEED non-restored (with a recorded
+    /// generation) — the Degraded conversion's non-emptiness requirement.
+    fn remaining_change_outcome() -> impl Strategy<Value = SlotOutcome> {
+        (
+            prop_oneof![
+                Just(SlotOutcomeKind::Activated),
+                Just(SlotOutcomeKind::Failed),
+                Just(SlotOutcomeKind::Compensated),
+                Just(SlotOutcomeKind::Skipped),
+            ],
+            (0u32..6).prop_map(|i| GenerationId::new(format!("gen-{i}"))),
+            any::<bool>(),
+            prop::option::of(prop::sample::select(vec![
+                "boom".to_string(),
+                "verification failed".to_string(),
+            ])),
+        )
+            .prop_map(|(outcome, generation, compensated, error)| {
+                let transition = match &outcome {
+                    SlotOutcomeKind::Restored => SlotTransition::Restored,
+                    SlotOutcomeKind::Skipped => SlotTransition::NeverAdvanced,
+                    SlotOutcomeKind::Activated => SlotTransition::Advanced,
+                    SlotOutcomeKind::Failed => {
+                        if compensated {
+                            SlotTransition::Restored
+                        } else {
+                            SlotTransition::AdvanceUnknown
+                        }
+                    }
+                    SlotOutcomeKind::Compensated => SlotTransition::Restored,
+                };
+                SlotOutcome {
+                    outcome,
+                    generation: Some(generation),
+                    compensated,
+                    error,
+                    transition,
+                }
+            })
+    }
+
+    /// An arbitrary DEGRADED domain terminal: the disposition's OWN outcomes
+    /// table is arbitrary (any kinds, any keys) with at least one GUARANTEED
+    /// non-restored outcome (the conversion refuses an all-restored Degraded
+    /// wire).
+    fn arbitrary_degraded() -> impl Strategy<Value = LedgerTerminal> {
+        (
+            slot_strategy(),
+            remaining_change_outcome(),
+            prop::collection::btree_map(slot_strategy(), arbitrary_outcome(), 0..3),
+        )
+            .prop_map(|(key, first, mut extras)| {
+                extras.insert(key, first);
+                LedgerTerminal {
+                    recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                    disposition: TerminalDisposition::Degraded {
+                        outcomes: SlotTable::from_map(extras),
+                    },
+                    reason: None,
+                }
+            })
+    }
+
+    /// An arbitrary domain terminal: ALL dispositions, each with an arbitrary
+    /// outcome table (FailedPreflight carries none by construction).
+    fn arbitrary_domain_terminal() -> impl Strategy<Value = LedgerTerminal> {
+        prop_oneof![
+            arbitrary_successful(),
+            Just(LedgerTerminal {
+                recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                disposition: TerminalDisposition::FailedPreflight,
+                reason: None,
+            }),
+            arbitrary_failed_rolled_back(),
+            arbitrary_degraded(),
+        ]
+    }
+
+    proptest! {
+        // THE USER'S PROPERTY: ARBITRARY DOMAIN TERMINALS (all dispositions,
+        // arbitrary outcome tables) round-trip through the wire EXACTLY —
+        // domain → wire → domain equals the original domain. The wire's
+        // redundant fields (the status, the outcome's slot_id) round-trip
+        // without changing the domain: the status is re-derived from the
+        // disposition and the outcome slot is dropped into the key. Bounded
+        // 16 cases, fixed seed 0x5EED_5EED (house style), no persistence.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn arbitrary_domain_terminals_round_trip_exactly(
+            terminal in arbitrary_domain_terminal()
+        ) {
+            let wire = LedgerTerminalWire::from_domain(
+                &DeploymentId::new("deploy-prop".to_string()),
+                &TargetName::new("t1".to_string()),
+                &terminal,
+            );
+            let back = wire.into_domain().expect(
+                "a disposition's own payloads are self-consistent — the round trip must convert",
+            );
+            assert_eq!(
+                back, terminal,
+                "the domain terminal must equal the original after the wire round trip"
+            );
+        }
     }
 
     // =====================================================================
@@ -4523,8 +4955,9 @@ mod tests {
         let intent = intent_wire.into_domain().unwrap();
         let terminal = LedgerTerminal {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
-            outcomes: SlotTable::from_map(outcomes.into_iter().collect()),
-            disposition: TerminalDisposition::Degraded,
+            disposition: TerminalDisposition::Degraded {
+                outcomes: SlotTable::from_map(outcomes.into_iter().collect()),
+            },
             reason: None,
         };
         (intent, terminal)

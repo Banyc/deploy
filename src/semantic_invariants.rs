@@ -3189,9 +3189,9 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
             Some(live),
             "slot {sid}: the observed record mirrors the live generation"
         );
-        // The ledger outcome for this slot.
+        // The ledger outcome for this slot (the disposition's OWN table).
         let out = terminal
-            .outcomes
+            .outcomes()
             .get(&SlotId::new(sid.to_string()))
             .unwrap_or_else(|| panic!("slot {sid} must appear in the terminal outcomes"));
 
@@ -5906,7 +5906,7 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
                  must never resolve to a different deployment (no duplicate, no re-append)"
             );
             let rollback = match &ss.terminal.as_ref().expect("terminal").disposition {
-                crate::records::TerminalDisposition::Successful { rollback } => rollback,
+                crate::records::TerminalDisposition::Successful { rollback, .. } => rollback,
                 _ => panic!("a successful entry carries a rollback state"),
             };
             // The snapshot's OWN first slot (a slot has exactly one owning

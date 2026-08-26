@@ -1174,7 +1174,6 @@ fn push_inner(
             deployment_id,
             &LedgerTerminal {
                 recorded_at: crate::remote::helper::now_rfc3339(),
-                outcomes: SlotTable::new(),
                 // FailedPreflight carries no payload: no rollback and no
                 // outcomes (a pre-mutation failure touched no slot).
                 disposition: TerminalDisposition::FailedPreflight,
@@ -1647,17 +1646,23 @@ fn push_inner(
         // before its own no-op check) — appending a PendingCommit terminal
         // would strand the attempt forever (reconciliation only picks up
         // entries WITHOUT a terminal).
+        // The wire outcomes are converted to the DOMAIN outcomes, deriving
+        // each slot's TRANSITION STATE from the wire's status/outcome fields
+        // and DROPPING the wire outcome's redundant `slot_id` into the key
+        // (the domain value carries no slot — the table key owns identity).
         let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(outcomes_map);
         // MAP the final status to its DISPOSITION (the domain truth table is
-        // structural): FailedPreflight carries nothing (empty outcomes — no
-        // slot touched), FailedRolledBack derives its compensation report
-        // from the outcome table, Degraded derives its remaining changes
-        // (the slots whose FINAL OBSERVED STATE differs from their pre_push
-        // state) from the outcomes — the same derivation the read path
-        // applies, so the domain and the wire conversion stay in sync.
+        // structural): FailedPreflight carries nothing (no slot touched),
+        // FailedRolledBack owns the outcome table as its compensation
+        // report, Degraded owns the outcome table its remaining changes are
+        // derived from (the slots whose FINAL OBSERVED STATE differs from
+        // their pre_push state) — the same derivation the read path applies,
+        // so the domain and the wire conversion stay in sync.
         let disposition = match &commit_status {
             DeploymentStatus::FailedPreflight => TerminalDisposition::FailedPreflight,
-            DeploymentStatus::FailedRolledBack => TerminalDisposition::FailedRolledBack,
+            DeploymentStatus::FailedRolledBack => {
+                TerminalDisposition::FailedRolledBack { outcomes }
+            }
             DeploymentStatus::Degraded => {
                 // The Degraded disposition's remaining changes are DERIVED
                 // from the outcomes (the slots whose final observed state
@@ -1678,7 +1683,7 @@ fn push_inner(
                             .to_string(),
                     ));
                 }
-                TerminalDisposition::Degraded
+                TerminalDisposition::Degraded { outcomes }
             }
             other => {
                 return Err(Error::store(format!(
@@ -1691,7 +1696,6 @@ fn push_inner(
             deployment_id,
             &LedgerTerminal {
                 recorded_at: crate::remote::helper::now_rfc3339(),
-                outcomes,
                 disposition,
                 reason: commit_reason.map(str::to_string),
             },
@@ -3057,25 +3061,28 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     // by the conversion, so a seeded Successful terminal
                     // must carry one Activated outcome per slotted
                     // generation.
-                    outcomes: SlotTable::from_map(
-                        slots
-                            .iter()
-                            .map(|(k, g)| {
-                                (
-                                    k.clone(),
-                                    SlotResult {
-                                        slot_id: k.clone(),
-                                        outcome: SlotOutcomeKind::Activated,
-                                        generation: Some(g.generation.clone()),
-                                        compensated: false,
-                                        error: None,
-                                    },
-                                )
-                            })
-                            .collect(),
-                    ),
                     disposition: TerminalDisposition::Successful {
-                        rollback: crate::records::LedgerRollback { slots, bindings },
+                        rollback: crate::records::LedgerRollback {
+                            slots: slots.clone(),
+                            bindings,
+                        },
+                        outcomes: SlotTable::from_map(
+                            slots
+                                .iter()
+                                .map(|(k, g)| {
+                                    (
+                                        k.clone(),
+                                        SlotResult {
+                                            slot_id: k.clone(),
+                                            outcome: SlotOutcomeKind::Activated,
+                                            generation: Some(g.generation.clone()),
+                                            compensated: false,
+                                            error: None,
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        ),
                     },
                     reason: None,
                 },
@@ -3684,7 +3691,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .expect("the entry has a terminal")
             .disposition
         {
-            TerminalDisposition::Successful { rollback } => rollback,
+            TerminalDisposition::Successful { rollback, .. } => rollback,
             _ => panic!("a successful snapshot entry carries a rollback state"),
         }
     }

@@ -647,16 +647,6 @@ mod tests {
         let p1 = SlotId::new("p1".to_string());
         LedgerTerminal {
             recorded_at: recorded_at.to_string(),
-            outcomes: SlotTable::from_map(BTreeMap::from([(
-                p1.clone(),
-                SlotResult {
-                    slot_id: p1.clone(),
-                    outcome: SlotOutcomeKind::Activated,
-                    generation: Some(test_generation_id("gen-1")),
-                    compensated: false,
-                    error: None,
-                },
-            )])),
             disposition: TerminalDisposition::Successful {
                 rollback: LedgerRollback {
                     slots: BTreeMap::from([(
@@ -681,6 +671,16 @@ mod tests {
                         },
                     )]),
                 },
+                outcomes: SlotTable::from_map(BTreeMap::from([(
+                    p1.clone(),
+                    SlotResult {
+                        slot_id: p1.clone(),
+                        outcome: SlotOutcomeKind::Activated,
+                        generation: Some(test_generation_id("gen-1")),
+                        compensated: false,
+                        error: None,
+                    },
+                )])),
             },
             reason: Some(reason.to_string()),
         }
@@ -749,7 +749,6 @@ mod tests {
                 &a_failed.deployment_id,
                 &LedgerTerminal {
                     recorded_at: "2026-01-02T00:00:00Z".to_string(),
-                    outcomes: SlotTable::new(),
                     disposition: TerminalDisposition::FailedPreflight,
                     reason: Some("preflight failed".to_string()),
                 },

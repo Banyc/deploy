@@ -371,7 +371,7 @@ impl LocalStore {
                 // several releases, so reachability is derived per slot —
                 // there is no snapshot-wide release.
                 if let Some(t) = entry.terminal.as_ref()
-                    && let TerminalDisposition::Successful { rollback } = &t.disposition
+                    && let TerminalDisposition::Successful { rollback, .. } = &t.disposition
                 {
                     for g in rollback.slots.values() {
                         out.releases
@@ -768,13 +768,15 @@ impl LocalStore {
     /// TEST-ONLY: the per-slot outcomes of a deployment's terminal event (the
     /// old `deployments/<id>/results.json`). An absent terminal is an error
     /// (the outcomes store never existed for it), mirroring the old read.
+    /// The domain outcomes carry no slot (the table key owns identity), so
+    /// the wire shape is re-attached here (each outcome's `slot_id` is its
+    /// table key).
     pub fn read_results(&self, id: &str) -> Result<BTreeMap<SlotId, SlotResult>> {
         self.latest_transition(id)?
             .map(|t| {
-                t.outcomes
-                    .into_map()
-                    .into_iter()
-                    .map(|(k, r)| (k, SlotResult::from(r)))
+                t.outcomes()
+                    .iter()
+                    .map(|(k, o)| (k.clone(), SlotResult::from_outcome(k, o)))
                     .collect()
             })
             .ok_or_else(|| Error::store(format!("no results for deployment '{id}'")))
@@ -800,9 +802,12 @@ impl LocalStore {
                     slots: BTreeMap::new(),
                     bindings: BTreeMap::new(),
                 },
+                outcomes: SlotTable::new(),
             },
             DeploymentStatus::FailedPreflight => TerminalDisposition::FailedPreflight,
-            DeploymentStatus::FailedRolledBack => TerminalDisposition::FailedRolledBack,
+            DeploymentStatus::FailedRolledBack => TerminalDisposition::FailedRolledBack {
+                outcomes: SlotTable::new(),
+            },
             other => {
                 return Err(Error::store(format!(
                     "append_transition cannot record status {other:?} as a status-only terminal"
@@ -814,7 +819,6 @@ impl LocalStore {
             &DeploymentId::new(id.to_string()),
             &LedgerTerminal {
                 recorded_at: crate::remote::helper::now_rfc3339(),
-                outcomes: SlotTable::new(),
                 disposition,
                 reason: reason.map(str::to_string),
             },
