@@ -760,7 +760,7 @@ Every deployment attempt records its immutable intent: target snapshot, behavior
 (The example omits the parallel `desired` and `pre_push` maps for brevity; the
 stored record contains both alongside `slots`. `desired` holds each slot's
 minted `GenerationRef` — `{generation, assignment: {placement_slot, artifact}}`
-— while `pre_push` holds the pre-push `AttemptServer` per slot, `None` when the
+— while `pre_push` holds the pre-push `SlotAttemptState` per slot, `None` when the
 slot was never deployed before. Schema version 1 keyed these maps by server ID
 and stored the artifact triple as flat fields; version 2 rekeys to placement
 slots and nests the artifact.)

@@ -68,8 +68,8 @@ use crate::model::{
     DeploymentId, GenerationRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId, TargetName,
 };
 use crate::records::{
-    AttemptServer, DeploymentStatus, LedgerEntry, LedgerIntent, LedgerRollback, LedgerTerminal,
-    PhysicalBinding, ServerResult,
+    DeploymentStatus, LedgerEntry, LedgerIntent, LedgerRollback, LedgerTerminal, PhysicalBinding,
+    SlotAttemptState, SlotResult,
 };
 use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
@@ -245,8 +245,8 @@ pub fn ref_name(target: &TargetName, deployment_id: &DeploymentId) -> String {
 pub fn finalize_successful_attempt(
     store: &LocalStore,
     attempt: &LedgerIntent,
-    outcomes: &BTreeMap<PlacementSlotId, ServerResult>,
-    actuals: &BTreeMap<PlacementSlotId, AttemptServer>,
+    outcomes: &BTreeMap<PlacementSlotId, SlotResult>,
+    actuals: &BTreeMap<PlacementSlotId, SlotAttemptState>,
     reason: &str,
     bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
     current_slot_ids: &[PlacementSlotId],
@@ -294,7 +294,7 @@ pub fn finalize_successful_attempt(
 /// partial snapshot can span several releases (group pushes over time) and
 /// the referenced releases are the set derived from the per-slot bindings.
 pub fn build_rollback(
-    actuals: &BTreeMap<PlacementSlotId, AttemptServer>,
+    actuals: &BTreeMap<PlacementSlotId, SlotAttemptState>,
     bindings: &BTreeMap<PlacementSlotId, PhysicalBinding>,
     base: Option<&LedgerRollback>,
     current_slot_ids: &[PlacementSlotId],
@@ -341,14 +341,14 @@ pub fn build_rollback(
 /// generation, so the outcomes ARE the desired assignments (the old
 /// `deployments/<id>/results.json` outcomes store is GONE — the ledger
 /// terminal carries outcomes, and a terminal-less entry has none by
-/// construction). Returns the per-slot `ServerResult` outcomes AND the
-/// per-slot actuals ([`AttemptServer`]) for the rollback, built from the
+/// construction). Returns the per-slot `SlotResult` outcomes AND the
+/// per-slot actuals ([`SlotAttemptState`]) for the rollback, built from the
 /// attempt's desired assignments.
 pub fn recovery_outcomes(
     attempt: &LedgerIntent,
 ) -> (
-    BTreeMap<PlacementSlotId, ServerResult>,
-    BTreeMap<PlacementSlotId, AttemptServer>,
+    BTreeMap<PlacementSlotId, SlotResult>,
+    BTreeMap<PlacementSlotId, SlotAttemptState>,
 ) {
     let mut outcomes = BTreeMap::new();
     let mut actuals = BTreeMap::new();
@@ -358,7 +358,7 @@ pub fn recovery_outcomes(
         };
         outcomes.insert(
             sid.clone(),
-            ServerResult {
+            SlotResult {
                 slot_id: sid.clone(),
                 outcome: crate::records::ServerOutcomeKind::Activated,
                 generation: Some(desired.generation.clone()),
@@ -368,7 +368,7 @@ pub fn recovery_outcomes(
         );
         actuals.insert(
             sid.clone(),
-            AttemptServer {
+            SlotAttemptState {
                 artifact: desired.assignment.artifact.clone(),
                 generation: Some(desired.generation.clone()),
             },
@@ -782,14 +782,14 @@ mod tests {
         store.append_intent(target.as_str(), &attempt).unwrap();
         let actuals = BTreeMap::from([(
             PlacementSlotId::new("p1".to_string()),
-            AttemptServer {
+            SlotAttemptState {
                 artifact: ArtifactRef::default(),
                 generation: Some(GenerationId::new("gen-1".to_string())),
             },
         )]);
         let outcomes = BTreeMap::from([(
             PlacementSlotId::new("p1".to_string()),
-            ServerResult {
+            SlotResult {
                 slot_id: PlacementSlotId::new("p1".to_string()),
                 outcome: crate::records::ServerOutcomeKind::Activated,
                 generation: Some(GenerationId::new("gen-1".to_string())),
@@ -838,7 +838,7 @@ mod tests {
         let slot = PlacementSlotId::new("p1".to_string());
         let actuals = BTreeMap::from([(
             slot.clone(),
-            AttemptServer {
+            SlotAttemptState {
                 artifact: ArtifactRef::default(),
                 generation: Some(GenerationId::new("gen-x".to_string())),
             },

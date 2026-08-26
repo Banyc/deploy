@@ -72,7 +72,7 @@ use crate::model::{PlacementSlotId, TargetName};
 #[cfg(test)]
 use crate::records::LedgerIntent;
 #[cfg(test)]
-use crate::records::{LedgerTerminal, ServerResult};
+use crate::records::{LedgerTerminal, SlotResult};
 #[cfg(test)]
 use crate::testutil::test_faults::FaultKind;
 #[cfg(test)]
@@ -765,7 +765,7 @@ impl LocalStore {
     /// TEST-ONLY: the per-slot outcomes of a deployment's terminal event (the
     /// old `deployments/<id>/results.json`). An absent terminal is an error
     /// (the outcomes store never existed for it), mirroring the old read.
-    pub fn read_results(&self, id: &str) -> Result<BTreeMap<PlacementSlotId, ServerResult>> {
+    pub fn read_results(&self, id: &str) -> Result<BTreeMap<PlacementSlotId, SlotResult>> {
         self.latest_transition(id)?
             .map(|t| t.outcomes)
             .ok_or_else(|| Error::store(format!("no results for deployment '{id}'")))

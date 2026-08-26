@@ -24,8 +24,8 @@ use crate::push::server::{
 };
 use crate::push::staging::{StagingCleanup, cleanup_dry_run_staging, remove_tree_restoring_write};
 use crate::records::{
-    AttemptServer, BehaviorIndex, DeploymentPlan, DeploymentStatus, LedgerIntent, LedgerTerminal,
-    ObservedServer, ServerOutcomeKind, ServerPlan, ServerResult,
+    BehaviorIndex, DeploymentPlan, DeploymentStatus, LedgerIntent, LedgerTerminal, ObservedSlot,
+    ServerOutcomeKind, SlotAttemptState, SlotPlan, SlotResult,
 };
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::transport::Remote;
@@ -692,9 +692,9 @@ fn push_inner(
     }
 
     // Build the per-slot plan with expected (pre-push) generation.
-    let mut plan_servers: BTreeMap<PlacementSlotId, ServerPlan> = BTreeMap::new();
+    let mut plan_servers: BTreeMap<PlacementSlotId, SlotPlan> = BTreeMap::new();
     let mut new_gen: HashMap<PlacementSlotId, GenerationId> = HashMap::new();
-    let mut pre_push: BTreeMap<PlacementSlotId, Option<AttemptServer>> = BTreeMap::new();
+    let mut pre_push: BTreeMap<PlacementSlotId, Option<SlotAttemptState>> = BTreeMap::new();
     for a in &assignments {
         let slot_id = &a.placement_slot;
         let expected = statuses
@@ -709,7 +709,7 @@ fn push_inner(
         new_gen.insert(slot_id.clone(), gid.clone());
         plan_servers.insert(
             slot_id.clone(),
-            ServerPlan {
+            SlotPlan {
                 slot_id: slot_id.clone(),
                 artifact: a.artifact.clone(),
                 expected_generation: expected.clone(),
@@ -728,11 +728,11 @@ fn push_inner(
                 // `actual_servers` refresh uses (see below).
                 helpers[slot_id]
                     .read_assignment(g.as_str())
-                    .map(|asn| AttemptServer {
+                    .map(|asn| SlotAttemptState {
                         artifact: asn.artifact.clone(),
                         generation: Some(g.clone()),
                     })
-                    .unwrap_or_else(|_| AttemptServer {
+                    .unwrap_or_else(|_| SlotAttemptState {
                         artifact: ArtifactRef::default(),
                         generation: Some(g.clone()),
                     })
@@ -925,12 +925,11 @@ fn push_inner(
                 // per the post-commit lifecycle: a refresh failure warns but
                 // never converts the no-op into an error — the report below
                 // stays "Everything up to date".
-                let mut observed_servers: BTreeMap<PlacementSlotId, ObservedServer> =
-                    BTreeMap::new();
+                let mut observed_servers: BTreeMap<PlacementSlotId, ObservedSlot> = BTreeMap::new();
                 for (slot_id, asn) in &existing {
                     observed_servers.insert(
                         slot_id.clone(),
-                        ObservedServer {
+                        ObservedSlot {
                             generation: Some(asn.generation_id.clone()),
                             artifact: Some(asn.artifact.clone()),
                             last_deployment: Some(asn.deployment_id.clone()),
@@ -1093,7 +1092,7 @@ fn push_inner(
     let failure_policy = target.rollout.failure_policy.clone();
     let stop_on_failure = target.rollout.stop_on_failure;
 
-    let mut results: BTreeMap<PlacementSlotId, ServerResult> = BTreeMap::new();
+    let mut results: BTreeMap<PlacementSlotId, SlotResult> = BTreeMap::new();
     let mut advanced: Vec<PlacementSlotId> = Vec::new();
     let mut compensated: Vec<PlacementSlotId> = Vec::new();
     let mut had_failure = false;
@@ -1123,7 +1122,7 @@ fn push_inner(
                 had_failure = true;
                 results.insert(
                     sid.clone(),
-                    ServerResult {
+                    SlotResult {
                         slot_id: sid.clone(),
                         outcome: ServerOutcomeKind::Failed,
                         generation: Some(new_gen[sid].clone()),
@@ -1187,7 +1186,7 @@ fn push_inner(
             }
             results.insert(
                 sid.clone(),
-                ServerResult {
+                SlotResult {
                     slot_id: sid.clone(),
                     outcome: kind,
                     generation: Some(generation),
@@ -1213,7 +1212,7 @@ fn push_inner(
                 .map(GenerationId::new);
             results.insert(
                 a.placement_slot.clone(),
-                ServerResult {
+                SlotResult {
                     slot_id: a.placement_slot.clone(),
                     outcome: ServerOutcomeKind::Skipped,
                     generation: cur,
@@ -1379,14 +1378,14 @@ fn push_inner(
     // remote generation it currently points at, rather than the desired plan
     // values. Failed/skipped/restored slots therefore report their actual
     // artifact instead of the desired one.
-    let mut actual_servers: BTreeMap<PlacementSlotId, AttemptServer> = BTreeMap::new();
+    let mut actual_servers: BTreeMap<PlacementSlotId, SlotAttemptState> = BTreeMap::new();
     for a in &assignments {
         let sid = &a.placement_slot;
         let helper = &helpers[sid];
         let final_gen = helper.status().ok().and_then(|s| s.current_generation);
         let actual = match final_gen {
             Some(g) => match helper.read_assignment(&g) {
-                Ok(asn) => AttemptServer {
+                Ok(asn) => SlotAttemptState {
                     artifact: asn.artifact.clone(),
                     generation: Some(GenerationId::new(g)),
                 },
@@ -1396,13 +1395,13 @@ fn push_inner(
                     // artifact for a failed observation: preserve the observed
                     // generation and mark the assignment unknown rather than
                     // fabricating desired state.
-                    AttemptServer {
+                    SlotAttemptState {
                         artifact: ArtifactRef::default(),
                         generation: Some(GenerationId::new(g)),
                     }
                 }
             },
-            None => AttemptServer {
+            None => SlotAttemptState {
                 artifact: a.artifact.clone(),
                 generation: None,
             },
@@ -1425,7 +1424,7 @@ fn push_inner(
         slots: actual_servers.clone(),
         ..attempt_intent.clone()
     };
-    let outcomes_map: BTreeMap<PlacementSlotId, ServerResult> = results.clone();
+    let outcomes_map: BTreeMap<PlacementSlotId, SlotResult> = results.clone();
 
     // Finalize the attempt's terminal event. A SUCCESSFUL attempt goes
     // through the SAME shared finalizer as recovery
@@ -1542,7 +1541,7 @@ fn push_inner(
     // carries its PRIOR physical observed record over verbatim (never
     // fabricated, never re-stamped).
     let mut observed_warnings: Vec<String> = Vec::new();
-    let mut observed_servers: BTreeMap<PlacementSlotId, ObservedServer> = BTreeMap::new();
+    let mut observed_servers: BTreeMap<PlacementSlotId, ObservedSlot> = BTreeMap::new();
     for (slot, _sdef) in &members {
         let slot_id = PlacementSlotId::new(slot.id.clone());
         // The slot's LIVE remote assignment. `status` is a read; under the
@@ -1559,7 +1558,7 @@ fn push_inner(
             Some(asn) => {
                 observed_servers.insert(
                     slot_id.clone(),
-                    ObservedServer {
+                    ObservedSlot {
                         generation: Some(asn.generation_id.clone()),
                         artifact: Some(asn.artifact.clone()),
                         last_deployment: Some(asn.deployment_id.clone()),
@@ -1875,7 +1874,7 @@ fn refresh_observed(
     store: &LocalStore,
     target_name: &str,
     members: &[(&crate::config::SlotDef, &crate::config::ServerDef)],
-    observed_servers: &BTreeMap<PlacementSlotId, ObservedServer>,
+    observed_servers: &BTreeMap<PlacementSlotId, ObservedSlot>,
     observed_warnings: &mut Vec<String>,
 ) {
     for (slot, sdef) in members {

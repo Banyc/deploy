@@ -69,7 +69,7 @@ use crate::model::{
 #[cfg(test)]
 use crate::model::DeploymentId;
 use crate::records::{
-    DeploymentStatus, LedgerEntry, LedgerIntent, LedgerLine, LedgerTerminal, ObservedServer,
+    DeploymentStatus, LedgerEntry, LedgerIntent, LedgerLine, LedgerTerminal, ObservedSlot,
     ObservedTarget, Pins, ServerState,
 };
 use crate::store::atomic::{
@@ -566,7 +566,7 @@ impl LocalStore {
     pub fn write_slot_observed(
         &self,
         slot: &PlacementSlotId,
-        observed: &ObservedServer,
+        observed: &ObservedSlot,
     ) -> Result<()> {
         #[cfg(test)]
         if let Some(d) = observed.last_deployment.as_ref()
@@ -593,7 +593,7 @@ impl LocalStore {
     /// only a genuine NotFound is "no observed record"; a stat failure
     /// propagates as a Store error (a permission error on the record must
     /// not read as "never observed").
-    pub fn read_slot_observed(&self, slot: &PlacementSlotId) -> Result<Option<ObservedServer>> {
+    pub fn read_slot_observed(&self, slot: &PlacementSlotId) -> Result<Option<ObservedSlot>> {
         let p = self.slot_observed_path(slot);
         if path_state(&p)? {
             read_json(&p).map(Some)
@@ -606,7 +606,7 @@ impl LocalStore {
     /// record (`slots/<slot-id>/observed.json`), keyed by [`PlacementSlotId`].
     /// This is the ONE physical state the per-target views are filtered
     /// from — a shared slot exists here exactly once.
-    pub fn read_global_observed(&self) -> Result<BTreeMap<PlacementSlotId, ObservedServer>> {
+    pub fn read_global_observed(&self) -> Result<BTreeMap<PlacementSlotId, ObservedSlot>> {
         let root = self.base.join("slots");
         let mut out = BTreeMap::new();
         let entries = match std::fs::read_dir(&root) {
@@ -620,7 +620,7 @@ impl LocalStore {
             if !path_state(&rec)? {
                 continue;
             }
-            let observed: ObservedServer = read_json(&rec)?;
+            let observed: ObservedSlot = read_json(&rec)?;
             out.insert(
                 PlacementSlotId::new(entry.file_name().to_string_lossy().into_owned()),
                 observed,
@@ -1290,7 +1290,7 @@ mod tests {
         ReleaseId, TargetName, VariantName,
     };
     use crate::records::{
-        LedgerIntent, LedgerLine, LedgerRollback, LedgerTerminal, ServerOutcomeKind, ServerResult,
+        LedgerIntent, LedgerLine, LedgerRollback, LedgerTerminal, ServerOutcomeKind, SlotResult,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
@@ -1318,7 +1318,7 @@ mod tests {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
             outcomes: BTreeMap::from([(
                 PlacementSlotId::new("p1".to_string()),
-                ServerResult {
+                SlotResult {
                     slot_id: PlacementSlotId::new("p1".to_string()),
                     outcome: ServerOutcomeKind::Activated,
                     generation: Some(GenerationId::new("gen-1".to_string())),
@@ -1393,7 +1393,7 @@ mod tests {
                 .join("observed.json"),
             "a '..' slot must be confined to its own slot dir, not the store root"
         );
-        let observed = ObservedServer {
+        let observed = ObservedSlot {
             generation: Some(GenerationId::new("g-..".to_string())),
             artifact: None,
             last_deployment: None,

@@ -466,7 +466,7 @@ mod tests {
         PlacementSlotId, SCHEMA_VERSION, TargetName, TreeDigest, VariantName,
     };
     use crate::records::{
-        DeploymentStatus, LedgerIntent, LedgerRollback, LedgerTerminal, ObservedServer, Pins,
+        DeploymentStatus, LedgerIntent, LedgerRollback, LedgerTerminal, ObservedSlot, Pins,
     };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -702,7 +702,7 @@ interval_seconds = 0
         let ledger_text = std::fs::read_to_string(store.ledger_path(TARGET)).unwrap_or_default();
 
         // The observed slot state (the ONE physical observed record).
-        let observed = ObservedServer {
+        let observed = ObservedSlot {
             generation: None,
             artifact: Some(ArtifactRef {
                 release: ReleaseId::new("rel-sha256-obs".to_string()),

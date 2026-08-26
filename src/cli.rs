@@ -575,7 +575,7 @@ mod tests {
         DeploymentId, GenerationId, PlacementSlotId, ReleaseId, SCHEMA_VERSION, TargetName,
         TreeDigest, VariantName,
     };
-    use crate::records::{LedgerIntent, LedgerRollback, LedgerTerminal, ObservedServer};
+    use crate::records::{LedgerIntent, LedgerRollback, LedgerTerminal, ObservedSlot};
     use std::collections::BTreeMap;
 
     fn pending_attempt(id: &str) -> LedgerIntent {
@@ -813,7 +813,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         store
             .write_slot_observed(
                 &PlacementSlotId::new("p1".to_string()),
-                &ObservedServer {
+                &ObservedSlot {
                     generation: Some(GenerationId::new("gen-41da".to_string())),
                     artifact: Some(crate::model::ArtifactRef {
                         release: ReleaseId::new("rel-sha256-status".to_string()),
@@ -827,7 +827,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         store
             .write_slot_observed(
                 &PlacementSlotId::new("p2".to_string()),
-                &ObservedServer {
+                &ObservedSlot {
                     generation: None,
                     artifact: None,
                     last_deployment: None,
@@ -837,7 +837,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         store
             .write_slot_observed(
                 &PlacementSlotId::new("p3".to_string()),
-                &ObservedServer {
+                &ObservedSlot {
                     generation: Some(GenerationId::new("gen-9f00".to_string())),
                     artifact: None,
                     last_deployment: None,

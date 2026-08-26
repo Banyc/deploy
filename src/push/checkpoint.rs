@@ -447,7 +447,7 @@ mod tests {
         ArtifactRef, GenerationRef, PlacementSlotAssignment, PlacementSlotId, ReleaseId,
         SCHEMA_VERSION, ServerId, TargetName, TreeDigest, VariantName,
     };
-    use crate::records::{LedgerIntent, LedgerRollback, LedgerTerminal, ObservedServer, Pins};
+    use crate::records::{LedgerIntent, LedgerRollback, LedgerTerminal, ObservedSlot, Pins};
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
     use std::collections::BTreeMap;
@@ -1385,7 +1385,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         store
             .write_slot_observed(
                 &PlacementSlotId::new("s-obs".to_string()),
-                &ObservedServer {
+                &ObservedSlot {
                     generation: None,
                     artifact: Some(ArtifactRef {
                         release: obs_rel.clone(),

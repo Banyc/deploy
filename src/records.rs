@@ -53,9 +53,6 @@ use crate::model::{
     ReleaseId, ServerId, TargetName, TreeDigest,
 };
 
-/// Alias for readability at the physical-binding / server-record sites: the
-/// ACTUAL SERVER identity used for transport addressing ([`ServerId`]).
-pub type ServerName = ServerId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -94,7 +91,7 @@ pub enum ServerOutcomeKind {
     /// Reserved: never emitted today. In-process compensation (a post-swap
     /// activation/verification failure restored by the per-server pipeline,
     /// step 11) is recorded as [`ServerOutcomeKind::Failed`] with
-    /// `ServerResult.compensated = true` — "record both the failure and the
+    /// `SlotResult.compensated = true` — "record both the failure and the
     /// compensation result" — and failure-policy compensation (step 13)
     /// upgrades the slot to [`ServerOutcomeKind::Restored`].
     Compensated,
@@ -107,7 +104,7 @@ pub enum ServerOutcomeKind {
 /// slot's server was never started (e.g. skipped after an earlier failure
 /// under `stop_on_failure`), or when only the pre-push state is unknown.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AttemptServer {
+pub struct SlotAttemptState {
     pub artifact: ArtifactRef,
     /// The generation this slot actually advanced to. `None` when the slot's
     /// server was never started (e.g. skipped after an earlier failure under
@@ -155,13 +152,13 @@ pub struct LedgerIntent {
     /// minted generation for its planned artifact.
     pub desired: BTreeMap<PlacementSlotId, GenerationRef>,
     /// Pre-push per-slot state before mutation (`None` if first deployment).
-    pub pre_push: BTreeMap<PlacementSlotId, Option<AttemptServer>>,
+    pub pre_push: BTreeMap<PlacementSlotId, Option<SlotAttemptState>>,
     /// Actual per-slot result after the attempt. INTENT vs OUTCOME: the
     /// persisted ledger intent keeps this map EMPTY (outcomes are recorded
     /// in the terminal event's `outcomes` map); in memory (the push report)
     /// it carries the observed actuals for display, and recovery derives
     /// outcomes from the verified desired state instead.
-    pub slots: BTreeMap<PlacementSlotId, AttemptServer>,
+    pub slots: BTreeMap<PlacementSlotId, SlotAttemptState>,
 }
 
 /// The complete PHYSICAL binding of one placement slot at terminal time: the
@@ -177,7 +174,7 @@ pub struct LedgerIntent {
 pub struct PhysicalBinding {
     /// The physical server the slot was bound to at the time of the
     /// deployment.
-    pub server: ServerName,
+    pub server: ServerId,
     /// The absolute on-server directory the slot's deployment state lives
     /// in, exactly as declared in the slot's `deploy_dir` at deployment time.
     pub deploy_dir: String,
@@ -235,7 +232,7 @@ pub struct LedgerRollback {
 pub type BehaviorIndex = BTreeMap<ReleaseId, BTreeMap<String, BehaviorContract>>;
 
 /// The TERMINAL EVENT of one deployment: the status the attempt ended with,
-/// the per-slot OUTCOMES ([`ServerResult`] map), and — when the status is
+/// the per-slot OUTCOMES ([`SlotResult`] map), and — when the status is
 /// [`DeploymentStatus::Successful`] — the ROLLBACK STATE
 /// ([`LedgerRollback`]). Appended ONCE to the target's ledger after the
 /// mutation loop; the entry's current status is the status of its terminal
@@ -252,7 +249,7 @@ pub struct LedgerTerminal {
     /// Actual per-slot outcomes after the mutation loop (the `results`
     /// payload). Empty for a pre-mutation failure (e.g.
     /// `FailedPreflight`): no slot was touched.
-    pub outcomes: BTreeMap<PlacementSlotId, ServerResult>,
+    pub outcomes: BTreeMap<PlacementSlotId, SlotResult>,
     /// The rollback state, present exactly when the deployment was
     /// SUCCESSFUL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -343,7 +340,7 @@ pub struct Pins {
 
 /// Observed remote state for one placement slot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ObservedServer {
+pub struct ObservedSlot {
     #[serde(default)]
     pub generation: Option<GenerationId>,
     #[serde(default)]
@@ -357,20 +354,20 @@ pub struct ObservedServer {
 pub struct ObservedTarget {
     pub target: TargetName,
     #[serde(default)]
-    pub slots: BTreeMap<PlacementSlotId, ObservedServer>,
+    pub slots: BTreeMap<PlacementSlotId, ObservedSlot>,
 }
 
 /// Persisted per-server local record (`servers/<id>.json`). Keyed by the
-/// ACTUAL server identity ([`ServerName`], transport addressing); the
+/// ACTUAL server identity ([`ServerId`], transport addressing); the
 /// slot→assignment maps live in [`ObservedTarget`] keyed by
 /// [`PlacementSlotId`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ServerState {
-    pub id: ServerName,
+    pub id: ServerId,
     #[serde(default)]
     pub last_seen_target: Option<TargetName>,
     #[serde(default)]
-    pub last_observed: Option<ObservedServer>,
+    pub last_observed: Option<ObservedSlot>,
 }
 
 /// Where a plan's desired assignment comes from.
@@ -391,7 +388,7 @@ pub enum PlanSource {
 /// Per-slot plan for one placement slot: its slot identity, the artifact it
 /// should run, and the compare-and-swap preconditions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ServerPlan {
+pub struct SlotPlan {
     pub slot_id: PlacementSlotId,
     pub artifact: ArtifactRef,
     /// Pre-push generation that must match for the compare-and-swap precondition.
@@ -412,7 +409,7 @@ pub struct DeploymentPlan {
     /// here rather than the caller's current configuration.
     pub behaviors: BehaviorIndex,
     pub slot_ids: Vec<PlacementSlotId>,
-    pub slots: BTreeMap<PlacementSlotId, ServerPlan>,
+    pub slots: BTreeMap<PlacementSlotId, SlotPlan>,
     pub source: PlanSource,
     /// The releases this attempt's slots reference (per-slot artifact
     /// provenance: a partial snapshot can span several releases).
@@ -420,7 +417,7 @@ pub struct DeploymentPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ServerResult {
+pub struct SlotResult {
     pub slot_id: PlacementSlotId,
     pub outcome: ServerOutcomeKind,
     /// The generation this slot advanced to, or `None` if it never started.
