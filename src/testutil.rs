@@ -72,7 +72,10 @@ pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// / [`FaultKind::AppendSync`] / [`FaultKind::AppendRename`] /
 /// [`FaultKind::AppendDirSync`], keyed by deployment id, firing at the
 /// whole-ledger rewrite's temp-write / temp-sync / rename / parent-dir-sync
-/// stages), the post-commit observed-refresh faults ([`FaultKind::WriteServer`],
+/// stages), the FIRST-append durable dir-creation syncs
+/// ([`FaultKind::SyncNewTargetDir`] / [`FaultKind::SyncTargetsDir`], keyed by
+/// TARGET, firing only when the append actually created the target directory),
+/// the post-commit observed-refresh faults ([`FaultKind::WriteServer`],
 /// [`FaultKind::WriteObserved`], keyed additionally by TARGET), and the
 /// rotation-maintenance arms ([`FaultKind::ReadRotationDebt`],
 /// [`FaultKind::WriteRotationDebt`], keyed by TARGET). The CHECKPOINT kinds
@@ -119,6 +122,23 @@ pub(crate) mod test_faults {
         /// NEW (the new content is in place under its final name, only the
         /// directory entry is not yet synced) but the append returns `Err`.
         AppendDirSync,
+        /// The FIRST append's durable dir-creation: the sync that makes the NEW
+        /// TARGET DIR's directory entry durable (the fsync of `targets/`, which
+        /// holds the `targets/<target>/` entry), keyed by target. Fires ONLY
+        /// when the append actually created the target directory (an existing
+        /// target's append creates and syncs nothing, so the arm never fires
+        /// there). The reported `Err` leaves the prior state: the target dir
+        /// exists (it was created before the sync boundary) but no ledger was
+        /// written — crash recovery finds the prior state, never a missing
+        /// target directory after a reported success.
+        SyncNewTargetDir,
+        /// The FIRST append's durable dir-creation: the sync of the `targets/`
+        /// directory's OWN entry (the fsync of the store base, which names
+        /// `targets/` — `targets/` may have been created by an EARLIER unsynced
+        /// store open), keyed by target. Fires ONLY when the append created the
+        /// target directory (same conditioning as
+        /// [`FaultKind::SyncNewTargetDir`]).
+        SyncTargetsDir,
         /// Post-commit observed-refresh per-server record write
         /// (`servers/<id>.json`), keyed by (deployment id, target).
         WriteServer,
@@ -358,6 +378,24 @@ pub(crate) mod test_faults {
         /// returns `Err`.
         pub(crate) fn arm_append_dir_sync(&self, deployment_id: &str) {
             self.arm(FaultKind::AppendDirSync, deployment_id);
+        }
+
+        /// Arm the FIRST append's durable dir-creation SYNC of the new target
+        /// dir's entry (the fsync of `targets/`) to fail once for `target`.
+        /// The arm fires only when the append actually CREATED the target
+        /// directory: the dirs are created and their entries synced by the
+        /// durable helper, the append reports `Err`, and crash recovery finds
+        /// the prior state (the target dir, no ledger).
+        pub(crate) fn arm_sync_new_target_dir(&self, target: &str) {
+            self.arm(FaultKind::SyncNewTargetDir, target);
+        }
+
+        /// Arm the FIRST append's durable dir-creation: the sync of the
+        /// `targets/` directory's OWN entry (the fsync of the store base) to
+        /// fail once for `target`. Same conditioning and outcome contract as
+        /// [`FaultRegistry::arm_sync_new_target_dir`].
+        pub(crate) fn arm_sync_targets_dir(&self, target: &str) {
+            self.arm(FaultKind::SyncTargetsDir, target);
         }
 
         /// Arm the next `write_server` call that records `deployment_id`

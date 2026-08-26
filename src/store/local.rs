@@ -73,8 +73,8 @@ use crate::records::{
     ObservedTarget, Pins, ServerState,
 };
 use crate::store::atomic::{
-    copy_dir_recursive, ensure_private_dir, path_state, read_json, set_private, sync_parent_dir,
-    temp_name_for, write_atomic_replace,
+    copy_dir_recursive, ensure_private_dir, ensure_private_dir_durable, path_state, read_json,
+    set_private, sync_parent_dir, temp_name_for, write_atomic_replace,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -491,6 +491,53 @@ impl LocalStore {
         self.base.join("targets").join(sanitize(target))
     }
 
+    /// DURABLE creation of a target's directory on the LEDGER-APPEND path
+    /// (the reported durability bug: the FIRST `append_intent` for a new
+    /// target created `targets/<target>/` — and the store open's `targets/` —
+    /// WITHOUT syncing their directory entries, so a power loss right after a
+    /// reported-successful first append could lose the new directories
+    /// entirely). The pure creation + syncs live in
+    /// [`ensure_private_dir_durable`](crate::store::atomic::ensure_private_dir_durable):
+    /// every component this call created gets a parent-directory fsync — at
+    /// minimum `targets/` (the new target dir's entry) and the store base
+    /// (the `targets/` entry) — before the ledger write below. The helper's
+    /// created flag feeds the test-only fault surface below: the per-target
+    /// dir-sync boundaries fire ONLY on the creation path (an EXISTING
+    /// target's append creates and syncs nothing, so the arms never fire
+    /// there).
+    fn ensure_target_dir_durable(&self, target: &str) -> Result<()> {
+        let created = ensure_private_dir_durable(&self.target_dir(target))?;
+        // Test-only: the two dir-sync boundaries of a FIRST append, keyed by
+        // target. They fire after the durable helper returned (the directory
+        // entries ARE created and synced — the modeled loss is the boundary
+        // between the dir syncs and the ledger write: the append reports `Err`
+        // and crash recovery finds the PRIOR STATE, never a reported success
+        // with the target directory missing).
+        #[cfg(test)]
+        if created
+            && self
+                .fault_registry
+                .consume(FaultKind::SyncNewTargetDir, target)
+        {
+            return Err(Error::store(
+                "test fault: the new target dir's entry sync forced to fail once",
+            ));
+        }
+        #[cfg(test)]
+        if created
+            && self
+                .fault_registry
+                .consume(FaultKind::SyncTargetsDir, target)
+        {
+            return Err(Error::store(
+                "test fault: the targets dir's entry sync forced to fail once",
+            ));
+        }
+        #[cfg(not(test))]
+        let _ = created;
+        Ok(())
+    }
+
     // ---- slots: the ONE physical observed state ---------------------------
 
     /// Path of a placement slot's single physical observed record
@@ -787,8 +834,7 @@ impl LocalStore {
                 "test fault: append_attempt (ledger intent) forced to fail once",
             ));
         }
-        let dir = self.target_dir(target);
-        ensure_private_dir(&dir)?;
+        self.ensure_target_dir_durable(target)?;
         // The intent is the entry's durable key: a duplicate intent for the
         // same deployment id is corruption (deployment ids are unique per
         // push) and must fail closed rather than append a second entry. The
@@ -830,8 +876,7 @@ impl LocalStore {
                 "test fault: append_terminal forced to fail once",
             ));
         }
-        let dir = self.target_dir(target);
-        ensure_private_dir(&dir)?;
+        self.ensure_target_dir_durable(target)?;
         let entries = self.read_ledger(target)?;
         let entry = entries
             .iter()
@@ -1066,6 +1111,12 @@ impl LocalStore {
     /// interleave with a concurrent rewrite.
     fn append_ledger_atomic(&self, target: &str, _deployment_id: &str, line: &str) -> Result<()> {
         let p = self.ledger_path(target);
+        // Durable target-dir creation (the FIRST append's reported bug): the
+        // `targets/<target>/` — and `targets/` — directory entries must be
+        // fsynced before the ledger write can report success. An existing
+        // target's dir is the helper's fast path (created nothing, syncs
+        // nothing).
+        self.ensure_target_dir_durable(target)?;
         // Read-modify-write: the whole current ledger + the new line.
         let mut buf = String::new();
         if path_state(&p)? {
@@ -2115,6 +2166,166 @@ mod tests {
         }
     }
 
+    // ---- the first-append durable dir-creation (the reported bug) ------
+
+    /// The reported durability bug: the FIRST `append_intent` for a NEW target
+    /// created `targets/<target>/` — and the store open's `targets/` — WITHOUT
+    /// syncing their directory entries, so a power loss right after a
+    /// reported-successful first append could lose the new directories
+    /// entirely (crash recovery would find NEITHER the new ledger NOR the
+    /// prior state). The fix routes the append path through
+    /// [`crate::store::atomic::ensure_private_dir_durable`]: every directory
+    /// entry the creation makes is fsynced before the ledger write. This test
+    /// pins the boundary contract per sync: with EACH of the two dir-sync
+    /// faults armed (and both), the first append reports `Err` and crash
+    /// recovery finds the PRIOR STATE — the target directory exists (created
+    /// before the sync boundary) but no ledger was written — and the
+    /// prior-state case then re-appends cleanly on the same base. With no
+    /// fault, the append reports success and the complete new ledger is
+    /// retained.
+    #[test]
+    fn first_append_dir_sync_fault_leaves_prior_state_or_full_durable() {
+        let cases: &[&[FaultKind]] = &[
+            &[],
+            &[FaultKind::SyncNewTargetDir],
+            &[FaultKind::SyncTargetsDir],
+            &[FaultKind::SyncNewTargetDir, FaultKind::SyncTargetsDir],
+        ];
+        for kinds in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().join("store");
+            let store = LocalStore::with_base(base.clone()).unwrap();
+            let target = "t1";
+            for kind in *kinds {
+                store.fault_registry().arm(*kind, target);
+            }
+            let result = store.append_intent(target, &intent("dep-x", target));
+            drop(store);
+            let reopened = LocalStore::with_base(base.clone()).unwrap();
+            assert!(
+                reopened.target_dir(target).exists(),
+                "the first append creates the target dir BEFORE any sync — it is never missing (kinds: {kinds:?})"
+            );
+            let entries = reopened.read_ledger(target).unwrap();
+            if kinds.is_empty() {
+                assert!(result.is_ok(), "an un-faulted first append reports success");
+                assert_eq!(
+                    entries.len(),
+                    1,
+                    "a reported success retains the complete new ledger"
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "a faulted dir-sync must fail the first append (kinds: {kinds:?})"
+                );
+                assert!(
+                    entries.is_empty(),
+                    "a faulted dir-sync leaves the PRIOR STATE — the append did not commit (kinds: {kinds:?})"
+                );
+                // The prior-state case re-appends cleanly (crash recovery +
+                // retry over the same base).
+                let store2 = LocalStore::with_base(base.clone()).unwrap();
+                store2
+                    .append_intent(target, &intent("dep-x", target))
+                    .unwrap();
+                assert_eq!(
+                    store2.read_ledger(target).unwrap().len(),
+                    1,
+                    "the prior-state case re-appends cleanly"
+                );
+            }
+        }
+    }
+
+    /// Run one model case of the first-append dir-sync property: a fresh
+    /// fixture, optionally pre-seeded as an EXISTING target (its dir + first
+    /// ledger entry already written), with the per-target dir-sync faults
+    /// armed per the vector; then ONE `append_intent`, a fresh-store reopen
+    /// over the same base, and the coherent-state assertions:
+    ///
+    /// * the target directory is NEVER missing after a reported success;
+    /// * an EXISTING target's append creates no directory, so the dir-sync
+    ///   arms never fire — the append reports success and retains the new
+    ///   entry;
+    /// * a FIRST target's faulted sync returns `Err` and recovery finds the
+    ///   PRIOR STATE (the dir was created, no ledger — the append did not
+    ///   commit);
+    /// * a FIRST target's un-faulted append reports success and recovery
+    ///   retains the complete new ledger.
+    fn run_first_append_dir_sync_model(
+        existing_target: bool,
+        sync_new_target_dir: bool,
+        sync_targets_dir: bool,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("store");
+        let store = LocalStore::with_base(base.clone()).unwrap();
+        let target = "t1";
+        if existing_target {
+            // The EXISTING-target model: the target dir and a first ledger
+            // entry exist before the append under test.
+            store
+                .append_intent(target, &intent("dep-0", target))
+                .unwrap();
+        }
+        if sync_new_target_dir {
+            store.fault_registry().arm_sync_new_target_dir(target);
+        }
+        if sync_targets_dir {
+            store.fault_registry().arm_sync_targets_dir(target);
+        }
+        let id = if existing_target { "dep-1" } else { "dep-0" };
+        let result = store.append_intent(target, &intent(id, target));
+        drop(store);
+        let reopened = LocalStore::with_base(base.clone()).unwrap();
+        assert!(
+            reopened.target_dir(target).exists(),
+            "the target directory is never missing (existing={existing_target}, new_target_sync={sync_new_target_dir}, targets_sync={sync_targets_dir})"
+        );
+        let entries = reopened.read_ledger(target).unwrap();
+        if existing_target {
+            // No durable creation happens (the dir exists): the dir-sync
+            // arms cannot fire, the append reports success and the new
+            // entry is retained beside the seeded one.
+            assert!(
+                result.is_ok(),
+                "an existing target's append creates no dir, so the dir-sync arms never fire (sync_new={sync_new_target_dir}, sync_targets={sync_targets_dir})"
+            );
+            assert_eq!(entries.len(), 2);
+            assert!(entries.iter().any(|e| e.deployment_id.as_str() == id));
+        } else if sync_new_target_dir || sync_targets_dir {
+            // A FIRST target with a faulted dir-sync boundary: the append
+            // reports `Err` and recovery finds the prior state — the target
+            // dir exists (created before the boundary), but the append did
+            // not commit, so the ledger is absent.
+            assert!(
+                result.is_err(),
+                "a faulted dir-sync must fail the first append"
+            );
+            assert!(
+                entries.is_empty(),
+                "a faulted first append did not commit — no ledger"
+            );
+            // The prior-state case re-appends cleanly on the same base.
+            let store2 = LocalStore::with_base(base.clone()).unwrap();
+            store2.append_intent(target, &intent(id, target)).unwrap();
+            assert!(
+                store2
+                    .read_ledger(target)
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.deployment_id.as_str() == id)
+            );
+        } else {
+            // A REPORTED SUCCESS for the first append: recovery retains the
+            // complete new ledger and the target directory is present.
+            assert!(result.is_ok(), "an un-faulted first append reports success");
+            assert_eq!(entries.len(), 1);
+            assert!(entries.iter().any(|e| e.deployment_id.as_str() == id));
+        }
+    }
+
     proptest! {
         // The main property: ORDINARY RANDOMIZED SEEDS with failure
         // persistence (proptest's defaults) — a failing vector writes to
@@ -2151,6 +2362,35 @@ mod tests {
         #[test]
         fn ledger_append_durability_fixed_seed_regression(history in ledger_history_strategy()) {
             run_ledger_durability_history(&history);
+        }
+    }
+
+    proptest! {
+        // FIXED-SEED PROPERTY for the FIRST-append durable dir-creation
+        // (the reported bug): model FIRST vs EXISTING targets with a fault
+        // at each dir-sync boundary. A REPORTED SUCCESS must imply that
+        // crash recovery (a fresh store over the same base) retains the
+        // complete new ledger with the target directory present — NEVER a
+        // missing target directory after a reported success; a faulted
+        // sync returns `Err` (prior state: the target dir was created, no
+        // ledger — the append did not commit) and the prior-state case
+        // re-appends cleanly. EXISTING targets create nothing (the durable
+        // helper's fast path), so their dir-sync arms never fire and the
+        // append always reports success. The pinned 0x5EED_5EED seed with
+        // no persistence runs the IDENTICAL 16 vectors on every invocation;
+        // the case count is bounded so the suite stays fast.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn first_append_dir_sync_durability(
+            (existing, sync_new, sync_targets) in (any::<bool>(), any::<bool>(), any::<bool>()),
+        ) {
+            run_first_append_dir_sync_model(existing, sync_new, sync_targets);
         }
     }
 

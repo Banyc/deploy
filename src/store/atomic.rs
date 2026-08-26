@@ -170,6 +170,85 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
     std::fs::set_permissions(path, perms)
         .map_err(|e| Error::store(format!("chmod {}: {e}", path.display())))
 }
+
+/// DURABLE private directory creation: create `path` (and every missing
+/// ancestor) with the same private chmod as [`ensure_private_dir`], then make
+/// EVERY newly created directory entry durable BEFORE the call returns — fsync
+/// the parent directory of each component this call created (deepest first), and
+/// then the parent of the new path's own parent (the entry that names the
+/// directory HOLDING the new path). The store case this exists for is the FIRST
+/// ledger append on a NEW target: the walk creates `targets/<target>/` while
+/// `targets/` itself was already created (UNSYNCED) by the store open's
+/// [`ensure_private_dir`], so the append must fsync BOTH the `targets/<target>/`
+/// entry (inside `targets/`) AND the `targets/` entry (inside the base) before
+/// it reports success — otherwise a power loss could lose the directories while
+/// the reported ledger survives.
+///
+/// The helper knows what it created by creating COMPONENT-BY-COMPONENT (walk
+/// up from `path` to the deepest existing ancestor, create the missing chain
+/// top-down, chmod each) instead of `create_dir_all`, which cannot report what
+/// it created. Syncing an already-existing ancestor is always safe (the fsync
+/// only forces the entries created below it), so the extra parent-of-parent
+/// sync is the harmless, conservative "sync the ancestor chain" choice.
+///
+/// Returns `true` when this call created at least one directory (and therefore
+/// ran the syncs), `false` when everything already existed (the fast path of
+/// every later append: nothing created, nothing to sync).
+pub(crate) fn ensure_private_dir_durable(path: &Path) -> Result<bool> {
+    // Walk from `path` up to the deepest ancestor that already exists,
+    // collecting the MISSING chain (pushed deepest-first).
+    let mut missing: Vec<PathBuf> = Vec::new();
+    let mut cur: &Path = path;
+    loop {
+        match std::fs::symlink_metadata(cur) {
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(cur.to_path_buf());
+                match cur.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => cur = parent,
+                    _ => break,
+                }
+            }
+            Err(e) => return Err(Error::store(format!("stat {}: {e}", cur.display()))),
+        }
+    }
+    if missing.is_empty() {
+        return Ok(false);
+    }
+    // Create the chain TOP-DOWN (parents before their children) with the
+    // private 0o700 chmod, exactly as `create_dir_all` + `ensure_private_dir`
+    // would — one component at a time so the caller knows what was created. A
+    // racing creation of an ancestor is tolerated (it exists; the chmod is
+    // idempotent). NOTE: the chmod must be 0o700 (never [`set_private`]'s
+    // 0o600) — a directory without its execute bit denies every subsequent
+    // stat of its children.
+    for component in missing.iter().rev() {
+        match std::fs::create_dir(component) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(Error::store(format!("mkdir {}: {e}", component.display())));
+            }
+        }
+        let perms = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(component, perms)
+            .map_err(|e| Error::store(format!("chmod {}: {e}", component.display())))?;
+    }
+    // Durable commit of every NEW directory entry: fsync the parent of each
+    // created component (deepest first — the new dir's own entry), and then
+    // the parent of the new path's PARENT — the `targets/` entry inside the
+    // base — which an earlier UNSYNCED creation (the store open) may have
+    // made: the first append is the first chance to make it durable.
+    for component in missing.iter().rev() {
+        sync_parent_dir(component)?;
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        sync_parent_dir(parent)?;
+    }
+    Ok(true)
+}
 pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)
         .map_err(|e| Error::store(format!("mkdir {}: {e}", dst.display())))?;
