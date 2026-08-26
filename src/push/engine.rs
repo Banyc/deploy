@@ -628,7 +628,11 @@ fn push_inner(
 
     // 5 & 7. Build the plan from the RESOLVED ref (post-reconciliation).
     // The plan covers exactly the SELECTED slots (the normalized selection).
-    let (assignments, desired_releases, source) = crate::push::plan::plan_assignments(
+    // The 4th element is the EXPLICIT rebinding context for a DIRECT release
+    // ref (a `release:<id>` push applies the release's frozen topology onto
+    // the CURRENT physical slots — [`crate::records::RebindingPlan`]); HEAD
+    // and deployment refs carry `None`.
+    let (assignments, desired_releases, source, rebinding) = crate::push::plan::plan_assignments(
         selection,
         &pref,
         &local_release_id,
@@ -752,6 +756,7 @@ fn push_inner(
             .collect(),
         slots: plan_servers.clone(),
         source,
+        rebinding,
         desired_releases: desired_releases.clone(),
     };
 

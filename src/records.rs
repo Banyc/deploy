@@ -381,8 +381,89 @@ pub enum PlanSource {
     /// `@` / `parent(...)` deployment-history walk): the rollback state
     /// resolved from the target's ledger.
     DeploymentRef(DeploymentId),
-    /// Assign each current slot its configured variant from a named release.
+    /// Assign each current slot its variant from a named release — the
+    /// release's OWN frozen topology applied onto the CURRENT physical
+    /// slots. The rebinding this performs is EXPLICIT: the plan carries it
+    /// as [`DeploymentPlan::rebinding`] ([`RebindingPlan`]), recording the
+    /// frozen slot→variant/group topology, the logical membership check,
+    /// and the current physical slots it binds onto.
     ReleaseRef(ReleaseId),
+}
+
+/// The logical topology one slot is FROZEN into inside a release record:
+/// which variant declares the slot and which rollout groups it belongs to
+/// (the declaring variant file names the slot; a slot can belong to several
+/// groups or none). This is the slot→variant/group half of a release's
+/// temporal source — a `release:<id>` push resolves each slot's variant
+/// from THIS frozen map, never the caller's current variant files.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenSlotTopology {
+    /// The variant that declares the slot in the release's canonical slot
+    /// snapshot (`ReleaseRecord.slots` is keyed by variant name).
+    pub variant: String,
+    /// The rollout groups the slot belongs to within its owning target
+    /// (empty when the slot is not grouped).
+    #[serde(default)]
+    pub groups: Vec<String>,
+}
+
+/// The membership check backing a historical-release rebinding: the
+/// release's FROZEN slot-id membership for the destination target versus the
+/// target's CURRENT slot-id membership, verified EQUAL before planning
+/// proceeds. The comparison is LOGICAL membership only — slot IDs, never
+/// physical bindings (server / deploy_dir) — so two sets may be identical
+/// while every physical binding differs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MembershipCheck {
+    /// The membership the release record FROZE for the destination target
+    /// (the union over every frozen variant of its slots whose owning target
+    /// equals the destination, deduplicated by slot id).
+    pub frozen: BTreeSet<String>,
+    /// The destination target's CURRENT membership from the caller's current
+    /// configuration (every slot whose owning target equals the target).
+    pub current: BTreeSet<String>,
+}
+
+/// An EXPLICIT record that a `release:<id>` push is REBINDING a historical
+/// release's frozen topology onto the CURRENT physical slots.
+///
+/// The temporal-source rule names four sources — HEAD (current variant slot
+/// declarations), `release:<id>` (that release's frozen slot→variant and
+/// group topology), a deployment rollback (that deployment's exact per-slot
+/// artifact and physical binding), and the current server configuration
+/// (connectivity and live capacity ONLY, never topology). A direct release
+/// push is the one historically IMPLICIT exception: it applies the frozen
+/// release topology onto the CURRENT target's slots, so the physical
+/// rebinding happened without being named. This plan makes it explicit: it
+/// records the release, the destination target, the frozen
+/// slot→variant/group topology, the LOGICAL membership check (physical
+/// bindings MAY differ; the logical membership MUST match), and the CURRENT
+/// physical slots (`{server, deploy_dir}`) the frozen topology is bound
+/// onto. Produced at plan time in the `PushRef::Release` branch and recorded
+/// in [`DeploymentPlan::rebinding`]; HEAD and deployment-keyed plans carry
+/// `None`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebindingPlan {
+    /// The historical release being rebound.
+    pub release: ReleaseId,
+    /// The destination target the release is rebound onto.
+    pub target: TargetName,
+    /// The release's frozen slot→variant/group topology, filtered to the
+    /// destination target (from the release record's OWN canonical slot
+    /// snapshot). Complete regardless of group selection: a `--group` push
+    /// narrows the PLANNED assignments, never the recorded topology.
+    pub frozen_topology: BTreeMap<PlacementSlotId, FrozenSlotTopology>,
+    /// The logical membership check that ran before planning: `frozen ==
+    /// current` (slot IDs only; physical bindings may differ). For a group
+    /// push this is the COMPLETE membership — the group narrows the planned
+    /// slots, never the membership check.
+    pub membership: MembershipCheck,
+    /// The CURRENT physical slots the frozen topology is bound onto, per
+    /// PLANNED slot: `slot -> {server, deploy_dir}` from the caller's
+    /// current configuration. A group selection records exactly the selected
+    /// slots (the group-filtered assignments); a full push records every
+    /// member slot.
+    pub current_physical_slots: BTreeMap<PlacementSlotId, PhysicalBinding>,
 }
 
 /// Per-slot plan for one placement slot: its slot identity, the artifact it
@@ -411,6 +492,15 @@ pub struct DeploymentPlan {
     pub slot_ids: Vec<PlacementSlotId>,
     pub slots: BTreeMap<PlacementSlotId, SlotPlan>,
     pub source: PlanSource,
+    /// When the plan was built from a DIRECT release reference
+    /// (`PlanSource::ReleaseRef`), the explicit rebinding context: the
+    /// historical release's frozen topology applied onto the CURRENT
+    /// physical slots ([`RebindingPlan`]). `None` for HEAD and
+    /// deployment-keyed plans. `#[serde(default)]` keeps deployment records
+    /// written before this field loadable; `skip_serializing_if` keeps the
+    /// recorded wire shape unchanged for plans that carry no rebinding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebinding: Option<RebindingPlan>,
     /// The releases this attempt's slots reference (per-slot artifact
     /// provenance: a partial snapshot can span several releases).
     pub desired_releases: BTreeSet<ReleaseId>,
