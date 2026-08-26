@@ -632,7 +632,9 @@ fn push_inner(
     // ref (a `release:<id>` push applies the release's frozen topology onto
     // the CURRENT physical slots — [`crate::records::RebindingPlan`]); HEAD
     // and deployment refs carry `None`.
-    let (assignments, desired_releases, source, rebinding) = crate::push::plan::plan_assignments(
+    // (`desired_releases` is now DERIVED from the plan's authoritative per-slot
+    // collection (`DeploymentPlan::releases`), never stored on the domain).
+    let (assignments, _desired_releases, source, rebinding) = crate::push::plan::plan_assignments(
         selection,
         &pref,
         &local_release_id,
@@ -748,16 +750,10 @@ fn push_inner(
     let plan = DeploymentPlan {
         deployment_id: deployment_id.clone(),
         target: TargetName::new(target_name.to_string()),
-        behavior_sha256: desired_behavior_sha.clone(),
         behaviors: behavior_index.clone(),
-        slot_ids: assignments
-            .iter()
-            .map(|a| a.placement_slot.clone())
-            .collect(),
         slots: plan_servers.clone(),
         source,
         rebinding,
-        desired_releases: desired_releases.clone(),
     };
 
     // ---- Dry-run: read-only planning, no mutation of store/remote/locks -----
@@ -6413,7 +6409,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         )
         .unwrap();
         assert_eq!(
-            plan.desired_releases,
+            plan.releases(),
             BTreeSet::from([r1_release.clone(), r2_release.clone()]),
             "the plan references BOTH snapshot releases"
         );

@@ -10,6 +10,26 @@
 //! identity — while [`crate::model::ServerId`] remains the actual-server
 //! identity used for transport addressing (`ServerState`, config `ServerDef`).
 //!
+//! # ONE authoritative collection per record; WIRE → VERIFIED DOMAIN
+//!
+//! Every record keeps ONE authoritative collection and derives the rest
+//! through methods (`membership()`, `releases()`, `behavior_digest()`); the
+//! redundant on-disk members exist only in the WIRE types (the raw serde
+//! shapes, [`LedgerIntentWire`], [`LedgerRollbackWire`], [`LedgerTerminalWire`],
+//! [`DeploymentPlanWire`]) and are RECONCILED by a VERIFYING CONVERSION
+//! (`Wire::into_domain`). The conversion checks that every duplicate
+//! projection AGREES — e.g. the `desired`/`pre_push`/`slots` key sets are
+//! subsets of the authoritative `slot_ids` membership, each
+//! [`crate::model::GenerationRef`]'s assignment names its own map key, the
+//! stored `behavior_sha256` equals the digest derived from the behavior index,
+//! and the stored `desired_releases` equals the releases derived from the
+//! per-slot artifacts. A disagreement is an [`crate::error::Error::integrity`]
+//! error (fail closed — a hand-constructed record can never put the
+//! duplicates out of agreement, and the code then reads whichever projection
+//! it happens to use). The rest of the codebase consumes ONLY the validated
+//! domain types; the store's readers convert wire → domain on read and refuse
+//! disagreeing records.
+//!
 //! # ONE history ledger per target
 //!
 //! A target's ENTIRE deployment history lives in ONE ordered, append-only
@@ -17,16 +37,17 @@
 //! physical line kinds ([`LedgerLine`]):
 //!
 //! * [`LedgerLine::Intent`] — the DURABLE INTENT of one deployment
-//!   ([`LedgerIntent`]): deployment_id, target, behavior digest, membership,
-//!   and the `desired` / `pre_push` per-slot maps. It is appended BEFORE any
-//!   remote mutation (the append-attempt contract) and never edited. It
-//!   carries NO status, NO outcomes, and NO rollback state.
+//!   ([`LedgerIntentWire`] → verified [`LedgerIntent`]): deployment_id,
+//!   target, behavior digest, membership, and the `desired` / `pre_push`
+//!   per-slot maps. It is appended BEFORE any remote mutation (the
+//!   append-attempt contract) and never edited. It carries NO status, NO
+//!   outcomes, and NO rollback state.
 //! * [`LedgerLine::Terminal`] — the TERMINAL EVENT of one deployment
-//!   ([`LedgerTerminal`]): the status, the per-slot OUTCOMES, and — when the
-//!   deployment was SUCCESSFUL — the ROLLBACK STATE ([`LedgerRollback`], the
-//!   snapshot payload: per-slot generation refs + behavior digest + physical
-//!   bindings + the release the generations came from). Appended once, after
-//!   the mutation loop, and never edited.
+//!   ([`LedgerTerminalWire`] → verified [`LedgerTerminal`]): the status, the
+//!   per-slot OUTCOMES, and — when the deployment was SUCCESSFUL — the
+//!   ROLLBACK STATE ([`LedgerRollbackWire`] → verified [`LedgerRollback`],
+//!   the snapshot payload: per-slot generation refs + physical bindings).
+//!   Appended once, after the mutation loop, and never edited.
 //!
 //! A merged [`LedgerEntry`] (intent + optional terminal) is the deployment's
 //! full history record. The ledger's APPEND ORDER is the HISTORY ORDER: the
@@ -48,12 +69,12 @@
 //! unreachable deployment directories, release records, and tree objects
 //! (see [`crate::store::history_floor`]).
 
+use crate::error::{Error, Result};
 use crate::model::{
     ArtifactRef, BehaviorContract, DeploymentId, GenerationId, GenerationRef, PlacementSlotId,
     ReleaseId, ServerId, TargetName, TreeDigest,
 };
-
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,27 +133,17 @@ pub struct SlotAttemptState {
     pub generation: Option<GenerationId>,
 }
 
-/// The durable INTENT of one deployment attempt: what was planned and
-/// observed BEFORE any server mutation. Appended once to the target's ledger
-/// ([`LedgerLine::Intent`]) BEFORE the remote mutation phase (a crash after
-/// servers advanced to new generations can never lose the deployment: the
-/// intent is already durable and the next push reconciles it) and never
-/// edited. The attempt's STATUS, per-slot OUTCOMES and (when successful)
-/// ROLLBACK STATE come from its TERMINAL EVENT ([`LedgerTerminal`]), never
-/// from this record — the persisted `slots` map is empty.
-///
-/// Every slot→assignment map is keyed by [`PlacementSlotId`]; `slot_ids` is
-/// the deployment's membership (mirroring the commit marker `slots`
-/// payload). The record carries `deployment_schema_version`, which must be
-/// exactly [`crate::model::LEDGER_SCHEMA_VERSION`]: writers emit the
-/// constant and readers (e.g. [`crate::store::local::LocalStore::read_ledger`]) refuse
-/// any other version with an error naming the version (fail closed — a
-/// mismatched record is never silently interpreted). The current v1 shape is
-/// the canonical placement-slot-keyed form (`BTreeMap<PlacementSlotId, _>`
-/// maps with nested `artifact`/`assignment` refs); an older server-keyed
-/// flat-artifact shape is NOT the current schema and never loads.
+/// The WIRE shape of a durable intent line: the RAW serde form the ledger's
+/// JSONL carries, holding every redundant member the domain reconciles (the
+/// per-slot maps' key sets next to the authoritative `slot_ids` membership,
+/// each [`crate::model::GenerationRef`]'s assignment slot next to its map
+/// key). [`LedgerLine::Intent`] serializes this type; the ledger's wire
+/// format is therefore unchanged (existing ledgers keep loading — the wire
+/// reads the current format). The VERIFYING CONVERSION
+/// ([`LedgerIntentWire::into_domain`]) checks every duplicate projection and
+/// exposes only the validated [`LedgerIntent`] domain type.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LedgerIntent {
+pub struct LedgerIntentWire {
     pub deployment_schema_version: u32,
     pub deployment_id: DeploymentId,
     pub target: TargetName,
@@ -144,8 +155,121 @@ pub struct LedgerIntent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// The placement slots participating in this deployment, in deployment
-    /// order (the same set the commit marker `slots` payload records).
+    /// order (the same set the commit marker `slots` payload records). This
+    /// is the AUTHORITATIVE membership: the `desired` / `pre_push` / `slots`
+    /// maps' key sets must agree with it (every key a member), verified by
+    /// the wire → domain conversion.
     pub slot_ids: Vec<PlacementSlotId>,
+    pub behavior_sha256: String,
+    pub attempted_at: String,
+    /// Desired per-slot assignments (what the plan intended): each slot's
+    /// minted generation for its planned artifact. Each entry's key must be a
+    /// member of `slot_ids`, and each `GenerationRef`'s assignment must name
+    /// its own map key.
+    pub desired: BTreeMap<PlacementSlotId, GenerationRef>,
+    /// Pre-push per-slot state before mutation (`None` if first deployment).
+    /// Every key must be a member of `slot_ids`.
+    pub pre_push: BTreeMap<PlacementSlotId, Option<SlotAttemptState>>,
+    /// Actual per-slot result after the attempt. The persisted ledger intent
+    /// keeps this map EMPTY (outcomes are recorded in the terminal event's
+    /// `outcomes` map); in memory (the push report) it carries the observed
+    /// actuals for display. Every key must be a member of `slot_ids`.
+    pub slots: BTreeMap<PlacementSlotId, SlotAttemptState>,
+}
+
+impl LedgerIntentWire {
+    /// VERIFYING CONVERSION (wire → domain): every duplicate projection must
+    /// AGREE. The authoritative membership is `slot_ids`; the `desired` /
+    /// `pre_push` / `slots` key sets must be subsets of it, and every
+    /// desired [`crate::model::GenerationRef`]'s assignment must name its own
+    /// map key. A disagreement is an [`Error::integrity`] error (fail closed —
+    /// a hand-constructed record can never be read as whichever projection a
+    /// consumer happens to use).
+    pub fn into_domain(self) -> Result<LedgerIntent> {
+        let membership: BTreeSet<&PlacementSlotId> = self.slot_ids.iter().collect();
+        let is_member = |sid: &PlacementSlotId| membership.contains(sid);
+        for (key, g) in &self.desired {
+            if !is_member(key) {
+                return Err(Error::integrity(format!(
+                    "intent {}: desired assignment for slot '{key}' is not a member of slot_ids",
+                    self.deployment_id
+                )));
+            }
+            if &g.assignment.placement_slot != key {
+                return Err(Error::integrity(format!(
+                    "intent {}: desired assignment for slot '{key}' names placement '{}'",
+                    self.deployment_id, g.assignment.placement_slot
+                )));
+            }
+        }
+        for key in self.pre_push.keys() {
+            if !is_member(key) {
+                return Err(Error::integrity(format!(
+                    "intent {}: pre_push slot '{key}' is not in slot_ids",
+                    self.deployment_id
+                )));
+            }
+        }
+        for key in self.slots.keys() {
+            if !is_member(key) {
+                return Err(Error::integrity(format!(
+                    "intent {}: slots key '{key}' is not in slot_ids",
+                    self.deployment_id
+                )));
+            }
+        }
+        Ok(LedgerIntent {
+            deployment_schema_version: self.deployment_schema_version,
+            deployment_id: self.deployment_id,
+            target: self.target,
+            group: self.group,
+            slot_ids: self.slot_ids,
+            behavior_sha256: self.behavior_sha256,
+            attempted_at: self.attempted_at,
+            desired: self.desired,
+            pre_push: self.pre_push,
+            slots: self.slots,
+        })
+    }
+}
+
+/// The durable INTENT of one deployment attempt, the VALIDATED domain form of
+/// [`LedgerIntentWire`]: what was planned and observed BEFORE any server
+/// mutation. Appended once to the target's ledger ([`LedgerLine::Intent`])
+/// BEFORE the remote mutation phase (a crash after servers advanced to new
+/// generations can never lose the deployment: the intent is already durable
+/// and the next push reconciles it) and never edited. The attempt's STATUS,
+/// per-slot OUTCOMES and (when successful) ROLLBACK STATE come from its
+/// TERMINAL EVENT ([`LedgerTerminal`]), never from this record — the
+/// persisted `slots` map is empty.
+///
+/// Every slot→assignment map is keyed by [`PlacementSlotId`]; `slot_ids` is
+/// the deployment's membership (mirroring the commit marker `slots`
+/// payload). The record carries `deployment_schema_version`, which must be
+/// exactly [`crate::model::LEDGER_SCHEMA_VERSION`]: writers emit the
+/// constant and readers (e.g. [`crate::store::local::LocalStore::read_ledger`]) refuse
+/// any other version with an error naming the version (fail closed — a
+/// mismatched record is never silently interpreted). The current v1 shape is
+/// the canonical placement-slot-keyed form (`BTreeMap<PlacementSlotId, _>`
+/// maps with nested `artifact`/`assignment` refs); an older server-keyed
+/// flat-artifact shape is NOT the current schema and never loads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LedgerIntent {
+    pub deployment_schema_version: u32,
+    pub deployment_id: DeploymentId,
+    pub target: TargetName,
+    /// The optional rollout group this attempt selected (`deploy push
+    /// <target> --group <name>`). `None` means the attempt selected every
+    /// slot owned by the target. The group name is DESCRIPTIVE (later
+    /// releases may change group membership); the exact selected slot IDs in
+    /// `slot_ids` are the authoritative historical evidence.
+    pub group: Option<String>,
+    /// The placement slots participating in this deployment, in deployment
+    /// order (the same set the commit marker `slots` payload records). THE
+    /// AUTHORITATIVE MEMBERSHIP — the `desired` / `pre_push` / `slots` key
+    /// sets must agree with it (enforced by the wire → domain conversion).
+    pub slot_ids: Vec<PlacementSlotId>,
+    /// The attempt's behavior digest (see [`LedgerIntentWire`]).
     pub behavior_sha256: String,
     pub attempted_at: String,
     /// Desired per-slot assignments (what the plan intended): each slot's
@@ -159,6 +283,61 @@ pub struct LedgerIntent {
     /// it carries the observed actuals for display, and recovery derives
     /// outcomes from the verified desired state instead.
     pub slots: BTreeMap<PlacementSlotId, SlotAttemptState>,
+}
+
+impl LedgerIntent {
+    /// The deployment's membership: the AUTHORITATIVE selected placement
+    /// slots (in deployment order).
+    pub fn membership(&self) -> &[PlacementSlotId] {
+        &self.slot_ids
+    }
+
+    /// The distinct releases referenced by the intent's per-slot desired
+    /// assignments — DERIVED from the authoritative `desired` map, never
+    /// stored separately (a partial snapshot can span several releases).
+    pub fn releases(&self) -> BTreeSet<ReleaseId> {
+        self.desired
+            .values()
+            .map(|g| g.assignment.artifact.release.clone())
+            .collect()
+    }
+}
+
+impl From<&LedgerIntent> for LedgerIntentWire {
+    fn from(i: &LedgerIntent) -> Self {
+        LedgerIntentWire {
+            deployment_schema_version: i.deployment_schema_version,
+            deployment_id: i.deployment_id.clone(),
+            target: i.target.clone(),
+            group: i.group.clone(),
+            slot_ids: i.slot_ids.clone(),
+            behavior_sha256: i.behavior_sha256.clone(),
+            attempted_at: i.attempted_at.clone(),
+            desired: i.desired.clone(),
+            pre_push: i.pre_push.clone(),
+            slots: i.slots.clone(),
+        }
+    }
+}
+
+impl Serialize for LedgerIntent {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        LedgerIntentWire::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for LedgerIntent {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = LedgerIntentWire::deserialize(deserializer)?;
+        wire.into_domain()
+            .map_err(|e| serde::de::Error::custom(e.to_string()))
+    }
 }
 
 /// The complete PHYSICAL binding of one placement slot at terminal time: the
@@ -181,22 +360,25 @@ pub struct PhysicalBinding {
 }
 
 /// The ROLLBACK STATE carried by the terminal event of a SUCCESSFUL
-/// deployment: the snapshot payload of the attempt — the complete per-slot
-/// [`GenerationRef`]s it advanced to (a successful terminal always has a
-/// generation per slot) and the physical bindings (`{server, deploy_dir}`)
-/// each slot had.
+/// deployment, the VALIDATED DOMAIN form: the snapshot payload of the attempt
+/// — the complete per-slot [`GenerationRef`]s it advanced to (a successful
+/// terminal always has a generation per slot) and the physical bindings
+/// (`{server, deploy_dir}`) each slot had.
 ///
 /// THERE IS NO SNAPSHOT-WIDE RELEASE/BEHAVIOR: each slot's [`GenerationRef`]
 /// carries its OWN artifact binding (`release`, `variant`, `tree`), and a
 /// PARTIAL snapshot can legitimately carry slots from DIFFERENT releases
 /// (group pushes over time: group A pushed release R1, group B pushed
 /// release R2, and the overlay snapshot keeps each slot's own artifact). The
-/// referenced releases are DERIVED from `slots` (each slot's artifact's
-/// release) — never stored once per snapshot — and rollback resolves EACH
-/// SLOT's behavior from ITS OWN (release, variant) binding. Legacy ledger
-/// lines that still carry the old snapshot-wide `behavior_sha256`/`release`
-/// fields deserialize fine (serde ignores the unknown members) and are
-/// interpreted purely through the per-slot bindings.
+/// referenced releases are DERIVED from `slots` ([`LedgerRollback::releases`])
+/// — never stored once per snapshot — and rollback resolves EACH SLOT's
+/// behavior from ITS OWN (release, variant) binding. Legacy ledger lines that
+/// still carry the old snapshot-wide `behavior_sha256`/`release` members
+/// deserialize into the WIRE form ([`LedgerRollbackWire`]), where the stored
+/// `release` must equal the snapshot's ONE derived release (a disagreement
+/// → `Error::integrity`); the legacy `behavior_sha256` is not derivable from
+/// the per-slot payload (behavior contracts are not stored) and is carried
+/// only for wire parseability, never interpreted.
 ///
 /// `bindings` records the COMPLETE PHYSICAL BINDING each slot had when the
 /// deployment ran. Exact rollback maps a terminal's generations to slots by
@@ -213,12 +395,100 @@ pub struct LedgerRollback {
     /// Per-slot generation refs, keyed by [`PlacementSlotId`]. Each
     /// generation ref's assignment carries the slot's OWN artifact binding
     /// (`release`, `variant`, `tree`); the referenced releases are the set
-    /// derived from these bindings.
+    /// derived from these bindings ([`LedgerRollback::releases`]).
     pub slots: BTreeMap<PlacementSlotId, GenerationRef>,
     /// The complete physical binding (`{server, deploy_dir}`) each slot had
-    /// at deployment time, keyed by [`PlacementSlotId`].
+    /// at deployment time, keyed by [`PlacementSlotId`]. Every binding key
+    /// must be a slotted generation (verified by the wire → domain
+    /// conversion).
     #[serde(default)]
     pub bindings: BTreeMap<PlacementSlotId, PhysicalBinding>,
+}
+
+impl LedgerRollback {
+    /// The distinct releases referenced by the snapshot's per-slot generation
+    /// bindings — DERIVED from the authoritative `slots` map, never stored
+    /// once per snapshot (a partial snapshot can legitimately span several
+    /// releases).
+    pub fn releases(&self) -> BTreeSet<ReleaseId> {
+        self.slots
+            .values()
+            .map(|g| g.assignment.artifact.release.clone())
+            .collect()
+    }
+}
+
+/// The WIRE shape of a rollback payload: the snapshot's `slots` + `bindings`
+/// plus the legacy snapshot-wide `behavior_sha256`/`release` members (carried
+/// so pre-refactor ledger lines still deserialize; writers never emit them).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerRollbackWire {
+    pub slots: BTreeMap<PlacementSlotId, GenerationRef>,
+    #[serde(default)]
+    pub bindings: BTreeMap<PlacementSlotId, PhysicalBinding>,
+    /// Legacy snapshot-wide behavior digest. NOT derivable from the per-slot
+    /// payload (behavior contracts are not stored) — carried only for wire
+    /// parseability, never interpreted (per-slot behavior resolution governs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior_sha256: Option<String>,
+    /// Legacy snapshot-wide release. When present it must equal the
+    /// snapshot's ONE derived release (the conversion fails closed on a
+    /// disagreement — a multi-release partial snapshot cannot be represented
+    /// by the legacy single release).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<ReleaseId>,
+}
+
+impl LedgerRollbackWire {
+    /// VERIFYING CONVERSION (wire → domain): every duplicate projection must
+    /// agree — each slot's [`crate::model::GenerationRef`] assignment names
+    /// its own map key, every binding belongs to a slotted generation, and
+    /// the legacy snapshot-wide `release` (when present) equals the
+    /// snapshot's ONE derived release. A disagreement → `Error::integrity`.
+    pub fn into_domain(self) -> Result<LedgerRollback> {
+        for (key, g) in &self.slots {
+            if &g.assignment.placement_slot != key {
+                return Err(Error::integrity(format!(
+                    "rollback: generation for slot '{key}' names placement '{}'",
+                    g.assignment.placement_slot
+                )));
+            }
+        }
+        for key in self.bindings.keys() {
+            if !self.slots.contains_key(key) {
+                return Err(Error::integrity(format!(
+                    "rollback: binding for slot '{key}' has no generation entry"
+                )));
+            }
+        }
+        if let Some(legacy) = &self.release {
+            let derived: BTreeSet<ReleaseId> = self
+                .slots
+                .values()
+                .map(|g| g.assignment.artifact.release.clone())
+                .collect();
+            if derived.len() != 1 || !derived.contains(legacy) {
+                return Err(Error::integrity(format!(
+                    "rollback: legacy release '{legacy}' disagrees with the derived snapshot releases {derived:?}"
+                )));
+            }
+        }
+        Ok(LedgerRollback {
+            slots: self.slots,
+            bindings: self.bindings,
+        })
+    }
+}
+
+impl From<&LedgerRollback> for LedgerRollbackWire {
+    fn from(r: &LedgerRollback) -> Self {
+        LedgerRollbackWire {
+            slots: r.slots.clone(),
+            bindings: r.bindings.clone(),
+            behavior_sha256: None,
+            release: None,
+        }
+    }
 }
 
 /// The per-release, per-variant behavior contracts an attempt is bound to:
@@ -259,27 +529,86 @@ pub struct LedgerTerminal {
     pub reason: Option<String>,
 }
 
-/// ONE physical line of a target's deployment ledger. The ledger is an
-/// append-only JSONL stream: each deployment contributes at most one
-/// [`LedgerLine::Intent`] (written BEFORE any remote mutation) and at most
-/// one [`LedgerLine::Terminal`] (appended when the deployment completes).
-/// The line ORDER is the history order. [`crate::store::local::LocalStore::read_ledger`]
-/// merges the lines into [`LedgerEntry`]s keyed by deployment id.
+/// The WIRE shape of a terminal event: identical to the domain
+/// [`LedgerTerminal`] except the rollback payload is the raw
+/// [`LedgerRollbackWire`] (so legacy snapshot-wide members are visible to the
+/// verifying conversion). The terminal itself has no duplicated authoritative
+/// projection beyond the rollback payload it carries; the conversion maps the
+/// payload wire → domain.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerTerminalWire {
+    pub deployment_id: DeploymentId,
+    pub target: TargetName,
+    pub status: DeploymentStatus,
+    pub recorded_at: String,
+    pub outcomes: BTreeMap<PlacementSlotId, SlotResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback: Option<LedgerRollbackWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl LedgerTerminalWire {
+    /// VERIFYING CONVERSION (wire → domain): the terminal's own members have
+    /// no redundant projection; the rollback payload is converted through
+    /// [`LedgerRollbackWire::into_domain`] (which fails closed on any
+    /// disagreement).
+    pub fn into_domain(self) -> Result<LedgerTerminal> {
+        let rollback = match self.rollback {
+            Some(wire) => Some(wire.into_domain()?),
+            None => None,
+        };
+        Ok(LedgerTerminal {
+            deployment_id: self.deployment_id,
+            target: self.target,
+            status: self.status,
+            recorded_at: self.recorded_at,
+            outcomes: self.outcomes,
+            rollback,
+            reason: self.reason,
+        })
+    }
+}
+
+impl From<&LedgerTerminal> for LedgerTerminalWire {
+    fn from(t: &LedgerTerminal) -> Self {
+        LedgerTerminalWire {
+            deployment_id: t.deployment_id.clone(),
+            target: t.target.clone(),
+            status: t.status.clone(),
+            recorded_at: t.recorded_at.clone(),
+            outcomes: t.outcomes.clone(),
+            rollback: t.rollback.as_ref().map(LedgerRollbackWire::from),
+            reason: t.reason.clone(),
+        }
+    }
+}
+
+/// ONE physical line of a target's deployment ledger — the WIRE enum: the
+/// raw serde shapes ([`LedgerIntentWire`], [`LedgerTerminalWire`]) exactly as
+/// the append-only JSONL stream carries them. The ledger is append-only: each
+/// deployment contributes at most one [`LedgerLine::Intent`] (written BEFORE
+/// any remote mutation) and at most one [`LedgerLine::Terminal`] (appended
+/// when the deployment completes). The line ORDER is the history order.
+/// [`crate::store::local::LocalStore::read_ledger`] parses these wire lines,
+/// runs the VERIFYING CONVERSION (refusing disagreeing records), and merges
+/// the validated domain records into [`LedgerEntry`]s keyed by deployment id.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LedgerLine {
     /// The durable intent of one deployment, written before any remote
     /// mutation (the append-attempt contract).
-    Intent(LedgerIntent),
+    Intent(LedgerIntentWire),
     /// The terminal event of one deployment, appended after the mutation
     /// loop.
-    Terminal(LedgerTerminal),
+    Terminal(LedgerTerminalWire),
 }
 
 /// A merged deployment entry of the target's ledger: the durable INTENT plus
 /// the optional TERMINAL EVENT (absent while the deployment is in flight or
 /// recoverable-pending). The append order is the history order; `seq` is the
-/// position of the intent line in the ledger.
+/// position of the intent line in the ledger. Only VALIDATED domain records
+/// ([`LedgerIntent`], [`LedgerTerminal`]) live here — never raw wire shapes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LedgerEntry {
     pub deployment_id: DeploymentId,
@@ -477,18 +806,28 @@ pub struct SlotPlan {
     pub expected_tree: Option<TreeDigest>,
 }
 
+/// The WIRE shape of a deployment plan (`deployments/<id>/plan.json`): the
+/// raw serde form holding the REDUNDANT members the domain reconciles away —
+/// `slot_ids` next to the authoritative per-slot `slots` map, `behavior_sha256`
+/// next to the authoritative `behaviors` index, `desired_releases` next to the
+/// releases derived from the per-slot artifacts. The on-disk plan keeps the
+/// redundant shape (the write path serializes the domain through this wire
+/// form); the VERIFYING CONVERSION ([`DeploymentPlanWire::into_domain`])
+/// checks every duplicate projection and exposes only the validated
+/// [`DeploymentPlan`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeploymentPlan {
+pub struct DeploymentPlanWire {
     pub deployment_id: DeploymentId,
     pub target: TargetName,
-    /// The attempt's snapshot-wide behavior digest: the canonical digest of
-    /// the [`BehaviorIndex`] the attempt is bound to.
+    /// The stored snapshot-wide behavior digest; must equal the digest
+    /// derived from `behaviors` (the authoritative index).
     pub behavior_sha256: String,
     /// The frozen, per-release name-keyed activation + verification contracts
-    /// this attempt is bound to, one per declared variant per referenced
-    /// release. Historical and rollback pushes carry the historical contracts
-    /// here rather than the caller's current configuration.
+    /// this attempt is bound to — THE AUTHORITATIVE BEHAVIOR COLLECTION (the
+    /// digest is derived from it).
     pub behaviors: BehaviorIndex,
+    /// The selected placement slots; the DEDUPLICATED SET must equal the
+    /// `slots` map's key set (the authoritative membership).
     pub slot_ids: Vec<PlacementSlotId>,
     pub slots: BTreeMap<PlacementSlotId, SlotPlan>,
     pub source: PlanSource,
@@ -501,9 +840,158 @@ pub struct DeploymentPlan {
     /// recorded wire shape unchanged for plans that carry no rebinding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rebinding: Option<RebindingPlan>,
-    /// The releases this attempt's slots reference (per-slot artifact
-    /// provenance: a partial snapshot can span several releases).
+    /// The releases this attempt's slots reference; must equal the set
+    /// derived from the per-slot artifacts (a partial snapshot can span
+    /// several releases).
     pub desired_releases: BTreeSet<ReleaseId>,
+}
+
+impl DeploymentPlanWire {
+    /// VERIFYING CONVERSION (wire → domain): every duplicate projection must
+    /// agree — the `slot_ids` set (deduplicated) equals the `slots` map keys,
+    /// every `SlotPlan` names its own map key, `desired_releases` equals
+    /// the releases derived from the per-slot artifacts, and
+    /// `behavior_sha256` equals the canonical digest of `behaviors`. A
+    /// disagreement → `Error::integrity` (fail closed).
+    pub fn into_domain(self) -> Result<DeploymentPlan> {
+        let wire_slots: BTreeSet<&PlacementSlotId> = self.slot_ids.iter().collect();
+        let keys: BTreeSet<&PlacementSlotId> = self.slots.keys().collect();
+        if wire_slots != keys {
+            return Err(Error::integrity(format!(
+                "plan {}: slot_ids {:?} disagrees with the per-slot plan keys {:?}",
+                self.deployment_id, wire_slots, keys
+            )));
+        }
+        for (key, plan) in &self.slots {
+            if &plan.slot_id != key {
+                return Err(Error::integrity(format!(
+                    "plan {}: per-slot plan for '{key}' names slot '{}'",
+                    self.deployment_id, plan.slot_id
+                )));
+            }
+        }
+        let releases: BTreeSet<ReleaseId> = self
+            .slots
+            .values()
+            .map(|p| p.artifact.release.clone())
+            .collect();
+        if self.desired_releases != releases {
+            return Err(Error::integrity(format!(
+                "plan {}: desired_releases {:?} disagrees with the derived releases {:?}",
+                self.deployment_id, self.desired_releases, releases
+            )));
+        }
+        let digest = crate::release::behavior_index_digest(&self.behaviors);
+        if self.behavior_sha256 != digest {
+            return Err(Error::integrity(format!(
+                "plan {}: stored behavior_sha256 disagrees with the derived digest of the behavior index",
+                self.deployment_id
+            )));
+        }
+        Ok(DeploymentPlan {
+            deployment_id: self.deployment_id,
+            target: self.target,
+            behaviors: self.behaviors,
+            slots: self.slots,
+            source: self.source,
+            rebinding: self.rebinding,
+        })
+    }
+}
+
+impl From<&DeploymentPlan> for DeploymentPlanWire {
+    fn from(p: &DeploymentPlan) -> Self {
+        DeploymentPlanWire {
+            deployment_id: p.deployment_id.clone(),
+            target: p.target.clone(),
+            behavior_sha256: p.behavior_digest(),
+            behaviors: p.behaviors.clone(),
+            slot_ids: p.membership().cloned().collect(),
+            slots: p.slots.clone(),
+            source: p.source.clone(),
+            rebinding: p.rebinding.clone(),
+            desired_releases: p.releases(),
+        }
+    }
+}
+
+/// A deployment plan, the VALIDATED DOMAIN form of [`DeploymentPlanWire`]:
+/// the attempt's snapshot-wide behavior digest, the frozen per-release
+/// name-keyed activation + verification contracts, and the per-slot plans.
+/// ONE AUTHORITATIVE COLLECTION PER CONCEPT — `slots` (per-slot plans) is
+/// the membership AND the release source; `behaviors` (the index) is the
+/// behavior source. The `slot_ids` / `desired_releases` / `behavior_sha256`
+/// members exist only in the wire (the serialized `plan.json` keeps the
+/// redundant shape) and are derived here through
+/// [`DeploymentPlan::membership`], [`DeploymentPlan::releases`],
+/// [`DeploymentPlan::behavior_digest`] — the verified conversion guarantees
+/// they agree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeploymentPlan {
+    pub deployment_id: DeploymentId,
+    pub target: TargetName,
+    /// The frozen, per-release name-keyed activation + verification contracts
+    /// this attempt is bound to, one per declared variant per referenced
+    /// release — THE AUTHORITATIVE BEHAVIOR COLLECTION (the digest is
+    /// derived from it). Historical and rollback pushes carry the historical
+    /// contracts here rather than the caller's current configuration.
+    pub behaviors: BehaviorIndex,
+    /// THE AUTHORITATIVE PER-SLOT COLLECTION: the selected slots (the map
+    /// keys are the membership) and their plans (their artifacts are the
+    /// release source).
+    pub slots: BTreeMap<PlacementSlotId, SlotPlan>,
+    pub source: PlanSource,
+    /// When the plan was built from a DIRECT release reference
+    /// (`PlanSource::ReleaseRef`), the explicit rebinding context: the
+    /// historical release's frozen topology applied onto the CURRENT
+    /// physical slots ([`RebindingPlan`]). `None` for HEAD and
+    /// deployment-keyed plans.
+    pub rebinding: Option<RebindingPlan>,
+}
+
+impl DeploymentPlan {
+    /// The plan's membership: the selected placement slots, DERIVED from the
+    /// authoritative `slots` map (its keys) — never stored separately.
+    pub fn membership(&self) -> impl Iterator<Item = &PlacementSlotId> {
+        self.slots.keys()
+    }
+
+    /// The distinct releases the plan's slots reference (per-slot artifact
+    /// provenance: a partial snapshot can span several releases) — DERIVED
+    /// from the authoritative `slots` map, never stored separately.
+    pub fn releases(&self) -> BTreeSet<ReleaseId> {
+        self.slots
+            .values()
+            .map(|p| p.artifact.release.clone())
+            .collect()
+    }
+
+    /// The attempt's snapshot-wide behavior digest: the canonical digest of
+    /// the [`BehaviorIndex`] the attempt is bound to — DERIVED from the
+    /// authoritative `behaviors` index, never stored separately.
+    pub fn behavior_digest(&self) -> String {
+        crate::release::behavior_index_digest(&self.behaviors)
+    }
+}
+
+impl Serialize for DeploymentPlan {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        DeploymentPlanWire::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DeploymentPlan {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = DeploymentPlanWire::deserialize(deserializer)?;
+        wire.into_domain()
+            .map_err(|e| serde::de::Error::custom(e.to_string()))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -515,4 +1003,649 @@ pub struct SlotResult {
     pub compensated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ActivationConfig, ActivationScope, VerificationConfig};
+    use crate::model::{PlacementSlotAssignment, VariantName};
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+
+    // ---- fixtures ----------------------------------------------------------
+
+    fn slot(i: u32) -> PlacementSlotId {
+        PlacementSlotId::new(format!("slot-{i}"))
+    }
+
+    fn release(i: u32) -> ReleaseId {
+        ReleaseId::new(format!("rel-{i}"))
+    }
+
+    fn slot_strategy() -> impl Strategy<Value = PlacementSlotId> {
+        (0u32..6).prop_map(slot)
+    }
+
+    fn release_strategy() -> impl Strategy<Value = ReleaseId> {
+        (0u32..4).prop_map(release)
+    }
+
+    /// A constant, well-formed behavior contract. The contract VALUES do not
+    /// vary across a case — digest agreement is what the property exercises,
+    /// and the digest depends on the index STRUCTURE (which releases/variants
+    /// are present), not on a single contract's value.
+    fn contract() -> BehaviorContract {
+        BehaviorContract {
+            activation: ActivationConfig {
+                adapter: "none".to_string(),
+                scope: ActivationScope::System,
+                reconcile_managed_units: true,
+                units: Vec::new(),
+            },
+            verification: VerificationConfig {
+                adapter: "check".to_string(),
+                argv: Vec::new(),
+                timeout_seconds: 1,
+                attempts: 1,
+                interval_seconds: 1,
+            },
+        }
+    }
+
+    fn binding(sid: &PlacementSlotId) -> PhysicalBinding {
+        PhysicalBinding {
+            server: ServerId::new("s1".to_string()),
+            deploy_dir: format!("/srv/deploy/{}", sid.as_str()),
+        }
+    }
+
+    /// A generation ref whose assignment names its own key (the agreeing
+    /// form); the artifact's release is derived from the slot id.
+    fn gen_ref_for(key: &PlacementSlotId) -> GenerationRef {
+        GenerationRef {
+            generation: GenerationId::new(format!("gen-{}", key.as_str())),
+            assignment: PlacementSlotAssignment {
+                placement_slot: key.clone(),
+                artifact: ArtifactRef {
+                    release: ReleaseId::new(format!("rel-{}", key.as_str())),
+                    variant: VariantName::new("standard".to_string()),
+                    tree: TreeDigest::new(format!("tree-{}", key.as_str())),
+                },
+            },
+        }
+    }
+
+    // ---- agreeing (base) wire strategies -----------------------------------
+    //
+    // Every base wire is FULLY ARBITRARY in its scalar/set members but keeps
+    // every duplicate projection IN AGREEMENT; the property then mutates ONE
+    // projection at a time and asserts the conversion fails closed exactly on
+    // the disagreement.
+
+    fn agreeing_gen_refs() -> impl Strategy<Value = BTreeMap<PlacementSlotId, GenerationRef>> {
+        prop::collection::btree_map(slot_strategy(), release_strategy(), 0..4).prop_map(|m| {
+            m.into_iter()
+                .map(|(key, release)| {
+                    (
+                        key.clone(),
+                        GenerationRef {
+                            generation: GenerationId::new(format!("gen-{}", key.as_str())),
+                            assignment: PlacementSlotAssignment {
+                                placement_slot: key.clone(),
+                                artifact: ArtifactRef {
+                                    release,
+                                    variant: VariantName::new("standard".to_string()),
+                                    tree: TreeDigest::new(format!("tree-{}", key.as_str())),
+                                },
+                            },
+                        },
+                    )
+                })
+                .collect()
+        })
+    }
+
+    fn agreeing_pre_push()
+    -> impl Strategy<Value = BTreeMap<PlacementSlotId, Option<SlotAttemptState>>> {
+        prop::collection::btree_map(
+            slot_strategy(),
+            any::<bool>().prop_map(|present| {
+                present.then(|| SlotAttemptState {
+                    artifact: ArtifactRef::default(),
+                    generation: Some(GenerationId::new("gen-0".to_string())),
+                })
+            }),
+            0..4,
+        )
+    }
+
+    fn agreeing_actuals() -> impl Strategy<Value = BTreeMap<PlacementSlotId, SlotAttemptState>> {
+        prop::collection::btree_map(slot_strategy(), any::<bool>(), 0..4).prop_map(|m| {
+            m.into_iter()
+                .filter_map(|(key, present)| {
+                    present.then(|| {
+                        (
+                            key.clone(),
+                            SlotAttemptState {
+                                artifact: ArtifactRef::default(),
+                                generation: Some(GenerationId::new("gen-a".to_string())),
+                            },
+                        )
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn agreeing_intent_wire() -> impl Strategy<Value = LedgerIntentWire> {
+        (agreeing_gen_refs(), agreeing_pre_push(), agreeing_actuals()).prop_map(
+            |(desired, pre_push, slots)| {
+                // The AUTHORITATIVE membership is the union of the per-slot
+                // maps' keys (every key a member — agreement by construction).
+                let mut membership: BTreeSet<PlacementSlotId> = desired.keys().cloned().collect();
+                membership.extend(pre_push.keys().cloned());
+                membership.extend(slots.keys().cloned());
+                let slot_ids: Vec<PlacementSlotId> = membership.into_iter().collect();
+                LedgerIntentWire {
+                    deployment_schema_version: crate::model::LEDGER_SCHEMA_VERSION,
+                    deployment_id: DeploymentId::new("deploy-w".to_string()),
+                    target: TargetName::new("t1".to_string()),
+                    group: None,
+                    slot_ids,
+                    behavior_sha256: "sha256-w".to_string(),
+                    attempted_at: "2026-01-01T00:00:00Z".to_string(),
+                    desired,
+                    pre_push,
+                    slots,
+                }
+            },
+        )
+    }
+
+    fn agreeing_rollback_wire() -> impl Strategy<Value = LedgerRollbackWire> {
+        (agreeing_gen_refs(), any::<bool>()).prop_map(|(slots, with_bindings)| {
+            let bindings = if with_bindings {
+                slots
+                    .keys()
+                    .cloned()
+                    .map(|k| {
+                        let b = binding(&k);
+                        (k, b)
+                    })
+                    .collect()
+            } else {
+                BTreeMap::new()
+            };
+            LedgerRollbackWire {
+                slots,
+                bindings,
+                behavior_sha256: None,
+                release: None,
+            }
+        })
+    }
+
+    fn agreeing_plan_wire() -> impl Strategy<Value = DeploymentPlanWire> {
+        let behaviors = prop::collection::btree_map(
+            release_strategy(),
+            prop::collection::btree_map(
+                (0u32..3).prop_map(|i| format!("variant-{i}")),
+                Just(contract()),
+                0..3,
+            ),
+            0..3,
+        );
+        let slots =
+            prop::collection::btree_map(slot_strategy(), any::<bool>(), 0..4).prop_map(|m| {
+                let plans: BTreeMap<PlacementSlotId, SlotPlan> = m
+                    .into_iter()
+                    .filter_map(|(key, present)| {
+                        present.then(|| {
+                            (
+                                key.clone(),
+                                SlotPlan {
+                                    slot_id: key.clone(),
+                                    artifact: ArtifactRef {
+                                        release: ReleaseId::new(format!("rel-{}", key.as_str())),
+                                        variant: VariantName::new("standard".to_string()),
+                                        tree: TreeDigest::new(format!("tree-{}", key.as_str())),
+                                    },
+                                    expected_generation: None,
+                                    expected_tree: None,
+                                },
+                            )
+                        })
+                    })
+                    .collect();
+                plans
+            });
+        (behaviors, slots).prop_map(|(behaviors, slots)| {
+            let slot_ids: Vec<PlacementSlotId> = slots.keys().cloned().collect();
+            let desired_releases: BTreeSet<ReleaseId> =
+                slots.values().map(|p| p.artifact.release.clone()).collect();
+            DeploymentPlanWire {
+                deployment_id: DeploymentId::new("deploy-w".to_string()),
+                target: TargetName::new("t1".to_string()),
+                behavior_sha256: crate::release::behavior_index_digest(&behaviors),
+                behaviors,
+                slot_ids,
+                slots,
+                source: PlanSource::Head,
+                rebinding: None,
+                desired_releases,
+            }
+        })
+    }
+
+    #[derive(Debug, Clone)]
+    enum WireCase {
+        Intent(LedgerIntentWire),
+        Rollback(LedgerRollbackWire),
+        Plan(DeploymentPlanWire),
+    }
+
+    fn wire_case_strategy() -> impl Strategy<Value = WireCase> {
+        prop_oneof![
+            agreeing_intent_wire().prop_map(WireCase::Intent),
+            agreeing_rollback_wire().prop_map(WireCase::Rollback),
+            agreeing_plan_wire().prop_map(WireCase::Plan),
+        ]
+    }
+
+    // ---- per-record assertions ---------------------------------------------
+
+    fn check_intent_case(w: &LedgerIntentWire) {
+        let domain = w
+            .clone()
+            .into_domain()
+            .expect("an agreeing intent wire converts");
+        // Round trip: wire → domain → serialize → deserialize (wire) →
+        // convert — the derived membership and releases never change.
+        let json = serde_json::to_string(&domain).unwrap();
+        let wire2: LedgerIntentWire = serde_json::from_str(&json).unwrap();
+        let domain2 = wire2.into_domain().unwrap();
+        assert_eq!(domain2.membership(), domain.membership());
+        assert_eq!(domain2.releases(), domain.releases());
+        // A disagreement PER DUPLICATE fails closed:
+        // (a) a desired key outside the authoritative membership
+        let mut bad = w.clone();
+        bad.desired.insert(slot(9), gen_ref_for(&slot(9)));
+        assert!(
+            bad.into_domain().is_err(),
+            "a desired key outside slot_ids is a conversion error"
+        );
+        // (b) a pre_push key outside the membership
+        let mut bad = w.clone();
+        bad.pre_push.insert(slot(9), None);
+        assert!(
+            bad.into_domain().is_err(),
+            "a pre_push key outside slot_ids is a conversion error"
+        );
+        // (c) a slots (actuals) key outside the membership
+        let mut bad = w.clone();
+        bad.slots.insert(
+            slot(9),
+            SlotAttemptState {
+                artifact: ArtifactRef::default(),
+                generation: None,
+            },
+        );
+        assert!(
+            bad.into_domain().is_err(),
+            "a slots key outside slot_ids is a conversion error"
+        );
+        // (d) a generation assignment naming a different placement slot
+        let mut bad = w.clone();
+        if let Some((_, g)) = bad.desired.iter_mut().next() {
+            g.assignment.placement_slot = slot(9);
+            assert!(
+                bad.into_domain().is_err(),
+                "a generation assignment naming a different placement is a conversion error"
+            );
+        }
+    }
+
+    fn check_rollback_case(w: &LedgerRollbackWire) {
+        let domain = w
+            .clone()
+            .into_domain()
+            .expect("an agreeing rollback wire converts");
+        // Round-trip: the derived releases never change.
+        let json = serde_json::to_string(&domain).unwrap();
+        let wire2: LedgerRollbackWire = serde_json::from_str(&json).unwrap();
+        assert!(
+            wire2.behavior_sha256.is_none() && wire2.release.is_none(),
+            "the domain serializes no legacy snapshot-wide members"
+        );
+        let domain2 = wire2.into_domain().unwrap();
+        assert_eq!(domain2.releases(), domain.releases());
+        // A disagreement PER DUPLICATE fails closed.
+        // (a) a binding for a slot with no generation entry
+        let mut bad = w.clone();
+        bad.bindings.insert(slot(9), binding(&slot(9)));
+        assert!(
+            bad.into_domain().is_err(),
+            "a binding without a generation is a conversion error"
+        );
+        // (b) a generation assignment naming a different placement slot
+        let mut bad = w.clone();
+        if let Some((_, g)) = bad.slots.iter_mut().next() {
+            g.assignment.placement_slot = slot(9);
+            assert!(
+                bad.into_domain().is_err(),
+                "a generation assignment naming a different placement is a conversion error"
+            );
+        }
+        // (c) a legacy snapshot-wide release disagreeing with the derived
+        // snapshot releases (rel-9 is outside the generated rel-0..3 domain)
+        let mut bad = w.clone();
+        bad.release = Some(release(9));
+        assert!(
+            bad.into_domain().is_err(),
+            "a legacy release outside the derived snapshot releases is a conversion error"
+        );
+    }
+
+    fn check_plan_case(w: &DeploymentPlanWire) {
+        let domain = w
+            .clone()
+            .into_domain()
+            .expect("an agreeing plan wire converts");
+        // Round-trip: the derived membership, releases, and behavior digest
+        // never change; the serialized domain keeps the redundant wire shape.
+        let json = serde_json::to_string(&domain).unwrap();
+        let wire2: DeploymentPlanWire = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            wire2.slot_ids,
+            domain.membership().cloned().collect::<Vec<_>>()
+        );
+        assert_eq!(wire2.desired_releases, domain.releases());
+        let domain2 = wire2.into_domain().unwrap();
+        assert_eq!(
+            domain2.membership().collect::<Vec<_>>(),
+            domain.membership().collect::<Vec<_>>()
+        );
+        assert_eq!(domain2.releases(), domain.releases());
+        assert_eq!(domain2.behavior_digest(), domain.behavior_digest());
+        // A disagreement PER DUPLICATE fails closed.
+        // (a) the slot_ids set disagrees with the per-slot plan keys
+        let mut bad = w.clone();
+        bad.slot_ids.push(slot(9));
+        assert!(
+            bad.into_domain().is_err(),
+            "a slot_ids set disagreeing with the plan keys is a conversion error"
+        );
+        // (b) a per-slot plan naming a different slot
+        let mut bad = w.clone();
+        if let Some((_, plan)) = bad.slots.iter_mut().next() {
+            plan.slot_id = slot(9);
+            assert!(
+                bad.into_domain().is_err(),
+                "a plan naming a different slot is a conversion error"
+            );
+        }
+        // (c) desired_releases disagreeing with the derived releases
+        let mut bad = w.clone();
+        bad.desired_releases.insert(release(9));
+        assert!(
+            bad.into_domain().is_err(),
+            "a desired_releases set disagreeing from the derived releases is a conversion error"
+        );
+        // (d) the stored behavior digest disagreeing with the derived digest
+        let mut bad = w.clone();
+        bad.behavior_sha256 = "tampered".to_string();
+        assert!(
+            bad.into_domain().is_err(),
+            "a stored behavior digest disagreeing from the derived digest is a conversion error"
+        );
+    }
+
+    proptest! {
+        // PROPERTY: arbitrary WIRE records (arbitrary slot sets, arbitrary
+        // desired/pre_push/behavior/release fields) convert EXACTLY when every
+        // duplicate projection AGREES — a disagreement (any one duplicate
+        // mutated) → `Err`; agreement → `Ok` — and every successfully
+        // converted record ROUND-TRIPS (wire → domain → serialize →
+        // deserialize → convert) without changing its derived membership,
+        // releases, or behavior digest (the derived values are stable).
+        // Bounded 16 cases, fixed seed 0x5EED_5EED (house style), no
+        // persistence.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn wire_records_convert_exactly_when_duplicate_projections_agree(
+            case in wire_case_strategy()
+        ) {
+            match case {
+                WireCase::Intent(wire) => check_intent_case(&wire),
+                WireCase::Rollback(wire) => check_rollback_case(&wire),
+                WireCase::Plan(wire) => check_plan_case(&wire),
+            }
+        }
+    }
+
+    // ---- deterministic unit tests per record --------------------------------
+
+    /// [`LedgerIntentWire`]: an agreeing record converts and round-trips
+    /// stably; a disagreement per duplicate projection (desired key, pre_push
+    /// key, slots key, generation assignment slot) is a conversion error.
+    #[test]
+    fn intent_wire_disagreement_per_duplicate_fails_closed() {
+        let wire = LedgerIntentWire {
+            deployment_schema_version: crate::model::LEDGER_SCHEMA_VERSION,
+            deployment_id: DeploymentId::new("deploy-u".to_string()),
+            target: TargetName::new("t1".to_string()),
+            group: None,
+            slot_ids: vec![slot(1)],
+            behavior_sha256: "sha256-u".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            desired: BTreeMap::from([(slot(1), gen_ref_for(&slot(1)))]),
+            pre_push: BTreeMap::from([(slot(1), None)]),
+            slots: BTreeMap::new(),
+        };
+        let domain = wire.clone().into_domain().unwrap();
+        assert_eq!(domain.membership(), &[slot(1)][..]);
+        assert_eq!(
+            domain.releases(),
+            BTreeSet::from([ReleaseId::new("rel-slot-1".to_string())])
+        );
+        let json = serde_json::to_string(&domain).unwrap();
+        let wire2: LedgerIntentWire = serde_json::from_str(&json).unwrap();
+        let domain2 = wire2.into_domain().unwrap();
+        assert_eq!(
+            domain2, domain,
+            "an agreeing intent survives the round trip unchanged"
+        );
+
+        let mut bad = wire.clone();
+        bad.desired.insert(slot(2), gen_ref_for(&slot(2)));
+        assert!(
+            bad.into_domain().is_err(),
+            "a desired key outside slot_ids fails closed"
+        );
+        let mut bad = wire.clone();
+        bad.pre_push.insert(slot(2), None);
+        assert!(
+            bad.into_domain().is_err(),
+            "a pre_push key outside slot_ids fails closed"
+        );
+        let mut bad = wire.clone();
+        bad.slots.insert(
+            slot(2),
+            SlotAttemptState {
+                artifact: ArtifactRef::default(),
+                generation: None,
+            },
+        );
+        assert!(
+            bad.into_domain().is_err(),
+            "a slots key outside slot_ids fails closed"
+        );
+        let mut bad = wire.clone();
+        bad.desired
+            .get_mut(&slot(1))
+            .unwrap()
+            .assignment
+            .placement_slot = slot(2);
+        assert!(
+            bad.into_domain().is_err(),
+            "an assignment naming a different placement fails closed"
+        );
+    }
+
+    /// [`LedgerRollback`]: an agreeing record converts and round-trips
+    /// stably; a disagreement per duplicate projection (binding slot, mapping
+    /// assignment slot, legacy snapshot-wide release) is a conversion error,
+    /// while an AGREEING legacy release and the (non-derivable) legacy
+    /// behavior digest pass.
+    #[test]
+    fn rollback_wire_disagreement_per_duplicate_fails_closed() {
+        let wire = LedgerRollbackWire {
+            slots: BTreeMap::from([(slot(1), gen_ref_for(&slot(1)))]),
+            bindings: BTreeMap::from([(slot(1), binding(&slot(1)))]),
+            behavior_sha256: None,
+            release: None,
+        };
+        let domain = wire.clone().into_domain().unwrap();
+        assert_eq!(
+            domain.releases(),
+            BTreeSet::from([ReleaseId::new("rel-slot-1".to_string())])
+        );
+        let json = serde_json::to_string(&domain).unwrap();
+        let wire2: LedgerRollbackWire = serde_json::from_str(&json).unwrap();
+        assert!(
+            wire2.behavior_sha256.is_none() && wire2.release.is_none(),
+            "the domain serializes no legacy snapshot-wide members"
+        );
+        let domain2 = wire2.into_domain().unwrap();
+        assert_eq!(domain2.releases(), domain.releases());
+
+        let mut bad = wire.clone();
+        bad.bindings.insert(slot(2), binding(&slot(2)));
+        assert!(
+            bad.into_domain().is_err(),
+            "a binding without a generation fails closed"
+        );
+        let mut bad = wire.clone();
+        bad.slots
+            .get_mut(&slot(1))
+            .unwrap()
+            .assignment
+            .placement_slot = slot(2);
+        assert!(
+            bad.into_domain().is_err(),
+            "an assignment naming a different placement fails closed"
+        );
+        let mut bad = wire.clone();
+        bad.release = Some(ReleaseId::new("rel-other".to_string()));
+        assert!(
+            bad.into_domain().is_err(),
+            "a legacy release disagreeing with the derived release fails closed"
+        );
+        let mut good = wire.clone();
+        good.release = Some(ReleaseId::new("rel-slot-1".to_string()));
+        assert!(
+            good.into_domain().is_ok(),
+            "an agreeing legacy release passes"
+        );
+        let mut good = wire.clone();
+        good.behavior_sha256 = Some("sha256-legacy".to_string());
+        let d = good.into_domain().unwrap();
+        assert_eq!(
+            d.releases(),
+            BTreeSet::from([ReleaseId::new("rel-slot-1".to_string())]),
+            "the legacy behavior digest is carried for parseability, never interpreted"
+        );
+    }
+
+    /// [`DeploymentPlan`]: an agreeing record converts and round-trips
+    /// stably (the serialized domain keeps the redundant wire shape); a
+    /// disagreement per duplicate projection (slot_ids set, per-slot plan
+    /// slot, desired_releases, stored behavior digest) fails closed.
+    #[test]
+    fn plan_wire_disagreement_per_duplicate_fails_closed() {
+        let behaviors: BehaviorIndex = BTreeMap::from([(
+            release(1),
+            BTreeMap::from([("standard".to_string(), contract())]),
+        )]);
+        let wire = DeploymentPlanWire {
+            deployment_id: DeploymentId::new("deploy-p".to_string()),
+            target: TargetName::new("t1".to_string()),
+            behavior_sha256: crate::release::behavior_index_digest(&behaviors),
+            behaviors,
+            slot_ids: vec![slot(1)],
+            slots: BTreeMap::from([(
+                slot(1),
+                SlotPlan {
+                    slot_id: slot(1),
+                    artifact: ArtifactRef {
+                        release: ReleaseId::new("rel-slot-1".to_string()),
+                        variant: VariantName::new("standard".to_string()),
+                        tree: TreeDigest::new("t1".to_string()),
+                    },
+                    expected_generation: None,
+                    expected_tree: None,
+                },
+            )]),
+            source: PlanSource::Head,
+            rebinding: None,
+            desired_releases: BTreeSet::from([ReleaseId::new("rel-slot-1".to_string())]),
+        };
+        let domain = wire.clone().into_domain().unwrap();
+        assert_eq!(domain.membership().collect::<Vec<_>>(), vec![&slot(1)]);
+        assert_eq!(
+            domain.releases(),
+            BTreeSet::from([ReleaseId::new("rel-slot-1".to_string())])
+        );
+        assert_eq!(
+            domain.behavior_digest(),
+            crate::release::behavior_index_digest(&domain.behaviors),
+            "the derived digest must equal the canonical recomputed digest"
+        );
+        let json = serde_json::to_string(&domain).unwrap();
+        let wire2: DeploymentPlanWire = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            wire2.slot_ids,
+            vec![slot(1)],
+            "the serialized domain keeps the wire shape"
+        );
+        assert_eq!(wire2.desired_releases, domain.releases());
+        let domain2 = wire2.into_domain().unwrap();
+        assert_eq!(
+            domain2, domain,
+            "an agreeing plan survives the round trip unchanged"
+        );
+
+        let mut bad = wire.clone();
+        bad.slot_ids.push(slot(2));
+        assert!(
+            bad.into_domain().is_err(),
+            "a slot_ids set disagreeing from the plan keys fails closed"
+        );
+        let mut bad = wire.clone();
+        bad.slots.get_mut(&slot(1)).unwrap().slot_id = slot(2);
+        assert!(
+            bad.into_domain().is_err(),
+            "a per-slot plan naming a different slot fails closed"
+        );
+        let mut bad = wire.clone();
+        bad.desired_releases
+            .insert(ReleaseId::new("rel-other".to_string()));
+        assert!(
+            bad.into_domain().is_err(),
+            "a desired_releases set disagreeing from the derived releases fails closed"
+        );
+        let mut bad = wire.clone();
+        bad.behavior_sha256 = "tampered".to_string();
+        assert!(
+            bad.into_domain().is_err(),
+            "a stored behavior digest disagreeing from the derived digest fails closed"
+        );
+    }
 }

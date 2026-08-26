@@ -1317,7 +1317,7 @@ pub fn resolved_mode(mode: &Option<String>) -> Result<Option<u32>> {
 mod tests {
     use super::*;
     use crate::model::{DeploymentId, LEDGER_SCHEMA_VERSION, TargetName};
-    use crate::records::{LedgerIntent, LedgerLine};
+    use crate::records::{LedgerIntent, LedgerIntentWire, LedgerLine};
     use crate::store::local::LocalStore;
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -2590,8 +2590,10 @@ interval_seconds = 0
         Config::load(&p).expect("a config at CONFIG_SCHEMA_VERSION must load");
 
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let line =
-            serde_json::to_string(&LedgerLine::Intent(intended_intent("deploy-ok"))).unwrap();
+        let line = serde_json::to_string(&LedgerLine::Intent(LedgerIntentWire::from(
+            &intended_intent("deploy-ok"),
+        )))
+        .unwrap();
         let lp = store.ledger_path("t1");
         std::fs::create_dir_all(lp.parent().unwrap()).unwrap();
         std::fs::write(&lp, format!("{line}\n")).unwrap();
@@ -2634,7 +2636,10 @@ interval_seconds = 0
         );
         // ... while the SAME store's ledger at LEDGER_SCHEMA_VERSION is
         // untouched by the config tamper and still decodes.
-        let line = serde_json::to_string(&LedgerLine::Intent(intended_intent("deploy-a"))).unwrap();
+        let line = serde_json::to_string(&LedgerLine::Intent(LedgerIntentWire::from(
+            &intended_intent("deploy-a"),
+        )))
+        .unwrap();
         let lp = store.ledger_path("t1");
         std::fs::create_dir_all(lp.parent().unwrap()).unwrap();
         std::fs::write(&lp, format!("{line}\n")).unwrap();
@@ -2651,7 +2656,8 @@ interval_seconds = 0
         // closed, naming the version ...
         let mut foreign = intended_intent("deploy-b");
         foreign.deployment_schema_version = LEDGER_SCHEMA_VERSION.wrapping_add(1);
-        let line = serde_json::to_string(&LedgerLine::Intent(foreign)).unwrap();
+        let line =
+            serde_json::to_string(&LedgerLine::Intent(LedgerIntentWire::from(&foreign))).unwrap();
         std::fs::write(&lp, format!("{line}\n")).unwrap();
         let err = store
             .read_ledger("t1")
@@ -2719,7 +2725,8 @@ interval_seconds = 0
             let store = LocalStore::with_base(dir.path().join("store")).unwrap();
             let mut intent = intended_intent("deploy-x");
             intent.deployment_schema_version = ledger_version;
-            let line = serde_json::to_string(&LedgerLine::Intent(intent)).unwrap();
+            let line =
+                serde_json::to_string(&LedgerLine::Intent(LedgerIntentWire::from(&intent))).unwrap();
             let lp = store.ledger_path("t1");
             std::fs::create_dir_all(lp.parent().unwrap()).unwrap();
             std::fs::write(&lp, format!("{line}\n")).unwrap();

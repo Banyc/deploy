@@ -69,8 +69,8 @@ use crate::model::{
 #[cfg(test)]
 use crate::model::DeploymentId;
 use crate::records::{
-    DeploymentStatus, LedgerEntry, LedgerIntent, LedgerLine, LedgerTerminal, ObservedSlot,
-    ObservedTarget, Pins, ServerState,
+    DeploymentStatus, LedgerEntry, LedgerIntent, LedgerIntentWire, LedgerLine, LedgerTerminal,
+    LedgerTerminalWire, ObservedSlot, ObservedTarget, Pins, ServerState,
 };
 use crate::store::atomic::{
     copy_dir_recursive, ensure_private_dir, ensure_private_dir_durable, path_state, read_json,
@@ -851,7 +851,7 @@ impl LocalStore {
                 intent.deployment_id
             )));
         }
-        let line = serde_json::to_string(&LedgerLine::Intent(intent.clone()))
+        let line = serde_json::to_string(&LedgerLine::Intent(LedgerIntentWire::from(intent)))
             .map_err(|e| Error::store(format!("serialize ledger intent: {e}")))?;
         self.append_ledger_atomic(target, intent.deployment_id.as_str(), &line)
     }
@@ -893,7 +893,7 @@ impl LocalStore {
                 terminal.deployment_id
             )));
         }
-        let line = serde_json::to_string(&LedgerLine::Terminal(terminal.clone()))
+        let line = serde_json::to_string(&LedgerLine::Terminal(LedgerTerminalWire::from(terminal)))
             .map_err(|e| Error::store(format!("serialize ledger terminal: {e}")))?;
         self.append_ledger_atomic(target, terminal.deployment_id.as_str(), &line)
     }
@@ -903,9 +903,17 @@ impl LocalStore {
     /// the SINGLE history read — it replaces the old `read_attempts` /
     /// `read_snapshots` pair (and their raw variants): there is no floor to
     /// gate (the checkpoint replaced the ledger with the retained suffix
-    /// atomically) and no separate snapshot log. Fail closed on malformed
-    /// lines, foreign `deployment_schema_version`, an intent-less terminal,
-    /// a duplicate intent, or a duplicate terminal.
+    /// atomically) and no separate snapshot log. Every parsed wire line is
+    /// converted through the VERIFYING CONVERSION
+    /// ([`LedgerIntentWire::into_domain`] / [`LedgerTerminalWire::into_domain`]):
+    /// a record whose duplicate projections disagree (e.g. a `desired` key
+    /// outside the authoritative `slot_ids` membership, or a rollback whose
+    /// legacy release disagrees with the derived releases) is REFUSED with an
+    /// integrity error — a hand-constructed or tampered record is never read
+    /// as whichever projection a consumer happens to use. Fail closed on
+    /// malformed lines, foreign `deployment_schema_version`, an intent-less
+    /// terminal, a duplicate intent, a duplicate terminal, or a disagreeing
+    /// record.
     pub fn read_ledger(&self, target: &str) -> Result<Vec<LedgerEntry>> {
         let p = self.ledger_path(target);
         // Tri-state: only a genuine NotFound is "no ledger" (the empty
@@ -925,18 +933,29 @@ impl LocalStore {
             match serde_json::from_str::<LedgerLine>(line)
                 .map_err(|e| Error::store(format!("parse ledger line: {e}")))?
             {
-                LedgerLine::Intent(intent) => {
+                LedgerLine::Intent(wire) => {
                     // Fail closed on the record schema version: only
                     // `LEDGER_SCHEMA_VERSION` is accepted, any other version
                     // is refused with an error naming the version (a record
                     // from a different schema is never silently
                     // interpreted).
-                    if intent.deployment_schema_version != LEDGER_SCHEMA_VERSION {
+                    if wire.deployment_schema_version != LEDGER_SCHEMA_VERSION {
                         return Err(Error::store(format!(
                             "intent {} carries unsupported deployment_schema_version {} (expected {LEDGER_SCHEMA_VERSION}): only LEDGER_SCHEMA_VERSION is accepted",
-                            intent.deployment_id, intent.deployment_schema_version
+                            wire.deployment_id, wire.deployment_schema_version
                         )));
                     }
+                    // VERIFYING CONVERSION (wire → domain): every duplicate
+                    // projection (desired/pre_push/slots key sets vs the
+                    // authoritative `slot_ids`, each generation assignment's
+                    // slot) must agree — a disagreement is refused (fail
+                    // closed) rather than read as whichever projection a
+                    // consumer happens to use.
+                    let intent = wire.into_domain().map_err(|e| {
+                        Error::integrity(format!(
+                            "ledger for target '{target}' refuses an intent line: {e}"
+                        ))
+                    })?;
                     let id = intent.deployment_id.as_str().to_string();
                     if index.contains_key(&id) {
                         return Err(Error::integrity(format!(
@@ -952,7 +971,17 @@ impl LocalStore {
                         seq: seq as u64,
                     });
                 }
-                LedgerLine::Terminal(terminal) => {
+                LedgerLine::Terminal(wire) => {
+                    // VERIFYING CONVERSION (wire → domain): the rollback
+                    // payload's duplicate projections (each generation
+                    // assignment's slot, the bindings' slot set, the legacy
+                    // snapshot-wide release) must agree — a disagreeing
+                    // record is refused.
+                    let terminal = wire.into_domain().map_err(|e| {
+                        Error::integrity(format!(
+                            "ledger for target '{target}' refuses a terminal line: {e}"
+                        ))
+                    })?;
                     let id = terminal.deployment_id.as_str();
                     let pos = index.get(id).copied().ok_or_else(|| {
                         Error::integrity(format!(
@@ -1290,7 +1319,8 @@ mod tests {
         ReleaseId, TargetName, VariantName,
     };
     use crate::records::{
-        LedgerIntent, LedgerLine, LedgerRollback, LedgerTerminal, ServerOutcomeKind, SlotResult,
+        LedgerIntent, LedgerIntentWire, LedgerLine, LedgerRollback, LedgerTerminal,
+        LedgerTerminalWire, ServerOutcomeKind, SlotResult,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
@@ -1517,7 +1547,8 @@ mod tests {
         let target = "t1";
         let mut foreign = intent("deploy-x", target);
         foreign.deployment_schema_version = LEDGER_SCHEMA_VERSION + 1;
-        let line = serde_json::to_string(&LedgerLine::Intent(foreign)).unwrap();
+        let line =
+            serde_json::to_string(&LedgerLine::Intent(LedgerIntentWire::from(&foreign))).unwrap();
         let p = store.ledger_path(target);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, format!("{line}\n")).unwrap();
@@ -1529,6 +1560,54 @@ mod tests {
         // Malformed bytes are a store error, never silently dropped.
         std::fs::write(&p, "{ not json !\n").unwrap();
         assert!(store.read_ledger(target).is_err());
+    }
+
+    /// The read path runs the VERIFYING CONVERSION: a ledger line whose
+    /// duplicate projections disagree (e.g. a `desired` key outside the
+    /// authoritative `slot_ids` membership) is REFUSED with an integrity
+    /// error rather than read as whichever projection a consumer happens to
+    /// use; the same record with an AGREEING membership reads fine.
+    #[test]
+    fn read_ledger_refuses_disagreeing_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let target = "t1";
+        let p = store.ledger_path(target);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+
+        // A DISAGREEING intent: `desired` names a slot the membership omits.
+        let mut wire = LedgerIntentWire::from(&intent("deploy-x", target));
+        wire.desired.insert(
+            PlacementSlotId::new("not-a-member".to_string()),
+            GenerationRef {
+                generation: GenerationId::new("gen-1".to_string()),
+                assignment: PlacementSlotAssignment {
+                    placement_slot: PlacementSlotId::new("not-a-member".to_string()),
+                    artifact: ArtifactRef {
+                        release: ReleaseId::new("rel-1".to_string()),
+                        variant: VariantName::new("standard".to_string()),
+                        tree: TreeDigest::new("t1".to_string()),
+                    },
+                },
+            },
+        );
+        let line = serde_json::to_string(&LedgerLine::Intent(wire)).unwrap();
+        std::fs::write(&p, format!("{line}\n")).unwrap();
+        let err = store.read_ledger(target).unwrap_err();
+        assert!(
+            err.to_string().contains("refuses"),
+            "a disagreeing intent line must be refused, got: {err}"
+        );
+
+        // The same desired map with an AGREEING membership reads fine.
+        let mut wire = LedgerIntentWire::from(&intent("deploy-x", target));
+        wire.slot_ids
+            .push(PlacementSlotId::new("not-a-member".to_string()));
+        let line = serde_json::to_string(&LedgerLine::Intent(wire)).unwrap();
+        std::fs::write(&p, format!("{line}\n")).unwrap();
+        let entries = store.read_ledger(target).unwrap();
+        assert_eq!(entries.len(), 1, "the agreeing line loads");
+        assert_eq!(entries[0].intent.membership().len(), 2);
     }
 
     /// `latest_status` derives from the ledger: the terminal's status for a
@@ -1869,8 +1948,10 @@ mod tests {
                 );
                 assert_eq!(
                     after.last().unwrap(),
-                    &serde_json::to_string(&LedgerLine::Terminal(successful_terminal(&id, target)))
-                        .unwrap(),
+                    &serde_json::to_string(&LedgerLine::Terminal(LedgerTerminalWire::from(
+                        &successful_terminal(&id, target),
+                    )))
+                    .unwrap(),
                     "{stage}: the wholly-new ledger's last line is the appended terminal"
                 );
             } else {
@@ -1957,27 +2038,36 @@ mod tests {
         assert_eq!(visible.len(), 5);
         assert_eq!(
             visible[0],
-            serde_json::to_string(&LedgerLine::Intent(intent("deploy-a", target))).unwrap()
+            serde_json::to_string(&LedgerLine::Intent(LedgerIntentWire::from(&intent(
+                "deploy-a", target
+            ))))
+            .unwrap()
         );
         assert_eq!(
             visible[1],
-            serde_json::to_string(&LedgerLine::Terminal(successful_terminal(
-                "deploy-a", target
+            serde_json::to_string(&LedgerLine::Terminal(LedgerTerminalWire::from(
+                &successful_terminal("deploy-a", target)
             )))
             .unwrap()
         );
         assert_eq!(
             visible[2],
-            serde_json::to_string(&LedgerLine::Intent(intent("deploy-b", target))).unwrap()
+            serde_json::to_string(&LedgerLine::Intent(LedgerIntentWire::from(&intent(
+                "deploy-b", target
+            ))))
+            .unwrap()
         );
         assert_eq!(
             visible[3],
-            serde_json::to_string(&LedgerLine::Intent(intent("deploy-d", target))).unwrap()
+            serde_json::to_string(&LedgerLine::Intent(LedgerIntentWire::from(&intent(
+                "deploy-d", target
+            ))))
+            .unwrap()
         );
         assert_eq!(
             visible[4],
-            serde_json::to_string(&LedgerLine::Terminal(successful_terminal(
-                "deploy-d", target
+            serde_json::to_string(&LedgerLine::Terminal(LedgerTerminalWire::from(
+                &successful_terminal("deploy-d", target)
             )))
             .unwrap()
         );
@@ -2089,7 +2179,10 @@ mod tests {
                     let id = format!("dep-{seq}");
                     seq += 1;
                     let intent = intent(&id, target);
-                    let line = serde_json::to_string(&LedgerLine::Intent(intent.clone())).unwrap();
+                    let line = serde_json::to_string(&LedgerLine::Intent(LedgerIntentWire::from(
+                        &intent.clone(),
+                    )))
+                    .unwrap();
                     if let Some(stage) = stage {
                         arm_append_stage(&store, *stage, &id);
                     }
@@ -2120,8 +2213,10 @@ mod tests {
                         continue; // nothing open: the op is a valid no-op
                     };
                     let terminal = successful_terminal(&id, target);
-                    let line =
-                        serde_json::to_string(&LedgerLine::Terminal(terminal.clone())).unwrap();
+                    let line = serde_json::to_string(&LedgerLine::Terminal(
+                        LedgerTerminalWire::from(&terminal.clone()),
+                    ))
+                    .unwrap();
                     if let Some(stage) = stage {
                         arm_append_stage(&store, *stage, &id);
                     }
@@ -2500,7 +2595,10 @@ mod tests {
                 // scan does not over-reject a new id.
                 let fresh = format!("dep-{}", ids.len());
                 let line =
-                    serde_json::to_string(&LedgerLine::Intent(intent(&fresh, target))).unwrap();
+                    serde_json::to_string(&LedgerLine::Intent(LedgerIntentWire::from(&intent(
+                        &fresh, target,
+                    ))))
+                    .unwrap();
                 store.append_intent(target, &intent(&fresh, target)).unwrap();
                 let mut after = before.clone();
                 after.extend_from_slice(format!("{line}\n").as_bytes());
