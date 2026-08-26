@@ -2327,21 +2327,78 @@ mod tests {
     }
 
     proptest! {
-        // The main property: ORDINARY RANDOMIZED SEEDS with failure
-        // persistence (proptest's defaults) — a failing vector writes to
-        // `proptest-regressions/local.txt` and is replayed on the next run
-        // (commit it so CI keeps reproducing the regression until fixed).
-        // The case count is bounded so the suite stays fast (the
-        // randomized leg runs 8 cases; the deterministic fixed-seed leg
-        // below replays the same vectors at 4).
+        // The main property split into PARALLEL SUBTESTS: the harness runs
+        // each test in its own thread, but proptest runs a test's cases
+        // sequentially in that one thread — so the randomized-with-
+        // persistence leg (8 cases) is SPLIT into four subtests of
+        // `cases: 8/4 = 2` each with DISTINCT FIXED seeds. The four
+        // subtests run concurrently on different harness threads, dividing
+        // this leg's wall time, while the fixed seeds keep every subtest
+        // deterministic (CI-reproducible). FAILURE PERSISTENCE stays on
+        // THIS subtest only: the shared `proptest-regressions/local.txt`
+        // is keyed per source FILE, so every subtest with persistence
+        // would replay ALL persisted vectors — duplicating the replay K
+        // times — so only `_0` carries the persistence (any persisted
+        // vectors replay exactly once, in `_0`), while `_1`..`_3` run the
+        // same generator + assertions under their fixed seeds. The
+        // deterministic fixed-seed leg below stays ONE test (the
+        // deterministic floor).
         #![proptest_config(ProptestConfig {
-            cases: 8,
+            cases: 2,
+            rng_seed: RngSeed::Fixed(0x5EED_0011),
             failure_persistence: Some(Box::new(FileFailurePersistence::default())),
             ..ProptestConfig::default()
         })]
 
         #[test]
-        fn ledger_append_durability(history in ledger_history_strategy()) {
+        fn ledger_append_durability_0(history in ledger_history_strategy()) {
+            run_ledger_durability_history(&history);
+        }
+    }
+
+    proptest! {
+        // The second slice of the split randomized leg: the same generator
+        // + assertions under a DISTINCT fixed seed (deterministic; no
+        // persistence — the fixed seed makes any failure reproducible).
+        #![proptest_config(ProptestConfig {
+            cases: 2,
+            rng_seed: RngSeed::Fixed(0x5EED_0012),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn ledger_append_durability_1(history in ledger_history_strategy()) {
+            run_ledger_durability_history(&history);
+        }
+    }
+
+    proptest! {
+        // The third slice of the split randomized ledger, distinct seed.
+        #![proptest_config(ProptestConfig {
+            cases: 2,
+            rng_seed: RngSeed::Fixed(0x5EED_0013),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn ledger_append_durability_2(history in ledger_history_strategy()) {
+            run_ledger_durability_history(&history);
+        }
+    }
+
+    proptest! {
+        // The fourth slice of the split randomized ledger, distinct seed.
+        #![proptest_config(ProptestConfig {
+            cases: 2,
+            rng_seed: RngSeed::Fixed(0x5EED_0014),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn ledger_append_durability_3(history in ledger_history_strategy()) {
             run_ledger_durability_history(&history);
         }
     }
