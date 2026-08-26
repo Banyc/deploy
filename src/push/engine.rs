@@ -6249,7 +6249,18 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     },
                 },
             )]),
-            BTreeMap::new(),
+            // The binding key set must equal the slot key set EXACTLY (the
+            // wire → domain conversion refuses a rollback whose bindings
+            // omit a slotted generation); this fixture's point is the
+            // MISSING BEHAVIOR SNAPSHOT, so the payload must be otherwise
+            // valid for the ledger to load at all.
+            BTreeMap::from([(
+                PlacementSlotId::new("p1".to_string()),
+                crate::records::PhysicalBinding {
+                    server: crate::model::ServerId::new("s1".to_string()),
+                    deploy_dir: "/srv/eng".to_string(),
+                },
+            )]),
         );
 
         let project_root = h.config.project_root(&h.cfg_path);

@@ -1572,7 +1572,12 @@ interval_seconds = 0
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
         // A snapshot whose `slots` record the generation but whose `bindings`
-        // map is EMPTY (legacy pre-feature line).
+        // map is EMPTY (legacy pre-feature line). The exact-binding-keys
+        // invariant now refuses such a payload at the STORE READ (the wire →
+        // domain conversion): the missing binding is caught at conversion
+        // time, BEFORE `plan_assignments` can resolve the rollback, and the
+        // refusal propagates out of the plan as an integrity error naming
+        // the missing binding.
         append_successful_snapshot(
             &store,
             "deploy-legacy-snapshot",
@@ -1608,12 +1613,12 @@ interval_seconds = 0
         .expect_err("a deployment ref whose snapshot recorded no physical binding must refuse");
         let msg = err.to_string();
         assert!(
-            msg.contains("no recorded physical binding") && msg.contains("p1"),
+            msg.contains("missing bindings") && msg.contains("p1"),
             "error must name the unverifiable slot and the missing binding, got: {msg}"
         );
         assert!(
-            msg.contains("exact rollback"),
-            "error must explain the exact-rollback verification failure, got: {msg}"
+            msg.contains("EXACTLY the slotted generations"),
+            "error must explain the exact-binding-keys verification failure, got: {msg}"
         );
     }
 

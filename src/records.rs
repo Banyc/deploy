@@ -473,15 +473,20 @@ pub struct PhysicalBinding {
 /// only for wire parseability, never interpreted.
 ///
 /// `bindings` records the COMPLETE PHYSICAL BINDING each slot had when the
-/// deployment ran. Exact rollback maps a terminal's generations to slots by
+/// deployment ran. The snapshot maps a terminal's generations to slots by
 /// SLOT, so without this map a slot that rebinds to a different server — or
 /// moves to a different `deploy_dir` on the same server — in `deploy.toml`
-/// would silently roll back onto the wrong host/location. A MISSING entry
-/// makes the binding unverifiable: rollback refuses rather than guessing the
-/// host. Kept as a separate `#[serde(default)]` field so the `slots` map and
-/// its [`GenerationRef`]s stay intact and ledger lines without a bindings
-/// map still deserialize (an empty map is "unverifiable", so exact rollback
-/// refuses).
+/// would silently roll back onto the wrong host/location. The bindings key
+/// set must equal the `slots` key set EXACTLY (every slotted generation has
+/// a physical binding and vice versa — no missing, no extra binding keys):
+/// a MISSING entry makes the binding unverifiable (rollback must never
+/// guess the host), an EXTRA entry binds a slot that carried no generation,
+/// and the wire → domain conversion REFUSES both at CONVERSION time —
+/// before history rendering, rollback resolution, reconciliation, or the
+/// GC sweep can consume the payload. Kept as a separate `#[serde(default)]`
+/// field so the `slots` map and its [`GenerationRef`]s stay intact and
+/// ledger lines without a bindings map still deserialize (the exact-key
+/// conversion then refuses any payload whose slots are non-empty).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerRollback {
     /// Per-slot generation refs, keyed by [`PlacementSlotId`]. Each
@@ -534,9 +539,11 @@ pub struct LedgerRollbackWire {
 impl LedgerRollbackWire {
     /// VERIFYING CONVERSION (wire → domain): every duplicate projection must
     /// agree — each slot's [`crate::model::GenerationRef`] assignment names
-    /// its own map key, every binding belongs to a slotted generation, and
-    /// the legacy snapshot-wide `release` (when present) equals the
-    /// snapshot's ONE derived release. A disagreement → `Error::integrity`.
+    /// its own map key, the `bindings` key set EQUALS the `slots` key set
+    /// EXACTLY (every slotted generation has a physical binding and vice
+    /// versa — no missing/extra binding keys), and the legacy snapshot-wide
+    /// `release` (when present) equals the snapshot's ONE derived release.
+    /// A disagreement → `Error::integrity`.
     pub fn into_domain(self) -> Result<LedgerRollback> {
         for (key, g) in &self.slots {
             if &g.assignment.placement_slot != key {
@@ -546,12 +553,23 @@ impl LedgerRollbackWire {
                 )));
             }
         }
-        for key in self.bindings.keys() {
-            if !self.slots.contains_key(key) {
-                return Err(Error::integrity(format!(
-                    "rollback: binding for slot '{key}' has no generation entry"
-                )));
-            }
+        // EXACT ROLLBACK BINDING KEYS (cross-field invariant): the
+        // `bindings` key set must equal the `slots` key set EXACTLY. A
+        // missing binding makes the slot's physical location unverifiable;
+        // an extra binding names a slot with no generation. Both are
+        // REFUSED here, at conversion time, before rollback resolution can
+        // consume the payload (a hand-constructed or tampered record can
+        // never be read as whichever projection a consumer happens to use).
+        let slot_keys: BTreeSet<&PlacementSlotId> = self.slots.keys().collect();
+        let binding_keys: BTreeSet<&PlacementSlotId> = self.bindings.keys().collect();
+        if slot_keys != binding_keys {
+            let missing: Vec<&PlacementSlotId> =
+                slot_keys.difference(&binding_keys).copied().collect();
+            let extra: Vec<&PlacementSlotId> =
+                binding_keys.difference(&slot_keys).copied().collect();
+            return Err(Error::integrity(format!(
+                "rollback: bindings must key EXACTLY the slotted generations (missing bindings for {missing:?}; extra bindings for {extra:?})"
+            )));
         }
         if let Some(legacy) = &self.release {
             let derived: BTreeSet<ReleaseId> = self
@@ -624,9 +642,12 @@ pub struct LedgerTerminal {
 /// The WIRE shape of a terminal event: identical to the domain
 /// [`LedgerTerminal`] except the rollback payload is the raw
 /// [`LedgerRollbackWire`] (so legacy snapshot-wide members are visible to the
-/// verifying conversion). The terminal itself has no duplicated authoritative
-/// projection beyond the rollback payload it carries; the conversion maps the
-/// payload wire → domain.
+/// verifying conversion). The terminal's own duplicates — the STATUS/ROLLBACK
+/// TRUTH TABLE (`Successful` ⇔ rollback present) and each outcome's value
+/// naming its own map key — are verified by the conversion; the CROSS-RECORD
+/// agreement (outcome key set vs the intent's authoritative `slot_ids`, the
+/// `target` field vs the read path and the intent) is enforced where the
+/// intent and terminal merge ([`crate::store::local::LocalStore::read_ledger`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerTerminalWire {
     pub deployment_id: DeploymentId,
@@ -641,15 +662,60 @@ pub struct LedgerTerminalWire {
 }
 
 impl LedgerTerminalWire {
-    /// VERIFYING CONVERSION (wire → domain): the terminal's own members have
-    /// no redundant projection; the rollback payload is converted through
-    /// [`LedgerRollbackWire::into_domain`] (which fails closed on any
-    /// disagreement).
+    /// VERIFYING CONVERSION (wire → domain): the rollback payload is
+    /// converted through [`LedgerRollbackWire::into_domain`] (which fails
+    /// closed on any disagreement), the STATUS/ROLLBACK TRUTH TABLE is
+    /// enforced (`Successful` always records its rollback state; every other
+    /// status never carries one), and each outcome's value must name its OWN
+    /// map key (the outcome's `slot_id` is the placement slot it records). A
+    /// disagreement → `Error::integrity`. The cross-record claims (outcome
+    /// key set vs the intent's `slot_ids`, and the `target` field vs the
+    /// read path / intent) are enforced by the ledger read that merges the
+    /// intent and the terminal ([`crate::store::local::LocalStore::read_ledger`]).
     pub fn into_domain(self) -> Result<LedgerTerminal> {
         let rollback = match self.rollback {
             Some(wire) => Some(wire.into_domain()?),
             None => None,
         };
+        // STATUS/ROLLBACK TRUTH TABLE (cross-field invariant): `Successful`
+        // ALWAYS records its rollback state, and every other status
+        // (`FailedPreflight`, `FailedRolledBack`, `Degraded`, `InProgress`,
+        // `PendingCommit`, …) NEVER carries one. A Successful terminal with
+        // no rollback — or a failed terminal carrying a rollback — is
+        // REFUSED here, at conversion time, before history rendering,
+        // rollback resolution, reconciliation, or the GC sweep can trust
+        // the record.
+        match (&self.status, &rollback) {
+            (DeploymentStatus::Successful, Some(_)) => {}
+            (DeploymentStatus::Successful, None) => {
+                return Err(Error::integrity(format!(
+                    "terminal {}: status Successful requires the rollback payload (a successful deployment always records its rollback state)",
+                    self.deployment_id
+                )));
+            }
+            (status, Some(_)) => {
+                return Err(Error::integrity(format!(
+                    "terminal {}: status {status:?} must not carry a rollback payload (only Successful does)",
+                    self.deployment_id
+                )));
+            }
+            (_, None) => {}
+        }
+        // OUTCOME OWN-KEY AGREEMENT (cross-field invariant, self-contained
+        // half): each outcome's value must name ITS OWN map key — the
+        // outcome's `slot_id` is the placement slot it records, so a value
+        // naming a different slot is a disagreement. (The other half — the
+        // outcome KEY SET matching the intent's authoritative `slot_ids` —
+        // is cross-record and lives in the ledger read that merges intent +
+        // terminal.)
+        for (key, result) in &self.outcomes {
+            if &result.slot_id != key {
+                return Err(Error::integrity(format!(
+                    "terminal {}: outcome for slot '{key}' names placement '{}'",
+                    self.deployment_id, result.slot_id
+                )));
+            }
+        }
         Ok(LedgerTerminal {
             deployment_id: self.deployment_id,
             target: self.target,
@@ -1229,20 +1295,20 @@ mod tests {
         })
     }
 
+    /// An agreeing rollback payload: the `bindings` key set EQUALS the
+    /// `slots` key set EXACTLY (the exact-binding-keys invariant — every
+    /// slotted generation has a physical binding and vice versa), each
+    /// generation assignment names its own map key.
     fn agreeing_rollback_wire() -> impl Strategy<Value = LedgerRollbackWire> {
-        (agreeing_gen_refs(), any::<bool>()).prop_map(|(slots, with_bindings)| {
-            let bindings = if with_bindings {
-                slots
-                    .keys()
-                    .cloned()
-                    .map(|k| {
-                        let b = binding(&k);
-                        (k, b)
-                    })
-                    .collect()
-            } else {
-                BTreeMap::new()
-            };
+        agreeing_gen_refs().prop_map(|slots| {
+            let bindings = slots
+                .keys()
+                .cloned()
+                .map(|k| {
+                    let b = binding(&k);
+                    (k, b)
+                })
+                .collect();
             LedgerRollbackWire {
                 slots,
                 bindings,
@@ -1250,6 +1316,58 @@ mod tests {
                 release: None,
             }
         })
+    }
+
+    /// An agreeing terminal event: the STATUS/ROLLBACK TRUTH TABLE holds
+    /// (`Successful` carries a rollback whose bindings key its slotted
+    /// generations exactly; every other status carries none), and each
+    /// outcome's value names its own map key.
+    fn agreeing_terminal_wire() -> impl Strategy<Value = LedgerTerminalWire> {
+        (
+            prop::collection::btree_set(slot_strategy(), 0..4),
+            any::<bool>(),
+        )
+            .prop_map(|(members, successful)| {
+                let slot_ids: Vec<PlacementSlotId> = members.into_iter().collect();
+                let outcomes: BTreeMap<PlacementSlotId, SlotResult> = slot_ids
+                    .iter()
+                    .cloned()
+                    .map(|k| {
+                        (
+                            k.clone(),
+                            SlotResult {
+                                slot_id: k,
+                                outcome: ServerOutcomeKind::Activated,
+                                generation: Some(GenerationId::new("gen-t".to_string())),
+                                compensated: false,
+                                error: None,
+                            },
+                        )
+                    })
+                    .collect();
+                let rollback = successful.then(|| LedgerRollbackWire {
+                    slots: slot_ids
+                        .iter()
+                        .map(|k| (k.clone(), gen_ref_for(k)))
+                        .collect(),
+                    bindings: slot_ids.iter().map(|k| (k.clone(), binding(k))).collect(),
+                    behavior_sha256: None,
+                    release: None,
+                });
+                LedgerTerminalWire {
+                    deployment_id: DeploymentId::new("deploy-t".to_string()),
+                    target: TargetName::new("t1".to_string()),
+                    status: if successful {
+                        DeploymentStatus::Successful
+                    } else {
+                        DeploymentStatus::FailedRolledBack
+                    },
+                    recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                    outcomes,
+                    rollback,
+                    reason: None,
+                }
+            })
     }
 
     fn agreeing_plan_wire() -> impl Strategy<Value = DeploymentPlanWire> {
@@ -1308,6 +1426,7 @@ mod tests {
     enum WireCase {
         Intent(LedgerIntentWire),
         Rollback(LedgerRollbackWire),
+        Terminal(LedgerTerminalWire),
         Plan(DeploymentPlanWire),
     }
 
@@ -1315,6 +1434,7 @@ mod tests {
         prop_oneof![
             agreeing_intent_wire().prop_map(WireCase::Intent),
             agreeing_rollback_wire().prop_map(WireCase::Rollback),
+            agreeing_terminal_wire().prop_map(WireCase::Terminal),
             agreeing_plan_wire().prop_map(WireCase::Plan),
         ]
     }
@@ -1439,6 +1559,28 @@ mod tests {
             bad.into_domain().is_err(),
             "a binding without a generation is a conversion error"
         );
+        // (a2) a slotted generation with NO binding (the exact-key rule: the
+        // binding key set must equal the slot key set — a missing binding
+        // key is refused, never left for rollback resolution to guess)
+        let mut bad = w.clone();
+        if let Some(key) = bad.bindings.keys().next().cloned() {
+            bad.bindings.remove(&key);
+            assert!(
+                bad.into_domain().is_err(),
+                "a generation without its binding is a conversion error"
+            );
+        }
+        // (a3) a binding key renamed out of the slot set (a missing + extra
+        // key pair — the exact-key rule refuses)
+        let mut bad = w.clone();
+        if let Some(key) = bad.bindings.keys().next().cloned() {
+            let value = bad.bindings.remove(&key).unwrap();
+            bad.bindings.insert(slot(9), value);
+            assert!(
+                bad.into_domain().is_err(),
+                "a renamed binding key is a conversion error"
+            );
+        }
         // (b) a generation assignment naming a different placement slot
         let mut bad = w.clone();
         if let Some((_, g)) = bad.slots.iter_mut().next() {
@@ -1456,6 +1598,54 @@ mod tests {
             bad.into_domain().is_err(),
             "a legacy release outside the derived snapshot releases is a conversion error"
         );
+    }
+
+    fn check_terminal_case(w: &LedgerTerminalWire) {
+        let domain = w
+            .clone()
+            .into_domain()
+            .expect("an agreeing terminal wire converts");
+        // Round-trip: wire → domain → serialize → deserialize (wire) →
+        // convert — the truth table, rollback, and outcomes survive intact.
+        let json = serde_json::to_string(&domain).unwrap();
+        let wire2: LedgerTerminalWire = serde_json::from_str(&json).unwrap();
+        let domain2 = wire2.into_domain().unwrap();
+        assert_eq!(domain2, domain);
+        // A disagreement PER FIELD fails closed.
+        // (a) the STATUS/ROLLBACK TRUTH TABLE: Successful without its
+        // rollback payload
+        let mut bad = w.clone();
+        if bad.status == DeploymentStatus::Successful && bad.rollback.is_some() {
+            bad.rollback = None;
+            assert!(
+                bad.into_domain().is_err(),
+                "a Successful terminal without its rollback is a conversion error"
+            );
+        }
+        // (b) the truth table: a non-successful status carrying a rollback
+        let mut bad = w.clone();
+        if bad.status != DeploymentStatus::Successful && bad.rollback.is_none() {
+            bad.rollback = Some(LedgerRollbackWire {
+                slots: BTreeMap::new(),
+                bindings: BTreeMap::new(),
+                behavior_sha256: None,
+                release: None,
+            });
+            assert!(
+                bad.into_domain().is_err(),
+                "a non-successful terminal carrying a rollback is a conversion error"
+            );
+        }
+        // (c) an outcome whose value names a DIFFERENT placement slot than
+        // its own map key (the outcome own-key agreement)
+        let mut bad = w.clone();
+        if let Some((_, result)) = bad.outcomes.iter_mut().next() {
+            result.slot_id = slot(9);
+            assert!(
+                bad.into_domain().is_err(),
+                "an outcome naming a different placement is a conversion error"
+            );
+        }
     }
 
     fn check_plan_case(w: &DeploymentPlanWire) {
@@ -1522,6 +1712,10 @@ mod tests {
         // is rejected: the conversion accepts EXACTLY the unique, equal-key-
         // set cases (no dups, exact equality). Bounded 16 cases, fixed seed
         // 0x5EED_5EED (house style), no persistence.
+        // stable). The terminal case covers the STATUS/ROLLBACK TRUTH TABLE,
+        // the exact rollback binding keys, and the outcome own-key
+        // agreement; the cross-record claims (outcome key set vs the
+        // read that merges intent + terminal (store tests).
         #![proptest_config(ProptestConfig {
             cases: 16,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
@@ -1536,6 +1730,7 @@ mod tests {
             match case {
                 WireCase::Intent(wire) => check_intent_case(&wire),
                 WireCase::Rollback(wire) => check_rollback_case(&wire),
+                WireCase::Terminal(wire) => check_terminal_case(&wire),
                 WireCase::Plan(wire) => check_plan_case(&wire),
             }
         }
@@ -1764,6 +1959,12 @@ mod tests {
             "a binding without a generation fails closed"
         );
         let mut bad = wire.clone();
+        bad.bindings.remove(&slot(1));
+        assert!(
+            bad.into_domain().is_err(),
+            "a slotted generation without its binding fails closed (exact binding keys)"
+        );
+        let mut bad = wire.clone();
         bad.slots
             .get_mut(&slot(1))
             .unwrap()
@@ -1877,6 +2078,100 @@ mod tests {
         assert!(
             bad.into_domain().is_err(),
             "a stored behavior digest disagreeing from the derived digest fails closed"
+        );
+    }
+
+    /// [`LedgerTerminalWire`]: an agreeing terminal converts and round-trips
+    /// stably; the STATUS/ROLLBACK TRUTH TABLE (Successful ⇔ rollback
+    /// present), the outcome own-key agreement, and the rollback's exact
+    /// binding keys each fail closed on ONE mutation, while both truth-table
+    /// variants (Successful + rollback, failed + no rollback) pass.
+    #[test]
+    fn terminal_wire_truth_table_and_rollback_agreement_fails_closed() {
+        let rollback = || LedgerRollbackWire {
+            slots: BTreeMap::from([(slot(1), gen_ref_for(&slot(1)))]),
+            bindings: BTreeMap::from([(slot(1), binding(&slot(1)))]),
+            behavior_sha256: None,
+            release: None,
+        };
+        let outcome = || SlotResult {
+            slot_id: slot(1),
+            outcome: ServerOutcomeKind::Activated,
+            generation: Some(GenerationId::new("gen-1".to_string())),
+            compensated: false,
+            error: None,
+        };
+        let wire = LedgerTerminalWire {
+            deployment_id: DeploymentId::new("deploy-terminal".to_string()),
+            target: TargetName::new("t1".to_string()),
+            status: DeploymentStatus::Successful,
+            recorded_at: "2026-01-01T00:00:00Z".to_string(),
+            outcomes: BTreeMap::from([(slot(1), outcome())]),
+            rollback: Some(rollback()),
+            reason: None,
+        };
+        let domain = wire.clone().into_domain().unwrap();
+        assert_eq!(domain.status, DeploymentStatus::Successful);
+        assert!(domain.rollback.is_some(), "Successful carries its rollback");
+        let json = serde_json::to_string(&domain).unwrap();
+        let wire2: LedgerTerminalWire = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            wire2.into_domain().unwrap(),
+            domain,
+            "an agreeing terminal survives the round trip unchanged"
+        );
+
+        // TRUTH TABLE, direction 1: Successful must carry its rollback.
+        let mut bad = wire.clone();
+        bad.rollback = None;
+        assert!(
+            bad.into_domain().is_err(),
+            "a Successful terminal without its rollback fails closed"
+        );
+        // TRUTH TABLE, direction 2: a failed status must not carry one.
+        let mut bad = wire.clone();
+        bad.status = DeploymentStatus::FailedRolledBack;
+        assert!(
+            bad.into_domain().is_err(),
+            "a failed terminal carrying a rollback fails closed"
+        );
+        // OUTCOME OWN-KEY: an outcome naming a different placement slot.
+        let mut bad = wire.clone();
+        bad.outcomes.get_mut(&slot(1)).unwrap().slot_id = slot(2);
+        assert!(
+            bad.into_domain().is_err(),
+            "an outcome naming a different placement fails closed"
+        );
+        // EXACT BINDING KEYS: a generation without its binding …
+        let mut bad = wire.clone();
+        bad.rollback.as_mut().unwrap().bindings.remove(&slot(1));
+        assert!(
+            bad.into_domain().is_err(),
+            "a slotted generation without its binding fails closed"
+        );
+        // … and a binding without its generation.
+        let mut bad = wire.clone();
+        bad.rollback
+            .as_mut()
+            .unwrap()
+            .bindings
+            .insert(slot(2), binding(&slot(2)));
+        assert!(
+            bad.into_domain().is_err(),
+            "a binding without a generation fails closed"
+        );
+
+        // The other truth-table variant stays VALID: a failed terminal with
+        // NO rollback and NO outcomes converts fine.
+        let failed = LedgerTerminalWire {
+            status: DeploymentStatus::FailedRolledBack,
+            outcomes: BTreeMap::new(),
+            rollback: None,
+            ..wire.clone()
+        };
+        assert!(
+            failed.into_domain().is_ok(),
+            "a failed terminal without a rollback stays valid"
         );
     }
 }

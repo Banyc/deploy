@@ -77,7 +77,7 @@ use crate::store::atomic::{
     set_private, sync_parent_dir, temp_name_for, write_atomic_replace,
 };
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -926,12 +926,18 @@ impl LocalStore {
     /// gate (the checkpoint replaced the ledger with the retained suffix
     /// atomically) and no separate snapshot log. Every parsed wire line is
     /// converted through the VERIFYING CONVERSION
-    /// ([`LedgerIntentWire::into_domain`] / [`LedgerTerminalWire::into_domain`]):
-    /// a record whose duplicate projections disagree (e.g. a `desired` key
-    /// outside the authoritative `slot_ids` membership, or a rollback whose
-    /// legacy release disagrees with the derived releases) is REFUSED with an
-    /// integrity error — a hand-constructed or tampered record is never read
-    /// as whichever projection a consumer happens to use. Fail closed on
+    /// ([`LedgerIntentWire::into_domain`] / [`LedgerTerminalWire::into_domain`])
+    /// and the CROSS-RECORD invariants are enforced where the intent and the
+    /// terminal merge: a record whose duplicate projections disagree (e.g. a
+    /// `desired` key outside the authoritative `slot_ids` membership, a
+    /// rollback whose legacy release disagrees with the derived releases, a
+    /// Successful terminal without its rollback, an outcome whose value
+    /// names a different slot, a rollback whose binding keys are not exactly
+    /// its generation keys), or whose cross-record claims disagree (the
+    /// terminal's target vs the read path / its intent, a non-empty outcome
+    /// key set vs the intent's `slot_ids`), is REFUSED with an integrity
+    /// error — a hand-constructed or tampered record is never read as
+    /// whichever projection a consumer happens to use. Fail closed on
     /// malformed lines, foreign `deployment_schema_version`, an intent-less
     /// terminal, a duplicate intent, a duplicate terminal, or a disagreeing
     /// record.
@@ -977,6 +983,17 @@ impl LocalStore {
                             "ledger for target '{target}' refuses an intent line: {e}"
                         ))
                     })?;
+                    // TARGET EQUALITY (cross-record invariant, intent leg):
+                    // the intent's own `target` must equal the ledger path it
+                    // was read from — a record written into the wrong
+                    // target's ledger would otherwise be rendered and swept
+                    // under the wrong target's history.
+                    if intent.target.as_str() != target {
+                        return Err(Error::integrity(format!(
+                            "ledger for target '{target}' refuses an intent line: deployment '{}' names target '{}'",
+                            intent.deployment_id, intent.target
+                        )));
+                    }
                     let id = intent.deployment_id.as_str().to_string();
                     if index.contains_key(&id) {
                         return Err(Error::integrity(format!(
@@ -1014,6 +1031,45 @@ impl LocalStore {
                         return Err(Error::integrity(format!(
                             "ledger of target '{target}': two terminal events for deployment '{id}' — a terminal event is written exactly once"
                         )));
+                    }
+                    // TARGET EQUALITY (cross-record invariant, terminal
+                    // leg): the terminal's `target` must equal BOTH the
+                    // ledger path it was read from AND its intent's `target`
+                    // — a terminal whose target disagrees with its intent or
+                    // its read path is refused (it can never be merged into
+                    // another deployment's or another target's entry).
+                    if terminal.target.as_str() != target {
+                        return Err(Error::integrity(format!(
+                            "ledger of target '{target}' refuses a terminal line: deployment '{id}' names target '{}'",
+                            terminal.target
+                        )));
+                    }
+                    if terminal.target != entry.intent.target {
+                        return Err(Error::integrity(format!(
+                            "ledger of target '{target}': terminal for deployment '{id}' names target '{}' but its intent names '{}'",
+                            terminal.target, entry.intent.target
+                        )));
+                    }
+                    // OUTCOME KEY SET AGREEMENT (cross-record invariant,
+                    // outcome leg): when the terminal carries outcomes, its
+                    // outcome key set must equal the intent's AUTHORITATIVE
+                    // `slot_ids` EXACTLY — every member slot has one outcome,
+                    // no extras, no missing. An EMPTY outcome map is the
+                    // documented pre-mutation / legacy no-outcomes state
+                    // (e.g. a preflight failure that touched no slot) and
+                    // stays valid; a PARTIAL outcome map — the shape that
+                    // would let a consumer trust only some members — is
+                    // always refused.
+                    if !terminal.outcomes.is_empty() {
+                        let outcome_keys: BTreeSet<&PlacementSlotId> =
+                            terminal.outcomes.keys().collect();
+                        let membership: BTreeSet<&PlacementSlotId> =
+                            entry.intent.slot_ids.iter().collect();
+                        if outcome_keys != membership {
+                            return Err(Error::integrity(format!(
+                                "ledger of target '{target}': terminal for deployment '{id}' carries outcomes for slots {outcome_keys:?} but its intent's slot_ids are {membership:?} — every member slot has exactly one outcome, no extras"
+                            )));
+                        }
                     }
                     entry.terminal = Some(terminal);
                 }
@@ -1335,14 +1391,15 @@ pub fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::model::{
         ArtifactRef, GenerationId, GenerationRef, PlacementSlotAssignment, PlacementSlotId,
-        ReleaseId, TargetName, VariantName,
+        ReleaseId, ServerId, TargetName, VariantName,
     };
     use crate::push::lock::FileLock;
     use crate::records::{
         LedgerIntent, LedgerIntentWire, LedgerLine, LedgerRollback, LedgerTerminal,
-        LedgerTerminalWire, ServerOutcomeKind, SlotResult,
+        LedgerTerminalWire, PhysicalBinding, ServerOutcomeKind, SlotAttemptState, SlotResult,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
@@ -2915,5 +2972,503 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- terminal cross-field / cross-record invariants -------------------
+
+    /// A canonical generation ref whose assignment names its own map key.
+    fn gen_ref(slot: &PlacementSlotId) -> GenerationRef {
+        GenerationRef {
+            generation: GenerationId::new(format!("gen-{}", slot.as_str())),
+            assignment: PlacementSlotAssignment {
+                placement_slot: slot.clone(),
+                artifact: ArtifactRef::default(),
+            },
+        }
+    }
+
+    /// A binding for a slot (server `s1`, the canonical deploy dir).
+    fn binding_for(slot: &PlacementSlotId) -> PhysicalBinding {
+        PhysicalBinding {
+            server: ServerId::new("s1".to_string()),
+            deploy_dir: format!("/srv/eng/{}", slot.as_str()),
+        }
+    }
+
+    /// An EXACT intent (slot_ids == desired keys == pre_push keys — the
+    /// shape the in-flight exact-intent tightening mandates): `slot_count`
+    /// members, every member desired + pre-push, no persisted actuals.
+    fn exact_intent(id: &str, target: &str, slot_count: u32) -> LedgerIntent {
+        let slot_ids: Vec<PlacementSlotId> = (0..slot_count)
+            .map(|i| PlacementSlotId::new(format!("slot-{i}")))
+            .collect();
+        let desired: BTreeMap<PlacementSlotId, GenerationRef> =
+            slot_ids.iter().map(|k| (k.clone(), gen_ref(k))).collect();
+        let pre_push: BTreeMap<PlacementSlotId, Option<SlotAttemptState>> = slot_ids
+            .iter()
+            .cloned()
+            .map(|k| {
+                (
+                    k,
+                    Some(SlotAttemptState {
+                        artifact: ArtifactRef::default(),
+                        generation: Some(GenerationId::new("gen-0".to_string())),
+                    }),
+                )
+            })
+            .collect();
+        LedgerIntent {
+            deployment_schema_version: LEDGER_SCHEMA_VERSION,
+            deployment_id: DeploymentId::new(id.to_string()),
+            target: TargetName::new(target.to_string()),
+            group: None,
+            slot_ids,
+            behavior_sha256: "sha256-pair".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            desired,
+            pre_push,
+        }
+    }
+
+    /// The terminal for an attempt: FULL per-slot outcomes (every member
+    /// slot has one outcome, each value naming its own key), and — when
+    /// `successful` — a rollback whose bindings key its slotted generations
+    /// EXACTLY. A failed status carries the same outcomes and NO rollback.
+    fn terminal_for_intent(intent: &LedgerIntent, id: &str, successful: bool) -> LedgerTerminal {
+        let outcomes: BTreeMap<PlacementSlotId, SlotResult> = intent
+            .slot_ids
+            .iter()
+            .cloned()
+            .map(|k| {
+                (
+                    k.clone(),
+                    SlotResult {
+                        slot_id: k,
+                        outcome: ServerOutcomeKind::Activated,
+                        generation: Some(GenerationId::new(format!("gen-{id}"))),
+                        compensated: false,
+                        error: None,
+                    },
+                )
+            })
+            .collect();
+        let rollback = successful.then(|| LedgerRollback {
+            slots: intent
+                .slot_ids
+                .iter()
+                .map(|k| (k.clone(), gen_ref(k)))
+                .collect(),
+            bindings: intent
+                .slot_ids
+                .iter()
+                .map(|k| (k.clone(), binding_for(k)))
+                .collect(),
+        });
+        LedgerTerminal {
+            deployment_id: DeploymentId::new(id.to_string()),
+            target: intent.target.clone(),
+            status: if successful {
+                DeploymentStatus::Successful
+            } else {
+                DeploymentStatus::FailedRolledBack
+            },
+            recorded_at: "2026-01-01T00:00:00Z".to_string(),
+            outcomes,
+            rollback,
+            reason: None,
+        }
+    }
+
+    /// Append a valid pair (intent + terminal) to a fresh ledger.
+    fn append_pair(
+        store: &LocalStore,
+        target: &str,
+        intent: &LedgerIntent,
+        terminal: &LedgerTerminal,
+    ) {
+        store.append_intent(target, intent).unwrap();
+        store.append_terminal(target, terminal).unwrap();
+    }
+
+    /// The minimal project config the consumer checks need (the GC
+    /// reachability scan reads `config.pins` — an empty pin set here). One
+    /// config per test case; every store of the case reuses it.
+    fn consumer_config(base: &std::path::Path) -> Config {
+        let project = base.join("proj");
+        std::fs::create_dir_all(project.join("releases").join("v1")).unwrap();
+        std::fs::write(
+            project.join("releases").join("v1").join("standard.toml"),
+            "[artifact]\nmappings = []\n\n[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntarget = \"t1\"\ngroups = []\ndeploy_dir = \"/srv\"\n\n[rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n[rotation.deployment]\nprotect_deployments = 1\n\n[activation]\nadapter = \"none\"\n\n[verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",        )
+        .unwrap();
+        std::fs::write(
+            project.join("deploy.toml"),
+            "schema_version = 2\napplication = \"store-tests\"\nrelease = \"v1\"\n\n\
+             [[servers]]\nid = \"s1\"\naddress = \"a\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n\
+             [targets.t1]\nrollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }\n",
+        )
+        .unwrap();
+        Config::load(&project.join("deploy.toml")).unwrap()
+    }
+
+    /// Every consumer of a target's ledger goes through the SAME read
+    /// ([`LocalStore::read_ledger`]), so a conversion-time refusal precedes
+    /// ALL of them: the direct read, a rollback resolve
+    /// ([`crate::history::resolve_deployment`]), and the GC reachability
+    /// scan ([`LocalStore::reachable_set`]). `why` names the mutation for
+    /// the failure messages.
+    fn assert_consumers_refuse_with_integrity(
+        store: &LocalStore,
+        config: &Config,
+        target: &str,
+        id: &str,
+        why: &str,
+    ) {
+        let err = store.read_ledger(target).unwrap_err();
+        assert!(
+            matches!(err, Error::Integrity(_)),
+            "{why}: read_ledger must refuse with an integrity error before any consumer sees the line, got: {err}"
+        );
+        let err = crate::history::resolve_deployment(
+            store,
+            &TargetName::new(target.to_string()),
+            &DeploymentId::new(id.to_string()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::Integrity(_)),
+            "{why}: a rollback resolve must refuse with the same integrity error before resolving, got: {err}"
+        );
+        let err = store.reachable_set(config, None).unwrap_err();
+        assert!(
+            matches!(err, Error::Integrity(_)),
+            "{why}: the GC reachability scan must refuse with the same integrity error before sweeping, got: {err}"
+        );
+    }
+
+    /// ONE-FIELD mutations of a valid terminal (the user's list): STATUS
+    /// flip (break the truth table), ROLLBACK presence (add it to a failed
+    /// terminal / remove it from a successful one), a BINDING key
+    /// (add / remove / move), an OUTCOME key (rename — the value keeps
+    /// naming its old slot), and the TARGET (change it away from the intent
+    /// and the read path). Returns the mutated terminal + a reason naming
+    /// the mutated field.
+    fn one_field_mutations(
+        terminal: &LedgerTerminal,
+        intent: &LedgerIntent,
+    ) -> Vec<(LedgerTerminal, String)> {
+        let mut out: Vec<(LedgerTerminal, String)> = Vec::new();
+        // (1) STATUS FLIP — the truth table, both directions.
+        if terminal.status == DeploymentStatus::Successful {
+            out.push((
+                LedgerTerminal {
+                    status: DeploymentStatus::FailedRolledBack,
+                    ..terminal.clone()
+                },
+                "status flipped Successful -> FailedRolledBack with the rollback kept".to_string(),
+            ));
+        } else {
+            out.push((
+                LedgerTerminal {
+                    status: DeploymentStatus::Successful,
+                    ..terminal.clone()
+                },
+                "status flipped FailedRolledBack -> Successful with no rollback".to_string(),
+            ));
+        }
+        // (2) ROLLBACK PRESENCE — remove from a successful terminal, add to
+        // a failed one.
+        if terminal.rollback.is_some() {
+            out.push((
+                LedgerTerminal {
+                    rollback: None,
+                    ..terminal.clone()
+                },
+                "rollback removed from a Successful terminal".to_string(),
+            ));
+        } else {
+            out.push((
+                LedgerTerminal {
+                    rollback: Some(LedgerRollback {
+                        slots: intent
+                            .slot_ids
+                            .iter()
+                            .map(|k| (k.clone(), gen_ref(k)))
+                            .collect(),
+                        bindings: intent
+                            .slot_ids
+                            .iter()
+                            .map(|k| (k.clone(), binding_for(k)))
+                            .collect(),
+                    }),
+                    ..terminal.clone()
+                },
+                "rollback added to a failed terminal".to_string(),
+            ));
+        }
+        // (3) BINDING KEY — add one, remove one, move (rename) one. Only
+        // meaningful when the terminal carries a rollback.
+        if let Some(rb) = &terminal.rollback {
+            let first = rb.bindings.keys().next().cloned().unwrap();
+            // (3a) an EXTRA binding key (no generation for it)
+            let mut t = terminal.clone();
+            t.rollback.as_mut().unwrap().bindings.insert(
+                PlacementSlotId::new("ghost-slot".to_string()),
+                PhysicalBinding {
+                    server: ServerId::new("s9".to_string()),
+                    deploy_dir: "/srv/ghost".to_string(),
+                },
+            );
+            out.push((
+                t,
+                "binding key ADDED (extra binding, no generation)".to_string(),
+            ));
+            // (3b) a MISSING binding key (a generation without its binding)
+            let mut t = terminal.clone();
+            t.rollback.as_mut().unwrap().bindings.remove(&first);
+            out.push((
+                t,
+                "binding key REMOVED (a generation without its binding)".to_string(),
+            ));
+            // (3c) a binding key RENAMED (moved out of the slot set)
+            let mut t = terminal.clone();
+            let value = t
+                .rollback
+                .as_mut()
+                .unwrap()
+                .bindings
+                .remove(&first)
+                .unwrap();
+            t.rollback
+                .as_mut()
+                .unwrap()
+                .bindings
+                .insert(PlacementSlotId::new("renamed-slot".to_string()), value);
+            out.push((t, "binding key RENAMED (missing + extra pair)".to_string()));
+        }
+        // (4) OUTCOME SLOT — rename an outcome's KEY (its value keeps
+        // naming the old slot: the outcome own-key agreement fails, and the
+        // key set no longer matches the intent's slot_ids).
+        if let Some((key, _)) = terminal.outcomes.iter().next() {
+            let mut t = terminal.clone();
+            let result = t.outcomes.remove(key).unwrap();
+            t.outcomes
+                .insert(PlacementSlotId::new("renamed-outcome".to_string()), result);
+            out.push((
+                t,
+                "outcome key RENAMED (the value still names its old slot)".to_string(),
+            ));
+        }
+        // (5) TARGET — the terminal's target disagrees with the read path
+        // AND its intent.
+        out.push((
+            LedgerTerminal {
+                target: TargetName::new("other-target".to_string()),
+                ..terminal.clone()
+            },
+            "terminal target changed away from the intent and the read path".to_string(),
+        ));
+        out
+    }
+
+    /// THE USER'S PROPERTY: VALID LEDGER PAIRS (an EXACT intent + a
+    /// SUCCESSFUL and a NON-SUCCESSFUL terminal derived from it) load and
+    /// every consumer accepts them; mutating ONE FIELD at a time — status
+    /// (truth-table flip), rollback presence (add/remove), a binding key
+    /// (add/remove/rename), an outcome key (rename), or the target — makes
+    /// EVERY consumer refuse the line with `Error::integrity` BEFORE any
+    /// consumer logic runs: the direct read, a rollback resolve, and the
+    /// GC reachability scan all fail on the SAME refusal.
+    /// Bounded 16 cases, fixed seed 0x5EED_5EED (house style), no
+    /// persistence.
+    fn ledger_pair_mutation_case(intent: &LedgerIntent) {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = consumer_config(tmp.path());
+        let target = intent.target.as_str();
+        for (variant, successful) in [("successful", true), ("failed", false)] {
+            let terminal = terminal_for_intent(intent, "deploy-pair", successful);
+            // THE VALID PAIR: the store loads and every consumer accepts it.
+            let store =
+                LocalStore::with_base(tmp.path().join(format!("store-{variant}-valid"))).unwrap();
+            append_pair(&store, target, intent, &terminal);
+            assert_eq!(
+                store.read_ledger(target).unwrap().len(),
+                1,
+                "the valid pair merges into one entry"
+            );
+            store.reachable_set(&config, None).unwrap();
+            let resolved = crate::history::resolve_deployment(
+                &store,
+                &TargetName::new(target.to_string()),
+                &DeploymentId::new("deploy-pair".to_string()),
+            );
+            match successful {
+                true => {
+                    resolved.expect("a Successful pair resolves to its rollback");
+                }
+                false => {
+                    assert!(
+                        matches!(resolved, Err(Error::Ref(_))),
+                        "a FailedRolledBack pair never resolves as a deployment ref (a ref refusal, not a record refusal)"
+                    );
+                }
+            }
+            // ONE mutation at a time — EVERY mutation must be refused by
+            // every consumer.
+            for (n, (mutated, why)) in one_field_mutations(&terminal, intent)
+                .into_iter()
+                .enumerate()
+            {
+                let store =
+                    LocalStore::with_base(tmp.path().join(format!("store-{variant}-mut-{n}")))
+                        .unwrap();
+                append_pair(&store, target, intent, &mutated);
+                assert_consumers_refuse_with_integrity(
+                    &store,
+                    &config,
+                    target,
+                    "deploy-pair",
+                    &why,
+                );
+            }
+        }
+    }
+
+    proptest! {
+        // THE USER'S PROPERTY: valid ledger pairs load; ONE-FIELD mutations
+        // of the terminal — status (truth-table flip), rollback presence,
+        // a binding key, an outcome key, or the target — are ALL refused
+        // with `Error::integrity` at conversion time, before read_ledger, a
+        // rollback resolve, or the GC reachability scan can consume the
+        // line. Bounded 16 cases, fixed seed 0x5EED_5EED (house style), no
+        // persistence.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn ledger_pair_one_field_mutations_are_refused_at_conversion(
+            slot_count in 1u32..4,
+        ) {
+            let intent = exact_intent("deploy-pair", "t1", slot_count);
+            ledger_pair_mutation_case(&intent);
+        }
+    }
+
+    /// The CROSS-RECORD invariants, deterministically: a valid pair loads;
+    /// ONE mutation per invariant — the truth table (both directions), the
+    /// exact binding keys, the outcome key set vs the intent's `slot_ids`,
+    /// the outcome own-key rule, and the target equality (terminal leg and
+    /// intent leg) — is refused with `Error::integrity` by the read path.
+    #[test]
+    fn read_ledger_refuses_terminal_cross_field_and_cross_record_violations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = consumer_config(tmp.path());
+        let intent = exact_intent("deploy-unit", "t1", 2);
+        let terminal = terminal_for_intent(&intent, "deploy-unit", true);
+        let id = "deploy-unit";
+        let target = "t1";
+
+        // THE VALID PAIR loads; the resolve and the GC scan accept it.
+        let store = LocalStore::with_base(tmp.path().join("store-valid")).unwrap();
+        append_pair(&store, target, &intent, &terminal);
+        assert_eq!(store.read_ledger(target).unwrap().len(), 1);
+        crate::history::resolve_deployment(
+            &store,
+            &TargetName::new(target.to_string()),
+            &DeploymentId::new(id.to_string()),
+        )
+        .unwrap();
+        store.reachable_set(&config, None).unwrap();
+
+        // (a) TRUTH TABLE: a Successful terminal without its rollback.
+        let mut bad = terminal.clone();
+        bad.rollback = None;
+        assert_terminal_refused(&tmp, target, &intent, &bad, "a");
+        // (b) TRUTH TABLE: a non-successful status carrying a rollback.
+        let mut bad = terminal.clone();
+        bad.status = DeploymentStatus::Degraded;
+        assert_terminal_refused(&tmp, target, &intent, &bad, "b");
+        // (c) EXACT BINDING KEYS: a generation without its binding.
+        let mut bad = terminal.clone();
+        let first = bad
+            .rollback
+            .as_mut()
+            .unwrap()
+            .bindings
+            .keys()
+            .next()
+            .cloned()
+            .unwrap();
+        bad.rollback.as_mut().unwrap().bindings.remove(&first);
+        assert_terminal_refused(&tmp, target, &intent, &bad, "c");
+        // (d) OUTCOME KEY SET == slot_ids: an outcome for a non-member slot
+        // (extra — the value names its own key, so only the cross-record
+        // equality fails).
+        let mut bad = terminal.clone();
+        bad.outcomes.insert(
+            PlacementSlotId::new("extra-slot".to_string()),
+            SlotResult {
+                slot_id: PlacementSlotId::new("extra-slot".to_string()),
+                outcome: ServerOutcomeKind::Activated,
+                generation: Some(GenerationId::new("gen-x".to_string())),
+                compensated: false,
+                error: None,
+            },
+        );
+        assert_terminal_refused(&tmp, target, &intent, &bad, "d");
+        // (e) OUTCOME OWN-KEY: an outcome whose value names a DIFFERENT slot
+        // than its map key.
+        let mut bad = terminal.clone();
+        let first = bad.outcomes.keys().next().cloned().unwrap();
+        let result = bad.outcomes.remove(&first).unwrap();
+        bad.outcomes
+            .insert(PlacementSlotId::new("renamed-outcome".to_string()), result);
+        assert_terminal_refused(&tmp, target, &intent, &bad, "e");
+        // (f) TARGET EQUALITY, terminal leg: the terminal names a different
+        // target than the path and its intent.
+        let mut bad = terminal.clone();
+        bad.target = TargetName::new("other-target".to_string());
+        assert_terminal_refused(&tmp, target, &intent, &bad, "f");
+        // (g) TARGET EQUALITY, intent leg: the intent names a different
+        // target than the path.
+        let mut bad_intent = intent.clone();
+        bad_intent.target = TargetName::new("other-target".to_string());
+        assert_intent_refused(&tmp, target, &bad_intent);
+    }
+
+    /// Append a valid intent + a MUTATED terminal to a fresh store and
+    /// assert the read path refuses with an integrity error. `tag` keeps
+    /// each mutation's store directory unique.
+    fn assert_terminal_refused(
+        tmp: &tempfile::TempDir,
+        target: &str,
+        intent: &LedgerIntent,
+        mutated: &LedgerTerminal,
+        tag: &str,
+    ) {
+        let store = LocalStore::with_base(tmp.path().join(format!("refuse-t-{tag}"))).unwrap();
+        append_pair(&store, target, intent, mutated);
+        let err = store.read_ledger(target).unwrap_err();
+        assert!(
+            matches!(err, Error::Integrity(_)),
+            "a terminal violating the invariants must be refused with an integrity error, got: {err}"
+        );
+    }
+
+    /// Append a MUTATED intent to a fresh store and assert the read path
+    /// refuses with an integrity error. The refusal fires on the intent line
+    /// itself (before any terminal is appended — `append_terminal`'s own
+    /// read would refuse the same ledger too).
+    fn assert_intent_refused(tmp: &tempfile::TempDir, target: &str, mutated: &LedgerIntent) {
+        let store = LocalStore::with_base(tmp.path().join("refuse-i")).unwrap();
+        store.append_intent(target, mutated).unwrap();
+        let err = store.read_ledger(target).unwrap_err();
+        assert!(
+            matches!(err, Error::Integrity(_)),
+            "an intent violating the target equality must be refused with an integrity error, got: {err}"
+        );
     }
 }

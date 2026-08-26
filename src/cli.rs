@@ -652,12 +652,26 @@ mod tests {
             (DeploymentStatus::PendingCommit, None)
         );
 
-        // A terminal event carries the status + reason.
+        // A terminal event carries the status + reason. The status is
+        // `Successful`, so the terminal must carry its rollback payload (the
+        // STATUS/ROLLBACK TRUTH TABLE refuses a Successful terminal without
+        // one — the status-only `append_transition` helper cannot represent
+        // it, so the terminal is appended directly).
         store
-            .append_transition(
-                a.deployment_id.as_str(),
-                &DeploymentStatus::Successful,
-                Some("recovery finalization"),
+            .append_terminal(
+                "production",
+                &LedgerTerminal {
+                    deployment_id: a.deployment_id.clone(),
+                    target: TargetName::new("production".to_string()),
+                    status: DeploymentStatus::Successful,
+                    recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                    outcomes: BTreeMap::new(),
+                    rollback: Some(LedgerRollback {
+                        slots: BTreeMap::new(),
+                        bindings: BTreeMap::new(),
+                    }),
+                    reason: Some("recovery finalization".to_string()),
+                },
             )
             .unwrap();
         let entries = store.read_ledger("production").unwrap();

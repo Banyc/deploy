@@ -616,7 +616,16 @@ interval_seconds = 0
                         },
                     },
                 )]),
-                bindings: BTreeMap::new(),
+                // The binding key set must equal the slot key set EXACTLY
+                // (the wire → domain conversion refuses a rollback whose
+                // bindings omit a slotted generation).
+                bindings: BTreeMap::from([(
+                    PlacementSlotId::new(SLOT.to_string()),
+                    crate::records::PhysicalBinding {
+                        server: crate::model::ServerId::new("s1".to_string()),
+                        deploy_dir: "/srv/eng".to_string(),
+                    },
+                )]),
             }),
             reason: None,
         }
