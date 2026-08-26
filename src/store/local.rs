@@ -11,6 +11,23 @@
 //! separate floor marker, snapshot op log, per-deployment results/transition
 //! stream, or cleanup-debt flag: the ledger replaces all of them.
 //!
+//! DURABILITY: every append is a CRASH-ATOMIC whole-ledger rewrite through
+//! the same protocol as the checkpoint's suffix replacement
+//! ([`crate::store::atomic::write_atomic_replace`]: unique same-directory
+//! temp file, chmod-private BEFORE visible, temp fsync, atomic rename, then
+//! a fail-closed parent-directory fsync). The ledger is bounded — the
+//! checkpoint's suffix compaction keeps it small, and even an
+//! un-checkpointed ledger is one small file per target — so the O(n)
+//! rewrite cost per append is acceptable, and the atomic rename gives the
+//! append the SAME whole-or-nothing guarantee the checkpoint has: a reader
+//! (or a fresh store after a crash) sees a wholly OLD or wholly NEW ledger,
+//! never a torn partial line, and an append that returned `Ok` is durable.
+//! Appends are serialized under the target lock (push and checkpoint both
+//! acquire the application-store lock then the target lock), so the
+//! read-modify-write cannot interleave with another writer. See
+//! [`LocalStore::append_ledger_atomic`] for the staged protocol and the
+//! test-only fault surface.
+//!
 //! ```text
 //! <base>/
 //!   objects/sha256/<digest>/root/ , tree.json
@@ -35,7 +52,9 @@
 //! [`LocalStore::with_base`]); the store methods consult ONLY that registry
 //! (`self.fault_registry.consume(...)`). Tests arm the fixture's registry via
 //! [`LocalStore::fault_registry`] (`store.fault_registry().arm_append_attempt(id)`
-//! etc.). There are NO process-global fault slots and NO shared fault lock:
+//! etc. — including the four atomic-append STAGE faults of
+//! [`LocalStore::append_ledger_atomic`]). There are NO process-global fault
+//! slots and NO shared fault lock:
 //! two fixtures' registries are disjoint by construction, so a fault armed by
 //! one test can never fire in another's push — structural isolation that
 //! holds under any parallel `cargo test` interleaving.
@@ -54,8 +73,8 @@ use crate::records::{
     ObservedTarget, Pins, ServerState,
 };
 use crate::store::atomic::{
-    copy_dir_recursive, ensure_private_dir, path_state, read_json, set_private,
-    write_atomic_replace,
+    copy_dir_recursive, ensure_private_dir, path_state, read_json, set_private, sync_parent_dir,
+    temp_name_for, write_atomic_replace,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -750,9 +769,12 @@ impl LocalStore {
     /// (one `{"kind":"intent", ...}` JSON line), BEFORE any remote
     /// mutation: a crash after servers advanced to new generations can never
     /// lose the deployment (the intent is already durable and the next push
-    /// reconciles it). Fail-closed keying: the deployment id keys the entry,
-    /// so a second intent for the same id (a corrupted duplicate) is refused
-    /// rather than silently merged.
+    /// reconciles it). The append is a CRASH-ATOMIC whole-ledger rewrite
+    /// (temp + fsync + chmod + rename + parent-dir fsync, see
+    /// [`LocalStore::append_ledger_atomic`]): a successful append is durable
+    /// and a crash can never leave a torn line. Fail-closed keying: the
+    /// deployment id keys the entry, so a second intent for the same id (a
+    /// corrupted duplicate) is refused rather than silently merged.
     pub fn append_intent(&self, target: &str, intent: &LedgerIntent) -> Result<()> {
         #[cfg(test)]
         if self
@@ -779,13 +801,15 @@ impl LocalStore {
         }
         let line = serde_json::to_string(&LedgerLine::Intent(intent.clone()))
             .map_err(|e| Error::store(format!("serialize ledger intent: {e}")))?;
-        append_ledger_line(&p, &line)
+        self.append_ledger_atomic(target, intent.deployment_id.as_str(), &line)
     }
 
     /// Append the TERMINAL EVENT of one deployment to the target's ledger
     /// ("`{"kind":"terminal", ...}`" JSON line), after the mutation loop.
     /// The terminal carries the status, the per-slot outcomes, and — when
-    /// successful — the rollback state. Fail-closed key contract: the
+    /// successful — the rollback state. Like the intent it is appended via
+    /// the crash-atomic whole-ledger rewrite (see
+    /// [`LocalStore::append_ledger_atomic`]). Fail-closed key contract: the
     /// deployment's intent must already exist in the ledger (a terminal for
     /// an unknown deployment is corruption) and the entry must not already
     /// have a terminal (the terminal event is written exactly once;
@@ -802,7 +826,6 @@ impl LocalStore {
         }
         let dir = self.target_dir(target);
         ensure_private_dir(&dir)?;
-        let p = self.ledger_path(target);
         let entries = self.read_ledger(target)?;
         let entry = entries
             .iter()
@@ -821,7 +844,7 @@ impl LocalStore {
         }
         let line = serde_json::to_string(&LedgerLine::Terminal(terminal.clone()))
             .map_err(|e| Error::store(format!("serialize ledger terminal: {e}")))?;
-        append_ledger_line(&p, &line)
+        self.append_ledger_atomic(target, terminal.deployment_id.as_str(), &line)
     }
 
     /// Read the FULL deployment ledger of a target: every merged
@@ -1008,25 +1031,6 @@ impl LocalStore {
         write_atomic_cas(&dir.join("plan.json"), &bytes)
     }
 }
-/// Append one JSON line to the target's ledger file (open-or-create,
-/// write, private perms). A crash mid-append leaves a possibly-partial
-/// trailing line; every read ([`LocalStore::read_ledger`]) fails closed on
-/// it rather than silently dropping history.
-fn append_ledger_line(path: &Path, line: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| Error::store(format!("mkdir {}: {e}", parent.display())))?;
-    }
-    let mut f = if path.exists() {
-        std::fs::OpenOptions::new().append(true).open(path)
-    } else {
-        std::fs::File::create(path)
-    }
-    .map_err(|e| Error::store(format!("open ledger: {e}")))?;
-    writeln!(f, "{line}").map_err(|e| Error::store(format!("write ledger: {e}")))?;
-    drop(f);
-    set_private(path)
-}
 
 impl LocalStore {
     /// Whether the ledger already contains an INTENT line (a cheap tri-state
@@ -1047,6 +1051,116 @@ impl LocalStore {
             }
         }
         Ok(None)
+    }
+
+    /// The ledger APPEND's durability protocol: atomically rewrite the WHOLE
+    /// ledger (read-modify-write) through the same four-stage sequence as
+    /// [`crate::store::atomic::write_atomic_replace`] — a UNIQUE temp file in
+    /// the same directory, chmod-private BEFORE it can become visible, temp
+    /// fsync, atomic rename (a reader sees wholly OLD or wholly NEW, never a
+    /// torn line), then a FAIL-CLOSED parent-directory fsync (the durability
+    /// commit point: the new ledger must survive power loss before the append
+    /// reports success).
+    ///
+    /// The stages are materialized here — rather than a single
+    /// `write_atomic_replace` call — so the per-fixture test registry can
+    /// fault each one ([`FaultKind::AppendWrite`] / [`FaultKind::AppendSync`]
+    /// / [`FaultKind::AppendRename`] / [`FaultKind::AppendDirSync`]), keyed
+    /// by the deployment id being appended. The first three fault stages
+    /// abort BEFORE the rename: the visible ledger is wholly OLD (a leftover
+    /// dot-prefixed temp is invisible to every read). The dir-sync fault
+    /// fires AFTER the rename: the ledger is wholly NEW — only the directory
+    /// entry is unsynced — and the append returns `Err` (the same
+    /// post-commit window the checkpoint's [`FaultKind::LedgerReplaceAfter`]
+    /// models).
+    ///
+    /// Appends are serialized by the caller's target lock (push and
+    /// checkpoint both acquire the application-store lock then the target
+    /// lock before any ledger write), so the read-modify-write cannot
+    /// interleave with a concurrent rewrite.
+    fn append_ledger_atomic(&self, target: &str, _deployment_id: &str, line: &str) -> Result<()> {
+        let p = self.ledger_path(target);
+        // Read-modify-write: the whole current ledger + the new line.
+        let mut buf = String::new();
+        if path_state(&p)? {
+            buf = std::fs::read_to_string(&p)
+                .map_err(|e| Error::store(format!("read ledger: {e}")))?;
+            // A legacy in-place append (pre-durability-fix) may have crashed
+            // WITHOUT a trailing newline; give that tail its own newline so
+            // the new line is never FUSED into it (the pre-existing torn
+            // tail still fails closed on read — this append neither drops
+            // nor amplifies it).
+            if !buf.is_empty() && !buf.ends_with('\n') {
+                buf.push('\n');
+            }
+        }
+        buf.push_str(line);
+        buf.push('\n');
+
+        // Stage 1: the temp write.
+        #[cfg(test)]
+        if self
+            .fault_registry
+            .consume(FaultKind::AppendWrite, _deployment_id)
+        {
+            return Err(Error::store(
+                "test fault: ledger append (temp write) forced to fail once",
+            ));
+        }
+        let tmp = temp_name_for(&p);
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map_err(|e| Error::store(format!("create {}: {e}", tmp.display())))?;
+            f.write_all(buf.as_bytes())
+                .map_err(|e| Error::store(format!("write {}: {e}", tmp.display())))?;
+        }
+        // Stage 2: the temp fsync.
+        #[cfg(test)]
+        if self
+            .fault_registry
+            .consume(FaultKind::AppendSync, _deployment_id)
+        {
+            return Err(Error::store(
+                "test fault: ledger append (temp sync) forced to fail once",
+            ));
+        }
+        {
+            let f = std::fs::File::open(&tmp)
+                .map_err(|e| Error::store(format!("open {}: {e}", tmp.display())))?;
+            f.sync_all()
+                .map_err(|e| Error::store(format!("fsync {}: {e}", tmp.display())))?;
+        }
+        // Private BEFORE visible: the temp carries 0o600 before the rename.
+        set_private(&tmp)?;
+        // Stage 3: the atomic rename (the commit point).
+        #[cfg(test)]
+        if self
+            .fault_registry
+            .consume(FaultKind::AppendRename, _deployment_id)
+        {
+            return Err(Error::store(
+                "test fault: ledger append (rename) forced to fail once",
+            ));
+        }
+        std::fs::rename(&tmp, &p)
+            .map_err(|e| Error::store(format!("rename {}: {e}", p.display())))?;
+        // Stage 4: the FAIL-CLOSED parent-directory fsync, AFTER the rename:
+        // the new ledger is already visible, but not durable across power
+        // loss until its directory entry is synced.
+        #[cfg(test)]
+        if self
+            .fault_registry
+            .consume(FaultKind::AppendDirSync, _deployment_id)
+        {
+            return Err(Error::store(
+                "test fault: ledger append (parent-dir sync) forced to fail once",
+            ));
+        }
+        sync_parent_dir(&p)?;
+        Ok(())
     }
 
     // ---- pins ------------------------------------------------------------
@@ -1141,6 +1255,8 @@ mod tests {
     use crate::records::{
         LedgerIntent, LedgerLine, LedgerRollback, LedgerTerminal, ServerOutcomeKind, ServerResult,
     };
+    use proptest::prelude::*;
+    use proptest::test_runner::{FileFailurePersistence, RngSeed};
 
     fn intent(id: &str, target: &str) -> LedgerIntent {
         LedgerIntent {
@@ -1625,5 +1741,407 @@ mod tests {
         // ...and never leaks into s2 (its deploy-b arm is untouched).
         s2.append_terminal("t1", &successful_terminal("deploy-b", "t1"))
             .expect_err("s2's own arm fires");
+    }
+
+    // ---------------------------------------------------------------------
+    // Ledger append durability (crash-atomic whole-ledger rewrite)
+    // ---------------------------------------------------------------------
+
+    /// A fault at ANY of the four atomic-append stages leaves the visible
+    /// ledger wholly OLD (pre-append) or wholly NEW (post-append): the
+    /// atomic rename means no crash window can ever leave a torn partial
+    /// line. The pre-rename stages ([`FaultKind::AppendWrite`] /
+    /// [`FaultKind::AppendSync`] / [`FaultKind::AppendRename`]) abort
+    /// BEFORE the rename: wholly OLD. The [`FaultKind::AppendDirSync`] fault
+    /// fires AFTER the rename: the ledger is wholly NEW (only the directory
+    /// entry is unsynced) and the append returns `Err`.
+    #[test]
+    fn ledger_append_faults_leave_wholly_old_or_wholly_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let target = "t1";
+        store
+            .append_intent(target, &intent("deploy-a", target))
+            .unwrap();
+        store
+            .append_terminal(target, &successful_terminal("deploy-a", target))
+            .unwrap();
+        for (i, (stage, kind, landed)) in [
+            ("temp write", FaultKind::AppendWrite, false),
+            ("temp sync", FaultKind::AppendSync, false),
+            ("rename", FaultKind::AppendRename, false),
+            ("dir sync", FaultKind::AppendDirSync, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("deploy-fault-{i}");
+            store.append_intent(target, &intent(&id, target)).unwrap();
+            let before = store.read_ledger_lines(target).unwrap();
+            store.fault_registry().arm(kind, &id);
+            let err = store
+                .append_terminal(target, &successful_terminal(&id, target))
+                .expect_err("the armed stage fault fires");
+            assert!(
+                err.to_string().contains("test fault"),
+                "the fault must fail the append, got: {err}"
+            );
+            let after = store.read_ledger_lines(target).unwrap();
+            if landed {
+                assert_eq!(
+                    after.len(),
+                    before.len() + 1,
+                    "{stage}: the dir-sync fault leaves the wholly NEW ledger (the rename landed)"
+                );
+                assert_eq!(
+                    after[..before.len()],
+                    before,
+                    "{stage}: the wholly-new ledger extends the old content in order"
+                );
+                assert_eq!(
+                    after.last().unwrap(),
+                    &serde_json::to_string(&LedgerLine::Terminal(successful_terminal(&id, target)))
+                        .unwrap(),
+                    "{stage}: the wholly-new ledger's last line is the appended terminal"
+                );
+            } else {
+                assert_eq!(
+                    after, before,
+                    "{stage}: a pre-rename fault leaves the wholly OLD ledger"
+                );
+            }
+            // Every line of the visible ledger parses (never torn).
+            store.read_ledger(target).unwrap();
+        }
+    }
+
+    /// The atomic rewrite never FUSES a new line into a pre-existing torn
+    /// trailing line (a crash from the OLD in-place append protocol): the
+    /// append gives the legacy tail its own newline, so the new line is
+    /// intact and the pre-existing torn line still fails closed on read —
+    /// never silently dropped, never amplified into a merged garbage line.
+    #[test]
+    fn atomic_append_never_fuses_a_crafted_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let target = "t1";
+        let p = store.ledger_path(target);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        // A crafted torn trailing line — exactly what the old in-place
+        // append could leave behind after a crash mid-write.
+        let torn = r#"{"kind":"intent","deployment_id":"deploy-torn""#;
+        std::fs::write(&p, torn).unwrap();
+        let id = "deploy-fresh";
+        let line = serde_json::to_string(&LedgerLine::Intent(intent(id, target))).unwrap();
+        store.append_intent(target, &intent(id, target)).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(
+            text,
+            format!("{torn}\n{line}\n"),
+            "the torn tail gets its own newline — the new line is never fused into it"
+        );
+        // The torn tail still fails closed on read (the append neither
+        // dropped it nor merged it) — the appended line is structurally in
+        // the file.
+        assert!(store.read_ledger(target).is_err());
+        // A follow-up append keeps the torn tail its own line too.
+        store
+            .append_intent(target, &intent("deploy-fresh-2", target))
+            .unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "the torn line stays its own line");
+        assert_eq!(lines[0], torn);
+        assert_eq!(lines[1], line);
+        assert_eq!(
+            lines[2],
+            serde_json::to_string(&LedgerLine::Intent(intent("deploy-fresh-2", target))).unwrap()
+        );
+    }
+
+    /// A SUCCESSFUL ledger append is durable: after appends (including an
+    /// append that FAILED at the dir-sync stage — the rename already landed
+    /// — and one that failed at a pre-rename stage), a FRESH store over the
+    /// same base reads exactly the committed lines: every append that
+    /// returned `Ok` is visible, in order, and no torn line exists.
+    #[test]
+    fn successful_ledger_appends_are_visible_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("store");
+        let store = LocalStore::with_base(base.clone()).unwrap();
+        let target = "t1";
+        store
+            .append_intent(target, &intent("deploy-a", target))
+            .unwrap();
+        store
+            .append_terminal(target, &successful_terminal("deploy-a", target))
+            .unwrap();
+        store
+            .append_intent(target, &intent("deploy-b", target))
+            .unwrap();
+        // A pre-rename fault: the intent of deploy-c never lands.
+        store.fault_registry().arm_append_rename("deploy-c");
+        store
+            .append_intent(target, &intent("deploy-c", target))
+            .expect_err("the armed rename fault aborts before the rename");
+        // The dir-sync fault on deploy-d's terminal: the rename DOES land
+        // (the ledger is wholly new) though the append returns `Err`.
+        store
+            .append_intent(target, &intent("deploy-d", target))
+            .unwrap();
+        store.fault_registry().arm_append_dir_sync("deploy-d");
+        store
+            .append_terminal(target, &successful_terminal("deploy-d", target))
+            .expect_err("the armed dir-sync fault still leaves the ledger wholly new");
+        drop(store);
+        let reopened = LocalStore::with_base(base).unwrap();
+        let visible = reopened.read_ledger_lines(target).unwrap();
+        assert_eq!(visible.len(), 5);
+        assert_eq!(
+            visible[0],
+            serde_json::to_string(&LedgerLine::Intent(intent("deploy-a", target))).unwrap()
+        );
+        assert_eq!(
+            visible[1],
+            serde_json::to_string(&LedgerLine::Terminal(successful_terminal(
+                "deploy-a", target
+            )))
+            .unwrap()
+        );
+        assert_eq!(
+            visible[2],
+            serde_json::to_string(&LedgerLine::Intent(intent("deploy-b", target))).unwrap()
+        );
+        assert_eq!(
+            visible[3],
+            serde_json::to_string(&LedgerLine::Intent(intent("deploy-d", target))).unwrap()
+        );
+        assert_eq!(
+            visible[4],
+            serde_json::to_string(&LedgerLine::Terminal(successful_terminal(
+                "deploy-d", target
+            )))
+            .unwrap()
+        );
+        // Every line parses and merges into consistent entries.
+        let entries = reopened.read_ledger(target).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.deployment_id.as_str() == "deploy-a" && e.terminal.is_some())
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.deployment_id.as_str() == "deploy-b" && e.terminal.is_none())
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.deployment_id.as_str() == "deploy-d" && e.terminal.is_some())
+        );
+    }
+
+    // ---- the reopen durability property -------------------------------
+
+    /// One generated ledger-history operation: the INTENT of a fresh
+    /// deployment (`Intent`), the terminal of the OLDEST still-open
+    /// deployment (`CloseOldest`), or the NEWEST (`CloseNewest`). The paired
+    /// [`AppendStage`] selects the single atomic-append stage fault armed for
+    /// that operation (`None` = no fault).
+    #[derive(Clone, Copy, Debug)]
+    enum LedgerOp {
+        Intent,
+        CloseOldest,
+        CloseNewest,
+    }
+
+    /// The four atomic-append rewrite stages a fault can be injected at.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum AppendStage {
+        Write,
+        Sync,
+        Rename,
+        DirSync,
+    }
+
+    fn ledger_history_strategy() -> impl Strategy<Value = Vec<(LedgerOp, Option<AppendStage>)>> {
+        prop::collection::vec(
+            (
+                prop::sample::select(vec![
+                    LedgerOp::Intent,
+                    LedgerOp::CloseOldest,
+                    LedgerOp::CloseNewest,
+                ]),
+                prop::sample::select(vec![
+                    None,
+                    Some(AppendStage::Write),
+                    Some(AppendStage::Sync),
+                    Some(AppendStage::Rename),
+                    Some(AppendStage::DirSync),
+                ]),
+            ),
+            0..=8,
+        )
+    }
+
+    /// Arm the generated stage fault on the fixture's per-fixture registry,
+    /// keyed by the deployment id of the append under test.
+    fn arm_append_stage(store: &LocalStore, stage: AppendStage, id: &str) {
+        match stage {
+            AppendStage::Write => store.fault_registry().arm_append_write(id),
+            AppendStage::Sync => store.fault_registry().arm_append_sync(id),
+            AppendStage::Rename => store.fault_registry().arm_append_rename(id),
+            AppendStage::DirSync => store.fault_registry().arm_append_dir_sync(id),
+        }
+    }
+
+    /// Replay one generated history against a FRESH fixture, then REOPEN
+    /// with a fresh store over the same base and assert the durability
+    /// contract:
+    ///
+    /// * the reopened ledger is EXACTLY the lines of the appends whose
+    ///   atomic rename LANDED, in order — a whole file of whole lines: no
+    ///   append can leave a torn/partial line, every line parses, and the
+    ///   intent/terminal structure is consistent;
+    /// * a SUCCESSFUL append (one that returned `Ok`) is ALWAYS present
+    ///   after the reopen, regardless of what failed afterward.
+    ///
+    /// Each operation arms ONE stage fault (keyed by the deployment id)
+    /// when its generated spec says so. The fault fires once at that stage:
+    /// `Write`/`Sync`/`Rename` abort before the rename (wholly OLD);
+    /// [`AppendStage::DirSync`] fires after the rename (wholly NEW — the
+    /// error returns but the new ledger is already durable).
+    fn run_ledger_durability_history(history: &[(LedgerOp, Option<AppendStage>)]) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("store");
+        let store = LocalStore::with_base(base.clone()).unwrap();
+        let target = "t1";
+        // The committed model: the ledger lines whose append's rename
+        // landed, in order; the still-open (intent-only) deployment ids; and
+        // every append that returned `Ok` (the visibility contract).
+        let mut committed: Vec<String> = Vec::new();
+        let mut open: Vec<String> = Vec::new();
+        let mut ok_appends: Vec<(String, bool)> = Vec::new();
+        let mut seq = 0u64;
+        for (op, stage) in history {
+            match op {
+                LedgerOp::Intent => {
+                    let id = format!("dep-{seq}");
+                    seq += 1;
+                    let intent = intent(&id, target);
+                    let line = serde_json::to_string(&LedgerLine::Intent(intent.clone())).unwrap();
+                    if let Some(stage) = stage {
+                        arm_append_stage(&store, *stage, &id);
+                    }
+                    match store.append_intent(target, &intent) {
+                        Ok(()) => {
+                            committed.push(line);
+                            open.push(id.clone());
+                            ok_appends.push((id, true));
+                        }
+                        Err(e) if e.to_string().contains("test fault") => {
+                            // The faulted append: committed ONLY when the
+                            // rename already landed (the dir-sync stage).
+                            if matches!(stage, Some(AppendStage::DirSync)) {
+                                committed.push(line);
+                                open.push(id);
+                            }
+                        }
+                        Err(e) => panic!("unexpected append_intent error for {id}: {e}"),
+                    }
+                }
+                LedgerOp::CloseOldest | LedgerOp::CloseNewest => {
+                    let Some(id) = (if matches!(op, LedgerOp::CloseOldest) {
+                        open.first()
+                    } else {
+                        open.last()
+                    })
+                    .cloned() else {
+                        continue; // nothing open: the op is a valid no-op
+                    };
+                    let terminal = successful_terminal(&id, target);
+                    let line =
+                        serde_json::to_string(&LedgerLine::Terminal(terminal.clone())).unwrap();
+                    if let Some(stage) = stage {
+                        arm_append_stage(&store, *stage, &id);
+                    }
+                    match store.append_terminal(target, &terminal) {
+                        Ok(()) => {
+                            committed.push(line);
+                            open.retain(|o| o != &id);
+                            ok_appends.push((id, false));
+                        }
+                        Err(e) if e.to_string().contains("test fault") => {
+                            if matches!(stage, Some(AppendStage::DirSync)) {
+                                committed.push(line);
+                                open.retain(|o| o != &id);
+                            }
+                        }
+                        Err(e) => panic!("unexpected append_terminal error for {id}: {e}"),
+                    }
+                }
+            }
+        }
+        // After REOPENING, the ledger is the wholly-written committed model:
+        // never a torn line, and the successful appends are all visible.
+        drop(store);
+        let reopened = LocalStore::with_base(base).unwrap();
+        assert_eq!(
+            reopened.read_ledger_lines(target).unwrap(),
+            committed,
+            "the reopened ledger is exactly the committed lines in order — every append is whole or absent, never torn"
+        );
+        let entries = reopened.read_ledger(target).unwrap();
+        for (id, is_intent) in &ok_appends {
+            let entry = entries
+                .iter()
+                .find(|e| e.deployment_id.as_str() == id)
+                .unwrap_or_else(|| panic!("a successful append for {id} is missing after reopen"));
+            if !is_intent {
+                assert!(
+                    entry.terminal.is_some(),
+                    "a successful terminal append for {id} is visible after reopen"
+                );
+            }
+        }
+    }
+
+    proptest! {
+        // The main property: ORDINARY RANDOMIZED SEEDS with failure
+        // persistence (proptest's defaults) — a failing vector writes to
+        // `proptest-regressions/local.txt` and is replayed on the next run
+        // (commit it so CI keeps reproducing the regression until fixed).
+        // The case count is bounded so the suite stays fast.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            failure_persistence: Some(Box::new(FileFailurePersistence::default())),
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn ledger_append_durability(history in ledger_history_strategy()) {
+            run_ledger_durability_history(&history);
+        }
+    }
+
+    proptest! {
+        // FIXED-SEED REGRESSION: the deterministic floor for CI. The same
+        // generator under the pinned 0x5EED_5EED seed with no persistence
+        // runs the IDENTICAL vectors on every invocation, so the suite stays
+        // reproducible even when no failure has ever been persisted by the
+        // main test. The case count is bounded so the suite stays fast.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn ledger_append_durability_fixed_seed_regression(history in ledger_history_strategy()) {
+            run_ledger_durability_history(&history);
+        }
     }
 }

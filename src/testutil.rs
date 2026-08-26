@@ -68,7 +68,11 @@ pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// Faults exist for the INTENT persist ([`FaultKind::AppendAttempt`]), the
 /// TERMINAL EVENT append ([`FaultKind::AppendTerminal`] — the deployment's
 /// single finalize write; a one-shot failure leaves the entry intent-only and
-/// recoverable), the post-commit observed-refresh faults ([`FaultKind::WriteServer`],
+/// recoverable), the four ATOMIC-APPEND stage kinds ([`FaultKind::AppendWrite`]
+/// / [`FaultKind::AppendSync`] / [`FaultKind::AppendRename`] /
+/// [`FaultKind::AppendDirSync`], keyed by deployment id, firing at the
+/// whole-ledger rewrite's temp-write / temp-sync / rename / parent-dir-sync
+/// stages), the post-commit observed-refresh faults ([`FaultKind::WriteServer`],
 /// [`FaultKind::WriteObserved`], keyed additionally by TARGET), and the
 /// rotation-maintenance arms ([`FaultKind::ReadRotationDebt`],
 /// [`FaultKind::WriteRotationDebt`], keyed by TARGET). The CHECKPOINT kinds
@@ -98,6 +102,23 @@ pub(crate) mod test_faults {
         /// single finalize write (status + outcomes + rollback). A one-shot
         /// failure here leaves the entry intent-only (recoverable-pending).
         AppendTerminal,
+        /// The ledger append's TEMP-WRITE stage (the atomic whole-ledger
+        /// rewrite, keyed by the deployment id being appended). Fires before
+        /// any I/O: the visible ledger is wholly OLD.
+        AppendWrite,
+        /// The ledger append's TEMP-SYNC stage: fires after the temp file
+        /// was written, before its fsync — the dot-prefixed temp exists but
+        /// is invisible, and the visible ledger is wholly OLD.
+        AppendSync,
+        /// The ledger append's RENAME stage: fires after the temp was
+        /// written AND fsynced, before the atomic rename — the visible
+        /// ledger is wholly OLD (only an invisible temp was created).
+        AppendRename,
+        /// The ledger append's PARENT-DIR-SYNC stage: fires AFTER the atomic
+        /// rename, BEFORE the parent-directory fsync — the ledger IS wholly
+        /// NEW (the new content is in place under its final name, only the
+        /// directory entry is not yet synced) but the append returns `Err`.
+        AppendDirSync,
         /// Post-commit observed-refresh per-server record write
         /// (`servers/<id>.json`), keyed by (deployment id, target).
         WriteServer,
@@ -267,6 +288,35 @@ pub(crate) mod test_faults {
         /// from the verified desired state.
         pub(crate) fn arm_append_terminal(&self, deployment_id: &str) {
             self.arm(FaultKind::AppendTerminal, deployment_id);
+        }
+
+        /// Arm the ledger append's TEMP-WRITE stage to fail once for
+        /// `deployment_id`: the fault fires before any I/O, so the visible
+        /// ledger is wholly OLD.
+        pub(crate) fn arm_append_write(&self, deployment_id: &str) {
+            self.arm(FaultKind::AppendWrite, deployment_id);
+        }
+
+        /// Arm the ledger append's TEMP-SYNC stage to fail once for
+        /// `deployment_id`: the fault fires after the temp write, before its
+        /// fsync — the visible ledger is wholly OLD.
+        pub(crate) fn arm_append_sync(&self, deployment_id: &str) {
+            self.arm(FaultKind::AppendSync, deployment_id);
+        }
+
+        /// Arm the ledger append's RENAME stage to fail once for
+        /// `deployment_id`: the fault fires before the atomic rename — the
+        /// visible ledger is wholly OLD.
+        pub(crate) fn arm_append_rename(&self, deployment_id: &str) {
+            self.arm(FaultKind::AppendRename, deployment_id);
+        }
+
+        /// Arm the ledger append's PARENT-DIR-SYNC stage to fail once for
+        /// `deployment_id`: the fault fires AFTER the atomic rename, before
+        /// the directory fsync — the ledger is wholly NEW but the append
+        /// returns `Err`.
+        pub(crate) fn arm_append_dir_sync(&self, deployment_id: &str) {
+            self.arm(FaultKind::AppendDirSync, deployment_id);
         }
 
         /// Arm the next `write_server` call that records `deployment_id`
