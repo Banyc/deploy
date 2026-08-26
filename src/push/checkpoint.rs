@@ -93,8 +93,10 @@ pub struct CheckpointReport {
     /// implicit: everything strictly before it is discarded.
     pub deployment_id: DeploymentId,
     /// Exactly what was / would be discarded: the entries dropped from the
-    /// ledger by the suffix replacement plus the deployment dirs, release
-    /// records, and tree objects the global sweep deleted (or would delete).
+    /// ledger by the suffix replacement plus the sweep's PLANNED candidate
+    /// sets and the counts ACTUALLY unlinked (see [`LedgerDiscards`] — the
+    /// preview reports the planned sets; the execution reports removed +
+    /// pending).
     pub discards: LedgerDiscards,
     /// True when this call performed the LOGICAL COMMIT (the atomic ledger
     /// replacement); false for dry-run previews.
@@ -339,16 +341,16 @@ fn preview_checkpoint(
     })
 }
 
-/// Render a checkpoint report for the CLI: a dry-run preview enumerates what
-/// WOULD be discarded; a real checkpoint reports what WAS. The CLI prints
-/// exactly these lines; the unit tests assert on them directly.
+/// Render a checkpoint report for the CLI: a dry-run preview reports the
+/// PLANNED deletion sets ("would remove N" — nothing was touched); a real
+/// checkpoint reports what WAS ACTUALLY unlinked ("removed N; P pending" —
+/// a candidate is counted as removed only after a successful unlink, and
+/// the candidates the sweep identified but did not remove — an aborted
+/// stage, or a stage that never ran — stay pending, never claimed as
+/// removed). The CLI prints exactly these lines; the unit tests assert on
+/// them directly.
 pub fn render_checkpoint_report(report: &CheckpointReport) -> Vec<String> {
     let mut lines = Vec::new();
-    let verb = if report.dry_run {
-        "would discard"
-    } else {
-        "discarded"
-    };
     let head = if report.dry_run {
         format!(
             "dry-run: checkpoint at deployment {} of target {}",
@@ -362,24 +364,32 @@ pub fn render_checkpoint_report(report: &CheckpointReport) -> Vec<String> {
     };
     lines.push(head);
     lines.push(format!(
-        "{verb} {} ledger entr{} below the checkpoint",
+        "{} {} ledger entr{} below the checkpoint",
+        if report.dry_run {
+            "would discard"
+        } else {
+            "discarded"
+        },
         report.discards.discarded_entries.len(),
         plural(report.discards.discarded_entries.len())
     ));
-    lines.push(format!(
-        "{verb} {} deployment director{} (unreachable)",
+    lines.push(sweep_line(
+        "deployment director",
+        report.dry_run,
         report.discards.sweep_deployments.len(),
-        plural(report.discards.sweep_deployments.len())
+        report.discards.removed_deployments,
     ));
-    lines.push(format!(
-        "{verb} {} release record{} (unreachable)",
+    lines.push(sweep_line(
+        "release record",
+        report.dry_run,
         report.discards.sweep_releases.len(),
-        plural(report.discards.sweep_releases.len())
+        report.discards.removed_releases,
     ));
-    lines.push(format!(
-        "{verb} {} tree object{} (unreachable)",
+    lines.push(sweep_line(
+        "tree object",
+        report.dry_run,
         report.discards.sweep_objects.len(),
-        plural(report.discards.sweep_objects.len())
+        report.discards.removed_objects,
     ));
     if !report.dry_run && !report.sweep_completed {
         lines.push(format!(
@@ -394,6 +404,35 @@ pub fn render_checkpoint_report(report: &CheckpointReport) -> Vec<String> {
         lines.push(format!("warning: {w}"));
     }
     lines
+}
+
+/// ONE sweep category's report line. A DRY-RUN reports the PLANNED set
+/// ("would remove N") — the preview enumerates the candidates and touches
+/// nothing. An EXECUTION reports the count ACTUALLY unlinked plus the
+/// PENDING remainder ("removed R; P pending"): `removed` is only ever
+/// incremented after a successful filesystem unlink, so the line never
+/// claims a candidate was deleted when the deletion failed — the pending
+/// candidates (an aborted stage, or a stage that never ran) stay visible
+/// as `pending`.
+fn sweep_line(category: &str, dry_run: bool, planned: usize, removed: usize) -> String {
+    if dry_run {
+        format!(
+            "would remove {planned} {category}{} (unreachable)",
+            plural(planned)
+        )
+    } else {
+        let pending = planned - removed;
+        match pending {
+            0 => format!(
+                "removed {removed} {category}{} (unreachable)",
+                plural(removed)
+            ),
+            _ => format!(
+                "removed {removed} {category}{} (unreachable); {pending} pending",
+                plural(removed)
+            ),
+        }
+    }
 }
 
 fn plural(n: usize) -> &'static str {
@@ -1399,11 +1438,43 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert!(executed.established);
         assert!(executed.sweep_completed);
 
-        // THE PARITY: the previewed deletion inventory (deployment dirs,
-        // releases, trees, ledger entries) EXACTLY equals the real one.
+        // THE PARITY (PLANNED == REMOVED + PENDING): the preview reports
+        // the PLANNED deletion sets ("would remove N" — the candidates); the
+        // execution reports REMOVED + PENDING. The two must reconcile: the
+        // previewed candidate sets (the `sweep_*` lists and the ledger
+        // entries) are IDENTICAL between the preview and the execution, and
+        // the executed sweep — which completed clean — removed EXACTLY the
+        // previewed candidates (removed == planned, nothing left pending).
         assert_eq!(
-            preview.discards, executed.discards,
-            "the dry-run preview must enumerate EXACTLY the deletions the real checkpoint performs (t1_len={t1_len}, t2_len={t2_len}, at={at})"
+            preview.discards.discarded_entries, executed.discards.discarded_entries,
+            "the previewed and executed ledger discard sets must match (t1_len={t1_len}, t2_len={t2_len}, at={at})"
+        );
+        assert_eq!(
+            preview.discards.sweep_deployments, executed.discards.sweep_deployments,
+            "the previewed PLANNED deployment dirs must equal the executed candidate sets (t1_len={t1_len}, t2_len={t2_len}, at={at})"
+        );
+        assert_eq!(
+            preview.discards.sweep_releases, executed.discards.sweep_releases,
+            "the previewed PLANNED release records must equal the executed candidate sets (t1_len={t1_len}, t2_len={t2_len}, at={at})"
+        );
+        assert_eq!(
+            preview.discards.sweep_objects, executed.discards.sweep_objects,
+            "the previewed PLANNED tree objects must equal the executed candidate sets (t1_len={t1_len}, t2_len={t2_len}, at={at})"
+        );
+        assert_eq!(
+            executed.discards.removed_deployments,
+            preview.discards.sweep_deployments.len(),
+            "the executed sweep removed EXACTLY the previewed deployment candidates (nothing pending)"
+        );
+        assert_eq!(
+            executed.discards.removed_releases,
+            preview.discards.sweep_releases.len(),
+            "the executed sweep removed EXACTLY the previewed release candidates (nothing pending)"
+        );
+        assert_eq!(
+            executed.discards.removed_objects,
+            preview.discards.sweep_objects.len(),
+            "the executed sweep removed EXACTLY the previewed tree candidates (nothing pending)"
         );
         // The pre-suffix-only artifact MUST be in both (the fix).
         assert!(

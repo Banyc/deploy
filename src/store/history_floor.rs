@@ -63,6 +63,7 @@ use crate::error::{Error, Result};
 use crate::model::{DeploymentId, ReleaseId};
 use crate::records::{DeploymentStatus, LedgerEntry};
 use crate::store::atomic::{path_state, write_atomic_replace};
+use crate::store::gc::SweepStageStats;
 use crate::store::local::LocalStore;
 use std::collections::BTreeSet;
 
@@ -82,20 +83,42 @@ use std::collections::BTreeMap;
 /// performed deletions. The dry-run preview enumerates precisely this; the
 /// real checkpoint replaces the ledger with the retained suffix and then
 /// sweeps exactly the `sweep_*` sets.
+///
+/// # Planned vs removed
+///
+/// The `sweep_*` lists are the PLANNED candidate sets (what a dry-run
+/// preview reports — the sweep's enumeration). The `removed_*` counters are
+/// the counts ACTUALLY unlinked — incremented only after a successful
+/// `remove_dir_all` — so `sweep_*.len() - removed_*` is the PENDING
+/// remainder (candidates identified but not removed: an aborted stage, or a
+/// stage that never ran because an earlier stage failed). A candidate is
+/// never counted as removed unless the filesystem unlink succeeded.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LedgerDiscards {
     /// Deployment ids whose entries were dropped from the ledger
     /// (everything strictly BEFORE the checkpoint deployment's position).
     pub discarded_entries: Vec<String>,
     /// Deployment ids whose `deployments/<id>/` directories the sweep
-    /// deleted (unreachable: not in any retained ledger, not observed as
-    /// current, not an in-flight pending entry).
+    /// identified for deletion — the PLANNED set (unreachable: not in any
+    /// retained ledger, not observed as current, not an in-flight pending
+    /// entry). The actually-unlinked count is `removed_deployments`.
     pub sweep_deployments: Vec<String>,
-    /// Release ids whose `releases/<id>/` directories the sweep deleted.
+    /// Release ids whose `releases/<id>/` directories the sweep identified
+    /// for deletion — the planned set. The actually-unlinked count is
+    /// `removed_releases`.
     pub sweep_releases: Vec<String>,
     /// Tree digests whose `objects/sha256/<digest>/` directories the sweep
-    /// deleted.
+    /// identified for deletion — the planned set. The actually-unlinked
+    /// count is `removed_objects`.
     pub sweep_objects: Vec<String>,
+    /// Deployment dirs ACTUALLY unlinked (only successful unlinks count).
+    /// Zero on a dry-run preview — the preview reports the planned sets
+    /// only.
+    pub removed_deployments: usize,
+    /// Release records actually unlinked (successful unlinks only).
+    pub removed_releases: usize,
+    /// Tree objects actually unlinked (successful unlinks only).
+    pub removed_objects: usize,
 }
 
 /// A HYPOTHETICAL LEDGER OVERRIDE for ONE target, consumed by the sweep's
@@ -538,10 +561,18 @@ impl LocalStore {
     /// retry-required. The release-record and tree-object stages are performed
     /// by the GLOBAL ARTIFACT GC ([`crate::store::gc::LocalStore::gc_artifacts`])
     /// — its own faults ([`FaultKind::GcScan`] / [`FaultKind::GcDeleteReleases`]
-    /// / [`FaultKind::GcDeleteTrees`]) fire inside the pass. Deletions are
-    /// tri-state (`path_state`): an already-removed target is skipped; ANY
-    /// other stat or removal error stops the stage. Returns the performed
-    /// deletions and whether EVERY stage ran clean.
+    /// / [`FaultKind::GcDeleteTrees`]) fire inside the pass, and its
+    /// per-candidate unlink faults ([`FaultKind::GcUnlinkReleases`] /
+    /// [`FaultKind::GcUnlinkTrees`], armed with
+    /// [`crate::testutil::test_faults::FaultRegistry::arm_release_unlink_after`]
+    /// / `arm_tree_unlink_after`) fail the k-th unlink MID-stage. Deletions
+    /// are tri-state (`path_state`): an already-removed target is skipped; ANY
+    /// other stat or removal error stops the stage. FAIL CLOSED: a failed (or
+    /// faulted) stage stops the sweep — the later stages stay PENDING (their
+    /// candidates are planned, nothing removed). Returns the sweep's
+    /// PLANNED candidate sets plus the counts ACTUALLY unlinked per category
+    /// (only successful unlinks — see [`LedgerDiscards`]) and whether EVERY
+    /// stage ran clean.
     /// `ledger_override` — the checkpoint's retained-suffix override, passed
     /// to BOTH the discard enumeration and the artifact GC so the sweep
     /// stays on the SAME reachability the dry-run preview reported; `None`
@@ -552,22 +583,25 @@ impl LocalStore {
         anchor: &str,
         ledger_override: Option<&LedgerOverride>,
     ) -> Result<(LedgerDiscards, bool)> {
-        let discards = self.sweep_discards(config, ledger_override)?;
+        let mut discards = self.sweep_discards(config, ledger_override)?;
         let mut complete = true;
-        // Stage 1: deployment directories.
+        // Stage 1: deployment directories. The deployment stage's own
+        // per-candidate unlink fault (`SweepDeploymentsNth`) fires INSIDE
+        // `delete_dirs`; the `SweepDeployments` entry fault skips the stage.
         #[cfg(test)]
-        if self
+        let depl_faulted = self
             .fault_registry()
-            .consume(FaultKind::SweepDeployments, "")
-        {
-            complete = false;
-        } else if let Err(e) = self.delete_dirs(&discards.sweep_deployments, "deployment") {
-            complete = false;
-            let _ = e;
-        }
+            .consume(FaultKind::SweepDeployments, "");
         #[cfg(not(test))]
-        if let Err(_e) = self.delete_dirs(&discards.sweep_deployments, "deployment") {
+        let depl_faulted = false;
+        if depl_faulted {
             complete = false;
+        } else {
+            let depl = self.delete_dirs(&discards.sweep_deployments);
+            discards.removed_deployments = depl.removed;
+            if !depl.completed {
+                complete = false;
+            }
         }
         // Stages 2+3: unreachable release records and tree objects — the
         // artifact GC recomputes the retained set from the ledgers (each
@@ -575,41 +609,90 @@ impl LocalStore {
         // pending entries, and the pins, then unlinks the unreachable
         // releases and objects. The `SweepReleases` / `SweepObjects` stage
         // faults each block the whole artifact pass BEFORE any deletion; the
-        // GC's own faults (`GcScan` / `GcDeleteReleases` / `GcDeleteTrees`)
-        // fire inside it.
+        // GC's own faults (`GcScan` / `GcDeleteReleases` / `GcDeleteTrees` /
+        // the per-candidate `GcUnlinkReleases` / `GcUnlinkTrees`) fire
+        // inside it. FAIL CLOSED: when an earlier stage failed or faulted
+        // (`complete` already false) the artifact stages stay PENDING —
+        // nothing is removed and the retry recomputes reachability fresh.
         #[cfg(test)]
-        if self.fault_registry().consume(FaultKind::SweepReleases, "")
-            || self.fault_registry().consume(FaultKind::SweepObjects, "")
-        {
-            complete = false;
-        } else if let Err(e) = self.gc_artifacts(anchor, config, ledger_override) {
-            complete = false;
-            let _ = e;
-        }
+        let gc_faulted = complete
+            && (self.fault_registry().consume(FaultKind::SweepReleases, "")
+                || self.fault_registry().consume(FaultKind::SweepObjects, ""));
         #[cfg(not(test))]
-        if let Err(_e) = self.gc_artifacts(anchor, config, ledger_override) {
+        let gc_faulted = false;
+        if gc_faulted {
             complete = false;
+        } else if complete {
+            match self.gc_artifacts(anchor, config, ledger_override) {
+                Ok(gc) => {
+                    discards.removed_releases = gc.removed_releases;
+                    discards.removed_objects = gc.removed_trees;
+                    if !gc.completed {
+                        complete = false;
+                    }
+                }
+                Err(_e) => {
+                    complete = false;
+                }
+            }
         }
         Ok((discards, complete))
     }
 
-    /// Remove one stage's directory set (all under the same root), tri-state
-    /// skip for already-removed dirs; any stat/removal failure aborts the
-    /// stage.
-    fn delete_dirs(&self, names: &[String], kind: &str) -> Result<()> {
+    /// Remove the DEPLOYMENT-DIR stage's directory set, tri-state skip for
+    /// already-removed dirs; any stat/removal failure stops the stage (fail
+    /// closed — no further deletions, the remaining candidates stay
+    /// pending). Returns the planned candidate count and the count ACTUALLY
+    /// unlinked (only successful unlinks) plus whether the stage ran clean.
+    fn delete_dirs(&self, names: &[String]) -> SweepStageStats {
+        let planned = names.len();
+        let mut removed = 0usize;
         for name in names {
-            let dir = match kind {
-                "deployment" => self.deployment_dir(name),
-                "release" => self.base().join(crate::layout::RELEASES).join(name),
-                _ => self.base().join(crate::layout::objects()).join(name),
-            };
-            if path_state(&dir)? {
-                std::fs::remove_dir_all(&dir).map_err(|e| {
-                    Error::store(format!("sweep {} dir {}: {e}", kind, dir.display()))
-                })?;
+            let dir = self.deployment_dir(name);
+            // Test-only per-candidate fault hook: the K-TH deployment-dir
+            // unlink fails — the stage aborts (fail closed), the count
+            // stays at the successful unlinks so far, and the remaining
+            // candidates stay pending.
+            #[cfg(test)]
+            if self
+                .fault_registry()
+                .consume_unlink(FaultKind::SweepDeploymentsNth, "")
+            {
+                return SweepStageStats {
+                    planned,
+                    removed,
+                    completed: false,
+                };
             }
+            let present = match path_state(&dir) {
+                Ok(p) => p,
+                Err(_) => {
+                    return SweepStageStats {
+                        planned,
+                        removed,
+                        completed: false,
+                    };
+                }
+            };
+            if !present {
+                continue;
+            }
+            if std::fs::remove_dir_all(&dir).is_err() {
+                // FAIL CLOSED: stop the stage; only the successful unlinks
+                // count as removed.
+                return SweepStageStats {
+                    planned,
+                    removed,
+                    completed: false,
+                };
+            }
+            removed += 1;
         }
-        Ok(())
+        SweepStageStats {
+            planned,
+            removed,
+            completed: true,
+        }
     }
 }
 

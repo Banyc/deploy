@@ -156,6 +156,23 @@ pub(crate) mod test_faults {
         /// The artifact GC's TREE-OBJECT deletion phase, keyed by the
         /// checkpoint deployment id. Fires before any tree dir is removed.
         GcDeleteTrees,
+        /// The artifact GC's K-TH RELEASE unlink, keyed by the checkpoint
+        /// deployment id and consumed PER CANDIDATE by the release-deletion
+        /// loop on a sequence counter: the unlink attempt after k successful
+        /// deletions fails — exactly k release records are removed and the
+        /// stage aborts (fail closed) with the remaining candidates pending.
+        /// Armed via [`FaultRegistry::arm_release_unlink_after`].
+        GcUnlinkReleases,
+        /// The artifact GC's K-TH TREE unlink — same per-candidate sequence
+        /// semantics as [`FaultKind::GcUnlinkReleases`], in the tree
+        /// deletion loop. Armed via [`FaultRegistry::arm_tree_unlink_after`].
+        GcUnlinkTrees,
+        /// The checkpoint sweep's K-TH DEPLOYMENT-DIR deletion (global empty
+        /// key like the other sweep kinds), consumed per candidate by the
+        /// deployment stage: the unlink fails after k successful deletions
+        /// and the stage aborts with the remaining candidates pending.
+        /// Armed via [`FaultRegistry::arm_deployment_unlink_after`].
+        SweepDeploymentsNth,
         /// The checkpoint's ATOMIC LEDGER REPLACEMENT, fired BEFORE any I/O
         /// (keyed by target): the checkpoint fails with `Err`, NO deletion
         /// happens, and the visible ledger is wholly OLD.
@@ -211,6 +228,14 @@ pub(crate) mod test_faults {
     #[derive(Default)]
     pub(crate) struct FaultRegistry {
         inner: Mutex<BTreeMap<FaultKey, ()>>,
+        /// Per-candidate SEQUENCE-COUNTER arms: (kind, deployment id) ->
+        /// (the unlink call number the fault fires ON, calls so far). An arm
+        /// with target N fires on the N-th `consume_unlink` call for the
+        /// kind — the `arm_*_unlink_after(k)` methods store k+1, so the
+        /// fault fires after k successful unlinks (the (k+1)-th unlink
+        /// attempt fails) and the stage aborts with exactly k candidates
+        /// removed and the rest pending.
+        unlinks: Mutex<BTreeMap<(FaultKind, String), (usize, usize)>>,
     }
 
     impl FaultRegistry {
@@ -278,6 +303,7 @@ pub(crate) mod test_faults {
         /// a later step of the same fixture.
         pub(crate) fn clear(&self) {
             self.inner.lock().unwrap().clear();
+            self.unlinks.lock().unwrap().clear();
         }
 
         // ---- arm_* convenience surface (historical API) --------------
@@ -441,6 +467,69 @@ pub(crate) mod test_faults {
         /// key).
         pub(crate) fn arm_write_sweep_debt(&self) {
             self.arm(FaultKind::WriteSweepDebt, "");
+        }
+
+        // ---- per-candidate SEQUENCE-COUNTER unlink faults -----------------
+        //
+        // The k-th unlink failure arms: the stage aborts AFTER `k`
+        // successful unlinks — the (k+1)-th unlink attempt fails — so
+        // exactly `k` candidates are removed and the remaining candidates
+        // stay PENDING (planned, still on disk). The count is consumed per
+        // candidate by the deletion loops ([`FaultRegistry::consume_unlink`])
+        // keyed by the checkpoint deployment id (or the empty global key for
+        // the deployment stage, like the other sweep kinds).
+
+        /// Arm the artifact GC's RELEASE stage to abort after `k` successful
+        /// release unlinks: the (k+1)-th unlink attempt fails, exactly `k`
+        /// candidates are removed, and the rest stay pending (the k-th
+        /// release unlink arm). Keyed by the checkpoint deployment id.
+        pub(crate) fn arm_release_unlink_after(&self, deployment_id: &str, k: usize) {
+            self.arm_unlink_after(FaultKind::GcUnlinkReleases, deployment_id, k);
+        }
+
+        /// Arm the artifact GC's TREE stage to abort after `k` successful
+        /// tree unlinks — same semantics as
+        /// [`FaultRegistry::arm_release_unlink_after`].
+        pub(crate) fn arm_tree_unlink_after(&self, deployment_id: &str, k: usize) {
+            self.arm_unlink_after(FaultKind::GcUnlinkTrees, deployment_id, k);
+        }
+
+        /// Arm the checkpoint sweep's DEPLOYMENT-DIR stage to abort after
+        /// `k` successful deletions (the k-th deployment unlink arm;
+        /// global empty key, like the other sweep kinds).
+        pub(crate) fn arm_deployment_unlink_after(&self, k: usize) {
+            self.arm_unlink_after(FaultKind::SweepDeploymentsNth, "", k);
+        }
+
+        /// Shared arm: the fault fires on the (k+1)-th `consume_unlink` call
+        /// — k deletions succeed first.
+        fn arm_unlink_after(&self, kind: FaultKind, deployment_id: &str, k: usize) {
+            self.unlinks
+                .lock()
+                .unwrap()
+                .insert((kind, deployment_id.to_string()), (k + 1, 0));
+        }
+
+        /// Consume the per-candidate sequence-counter fault for `kind`: each
+        /// call advances the counter, and the call that reaches the armed
+        /// target returns `true` (that unlink fails and the stage aborts)
+        /// and disarms. Every other call returns `false` (the unlink
+        /// succeeds).
+        pub(crate) fn consume_unlink(&self, kind: FaultKind, deployment_id: &str) -> bool {
+            let mut m = self.unlinks.lock().unwrap();
+            let key = (kind, deployment_id.to_string());
+            match m.get_mut(&key) {
+                Some((target, count)) => {
+                    *count += 1;
+                    if *count == *target {
+                        m.remove(&key);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => false,
+            }
         }
     }
 }

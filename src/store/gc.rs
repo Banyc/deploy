@@ -105,11 +105,36 @@ pub struct GcOutcome {
     /// the pass aborted (fail closed — see the module docs) or was not
     /// attempted because an earlier sweep stage faulted.
     pub completed: bool,
-    /// Number of unreachable release records (`releases/<id>/` dirs) removed.
-    pub removed_releases: usize,
+    /// Number of unreachable release records (`releases/<id>/` dirs) the
+    /// pass IDENTIFIED as deletion candidates — the PLANNED set (includes
+    /// the already-removed ones).
+    pub planned_releases: usize,
     /// Number of unreachable tree objects (`objects/sha256/<digest>/` dirs)
-    /// removed.
+    /// identified as candidates — the planned set.
+    pub planned_trees: usize,
+    /// Number of unreachable release records ACTUALLY UNLINKED — only
+    /// successful `remove_dir_all` calls count. A candidate whose unlink
+    /// failed mid-stage (or whose stage never ran) is NEVER counted here;
+    /// it stays in the planned set as PENDING.
+    pub removed_releases: usize,
+    /// Number of unreachable tree objects actually unlinked (successful
+    /// unlinks only).
     pub removed_trees: usize,
+}
+
+/// ONE deletion stage's outcome (deployment dirs / release records / tree
+/// objects): how many candidates were identified (`planned`), how many were
+/// ACTUALLY unlinked (`removed` — incremented only after a successful
+/// `remove_dir_all`), and whether the stage ran clean (`completed`). A
+/// mid-stage failure STOPS the stage (fail closed — no further unlinks):
+/// the removed count reflects exactly the successful unlinks and the
+/// remaining candidates stay PENDING (`planned - removed`), never reported
+/// as removed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SweepStageStats {
+    pub planned: usize,
+    pub removed: usize,
+    pub completed: bool,
 }
 
 /// Enumerate the store's targets (every directory under `targets/`), sorted
@@ -194,21 +219,62 @@ impl LocalStore {
                 )));
             }
         };
-        let removed_releases = self.delete_unretained_releases(anchor, &retained)?;
-        let removed_trees = self.delete_unretained_trees(anchor, &retained)?;
+        // `anchor` is the test-only fault-registry key (see the deletion
+        // functions) — the argument exists only under `#[cfg(test)]`.
+        #[cfg(test)]
+        let releases = self.delete_unretained_releases(anchor, &retained)?;
+        #[cfg(not(test))]
+        let releases = self.delete_unretained_releases(&retained)?;
+        // FAIL CLOSED: a failed release stage stops the artifact pass — the
+        // tree stage stays PENDING (its candidates are planned, nothing
+        // removed). The tree candidates are still enumerated so the planned
+        // count is exact.
+        let trees = if releases.completed {
+            #[cfg(test)]
+            let trees = self.delete_unretained_trees(anchor, &retained)?;
+            #[cfg(not(test))]
+            let trees = self.delete_unretained_trees(&retained)?;
+            trees
+        } else {
+            let planned = match enumerate_dirs(&self.base().join(layout::objects())) {
+                Ok(names) => names
+                    .iter()
+                    .filter(|n| !retained.trees.contains(*n))
+                    .count(),
+                Err(_) => 0,
+            };
+            SweepStageStats {
+                planned,
+                removed: 0,
+                completed: false,
+            }
+        };
         Ok(GcOutcome {
-            completed: true,
-            removed_releases,
-            removed_trees,
+            completed: releases.completed && trees.completed,
+            planned_releases: releases.planned,
+            planned_trees: trees.planned,
+            removed_releases: releases.removed,
+            removed_trees: trees.removed,
         })
     }
 
     /// Unlink every release record NOT in the retained set, then fsync the
     /// `releases/` parent so the unlinks are durable. A deletion is TRI-STATE:
-    /// an already-removed dir (a previous interrupted pass) is a skip; ANY
-    /// other stat or deletion error PROPAGATES (fail closed — a deletion
-    /// pass that cannot remove one dir must not silently end early).
-    fn delete_unretained_releases(&self, anchor: &str, retained: &ReachableSet) -> Result<usize> {
+    /// an already-removed dir (a previous interrupted pass) is a skip. FAIL
+    /// CLOSED: ANY stat, unlink, or fsync failure STOPS the stage — the
+    /// removed count reports exactly the successful unlinks and the remaining
+    /// candidates stay PENDING (planned, never reported as removed). The ONLY
+    /// `Err` here is a root-enumeration read failure, which aborts the pass
+    /// BEFORE any deletion.
+    ///
+    /// `anchor` is TEST-ONLY: the per-fixture fault registry's key (the
+    /// triggering checkpoint's deployment id); production never depends on
+    /// it.
+    fn delete_unretained_releases(
+        &self,
+        #[cfg(test)] anchor: &str,
+        retained: &ReachableSet,
+    ) -> Result<SweepStageStats> {
         // Fault hook (test-only, keyed by the checkpoint deployment id):
         // the release-deletion phase fails BEFORE any release is removed —
         // the extra garbage stays and the retry reclaims it.
@@ -222,32 +288,85 @@ impl LocalStore {
             ));
         }
         let root = self.base().join(layout::RELEASES);
+        let mut candidates = enumerate_dirs(&root)?;
+        candidates.retain(|n| !retained.releases.contains(n));
+        let planned = candidates.len();
         let mut removed = 0usize;
-        for name in enumerate_dirs(&root)? {
-            if retained.releases.contains(&name) {
+        for name in &candidates {
+            let dir = self.release_dir(&ReleaseId::new(name.clone()));
+            // TRI-STATE: an already-removed dir (a previous interrupted
+            // pass) is a skip — it is neither removed now nor pending. ANY
+            // other stat failure stops the stage (fail closed) with the
+            // successful-unlink count so far.
+            let present = match path_state(&dir) {
+                Ok(p) => p,
+                Err(_) => {
+                    return Ok(SweepStageStats {
+                        planned,
+                        removed,
+                        completed: false,
+                    });
+                }
+            };
+            if !present {
                 continue;
             }
-            let dir = self.release_dir(&ReleaseId::new(name.clone()));
-            if path_state(&dir)? {
-                std::fs::remove_dir_all(&dir).map_err(|e| {
-                    Error::store(format!(
-                        "artifact GC (triggered by checkpoint {anchor}): remove release dir {}: {e}",
-                        dir.display()
-                    ))
-                })?;
-                removed += 1;
+            // Test-only per-candidate fault hook: the K-TH release unlink
+            // fails — the stage aborts (fail closed), the count stays at the
+            // successful unlinks so far, and the remaining candidates stay
+            // pending.
+            #[cfg(test)]
+            if self
+                .fault_registry()
+                .consume_unlink(FaultKind::GcUnlinkReleases, anchor)
+            {
+                return Ok(SweepStageStats {
+                    planned,
+                    removed,
+                    completed: false,
+                });
             }
+            if std::fs::remove_dir_all(&dir).is_err() {
+                // FAIL CLOSED: the unlink failed — stop the stage. The
+                // failed candidate and everything after it stay pending;
+                // only the successful unlinks count as removed.
+                return Ok(SweepStageStats {
+                    planned,
+                    removed,
+                    completed: false,
+                });
+            }
+            removed += 1;
         }
         // Durable unlink: without the parent fsync the removal may not
-        // survive power loss and the space is not reclaimed.
-        sync_parent_dir(&root)?;
-        Ok(removed)
+        // survive power loss and the space is not reclaimed. A failed fsync
+        // leaves the stage incomplete (the unlinks are not yet durable) —
+        // the counts still report exactly what was unlinked.
+        if sync_parent_dir(&root).is_err() {
+            return Ok(SweepStageStats {
+                planned,
+                removed,
+                completed: false,
+            });
+        }
+        Ok(SweepStageStats {
+            planned,
+            removed,
+            completed: true,
+        })
     }
 
     /// Unlink every tree object NOT in the retained tree set, then fsync
     /// the `objects/sha256/` parent. Same tri-state and fail-closed rules as
-    /// the release phase.
-    fn delete_unretained_trees(&self, anchor: &str, retained: &ReachableSet) -> Result<usize> {
+    /// the release phase: a failure stops the stage and the remaining
+    /// candidates stay pending (planned, never reported as removed).
+    /// `anchor` is TEST-ONLY (the fault registry's key, like the release
+    /// stage's).
+    fn delete_unretained_trees(
+        &self,
+        #[cfg(test)] anchor: &str,
+        retained: &ReachableSet,
+    ) -> Result<SweepStageStats> {
         // Fault hook (test-only): the tree-deletion phase fails before any
         // removal.
         #[cfg(test)]
@@ -260,26 +379,67 @@ impl LocalStore {
             ));
         }
         let root = self.base().join(layout::objects());
+        let mut candidates = enumerate_dirs(&root)?;
+        candidates.retain(|n| !retained.trees.contains(n));
+        let planned = candidates.len();
         let mut removed = 0usize;
-        for name in enumerate_dirs(&root)? {
-            if retained.trees.contains(&name) {
-                continue;
-            }
+        for name in &candidates {
             // The digest directory itself (`objects/sha256/<digest>/`),
             // holding `root/` and `tree.json`.
             let dir = self.base().join(layout::objects()).join(name);
-            if path_state(&dir)? {
-                std::fs::remove_dir_all(&dir).map_err(|e| {
-                    Error::store(format!(
-                        "artifact GC (triggered by checkpoint {anchor}): remove object dir {}: {e}",
-                        dir.display()
-                    ))
-                })?;
-                removed += 1;
+            let present = match path_state(&dir) {
+                Ok(p) => p,
+                Err(_) => {
+                    return Ok(SweepStageStats {
+                        planned,
+                        removed,
+                        completed: false,
+                    });
+                }
+            };
+            if !present {
+                continue;
             }
+            // Test-only per-candidate fault hook: the K-TH tree unlink
+            // fails — the stage aborts (fail closed), the count stays at the
+            // successful unlinks so far, and the remaining candidates stay
+            // pending.
+            #[cfg(test)]
+            if self
+                .fault_registry()
+                .consume_unlink(FaultKind::GcUnlinkTrees, anchor)
+            {
+                return Ok(SweepStageStats {
+                    planned,
+                    removed,
+                    completed: false,
+                });
+            }
+            if std::fs::remove_dir_all(&dir).is_err() {
+                // FAIL CLOSED: the unlink failed — stop the stage. The
+                // failed candidate and everything after it stay pending;
+                // only the successful unlinks count as removed.
+                return Ok(SweepStageStats {
+                    planned,
+                    removed,
+                    completed: false,
+                });
+            }
+            removed += 1;
         }
-        sync_parent_dir(&root)?;
-        Ok(removed)
+        // Durable unlink (see the release stage).
+        if sync_parent_dir(&root).is_err() {
+            return Ok(SweepStageStats {
+                planned,
+                removed,
+                completed: false,
+            });
+        }
+        Ok(SweepStageStats {
+            planned,
+            removed,
+            completed: true,
+        })
     }
 }
 
@@ -989,5 +1149,281 @@ interval_seconds = 0
             store.object_root(&TreeDigest::new("tree-garbage")).exists(),
             "zero deletions: the garbage tree survives"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // PLANNED vs REMOVED — THE COUNTING FIX
+    //
+    // The user-reported bug: "checkpoint output can claim candidate files
+    // were deleted when deletion failed". The fix splits PLANNED (the
+    // candidates the sweep identified — the preview reports these) from
+    // REMOVED (only successful filesystem unlinks — the execution reports
+    // these plus the PENDING remainder). A candidate is NEVER counted as
+    // removed unless the unlink succeeded: a failure AFTER the k-th
+    // deletion aborts the stage (fail closed) with exactly k removed and
+    // the rest PENDING (planned, still on disk); stages after the aborted
+    // one stay pending too. The property generates inventories (deployment
+    // dirs / release records / tree objects), injects the k-th unlink
+    // failure in EVERY stage (the per-fixture FaultRegistry's per-candidate
+    // sequence-counter kinds — [`FaultKind::SweepDeploymentsNth`] /
+    // [`FaultKind::GcUnlinkReleases`] / [`FaultKind::GcUnlinkTrees`]), and
+    // asserts the REPORTED REMOVALS EQUAL THE FILESYSTEM DELTA, the
+    // remaining candidates stay PENDING (reported and still on disk), and
+    // RETRY CONVERGES (the next sweep removes exactly the still-present
+    // candidates). Bounded 16 cases, house fixed seed; the unit test pins
+    // the user's deterministic case.
+
+    /// The filesystem-delta oracle: the number of immediate subdirectories
+    /// under `root` (0 when the root does not exist).
+    fn count_dir_entries(root: &std::path::Path) -> usize {
+        std::fs::read_dir(root).map(|rd| rd.count()).unwrap_or(0)
+    }
+
+    /// Run ONE planned-vs-removed case: `stage` (0 = deployment dirs, 1 =
+    /// release records, 2 = tree objects) gets the failure injected AFTER
+    /// its k-th deletion; every candidate is unreachable (no pins, no
+    /// ledger). Asserts the full contract — reported removals == real
+    /// unlinks, pending candidates stay on disk, retry converges.
+    fn run_planned_vs_removed_case(
+        n_deployments: usize,
+        n_releases: usize,
+        n_trees: usize,
+        k: usize,
+        stage: usize,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let config = config_with_pin(dir.path(), None);
+        let deploys: Vec<String> = (0..n_deployments)
+            .map(|i| format!("deploy-c-{i}"))
+            .collect();
+        let rels: Vec<String> = (0..n_releases).map(|i| format!("rel-c-{i}")).collect();
+        let trees: Vec<String> = (0..n_trees).map(|i| format!("tree-c-{i}")).collect();
+        for d in &deploys {
+            seed_deployment_dir(&store, d);
+        }
+        for r in &rels {
+            seed_named_release(&store, r);
+        }
+        for t in &trees {
+            seed_object(&store, t);
+        }
+        // The k-th unlink arm: the failure must fire strictly inside the
+        // stage's candidate set, so k is clamped to a valid "after k
+        // deletions" point for the faulted stage.
+        let max_k = match stage {
+            0 => n_deployments,
+            1 => n_releases,
+            _ => n_trees,
+        };
+        let k = k % max_k;
+        let reg = store.fault_registry();
+        match stage {
+            0 => reg.arm_deployment_unlink_after(k),
+            1 => reg.arm_release_unlink_after("anchor", k),
+            _ => reg.arm_tree_unlink_after("anchor", k),
+        }
+
+        let (discards, complete) = store.run_sweep(&config, "anchor", None).unwrap();
+        assert!(
+            !complete,
+            "the k-th unlink failure aborts the sweep (stage {stage}, k={k})"
+        );
+        // The PLANNED sets are the full candidate inventories.
+        assert_eq!(discards.sweep_deployments, deploys);
+        assert_eq!(discards.sweep_releases, rels);
+        assert_eq!(discards.sweep_objects, trees);
+        // The expected REMOVED counts: stages BEFORE the aborted one removed
+        // everything they planned; the aborted stage removed exactly k (its
+        // (k+1)-th unlink failed); stages AFTER it are pending (fail closed
+        // — nothing removed).
+        let (expected_depl, expected_rel, expected_tree) = match stage {
+            0 => (k, 0, 0),
+            1 => (n_deployments, k, 0),
+            _ => (n_deployments, n_releases, k),
+        };
+        assert_eq!(
+            discards.removed_deployments, expected_depl,
+            "deployment removals == the real unlinks (stage {stage}, k={k})"
+        );
+        assert_eq!(
+            discards.removed_releases, expected_rel,
+            "release removals == the real unlinks (stage {stage}, k={k})"
+        );
+        assert_eq!(
+            discards.removed_objects, expected_tree,
+            "tree removals == the real unlinks (stage {stage}, k={k})"
+        );
+        // THE FILESYSTEM DELTA: removed + still-present == planned, per
+        // category — a reported removal is a real unlink, never a candidate
+        // that is still on disk.
+        let depl_root = store.base().join("deployments");
+        let rel_root = store.base().join(crate::layout::RELEASES);
+        let tree_root = store.base().join(crate::layout::objects());
+        assert_eq!(
+            count_dir_entries(&depl_root),
+            deploys.len() - discards.removed_deployments,
+            "deployment dirs still on disk == planned - removed (stage {stage}, k={k})"
+        );
+        assert_eq!(
+            count_dir_entries(&rel_root),
+            rels.len() - discards.removed_releases,
+            "release dirs still on disk == planned - removed (stage {stage}, k={k})"
+        );
+        assert_eq!(
+            count_dir_entries(&tree_root),
+            trees.len() - discards.removed_objects,
+            "tree dirs still on disk == planned - removed (stage {stage}, k={k})"
+        );
+        // The pending candidates (the tail of each SORTED planned list —
+        // the deletion order IS the sorted enumeration order) stay on disk.
+        for d in discards
+            .sweep_deployments
+            .iter()
+            .skip(discards.removed_deployments)
+        {
+            assert!(
+                store.deployment_dir(d).exists(),
+                "pending deployment {d} stays on disk"
+            );
+        }
+        for r in discards
+            .sweep_releases
+            .iter()
+            .skip(discards.removed_releases)
+        {
+            assert!(
+                store.release_dir(&ReleaseId::new(r.clone())).exists(),
+                "pending release {r} stays on disk"
+            );
+        }
+        for t in discards.sweep_objects.iter().skip(discards.removed_objects) {
+            assert!(
+                store.object_root(&TreeDigest::new(t.clone())).exists(),
+                "pending tree {t} stays on disk"
+            );
+        }
+
+        // RETRY CONVERGES: the next fault-free sweep recomputes
+        // reachability fresh, removes EXACTLY the still-present candidates,
+        // and completes.
+        let (retry, retry_complete) = store.run_sweep(&config, "anchor", None).unwrap();
+        assert!(retry_complete, "the retry converges (stage {stage}, k={k})");
+        assert_eq!(
+            retry.removed_deployments,
+            deploys.len() - expected_depl,
+            "the retry removed exactly the pending deployment dirs"
+        );
+        assert_eq!(
+            retry.removed_releases,
+            rels.len() - expected_rel,
+            "the retry removed exactly the pending release records"
+        );
+        assert_eq!(
+            retry.removed_objects,
+            trees.len() - expected_tree,
+            "the retry removed exactly the pending tree objects"
+        );
+        assert_eq!(
+            count_dir_entries(&depl_root),
+            0,
+            "no deployment dir remains"
+        );
+        assert_eq!(count_dir_entries(&rel_root), 0, "no release dir remains");
+        assert_eq!(count_dir_entries(&tree_root), 0, "no tree dir remains");
+    }
+
+    proptest! {
+        // THE PROPERTY: generated inventories (deployment dirs, release
+        // records, tree objects) with a failure injected AFTER the k-th
+        // deletion in EVERY sweep stage — the REPORTED REMOVALS equal the
+        // FILESYSTEM DELTA, the remaining candidates stay PENDING (reported
+        // as planned/pending, still on disk), and RETRY CONVERGES (the next
+        // sweep removes exactly the still-present candidates). Bounded 16
+        // cases + the house fixed seed.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn sweep_removed_counts_match_filesystem_and_retry_converges(
+            n_deployments in 1usize..=4,
+            n_releases in 1usize..=4,
+            n_trees in 1usize..=4,
+            k in 0usize..=4,
+        ) {
+            // EVERY sweep stage gets the k-th failure (a fresh fixture per
+            // stage — the per-fixture arms must not interact).
+            for stage in 0..3 {
+                run_planned_vs_removed_case(n_deployments, n_releases, n_trees, k, stage);
+            }
+        }
+    }
+
+    // ---- the deterministic unit test ---------------------------------------
+
+    /// THE USER-REQUIRED DETERMINISTIC CASE: 5 release candidates, the
+    /// failure armed AFTER the k=3rd deletion — removed == 3, pending == 2,
+    /// the disk holds EXACTLY the 2 pending candidates; the retry removes
+    /// those 2 and completes.
+    #[test]
+    fn unlink_failure_after_three_counts_removed_and_pending_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let config = config_with_pin(dir.path(), None);
+        let candidates: Vec<String> = (0..5).map(|i| format!("rel-u-{i}")).collect();
+        for r in &candidates {
+            seed_named_release(&store, r);
+        }
+        // Fail AFTER the 3rd deletion: rel-u-0..rel-u-2 are unlinked, the
+        // rel-u-3 unlink fails, and the stage aborts.
+        store.fault_registry().arm_release_unlink_after("anchor", 3);
+
+        let (discards, complete) = store.run_sweep(&config, "anchor", None).unwrap();
+        assert!(!complete, "the sweep is incomplete (retry-required)");
+        assert_eq!(
+            discards.sweep_releases, candidates,
+            "the PLANNED set is all 5 candidates"
+        );
+        assert_eq!(
+            discards.removed_releases, 3,
+            "removed == 3: exactly the successful unlinks"
+        );
+        assert_eq!(
+            discards.sweep_releases.len() - discards.removed_releases,
+            2,
+            "pending == 2: the remaining candidates are reported pending"
+        );
+        // THE FILESYSTEM DELTA: the disk holds EXACTLY the 2 pending
+        // candidates.
+        for r in &candidates[..3] {
+            assert!(
+                !store.release_dir(&ReleaseId::new(r.clone())).exists(),
+                "{r} was really unlinked"
+            );
+        }
+        for r in &candidates[3..] {
+            assert!(
+                store.release_dir(&ReleaseId::new(r.clone())).exists(),
+                "{r} stays pending on disk"
+            );
+        }
+        // RETRY CONVERGES: the next sweep removes exactly the 2
+        // still-present candidates and completes.
+        let (retry, retry_complete) = store.run_sweep(&config, "anchor", None).unwrap();
+        assert!(retry_complete, "the retry converges");
+        assert_eq!(
+            retry.removed_releases, 2,
+            "the retry removed exactly the 2 pending candidates"
+        );
+        for r in &candidates {
+            assert!(
+                !store.release_dir(&ReleaseId::new(r.clone())).exists(),
+                "no candidate remains after the retry"
+            );
+        }
     }
 }
