@@ -95,9 +95,11 @@ use crate::model::{
     PlacementSlotAssignment, ReleaseId, ServerId, SlotId, TargetName, TreeDigest,
 };
 use crate::scalar::{BehaviorDigest, RolloutGroupName, Timestamp};
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Deref;
+use std::marker::PhantomData;
+use std::ops::Index;
 
 // ---------------------------------------------------------------------------
 // DOMAIN SLOT TABLES: the membership + per-slot data are ONE table
@@ -107,34 +109,142 @@ use std::ops::Deref;
 // split into a single authoritative slot→slot-data table, so the
 // exact-key-set invariant (membership == desired keys == pre_push keys, no
 // duplicates) becomes STRUCTURAL: a [`NonEmptySlotTable`] is non-empty and
-// its keys are unique (a `BTreeMap` has no duplicate keys), so an intent can
-// never carry a member slot without its desired/pre-push entries, or an
+// its keys are unique (the ordered map has no duplicate keys), so an intent
+// can never carry a member slot without its desired/pre-push entries, or an
 // entry for a non-member slot. The WIRE types keep the split on-disk shape;
 // the wire → domain conversion builds the table and refuses disagreements
 // exactly as before.
+//
+// THE TABLE IS ORDERED: iteration (`keys` / `values` / `iter`) is in
+// INSERTION order — the DEPLOYMENT order — never sorted by slot id. The
+// wire's `slot_ids` is the authoritative deployment order (the same set the
+// commit marker `slots` payload records), and the wire → domain conversion
+// builds the table from that SEQUENCE, so the round trip preserves the
+// exact `slot_ids` order instead of silently re-sorting it.
+
+/// A PRIVATE ordered slot→value map: a `Vec<(SlotId, T)>` keeps the
+/// INSERTION SEQUENCE (the deployment order) and a `BTreeMap<SlotId, usize>`
+/// index gives O(log n) lookup. Iteration (`keys` / `values` / `iter`) is in
+/// INSERTION order — the deployment order — never sorted by slot id.
+/// `insert` APPENDS a new key at the end of the sequence and OVERWRITES an
+/// existing key in place (its position is preserved), so the sequence is
+/// exactly the order the entries were first inserted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OrderedSlotMap<T> {
+    entries: Vec<(SlotId, T)>,
+    index: BTreeMap<SlotId, usize>,
+}
+
+impl<T> Default for OrderedSlotMap<T> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            index: BTreeMap::new(),
+        }
+    }
+}
+
+impl<T> OrderedSlotMap<T> {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn from_map(map: BTreeMap<SlotId, T>) -> Self {
+        let entries: Vec<(SlotId, T)> = map.into_iter().collect();
+        let index = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (k, _))| (k.clone(), i))
+            .collect();
+        Self { entries, index }
+    }
+
+    fn into_map(self) -> BTreeMap<SlotId, T> {
+        self.entries.into_iter().collect()
+    }
+
+    fn insert(&mut self, key: SlotId, value: T) {
+        if let Some(&i) = self.index.get(&key) {
+            self.entries[i].1 = value;
+        } else {
+            self.index.insert(key.clone(), self.entries.len());
+            self.entries.push((key, value));
+        }
+    }
+
+    fn get(&self, key: &SlotId) -> Option<&T> {
+        self.index.get(key).map(|&i| &self.entries[i].1)
+    }
+
+    fn contains_key(&self, key: &SlotId) -> bool {
+        self.index.contains_key(key)
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &SlotId> {
+        self.entries.iter().map(|(k, _)| k)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &T> {
+        self.entries.iter().map(|(_, v)| v)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&SlotId, &T)> {
+        self.entries.iter().map(|(k, v)| (k, v))
+    }
+}
+
+impl<T> Index<&SlotId> for OrderedSlotMap<T> {
+    type Output = T;
+    fn index(&self, key: &SlotId) -> &Self::Output {
+        self.get(key).expect("no entry found for key")
+    }
+}
 
 /// A possibly-empty ordered slot→value table keyed by
 /// [`SlotId`] — the domain's keyed-by-slot collection type
 /// (the possibly-empty variant of [`NonEmptySlotTable`], used for the
 /// terminal's per-slot OUTCOMES, which are legitimately empty for a
-/// pre-mutation failure). Uniqueness is structural (`BTreeMap` keys); the
-/// table carries no other invariant. `Deref` exposes the underlying map so
-/// indexing / iteration / `get` work transparently.
-#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SlotTable<T>(BTreeMap<SlotId, T>);
+/// pre-mutation failure). Uniqueness is structural (the ordered map has no
+/// duplicate keys); the table carries no other invariant. Iteration
+/// (`keys` / `values` / `iter`) is in INSERTION order — the deployment
+/// order — never sorted by slot id.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct SlotTable<T>(OrderedSlotMap<T>);
 
 impl<T> SlotTable<T> {
     pub fn new() -> Self {
-        Self(BTreeMap::new())
+        Self(OrderedSlotMap::new())
     }
 
     pub fn from_map(map: BTreeMap<SlotId, T>) -> Self {
-        Self(map)
+        Self(OrderedSlotMap::from_map(map))
     }
 
     pub fn into_map(self) -> BTreeMap<SlotId, T> {
-        self.0
+        self.0.into_map()
+    }
+
+    /// Insert a slot→value entry, APPENDING a new key at the end of the
+    /// table's sequence (the deployment order) and overwriting an existing
+    /// key in place (its position is preserved).
+    pub fn insert(&mut self, key: SlotId, value: T) {
+        self.0.insert(key, value);
+    }
+
+    pub fn get(&self, key: &SlotId) -> Option<&T> {
+        self.0.get(key)
+    }
+
+    pub fn contains_key(&self, key: &SlotId) -> bool {
+        self.0.contains_key(key)
     }
 
     pub fn len(&self) -> usize {
@@ -144,12 +254,57 @@ impl<T> SlotTable<T> {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    pub fn keys(&self) -> impl Iterator<Item = &SlotId> {
+        self.0.keys()
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.0.values()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&SlotId, &T)> {
+        self.0.iter()
+    }
 }
 
-impl<T> Deref for SlotTable<T> {
-    type Target = BTreeMap<SlotId, T>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
+impl<T> Index<&SlotId> for SlotTable<T> {
+    type Output = T;
+    fn index(&self, key: &SlotId) -> &Self::Output {
+        &self.0[key]
+    }
+}
+
+impl<T: Serialize> Serialize for SlotTable<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.len()))?;
+        for (k, v) in self.iter() {
+            map.serialize_entry(k, v)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for SlotTable<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct SlotTableVisitor<T>(PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for SlotTableVisitor<T> {
+            type Value = SlotTable<T>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a slot table")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut access: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut table = OrderedSlotMap::new();
+                while let Some((k, v)) = access.next_entry()? {
+                    table.insert(k, v);
+                }
+                Ok(SlotTable(table))
+            }
+        }
+        deserializer.deserialize_map(SlotTableVisitor(PhantomData))
     }
 }
 
@@ -157,31 +312,46 @@ impl<T> Deref for SlotTable<T> {
 /// domain's authoritative membership-bearing collection type (the
 /// non-empty variant of [`SlotTable`], used for the deployment intent's
 /// slots and the degraded disposition's remaining changes). The domain
-/// invariant is STRUCTURAL: the key set is unique (`BTreeMap`) and
+/// invariant is STRUCTURAL: the key set is unique (the ordered map) and
 /// NON-EMPTY (the only constructor is the VERIFIED
-/// [`NonEmptySlotTable::build`], which refuses the empty map — a deployment
-/// that selects no slot cannot be represented). No duplicate/missing-key
-/// state exists in the domain: a member slot always carries its desired +
-/// pre-push entry, and no entry exists for a non-member.
+/// [`NonEmptySlotTable::build`], which refuses the empty table — a
+/// deployment that selects no slot cannot be represented). No
+/// duplicate/missing-key state exists in the domain: a member slot always
+/// carries its desired + pre-push entry, and no entry exists for a
+/// non-member. Iteration (`keys` / `values` / `iter`) is in INSERTION
+/// order — the deployment order — never sorted by slot id.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NonEmptySlotTable<T>(BTreeMap<SlotId, T>);
+pub struct NonEmptySlotTable<T>(OrderedSlotMap<T>);
 
 impl<T> NonEmptySlotTable<T> {
-    /// The VERIFIED constructor: refuse the empty map (fail closed — the
+    /// The VERIFIED constructor: refuse the empty table (fail closed — the
     /// domain cannot represent an empty deployment membership or an empty
-    /// remaining-changes set). Uniqueness needs no check (`BTreeMap` keys
-    /// are unique by construction).
-    pub fn build(map: BTreeMap<SlotId, T>) -> Result<Self> {
-        if map.is_empty() {
+    /// remaining-changes set). Uniqueness needs no check (the ordered map
+    /// keys are unique by construction). The table's INSERTION SEQUENCE is
+    /// the entry order of `entries` — the wire's `slot_ids` order — and
+    /// iteration preserves it exactly.
+    pub fn build<I>(entries: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = (SlotId, T)>,
+    {
+        let mut table = OrderedSlotMap::new();
+        for (key, value) in entries {
+            table.insert(key, value);
+        }
+        if table.is_empty() {
             return Err(Error::integrity(
                 "a non-empty slot table cannot be empty — the domain refuses an empty deployment membership / remaining-changes set",
             ));
         }
-        Ok(Self(map))
+        Ok(Self(table))
     }
 
     pub fn get(&self, key: &SlotId) -> Option<&T> {
         self.0.get(key)
+    }
+
+    pub fn contains_key(&self, key: &SlotId) -> bool {
+        self.0.contains_key(key)
     }
 
     pub fn len(&self) -> usize {
@@ -205,14 +375,14 @@ impl<T> NonEmptySlotTable<T> {
     }
 
     pub fn into_map(self) -> BTreeMap<SlotId, T> {
-        self.0
+        self.0.into_map()
     }
 }
 
-impl<T> Deref for NonEmptySlotTable<T> {
-    type Target = BTreeMap<SlotId, T>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
+impl<T> Index<&SlotId> for NonEmptySlotTable<T> {
+    type Output = T;
+    fn index(&self, key: &SlotId) -> &Self::Output {
+        &self.0[key]
     }
 }
 
@@ -427,33 +597,34 @@ impl LedgerIntentWire {
                 )));
             }
         }
-        // COLLAPSE the three projections into ONE table. The wire's per-slot
-        // duplicate facts (the `GenerationRef`'s assignment slot, the
-        // `pre_push` map key) are VERIFIED above and then dropped: the table
-        // key owns the slot identity, so the domain stores each fact exactly
-        // once (`DesiredGeneration` carries no redundant slot id, and
-        // `PreviousGeneration` has no map-key claim of its own).
-        let mut slots: BTreeMap<SlotId, IntentSlot> = BTreeMap::new();
-        for (key, desired) in &self.desired {
-            let pre_push =
-                self.pre_push
-                    .get(key)
-                    .and_then(|p| p.clone())
-                    .map(|p| PreviousGeneration {
-                        artifact: p.artifact,
-                        generation: p.generation,
+        // COLLAPSE the three projections into ONE table, in the wire's
+        // `slot_ids` SEQUENCE order (the deployment order) — never the
+        // sorted-by-id order of the per-slot maps. The exact-key-set
+        // equality verified above guarantees every member has its desired +
+        // pre_push entry, so each member's facts are read by member id.
+        let slots: Vec<(SlotId, IntentSlot)> =
+            self.slot_ids
+                .iter()
+                .map(|key| {
+                    let desired = &self.desired[key];
+                    let pre_push = self.pre_push.get(key).and_then(|p| p.clone()).map(|p| {
+                        PreviousGeneration {
+                            artifact: p.artifact,
+                            generation: p.generation,
+                        }
                     });
-            slots.insert(
-                key.clone(),
-                IntentSlot {
-                    desired: DesiredGeneration {
-                        generation: desired.generation.clone(),
-                        artifact: desired.assignment.artifact.clone(),
-                    },
-                    pre_push,
-                },
-            );
-        }
+                    (
+                        key.clone(),
+                        IntentSlot {
+                            desired: DesiredGeneration {
+                                generation: desired.generation.clone(),
+                                artifact: desired.assignment.artifact.clone(),
+                            },
+                            pre_push,
+                        },
+                    )
+                })
+                .collect();
         Ok(DeploymentIntent {
             deployment_id: self.deployment_id,
             target: self.target,
@@ -1202,10 +1373,8 @@ impl LedgerTerminalWire {
                 // the "successful with no outcomes" hole (an empty outcome
                 // table can never agree with a non-empty rollback).
                 let outcome_keys: BTreeSet<&SlotId> = outcomes.keys().collect();
-                let rollback_slot_keys: BTreeSet<&SlotId> =
-                    rollback.slots.keys().collect();
-                let rollback_binding_keys: BTreeSet<&SlotId> =
-                    rollback.bindings.keys().collect();
+                let rollback_slot_keys: BTreeSet<&SlotId> = rollback.slots.keys().collect();
+                let rollback_binding_keys: BTreeSet<&SlotId> = rollback.bindings.keys().collect();
                 if outcome_keys.is_empty() {
                     return Err(Error::integrity(format!(
                         "terminal {}: status Successful requires NON-EMPTY outcomes — a successful deployment records a complete rollback over exactly the slots it reports outcomes for",
@@ -1461,7 +1630,13 @@ pub struct ServerState {
     pub last_observed: Option<ObservedSlot>,
 }
 
-/// Where a plan's desired assignment comes from.
+/// Where a plan's desired assignment comes from — the WIRE (on-disk) form
+/// of the plan source. The wire keeps this shape: a `release:<id>` source
+/// names the release, and the CLAIMED rebinding proof lives in the
+/// separate [`DeploymentPlanWire::rebinding`] field ([`RebindingPlan`]).
+/// The VERIFYING CONVERSION ([`DeploymentPlanWire::into_domain`]) recomputes
+/// the proof and exposes the verified [`PlanOrigin`] on the domain — a
+/// Release origin without its proof is unrepresentable there.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlanSource {
     /// Materialize the currently mapped local files and assign each slot its
@@ -1474,11 +1649,39 @@ pub enum PlanSource {
     DeploymentRef(DeploymentId),
     /// Assign each current slot its variant from a named release — the
     /// release's OWN frozen topology applied onto the CURRENT physical
-    /// slots. The rebinding this performs is EXPLICIT: the plan carries it
-    /// as [`DeploymentPlan::rebinding`] ([`RebindingPlan`]), recording the
-    /// frozen slot→variant/group topology, the logical membership check,
-    /// and the current physical slots it binds onto.
+    /// slots. The rebinding this performs is EXPLICIT: the wire carries the
+    /// claimed proof as [`DeploymentPlanWire::rebinding`]
+    /// ([`RebindingPlan`]); the domain conversion verifies it and carries
+    /// the verified proof inside [`PlanOrigin::Release`].
     ReleaseRef(ReleaseId),
+}
+
+/// The VERIFIED origin of a deployment plan — the DOMAIN form of the wire's
+/// [`PlanSource`] + separate `rebinding` fields. THE SOURCE OWNS ITS
+/// REQUIRED PAYLOAD: a Release origin ([`PlanOrigin::Release`]) CARRIES its
+/// [`VerifiedReleaseRebinding`] (the proof) INSIDE the source — a Release
+/// origin without the proof is unrepresentable; HEAD and deployment origins
+/// carry none. The wire → domain conversion
+/// ([`DeploymentPlanWire::into_domain`]) RECOMPUTES the proof from the
+/// wire's claimed rebinding and the plan's own source/target/membership,
+/// succeeding only when the claimed rebinding matches the recomputed proof
+/// (a mismatch → [`crate::error::Error::integrity`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlanOrigin {
+    /// Materialize the currently mapped local files and assign each slot its
+    /// target-configured (current) variant.
+    Head,
+    /// Restore the stored state of a successful deployment, keyed by its
+    /// deployment id.
+    Deployment(DeploymentId),
+    /// Assign each current slot its variant from a named release — the
+    /// release's OWN frozen topology applied onto the CURRENT physical
+    /// slots. The rebinding this performs is EXPLICIT and VERIFIED: the
+    /// proof ([`VerifiedReleaseRebinding`]) is carried INSIDE the source.
+    Release {
+        release: ReleaseId,
+        rebinding: VerifiedReleaseRebinding,
+    },
 }
 
 /// The logical topology one slot is FROZEN into inside a release record:
@@ -1498,6 +1701,15 @@ pub struct FrozenSlotTopology {
     pub groups: Vec<String>,
 }
 
+/// The WIRE (claimed) rebinding context of a direct `release:<id>` plan: the
+/// historical release's frozen topology applied onto the CURRENT physical
+/// slots. This is the ON-DISK shape ([`DeploymentPlanWire::rebinding`]); the
+/// domain's verified form is [`VerifiedReleaseRebinding`] — the wire →
+/// domain conversion RECOMPUTES the proof from this claimed shape and the
+/// plan's own source/target/membership, succeeding only when the claimed
+/// rebinding matches the recomputed proof (a mismatch →
+/// [`crate::error::Error::integrity`]).
+///
 /// The membership proof backing a historical-release rebinding: the PROOF
 /// ([`MatchingMembership`]) that the release's FROZEN slot-id membership for
 /// the destination target and the target's CURRENT slot-id membership were
@@ -1526,9 +1738,8 @@ pub struct FrozenSlotTopology {
 /// slot→variant/group topology, the LOGICAL membership check (physical
 /// bindings MAY differ; the logical membership MUST match), and the CURRENT
 /// physical slots (`{server, deploy_dir}`) the frozen topology is bound
-/// onto. Produced at plan time in the `PushRef::Release` branch and recorded
-/// in [`DeploymentPlan::rebinding`]; HEAD and deployment-keyed plans carry
-/// `None`.
+/// onto. Produced at plan time in the `PushRef::Release` branch; HEAD and
+/// deployment-keyed plans carry `None`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RebindingPlan {
     /// The historical release being rebound.
@@ -1552,6 +1763,99 @@ pub struct RebindingPlan {
     /// slots (the group-filtered assignments); a full push records every
     /// member slot.
     pub current_physical_slots: BTreeMap<SlotId, PhysicalBinding>,
+}
+
+/// The VERIFIED rebinding proof carried by a Release-origin plan: the
+/// complete evidence that the plan's claimed rebinding is REAL — the
+/// historical release, the destination target, the release's frozen
+/// slot→variant/group topology, the membership PROOF (frozen == current,
+/// verified), the SELECTED plan slots (the plan's membership), and the
+/// current physical slots the frozen topology is bound onto. A Release
+/// origin WITHOUT this proof is unrepresentable ([`PlanOrigin::Release`]
+/// carries it INSIDE the source); HEAD and deployment origins carry none.
+///
+/// The ONLY construction path is [`VerifiedReleaseRebinding::verify`], which
+/// checks that every component agrees — the frozen topology's keys equal the
+/// membership's agreed slots, every selected plan slot is a member of the
+/// agreed membership, and the current physical slots cover exactly the
+/// selected plan slots. The wire → domain conversion
+/// ([`DeploymentPlanWire::into_domain`]) RECOMPUTES the proof from the
+/// wire's claimed [`RebindingPlan`] and the plan's own source/target/
+/// membership, succeeding only when the claimed rebinding matches the
+/// recomputed proof (a mismatch → [`crate::error::Error::integrity`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedReleaseRebinding {
+    /// The historical release being rebound.
+    pub release: ReleaseId,
+    /// The destination target the release is rebound onto.
+    pub target: TargetName,
+    /// The release's frozen slot→variant/group topology, filtered to the
+    /// destination target (from the release record's OWN canonical slot
+    /// snapshot). Complete regardless of group selection: a `--group` push
+    /// narrows the PLANNED assignments, never the recorded topology.
+    pub frozen_topology: BTreeMap<SlotId, FrozenSlotTopology>,
+    /// The membership PROOF that ran before planning (see
+    /// [`MatchingMembership`]): `frozen == current` verified (slot IDs only;
+    /// physical bindings may differ). For a group push this is the COMPLETE
+    /// membership — the group narrows the planned slots, never the
+    /// membership check.
+    pub(crate) membership: MatchingMembership,
+    /// The SELECTED plan slots: the plan's membership (the `slots` map keys)
+    /// — the slots the frozen topology is actually bound onto. A group
+    /// selection records exactly the selected slots (the group-filtered
+    /// assignments); a full push records every member slot.
+    pub selected_plan_slots: BTreeSet<SlotId>,
+    /// The CURRENT physical slots the frozen topology is bound onto, per
+    /// SELECTED slot: `slot -> {server, deploy_dir}` from the caller's
+    /// current configuration.
+    pub current_physical_slots: BTreeMap<SlotId, PhysicalBinding>,
+}
+
+impl VerifiedReleaseRebinding {
+    /// The ONLY construction path: verify that the claimed rebinding
+    /// components agree — the frozen topology's keys must equal the
+    /// membership's agreed slots, every selected plan slot must be a member
+    /// of the agreed membership, and the current physical slots must cover
+    /// exactly the selected plan slots. Any disagreement →
+    /// [`crate::error::Error::integrity`] (fail closed: a hand-constructed
+    /// proof can never put the components out of agreement).
+    pub(crate) fn verify(
+        release: ReleaseId,
+        target: TargetName,
+        frozen_topology: BTreeMap<SlotId, FrozenSlotTopology>,
+        membership: MatchingMembership,
+        selected_plan_slots: BTreeSet<SlotId>,
+        current_physical_slots: BTreeMap<SlotId, PhysicalBinding>,
+    ) -> Result<Self> {
+        let membership_slots: BTreeSet<SlotId> = membership.slots().iter().cloned().collect();
+        let frozen_keys: BTreeSet<SlotId> = frozen_topology.keys().cloned().collect();
+        if frozen_keys != membership_slots {
+            return Err(Error::integrity(
+                "rebinding proof refused: the frozen topology keys disagree with the membership's agreed slots",
+            ));
+        }
+        for slot in &selected_plan_slots {
+            if !membership_slots.contains(slot) {
+                return Err(Error::integrity(format!(
+                    "rebinding proof refused: selected slot '{slot}' is outside the agreed membership"
+                )));
+            }
+        }
+        let physical_keys: BTreeSet<SlotId> = current_physical_slots.keys().cloned().collect();
+        if physical_keys != selected_plan_slots {
+            return Err(Error::integrity(
+                "rebinding proof refused: the current physical slots disagree with the selected plan slots",
+            ));
+        }
+        Ok(VerifiedReleaseRebinding {
+            release,
+            target,
+            frozen_topology,
+            membership,
+            selected_plan_slots,
+            current_physical_slots,
+        })
+    }
 }
 
 /// Per-slot plan for one placement slot: its slot identity, the artifact it
@@ -1591,11 +1895,15 @@ pub struct DeploymentPlanWire {
     pub slots: BTreeMap<SlotId, SlotPlan>,
     pub source: PlanSource,
     /// When the plan was built from a DIRECT release reference
-    /// (`PlanSource::ReleaseRef`), the explicit rebinding context: the
+    /// (`PlanSource::ReleaseRef`), the CLAIMED rebinding context: the
     /// historical release's frozen topology applied onto the CURRENT
     /// physical slots ([`RebindingPlan`]). `None` for HEAD and
-    /// deployment-keyed plans. `#[serde(default)]` keeps deployment records
-    /// written before this field loadable; `skip_serializing_if` keeps the
+    /// deployment-keyed plans. The VERIFYING CONVERSION recomputes the
+    /// proof from this claimed shape and the plan's own
+    /// source/target/membership, refusing any disagreement (a Release
+    /// origin without a proof, or a non-Release origin carrying one, is
+    /// refused). `#[serde(default)]` keeps deployment records written
+    /// before this field loadable; `skip_serializing_if` keeps the
     /// recorded wire shape unchanged for plans that carry no rebinding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rebinding: Option<RebindingPlan>,
@@ -1657,19 +1965,131 @@ impl DeploymentPlanWire {
                 self.deployment_id
             )));
         }
+        // THE SOURCE OWNS ITS REQUIRED PAYLOAD: the wire's `PlanSource` +
+        // separate `rebinding` field convert to the domain's [`PlanOrigin`]
+        // by RECOMPUTING the proof. A Release origin must carry its
+        // [`VerifiedReleaseRebinding`] (a Release source without a claimed
+        // rebinding is refused — the proof is unrepresentable without it);
+        // HEAD and deployment origins must carry NONE (a claimed rebinding
+        // on a non-Release plan is a disagreement — the domain has no place
+        // for it, so it is refused rather than silently dropped). The
+        // recomputation compares the claimed rebinding against the plan's
+        // own source/target/membership: the claimed release must be the
+        // plan's source release AND the release its slots reference, the
+        // claimed target must equal the plan's target, and the claimed
+        // components must agree internally (frozen topology keys ==
+        // membership, selected plan slots ⊆ membership, physical slots ==
+        // selected). A mismatch → `Error::integrity` (fail closed: a
+        // tampered plan can never claim a rebinding its source/release/
+        // target/slots don't support).
+        let source = match self.source {
+            PlanSource::Head => {
+                if self.rebinding.is_some() {
+                    return Err(Error::integrity(format!(
+                        "plan {}: a HEAD plan cannot carry a rebinding proof",
+                        self.deployment_id
+                    )));
+                }
+                PlanOrigin::Head
+            }
+            PlanSource::DeploymentRef(deployment_id) => {
+                if self.rebinding.is_some() {
+                    return Err(Error::integrity(format!(
+                        "plan {}: a deployment-keyed plan cannot carry a rebinding proof",
+                        self.deployment_id
+                    )));
+                }
+                PlanOrigin::Deployment(deployment_id)
+            }
+            PlanSource::ReleaseRef(release) => {
+                let claimed = self.rebinding.ok_or_else(|| {
+                    Error::integrity(format!(
+                        "plan {}: a release-origin plan must carry its rebinding proof",
+                        self.deployment_id
+                    ))
+                })?;
+                // The claimed release must be the plan's source release AND
+                // the release the plan's slots reference (a release-origin
+                // plan's slots all reference the release).
+                if claimed.release != release {
+                    return Err(Error::integrity(format!(
+                        "plan {}: the claimed rebinding release {} disagrees with the plan's source release {release}",
+                        self.deployment_id, claimed.release
+                    )));
+                }
+                if claimed.target != self.target {
+                    return Err(Error::integrity(format!(
+                        "plan {}: the claimed rebinding target '{}' disagrees with the plan's target '{}'",
+                        self.deployment_id, claimed.target, self.target
+                    )));
+                }
+                let derived: BTreeSet<ReleaseId> = self
+                    .slots
+                    .values()
+                    .map(|p| p.artifact.release.clone())
+                    .collect();
+                if derived != BTreeSet::from([release.clone()]) {
+                    return Err(Error::integrity(format!(
+                        "plan {}: the claimed rebinding release {release} disagrees with the releases derived from the plan's slots {derived:?}",
+                        self.deployment_id
+                    )));
+                }
+                // RECOMPUTE the proof from the claimed components and the
+                // plan's own membership (the selected plan slots are the
+                // plan's `slots` map keys).
+                let proof = VerifiedReleaseRebinding::verify(
+                    claimed.release,
+                    claimed.target,
+                    claimed.frozen_topology,
+                    claimed.membership,
+                    self.slots.keys().cloned().collect(),
+                    claimed.current_physical_slots,
+                )
+                .map_err(|e| {
+                    Error::integrity(format!(
+                        "plan {}: the claimed rebinding disagrees with the recomputed proof: {e}",
+                        self.deployment_id
+                    ))
+                })?;
+                PlanOrigin::Release {
+                    release,
+                    rebinding: proof,
+                }
+            }
+        };
         Ok(DeploymentPlan {
             deployment_id: self.deployment_id,
             target: self.target,
             behaviors: self.behaviors,
             slots: self.slots,
-            source: self.source,
-            rebinding: self.rebinding,
+            source,
         })
     }
 }
 
 impl From<&DeploymentPlan> for DeploymentPlanWire {
     fn from(p: &DeploymentPlan) -> Self {
+        // The domain's [`PlanOrigin`] re-expands into the wire's `PlanSource`
+        // + separate `rebinding` shape: a Release origin carries its
+        // verified proof back into the claimed [`RebindingPlan`] (the
+        // selected plan slots are re-derived from the plan's membership on
+        // the next read); HEAD and deployment origins carry `None`.
+        let (source, rebinding) = match &p.source {
+            PlanOrigin::Head => (PlanSource::Head, None),
+            PlanOrigin::Deployment(deployment_id) => {
+                (PlanSource::DeploymentRef(deployment_id.clone()), None)
+            }
+            PlanOrigin::Release { release, rebinding } => (
+                PlanSource::ReleaseRef(release.clone()),
+                Some(RebindingPlan {
+                    release: rebinding.release.clone(),
+                    target: rebinding.target.clone(),
+                    frozen_topology: rebinding.frozen_topology.clone(),
+                    membership: rebinding.membership.clone(),
+                    current_physical_slots: rebinding.current_physical_slots.clone(),
+                }),
+            ),
+        };
         DeploymentPlanWire {
             deployment_id: p.deployment_id.clone(),
             target: p.target.clone(),
@@ -1677,8 +2097,8 @@ impl From<&DeploymentPlan> for DeploymentPlanWire {
             behaviors: p.behaviors.clone(),
             slot_ids: p.membership().cloned().collect(),
             slots: p.slots.clone(),
-            source: p.source.clone(),
-            rebinding: p.rebinding.clone(),
+            source,
+            rebinding,
             desired_releases: p.releases(),
         }
     }
@@ -1689,10 +2109,12 @@ impl From<&DeploymentPlan> for DeploymentPlanWire {
 /// name-keyed activation + verification contracts, and the per-slot plans.
 /// ONE AUTHORITATIVE COLLECTION PER CONCEPT — `slots` (per-slot plans) is
 /// the membership AND the release source; `behaviors` (the index) is the
-/// behavior source. The `slot_ids` / `desired_releases` / `behavior_sha256`
-/// members exist only in the wire (the serialized `plan.json` keeps the
-/// redundant shape) and are derived here through
-/// [`DeploymentPlan::membership`], [`DeploymentPlan::releases`],
+/// behavior source; `source` ([`PlanOrigin`]) is the verified origin and
+/// OWNS its required payload (a Release origin carries its
+/// [`VerifiedReleaseRebinding`] proof inside the source). The `slot_ids` /
+/// `desired_releases` / `behavior_sha256` members exist only in the wire
+/// (the serialized `plan.json` keeps the redundant shape) and are derived
+/// here through [`DeploymentPlan::membership`], [`DeploymentPlan::releases`],
 /// [`DeploymentPlan::behavior_digest`] — the verified conversion guarantees
 /// they agree.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1709,13 +2131,14 @@ pub struct DeploymentPlan {
     /// keys are the membership) and their plans (their artifacts are the
     /// release source).
     pub slots: BTreeMap<SlotId, SlotPlan>,
-    pub source: PlanSource,
-    /// When the plan was built from a DIRECT release reference
-    /// (`PlanSource::ReleaseRef`), the explicit rebinding context: the
-    /// historical release's frozen topology applied onto the CURRENT
-    /// physical slots ([`RebindingPlan`]). `None` for HEAD and
-    /// deployment-keyed plans.
-    pub rebinding: Option<RebindingPlan>,
+    /// THE SOURCE OWNS ITS REQUIRED PAYLOAD: a Release origin
+    /// ([`PlanOrigin::Release`]) CARRIES its verified rebinding proof
+    /// ([`VerifiedReleaseRebinding`]) INSIDE the source — a Release origin
+    /// without the proof is unrepresentable; HEAD and deployment origins
+    /// carry none. The wire's separate `rebinding` field exists only in the
+    /// on-disk shape ([`DeploymentPlanWire`]) and is reconciled by the
+    /// verifying conversion.
+    pub source: PlanOrigin,
 }
 
 impl DeploymentPlan {
@@ -1776,7 +2199,7 @@ pub struct SlotResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{PlacementSlotAssignment, VariantName};
+    use crate::model::{PlacementSlotAssignment, SlotSet, VariantName};
     use crate::store::local::LocalStore;
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -1941,6 +2364,25 @@ mod tests {
                 )
             },
         )
+    }
+
+    /// UNIQUE slot ids in an ARBITRARY PERMUTATION: a shuffled non-empty
+    /// subset of the slot universe — the wire's `slot_ids` is the
+    /// authoritative deployment order, so the ordering property must cover
+    /// orders that are NOT sorted by id.
+    fn slot_ids_permutation() -> impl Strategy<Value = Vec<SlotId>> {
+        prop::collection::btree_set(slot_strategy(), 1..4).prop_flat_map(|set| {
+            let ids: Vec<SlotId> = set.into_iter().collect();
+            let n = ids.len();
+            // Shuffle the selected ids by sorting random keys: every order is
+            // reachable (with n ≤ 3 the key space is collision-free in
+            // practice), and the strategy shrinks naturally.
+            prop::collection::vec(0u32..1000, n).prop_map(move |keys| {
+                let mut order: Vec<usize> = (0..n).collect();
+                order.sort_by_key(|&i| keys[i]);
+                order.into_iter().map(|i| ids[i].clone()).collect()
+            })
+        })
     }
 
     // ---- THE VERIFYING PAIR CONVERSION + the read_ledger consumer ---------
@@ -2511,6 +2953,54 @@ mod tests {
         }
     }
 
+    // ---- THE ORDERING PROPERTY (the ordered tables) ------------------------
+
+    proptest! {
+        // THE ORDERING PROPERTY (the user's requirement): the wire's
+        // `slot_ids` is the AUTHORITATIVE deployment order, and the domain
+        // table must PRESERVE it exactly — never silently re-sort by slot
+        // id. Over UNIQUE slot ids in ARBITRARY PERMUTATIONS, the wire →
+        // domain → wire round trip must reproduce the EXACT `slot_ids`
+        // sequence (not the sorted order): the domain table iterates in the
+        // wire's sequence, the domain → wire re-expansion emits the same
+        // sequence, and the full JSON round trip preserves it. Bounded 16
+        // cases, fixed seed 0x5EED_5EED (house style), no persistence.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn wire_slot_ids_sequence_round_trips_exactly(keys in slot_ids_permutation()) {
+            let wire = agreeing_intent(&keys);
+            let domain = wire
+                .clone()
+                .into_domain()
+                .expect("the agreeing intent converts");
+            // The DOMAIN table iterates in the wire's sequence order.
+            assert_eq!(
+                domain.membership(),
+                keys,
+                "the domain table must preserve the wire's slot_ids sequence (deployment order), not sort by id"
+            );
+            // The domain → wire re-expansion emits the SAME sequence.
+            let wire2 = LedgerIntentWire::from(&domain);
+            assert_eq!(
+                wire2.slot_ids, keys,
+                "the domain → wire re-expansion must reproduce the exact slot_ids sequence"
+            );
+            // The full JSON round trip (serialize → deserialize) too.
+            let json = serde_json::to_string(&domain).unwrap();
+            let wire3: LedgerIntentWire = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                wire3.slot_ids, keys,
+                "the JSON round trip must preserve the exact slot_ids sequence"
+            );
+        }
+    }
+
     // ---- deterministic unit tests -----------------------------------------
 
     /// THE FOUR-SET EQUALITY, SUFFICIENCY DIRECTION (deterministic): a
@@ -2989,6 +3479,65 @@ mod tests {
         assert!(SlotTable::<u32>::new().is_empty());
     }
 
+    /// The ordered tables PRESERVE INSERTION ORDER across build / get /
+    /// iter / keys: a table built from a deliberately NON-sorted sequence
+    /// iterates in exactly that sequence (never sorted by slot id), and
+    /// `get` / `contains_key` / `len` / indexing still work.
+    /// `SlotTable::insert` appends new keys and keeps an overwritten key's
+    /// position.
+    #[test]
+    fn slot_tables_preserve_insertion_order_across_build_get_iter_keys() {
+        // Deliberately NOT sorted by id: the deployment order.
+        let order = vec![slot(3), slot(1), slot(5), slot(0)];
+        let table = NonEmptySlotTable::build(
+            order
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(i, k)| (k, i as u32)),
+        )
+        .unwrap();
+        assert_eq!(
+            table.keys().cloned().collect::<Vec<_>>(),
+            order,
+            "keys() iterates in insertion order, not sorted by id"
+        );
+        assert_eq!(
+            table.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+            order,
+            "iter() iterates in insertion order"
+        );
+        assert_eq!(
+            table.values().cloned().collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "values() iterates in insertion order"
+        );
+        assert_eq!(table.len(), 4);
+        assert_eq!(table.get(&slot(1)), Some(&1));
+        assert!(table.contains_key(&slot(5)));
+        assert!(!table.contains_key(&slot(2)));
+        assert_eq!(table[&slot(0)], 3, "indexing works");
+
+        // The possibly-empty variant preserves the same order.
+        let mut empty = SlotTable::new();
+        assert!(empty.is_empty());
+        empty.insert(slot(2), 2u32);
+        empty.insert(slot(0), 0u32);
+        assert_eq!(
+            empty.keys().cloned().collect::<Vec<_>>(),
+            vec![slot(2), slot(0)],
+            "SlotTable::insert appends in insertion order"
+        );
+        // Overwriting an existing key keeps its position.
+        empty.insert(slot(2), 9u32);
+        assert_eq!(
+            empty.keys().cloned().collect::<Vec<_>>(),
+            vec![slot(2), slot(0)],
+            "an overwritten key keeps its original position"
+        );
+        assert_eq!(empty[&slot(2)], 9, "the overwritten value is visible");
+    }
+
     /// The wire rollback payload converts into the domain rollback with the
     /// kept duplicate-projection checks (assignment own-key, bindings ⊆
     /// slotted generations, the legacy snapshot-wide release when present).
@@ -3285,6 +3834,510 @@ mod tests {
                         "the rejection must be an integrity error, got: {e}"
                     );
                 }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // PLAN WIRE → DOMAIN: THE SOURCE OWNS ITS REQUIRED PAYLOAD
+    // ---------------------------------------------------------------------
+    //
+    // The wire plan (the on-disk shape with the `source` + separate
+    // `rebinding` fields) converts to the domain by RECOMPUTING the proof:
+    // a Release origin must carry its [`VerifiedReleaseRebinding`] INSIDE
+    // the source (a Release origin without the proof is unrepresentable),
+    // HEAD/deployment origins must carry NONE, and the claimed rebinding
+    // must agree with the plan's own source/target/membership — the claimed
+    // release equals the plan's source release AND the release its slots
+    // reference, the claimed target equals the plan's target, the frozen
+    // topology keys equal the membership's agreed slots, the selected plan
+    // slots are covered by the membership, and the current physical slots
+    // cover exactly the selected plan slots. A disagreement →
+    // `Error::integrity` (fail closed).
+
+    /// A per-slot plan for the given key, referencing the given release.
+    fn plan_for(key: &SlotId, release: &ReleaseId) -> SlotPlan {
+        SlotPlan {
+            slot_id: key.clone(),
+            artifact: ArtifactRef {
+                release: release.clone(),
+                variant: VariantName::new("standard".to_string()),
+                tree: TreeDigest::new(format!("tree-{}", key.as_str())),
+            },
+            expected_generation: None,
+            expected_tree: None,
+        }
+    }
+
+    /// The membership PROOF for the given keys (frozen == current verified
+    /// through the ONLY construction path, [`MatchingMembership::verify`]).
+    fn membership_for(keys: &[SlotId]) -> MatchingMembership {
+        MatchingMembership::verify(
+            SlotSet::new(keys.iter().cloned()),
+            SlotSet::new(keys.iter().cloned()),
+        )
+        .expect("a non-empty agreeing membership verifies")
+    }
+
+    /// The frozen slot→variant/group topology for the given keys (each slot
+    /// in the `standard` variant, no groups).
+    fn frozen_topology_for(keys: &[SlotId]) -> BTreeMap<SlotId, FrozenSlotTopology> {
+        keys.iter()
+            .map(|k| {
+                (
+                    k.clone(),
+                    FrozenSlotTopology {
+                        variant: "standard".to_string(),
+                        groups: Vec::new(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The current physical slots for the given keys.
+    fn physical_slots_for(keys: &[SlotId]) -> BTreeMap<SlotId, PhysicalBinding> {
+        keys.iter().map(|k| (k.clone(), binding(k))).collect()
+    }
+
+    /// A CLAIMED rebinding AGREEING with the plan's own data: the release,
+    /// the target, the frozen topology (keys == the membership's agreed
+    /// slots), the membership proof, and the current physical slots (keys
+    /// == the selected slots).
+    fn agreeing_rebinding(
+        release: &ReleaseId,
+        target: &TargetName,
+        keys: &[SlotId],
+    ) -> RebindingPlan {
+        RebindingPlan {
+            release: release.clone(),
+            target: target.clone(),
+            frozen_topology: frozen_topology_for(keys),
+            membership: membership_for(keys),
+            current_physical_slots: physical_slots_for(keys),
+        }
+    }
+
+    /// A VALID plan wire for the given source kind (0 Head, 1 Deployment,
+    /// 2 Release): a NON-EMPTY membership K, every duplicate projection
+    /// agreeing, and — for a Release source — a claimed rebinding agreeing
+    /// with the plan's own source/target/membership.
+    fn agreeing_plan_wire(source_kind: u32, keys: &[SlotId]) -> DeploymentPlanWire {
+        let release = ReleaseId::new("rel-plan".to_string());
+        let target = TargetName::new("t1".to_string());
+        let slots: BTreeMap<SlotId, SlotPlan> = keys
+            .iter()
+            .map(|k| (k.clone(), plan_for(k, &release)))
+            .collect();
+        let behaviors = BehaviorIndex::new();
+        let source = match source_kind {
+            0 => PlanSource::Head,
+            1 => PlanSource::DeploymentRef(DeploymentId::new("deploy-plan".to_string())),
+            _ => PlanSource::ReleaseRef(release.clone()),
+        };
+        let rebinding = match source_kind {
+            2 => Some(agreeing_rebinding(&release, &target, keys)),
+            _ => None,
+        };
+        DeploymentPlanWire {
+            deployment_id: DeploymentId::new("deploy-plan".to_string()),
+            target,
+            behavior_sha256: crate::release::behavior_index_digest(&behaviors),
+            behaviors,
+            slot_ids: keys.to_vec(),
+            slots,
+            source,
+            rebinding,
+            desired_releases: BTreeSet::from([release]),
+        }
+    }
+
+    // ---- plan wire mutations (ONE field at a time) -----------------------
+
+    /// source: ReleaseRef → Head (the claimed rebinding stays — a HEAD plan
+    /// carrying a rebinding is a disagreement).
+    fn source_to_head(w: &mut DeploymentPlanWire) {
+        w.source = PlanSource::Head;
+    }
+
+    /// source: ReleaseRef → DeploymentRef (the claimed rebinding stays).
+    fn source_to_deployment(w: &mut DeploymentPlanWire) {
+        w.source = PlanSource::DeploymentRef(DeploymentId::new("deploy-other".to_string()));
+    }
+
+    /// source: Head/Deployment → ReleaseRef (no rebinding — a Release
+    /// origin without its proof is unrepresentable).
+    fn source_to_release(w: &mut DeploymentPlanWire) {
+        w.source = PlanSource::ReleaseRef(ReleaseId::new("rel-plan".to_string()));
+    }
+
+    /// rebinding presence: remove the claimed rebinding from a Release
+    /// plan.
+    fn rebinding_removed(w: &mut DeploymentPlanWire) {
+        w.rebinding = None;
+    }
+
+    /// rebinding presence: add a claimed rebinding (internally agreeing
+    /// with the plan's own data) to a Head/Deployment plan.
+    fn rebinding_added(w: &mut DeploymentPlanWire) {
+        let release = ReleaseId::new("rel-plan".to_string());
+        let target = TargetName::new("t1".to_string());
+        let keys: Vec<SlotId> = w.slots.keys().cloned().collect();
+        w.rebinding = Some(agreeing_rebinding(&release, &target, &keys));
+    }
+
+    /// release: change the claimed rebinding's release (disagrees with the
+    /// plan's source release AND the releases derived from the slots).
+    fn rebinding_release_changed(w: &mut DeploymentPlanWire) {
+        let rp = w
+            .rebinding
+            .as_mut()
+            .expect("a release plan carries a rebinding");
+        rp.release = ReleaseId::new("rel-other".to_string());
+    }
+
+    /// release: change the SOURCE's release (disagrees with the claimed
+    /// rebinding's release).
+    fn source_release_changed(w: &mut DeploymentPlanWire) {
+        w.source = PlanSource::ReleaseRef(ReleaseId::new("rel-other".to_string()));
+    }
+
+    /// target: change the claimed rebinding's target (disagrees with the
+    /// plan's target).
+    fn rebinding_target_changed(w: &mut DeploymentPlanWire) {
+        let rp = w
+            .rebinding
+            .as_mut()
+            .expect("a release plan carries a rebinding");
+        rp.target = TargetName::new("t2".to_string());
+    }
+
+    /// membership: change the claimed membership's agreed set (remove a
+    /// slot when there is more than one, else add one) — the frozen
+    /// topology keys no longer equal the membership, and the selected slots
+    /// are no longer covered.
+    fn membership_changed(w: &mut DeploymentPlanWire) {
+        let rp = w
+            .rebinding
+            .as_mut()
+            .expect("a release plan carries a rebinding");
+        let mut slots: BTreeSet<SlotId> = rp.membership.slots().iter().cloned().collect();
+        if slots.len() > 1 {
+            let removed = slots.iter().next().cloned().expect("non-empty membership");
+            slots.remove(&removed);
+        } else {
+            slots.insert(slot(99));
+        }
+        rp.membership = MatchingMembership::verify(
+            SlotSet::new(slots.iter().cloned()),
+            SlotSet::new(slots.iter().cloned()),
+        )
+        .expect("a changed non-empty membership verifies");
+    }
+
+    /// frozen topology: remove a key (the frozen topology keys no longer
+    /// equal the membership's agreed slots).
+    fn frozen_topology_shrunk(w: &mut DeploymentPlanWire) {
+        let rp = w
+            .rebinding
+            .as_mut()
+            .expect("a release plan carries a rebinding");
+        let removed = rp
+            .frozen_topology
+            .keys()
+            .next()
+            .cloned()
+            .expect("non-empty frozen topology");
+        rp.frozen_topology.remove(&removed);
+    }
+
+    /// physical-slot keys: remove a key (the current physical slots no
+    /// longer cover exactly the selected plan slots).
+    fn physical_slots_shrunk(w: &mut DeploymentPlanWire) {
+        let rp = w
+            .rebinding
+            .as_mut()
+            .expect("a release plan carries a rebinding");
+        let removed = rp
+            .current_physical_slots
+            .keys()
+            .next()
+            .cloned()
+            .expect("non-empty physical slots");
+        rp.current_physical_slots.remove(&removed);
+    }
+
+    /// One plan-wire mutation: a named single-field tamper applied to a
+    /// [`DeploymentPlanWire`].
+    type PlanWireMutation = fn(&mut DeploymentPlanWire);
+
+    proptest! {
+        // PROPERTY (the user's requirement): generate VALID plans (all
+        // three source kinds), then MUTATE ONE FIELD AT A TIME — source
+        // (Head↔Deployment↔Release), rebinding presence (add/remove),
+        // release, target, membership, frozen topology, physical-slot keys
+        // — and assert the CONVERSION SUCCEEDS ONLY FOR THE COMPLETE TRUTH
+        // TABLE: the untampered plan converts, and EVERY single-field
+        // mutation that breaks the proof fails the verifying conversion
+        // with an integrity error. A Release origin without its proof, a
+        // non-Release origin carrying one, a claimed release/target
+        // disagreeing with the plan's own, a membership/frozen-topology/
+        // physical-slot disagreement — all fail closed. Bounded 16 cases,
+        // fixed seed 0x5EED_5EED (house style), no persistence.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn plan_wire_rebinding_truth_table(
+            source_kind in 0u32..3,
+            keys in prop::collection::btree_set(slot_strategy(), 2..4),
+        ) {
+            let keys: Vec<SlotId> = keys.into_iter().collect();
+            let wire = agreeing_plan_wire(source_kind, &keys);
+            // The untampered plan converts (the truth table's Ok row).
+            let domain = wire
+                .clone()
+                .into_domain()
+                .expect("the agreeing plan converts");
+            // The domain's source OWNS its payload: a Release origin
+            // carries the verified proof inside the source; HEAD/deployment
+            // carry none.
+            match &domain.source {
+                PlanOrigin::Release { release, rebinding } => {
+                    assert_eq!(release.as_str(), "rel-plan");
+                    assert_eq!(
+                        rebinding.selected_plan_slots,
+                        keys.iter().cloned().collect::<BTreeSet<_>>(),
+                        "the proof carries the selected plan slots"
+                    );
+                    assert_eq!(
+                        rebinding
+                            .membership
+                            .slots()
+                            .iter()
+                            .cloned()
+                            .collect::<BTreeSet<_>>(),
+                        keys.iter().cloned().collect::<BTreeSet<_>>(),
+                        "the proof carries the agreed membership"
+                    );
+                }
+                PlanOrigin::Head | PlanOrigin::Deployment(_) => {}
+            }
+
+            // The proof-breaking mutations for this plan kind: each
+            // single-field mutation that breaks the proof must fail the
+            // conversion (the truth table's Err rows).
+            let mutations: Vec<(&str, PlanWireMutation)> = match source_kind {
+                // A Release plan: every claimed-rebinding field is a fact.
+                2 => vec![
+                    ("source → Head (rebinding present)", source_to_head as fn(&mut DeploymentPlanWire)),
+                    ("source → Deployment (rebinding present)", source_to_deployment),
+                    ("rebinding removed (Release origin without its proof)", rebinding_removed),
+                    ("claimed rebinding release changed", rebinding_release_changed),
+                    ("source release changed", source_release_changed),
+                    ("claimed rebinding target changed", rebinding_target_changed),
+                    ("membership changed", membership_changed),
+                    ("frozen topology key removed", frozen_topology_shrunk),
+                    ("physical-slot key removed", physical_slots_shrunk),
+                ],
+                // HEAD / Deployment plans: no rebinding is allowed; a
+                // Release source without its proof is refused.
+                _ => vec![
+                    ("source → Release (no rebinding)", source_to_release),
+                    ("rebinding added to a non-Release plan", rebinding_added),
+                ],
+            };
+            for (name, mutate) in mutations {
+                let mut bad = wire.clone();
+                mutate(&mut bad);
+                let err = bad.into_domain();
+                assert!(
+                    err.is_err(),
+                    "{name} must fail the verifying conversion"
+                );
+                assert!(
+                    matches!(err, Err(Error::Integrity(_))),
+                    "{name} must fail with an integrity error, got: {err:?}"
+                );
+            }
+        }
+    }
+
+    // ---- deterministic unit tests per mutation class ---------------------
+
+    /// A Release-origin plan WITHOUT its claimed rebinding is refused: the
+    /// proof is unrepresentable without it (a Release origin must carry its
+    /// [`VerifiedReleaseRebinding`] inside the source).
+    #[test]
+    fn plan_wire_release_origin_without_proof_refused() {
+        let keys = vec![slot(1), slot(2)];
+        let mut wire = agreeing_plan_wire(2, &keys);
+        wire.rebinding = None;
+        let err = wire
+            .into_domain()
+            .expect_err("a Release origin without its proof must refuse");
+        assert!(
+            matches!(err, Error::Integrity(_))
+                && err.to_string().contains("must carry its rebinding proof"),
+            "the refusal must be the missing-proof integrity error, got: {err}"
+        );
+    }
+
+    /// A non-Release origin (HEAD / deployment) CARRYING a claimed
+    /// rebinding is refused: the domain has no place for it, so it is
+    /// refused rather than silently dropped.
+    #[test]
+    fn plan_wire_non_release_origin_with_rebinding_refused() {
+        for source_kind in [0u32, 1] {
+            let keys = vec![slot(1), slot(2)];
+            let mut wire = agreeing_plan_wire(source_kind, &keys);
+            rebinding_added(&mut wire);
+            let err = wire
+                .into_domain()
+                .expect_err("a non-Release plan carrying a rebinding must refuse");
+            assert!(
+                matches!(err, Error::Integrity(_))
+                    && err.to_string().contains("cannot carry a rebinding proof"),
+                "the refusal must be the non-Release-with-rebinding integrity error, got: {err}"
+            );
+        }
+    }
+
+    /// The claimed rebinding's release must equal the plan's source release
+    /// AND the release the plan's slots reference: changing either half is a
+    /// disagreement.
+    #[test]
+    fn plan_wire_claimed_release_disagreement_refused() {
+        let keys = vec![slot(1), slot(2)];
+        // The claimed rebinding's release disagrees with the plan's source.
+        let mut wire = agreeing_plan_wire(2, &keys);
+        rebinding_release_changed(&mut wire);
+        let err = wire
+            .into_domain()
+            .expect_err("a claimed release disagreeing with the plan's source must refuse");
+        assert!(
+            matches!(err, Error::Integrity(_))
+                && err.to_string().contains("claimed rebinding release"),
+            "the refusal must name the claimed release disagreement, got: {err}"
+        );
+        // The source's release disagrees with the claimed rebinding's.
+        let mut wire = agreeing_plan_wire(2, &keys);
+        source_release_changed(&mut wire);
+        let err = wire
+            .into_domain()
+            .expect_err("a source release disagreeing with the claimed rebinding must refuse");
+        assert!(
+            matches!(err, Error::Integrity(_))
+                && err.to_string().contains("claimed rebinding release"),
+            "the refusal must name the claimed release disagreement, got: {err}"
+        );
+    }
+
+    /// The claimed rebinding's target must equal the plan's target.
+    #[test]
+    fn plan_wire_claimed_target_disagreement_refused() {
+        let keys = vec![slot(1), slot(2)];
+        let mut wire = agreeing_plan_wire(2, &keys);
+        rebinding_target_changed(&mut wire);
+        let err = wire
+            .into_domain()
+            .expect_err("a claimed target disagreeing with the plan's target must refuse");
+        assert!(
+            matches!(err, Error::Integrity(_))
+                && err.to_string().contains("claimed rebinding target"),
+            "the refusal must name the claimed target disagreement, got: {err}"
+        );
+    }
+
+    /// The claimed membership's agreed set must equal the frozen topology's
+    /// keys and cover the selected plan slots: a changed agreed set is a
+    /// disagreement.
+    #[test]
+    fn plan_wire_membership_disagreement_refused() {
+        let keys = vec![slot(1), slot(2)];
+        let mut wire = agreeing_plan_wire(2, &keys);
+        membership_changed(&mut wire);
+        let err = wire
+            .into_domain()
+            .expect_err("a changed membership must refuse");
+        assert!(
+            matches!(err, Error::Integrity(_)) && err.to_string().contains("recomputed proof"),
+            "the refusal must be the recomputed-proof integrity error, got: {err}"
+        );
+    }
+
+    /// The frozen topology's keys must equal the membership's agreed slots:
+    /// a removed frozen key is a disagreement.
+    #[test]
+    fn plan_wire_frozen_topology_disagreement_refused() {
+        let keys = vec![slot(1), slot(2)];
+        let mut wire = agreeing_plan_wire(2, &keys);
+        frozen_topology_shrunk(&mut wire);
+        let err = wire
+            .into_domain()
+            .expect_err("a shrunk frozen topology must refuse");
+        assert!(
+            matches!(err, Error::Integrity(_)) && err.to_string().contains("recomputed proof"),
+            "the refusal must be the recomputed-proof integrity error, got: {err}"
+        );
+    }
+
+    /// The current physical slots must cover exactly the selected plan
+    /// slots: a removed physical-slot key is a disagreement.
+    #[test]
+    fn plan_wire_physical_slots_disagreement_refused() {
+        let keys = vec![slot(1), slot(2)];
+        let mut wire = agreeing_plan_wire(2, &keys);
+        physical_slots_shrunk(&mut wire);
+        let err = wire
+            .into_domain()
+            .expect_err("a shrunk physical-slot set must refuse");
+        assert!(
+            matches!(err, Error::Integrity(_)) && err.to_string().contains("recomputed proof"),
+            "the refusal must be the recomputed-proof integrity error, got: {err}"
+        );
+    }
+
+    /// A Release-origin plan ROUND-TRIPS through the wire (JSON) with its
+    /// proof intact: the domain serializes through the wire shape (the
+    /// claimed [`RebindingPlan`]), and the next read RECOMPUTES the proof
+    /// from the plan's own data — the selected plan slots are re-derived
+    /// from the plan's membership, and every component agrees again.
+    #[test]
+    fn plan_wire_release_origin_round_trips_with_its_proof() {
+        let keys = vec![slot(1), slot(2)];
+        let wire = agreeing_plan_wire(2, &keys);
+        let domain = wire.into_domain().expect("the agreeing plan converts");
+        let json = serde_json::to_string(&domain).expect("the domain serializes through the wire");
+        let back: DeploymentPlan =
+            serde_json::from_str(&json).expect("the wire deserializes back into the domain");
+        match &back.source {
+            PlanOrigin::Release { release, rebinding } => {
+                assert_eq!(release.as_str(), "rel-plan");
+                assert_eq!(
+                    rebinding.selected_plan_slots,
+                    BTreeSet::from([slot(1), slot(2)]),
+                    "the round trip re-derives the selected plan slots from the plan's membership"
+                );
+                assert_eq!(rebinding.frozen_topology.len(), 2);
+                assert_eq!(rebinding.current_physical_slots.len(), 2);
+                assert_eq!(
+                    rebinding
+                        .membership
+                        .slots()
+                        .iter()
+                        .cloned()
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from([slot(1), slot(2)]),
+                    "the round trip keeps the agreed membership"
+                );
+            }
+            other => {
+                panic!("a Release-origin plan must round-trip as a Release origin, got {other:?}")
             }
         }
     }

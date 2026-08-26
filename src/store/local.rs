@@ -1105,45 +1105,43 @@ impl LocalStore {
                     // stays valid; a PARTIAL outcome map — the shape that
                     // would let a consumer absorb only some members — is
                     // always refused.
-                   // outcome leg), BY STATUS: the terminal's outcome key
-                   // set must agree with the intent's AUTHORITATIVE
-                   // membership EXACTLY —
-                   // - Successful: the four sets (outcomes, rollback
-                   //   slots, rollback bindings, intent membership) are
-                   //   EXACTLY EQUAL and NON-EMPTY — the terminal-local
-                   //   three-set equality is enforced by the wire → domain
-                   //   conversion; the membership leg is enforced here.
-                   // - FailedPreflight: outcomes EMPTY (a pre-mutation
-                   //   failure touched no slot).
-                   // - every other terminal state (FailedRolledBack,
-                   //   Degraded): the outcomes EXACTLY COVER the
-                   //   membership — every member slot has one outcome, no
-                   //   extras, no missing.
-                   let outcome_keys: BTreeSet<&SlotId> =
-                       terminal.outcomes.keys().collect();
-                   let membership: BTreeSet<&SlotId> =
-                       entry.intent.slots.keys().collect();
-                   match terminal.status() {
-                       DeploymentStatus::Successful => {
-                           if outcome_keys != membership {
-                               return Err(Error::integrity(format!(
-                                   "ledger of target '{target}': Successful terminal for deployment '{id}' carries outcomes for slots {outcome_keys:?} but its intent's slot_ids are {membership:?} — a successful deployment's outcomes must EXACTLY equal its membership (the rollback's slots and bindings equal them by the conversion)"
-                               )));
-                           }
-                       }
-                       DeploymentStatus::FailedPreflight => {
-                           if !outcome_keys.is_empty() {
-                               return Err(Error::integrity(format!(
-                                   "ledger of target '{target}': FailedPreflight terminal for deployment '{id}' carries outcomes for slots {outcome_keys:?} — a pre-mutation failure touched no slot"
-                               )));
-                           }
-                       }
-                       _ => {
-                           if outcome_keys != membership {
-                               return Err(Error::integrity(format!(
-                                   "ledger of target '{target}': terminal for deployment '{id}' carries outcomes for slots {outcome_keys:?} but its intent's slot_ids are {membership:?} — every member slot has exactly one outcome, no extras"
-                               )));
-                           }
+                    // outcome leg), BY STATUS: the terminal's outcome key
+                    // set must agree with the intent's AUTHORITATIVE
+                    // membership EXACTLY —
+                    // - Successful: the four sets (outcomes, rollback
+                    //   slots, rollback bindings, intent membership) are
+                    //   EXACTLY EQUAL and NON-EMPTY — the terminal-local
+                    //   three-set equality is enforced by the wire → domain
+                    //   conversion; the membership leg is enforced here.
+                    // - FailedPreflight: outcomes EMPTY (a pre-mutation
+                    //   failure touched no slot).
+                    // - every other terminal state (FailedRolledBack,
+                    //   Degraded): the outcomes EXACTLY COVER the
+                    //   membership — every member slot has one outcome, no
+                    //   extras, no missing.
+                    let outcome_keys: BTreeSet<&SlotId> = terminal.outcomes.keys().collect();
+                    let membership: BTreeSet<&SlotId> = entry.intent.slots.keys().collect();
+                    match terminal.status() {
+                        DeploymentStatus::Successful => {
+                            if outcome_keys != membership {
+                                return Err(Error::integrity(format!(
+                                    "ledger of target '{target}': Successful terminal for deployment '{id}' carries outcomes for slots {outcome_keys:?} but its intent's slot_ids are {membership:?} — a successful deployment's outcomes must EXACTLY equal its membership (the rollback's slots and bindings equal them by the conversion)"
+                                )));
+                            }
+                        }
+                        DeploymentStatus::FailedPreflight => {
+                            if !outcome_keys.is_empty() {
+                                return Err(Error::integrity(format!(
+                                    "ledger of target '{target}': FailedPreflight terminal for deployment '{id}' carries outcomes for slots {outcome_keys:?} — a pre-mutation failure touched no slot"
+                                )));
+                            }
+                        }
+                        _ => {
+                            if outcome_keys != membership {
+                                return Err(Error::integrity(format!(
+                                    "ledger of target '{target}': terminal for deployment '{id}' carries outcomes for slots {outcome_keys:?} but its intent's slot_ids are {membership:?} — every member slot has exactly one outcome, no extras"
+                                )));
+                            }
                         }
                     }
                     entry.terminal = Some(terminal);
@@ -3200,7 +3198,7 @@ mod tests {
         let slot_ids: Vec<SlotId> = (0..slot_count)
             .map(|i| SlotId::new(format!("slot-{i}")))
             .collect();
-        let slots = slot_ids
+        let slots: Vec<(SlotId, IntentSlot)> = slot_ids
             .iter()
             .map(|k| {
                 (

@@ -1004,11 +1004,10 @@ mod tests {
         // excluded from the digest: republishing
         // against a record that differs ONLY in those fields is still an
         // idempotent no-op.
-        let metadata_mutations: [JsonMutation; 1] = [
-            ("created_at", |v: &mut serde_json::Value| {
+        let metadata_mutations: [JsonMutation; 1] =
+            [("created_at", |v: &mut serde_json::Value| {
                 v["created_at"] = serde_json::json!("2099-01-01T00:00:00Z");
-            }),
-        ];
+            })];
         for (name, mutate) in metadata_mutations {
             let (_dir, remote, rec, release_json, behavior_json) = published_release_fixture();
             let mut stored = serde_json::to_value(&rec).unwrap();

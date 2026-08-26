@@ -530,11 +530,12 @@ impl MatchingMembership {
     }
 
     /// The agreed (frozen == current) membership: the non-empty slot set
-    /// the proof verifies. Test/read path: the plan consumes the proof by
-    /// storing it (the membership gate produced it); the property suite
-    /// asserts its content through this accessor.
-    #[cfg(test)]
-    pub fn slots(&self) -> &NonEmptySlotSet {
+    /// the proof verifies. Read path: the wire → domain conversion
+    /// re-checks the claimed proof's agreed set against the plan's own
+    /// membership (the frozen topology keys must equal it, and every
+    /// selected plan slot must be a member); the property suite asserts its
+    /// content through this accessor.
+    pub(crate) fn slots(&self) -> &NonEmptySlotSet {
         &self.slots
     }
 }

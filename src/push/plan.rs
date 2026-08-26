@@ -13,9 +13,11 @@
 //! * **`release:<id>`**: that RELEASE's frozen slot→variant and group
 //!   topology (the release record's OWN canonical slot snapshot), applied
 //!   onto the CURRENT physical slots under the LOGICAL membership check. The
-//!   rebinding is now EXPLICIT: the plan carries a
-//!   [`crate::records::RebindingPlan`] recording the frozen topology, the
-//!   membership check, and the current physical slots it binds onto. A
+//!   rebinding is now EXPLICIT and VERIFIED: the plan's origin
+//!   ([`crate::records::PlanOrigin::Release`]) CARRIES its
+//!   [`crate::records::VerifiedReleaseRebinding`] proof INSIDE the source —
+//!   the frozen topology, the membership check, the selected plan slots, and
+//!   the current physical slots it binds onto. A
 //!   `--group <g>` selection resolves the group's slot IDs from THIS frozen
 //!   topology (each frozen slot's era `groups` list), never from the caller's
 //!   current group partition: a slot the release pushed inside `g` but the
@@ -35,9 +37,11 @@
 //!
 //! The one historically IMPLICIT exception — a `release:<id>` push applying a
 //! historical release's frozen topology onto the CURRENT physical slots — is
-//! now an explicit, typed artifact: [`crate::records::RebindingPlan`], built
-//! in the `PushRef::Release` branch of [`plan_assignments`] and recorded in
-//! [`crate::records::DeploymentPlan::rebinding`].
+//! now an explicit, typed, VERIFIED artifact: the plan's origin
+//! ([`crate::records::PlanOrigin::Release`]) carries its
+//! [`crate::records::VerifiedReleaseRebinding`] proof INSIDE the source,
+//! built in the `PushRef::Release` branch of [`plan_assignments`] from the
+//! membership gate's proof.
 
 use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
@@ -47,7 +51,7 @@ use crate::model::{
     ReleaseId, ReleaseRecord, ServerId, SlotId, SlotSet, TargetName, TreeDigest, VariantName,
 };
 use crate::records::{
-    FrozenSlotTopology, LedgerRollback, PhysicalBinding, PlanSource, RebindingPlan,
+    FrozenSlotTopology, LedgerRollback, PhysicalBinding, PlanOrigin, VerifiedReleaseRebinding,
 };
 use crate::store::local::LocalStore;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -65,25 +69,6 @@ pub(crate) enum ResolvedSelectionSource {
     Head,
     FrozenRelease(ReleaseId),
     Deployment(DeploymentId),
-}
-
-impl From<ResolvedSelectionSource> for PlanSource {
-    /// The resolved temporal source IS the plan source: `Head` plans from
-    /// the current topology, `FrozenRelease` is the direct-release reference
-    /// ([`PlanSource::ReleaseRef`]), and `Deployment` is the deployment
-    /// rollback ([`PlanSource::DeploymentRef`]). The engine derives the plan
-    /// record's [`PlanSource`] from the proof-bearing resolution's source via
-    /// this conversion — the planner's proof is the single authority for what
-    /// a plan resolves against.
-    fn from(source: ResolvedSelectionSource) -> PlanSource {
-        match source {
-            ResolvedSelectionSource::Head => PlanSource::Head,
-            ResolvedSelectionSource::FrozenRelease(release) => PlanSource::ReleaseRef(release),
-            ResolvedSelectionSource::Deployment(deployment_id) => {
-                PlanSource::DeploymentRef(deployment_id)
-            }
-        }
-    }
 }
 
 /// The PROOF-BEARING resolution of one push reference: the owning target,
@@ -130,6 +115,12 @@ impl ResolvedSelection {
         &self.target
     }
 
+    /// The declared temporal source the resolution resolved against. The
+    /// engine derives the plan's ORIGIN from the planner's
+    /// [`PlannedResolution::origin`] (built from this source + the verified
+    /// rebinding proof), so this accessor is test-only: the property suite
+    /// asserts the resolution's declared source.
+    #[cfg(test)]
     pub(crate) fn source(&self) -> &ResolvedSelectionSource {
         &self.source
     }
@@ -146,20 +137,23 @@ pub type PlannedAssignment = PlacementSlotAssignment;
 /// The resolution of one push reference into a planned assignment set: the
 /// per-slot assignments, the SET of releases they reference (per-slot
 /// artifact provenance — a partial snapshot can span several releases, so
-/// there is NO single snapshot-wide release), the plan source, — and for a
-/// DIRECT release reference — the explicit [`RebindingPlan`] documenting
-/// that the historical release's frozen topology is being applied onto the
-/// CURRENT physical slots (`None` for HEAD and deployment references) —
-/// plus the PROOF-BEARING [`ResolvedSelection`] the assignments were derived
-/// from: the target, its declared temporal source, and the non-empty
-/// resolved slot set. The engine consumes the resolution by accessor
-/// ([`PlannedResolution::resolved`]); it can never construct one.
+/// there is NO single snapshot-wide release), and the VERIFIED plan origin
+/// ([`PlanOrigin`]) — THE SOURCE OWNS ITS REQUIRED PAYLOAD: a DIRECT
+/// release reference carries its [`VerifiedReleaseRebinding`] proof INSIDE
+/// the source (a Release origin without the proof is unrepresentable);
+/// HEAD and deployment references carry none — plus the PROOF-BEARING
+/// [`ResolvedSelection`] the assignments were derived from: the target, its
+/// declared temporal source, and the non-empty resolved slot set. The
+/// engine consumes the resolution by accessor ([`PlannedResolution::resolved`]);
+/// it can never construct one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannedResolution {
     pub assignments: Vec<PlannedAssignment>,
     pub releases: BTreeSet<ReleaseId>,
-    pub source: PlanSource,
-    pub rebinding: Option<RebindingPlan>,
+    /// THE SOURCE OWNS ITS REQUIRED PAYLOAD: the verified [`PlanOrigin`] —
+    /// a Release origin carries its [`VerifiedReleaseRebinding`] proof
+    /// inside the source; HEAD and deployment origins carry none.
+    pub origin: PlanOrigin,
     resolved: ResolvedSelection,
 }
 
@@ -566,8 +560,7 @@ pub fn plan_assignments(
             Ok(PlannedResolution {
                 assignments: out,
                 releases: BTreeSet::from([local_release_id.clone()]),
-                source: PlanSource::Head,
-                rebinding: None,
+                origin: PlanOrigin::Head,
                 resolved,
             })
         }
@@ -661,8 +654,7 @@ pub fn plan_assignments(
             Ok(PlannedResolution {
                 assignments: out,
                 releases,
-                source: PlanSource::DeploymentRef(deployment_id.clone()),
-                rebinding: None,
+                origin: PlanOrigin::Deployment(deployment_id.clone()),
                 resolved,
             })
         }
@@ -803,16 +795,42 @@ pub fn plan_assignments(
                     }
                 }
             }
-            let rebinding = RebindingPlan {
-                release: release.clone(),
-                target: selection.target.clone(),
+            // THE VERIFIED REBINDING PROOF — the plan-level record that this
+            // `release:<id>` push is REBINDING the historical release's frozen
+            // topology onto the CURRENT physical slots. Historically this was
+            // the one IMPLICIT exception to the temporal-source rule (HEAD
+            // plans from current decls, a deployment ref uses the deployment's
+            // exact binding, current server configuration contributes only
+            // connectivity + capacity): the release resolved slot→variant from
+            // its own frozen record while its slot→SERVER rebinding onto the
+            // current target stayed implicit. The proof makes it explicit and
+            // typed: the frozen slot→variant/group topology (from the record's
+            // OWN snapshot, filtered to the destination target), the LOGICAL
+            // membership check that ran (the release's frozen slot IDs == the
+            // target's COMPLETE current membership — physical bindings may
+            // differ, the logical membership must match), the SELECTED plan
+            // slots (the PLANNED slots: a `--group` push narrows the
+            // assignments — the membership check still covers the complete
+            // set, composed with the engine's full-membership gate), and the
+            // CURRENT physical slots the topology is bound onto. The ONLY
+            // construction path is [`VerifiedReleaseRebinding::verify`], which
+            // checks that every component agrees (frozen topology keys ==
+            // membership, selected slots ⊆ membership, physical slots ==
+            // selected).
+            let rebinding = VerifiedReleaseRebinding::verify(
+                release.clone(),
+                selection.target.clone(),
                 frozen_topology,
                 // The PROOF the membership gate produced above: the frozen
                 // and current memberships verified EXACTLY EQUAL. Only a
                 // verified [`crate::model::MatchingMembership`] can be
                 // recorded here — the proof is the only construction path.
                 membership,
-                current_physical_slots: members
+                members
+                    .iter()
+                    .map(|(slot, _)| SlotId::new(slot.id.clone()))
+                    .collect(),
+                members
                     .iter()
                     .map(|(slot, sdef)| {
                         (
@@ -824,12 +842,14 @@ pub fn plan_assignments(
                         )
                     })
                     .collect(),
-            };
+            )?;
             Ok(PlannedResolution {
                 assignments: out,
                 releases: BTreeSet::from([release.clone()]),
-                source: PlanSource::ReleaseRef(release.clone()),
-                rebinding: Some(rebinding),
+                origin: PlanOrigin::Release {
+                    release: release.clone(),
+                    rebinding,
+                },
                 resolved,
             })
         }
@@ -874,6 +894,31 @@ mod tests {
     };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
+
+    /// Assert the planned origin is a Release origin naming the given
+    /// release and carrying the VERIFIED rebinding proof; returns the proof
+    /// (the caller then asserts its frozen topology / membership / physical
+    /// slots). A Release origin without its proof is unrepresentable, so
+    /// this single assertion covers both the release identity and the
+    /// proof's presence.
+    fn release_origin<'a>(
+        origin: &'a PlanOrigin,
+        release: &ReleaseId,
+    ) -> &'a VerifiedReleaseRebinding {
+        match origin {
+            PlanOrigin::Release {
+                release: r,
+                rebinding,
+            } => {
+                assert_eq!(
+                    r, release,
+                    "the release origin must name the planned release"
+                );
+                rebinding
+            }
+            other => panic!("expected a Release origin for {release}, got {other:?}"),
+        }
+    }
 
     const DEPLOY_TOML: &str = r#"
 schema_version = 2
@@ -1156,7 +1201,7 @@ interval_seconds = 0
         // The current config declares p1 inside the `standard` variant file.
         assert_eq!(config.slot_variant("p1").unwrap(), "standard");
 
-        let (assignments, desired, source, rebinding) = plan_assignments(
+        let (assignments, desired, origin) = plan_assignments(
             &SlotSelection::normalize(&config, "t1", None).unwrap(),
             &PushRef::Release {
                 release: release.clone(),
@@ -1166,14 +1211,7 @@ interval_seconds = 0
             &store,
             &config,
         )
-        .map(|planned| {
-            (
-                planned.assignments,
-                planned.releases,
-                planned.source,
-                planned.rebinding,
-            )
-        })
+        .map(|planned| (planned.assignments, planned.releases, planned.origin))
         .expect("snapshot-carrying release resolves");
 
         assert_eq!(assignments.len(), 1);
@@ -1191,11 +1229,7 @@ interval_seconds = 0
         );
         assert_eq!(a.artifact.release, release);
         assert_eq!(desired, BTreeSet::from([release.clone()]));
-        assert_eq!(source, PlanSource::ReleaseRef(release));
-        assert!(
-            rebinding.is_some(),
-            "a direct release plan must record the explicit RebindingPlan"
-        );
+        release_origin(&origin, &release);
     }
 
     /// An on-disk record with an EMPTY stored slot snapshot (the pre-snapshot
@@ -1505,7 +1539,7 @@ interval_seconds = 0
         let release = consistent(&mut rec);
         store.write_release(&rec).unwrap();
 
-        let (assignments, desired, source, rebinding) = plan_assignments(
+        let (assignments, desired, origin) = plan_assignments(
             &SlotSelection::normalize(&config, "t1", None).unwrap(),
             &PushRef::Release {
                 release: release.clone(),
@@ -1515,23 +1549,12 @@ interval_seconds = 0
             &store,
             &config,
         )
-        .map(|planned| {
-            (
-                planned.assignments,
-                planned.releases,
-                planned.source,
-                planned.rebinding,
-            )
-        })
+        .map(|planned| (planned.assignments, planned.releases, planned.origin))
         .expect("physical binding drift must not block logical-membership planning");
         assert_eq!(assignments.len(), 1);
         assert_eq!(assignments[0].placement_slot, SlotId::new("p1"));
         assert_eq!(desired, BTreeSet::from([release.clone()]));
-        assert_eq!(source, PlanSource::ReleaseRef(release));
-        assert!(
-            rebinding.is_some(),
-            "a release:<id> plan must record the explicit RebindingPlan"
-        );
+        release_origin(&origin, &release);
     }
 
     /// The TREE must come from the release record's own variant bindings: a
@@ -1607,7 +1630,7 @@ interval_seconds = 0
         let release = consistent(&mut rec);
         store.write_release(&rec).unwrap();
 
-        let (assignments, _, _, rebinding) = plan_assignments(
+        let (assignments, _, origin) = plan_assignments(
             &SlotSelection::normalize(&config, "t1", None).unwrap(),
             &PushRef::Release {
                 release: release.clone(),
@@ -1617,19 +1640,9 @@ interval_seconds = 0
             &store,
             &config,
         )
-        .map(|planned| {
-            (
-                planned.assignments,
-                planned.releases,
-                planned.source,
-                planned.rebinding,
-            )
-        })
+        .map(|planned| (planned.assignments, planned.releases, planned.origin))
         .expect("snapshot-declared release resolves");
-        assert!(
-            rebinding.is_some(),
-            "a direct release plan must record the explicit RebindingPlan"
-        );
+        release_origin(&origin, &release);
         assert_eq!(
             assignments[0].artifact.variant.as_str(),
             "other",
@@ -1714,7 +1727,7 @@ interval_seconds = 0
         // Exact rollback restores the historical artifact (variant `old` +
         // tree-old together) even though the current config declares p1 in
         // `new` and the release also ships it.
-        let (assignments, desired, source, _rebinding) = plan_assignments(
+        let (assignments, desired, origin) = plan_assignments(
             &SlotSelection::normalize(&config, "t1", None).unwrap(),
             &PushRef::Deployment {
                 target: TargetName::new("t1".to_string()),
@@ -1725,22 +1738,15 @@ interval_seconds = 0
             &store,
             &config,
         )
-        .map(|planned| {
-            (
-                planned.assignments,
-                planned.releases,
-                planned.source,
-                planned.rebinding,
-            )
-        })
+        .map(|planned| (planned.assignments, planned.releases, planned.origin))
         .expect("deployment ref resolves");
         assert_eq!(assignments[0].artifact.variant.as_str(), "old");
         assert_eq!(assignments[0].artifact.tree.as_str(), "tree-old");
         assert_eq!(assignments[0].artifact.release, release);
         assert_eq!(desired, BTreeSet::from([release.clone()]));
         assert_eq!(
-            source,
-            PlanSource::DeploymentRef(DeploymentId::new("deploy-snapshot-histvar".to_string()))
+            origin,
+            PlanOrigin::Deployment(DeploymentId::new("deploy-snapshot-histvar".to_string()))
         );
     }
 
@@ -1963,7 +1969,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // the release's FROZEN topology (here identical to the current
             // partition, so the plan's assignments are the authoritative
             // answer for `want`).
-            let (assignments, desired, source, _rebinding) = plan_assignments(
+            let (assignments, desired, origin) = plan_assignments(
                 &selection,
                 &PushRef::Release {
                     release: release.clone(),
@@ -1973,14 +1979,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &store,
                 &config,
             )
-            .map(|planned| {
-                (
-                    planned.assignments,
-                    planned.releases,
-                    planned.source,
-                    planned.rebinding,
-                )
-            })
+            .map(|planned| (planned.assignments, planned.releases, planned.origin))
             .unwrap_or_else(|e| panic!("group {group} must plan a direct release: {e}"));
             let got: Vec<&str> = assignments
                 .iter()
@@ -1992,7 +1991,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 assert_eq!(a.artifact.variant.as_str(), "standard");
             }
             assert_eq!(desired, BTreeSet::from([release.clone()]));
-            assert_eq!(source, PlanSource::ReleaseRef(release.clone()));
+            release_origin(&origin, &release);
         }
 
         // A 4th slot (`p4` on a new server `s4`) joins the target's config:
@@ -2224,7 +2223,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         // HEAD --group G: the CURRENT partition {p2} — the current config's
         // group declarations are HEAD's declared temporal source.
-        let (head, desired, source, rebinding) = plan_assignments(
+        let (head, desired, origin) = plan_assignments(
             &selection,
             &PushRef::Head,
             &local_release,
@@ -2232,14 +2231,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &store,
             &config,
         )
-        .map(|planned| {
-            (
-                planned.assignments,
-                planned.releases,
-                planned.source,
-                planned.rebinding,
-            )
-        })
+        .map(|planned| (planned.assignments, planned.releases, planned.origin))
         .expect("HEAD --group G must plan the current partition");
         let head_ids: Vec<&str> = head.iter().map(|a| a.placement_slot.as_str()).collect();
         assert_eq!(
@@ -2248,15 +2240,18 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "HEAD --group G must select EXACTLY the CURRENT partition {{p2}}, got {head_ids:?}"
         );
         assert_eq!(desired, BTreeSet::from([local_release.clone()]));
-        assert_eq!(source, PlanSource::Head);
-        assert!(rebinding.is_none(), "HEAD records no rebinding");
+        assert_eq!(origin, PlanOrigin::Head);
+        assert!(
+            matches!(origin, PlanOrigin::Head),
+            "HEAD records no rebinding"
+        );
 
         // release:R --group G: the FROZEN partition {p1, p3} — a slot the
         // release pushed inside G but the current config moved OUT of G (p1,
         // p3) still belongs to the push, and a slot the current config moved
         // INTO G (p2) does not. The frozen slots are REBOUND onto their
         // current physical locations (recorded in the RebindingPlan).
-        let (rel_assignments, rel_desired, rel_source, rel_rebinding) = plan_assignments(
+        let (rel_assignments, rel_desired, rel_origin) = plan_assignments(
             &selection,
             &PushRef::Release {
                 release: release.clone(),
@@ -2266,14 +2261,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &store,
             &config,
         )
-        .map(|planned| {
-            (
-                planned.assignments,
-                planned.releases,
-                planned.source,
-                planned.rebinding,
-            )
-        })
+        .map(|planned| (planned.assignments, planned.releases, planned.origin))
         .expect("release:<id> --group G must plan the frozen partition");
         let rel_ids: Vec<&str> = rel_assignments
             .iter()
@@ -2290,8 +2278,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             assert_eq!(a.artifact.tree.as_str(), "tree-frozen");
         }
         assert_eq!(rel_desired, BTreeSet::from([release.clone()]));
-        assert_eq!(rel_source, PlanSource::ReleaseRef(release.clone()));
-        let rp = rel_rebinding.expect("a release:<id> plan must carry the explicit RebindingPlan");
+        release_origin(&rel_origin, &release);
+        let rp = release_origin(&rel_origin, &release);
         // The frozen group's slots are REBOUND to their current physical
         // locations: the recorded current_physical_slots carry the CURRENT
         // (server, deploy_dir) for exactly the frozen partition's ids.
@@ -2356,7 +2344,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "the current config no longer declares G"
         );
         let selection2 = SlotSelection::normalize(&config2, "t1", Some("G")).unwrap();
-        let (rel2, _, _, _) = plan_assignments(
+        let (rel2, _, _) = plan_assignments(
             &selection2,
             &PushRef::Release {
                 release: release.clone(),
@@ -2366,14 +2354,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &store,
             &config2,
         )
-        .map(|planned| {
-            (
-                planned.assignments,
-                planned.releases,
-                planned.source,
-                planned.rebinding,
-            )
-        })
+        .map(|planned| (planned.assignments, planned.releases, planned.origin))
         .expect("a frozen-only group must still resolve for the release ref");
         let rel2_ids: Vec<&str> = rel2.iter().map(|a| a.placement_slot.as_str()).collect();
         assert_eq!(
@@ -2586,7 +2567,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             )]);
 
             // HEAD --group G: the CURRENT partition governs.
-            let (head, _, source, rebinding) = plan_assignments(
+            let (head, _, origin) = plan_assignments(
                 &selection,
                 &PushRef::Head,
                 &local_release,
@@ -2594,7 +2575,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &store,
                 &config,
             )
-                .map(|planned| (planned.assignments, planned.releases, planned.source, planned.rebinding))
+                .map(|planned| (planned.assignments, planned.releases, planned.origin))
             .unwrap_or_else(|e| {
                 panic!("HEAD --group G must plan the current partition {current:?}: {e}")
             });
@@ -2606,8 +2587,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 head_ids, current,
                 "HEAD --group G must select EXACTLY the CURRENT partition"
             );
-            assert_eq!(source, PlanSource::Head);
-            assert!(rebinding.is_none(), "HEAD records no rebinding");
+            assert_eq!(origin, PlanOrigin::Head);
+            assert!(matches!(origin, PlanOrigin::Head), "HEAD records no rebinding");
 
             // release:R --group G: the FROZEN partition governs — a slot in G
             // in the release but moved OUT of G in the current config still
@@ -2616,7 +2597,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // are the frozen ids REBOUND to their current physical locations
             // (the RebindingPlan records the current binding for exactly the
             // frozen partition's ids).
-            let (rel, _, rel_source, rel_rebinding) = plan_assignments(
+            let (rel, _, rel_origin) = plan_assignments(
                 &selection,
                 &PushRef::Release {
                     release: release.clone(),
@@ -2626,7 +2607,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &store,
                 &config,
             )
-                .map(|planned| (planned.assignments, planned.releases, planned.source, planned.rebinding))
+                .map(|planned| (planned.assignments, planned.releases, planned.origin))
             .unwrap_or_else(|e| {
                 panic!("release:R --group G must plan the frozen partition {frozen:?}: {e}")
             });
@@ -2643,9 +2624,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 assert_eq!(a.artifact.variant.as_str(), "standard");
                 assert_eq!(a.artifact.tree.as_str(), "tree-frozen");
             }
-            assert_eq!(rel_source, PlanSource::ReleaseRef(release.clone()));
-            let rp = rel_rebinding
-                .expect("a release:<id> plan must carry the explicit RebindingPlan");
+            release_origin(&rel_origin, &release);
+            let rp = release_origin(&rel_origin, &release);
             let rebound: Vec<&str> = rp
                 .current_physical_slots
                 .keys()
@@ -2815,7 +2795,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // any snapshot chain, regardless of the changed binding. Each
             // target owns its own slot (t1 -> p1, t2 -> p2).
             for dest in ["t1", "t2"] {
-                let (assignments, desired, source, rebinding) = plan_assignments(
+                let (assignments, desired, origin) = plan_assignments(
                     &SlotSelection::normalize(&config, dest, None).unwrap(),
                     &release_ref,
                     &ReleaseId::new("unused-local".to_string()),
@@ -2823,7 +2803,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     &store,
                     &config,
                 )
-                    .map(|planned| (planned.assignments, planned.releases, planned.source, planned.rebinding))
+                    .map(|planned| (planned.assignments, planned.releases, planned.origin))
                 .unwrap_or_else(|e| panic!("release:<id> must plan on target {dest}: {e}"));
                 assert_eq!(assignments.len(), 1, "one slot per target");
                 let a = &assignments[0];
@@ -2841,11 +2821,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 );
                 assert_eq!(a.artifact.release, release);
                 assert_eq!(desired, BTreeSet::from([release.clone()]));
-                assert_eq!(source, PlanSource::ReleaseRef(release.clone()));
-                assert!(
-                    rebinding.is_some(),
-                    "a release:<id> plan must record the explicit RebindingPlan"
-                );
+                release_origin(&origin, &release);
             }
 
             // The SNAPSHOT ref RETAINS the exact physical-binding checks: on
@@ -3078,7 +3054,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 // the record AND declared in the config) must not disturb
                 // t1's derived membership — t1 plans exactly its own set.
                 for dest in ["t1", "t2"] {
-                    let (assignments, desired, source, rebinding) = plan_assignments(
+                    let (assignments, desired, origin) = plan_assignments(
                         &SlotSelection::normalize(&config, dest, None).unwrap(),
                         &release_ref,
                         &ReleaseId::new("unused-local".to_string()),
@@ -3086,7 +3062,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                         &store,
                         &config,
                     )
-                        .map(|planned| (planned.assignments, planned.releases, planned.source, planned.rebinding))
+                        .map(|planned| (planned.assignments, planned.releases, planned.origin))
                     .unwrap_or_else(|e| {
                         panic!("release:<id> must plan on target {dest} when the membership matches: {e}")
                     });
@@ -3114,11 +3090,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                         assert_eq!(a.artifact.release, release);
                     }
                     assert_eq!(desired, BTreeSet::from([release.clone()]));
-                    assert_eq!(source, PlanSource::ReleaseRef(release.clone()));
-                    assert!(
-                        rebinding.is_some(),
-                        "a release:<id> plan must record the explicit RebindingPlan"
-                    );
+                    release_origin(&origin, &release);
                 }
                 // LOGICAL-ONLY: when the fixture realized a physical binding
                 // change (phys's server rebound), planning still succeeded
@@ -3175,7 +3147,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     "refusal must be the membership-drift error, got: {msg}"
                 );
                 // t2's membership is unchanged: it plans its own slot.
-                let (assignments, _, _, _rebinding) = plan_assignments(
+                let (assignments, _, _) = plan_assignments(
                     &SlotSelection::normalize(&config, "t2", None).unwrap(),
                     &release_ref,
                     &ReleaseId::new("unused-local".to_string()),
@@ -3183,7 +3155,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     &store,
                     &config,
                 )
-                    .map(|planned| (planned.assignments, planned.releases, planned.source, planned.rebinding))
+                    .map(|planned| (planned.assignments, planned.releases, planned.origin))
                 .expect("t2's membership is unchanged, so it still plans");
                 assert_eq!(assignments.len(), 1);
                 assert_eq!(assignments[0].placement_slot, SlotId::new("iso"));
@@ -3255,7 +3227,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 )]),
             );
 
-            let (assignments, desired, source, _rebinding) = plan_assignments(
+            let (assignments, desired, origin) = plan_assignments(
                 &SlotSelection::normalize(&config, "t1", None).unwrap(),
                 &PushRef::Deployment {
                     target: TargetName::new("t1".to_string()),
@@ -3266,7 +3238,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &store,
                 &config,
             )
-                .map(|planned| (planned.assignments, planned.releases, planned.source, planned.rebinding))
+                .map(|planned| (planned.assignments, planned.releases, planned.origin))
             .unwrap_or_else(|e| panic!("the deployment id must plan its stored state: {e}"));
 
             // EXACTLY the stored state: one slot, its artifact (variant +
@@ -3283,9 +3255,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "the rollout releases are exactly the snapshot's referenced releases"
             );
             assert_eq!(
-                source,
-                PlanSource::DeploymentRef(deployment_id.clone()),
-                "the plan source records the deployment key"
+                origin,
+                PlanOrigin::Deployment(deployment_id.clone()),
+                "the plan origin records the deployment key"
             );
 
             // A deployment id with NO snapshot never plans (failed / unknown
@@ -3563,7 +3535,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         } else {
             SlotSelection::normalize(&config, "t1", Some("group-a")).unwrap()
         };
-        let (assignments, referenced, source, _rebinding) = plan_assignments(
+        let (assignments, referenced, origin) = plan_assignments(
             &selection,
             &PushRef::Deployment {
                 target: TargetName::new("t1".to_string()),
@@ -3574,14 +3546,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &store,
             &config,
         )
-        .map(|planned| {
-            (
-                planned.assignments,
-                planned.releases,
-                planned.source,
-                planned.rebinding,
-            )
-        })
+        .map(|planned| (planned.assignments, planned.releases, planned.origin))
         .expect("the deployment id must plan its stored state");
 
         // The plan's referenced-releases set is EXACTLY the releases of the
@@ -3599,9 +3564,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .collect();
         assert_eq!(referenced, stored_releases);
         assert_eq!(
-            source,
-            PlanSource::DeploymentRef(rollback_id.clone()),
-            "the plan source records the deployment key"
+            origin,
+            PlanOrigin::Deployment(rollback_id.clone()),
+            "the plan origin records the deployment key"
         );
 
         // EVERY SELECTED SLOT: exactly its stored (release, tree, variant) and
@@ -3940,11 +3905,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 );
             } else {
                 let planned = head.unwrap();
-                let (assignments, desired, source, rebinding) = (
+                let (assignments, desired, origin) = (
                     planned.assignments,
                     planned.releases,
-                    planned.source,
-                    planned.rebinding,
+                    planned.origin,
                 );
                 assert_eq!(assignments.len(), 2);
                 for a in &assignments {
@@ -3961,8 +3925,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     assert_eq!(a.artifact.release, local_release);
                 }
                 assert_eq!(desired, BTreeSet::from([local_release.clone()]));
-                assert_eq!(source, PlanSource::Head);
-                assert!(rebinding.is_none(), "HEAD records no rebinding");
+                assert_eq!(origin, PlanOrigin::Head);
+                assert!(matches!(origin, PlanOrigin::Head), "HEAD records no rebinding");
             }
 
             // `release:<id>` — the RELEASE's frozen topology is its ONLY
@@ -3991,11 +3955,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 );
             } else {
                 let planned = rel.unwrap();
-                let (assignments, desired, source, rebinding) = (
+                let (assignments, desired, origin) = (
                     planned.assignments,
                     planned.releases,
-                    planned.source,
-                    planned.rebinding,
+                    planned.origin,
                 );
                 assert_eq!(assignments.len(), 2);
                 for a in &assignments {
@@ -4012,14 +3975,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     assert_eq!(a.artifact.release, release);
                 }
                 assert_eq!(desired, BTreeSet::from([release.clone()]));
-                assert_eq!(source, PlanSource::ReleaseRef(release.clone()));
+                release_origin(&origin, &release);
                 // THE EXPLICIT REBINDING PLAN: the frozen topology, the
                 // logical membership check (frozen == current; physical
                 // bindings may differ), and the CURRENT physical slots the
                 // topology is bound onto — never the deployment's recorded
                 // binding, even when the fixture drifted it.
-                let rp = rebinding
-                    .expect("a release:<id> plan must carry the explicit RebindingPlan");
+                let rp = release_origin(&origin, &release);
                 assert_eq!(rp.release, release);
                 assert_eq!(rp.target.as_str(), "t1");
                 // The membership proof carries the AGREED set (frozen ==
@@ -4075,11 +4037,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 );
             } else {
                 let planned = dep.unwrap();
-                let (assignments, desired, source, rebinding) = (
+                let (assignments, desired, origin) = (
                     planned.assignments,
                     planned.releases,
-                    planned.source,
-                    planned.rebinding,
+                    planned.origin,
                 );
                 assert_eq!(assignments.len(), 2);
                 for a in &assignments {
@@ -4096,11 +4057,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     BTreeSet::from([ReleaseId::new("rel-deploy".to_string())])
                 );
                 assert_eq!(
-                    source,
-                    PlanSource::DeploymentRef(DeploymentId::new("deploy-snapshot".to_string()))
+                    origin,
+                    PlanOrigin::Deployment(DeploymentId::new("deploy-snapshot".to_string()))
                 );
                 assert!(
-                    rebinding.is_none(),
+                    matches!(origin, PlanOrigin::Deployment(_)),
                     "a deployment rollback records no rebinding"
                 );
             }

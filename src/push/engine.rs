@@ -25,7 +25,7 @@ use crate::push::server::{
 use crate::push::staging::{StagingCleanup, cleanup_dry_run_staging, remove_tree_restoring_write};
 use crate::records::{
     BehaviorIndex, DeploymentIntent, DeploymentPlan, DeploymentStatus, DesiredGeneration,
-    IntentSlot, LedgerIntentReport, LedgerTerminal, NonEmptySlotTable, ObservedSlot, PlanSource,
+    IntentSlot, LedgerIntentReport, LedgerTerminal, NonEmptySlotTable, ObservedSlot,
     PreviousGeneration, SlotAttemptState, SlotOutcomeKind, SlotPlan, SlotResult, SlotTable,
     TerminalDisposition,
 };
@@ -656,10 +656,12 @@ fn push_inner(
 
     // 5 & 7. Build the plan from the RESOLVED ref (post-reconciliation).
     // The plan covers exactly the SELECTED slots (the normalized selection).
-    // The 4th element is the EXPLICIT rebinding context for a DIRECT release
-    // ref (a `release:<id>` push applies the release's frozen topology onto
-    // the CURRENT physical slots — [`crate::records::RebindingPlan`]); HEAD
-    // and deployment refs carry `None`. The planner ALSO produces the
+    // THE SOURCE OWNS ITS REQUIRED PAYLOAD: the plan's origin
+    // ([`crate::records::PlanOrigin`]) is the VERIFIED form — a DIRECT
+    // release ref (a `release:<id>` push applies the release's frozen
+    // topology onto the CURRENT physical slots) carries its
+    // [`crate::records::VerifiedReleaseRebinding`] proof INSIDE the source;
+    // HEAD and deployment refs carry none. The planner ALSO produces the
     // PROOF-BEARING resolution ([`crate::push::plan::ResolvedSelection`]:
     // target + declared temporal source + the non-empty resolved slot set),
     // which the engine consumes BY ACCESSOR below (`planned.resolved()`) —
@@ -677,13 +679,13 @@ fn push_inner(
     // The PROOF-BEARING resolution is consumed BY ACCESSOR (the planner is
     // the only constructor; the engine never builds one).
     let resolved = planned.resolved().clone();
-    let (assignments, rebinding) = (planned.assignments, planned.rebinding);
-    // The plan's target AND source are DERIVED from the proof-bearing
-    // resolution: the resolved target IS the plan's target, and the resolved
-    // DECLARED TEMPORAL SOURCE ([`crate::push::plan::ResolvedSelectionSource`])
-    // IS the plan's [`PlanSource`] — the planner's proof is the single
-    // authority for what this plan resolves against.
-    let source: PlanSource = resolved.source().clone().into();
+    let (assignments, origin) = (planned.assignments, planned.origin);
+    // The plan's target is DERIVED from the proof-bearing resolution: the
+    // resolved target IS the plan's target. The plan's ORIGIN is the
+    // planner's VERIFIED [`crate::records::PlanOrigin`] (built from the
+    // resolution's declared temporal source — the planner's proof is the
+    // single authority for what this plan resolves against — and, for a
+    // Release origin, the membership gate's verified rebinding proof).
 
     // THE SELECTED (slot, server) pairs this push plans, mutates, and
     // refreshes: derived from the plan's assignments — the per-branch
@@ -831,8 +833,7 @@ fn push_inner(
         target: resolved.target().clone(),
         behaviors: behavior_index.clone(),
         slots: plan_servers.clone(),
-        source,
-        rebinding,
+        source: origin,
     };
 
     // ---- Dry-run: read-only planning, no mutation of store/remote/locks -----
@@ -1073,7 +1074,7 @@ fn push_inner(
     // The DOMAIN intent stores ONE slot table (the membership + the
     // desired/pre-push entries are the same table — the exact-key-set
     // invariant is structural); the wire re-expands it on serialization.
-    let intent_slots: BTreeMap<SlotId, IntentSlot> = assignments
+    let intent_slots: Vec<(SlotId, IntentSlot)> = assignments
         .iter()
         .map(|a| {
             (
@@ -1565,17 +1566,17 @@ fn push_inner(
         // The CURRENT target slot set: the complete snapshot omits slots
         // removed from the current configuration and carries every current
         // unselected slot forward from the base.
-       // The rollback must key EXACTLY the deployment's membership (the
-       // four-set equality: outcomes == rollback slots == rollback bindings
-       // == intent membership, enforced by the conversion). The membership
-       // is the SELECTED slots (`assignments` — the full target for a full
-       // push, the group for a group push), so the rollback records exactly
-       // what the deployment touched: slots removed from the current
-       // configuration are omitted (they are not selected), and the
-       // partial-rollout overlay (carrying unselected base slots forward)
-       // is gone — a successful terminal's rollback must equal its
-       // outcomes.
-       let current_slot_ids: Vec<SlotId> = assignments
+        // The rollback must key EXACTLY the deployment's membership (the
+        // four-set equality: outcomes == rollback slots == rollback bindings
+        // == intent membership, enforced by the conversion). The membership
+        // is the SELECTED slots (`assignments` — the full target for a full
+        // push, the group for a group push), so the rollback records exactly
+        // what the deployment touched: slots removed from the current
+        // configuration are omitted (they are not selected), and the
+        // partial-rollout overlay (carrying unselected base slots forward)
+        // is gone — a successful terminal's rollback must equal its
+        // outcomes.
+        let current_slot_ids: Vec<SlotId> = assignments
             .iter()
             .map(|a| a.placement_slot.clone())
             .collect();
@@ -5057,6 +5058,206 @@ interval_seconds = 0
         );
     }
 
+    // ---- Deployment order: the batching follows the plan's order ---------
+    //
+    // The wire's `slot_ids` is documented as "in deployment order (the same
+    // set the commit marker `slots` payload records)". The plan's assignment
+    // order — which drives the ROLLOUT BATCHING — is the config's
+    // deterministic order (variants in name order, then each variant's slots
+    // in FILE order), NOT sorted by slot id. The intent's slot table must
+    // preserve that order, so the recorded `slot_ids` matches the batching
+    // order exactly. Here the slots are declared in the deliberately
+    // NON-sorted plan order [p3, p1, p2] and p1's verification FAILS: with
+    // batch_size = 1 + stop_on_failure the batching processes p3 first
+    // (advances), then p1 (fails) and stops — p2 is never started. If the
+    // batching (or the recorded slot_ids) were sorted by id, p1 would fail
+    // FIRST and p3 would never advance.
+
+    #[test]
+    fn batching_follows_the_deployment_order_not_sorted_slot_ids() {
+        const ORDERED_TOML: &str = r#"
+schema_version = 2
+application = "ordered"
+release = "v1"
+
+[[servers]]
+id = "s1"
+address = "a"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s2"
+address = "b"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s3"
+address = "c"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        // Variant `a` (sorts first) declares p3 with PASSING verification;
+        // variant `b` declares p1 (FAILING verification) then p2 (passing,
+        // never reached). The plan order is [p3, p1, p2] — the deployment
+        // order — never the sorted [p1, p2, p3].
+        let a = r#"
+[[slots]]
+id = "p3"
+server = "s3"
+target = "t1"
+deploy_dir = "/srv/p3"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[retention.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[retention.deployment]
+protect_deployments = 2
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+        let b = r#"
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+deploy_dir = "/srv/p1"
+
+[[slots]]
+id = "p2"
+server = "s2"
+target = "t1"
+deploy_dir = "/srv/p2"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[retention.per_server]
+keep_distinct_artifacts = 5
+keep_days = 14
+protect_previous = true
+
+[retention.deployment]
+protect_deployments = 2
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["false"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+        std::fs::write(release_dir.join("a.toml"), a).unwrap();
+        std::fs::write(release_dir.join("b.toml"), b).unwrap();
+        let artifacts = release_dir.join("artifacts");
+        std::fs::create_dir_all(artifacts.join("build/output/app")).unwrap();
+        std::fs::write(artifacts.join("build/output/app/server"), "v1\n").unwrap();
+
+        let cfg_path = project.join("deploy.toml");
+        std::fs::write(&cfg_path, ORDERED_TOML).unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let remotes_base = dir.path().join("remotes");
+        std::fs::create_dir_all(&remotes_base).unwrap();
+
+        let id = DeploymentId::new("deploy-ordered".to_string());
+        let op_id = OperationId::new(format!("op-{}", id.as_str()));
+        let rf = remotes_base.clone();
+        let factory = move |s: &crate::config::ServerDef,
+                            _slot: &crate::config::SlotConfig|
+              -> Result<Box<dyn Remote>> {
+            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
+        };
+        let r = push_inner(
+            &config.project_root(&cfg_path),
+            &store,
+            &factory,
+            "t1",
+            &crate::push::plan::SlotSelection::normalize(&config, "t1", None).unwrap(),
+            &RefExpr::Head,
+            None,
+            &id,
+            &op_id,
+            &config,
+            config.targets.get("t1").expect("target t1"),
+            &PushOptions {
+                dry_run: false,
+                ref_token: None,
+                group: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            r.status,
+            Some(DeploymentStatus::FailedRolledBack),
+            "the failing p1 under stop_on_failure must roll the attempt back, got {:?}",
+            r.status
+        );
+
+        // The recorded intent's slot_ids are the DEPLOYMENT order (the
+        // batching order), never the sorted-by-id order.
+        let attempt = r.attempt.expect("attempt recorded on failure");
+        assert_eq!(
+            attempt.slot_ids,
+            vec![
+                SlotId::new("p3".to_string()),
+                SlotId::new("p1".to_string()),
+                SlotId::new("p2".to_string()),
+            ],
+            "the wire's slot_ids must record the deployment order (the batching order), never sorted by id"
+        );
+
+        // The BATCHING order: p3 (the FIRST planned slot) advanced before
+        // p1 failed; p2 (after the failing slot) was never started. Under a
+        // sorted-by-id order p1 would have failed FIRST and p3 would never
+        // have advanced.
+        let results = store.read_results(id.as_str()).unwrap();
+        assert_eq!(
+            results[&SlotId::new("p3")].outcome,
+            SlotOutcomeKind::Restored,
+            "p3 (first in the deployment order) advanced before the failure and was compensated back"
+        );
+        assert_eq!(
+            results[&SlotId::new("p1")].outcome,
+            SlotOutcomeKind::Failed,
+            "p1 (second in the deployment order) is the failing slot"
+        );
+        assert_eq!(
+            results[&SlotId::new("p2")].outcome,
+            SlotOutcomeKind::Skipped,
+            "p2 (after the failing slot) was never started"
+        );
+    }
+
     // ---- Snapshot-ref membership-change refusal ------------------------------
     //
     // Exact snapshot rollback requires the current target's placement-slot SET to
@@ -7713,7 +7914,7 @@ interval_seconds = 0
             .unwrap();
             assert_eq!(
                 plan.source,
-               crate::records::PlanSource::DeploymentRef(DeploymentId::new(
+               crate::records::PlanOrigin::Deployment(DeploymentId::new(
                    selected_deployment.clone()
                )),
                "'{token}' must select the entry at successful-chain position {selected} =                  s{}(latest + 1) - {depth} — the POST-reconciliation selection, not the                  pre-reconcile s{}(latest) - {depth}",

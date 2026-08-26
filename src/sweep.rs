@@ -44,8 +44,7 @@ use crate::push::checkpoint::run_checkpoint_unlocked;
 use crate::push::engine::{PushOptions, push, retry_pending_sweep};
 use crate::records::{
     DeploymentIntent, DeploymentStatus, DesiredGeneration, IntentSlot, LedgerRollback,
-    LedgerTerminal, NonEmptySlotTable, SlotOutcomeKind, SlotResult, SlotTable,
-    TerminalDisposition,
+    LedgerTerminal, NonEmptySlotTable, SlotOutcomeKind, SlotResult, SlotTable, TerminalDisposition,
 };
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::transport::{LocalTransport, Remote};
