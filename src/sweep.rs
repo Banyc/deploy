@@ -266,9 +266,7 @@ fn failed_terminal() -> LedgerTerminal {
     LedgerTerminal {
         recorded_at: "2026-01-01T00:00:00Z".to_string(),
         outcomes: SlotTable::new(),
-        disposition: TerminalDisposition::FailedRolledBack {
-            compensation: SlotTable::new(),
-        },
+        disposition: TerminalDisposition::FailedRolledBack,
         reason: None,
     }
 }

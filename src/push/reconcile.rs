@@ -235,11 +235,13 @@ fn append_degraded(
     attempt: &DeploymentIntent,
     reason: &str,
 ) -> Result<()> {
-    // The Degraded disposition carries its REMAINING CHANGES: the wire
-    // record therefore records the pending changes — the attempt's desired
-    // generations, each as a Skipped outcome (never advanced) — so the
-    // read-back conversion derives a NON-EMPTY remaining-changes set (a
-    // Degraded terminal with nothing remaining is a payload mismatch).
+    // The Degraded disposition's REMAINING CHANGES are DERIVED from the
+    // outcomes (the non-restored slots with a recorded generation) — never
+    // stored. The wire record therefore records the pending changes — the
+    // attempt's desired generations, each as a Skipped outcome (never
+    // advanced) — so the read-back conversion derives a NON-EMPTY
+    // remaining-changes set (a Degraded terminal with nothing remaining is
+    // a payload mismatch).
     let outcomes: BTreeMap<PlacementSlotId, SlotResult> = attempt
         .slots
         .iter()
@@ -257,19 +259,20 @@ fn append_degraded(
         })
         .collect();
     let outcomes = SlotTable::from_map(outcomes);
+    // Verify the derivation is NON-EMPTY (fail fast — the read path derives
+    // the same set and refuses an empty one).
     let remaining_changes: BTreeMap<PlacementSlotId, GenerationId> = outcomes
         .iter()
         .map(|(sid, r)| (sid.clone(), r.generation.clone().expect("recorded above")))
         .collect();
+    NonEmptySlotTable::build(remaining_changes)?;
     store.append_terminal(
         target_name,
         &attempt.deployment_id,
         &LedgerTerminal {
             recorded_at: crate::remote::helper::now_rfc3339(),
             outcomes,
-            disposition: TerminalDisposition::Degraded {
-                remaining_changes: NonEmptySlotTable::build(remaining_changes)?,
-            },
+            disposition: TerminalDisposition::Degraded,
             reason: Some(reason.to_string()),
         },
     )

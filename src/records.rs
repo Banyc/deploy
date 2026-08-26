@@ -13,7 +13,8 @@
 //! # ONE authoritative collection per record; WIRE → VERIFIED DOMAIN
 //!
 //! Every record keeps ONE authoritative collection and derives the rest
-//! through methods (`membership()`, `releases()`, `behavior_digest()`); the
+//! through methods (`membership()`, `releases()`, `behavior_digest()`,
+//! [`LedgerTerminal::remaining_changes`], [`LedgerTerminal::compensation`]); the
 //! redundant on-disk members exist only in the WIRE types (the raw serde
 //! shapes, [`LedgerIntentWire`], [`LedgerRollbackWire`], [`LedgerTerminalWire`],
 //! [`DeploymentPlanWire`]) and are RECONCILED by a VERIFYING CONVERSION
@@ -59,10 +60,14 @@
 //!   outcomes, and NO rollback state.
 //! * [`LedgerLine::Terminal`] — the TERMINAL EVENT of one deployment
 //!   ([`LedgerTerminalWire`] → verified [`LedgerTerminal`]): the status, the
-//!   per-slot OUTCOMES, and — when the deployment was SUCCESSFUL — the
-//!   ROLLBACK STATE ([`LedgerRollbackWire`] → verified [`LedgerRollback`],
-//!   the snapshot payload: per-slot generation refs + physical bindings).
-//!   Appended once, after the mutation loop, and never edited.
+//!   per-slot OUTCOMES (the AUTHORITATIVE per-slot facts — the disposition's
+//!   per-slot projections, the Degraded remaining changes and the
+//!   FailedRolledBack compensation report, are DERIVED from them, never
+//!   stored twice), and — when the deployment was SUCCESSFUL — the ROLLBACK
+//!   STATE ([`LedgerRollbackWire`] → verified [`LedgerRollback`], the
+//!   snapshot payload: per-slot generation refs + physical bindings, the ONE
+//!   fact the outcomes cannot express). Appended once, after the mutation
+//!   loop, and never edited.
 //!
 //! A merged [`LedgerEntry`] (intent + optional terminal) is the deployment's
 //! full history record. The ledger's APPEND ORDER is the HISTORY ORDER: the
@@ -933,7 +938,10 @@ pub type CompleteRollback = LedgerRollback;
 /// The COMPENSATION REPORT of a [`TerminalDisposition::FailedRolledBack`]
 /// terminal — the existing per-slot outcomes table under the disposition's
 /// name: each slot's result during the failed-then-rolled-back attempt
-/// (which slots were compensated back and which compensation failed).
+/// (which slots were compensated back and which compensation failed). The
+/// report is DERIVED from the terminal's authoritative outcomes table
+/// ([`LedgerTerminal::compensation`]) — never stored as a duplicate that
+/// could disagree with the outcomes.
 pub type CompensationReport = SlotTable<SlotOutcome>;
 
 /// The DISPOSITION of a deployment's terminal event — the DOMAIN replaces
@@ -944,43 +952,54 @@ pub type CompensationReport = SlotTable<SlotOutcome>;
 ///
 /// * [`TerminalDisposition::Successful`] ALWAYS carries its complete
 ///   rollback payload (a successful deployment always records its rollback
-///   state).
+///   state — the generation refs + physical bindings, the ONE fact the
+///   per-slot outcomes cannot express).
 /// * [`TerminalDisposition::FailedPreflight`] carries NOTHING — a
 ///   pre-mutation failure cannot carry a rollback, and no slot was touched.
-/// * [`TerminalDisposition::FailedRolledBack`] carries its COMPENSATION
-///   REPORT (the per-slot results of the compensation pass).
-/// * [`TerminalDisposition::Degraded`] carries its REMAINING CHANGES (the
-///   slots that did not reach a restored state, each mapped to the
-///   generation it recorded — derived from the wire outcomes).
+/// * [`TerminalDisposition::FailedRolledBack`] carries NOTHING — its
+///   COMPENSATION REPORT (the per-slot results of the compensation pass) IS
+///   the terminal's authoritative outcomes table, DERIVED via
+///   [`LedgerTerminal::compensation`], never stored twice.
+/// * [`TerminalDisposition::Degraded`] carries NOTHING — its REMAINING
+///   CHANGES (the slots that did not reach a restored state, each mapped to
+///   the generation it recorded) are DERIVED from the authoritative
+///   outcomes via [`LedgerTerminal::remaining_changes`], never stored twice.
 ///
-/// The WIRE keeps the current `status` + `rollback` shape; the wire → domain
-/// conversion maps every status to EXACTLY ONE disposition and refuses a
-/// status whose payload does not match its disposition (a `Successful` with
-/// no rollback, a failed status carrying a rollback, a `Degraded` with no
-/// remaining changes, an `InProgress`/`PendingCommit` terminal — all are
-/// conversion errors, fail closed).
+/// STORE EACH FACT EXACTLY ONCE: the per-slot OUTCOMES are the authoritative
+/// per-slot facts; the disposition carries ONLY what the outcomes cannot
+/// express (the Successful rollback payload). The WIRE keeps the current
+/// `status` + `rollback` shape; the wire → domain conversion maps every
+/// status to EXACTLY ONE disposition and refuses a status whose payload does
+/// not match its disposition (a `Successful` with no rollback, a failed
+/// status carrying a rollback, a `Degraded` whose outcomes show all-restored,
+/// a `Successful` whose outcomes disagree with the rollback's slots, an
+/// `InProgress`/`PendingCommit` terminal — all are conversion errors, fail
+/// closed).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalDisposition {
     /// The deployment succeeded: the complete rollback payload (the full
-    /// snapshot: per-slot generations + physical bindings).
+    /// snapshot: per-slot generations + physical bindings — the ONE fact
+    /// the per-slot outcomes cannot express; the outcomes' keys must agree
+    /// with the rollback's slots, enforced by the conversion).
     Successful { rollback: CompleteRollback },
     /// The attempt failed before any slot mutation: no payload (no
     /// rollback — and the conversion also refuses outcomes, since a
     /// pre-mutation failure touched no slot).
     FailedPreflight,
-    /// The attempt failed after mutating slots and was rolled back: the
-    /// compensation report — each slot's per-slot result of the
-    /// compensation pass (which slots were restored and which compensation
-    /// failed).
-    FailedRolledBack { compensation: CompensationReport },
+    /// The attempt failed after mutating slots and was rolled back: no
+    /// payload — the compensation report (each slot's per-slot result of
+    /// the compensation pass: which slots were restored and which
+    /// compensation failed) IS the terminal's authoritative outcomes table,
+    /// derived via [`LedgerTerminal::compensation`].
+    FailedRolledBack,
     /// The attempt ended degraded (some slots advanced and were not
-    /// restored, or the commit could not be finalized): the REMAINING
-    /// CHANGES — the slots that did not reach a restored state, each mapped
-    /// to the generation it recorded (derived from the wire outcomes;
-    /// NON-EMPTY by construction).
-    Degraded {
-        remaining_changes: NonEmptySlotTable<GenerationId>,
-    },
+    /// restored, or the commit could not be finalized): no payload — the
+    /// REMAINING CHANGES (the slots that did not reach a restored state,
+    /// each mapped to the generation it recorded) are DERIVED from the
+    /// authoritative outcomes via [`LedgerTerminal::remaining_changes`]
+    /// (NON-EMPTY by construction — the conversion refuses a Degraded wire
+    /// whose outcomes show all-restored).
+    Degraded,
 }
 
 impl TerminalDisposition {
@@ -991,8 +1010,8 @@ impl TerminalDisposition {
         match self {
             TerminalDisposition::Successful { .. } => DeploymentStatus::Successful,
             TerminalDisposition::FailedPreflight => DeploymentStatus::FailedPreflight,
-            TerminalDisposition::FailedRolledBack { .. } => DeploymentStatus::FailedRolledBack,
-            TerminalDisposition::Degraded { .. } => DeploymentStatus::Degraded,
+            TerminalDisposition::FailedRolledBack => DeploymentStatus::FailedRolledBack,
+            TerminalDisposition::Degraded => DeploymentStatus::Degraded,
         }
     }
 
@@ -1012,24 +1031,36 @@ impl TerminalDisposition {
 /// intent's, verified equal by the reader when the terminal merges into its
 /// entry). The terminal's own shape is the disposition enum: the
 /// status/rollback TRUTH TABLE is STRUCTURAL (see [`TerminalDisposition`])
-/// — an invalid status/payload combination is unrepresentable. `reason`
-/// carries optional human context (e.g. "push completed", "recovery
-/// finalized", "preflight failed") — a single fact for display, not a
-/// duplicated projection.
+/// — an invalid status/payload combination is unrepresentable.
+///
+/// STORE EACH FACT EXACTLY ONCE: the per-slot OUTCOMES are the authoritative
+/// per-slot facts; the disposition carries ONLY what the outcomes cannot
+/// express (the Successful rollback payload). The disposition's per-slot
+/// projections — the Degraded REMAINING CHANGES and the FailedRolledBack
+/// COMPENSATION REPORT — are DERIVED from the outcomes
+/// ([`LedgerTerminal::remaining_changes`], [`LedgerTerminal::compensation`]),
+/// never stored twice, so they can never disagree with the outcomes.
+/// `reason` carries optional human context (e.g. "push completed", "recovery
+/// finalized", "preflight failed") — a free-form human NOTE, not a fact: it
+/// never participates in any invariant (the disposition IS the machine fact).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LedgerTerminal {
     /// When the terminal event was recorded (RFC 3339).
     pub recorded_at: String,
     /// Actual per-slot outcomes after the mutation loop, the domain
     /// [`SlotTable`] (possibly empty — a pre-mutation failure touched no
-    /// slot). The per-slot outcomes of a failed-then-rolled-back terminal
-    /// are ALSO the disposition's compensation report (see
-    /// [`TerminalDisposition::FailedRolledBack`]).
+    /// slot). THE AUTHORITATIVE per-slot facts: the disposition's per-slot
+    /// projections (the Degraded remaining changes, the FailedRolledBack
+    /// compensation report) are DERIVED from this table, never stored
+    /// separately.
     pub outcomes: SlotTable<SlotOutcome>,
     /// HOW the attempt ended — the enum whose variants carry exactly their
-    /// payload (the truth table is structural).
+    /// payload (the truth table is structural; the per-slot projections are
+    /// derived from `outcomes`).
     pub disposition: TerminalDisposition,
-    /// Optional human context: why this terminal event happened.
+    /// Optional human context: why this terminal event happened. A
+    /// free-form NOTE, not a fact — it never participates in invariants
+    /// (the disposition is the machine fact).
     pub reason: Option<String>,
 }
 
@@ -1038,6 +1069,45 @@ impl LedgerTerminal {
     /// separately — a status and a disposition can never disagree).
     pub fn status(&self) -> DeploymentStatus {
         self.disposition.status()
+    }
+
+    /// The REMAINING CHANGES of a [`TerminalDisposition::Degraded`] terminal
+    /// — DERIVED from the authoritative per-slot outcomes (the slots whose
+    /// outcome is non-restored, each mapped to the generation it recorded),
+    /// never stored. `None` for any non-Degraded disposition. For a Degraded
+    /// terminal the conversion guarantees at least one remaining change, so
+    /// the derived value is always `Some` (non-empty by construction).
+    pub fn remaining_changes(&self) -> Option<NonEmptySlotTable<GenerationId>> {
+        if !matches!(self.disposition, TerminalDisposition::Degraded) {
+            return None;
+        }
+        let remaining: BTreeMap<PlacementSlotId, GenerationId> = self
+            .outcomes
+            .iter()
+            .filter(|(_, r)| r.outcome != ServerOutcomeKind::Restored && r.generation.is_some())
+            .map(|(k, r)| {
+                (
+                    k.clone(),
+                    r.generation
+                        .clone()
+                        .expect("a non-restored outcome whose generation is Some (filtered above)"),
+                )
+            })
+            .collect();
+        NonEmptySlotTable::build(remaining).ok()
+    }
+
+    /// The COMPENSATION REPORT of a [`TerminalDisposition::FailedRolledBack`]
+    /// terminal — the authoritative per-slot outcomes table itself (the
+    /// record of what the compensation pass did to each slot: which slots
+    /// were restored and which compensation failed), never a stored
+    /// duplicate. `None` for any other disposition.
+    pub fn compensation(&self) -> Option<&CompensationReport> {
+        if matches!(self.disposition, TerminalDisposition::FailedRolledBack) {
+            Some(&self.outcomes)
+        } else {
+            None
+        }
     }
 }
 
@@ -1070,8 +1140,13 @@ impl LedgerTerminalWire {
     /// converted through [`LedgerRollbackWire::into_domain`] (which fails
     /// closed on any disagreement), the STATUS/ROLLBACK TRUTH TABLE is
     /// enforced (`Successful` always records its rollback state; every other
-    /// status never carries one), and each outcome's value must name its OWN
-    /// map key (the outcome's `slot_id` is the placement slot it records). A
+    /// status never carries one), each outcome's value must name its OWN
+    /// map key (the outcome's `slot_id` is the placement slot it records),
+    /// and the disposition's duplicated projections must AGREE with the
+    /// authoritative outcomes: a `Successful` wire's outcomes must be
+    /// covered by the rollback's slots and every outcome must be Activated,
+    /// and a `Degraded` wire's outcomes must derive a NON-EMPTY
+    /// remaining-changes set (all-restored outcomes are refused). A
     /// disagreement → `Error::integrity`. The cross-record claims (outcome
     /// key set vs the intent's `slot_ids`, and the `target` field vs the
     /// read path / intent) are enforced by the ledger read that merges the
@@ -1107,6 +1182,33 @@ impl LedgerTerminalWire {
         // conversion error (fail closed).
         let disposition = match (&self.status, rollback) {
             (DeploymentStatus::Successful, Some(rollback)) => {
+                // OUTCOME/ROLLBACK AGREEMENT: every outcome key must be a
+                // rollback slot — the rollback is the authoritative rollback
+                // fact (the complete snapshot), and an outcome for a slot the
+                // rollback does not cover is a disagreement. (The reverse — a
+                // rollback slot without an outcome — is legitimate: a
+                // partial rollout's rollback carries unselected slots
+                // forward from the base.)
+                for key in outcomes.keys() {
+                    if !rollback.slots.contains_key(key) {
+                        return Err(Error::integrity(format!(
+                            "terminal {}: outcome for slot '{key}' is not covered by the Successful rollback — the outcomes must agree with the rollback's slots",
+                            self.deployment_id
+                        )));
+                    }
+                }
+                // A Successful deployment implies every slot activated: a
+                // non-activated outcome is a disagreement (the disposition's
+                // implied state vs the recorded outcome).
+                if let Some(r) = outcomes
+                    .values()
+                    .find(|r| r.outcome != ServerOutcomeKind::Activated)
+                {
+                    return Err(Error::integrity(format!(
+                        "terminal {}: status Successful requires every outcome Activated — slot '{}' records {:?}",
+                        self.deployment_id, r.slot_id, r.outcome
+                    )));
+                }
                 TerminalDisposition::Successful { rollback }
             }
             (DeploymentStatus::Successful, None) => {
@@ -1132,10 +1234,11 @@ impl LedgerTerminalWire {
             }
             (DeploymentStatus::FailedRolledBack, None) => {
                 // The compensation report IS the outcome table: the record
-                // of what the compensation pass did to each slot.
-                TerminalDisposition::FailedRolledBack {
-                    compensation: outcomes.clone(),
-                }
+                // of what the compensation pass did to each slot — DERIVED
+                // from the authoritative outcomes
+                // ([`LedgerTerminal::compensation`]), never stored as a
+                // duplicate that could disagree with them.
+                TerminalDisposition::FailedRolledBack
             }
             (DeploymentStatus::FailedRolledBack, Some(_)) => {
                 return Err(Error::integrity(format!(
@@ -1146,11 +1249,12 @@ impl LedgerTerminalWire {
             (DeploymentStatus::Degraded, None) => {
                 // REMAINING CHANGES: the slots whose outcome did NOT restore
                 // (compensated back), each mapped to the generation it
-                // recorded. Derived from the wire outcomes; NON-EMPTY by
-                // construction (a degraded terminal with every slot restored
-                // — or with no recorded outcome — has no remaining change and
-                // is refused: a status whose payload does not match its
-                // disposition).
+                // recorded. DERIVED from the wire outcomes
+                // ([`LedgerTerminal::remaining_changes`]) — never stored.
+                // The derivation must be NON-EMPTY (a degraded terminal with
+                // every slot restored — or with no recorded outcome — has no
+                // remaining change and is refused: a status whose payload
+                // does not match its disposition).
                 let remaining: BTreeMap<PlacementSlotId, GenerationId> = outcomes
                     .iter()
                     .filter(|(_, r)| {
@@ -1165,14 +1269,13 @@ impl LedgerTerminalWire {
                         )
                     })
                     .collect();
-                TerminalDisposition::Degraded {
-                    remaining_changes: NonEmptySlotTable::build(remaining).map_err(|_| {
-                        Error::integrity(format!(
-                            "terminal {}: status Degraded requires at least one REMAINING change (a non-restored outcome with a recorded generation)",
-                            self.deployment_id
-                        ))
-                    })?,
-                }
+                NonEmptySlotTable::build(remaining).map_err(|_| {
+                    Error::integrity(format!(
+                        "terminal {}: status Degraded requires at least one REMAINING change (a non-restored outcome with a recorded generation)",
+                        self.deployment_id
+                    ))
+                })?;
+                TerminalDisposition::Degraded
             }
             (DeploymentStatus::Degraded, Some(_)) => {
                 return Err(Error::integrity(format!(
@@ -1923,7 +2026,10 @@ mod tests {
             (TerminalDisposition::FailedPreflight, 1) => {
                 assert!(terminal.outcomes.is_empty(), "preflight touched no slot");
             }
-            (TerminalDisposition::FailedRolledBack { compensation }, 2) => {
+            (TerminalDisposition::FailedRolledBack, 2) => {
+                let compensation = terminal.compensation().expect(
+                    "a FailedRolledBack terminal derives its compensation report from the outcomes",
+                );
                 assert_eq!(
                     compensation.len(),
                     keys.len(),
@@ -1936,7 +2042,10 @@ mod tests {
                     "the compensation records the restored slots"
                 );
             }
-            (TerminalDisposition::Degraded { remaining_changes }, 3) => {
+            (TerminalDisposition::Degraded, 3) => {
+                let remaining_changes = terminal
+                    .remaining_changes()
+                    .expect("a Degraded terminal derives its remaining changes from the outcomes");
                 assert!(
                     !remaining_changes.is_empty(),
                     "degraded keeps non-empty remaining changes"
@@ -2004,6 +2113,70 @@ mod tests {
         t.outcomes
             .insert(slot(9), outcome_for(&slot(9), ServerOutcomeKind::Activated));
     }
+    fn outcome_status_vs_disposition(t: &mut LedgerTerminalWire) {
+        match &t.status {
+            DeploymentStatus::Degraded => {
+                // The Degraded disposition implies non-restored remaining
+                // changes; an all-restored outcome table is a disagreement.
+                for r in t.outcomes.values_mut() {
+                    r.outcome = ServerOutcomeKind::Restored;
+                }
+            }
+            DeploymentStatus::FailedPreflight => {
+                // A pre-mutation failure touched no slot; any outcome is a
+                // disagreement.
+                t.outcomes
+                    .insert(slot(0), outcome_for(&slot(0), ServerOutcomeKind::Activated));
+            }
+            DeploymentStatus::Successful => {
+                // The Successful disposition implies every slot activated; a
+                // failed outcome is a disagreement.
+                if let Some(r) = t.outcomes.values_mut().next() {
+                    r.outcome = ServerOutcomeKind::Failed;
+                }
+            }
+            DeploymentStatus::FailedRolledBack => {
+                // The compensation report IS the outcome table — no per-slot
+                // status can disagree with it; the disagreement is a
+                // rollback payload on a failed status.
+                t.rollback = Some(LedgerRollbackWire {
+                    slots: BTreeMap::new(),
+                    bindings: BTreeMap::new(),
+                    behavior_sha256: None,
+                    release: None,
+                });
+            }
+            other => panic!("unexpected wire status {other:?}"),
+        }
+    }
+    fn outcome_key_vs_rollback_slots(t: &mut LedgerTerminalWire) {
+        if t.status == DeploymentStatus::Successful {
+            // The Successful rollback is the authoritative rollback fact; an
+            // outcome key the rollback no longer covers is a disagreement.
+            let Some(rb) = t.rollback.as_mut() else {
+                return;
+            };
+            let Some(key) = rb.slots.keys().next().cloned() else {
+                return;
+            };
+            rb.slots.remove(&key);
+            rb.bindings.remove(&key);
+        } else {
+            // Only Successful may carry a rollback; a failed status with one
+            // is a disagreement.
+            t.rollback = Some(LedgerRollbackWire {
+                slots: BTreeMap::new(),
+                bindings: BTreeMap::new(),
+                behavior_sha256: None,
+                release: None,
+            });
+        }
+    }
+    fn reason_mutated(t: &mut LedgerTerminalWire) {
+        // The reason is a free-form human NOTE, not a fact: it never
+        // participates in invariants, so mutating it is NOT a disagreement.
+        t.reason = Some("tampered note".to_string());
+    }
     fn target_mismatch(t: &mut LedgerTerminalWire) {
         t.target = TargetName::new("other-target".to_string());
     }
@@ -2013,14 +2186,21 @@ mod tests {
 
     proptest! {
         // PROPERTY (the directive's point 4): generate VALID wire pairs
-        // (intent + terminal), then mutate ONE field at a time — the
-        // status→disposition mapping, the rollback payload, an outcome slot,
-        // the target identity — and assert EVERY mutation fails the
-        // verifying conversion BEFORE any consumer (the REAL read_ledger
-        // consumer path), while the VALID pair converts to a DOMAIN whose
-        // SHAPE has no duplicates/missing keys (asserted by inspection of
-        // the NonEmptySlotTable / outcomes / disposition). Bounded 16 cases,
-        // fixed seed 0x5EED_5EED (house style), no persistence.
+        // (intent + terminal), then mutate ONE duplicated fact at a time —
+        // the status→disposition mapping, the rollback payload, an outcome
+        // slot, an outcome's status vs the disposition's implied state, an
+        // outcome key vs the rollback's slots, the target identity — and
+        // assert EVERY disagreement fails the verifying conversion BEFORE
+        // any consumer (the REAL read_ledger consumer path), while the
+        // VALID pair converts to a DOMAIN whose SHAPE has no
+        // duplicates/missing keys (asserted by inspection of the
+        // NonEmptySlotTable / outcomes / disposition) and whose DERIVED
+        // methods (`remaining_changes`, `compensation`) agree with the
+        // outcomes by construction. The REASON is a free-form human note,
+        // NOT a fact: mutating it never creates a disagreement — the
+        // conversion succeeds and carries the note through unchanged.
+        // Bounded 16 cases, fixed seed 0x5EED_5EED (house style), no
+        // persistence.
         #![proptest_config(ProptestConfig {
             cases: 16,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
@@ -2053,12 +2233,14 @@ mod tests {
                 status_idx,
             );
 
-            let mutations: [(&str, TerminalMutation); 7] = [
+            let mutations: [(&str, TerminalMutation); 9] = [
                 ("status→disposition mismatch", tamper_status),
                 ("rollback payload mismatch (missing on Successful / added to a failed status)", rollback_added_to_failed),
                 ("rollback binding without a generation", rollback_extra_binding),
                 ("outcome value naming a different slot", outcome_slot_mismatch),
                 ("outcome key outside the membership", outcome_outside_membership),
+                ("outcome status vs the disposition's implied state", outcome_status_vs_disposition),
+                ("outcome key vs the rollback's slots", outcome_key_vs_rollback_slots),
                 ("terminal target disagrees with the entry", target_mismatch),
                 ("terminal deployment id keys no intent line", deployment_id_mismatch),
             ];
@@ -2076,6 +2258,20 @@ mod tests {
                     "{name} must fail read_ledger (the first consumer)"
                 );
             }
+
+            // The REASON is a free-form human note, NOT a fact: mutating it
+            // never creates a disagreement — the conversion succeeds and
+            // carries the note through unchanged (it never participates in
+            // invariants).
+            let mut noted = (intent, terminal);
+            reason_mutated(&mut noted.1);
+            let (_, d_terminal) =
+                pair_to_domain(&noted).expect("a mutated reason is not a disagreement");
+            assert_eq!(
+                d_terminal.reason.as_deref(),
+                Some("tampered note"),
+                "the note is carried through unchanged"
+            );
         }
     }
 
@@ -2259,21 +2455,28 @@ mod tests {
         let d = wire.into_domain().unwrap();
         assert_eq!(d.disposition, TerminalDisposition::FailedPreflight);
 
-        // FailedRolledBack → the outcome table is the compensation report.
+        // FailedRolledBack → the outcome table is the compensation report
+        // (derived, never stored twice).
         let wire = agreeing_terminal(&keys, 2);
         let d = wire.into_domain().unwrap();
-        let TerminalDisposition::FailedRolledBack { compensation } = &d.disposition else {
-            panic!("FailedRolledBack maps to FailedRolledBack {{ compensation }}");
-        };
-        assert_eq!(compensation.len(), 2);
+        assert_eq!(d.disposition, TerminalDisposition::FailedRolledBack);
+        assert_eq!(
+            d.compensation().expect("derived compensation report").len(),
+            2,
+            "the compensation report is the outcome table"
+        );
 
-        // Degraded → the non-restored outcomes ARE the remaining changes.
+        // Degraded → the non-restored outcomes ARE the remaining changes
+        // (derived, never stored twice).
         let wire = agreeing_terminal(&keys, 3);
         let d = wire.into_domain().unwrap();
-        let TerminalDisposition::Degraded { remaining_changes } = &d.disposition else {
-            panic!("Degraded maps to Degraded {{ remaining_changes }}");
-        };
-        assert_eq!(remaining_changes.len(), 2);
+        assert_eq!(d.disposition, TerminalDisposition::Degraded);
+        assert_eq!(
+            d.remaining_changes()
+                .expect("derived remaining changes")
+                .len(),
+            2
+        );
 
         // PAYLOAD MISMATCHES: a status whose payload does not match its
         // disposition is a conversion error.
@@ -2314,6 +2517,23 @@ mod tests {
         assert!(
             bad.into_domain().is_err(),
             "Degraded with every slot restored is refused"
+        );
+        // A Successful wire whose outcomes disagree with the rollback's
+        // slots (an outcome key the rollback does not cover).
+        let mut bad = agreeing_terminal(&keys, 0); // Successful
+        bad.outcomes
+            .insert(slot(9), outcome_for(&slot(9), ServerOutcomeKind::Activated));
+        assert!(
+            bad.into_domain().is_err(),
+            "a Successful outcome outside the rollback's slots is refused"
+        );
+        // A Successful wire whose outcome status disagrees with the
+        // disposition's implied state (every slot activated).
+        let mut bad = agreeing_terminal(&keys, 0); // Successful
+        bad.outcomes.get_mut(&slot(1)).unwrap().outcome = ServerOutcomeKind::Failed;
+        assert!(
+            bad.into_domain().is_err(),
+            "a Successful terminal with a failed outcome is refused"
         );
         // InProgress / PendingCommit never appear on a terminal event.
         let mut bad = agreeing_terminal(&keys, 0);

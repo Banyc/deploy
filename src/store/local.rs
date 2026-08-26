@@ -1802,13 +1802,7 @@ mod tests {
                             error: None,
                         },
                     )])),
-                    disposition: TerminalDisposition::Degraded {
-                        remaining_changes: NonEmptySlotTable::build(BTreeMap::from([(
-                            PlacementSlotId::new("p1".to_string()),
-                            GenerationId::new("gen-1".to_string()),
-                        )]))
-                        .expect("one remaining change"),
-                    },
+                    disposition: TerminalDisposition::Degraded,
                     reason: Some("boom".to_string()),
                 },
             )
@@ -1855,9 +1849,7 @@ mod tests {
                 &LedgerTerminal {
                     recorded_at: "2026-01-01T00:00:00Z".to_string(),
                     outcomes: SlotTable::new(),
-                    disposition: TerminalDisposition::FailedRolledBack {
-                        compensation: SlotTable::new(),
-                    },
+                    disposition: TerminalDisposition::FailedRolledBack,
                     reason: None,
                 },
             )
@@ -3190,9 +3182,7 @@ mod tests {
                 },
             }
         } else {
-            TerminalDisposition::FailedRolledBack {
-                compensation: SlotTable::from_map(outcomes.clone()),
-            }
+            TerminalDisposition::FailedRolledBack
         };
         LedgerTerminal {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),

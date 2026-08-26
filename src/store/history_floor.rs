@@ -796,9 +796,7 @@ impl LocalStore {
                 },
             },
             DeploymentStatus::FailedPreflight => TerminalDisposition::FailedPreflight,
-            DeploymentStatus::FailedRolledBack => TerminalDisposition::FailedRolledBack {
-                compensation: SlotTable::new(),
-            },
+            DeploymentStatus::FailedRolledBack => TerminalDisposition::FailedRolledBack,
             other => {
                 return Err(Error::store(format!(
                     "append_transition cannot record status {other:?} as a status-only terminal"

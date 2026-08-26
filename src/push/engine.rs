@@ -1594,17 +1594,20 @@ fn push_inner(
         let outcomes = SlotTable::from_map(outcomes_map);
         // MAP the final status to its DISPOSITION (the domain truth table is
         // structural): FailedPreflight carries nothing (empty outcomes — no
-        // slot touched), FailedRolledBack carries the outcome table as its
-        // compensation report, Degraded carries its remaining changes (the
-        // non-restored outcomes, derived by the wire conversion on read —
-        // here the domain is built directly, so the same derivation is
-        // applied to stay in sync with the read path).
+        // slot touched), FailedRolledBack derives its compensation report
+        // from the outcome table, Degraded derives its remaining changes
+        // (the non-restored outcomes) from the outcomes — the same
+        // derivation the read path applies, so the domain and the wire
+        // conversion stay in sync.
         let disposition = match &commit_status {
             DeploymentStatus::FailedPreflight => TerminalDisposition::FailedPreflight,
-            DeploymentStatus::FailedRolledBack => TerminalDisposition::FailedRolledBack {
-                compensation: outcomes.clone(),
-            },
+            DeploymentStatus::FailedRolledBack => TerminalDisposition::FailedRolledBack,
             DeploymentStatus::Degraded => {
+                // The Degraded disposition's remaining changes are DERIVED
+                // from the outcomes (the non-restored slots with a recorded
+                // generation) — never stored. The derivation must be
+                // NON-EMPTY (a Degraded terminal with nothing remaining is
+                // a payload mismatch).
                 let remaining: BTreeMap<PlacementSlotId, GenerationId> = outcomes
                     .iter()
                     .filter(|(_, r)| {
@@ -1619,14 +1622,13 @@ fn push_inner(
                         )
                     })
                     .collect();
-                TerminalDisposition::Degraded {
-                    remaining_changes: NonEmptySlotTable::build(remaining).map_err(|_| {
-                        Error::store(
-                            "a Degraded terminal requires at least one remaining change — none recorded"
-                                .to_string(),
-                        )
-                    })?,
-                }
+                NonEmptySlotTable::build(remaining).map_err(|_| {
+                    Error::store(
+                        "a Degraded terminal requires at least one remaining change — none recorded"
+                            .to_string(),
+                    )
+                })?;
+                TerminalDisposition::Degraded
             }
             other => {
                 return Err(Error::store(format!(
