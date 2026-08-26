@@ -49,7 +49,7 @@ use crate::error::{Error, Result};
 use crate::model::{CONFIG_SCHEMA_VERSION, ServerId, SlotId};
 use crate::records::PhysicalBinding;
 use crate::scalar::{
-    AbsoluteDeployDir, ApplicationDisplayName, BatchSize, CapacityPercent, Host, Identifier,
+    AbsoluteDeployDir, ApplicationStoreKey, BatchSize, CapacityPercent, Host, Identifier,
     RolloutGroupName, SshUser,
 };
 use serde::{Deserialize, Serialize};
@@ -1082,17 +1082,18 @@ pub struct ProjectConfig {
     /// conversion refuses any other value). Private + read-only
     /// ([`ProjectConfig::schema_version`]): the format identity is invariant.
     schema_version: u32,
-    /// The deployment application DISPLAY name: a validated NON-EMPTY,
-    /// control-free [`ApplicationDisplayName`] parsed by the raw -> domain
-    /// conversion (an empty or control-bearing application name is
-    /// rejected). The display name is FREE-FORM (it may contain `/`, `\`,
-    /// `.`/`..`, or surrounding whitespace) — it is used in messages and
-    /// rendering, never as a path. The STORE directory key is the separate
-    /// [`crate::scalar::ApplicationStoreKey`], derived from the display
-    /// name at the store boundary ([`crate::store::local::LocalStore::new`]
-    /// takes the key), so the store path can never be escaped. Private +
-    /// read-only ([`ProjectConfig::application`]).
-    application: ApplicationDisplayName,
+    /// The deployment application identifier: a validated single safe
+    /// path segment ([`crate::scalar::ApplicationStoreKey`]) parsed by the
+    /// raw -> domain conversion (an application name that is not a safe
+    /// store key — empty, control-bearing, `/`/`\`-separated, `.`/`..`, or
+    /// padded — is rejected AT THE LOAD, fail closed). ONE safe
+    /// application identifier is used for BOTH display (messages and
+    /// rendering) and storage: the store directory key is the SAME value
+    /// ([`crate::store::local::LocalStore::new`] takes it directly, with
+    /// no further conversion), so a successfully loaded config always
+    /// constructs its store. Private + read-only
+    /// ([`ProjectConfig::application`]).
+    application: ApplicationStoreKey,
     /// The active release: the name of a directory directly beneath
     /// `releases/` in the project root (`release: v1` -> `releases/v1/`).
     /// INVARIANT-BEARING (a single directory component) — private and
@@ -1183,8 +1184,11 @@ impl ProjectConfig {
         &self.release
     }
 
-    /// The deployment application DISPLAY name (read-only).
-    pub fn application(&self) -> &ApplicationDisplayName {
+    /// The deployment application identifier (read-only): ONE safe name
+    /// used for both display and storage — the store is constructed
+    /// directly from it ([`crate::store::local::LocalStore::new`]), with
+    /// no further conversion.
+    pub fn application(&self) -> &ApplicationStoreKey {
         &self.application
     }
 
@@ -1885,14 +1889,18 @@ impl TryFrom<RawProject> for ProjectConfig {
             return Err(Error::config("at least one target must be declared"));
         }
 
-        // The application name is parsed into the validated NON-EMPTY,
-        // control-free [`ApplicationDisplayName`] scalar: an empty or
-        // control-bearing application name is rejected (fail closed). The
-        // display name is free-form (it is not a path); the STORE KEY is
-        // derived from it at the store boundary, where a display name that
-        // is not a single safe path segment is rejected.
-        let application = ApplicationDisplayName::parse(&manifest.application)
-            .map_err(|_| Error::config("application must be a non-empty, control-free name"))?;
+        // The application name is parsed into the validated single safe
+        // path segment [`crate::scalar::ApplicationStoreKey`]: an
+        // application name that is not a safe store key (empty,
+        // control-bearing, `/`/`\`-separated, `.`/`..`, or padded) is
+        // rejected HERE — at the LOAD, fail closed — so a successfully
+        // loaded config always constructs its store. ONE safe application
+        // identifier is used for both display and storage.
+        let application = ApplicationStoreKey::parse(&manifest.application).map_err(|_| {
+            Error::config(
+                "application must be a single safe name (no '/', '\\', '.', '..', or whitespace)",
+            )
+        })?;
 
         // Each loaded variant carries its own artifact/activation/verification
         // policy; validate each one and build the domain variant (the raw
@@ -5495,11 +5503,11 @@ interval_seconds = 0
     /// scalar outcome exactly.
     fn scalar_mutation_project() -> impl Strategy<Value = (RawProject, bool)> {
         prop_oneof![
-            // application: ApplicationDisplayName (non-empty, control-free).
+            // application: ApplicationStoreKey (single safe segment).
             arbitrary_scalar_text().prop_map(|v| {
                 let mut p = minimal_raw_project();
                 p.manifest.application = v.clone();
-                (p, ApplicationDisplayName::parse(&v).is_ok())
+                (p, ApplicationStoreKey::parse(&v).is_ok())
             }),
             // slot id: Identifier.
             arbitrary_scalar_text().prop_map(|v| {
@@ -5581,6 +5589,179 @@ interval_seconds = 0
                 }
             }
         }
+    }
+
+    // =====================================================================
+    // application: ONE safe identifier for display AND storage
+    // =====================================================================
+    //
+    // The config's `application` field IS the store key
+    // ([`crate::scalar::ApplicationStoreKey`]): a single safe path segment
+    // used for both display and storage. The raw -> domain conversion
+    // parses it AS the store key, so a display name that is not a safe key
+    // FAILS THE LOAD (fail closed at load, not at the store boundary), and
+    // a successfully loaded config constructs its LocalStore directly from
+    // `config.application()` — no fallible identity conversion remains.
+
+    #[test]
+    fn application_name_is_the_store_key_load_and_store() {
+        // A SAFE application name LOADS and constructs the store: the
+        // config's `application` IS the store key, so the load implies the
+        // store construction with no further fallible identity conversion.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_standard_release(&project, "v1");
+        let p = project.join("deploy.toml");
+        std::fs::write(
+            &p,
+            deploy_toml("v1").replace("application = \"forced\"", "application = \"my-app\""),
+        )
+        .unwrap();
+        let cfg = ProjectConfig::load(&p).expect("a safe application name loads");
+        assert_eq!(cfg.application().as_str(), "my-app");
+        // The store is constructed DIRECTLY from the config's application
+        // (the field IS the key): `LocalStore::new(&config.application())`.
+        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
+        let store_root = crate::testutil::hermetic_tmpdir_root();
+        unsafe { std::env::set_var("TMPDIR", &store_root) };
+        let store = LocalStore::new(cfg.application())
+            .expect("a loaded config must construct its LocalStore");
+        assert_eq!(
+            store.base().file_name(),
+            Some(std::ffi::OsStr::new("my-app")),
+            "the store sits under <base>/<application>"
+        );
+        unsafe { std::env::remove_var("TMPDIR") };
+        let _ = std::fs::remove_dir_all(store_root.join("deploy-test"));
+
+        // An UNSAFE application name (a path separator, a traversal
+        // component, or padding) FAILS THE LOAD — fail closed at load, not
+        // at the store boundary.
+        for bad in ["a/b", "a\\b", "..", ".", "../x", "x/..", " x", "x "] {
+            let mut raw = minimal_raw_project();
+            raw.manifest.application = bad.to_string();
+            let err = ProjectConfig::from_raw_parts(raw.manifest, raw.variants)
+                .expect_err("an unsafe application name must fail the load");
+            assert!(
+                matches!(err, Error::Config(_)),
+                "the rejection must be a config error, got: {err}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // THE LOAD-IMPLIES-STORE PROPERTY: over ARBITRARY application names
+    // (empty, `/`/`\`-separated, `.`/`..` traversal, padded, control,
+    // unicode, and clean single segments), EVERY configuration the raw ->
+    // domain conversion ACCEPTS must ALSO construct its LocalStore — the
+    // config's `application` IS the store key (one safe identifier for
+    // display and storage), so the load implies the store construction
+    // with NO further fallible identity conversion; and a config whose
+    // application is not a safe key FAILS THE LOAD (fail closed at load,
+    // not at the store boundary). The generated alphabet is
+    // FILESYSTEM-SAFE (every accepted name is encodable on the local
+    // filesystem), so the store construction is asserted to SUCCEED for
+    // every accepted config; the full arbitrary space — including
+    // filesystem-incompatible unicode, which fails the store open with a
+    // STORE error (fail closed, never an escape) — is pinned by the
+    // scalar-level store-key property. Bounded 16 cases, fixed seed
+    // 0x5EED_5EED per house style.
+    // -------------------------------------------------------------------
+
+    /// Arbitrary application-name text over a FILESYSTEM-SAFE alphabet:
+    /// every identity-relevant class (empty, separators, traversal
+    /// components, padding, control characters, unicode, clean segments)
+    /// plus random strings over ASCII printable (minus `/`) and a safe
+    /// unicode letter — every generated name is encodable on the local
+    /// filesystem, so a name the conversion accepts ALWAYS constructs its
+    /// store.
+    fn arbitrary_application_text() -> impl Strategy<Value = String> {
+        prop_oneof![
+            prop::sample::select(vec![
+                String::new(),
+                " ".to_string(),
+                "s1".to_string(),
+                "production".to_string(),
+                "wave-1".to_string(),
+                " x".to_string(),
+                "x ".to_string(),
+                "x y".to_string(),
+                "α".to_string(),
+                "a\nb".to_string(),
+                "/srv/p1".to_string(),
+                "/srv/deploy/app".to_string(),
+                "srv/relative".to_string(),
+                "..".to_string(),
+                ".".to_string(),
+                "../x".to_string(),
+                "x/..".to_string(),
+                "a..b".to_string(),
+                "a.b".to_string(),
+            ]),
+            prop::collection::vec(
+                prop::sample::select(vec!['a', 'b', 'c', '1', '2', '-', '_', '.', ' ', 'α']),
+                0..8,
+            )
+            .prop_map(|v| v.into_iter().collect()),
+        ]
+    }
+
+    /// One application-mutation case: the minimal valid raw project with
+    /// ONLY the `application` field set to an arbitrary raw value, paired
+    /// with the store-key parse verdict on that value. No other conversion
+    /// gate can fire, so the conversion outcome is the application outcome
+    /// exactly.
+    fn application_mutation_project() -> impl Strategy<Value = (RawProject, bool)> {
+        arbitrary_application_text().prop_map(|v| {
+            let mut p = minimal_raw_project();
+            p.manifest.application = v.clone();
+            (p, ApplicationStoreKey::parse(&v).is_ok())
+        })
+    }
+
+    #[test]
+    fn loaded_config_always_constructs_its_store() {
+        // The property constructs REAL stores via `LocalStore::new`, so the
+        // process-global `$TMPDIR` is pointed at a hermetic temp root for
+        // the whole run (ENV_LOCK serializes against every other
+        // env-mutating test; the closure-form proptest runs all 16 cases in
+        // this thread).
+        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
+        let store_root = crate::testutil::hermetic_tmpdir_root();
+        unsafe { std::env::set_var("TMPDIR", &store_root) };
+        proptest!(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        }, |((project, expected) in application_mutation_project())| {
+            match ProjectConfig::from_raw_parts(project.manifest, project.variants) {
+                Ok(cfg) => {
+                    assert!(
+                        expected,
+                        "the conversion must accept exactly the values the store key accepts"
+                    );
+                    // THE LOAD IMPLIES THE STORE: the config's application
+                    // IS the store key — no fallible identity conversion
+                    // remains between a loaded config and its store.
+                    LocalStore::new(cfg.application())
+                        .expect("a loaded config must construct its LocalStore");
+                }
+                Err(e) => {
+                    assert!(
+                        !expected,
+                        "the conversion must accept a value the store key accepts, got: {e}"
+                    );
+                    assert!(
+                        matches!(e, Error::Config(_)),
+                        "the rejection must be a config error, got: {e}"
+                    );
+                }
+            }
+        });
+        unsafe { std::env::remove_var("TMPDIR") };
+        let _ = std::fs::remove_dir_all(store_root.join("deploy-test"));
     }
 
     // =====================================================================

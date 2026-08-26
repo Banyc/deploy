@@ -6,9 +6,10 @@
 //! TRAVERSAL-FREE path with at least one normal component below the root,
 //! a batch size must be nonzero, a capacity percent
 //! must fit 0..=100, and a recorded timestamp must parse as RFC 3339. The
-//! application name splits into a free-form DISPLAY name (messages and
-//! rendering) and a single-segment STORE KEY (the one filesystem component
-//! that names the local store directory). Each
+//! application name is ONE safe identifier ([`ApplicationStoreKey`]): a
+//! single normal filesystem component used for BOTH display (messages and
+//! rendering) and storage (the one filesystem component that names the
+//! local store directory). Each
 //! such value is
 //! wrapped in a NEWTYPE whose CONSTRUCTION validates the invariant (a
 //! private inner value, reachable only through [`parse`]-style constructors
@@ -140,53 +141,18 @@ name_scalar!(
 
 name_scalar!(
     ApplicationStoreKey,
-    "The application STORE KEY: the single filesystem component that names \
-    the application's local store directory (`<data>/simple-deploy/<key>`). \
-    EXACTLY ONE NORMAL FILESYSTEM COMPONENT: non-empty, no `/` or `\\`, not \
-    `.`/`..`, no surrounding whitespace or control characters — the same \
+    "The application identifier: THE single safe name from the config's \
+    `application` field, used for BOTH display (messages and rendering) and \
+    storage (the single filesystem component that names the application's \
+    local store directory, `<data>/simple-deploy/<key>`). EXACTLY ONE \
+    NORMAL FILESYSTEM COMPONENT: non-empty, no `/` or `\\`, not `.`/`..`, \
+    no surrounding whitespace or control characters — the same \
     single-safe-segment rule as the other path-segment scalars. The store \
     path is built ONLY from a validated key ([`crate::store::local::LocalStore::new`] \
     takes the key, never a raw string), so an application name can never \
     escape the store base.",
     valid_name
 );
-
-/// The display-name rule: non-empty and control-free (a display name must
-/// be printable in messages and rendering), but otherwise FREE-FORM — path
-/// separators, `.`/`..` traversal components, and surrounding whitespace
-/// are all allowed, because the display name is NOT a path: the store
-/// directory key is the separate [`ApplicationStoreKey`], derived from the
-/// display name at the store boundary ([`TryFrom<&ApplicationDisplayName>`]).
-fn valid_display_name(s: &str) -> bool {
-    !s.is_empty() && !s.chars().any(|c| c.is_control())
-}
-
-name_scalar!(
-    ApplicationDisplayName,
-    "The application DISPLAY name: the free-form name from the config's \
-    `application` field, used in messages and rendering. NON-EMPTY and \
-    control-free (a display name must be printable), but otherwise \
-    unrestricted — it may contain `/`, `\\`, `.`/`..`, or surrounding \
-    whitespace. The display name is NOT a path: the store directory key is \
-    the separate [`ApplicationStoreKey`], derived from the display name at \
-    the store boundary ([`TryFrom<&ApplicationDisplayName>`]) — a display \
-    name that is not ALSO a safe store key is rejected there, so the store \
-    path can never be escaped.",
-    valid_display_name
-);
-
-/// The config → store handoff: the store directory key is derived from the
-/// display name by parsing it as a single safe path segment. A display name
-/// that is not ALSO a valid store key (e.g. `a/b`, `..`, ` x`) is rejected
-/// HERE — at the store boundary — so an application name can never reach
-/// [`crate::store::local::LocalStore::new`] unless it is a valid store key,
-/// and the store path can never escape the store base.
-impl TryFrom<&ApplicationDisplayName> for ApplicationStoreKey {
-    type Error = Error;
-    fn try_from(display: &ApplicationDisplayName) -> Result<ApplicationStoreKey> {
-        ApplicationStoreKey::parse(display.as_str())
-    }
-}
 
 impl AsRef<std::path::Path> for ApplicationStoreKey {
     /// The store key is used directly as the single filesystem component of
@@ -490,56 +456,6 @@ mod tests {
     }
 
     #[test]
-    fn application_display_name_is_free_form() {
-        // The display name is FREE-FORM: separators, traversal components,
-        // and surrounding whitespace are all allowed (it is not a path —
-        // the store key is a separate scalar).
-        for ok in [
-            "app", "my app", "α", "a/b", "a\\b", "..", ".", " x ", "x y", "a..b",
-        ] {
-            let name = ApplicationDisplayName::parse(ok).expect("free-form display name parses");
-            assert_eq!(name.as_str(), ok);
-            assert_eq!(name.to_string(), ok);
-            assert_eq!(
-                ok.parse::<ApplicationDisplayName>().expect("from_str"),
-                name
-            );
-        }
-        // Only the display invariants hold: non-empty and control-free.
-        for bad in ["", "\u{0}", "a\nb", "a\tb"] {
-            ApplicationDisplayName::parse(bad)
-                .expect_err("empty or control-bearing display name rejected");
-            assert!(bad.parse::<ApplicationDisplayName>().is_err(), "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn display_name_to_store_key_handoff_rejects_unsafe_names() {
-        // A clean display name converts to its store key.
-        let display = ApplicationDisplayName::parse("my-app").expect("display name parses");
-        let key =
-            ApplicationStoreKey::try_from(&display).expect("clean display name is a safe key");
-        assert_eq!(key.as_str(), "my-app");
-        // Every escape class is rejected at the handoff: the display name
-        // may be free-form, but the STORE KEY must be a single safe
-        // segment, so an unsafe display name can never reach the store
-        // construction.
-        for bad in ["a/b", "a\\b", "..", ".", "../x", "x/..", " x", "x "] {
-            let display =
-                ApplicationDisplayName::parse(bad).expect("free-form display name parses");
-            ApplicationStoreKey::try_from(&display)
-                .expect_err("an unsafe display name must never become a store key");
-        }
-        // Control characters are rejected at the DISPLAY parse itself (a
-        // display name must be printable), so they can never even reach the
-        // handoff.
-        for bad in ["", "\u{0}", "a\nb"] {
-            ApplicationDisplayName::parse(bad)
-                .expect_err("empty or control-bearing display name rejected");
-        }
-    }
-
-    #[test]
     fn rollout_group_name_accepts_valid_rejects_invalid() {
         for ok in ["canary", "wave-1", "α", "a..b"] {
             let g = RolloutGroupName::parse(ok).expect("valid group parses");
@@ -763,10 +679,11 @@ mod tests {
     // `/`, `\`, `..`, `.`, empty, whitespace, unicode, and control
     // characters), the store-key parse accepts EXACTLY the single-normal-
     // component values; `LocalStore::new` with a valid key places the store
-    // under `<base>/<key>/` (exactly ONE component appended); and an unsafe
-    // display name can never reach the store construction (the config→store
-    // handoff rejects it). Bounded 16 cases, fixed seed 0x5EED_5EED per
-    // house style.
+    // under `<base>/<key>/` (exactly ONE component appended). The key IS
+    // the config's application identifier (one safe name for display and
+    // storage), so an unsafe application name can never reach the store
+    // construction. Bounded 16 cases, fixed seed 0x5EED_5EED per house
+    // style.
     // -------------------------------------------------------------------
 
     #[test]
@@ -791,23 +708,6 @@ mod tests {
                 expected,
                 "ApplicationStoreKey must accept exactly safe single segments: {s:?}"
             );
-            // The display name is free-form (non-empty, control-free); the
-            // config→store handoff (TryFrom) accepts exactly the
-            // safe-segment values, so an unsafe display name can never
-            // reach the store construction.
-            let display_ok = !s.is_empty() && !s.chars().any(|c| c.is_control());
-            assert_eq!(
-                ApplicationDisplayName::parse(&s).is_ok(),
-                display_ok,
-                "ApplicationDisplayName must accept exactly non-empty control-free names: {s:?}"
-            );
-            if let Ok(display) = ApplicationDisplayName::parse(&s) {
-                assert_eq!(
-                    ApplicationStoreKey::try_from(&display).is_ok(),
-                    expected,
-                    "the display→store-key handoff must accept exactly safe single segments: {s:?}"
-                );
-            }
             if let Ok(key) = ApplicationStoreKey::parse(&s) {
                 // The store path is default_base().join(key): EXACTLY ONE
                 // component appended — the key is a single safe segment, so
