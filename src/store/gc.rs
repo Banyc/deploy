@@ -172,6 +172,12 @@ impl LocalStore {
                 "test fault: artifact GC scan forced to fail once",
             ));
         }
+        // KEEP-BOTH (merge): the gc side's fail-closed taxonomy — a
+        // pin-abort keeps its INTEGRITY class, every other anchor failure is
+        // annotated with the triggering checkpoint — combined with the
+        // preview side's retained-suffix ledger override threaded into the
+        // reachability scan. Both compose: reachability runs WITH the
+        // override; the fail-closed error classes are preserved.
         let retained = match self.reachable_set(config, ledger_override) {
             Ok(rs) => rs,
             // A pin-abort (an un-honorable pinned release) is an integrity

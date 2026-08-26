@@ -57,6 +57,9 @@
 
 use crate::config::Config;
 use crate::error::{Error, Result};
+// KEEP-BOTH (merge): the gc side's `ReleaseId` (pins honored by name in the
+// reachability scan) and the preview side's `LedgerEntry` (the override
+// carries parsed entries) are both live imports — keep both.
 use crate::model::{DeploymentId, ReleaseId};
 use crate::records::{DeploymentStatus, LedgerEntry};
 use crate::store::atomic::{path_state, write_atomic_replace};
@@ -264,6 +267,16 @@ impl LocalStore {
     /// variant/tree of its release. `deployments/<id>/` dirs of the
     /// retained ledger entries AND observed `last_deployment`s are reachable.
     ///
+    /// FAIL CLOSED on EVERY retention anchor: a PRESENT-but-unreadable
+    /// anchor — an unreadable ledger, an unreadable observed record, an
+    /// unreadable or malformed pins file, or a release record a pin names —
+    /// is an ERROR, never ABSENCE. An anchor that reads as absent shrinks
+    /// the retained set and the sweep would delete content the failed read
+    /// might have protected; the failed scan must abort the pass BEFORE any
+    /// unlink (extra garbage on disk is safe, a partial retained set is
+    /// not). (KEEP-BOTH merge: the gc side's fail-closed anchor docs + the
+    /// preview side's override docs + parameter — both compose.)
+    ///
     /// `ledger_override` — the checkpoint's retained-suffix override: when
     /// `Some`, the named target's ledger is scanned as the OVERRIDE entries
     /// (the as-if ledger after the suffix replacement), never the on-disk
@@ -445,7 +458,30 @@ impl LocalStore {
         config: &Config,
         ledger_override: Option<&LedgerOverride>,
     ) -> Result<LedgerDiscards> {
+        // POST-COMMIT SWEEP READ FAULT HOOK (test-only, global key): the
+        // REACHABILITY-SCAN stage fails — the sweep aborts before any
+        // enumeration or deletion. The checkpoint's explicit post-commit
+        // boundary converts this `Err` into a warning (the ledger commit
+        // stands; the sweep is retry-required) — it must never surface as a
+        // checkpoint `Err` after the irreversible replacement.
+        #[cfg(test)]
+        if self.fault_registry().consume(FaultKind::SweepScan, "") {
+            return Err(Error::store(
+                "test fault: checkpoint sweep reachability scan forced to fail once",
+            ));
+        }
         let reachable = self.reachable_set(config, ledger_override)?;
+        // POST-COMMIT SWEEP ENUMERATION FAULT HOOK (test-only, global key):
+        // the directory-ENUMERATION stage fails after the scan succeeded —
+        // nothing is listed, nothing is deleted. Same conversion contract as
+        // the scan fault: the checkpoint reports the sweep retry-required
+        // (warning), never `Err`.
+        #[cfg(test)]
+        if self.fault_registry().consume(FaultKind::SweepEnumerate, "") {
+            return Err(Error::store(
+                "test fault: checkpoint sweep directory enumeration forced to fail once",
+            ));
+        }
         let mut discards = LedgerDiscards::default();
         let depl_root = self.base().join("deployments");
         if path_state(&depl_root)? {

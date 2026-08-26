@@ -24,7 +24,13 @@
 //!    rename + parent-dir fsync). THIS is the checkpoint's ONLY logical
 //!    commit: a reader never observes a torn ledger (wholly old or wholly
 //!    new). IF THE REPLACEMENT FAILS, NO DELETION HAPPENS — the checkpoint
-//!    is a plain `Err` and the full history stands untouched.
+//!    is a plain `Err` and the full history stands untouched. ONCE THE
+//!    REPLACEMENT SUCCEEDS THE CHECKPOINT IS IRREVERSIBLY COMMITTED: that
+//!    moment is the EXPLICIT COMMIT BOUNDARY — from it on, no post-commit
+//!    sweep failure (scan, enumeration, deletion, or the debt-marker write)
+//!    may surface as an `Err`; each is converted into a report with
+//!    `established: true`, `sweep_completed: false`, and a warning (see
+//!    step 3).
 //! 3. BEST-EFFORT GLOBAL SWEEP ([`LocalStore::run_sweep`]) of unreachable
 //!    deployment directories (`deployments/<id>/`), release records
 //!    (`releases/<release-id>/`), and tree objects
@@ -98,6 +104,18 @@ pub struct CheckpointReport {
     /// recorded and the next push (or a re-run of the same checkpoint)
     /// recomputes reachability fresh and finishes it.
     pub sweep_completed: bool,
+    /// THE EXPLICIT POST-COMMIT BOUNDARY WARNING: a sweep READ/DELETION
+    /// failure that surfaced AFTER the irreversible ledger replacement
+    /// committed (the reachable-set scan, the directory enumeration, or a
+    /// deletion stage) is converted into this warning — `established` stays
+    /// `true`, `sweep_completed` is `false`, and the sweep is retry-required
+    /// (the durable sweep-debt marker records it; the next push — or a
+    /// re-run — recomputes reachability fresh). The checkpoint NEVER returns
+    /// `Err` for a post-commit sweep failure; this field carries the reason.
+    /// `None` when the sweep ran without a post-commit error (a
+    /// merely-incomplete sweep is reported via `sweep_completed` + the
+    /// renderer's retry line, not here).
+    pub sweep_warning: Option<String>,
     /// Warning about the sweep-debt marker I/O when the sweep did not
     /// complete (the marker could not be persisted). Post-commit
     /// maintenance: a debt write failure is a warning, never an `Err` — the
@@ -162,6 +180,19 @@ pub(crate) fn run_checkpoint_unlocked(
 /// best-effort global sweep. A repeated checkpoint of the same deployment
 /// recomputes the SAME suffix (the ledger already IS it — the replacement is
 /// an identical rewrite) and re-runs the sweep to convergence.
+///
+/// # The EXPLICIT COMMIT BOUNDARY
+///
+/// The moment [`LocalStore::write_ledger_suffix`] returns `Ok`, the
+/// checkpoint is IRREVERSIBLY committed — the pre-checkpoint history is
+/// gone forever. From that exact point on the checkpoint CANNOT return
+/// `Err`: the sweep (the reachable-set scan, the directory enumeration, the
+/// three deletion stages) and the sweep-debt marker are POST-COMMIT
+/// MAINTENANCE, and every failure of theirs is converted into a report with
+/// `established: true`, `sweep_completed: false`, and a warning (see
+/// [`CheckpointReport::sweep_warning`]). Only failures BEFORE the boundary —
+/// the suffix computation and the ledger replacement itself — return `Err`
+/// (nothing was committed).
 fn checkpoint_inner(
     store: &LocalStore,
     config: &Config,
@@ -184,27 +215,66 @@ fn checkpoint_inner(
     };
     // 2. THE LOGICAL COMMIT: atomically replace the ledger with the suffix.
     //    If this fails, NO DELETION HAPPENS — the previous ledger stands.
+    //    `?` is correct here: a failed replacement is a PRE-COMMIT failure
+    //    and the checkpoint returns a plain `Err`.
     store.write_ledger_suffix(target, &suffix)?;
+    //
+    // ==================== THE EXPLICIT COMMIT BOUNDARY ====================
+    // `write_ledger_suffix` returned Ok: the checkpoint is IRREVERSIBLY
+    // committed — the pre-checkpoint history is gone. From this line on the
+    // checkpoint CANNOT return `Err`. Everything below — the sweep (the
+    // reachable-set scan, the directory enumeration, the deployment-dir /
+    // release / tree-object deletion stages) and the sweep-debt marker — is
+    // POST-COMMIT MAINTENANCE: every failure is converted into a report
+    // with `established: true`, `sweep_completed: false`, and a warning
+    // surfaced on the report (`sweep_warning` / `sweep_debt_warning`). The
+    // durable sweep-debt marker records the pending sweep so the NEXT PUSH
+    // (not just a re-run) recomputes reachability FRESH (no persisted
+    // deletion worklist) and finishes it.
+    //
     // 3. Best-effort global sweep of unreachable deployments / releases /
     //    objects — computed with the SAME override the preview used (after
     //    the atomic replacement the on-disk ledger IS the suffix, so the
     //    override and the current ledger agree; passing it keeps the sweep
-    //    structurally identical to the preview's calculation). The sweep is
-    //    POST-COMMIT MAINTENANCE: an incomplete sweep must NEVER fail the
-    //    checkpoint (the ledger commit stands) — it records a DURABLE
-    //    sweep-debt marker so the NEXT PUSH (not just the next checkpoint)
-    //    retries the sweep, recomputing reachability fresh (no persisted
-    //    deletion worklist), and clears the marker once it completes. The
-    //    debt write is itself non-fallible maintenance: a failure is a
-    //    warning on the report, never an `Err`.
-    let (sweep, complete) =
-        store.run_sweep(config, deployment_id.as_str(), Some(&ledger_override))?;
+    //    structurally identical to the preview's calculation). The sweep's
+    //    DELETION stages are internally absorbed into `complete = false` by
+    //    `run_sweep` itself (stage faults and deletion errors); its READ
+    //    stages — the reachable-set scan and the directory enumeration —
+    //    escape `run_sweep` as `Err` and are converted HERE into a warning:
+    //    the committed ledger stands, the sweep is retry-required.
+    let (sweep, complete, sweep_failed) =
+        match store.run_sweep(config, deployment_id.as_str(), Some(&ledger_override)) {
+            Ok((sweep, complete)) => (sweep, complete, None),
+            Err(e) => (
+                LedgerDiscards::default(),
+                false,
+                Some(format!(
+                    "checkpoint sweep failed after the ledger commit ({e}); the sweep is \
+                 retry-required — the next push recomputes reachability fresh and finishes it"
+                )),
+            ),
+        };
+    // The DURABLE sweep-debt marker: an incomplete OR failed sweep records
+    // retry-required so the next push (or a re-run of the same checkpoint)
+    // retries it; a COMPLETED sweep clears any stale marker a prior
+    // incomplete sweep left (this re-run just serviced it — convergence).
+    // The marker write/clear is itself non-fallible maintenance: a failure
+    // is a warning on the report, never an `Err`.
+    let debt_reason = match &sweep_failed {
+        Some(failed) => failed.clone(),
+        None => "checkpoint sweep did not complete; the next push retries it".to_string(),
+    };
     let sweep_debt_warning = if complete {
-        None
+        // The sweep ran clean: clear the pending-sweep marker (a prior
+        // incomplete sweep left it; it is serviced now).
+        match store.write_sweep_debt(None) {
+            Ok(()) => None,
+            Err(e) => Some(format!(
+                "sweep debt maintenance deferred: failed to clear sweep debt: {e}"
+            )),
+        }
     } else {
-        match store.write_sweep_debt(Some(
-            "checkpoint sweep did not complete; the next push retries it",
-        )) {
+        match store.write_sweep_debt(Some(&debt_reason)) {
             Ok(()) => None,
             Err(e) => Some(format!(
                 "sweep debt maintenance deferred: failed to write sweep debt: {e}"
@@ -220,6 +290,7 @@ fn checkpoint_inner(
         },
         established: true,
         sweep_completed: complete,
+        sweep_warning: sweep_failed,
         sweep_debt_warning,
         dry_run: false,
     })
@@ -262,6 +333,7 @@ fn preview_checkpoint(
         },
         established: false,
         sweep_completed: false,
+        sweep_warning: None,
         sweep_debt_warning: None,
         dry_run: true,
     })
@@ -314,6 +386,9 @@ pub fn render_checkpoint_report(report: &CheckpointReport) -> Vec<String> {
             "warning: sweep did not complete — the next push retries it; re-run `deploy checkpoint {} {}` to finish it now",
             report.target, report.deployment_id
         ));
+    }
+    if let Some(w) = &report.sweep_warning {
+        lines.push(format!("warning: {w}"));
     }
     if let Some(w) = &report.sweep_debt_warning {
         lines.push(format!("warning: {w}"));
@@ -815,15 +890,24 @@ interval_seconds = 0
     // ---------------------------------------------------------------------
 
     /// The fault slots of the property: BEFORE/AFTER the atomic ledger
-    /// replacement, and each sweep stage (deployment dirs / release records /
-    /// tree objects).
+    /// replacement (the PRE-COMMIT boundary — these may return `Err`), and
+    /// EVERY POST-COMMIT sweep stage: the reachability read/scan
+    /// ([`FaultKind::SweepScan`]), the directory enumeration
+    /// ([`FaultKind::SweepEnumerate`]), the three deletion stages
+    /// (deployment dirs / release records / tree objects), and the
+    /// sweep-debt marker write. Once the ledger replacement has committed,
+    /// a fault at ANY of these stages must be CONVERTED into an established
+    /// report (never `Err`) — the explicit commit boundary.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum CheckpointFault {
         LedgerReplaceBefore,
         LedgerReplaceAfter,
+        SweepScan,
+        SweepEnumerate,
         SweepDeployments,
         SweepReleases,
         SweepObjects,
+        SweepDebtWrite,
     }
 
     fn arm_fault(store: &LocalStore, fault: CheckpointFault) {
@@ -831,9 +915,18 @@ interval_seconds = 0
         match fault {
             CheckpointFault::LedgerReplaceBefore => reg.arm_ledger_replace_before(TARGET),
             CheckpointFault::LedgerReplaceAfter => reg.arm_ledger_replace_after(TARGET),
+            CheckpointFault::SweepScan => reg.arm_sweep_scan(),
+            CheckpointFault::SweepEnumerate => reg.arm_sweep_enumerate(),
             CheckpointFault::SweepDeployments => reg.arm_sweep_deployments(),
             CheckpointFault::SweepReleases => reg.arm_sweep_releases(),
             CheckpointFault::SweepObjects => reg.arm_sweep_objects(),
+            // The debt-write fault fires only when the sweep is INCOMPLETE
+            // (the marker write is reached): arm a sweep-stage fault too, so
+            // the debt write is actually attempted.
+            CheckpointFault::SweepDebtWrite => {
+                reg.arm_sweep_deployments();
+                reg.arm_write_sweep_debt();
+            }
         }
     }
 
@@ -842,13 +935,20 @@ interval_seconds = 0
     /// unreachable + pinned content, inject `fault` at the checkpoint, then
     /// RETRY the checkpoint (no fault) until it converges. Asserts:
     ///
-    /// * the visible ledger after the fault is WHOLLY OLD or WHOLLY NEW —
-    ///   never torn (the atomic replace): it either contains every seeded
-    ///   entry (old) or is EXACTLY the suffix at the checkpoint (new);
-    /// * retained and pinned content survives every failure (the checkpoint
-    ///   deployment's own rollback release/tree and the pinned release);
-    /// * the retry converges: it finishes the sweep and the report says
-    ///   `sweep_completed`.
+    /// * THE EXPLICIT COMMIT BOUNDARY: a PRE-commit fault (the replacement
+    ///   itself — `LedgerReplaceBefore` / `LedgerReplaceAfter`) is a plain
+    ///   `Err`; a POST-commit fault (EVERY sweep stage — the reachability
+    ///   scan, the enumeration, the three deletion stages, the debt-marker
+    ///   write) is CONVERTED into an established report with
+    ///   `sweep_completed: false` and a warning — NEVER an `Err`;
+    /// * the visible ledger is always WHOLY OLD or WHOLY NEW — never torn
+    ///   (the atomic replace): wholly OLD only for `LedgerReplaceBefore`
+    ///   (nothing committed); wholly NEW — EXACTLY the retained suffix — for
+    ///   every post-replacement fault (the commit stands);
+    /// * retained and pinned content survives every failure;
+    /// * the retry converges: `sweep_completed: true`, the ledger matches
+    ///   the retained suffix, the unreachable content is gone, the sweep
+    ///   debt is cleared.
     fn run_fault_case(at: usize, fault: CheckpointFault) {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
@@ -886,56 +986,141 @@ interval_seconds = 0
                 .collect::<Vec<_>>()
         };
 
-        // The faulted checkpoint (may Err at the fault slot; the ledger must
-        // still be wholly old or wholly new).
+        // THE FAULTED CHECKPOINT + THE EXPLICIT COMMIT BOUNDARY. The ledger
+        // is always WHOLY OLD or WHOLY NEW (the atomic replace, never torn),
+        // and the fault's CLASS decides which:
         arm_fault(&store, fault);
-        let _ = run_checkpoint_unlocked(&store, &cfg, TARGET, &DeploymentId::new(checkpoint_id));
-
-        // INVARIANT 1: the visible ledger is WHOLY OLD or WHOLY NEW — never
-        // torn. Old = every seeded entry in order; New = exactly the
-        // expected suffix (the checkpoint's own entry onward, in order).
+        let faulted =
+            run_checkpoint_unlocked(&store, &cfg, TARGET, &DeploymentId::new(checkpoint_id));
         let visible: Vec<String> = store
             .read_ledger(TARGET)
             .unwrap()
             .iter()
             .map(|e| e.deployment_id.as_str().to_string())
             .collect();
-        let wholly_old = visible == ids.clone();
-        let wholly_new = visible == expected_suffix;
-        assert!(
-            wholly_old || wholly_new,
-            "fault {fault:?}: the visible ledger must be wholly old or wholly new, got {visible:?}"
-        );
-        // INVARIANT 2: retained and pinned content survive every failure.
+        match fault {
+            // ---- the PRE-COMMIT boundary: a failed replacement is a plain
+            // `Err` (nothing was committed / the replacement itself did not
+            // return Ok), never a report ----
+            CheckpointFault::LedgerReplaceBefore => {
+                assert!(
+                    faulted.is_err(),
+                    "fault {fault:?}: a pre-replacement fault must fail the checkpoint with Err"
+                );
+                assert_eq!(
+                    visible, ids,
+                    "fault {fault:?}: a pre-replacement fault leaves the ledger wholly OLD"
+                );
+            }
+            CheckpointFault::LedgerReplaceAfter => {
+                assert!(
+                    faulted.is_err(),
+                    "fault {fault:?}: a failed replacement still returns Err"
+                );
+                assert_eq!(
+                    visible, expected_suffix,
+                    "fault {fault:?}: the after-rename durability hook leaves the wholly-NEW suffix durable"
+                );
+            }
+            // ---- THE POST-COMMIT BOUNDARY: the replacement succeeded, so
+            // EVERY sweep-stage fault is CONVERTED into an established report
+            // (never Err); the retained suffix is preserved (the ledger = the
+            // suffix, wholly new) ----
+            _ => {
+                let rep = faulted.unwrap_or_else(|e| {
+                    panic!(
+                        "fault {fault:?}: a post-commit sweep failure must NEVER be an Err, got {e}"
+                    )
+                });
+                assert!(
+                    rep.established,
+                    "fault {fault:?}: the ledger commit stands (established)"
+                );
+                assert!(
+                    !rep.sweep_completed,
+                    "fault {fault:?}: the sweep is reported retry-required"
+                );
+                assert_eq!(
+                    visible, expected_suffix,
+                    "fault {fault:?}: the committed ledger is EXACTLY the retained suffix, wholly new"
+                );
+                match fault {
+                    // The sweep READ/scan + enumeration failures: the reason
+                    // surfaces as the report's sweep warning; the durable
+                    // debt marker records the pending sweep.
+                    CheckpointFault::SweepScan | CheckpointFault::SweepEnumerate => {
+                        assert!(
+                            rep.sweep_warning.is_some(),
+                            "fault {fault:?}: a sweep read failure must surface a warning on the report"
+                        );
+                        assert!(
+                            rep.sweep_debt_warning.is_none(),
+                            "fault {fault:?}: the debt marker itself wrote cleanly"
+                        );
+                        assert!(
+                            store.read_sweep_debt().unwrap().is_some(),
+                            "fault {fault:?}: the pending sweep is recorded as durable debt"
+                        );
+                    }
+                    // The debt-marker WRITE failure: the report carries the
+                    // debt warning and no marker is left on disk.
+                    CheckpointFault::SweepDebtWrite => {
+                        assert!(
+                            rep.sweep_warning.is_none(),
+                            "fault {fault:?}: the sweep itself did not error"
+                        );
+                        assert!(
+                            rep.sweep_debt_warning.is_some(),
+                            "fault {fault:?}: the failed debt write is a warning, never an Err"
+                        );
+                        assert!(
+                            store.read_sweep_debt().unwrap().is_none(),
+                            "fault {fault:?}: the failed marker write leaves no marker on disk"
+                        );
+                    }
+                    // The deletion stages: internally absorbed by `run_sweep`
+                    // into `sweep_completed: false` + a cleanly-recorded
+                    // debt marker.
+                    _ => {
+                        assert!(
+                            rep.sweep_warning.is_none(),
+                            "fault {fault:?}: a deletion-stage fault is absorbed, not an error"
+                        );
+                        assert!(
+                            rep.sweep_debt_warning.is_none(),
+                            "fault {fault:?}: the debt marker recorded cleanly"
+                        );
+                        assert!(
+                            store.read_sweep_debt().unwrap().is_some(),
+                            "fault {fault:?}: a pending sweep records durable debt"
+                        );
+                    }
+                }
+            }
+        }
+        // INVARIANT: retained and pinned content survives every failure.
         assert!(
             store.release_dir(&ReleaseId::new(&pinned_rel)).exists(),
             "fault {fault:?}: the pinned release must survive"
         );
-        // The retained suffix survives in ORDER — in the wholly-NEW case the
-        // visible ledger IS exactly the checkpoint's own entry onward; in the
-        // wholly-OLD case the full history stands (nothing discarded).
-        let checkpoint_suffix = expected_suffix.clone();
-        if wholly_new {
-            let visible: Vec<String> = store
-                .read_ledger(TARGET)
-                .unwrap()
-                .iter()
-                .map(|e| e.deployment_id.as_str().to_string())
-                .collect();
-            assert_eq!(
-                visible, checkpoint_suffix,
-                "fault {fault:?}: the wholly-new ledger is exactly the retained suffix in order"
-            );
-        }
 
         // RETRY CONVERGES: repeat the checkpoint without a fault — the
-        // suffix is recomputed (identical) and the sweep finishes.
+        // suffix is recomputed (identical) and the sweep finishes (the debt
+        // marker is cleared).
         let retry =
             run_checkpoint_unlocked(&store, &cfg, TARGET, &DeploymentId::new(checkpoint_id))
                 .expect("the retry checkpoint succeeds");
         assert!(
             retry.sweep_completed,
             "fault {fault:?}: the retry must finish the sweep (converged)"
+        );
+        assert!(
+            retry.sweep_warning.is_none() && retry.sweep_debt_warning.is_none(),
+            "fault {fault:?}: the converged retry has no warnings"
+        );
+        assert!(
+            store.read_sweep_debt().unwrap().is_none(),
+            "fault {fault:?}: the converged sweep cleared the debt"
         );
         assert_eq!(
             store
@@ -959,26 +1144,74 @@ interval_seconds = 0
 
     proptest! {
         #![proptest_config(ProptestConfig {
-            // Bounded 4 cases, fixed seed per house style.
-            cases: 4,
+            // Bounded 16 cases, fixed seed per house style.
+            cases: 16,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
         })]
 
+        /// THE EXPLICIT COMMIT BOUNDARY PROPERTY: a fault BEFORE the ledger
+        /// replacement (`LedgerReplaceBefore` / `LedgerReplaceAfter`) is a
+        /// plain `Err`; a fault at EVERY POST-REPLACEMENT sweep stage — the
+        /// reachability scan, the directory enumeration, the three deletion
+        /// stages (deployment dirs / release records / tree objects), and
+        /// the sweep-debt write — is CONVERTED into an established report
+        /// (never `Err`), the retained suffix is preserved (the ledger = the
+        /// suffix, wholly new), and a repeat of the same checkpoint
+        /// converges (`sweep_completed`, debt cleared).
         #[test]
         fn checkpoint_faults_never_torn_and_retries_converge(
             at in 0usize..=5,
             fault in prop_oneof![
                 Just(CheckpointFault::LedgerReplaceBefore),
                 Just(CheckpointFault::LedgerReplaceAfter),
+                Just(CheckpointFault::SweepScan),
+                Just(CheckpointFault::SweepEnumerate),
                 Just(CheckpointFault::SweepDeployments),
                 Just(CheckpointFault::SweepReleases),
                 Just(CheckpointFault::SweepObjects),
+                Just(CheckpointFault::SweepDebtWrite),
             ],
         ) {
             run_fault_case(at, fault);
         }
+    }
+
+    // ---- the deterministic unit tests, one per sweep stage ----------------
+    // Each pins ONE stage's conversion at the explicit commit boundary: the
+    // faulted checkpoint returns an ESTABLISHED report (never `Err`), the
+    // retained suffix is preserved (the ledger = the suffix, wholly new),
+    // and the re-run of the same checkpoint converges (`sweep_completed`,
+    // debt cleared).
+    #[test]
+    fn sweep_scan_fault_never_fails_the_committed_checkpoint() {
+        run_fault_case(2, CheckpointFault::SweepScan);
+    }
+
+    #[test]
+    fn sweep_enumeration_fault_never_fails_the_committed_checkpoint() {
+        run_fault_case(2, CheckpointFault::SweepEnumerate);
+    }
+
+    #[test]
+    fn sweep_deployment_deletion_fault_never_fails_the_committed_checkpoint() {
+        run_fault_case(2, CheckpointFault::SweepDeployments);
+    }
+
+    #[test]
+    fn sweep_release_deletion_fault_never_fails_the_committed_checkpoint() {
+        run_fault_case(2, CheckpointFault::SweepReleases);
+    }
+
+    #[test]
+    fn sweep_object_deletion_fault_never_fails_the_committed_checkpoint() {
+        run_fault_case(2, CheckpointFault::SweepObjects);
+    }
+
+    #[test]
+    fn sweep_debt_write_fault_never_fails_the_committed_checkpoint() {
+        run_fault_case(2, CheckpointFault::SweepDebtWrite);
     }
 
     // ---------------------------------------------------------------------
@@ -1125,26 +1358,28 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             )
             .unwrap();
         seed_tree_dir(&store, PROPERTY_TREES[0]);
-        // PINS: a whole-release pin (pin_rel2 — keeps its release record and
-        // every recorded variant tree) and an exact-binding pin (pin_rel1:
-        // release + tree). Both reference the DERIVED ids the seeding
-        // returned: a pin is content-verified, so the record at the pinned
-        // id's dir must DECLARE that id (a record swapped into a differently-
-        // named dir is refused).
-        let pin_rel1 = seed_named_release(&store, "pin1");
-        let pin_rel2 = seed_named_release(&store, "pin2");
+        // PINS — REAL, verifiable records. KEEP-BOTH with the gc side's
+        // fail-closed pin handling (a pinned release's record is read +
+        // identity-verified, so a junk-named dir can never be a pin target):
+        // the property pins a genuine content-derived record instead — a
+        // WHOLE-RELEASE pin (keeps the record + its variant trees) AND an
+        // EXACT-BINDING pin on the SAME record ((release, tree) kept). The
+        // pin-retained content is asserted below via the record's real id.
+        let pinned = seed_real_release(&store);
+        let pinned_tree = "tree-pinned".to_string();
+        seed_tree_dir(&store, &pinned_tree);
+
         store
             .write_pins(&Pins {
                 schema_version: crate::model::PINS_SCHEMA_VERSION,
-                releases: vec![pin_rel2.clone()],
+                releases: vec![pinned.clone()],
                 bindings: vec![ArtifactRef {
-                    release: pin_rel1.clone(),
+                    release: pinned.clone(),
                     variant: VariantName::new("standard".to_string()),
-                    tree: TreeDigest::new(PROPERTY_TREES[1].to_string()),
+                    tree: TreeDigest::new(pinned_tree.clone()),
                 }],
             })
             .unwrap();
-        seed_tree_dir(&store, PROPERTY_TREES[1]);
 
         let checkpoint_id = DeploymentId::new(format!("dep-t1-{at}"));
         // PREVIEW on the ORIGINAL store (read-only: no locks, no writes).
@@ -1205,12 +1440,21 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "tree object {t} must be deleted"
             );
         }
-        // Retained content survives: the observed (obs_rel) and pinned
-        // (pin_rel1 / pin_rel2) release records — each at its content-derived
-        // dir — their retained trees, and every t2 ledger entry's content.
-        assert!(clone.release_dir(&obs_rel).exists());
-        assert!(clone.release_dir(&pin_rel1).exists());
-        assert!(clone.release_dir(&pin_rel2).exists());
+        // Retained content survives: the observed REAL record (obs_rel, per
+        // the master's observed seeding) + its observed tree, the pinned
+        // REAL record + its tree, and every t2 ledger entry's content. (The
+        // pool names p0..p2 survive only when a retained ledger or the
+        // observed state references them — an unreferenced pool dir is
+        // correctly swept; only the pin-/observed-retained records are
+        // asserted unconditionally.)
+        assert!(
+            clone.release_dir(&obs_rel).exists(),
+            "the observed release record survives"
+        );
+        assert!(
+            clone.release_dir(&pinned).exists(),
+            "the pinned release record survives"
+        );
         assert!(
             clone
                 .object_root(&TreeDigest::new(PROPERTY_TREES[0].to_string()))
@@ -1218,8 +1462,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         assert!(
             clone
-                .object_root(&TreeDigest::new(PROPERTY_TREES[1].to_string()))
-                .exists()
+                .object_root(&TreeDigest::new(pinned_tree.clone()))
+                .exists(),
+            "the pinned record's variant tree survives"
         );
         assert!(clone.deployment_dir(&format!("dep-t1-{at}")).exists());
         for (i, &(r, t)) in t2_hist.iter().enumerate() {

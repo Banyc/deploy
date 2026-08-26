@@ -177,6 +177,21 @@ pub(crate) mod test_faults {
         /// at the stage's entry: no object is deleted and the report says
         /// sweep retry-required.
         SweepObjects,
+        /// The checkpoint sweep's REACHABILITY-SCAN stage (keyed by the
+        /// empty global key, like the other sweep stages): fired at the
+        /// sweep's entry, BEFORE the reachable-set computation — the sweep
+        /// aborts with an error that the checkpoint flow converts into a
+        /// warning (the ledger commit stands, the sweep is retry-required).
+        /// This is the "sweep read" failure the explicit commit boundary
+        /// must never surface as `Err`.
+        SweepScan,
+        /// The checkpoint sweep's DIRECTORY-ENUMERATION stage (keyed by the
+        /// empty global key): fired AFTER the reachable-set scan succeeds,
+        /// BEFORE the `deployments/` / `releases/` / `objects/` listings —
+        /// the sweep fails with nothing deleted; the checkpoint flow
+        /// converts the failure into a warning (established report,
+        /// retry-required).
+        SweepEnumerate,
     }
 
     /// A per-fixture one-shot fault registry.
@@ -395,6 +410,24 @@ pub(crate) mod test_faults {
         /// [`FaultRegistry::arm_sweep_deployments`].
         pub(crate) fn arm_sweep_objects(&self) {
             self.arm(FaultKind::SweepObjects, "");
+        }
+
+        /// Arm the checkpoint sweep's REACHABILITY-SCAN to fail once (before
+        /// the retained-set computation: the sweep aborts with nothing
+        /// deleted and the checkpoint reports the sweep retry-required as a
+        /// WARNING — never an `Err`, the ledger commit stands). Global, like
+        /// [`FaultRegistry::arm_sweep_deployments`].
+        pub(crate) fn arm_sweep_scan(&self) {
+            self.arm(FaultKind::SweepScan, "");
+        }
+
+        /// Arm the checkpoint sweep's DIRECTORY-ENUMERATION to fail once
+        /// (after the reachable-set scan, before the root listings — the
+        /// sweep aborts with nothing deleted and the checkpoint reports the
+        /// sweep retry-required as a warning). Global, like
+        /// [`FaultRegistry::arm_sweep_deployments`].
+        pub(crate) fn arm_sweep_enumerate(&self) {
+            self.arm(FaultKind::SweepEnumerate, "");
         }
 
         /// Arm the next store-global `read_sweep_debt` call to fail once
