@@ -49,7 +49,8 @@ use crate::error::{Error, Result};
 use crate::model::{CONFIG_SCHEMA_VERSION, ServerId, SlotId};
 use crate::records::PhysicalBinding;
 use crate::scalar::{
-    AbsoluteDeployDir, ApplicationDisplayName, BatchSize, CapacityPercent, GroupName, Identifier,
+    AbsoluteDeployDir, ApplicationDisplayName, BatchSize, CapacityPercent, Identifier,
+    RolloutGroupName,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -1492,11 +1493,11 @@ impl TryFrom<RawProject> for ProjectConfig {
                 let mut seen_groups = HashSet::new();
                 for g in &p.groups {
                     // Each group name is parsed into the validated
-                    // [`GroupName`] scalar (non-empty, well-formed); the
+                    // [`RolloutGroupName`] scalar (non-empty, well-formed); the
                     // DUPLICATE rule is structural and stays here (a
                     // duplicate adds no membership yet would change the
                     // release identity).
-                    GroupName::parse(g).map_err(|_| {
+                    RolloutGroupName::parse(g).map_err(|_| {
                         Error::config(format!(
                             "variant '{vname}': slot '{}' declares an invalid group name {g:?}",
                             p.id
@@ -4230,11 +4231,11 @@ interval_seconds = 0
                 (p, Identifier::parse(&v).is_ok())
             }),
             // slot group (single element: the duplicate rule cannot fire):
-            // GroupName.
+            // RolloutGroupName.
             arbitrary_scalar_text().prop_map(|v| {
                 let mut p = minimal_raw_project();
                 p.variants.get_mut("standard").unwrap().slots[0].groups = vec![v.clone()];
-                (p, GroupName::parse(&v).is_ok())
+                (p, RolloutGroupName::parse(&v).is_ok())
             }),
             // slot deploy_dir (single slot: the location-uniqueness rule
             // cannot fire): AbsoluteDeployDir.

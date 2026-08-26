@@ -174,7 +174,7 @@ impl AsRef<std::path::Path> for ApplicationStoreKey {
 }
 
 name_scalar!(
-    GroupName,
+    RolloutGroupName,
     "A rollout group name, validated per the config rules: non-empty and \
     well-formed (no surrounding whitespace, no control characters). \
     DUPLICATE group names are a separate STRUCTURAL rule enforced by the \
@@ -496,15 +496,15 @@ mod tests {
     }
 
     #[test]
-    fn group_name_accepts_valid_rejects_invalid() {
+    fn rollout_group_name_accepts_valid_rejects_invalid() {
         for ok in ["canary", "wave-1", "α", "a..b"] {
-            let g = GroupName::parse(ok).expect("valid group parses");
+            let g = RolloutGroupName::parse(ok).expect("valid group parses");
             assert_eq!(g.as_str(), ok);
         }
         for bad in [
             "", "   ", " x", "x ", "\u{0}", "a/b", "a\\b", ".", "..", "../x",
         ] {
-            GroupName::parse(bad).expect_err("invalid group name rejected");
+            RolloutGroupName::parse(bad).expect_err("invalid group name rejected");
         }
     }
 
@@ -669,7 +669,7 @@ mod tests {
     }
 
     proptest! {
-        // THE PROPERTY: the three name scalars (Identifier, GroupName,
+        // THE PROPERTY: the three name scalars (Identifier, RolloutGroupName,
         // ApplicationStoreKey) accept EXACTLY the safe single-segment values —
         // every traversal class (`..`, `.`, `/`, `\`, padding, control
         // chars) is rejected, every clean single segment is accepted.
@@ -691,9 +691,9 @@ mod tests {
                 "Identifier must accept exactly safe single segments: {s:?}"
             );
             assert_eq!(
-                GroupName::parse(&s).is_ok(),
+                RolloutGroupName::parse(&s).is_ok(),
                 expected,
-                "GroupName must accept exactly safe single segments: {s:?}"
+                "RolloutGroupName must accept exactly safe single segments: {s:?}"
             );
             assert_eq!(
                 ApplicationStoreKey::parse(&s).is_ok(),

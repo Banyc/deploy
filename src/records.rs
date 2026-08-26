@@ -94,7 +94,7 @@ use crate::model::{
     ArtifactRef, BehaviorContract, DeploymentId, GenerationId, GenerationRef, MatchingMembership,
     PlacementSlotAssignment, ReleaseId, ServerId, SlotId, TargetName, TreeDigest,
 };
-use crate::scalar::{BehaviorDigest, GroupName, Timestamp};
+use crate::scalar::{BehaviorDigest, RolloutGroupName, Timestamp};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
@@ -357,7 +357,7 @@ impl LedgerIntentWire {
             ))
         })?;
         if let Some(g) = &self.group {
-            GroupName::parse(g).map_err(|_| {
+            RolloutGroupName::parse(g).map_err(|_| {
                 Error::integrity(format!(
                     "intent {}: rollout group {g:?} is not a valid group name",
                     self.deployment_id
@@ -633,8 +633,8 @@ pub struct LedgerIntentReport {
     pub deployment_id: DeploymentId,
     pub target: TargetName,
     /// The optional rollout group this attempt selected, as a validated
-    /// [`GroupName`] (parsed from the verified intent's group string).
-    pub group: Option<GroupName>,
+    /// [`RolloutGroupName`] (parsed from the verified intent's group string).
+    pub group: Option<RolloutGroupName>,
     pub slot_ids: Vec<SlotId>,
     /// The attempt's behavior digest, as a validated [`BehaviorDigest`]
     /// (parsed from the wire's `behavior_sha256` string).
@@ -660,7 +660,7 @@ impl LedgerIntentReport {
     /// rather than constructing an invalid report.
     pub fn from_intent(i: &DeploymentIntent) -> Result<LedgerIntentReport> {
         let group = match &i.group {
-            Some(g) => Some(GroupName::parse(g).map_err(|_| {
+            Some(g) => Some(RolloutGroupName::parse(g).map_err(|_| {
                 Error::integrity(format!(
                     "intent {}: rollout group {g:?} is not a valid group name",
                     i.deployment_id
@@ -2815,7 +2815,7 @@ mod tests {
             }),
             // intent group: a valid group name or rejected.
             (Just(base_intent_wire()), arbitrary_wire_text()).prop_map(|(mut w, v)| {
-                let ok = GroupName::parse(&v).is_ok();
+                let ok = RolloutGroupName::parse(&v).is_ok();
                 w.group = Some(v);
                 (ScalarWire::Intent(w), ok)
             }),
