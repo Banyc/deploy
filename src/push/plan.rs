@@ -15,7 +15,12 @@
 //!   onto the CURRENT physical slots under the LOGICAL membership check. The
 //!   rebinding is now EXPLICIT: the plan carries a
 //!   [`crate::records::RebindingPlan`] recording the frozen topology, the
-//!   membership check, and the current physical slots it binds onto.
+//!   membership check, and the current physical slots it binds onto. A
+//!   `--group <g>` selection resolves the group's slot IDs from THIS frozen
+//!   topology (each frozen slot's era `groups` list), never from the caller's
+//!   current group partition: a slot the release pushed inside `g` but the
+//!   current config moved out of `g` still belongs to the push, and a group
+//!   named only in the frozen topology still resolves.
 //! * **a deployment rollback** (`deploy push <target> <deployment-id>`, and
 //!   the `@`-relative / `parent(...)` walk resolved by
 //!   [`crate::history::resolve_ref_expr`] against the target's ledger): that
@@ -65,64 +70,128 @@ pub type PlannedResolution = (
     Option<RebindingPlan>,
 );
 
-/// The NORMALIZED selection of one push/status invocation: the owning target,
-/// the optional rollout group, and the EXACT selected slot IDs. Normalized
-/// once near command entry (from the caller's current configuration — the
-/// selection source, including for historical references); planning,
-/// execution, reporting, and persistence consume this instead of
-/// independently filtering slots.
+/// The NORMALIZED selection of one push/status invocation: the owning target
+/// and the optional rollout group. Normalized once near command entry as the
+/// branch-agnostic {target, group} pair — the selection deliberately does
+/// NOT resolve slot IDs from the caller's current configuration. Each
+/// reference branch resolves the selected slot IDs against ITS OWN declared
+/// temporal source ([`plan_assignments`]): HEAD and deployment references
+/// from the CURRENT config's group declarations, `release:<id>` from the
+/// release record's FROZEN per-slot groups (rebound onto the current
+/// physical slots). Planning, execution, reporting, and persistence consume
+/// this selection plus the per-branch resolution instead of independently
+/// filtering slots.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotSelection {
     pub target: TargetName,
     /// The optional rollout group (`deploy push <target> --group <name>`).
     /// `None` selects every slot owned by the target.
     pub group: Option<String>,
-    /// The exact selected slot IDs, in deterministic order (variants in name
-    /// order, then each variant's slots in file order).
-    pub slot_ids: Vec<PlacementSlotId>,
 }
 
 impl SlotSelection {
-    /// Normalize a target + optional group into the exact selected slot set
-    /// from the caller's current configuration. Omitting the group selects
-    /// every slot owned by the target; a group selects exactly the target's
-    /// slots whose `groups` list contains it (an unknown group, or a group
-    /// selecting zero slots, is a configuration error).
+    /// Normalize a target + optional group into the branch-agnostic
+    /// selection: ONLY the owning target and the requested group, without
+    /// resolving slot IDs from the caller's current configuration. Slot-ID
+    /// resolution is deliberately deferred to each reference branch: the
+    /// CURRENT group partition governs a HEAD push, while a `release:<id>`
+    /// push must select from the RELEASE's FROZEN per-slot groups (a group
+    /// named in the release's frozen topology but unknown in the current
+    /// config still works — the frozen partition governs), so resolving the
+    /// group against the current config here would both reject release-only
+    /// groups and select the wrong slot IDs for a historical release whose
+    /// frozen partition drifted. The target must exist in the current config
+    /// (validated here, before any lock or remote access).
     pub fn normalize(config: &Config, target: &str, group: Option<&str>) -> Result<Self> {
-        let members = match group {
-            Some(g) => config.target_group_slots(target, g)?,
-            None => config.target_slots(target)?,
-        };
-        let slot_ids = members
-            .iter()
-            .map(|(s, _)| PlacementSlotId::new(s.id.clone()))
-            .collect();
+        config
+            .targets
+            .get(target)
+            .ok_or_else(|| Error::not_found(format!("target '{target}'")))?;
         Ok(SlotSelection {
             target: TargetName::new(target.to_string()),
             group: group.map(str::to_string),
-            slot_ids,
         })
     }
 
-    /// The selected (slot, server) pairs from the caller's current
-    /// configuration, in the same deterministic order as the selection's
-    /// `slot_ids` (derived by filtering the target's members to the
-    /// selection).
-    pub fn members<'a>(
+    /// The selected (slot, server) pairs resolved from the caller's CURRENT
+    /// configuration — the declared temporal source for HEAD and deployment
+    /// references, and the physical-rebinding half of a release reference
+    /// (each frozen slot id looked up in the target's current member
+    /// declarations). `None` selects every slot owned by the target; a group
+    /// selects exactly the target's slots whose CURRENT `groups` list
+    /// contains it (an unknown group, or a group selecting zero slots in the
+    /// current config, is a configuration error — HEAD/deployment behavior,
+    /// unchanged). Deterministic order: variants in name order, then each
+    /// variant's slots in file order.
+    pub fn current_members<'a>(
         &self,
         config: &'a Config,
     ) -> Result<Vec<(&'a crate::config::SlotDef, &'a crate::config::ServerDef)>> {
-        let all = config.target_slots(self.target.as_str())?;
-        Ok(all
-            .into_iter()
-            .filter(|(s, _)| self.slot_ids.iter().any(|id| id.as_str() == s.id))
-            .collect())
+        match &self.group {
+            Some(g) => config.target_group_slots(self.target.as_str(), g),
+            None => config.target_slots(self.target.as_str()),
+        }
     }
 
-    /// True when the selection covers every slot owned by the target.
-    pub fn is_full(&self, config: &Config) -> Result<bool> {
+    /// The selected (slot, server) pairs for a DIRECT RELEASE reference: the
+    /// group's slot IDs resolve from the RELEASE's FROZEN topology — each
+    /// frozen [`crate::model::CanonicalSlot`] in the record's own snapshot
+    /// carries its era's `groups` list, so the frozen partition governs (a
+    /// slot the release pushed inside the group but the current config moved
+    /// OUT of it still belongs to this push; a group named only in the
+    /// frozen topology — unknown in the current config — still resolves).
+    /// The frozen IDs are then REBOUND onto their current physical locations
+    /// (server / deploy_dir from the target's CURRENT member declarations) —
+    /// composing with the explicit [`RebindingPlan`]'s frozen-topology →
+    /// current-physical-slot record built in the `PushRef::Release` plan
+    /// branch. Deterministic order follows the frozen snapshot: variants in
+    /// name order, then each variant's slots in the canonical slot order.
+    /// `None` selects every slot the release froze for the target; a group
+    /// selecting zero frozen slots is a configuration error as today.
+    pub fn release_members<'a>(
+        &self,
+        config: &'a Config,
+        rec: &ReleaseRecord,
+    ) -> Result<Vec<(&'a crate::config::SlotDef, &'a crate::config::ServerDef)>> {
+        let frozen_ids: Vec<PlacementSlotId> = rec
+            .slots
+            .values()
+            .flat_map(|cs| cs.slots.iter())
+            .filter(|s| s.target == self.target.as_str())
+            .filter(|s| match &self.group {
+                Some(g) => s.groups.iter().any(|x| x == g),
+                None => true,
+            })
+            .map(|s| PlacementSlotId::new(s.id.clone()))
+            .collect();
+        if self.group.is_some() && frozen_ids.is_empty() {
+            return Err(Error::config(format!(
+                "group '{}' selects no slots of target '{}' in the release's frozen topology",
+                self.group.as_deref().unwrap_or(""),
+                self.target
+            )));
+        }
+        // Rebind the frozen slot IDs onto the CURRENT physical locations.
+        // The direct-release membership gate (which the caller runs first)
+        // guarantees the frozen slot-ID set equals the target's complete
+        // current membership, so every frozen id has a current declaration.
         let all = config.target_slots(self.target.as_str())?;
-        Ok(all.len() == self.slot_ids.len())
+        let mut out = Vec::with_capacity(frozen_ids.len());
+        for id in &frozen_ids {
+            out.push(
+                all.iter()
+                    .find(|(s, _)| s.id == id.as_str())
+                    .copied()
+                    .ok_or_else(|| {
+                        Error::rollback(format!(
+                            "release's frozen slot '{id}' is not declared by target '{}' today; \
+                             membership drift is rejected before planning",
+                            self.target
+                        ))
+                    })?,
+            );
+        }
+        Ok(out)
     }
 }
 
@@ -159,8 +228,16 @@ pub(crate) fn latest_successful_rollback(
 ///
 /// A full-target push (no group) is always allowed: it establishes a new
 /// complete snapshot from its own actuals.
+///
+/// `selected` is the PER-BRANCH resolved slot-ID set (the plan's assignments
+/// — HEAD/deployment from the current topology, `release:<id>` from the
+/// release's FROZEN group topology), NOT a resolution from the caller's
+/// current configuration: a historical release's frozen group partition may
+/// legitimately differ from the current one, and the guard must compare the
+/// slots the push actually selects against the current membership.
 pub(crate) fn validate_partial_rollout(
     selection: &SlotSelection,
+    selected: &[PlacementSlotId],
     config: &Config,
     store: &LocalStore,
 ) -> Result<()> {
@@ -168,7 +245,7 @@ pub(crate) fn validate_partial_rollout(
         return Ok(());
     }
     let current = config.target_slots(selection.target.as_str())?;
-    let selected: HashSet<&str> = selection.slot_ids.iter().map(|s| s.as_str()).collect();
+    let selected: HashSet<&str> = selected.iter().map(|s| s.as_str()).collect();
     let unselected: Vec<(&crate::config::SlotDef, &crate::config::ServerDef)> = current
         .iter()
         .filter(|(s, _)| !selected.contains(s.id.as_str()))
@@ -302,9 +379,12 @@ pub(crate) fn validate_direct_release_membership(
 }
 
 /// Resolve the desired assignment for each SELECTED slot given the push
-/// reference. The selection (target + optional group + exact slot IDs) is
-/// normalized once near command entry; planning consumes it instead of
-/// independently filtering slots. Returns the assignments, the SET of
+/// reference. The selection (target + optional group) is normalized once near
+/// command entry; each reference branch resolves its selected slot IDs
+/// against its own declared temporal source (HEAD and deployment refs: the
+/// current topology; `release:<id>`: the release's FROZEN topology) and
+/// planning consumes the resolution instead of independently filtering
+/// slots. Returns the assignments, the SET of
 /// releases the assignments reference (per-slot artifact provenance — a
 /// partial snapshot can span several releases, so there is NO single
 /// snapshot-wide release), the plan source, and — for a DIRECT release
@@ -335,14 +415,25 @@ pub fn plan_assignments(
     if !config.targets.contains_key(selection.target.as_str()) {
         return Err(Error::not_found(format!("target '{}'", selection.target)));
     }
-    let members = selection.members(config)?;
-    let slot_ids: Vec<PlacementSlotId> = members
-        .iter()
-        .map(|(slot, _)| PlacementSlotId::new(slot.id.clone()))
-        .collect();
 
+    // SLOT-ID RESOLUTION HAPPENS INSIDE EACH REFERENCE BRANCH against that
+    // branch's declared temporal source: HEAD resolves the selected slots
+    // from the CURRENT config's declarations; `release:<id>` resolves them
+    // from the RELEASE's FROZEN per-slot `groups` (rebound onto the current
+    // physical slots); a deployment ref resolves them from the current
+    // config (narrowed by the snapshot's exact per-slot checks). The
+    // selection itself carries only {target, group} — never slot IDs — so a
+    // historical release's frozen group partition governs its push even when
+    // it differs from the current partition (and a group named only in the
+    // frozen topology still resolves).
     match pref {
         PushRef::Head => {
+            // HEAD's declared temporal source is the CURRENT topology: the
+            // group's slot IDs resolve from the caller's current variant slot
+            // declarations (`config.target_group_slots` — an unknown group,
+            // or one selecting zero slots in the current config, is a
+            // configuration error, unchanged).
+            let members = selection.current_members(config)?;
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
                 let slot_id = PlacementSlotId::new(slot.id.clone());
@@ -374,6 +465,16 @@ pub fn plan_assignments(
             target: ft,
             deployment_id,
         } => {
+            // A deployment rollback's SELECTED slots also resolve from the
+            // CURRENT topology (as for HEAD): the snapshot's exact per-slot
+            // artifact and physical-binding checks below narrow them. There
+            // is no per-deployment group partition — groups are a
+            // current-config selection view.
+            let members = selection.current_members(config)?;
+            let slot_ids: Vec<PlacementSlotId> = members
+                .iter()
+                .map(|(slot, _)| PlacementSlotId::new(slot.id.clone()))
+                .collect();
             let entry = resolve_deployment(store, ft, deployment_id)?;
             let recorded: BTreeSet<String> =
                 entry.slots.keys().map(|s| s.as_str().to_string()).collect();
@@ -471,6 +572,23 @@ pub fn plan_assignments(
                 &rec,
                 &current_slot_ids,
             )?;
+            // THE RELEASE'S FROZEN GROUP PARTITION GOVERNS: the selected
+            // slots resolve from the release record's OWN canonical slot
+            // snapshot — each frozen [`crate::model::CanonicalSlot`] carries
+            // its era's `groups` list, so a slot the release pushed inside
+            // the group but the current config moved OUT of it still belongs
+            // to this push, and a group named only in the frozen topology
+            // (unknown in the current config) still resolves. The frozen IDs
+            // are then REBOUND onto their current physical locations
+            // (server / deploy_dir from the target's current member
+            // declarations) — the explicit [`RebindingPlan`] below records
+            // exactly this frozen-topology → current-physical-slot
+            // composition. A frozen group selecting zero slots is a
+            // configuration error as today. (The membership gate above
+            // guarantees the frozen slot-ID set equals the target's COMPLETE
+            // current membership, so every frozen id rebinds to a current
+            // physical declaration.)
+            let members = selection.release_members(config, &rec)?;
             let mut out = Vec::new();
             for (slot, _sdef) in &members {
                 let slot_id = PlacementSlotId::new(slot.id.clone());
@@ -1641,15 +1759,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         ];
         for (group, want) in groups {
             let selection = SlotSelection::normalize(&config, "t1", Some(group)).unwrap();
-            assert_eq!(
-                selection
-                    .slot_ids
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>(),
-                *want,
-                "group {group} must select exactly {want:?}"
-            );
+            // The selection is now the branch-agnostic {target, group} pair:
+            // slot-ID resolution happens inside the release branch, against
+            // the release's FROZEN topology (here identical to the current
+            // partition, so the plan's assignments are the authoritative
+            // answer for `want`).
             let (assignments, desired, source, _rebinding) = plan_assignments(
                 &selection,
                 &PushRef::Release {
@@ -1751,6 +1865,561 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 msg.contains("before remote access"),
                 "refusal must explain it happens before remote access, got: {msg}"
             );
+        }
+    }
+
+    /// THE USER'S FROZEN-GROUP FIX, deterministic form: a 3-slot target
+    /// (`p1`/`p2`/`p3`) whose release FROZE group `G = {p1, p3}` while the
+    /// CURRENT config declares `G = {p2}` — the SAME slot IDs, a DIFFERENT
+    /// group partition across eras. `release:<id> --group G` must plan
+    /// EXACTLY the FROZEN partition (`p1` + `p3`, rebound onto their current
+    /// physical locations), while `HEAD --group G` must plan EXACTLY the
+    /// CURRENT partition (`p2`). A second scenario drops `G` from the current
+    /// config entirely: a group named only in the release's frozen topology
+    /// still resolves for the release ref (the frozen partition governs),
+    /// while HEAD refuses (unknown group in the current era). A third
+    /// scenario: a frozen group selecting zero slots is a configuration error
+    /// as today.
+    #[test]
+    fn release_group_resolves_frozen_partition_head_uses_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        // CURRENT config: p1/p2/p3 on s1/s2/s3; ONLY p2 belongs to group G.
+        const VARIANT_G_CURRENT: &str = r#"
+[[slots]]
+id = "p1"
+server = "s1"
+target = "t1"
+deploy_dir = "/srv/p1"
+
+[[slots]]
+id = "p2"
+server = "s2"
+target = "t1"
+groups = ["G"]
+deploy_dir = "/srv/p2"
+
+[[slots]]
+id = "p3"
+server = "s3"
+target = "t1"
+deploy_dir = "/srv/p3"
+
+[[artifact.mappings]]
+from = "artifacts/build/output/"
+to = "app/"
+recursive = true
+
+[rotation.per_server]
+keep_distinct_artifacts = 1
+keep_days = 0
+protect_previous = true
+
+[rotation.deployment]
+protect_deployments = 1
+
+[activation]
+adapter = "none"
+
+[verification]
+adapter = "command"
+argv = ["true"]
+timeout_seconds = 5
+attempts = 1
+interval_seconds = 0
+"#;
+        std::fs::write(release_dir.join("standard.toml"), VARIANT_G_CURRENT).unwrap();
+        let cfg_path = project.join("deploy.toml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+schema_version = 2
+application = "plan"
+release = "v1"
+
+[[servers]]
+id = "s1"
+address = "a1"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s2"
+address = "a2"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[[servers]]
+id = "s3"
+address = "a3"
+user = "u"
+host_key_fingerprint = "SHA256:test"
+
+[targets.t1]
+rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
+"#,
+        )
+        .unwrap();
+        let config = Config::load(&cfg_path).unwrap();
+        assert_eq!(config.target_slot_ids("t1").unwrap(), ["p1", "p2", "p3"]);
+        assert_eq!(
+            config.target_group_slots("t1", "G").unwrap().len(),
+            1,
+            "the CURRENT partition of G is exactly {{p2}}"
+        );
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+
+        // The release's OWN frozen snapshot froze G = {p1, p3}: p1 and p3
+        // belong to G in the release's era, p2 does not. The slot-ID SET is
+        // identical to the current membership (the logical membership gate
+        // passes); only the GROUP partition differs.
+        let mut rec = legacy_record("unused", "tree-frozen");
+        rec.slots = BTreeMap::from([(
+            "standard".to_string(),
+            CanonicalSlots {
+                slots: vec![
+                    CanonicalSlot {
+                        id: "p1".to_string(),
+                        server: "s1".to_string(),
+                        deploy_dir: "/srv/p1".to_string(),
+                        target: "t1".to_string(),
+                        groups: vec!["G".to_string()],
+                    },
+                    CanonicalSlot {
+                        id: "p2".to_string(),
+                        server: "s2".to_string(),
+                        deploy_dir: "/srv/p2".to_string(),
+                        target: "t1".to_string(),
+                        groups: Vec::new(),
+                    },
+                    CanonicalSlot {
+                        id: "p3".to_string(),
+                        server: "s3".to_string(),
+                        deploy_dir: "/srv/p3".to_string(),
+                        target: "t1".to_string(),
+                        groups: vec!["G".to_string()],
+                    },
+                ],
+            },
+        )]);
+        let release = consistent(&mut rec);
+        store.write_release(&rec).unwrap();
+
+        let selection = SlotSelection::normalize(&config, "t1", Some("G")).unwrap();
+        let local_release = ReleaseId::new("unused-local".to_string());
+        let variant_trees = BTreeMap::from([(
+            "standard".to_string(),
+            TreeDigest::new("tree-current".to_string()),
+        )]);
+
+        // HEAD --group G: the CURRENT partition {p2} — the current config's
+        // group declarations are HEAD's declared temporal source.
+        let (head, desired, source, rebinding) = plan_assignments(
+            &selection,
+            &PushRef::Head,
+            &local_release,
+            &variant_trees,
+            &store,
+            &config,
+        )
+        .expect("HEAD --group G must plan the current partition");
+        let head_ids: Vec<&str> = head.iter().map(|a| a.placement_slot.as_str()).collect();
+        assert_eq!(
+            head_ids,
+            ["p2"],
+            "HEAD --group G must select EXACTLY the CURRENT partition {{p2}}, got {head_ids:?}"
+        );
+        assert_eq!(desired, BTreeSet::from([local_release.clone()]));
+        assert_eq!(source, PlanSource::Head);
+        assert!(rebinding.is_none(), "HEAD records no rebinding");
+
+        // release:R --group G: the FROZEN partition {p1, p3} — a slot the
+        // release pushed inside G but the current config moved OUT of G (p1,
+        // p3) still belongs to the push, and a slot the current config moved
+        // INTO G (p2) does not. The frozen slots are REBOUND onto their
+        // current physical locations (recorded in the RebindingPlan).
+        let (rel_assignments, rel_desired, rel_source, rel_rebinding) = plan_assignments(
+            &selection,
+            &PushRef::Release {
+                release: release.clone(),
+            },
+            &local_release,
+            &variant_trees,
+            &store,
+            &config,
+        )
+        .expect("release:<id> --group G must plan the frozen partition");
+        let rel_ids: Vec<&str> = rel_assignments
+            .iter()
+            .map(|a| a.placement_slot.as_str())
+            .collect();
+        assert_eq!(
+            rel_ids,
+            ["p1", "p3"],
+            "release --group G must select EXACTLY the FROZEN partition {{p1, p3}}"
+        );
+        for a in &rel_assignments {
+            assert_eq!(a.artifact.release, release);
+            assert_eq!(a.artifact.variant.as_str(), "standard");
+            assert_eq!(a.artifact.tree.as_str(), "tree-frozen");
+        }
+        assert_eq!(rel_desired, BTreeSet::from([release.clone()]));
+        assert_eq!(rel_source, PlanSource::ReleaseRef(release.clone()));
+        let rp = rel_rebinding.expect("a release:<id> plan must carry the explicit RebindingPlan");
+        // The frozen group's slots are REBOUND to their current physical
+        // locations: the recorded current_physical_slots carry the CURRENT
+        // (server, deploy_dir) for exactly the frozen partition's ids.
+        let rebound: Vec<&str> = rp
+            .current_physical_slots
+            .keys()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(
+            rebound,
+            ["p1", "p3"],
+            "the rebinding records exactly the frozen partition's slots"
+        );
+        for id in ["p1", "p3"] {
+            let got = &rp.current_physical_slots[&PlacementSlotId::new(id.to_string())];
+            assert_eq!(got.server.as_str(), format!("s{}", &id[1..]));
+            assert_eq!(got.deploy_dir, format!("/srv/{id}"));
+        }
+        // The frozen topology records the COMPLETE frozen partition with each
+        // slot's era groups (never narrowed to the selection); the membership
+        // check records the FULL slot-ID sets (logical only).
+        assert_eq!(rp.frozen_topology.len(), 3);
+        assert_eq!(
+            rp.frozen_topology[&PlacementSlotId::new("p1".to_string())].groups,
+            vec!["G".to_string()]
+        );
+        assert!(
+            rp.frozen_topology[&PlacementSlotId::new("p2".to_string())]
+                .groups
+                .is_empty()
+        );
+        assert_eq!(
+            rp.frozen_topology[&PlacementSlotId::new("p3".to_string())].groups,
+            vec!["G".to_string()]
+        );
+        assert_eq!(
+            rp.membership.frozen,
+            BTreeSet::from(["p1".to_string(), "p2".to_string(), "p3".to_string()])
+        );
+        assert_eq!(rp.membership.current, rp.membership.frozen);
+
+        // SCENARIO 2: drop G from the CURRENT config entirely — a group named
+        // only in the release's frozen topology still resolves for the
+        // release ref (the frozen partition governs), while HEAD refuses (an
+        // unknown group is a config error for the current era).
+        std::fs::write(
+            release_dir.join("standard.toml"),
+            VARIANT_G_CURRENT.replace("groups = [\"G\"]\n", ""),
+        )
+        .unwrap();
+        let config2 = Config::load(&cfg_path).unwrap();
+        assert_eq!(config2.target_slot_ids("t1").unwrap(), ["p1", "p2", "p3"]);
+        assert!(
+            config2.target_group_slots("t1", "G").is_err(),
+            "the current config no longer declares G"
+        );
+        let selection2 = SlotSelection::normalize(&config2, "t1", Some("G")).unwrap();
+        let (rel2, _, _, _) = plan_assignments(
+            &selection2,
+            &PushRef::Release {
+                release: release.clone(),
+            },
+            &local_release,
+            &variant_trees,
+            &store,
+            &config2,
+        )
+        .expect("a frozen-only group must still resolve for the release ref");
+        let rel2_ids: Vec<&str> = rel2.iter().map(|a| a.placement_slot.as_str()).collect();
+        assert_eq!(
+            rel2_ids,
+            ["p1", "p3"],
+            "a group named only in the release's frozen topology still plans the frozen partition"
+        );
+        let err = plan_assignments(
+            &selection2,
+            &PushRef::Head,
+            &local_release,
+            &variant_trees,
+            &store,
+            &config2,
+        )
+        .expect_err("HEAD must refuse a group unknown in the current config");
+        assert!(
+            err.to_string().contains("selects no slots"),
+            "HEAD's refusal must be the group config error, got: {err}"
+        );
+
+        // SCENARIO 3: a frozen group selecting ZERO slots is a configuration
+        // error as today (the frozen partition governs the error too).
+        let mut rec2 = legacy_record("unused", "tree-frozen");
+        rec2.slots = BTreeMap::from([(
+            "standard".to_string(),
+            CanonicalSlots {
+                slots: vec![
+                    CanonicalSlot {
+                        id: "p1".to_string(),
+                        server: "s1".to_string(),
+                        deploy_dir: "/srv/p1".to_string(),
+                        target: "t1".to_string(),
+                        groups: Vec::new(),
+                    },
+                    CanonicalSlot {
+                        id: "p2".to_string(),
+                        server: "s2".to_string(),
+                        deploy_dir: "/srv/p2".to_string(),
+                        target: "t1".to_string(),
+                        groups: Vec::new(),
+                    },
+                    CanonicalSlot {
+                        id: "p3".to_string(),
+                        server: "s3".to_string(),
+                        deploy_dir: "/srv/p3".to_string(),
+                        target: "t1".to_string(),
+                        groups: Vec::new(),
+                    },
+                ],
+            },
+        )]);
+        let release2 = consistent(&mut rec2);
+        store.write_release(&rec2).unwrap();
+        let err = plan_assignments(
+            &selection,
+            &PushRef::Release {
+                release: release2.clone(),
+            },
+            &local_release,
+            &variant_trees,
+            &store,
+            &config,
+        )
+        .expect_err("a frozen group selecting zero slots must be a config error");
+        assert!(
+            err.to_string().contains("selects no slots"),
+            "the refusal must name the frozen group's empty selection, got: {err}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // THE USER'S FROZEN-GROUP PROPERTY: arbitrary OLD (frozen) / CURRENT
+    // group partitions over the SAME slot-ID set. `HEAD --group G` must
+    // select exactly the CURRENT partition; `release:R --group G` must select
+    // exactly the FROZEN partition, planned against the frozen slots REBOUND
+    // to their current physical locations — a slot in G in the release but
+    // moved out of G in the current config still belongs to the release push,
+    // and vice versa.
+    // ---------------------------------------------------------------------
+
+    /// Build the frozen/current group-partition fixture: a project whose
+    /// CURRENT variant declares the fixed 4-slot universe `p1..p4` with the
+    /// generated CURRENT partition (`G` on exactly the slots `current_inc`
+    /// marks), and a release record whose OWN frozen snapshot declares the
+    /// SAME 4 slot IDs with the generated FROZEN partition (`G` on exactly
+    /// `frozen_inc`). The slot-ID sets are IDENTICAL across eras by
+    /// construction, so the release's logical membership gate passes for
+    /// every generated case; only the GROUP partition differs. Returns the
+    /// fixture's tempdir, config, store, and the written release id.
+    fn group_partition_fixture(
+        frozen_inc: [bool; 4],
+        current_inc: [bool; 4],
+    ) -> (tempfile::TempDir, Config, LocalStore, ReleaseId) {
+        const SLOTS: [&str; 4] = ["p1", "p2", "p3", "p4"];
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        let mut variant = String::from(
+            "[[artifact.mappings]]\nfrom = \"artifacts/build/output/\"\nto = \"app/\"\nrecursive = true\n\n\
+             [rotation.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n\
+             [rotation.deployment]\nprotect_deployments = 1\n\n\
+             [activation]\nadapter = \"none\"\n\n\
+             [verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
+        );
+        for (i, id) in SLOTS.iter().enumerate() {
+            let groups = if current_inc[i] {
+                "groups = [\"G\"]\n"
+            } else {
+                ""
+            };
+            variant.push_str(&format!(
+                "[[slots]]\nid = \"{id}\"\nserver = \"s{}\"\ntarget = \"t1\"\n{groups}deploy_dir = \"/srv/{id}\"\n\n",
+                i + 1
+            ));
+        }
+        std::fs::write(release_dir.join("standard.toml"), variant).unwrap();
+        let mut servers = String::new();
+        for i in 1..=4 {
+            servers.push_str(&format!(
+                "[[servers]]\nid = \"s{i}\"\naddress = \"a{i}\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n"
+            ));
+        }
+        let cfg_path = project.join("deploy.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "schema_version = 2\napplication = \"plan\"\nrelease = \"v1\"\n\n\
+                 {servers}\
+                 [targets.t1]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n"
+            ),
+        )
+        .unwrap();
+        let config = Config::load(&cfg_path).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+
+        // The release's OWN frozen snapshot: the SAME slot IDs with the
+        // FROZEN partition (`G` on exactly `frozen_inc`).
+        let mut rec = legacy_record("unused", "tree-frozen");
+        rec.slots = BTreeMap::from([(
+            "standard".to_string(),
+            CanonicalSlots {
+                slots: SLOTS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, id)| CanonicalSlot {
+                        id: id.to_string(),
+                        server: format!("s{}", i + 1),
+                        deploy_dir: format!("/srv/{id}"),
+                        target: "t1".to_string(),
+                        groups: if frozen_inc[i] {
+                            vec!["G".to_string()]
+                        } else {
+                            Vec::new()
+                        },
+                    })
+                    .collect(),
+            },
+        )]);
+        let release = consistent(&mut rec);
+        store.write_release(&rec).unwrap();
+        (dir, config, store, release)
+    }
+
+    proptest! {
+        // THE USER'S FROZEN-GROUP PROPERTY: identical slot-ID sets with
+        // ARBITRARY frozen/current group partitions (each era independently
+        // decides which slots belong to `G`; both non-empty so both branches
+        // plan). Bounded 16 cases + the pinned 0x5EED_5EED seed (house style)
+        // keep the deterministic floor fast; each case is store-only (no
+        // remote).
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn release_group_selects_frozen_partition_head_selects_current(
+            frozen_inc in prop::array::uniform4(prop::bool::ANY)
+                .prop_filter("the frozen partition must be non-empty", |a| a.iter().any(|b| *b)),
+            current_inc in prop::array::uniform4(prop::bool::ANY)
+                .prop_filter("the current partition must be non-empty", |a| a.iter().any(|b| *b)),
+        ) {
+            let (_dir, config, store, release) =
+                group_partition_fixture(frozen_inc, current_inc);
+            const SLOTS: [&str; 4] = ["p1", "p2", "p3", "p4"];
+            let frozen: Vec<&str> = SLOTS
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| frozen_inc[*i])
+                .map(|(_, id)| *id)
+                .collect();
+            let current: Vec<&str> = SLOTS
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| current_inc[*i])
+                .map(|(_, id)| *id)
+                .collect();
+            assert!(!frozen.is_empty(), "the frozen partition is non-empty");
+            assert!(!current.is_empty(), "the current partition is non-empty");
+            let selection = SlotSelection::normalize(&config, "t1", Some("G")).unwrap();
+            let local_release = ReleaseId::new("unused-local".to_string());
+            let variant_trees = BTreeMap::from([(
+                "standard".to_string(),
+                TreeDigest::new("tree-current".to_string()),
+            )]);
+
+            // HEAD --group G: the CURRENT partition governs.
+            let (head, _, source, rebinding) = plan_assignments(
+                &selection,
+                &PushRef::Head,
+                &local_release,
+                &variant_trees,
+                &store,
+                &config,
+            )
+            .unwrap_or_else(|e| {
+                panic!("HEAD --group G must plan the current partition {current:?}: {e}")
+            });
+            let head_ids: Vec<&str> = head
+                .iter()
+                .map(|a| a.placement_slot.as_str())
+                .collect();
+            assert_eq!(
+                head_ids, current,
+                "HEAD --group G must select EXACTLY the CURRENT partition"
+            );
+            assert_eq!(source, PlanSource::Head);
+            assert!(rebinding.is_none(), "HEAD records no rebinding");
+
+            // release:R --group G: the FROZEN partition governs — a slot in G
+            // in the release but moved OUT of G in the current config still
+            // belongs to the push, and a slot moved INTO G in the current
+            // config but outside G in the release does not. The planned slots
+            // are the frozen ids REBOUND to their current physical locations
+            // (the RebindingPlan records the current binding for exactly the
+            // frozen partition's ids).
+            let (rel, _, rel_source, rel_rebinding) = plan_assignments(
+                &selection,
+                &PushRef::Release {
+                    release: release.clone(),
+                },
+                &local_release,
+                &variant_trees,
+                &store,
+                &config,
+            )
+            .unwrap_or_else(|e| {
+                panic!("release:R --group G must plan the frozen partition {frozen:?}: {e}")
+            });
+            let rel_ids: Vec<&str> = rel
+                .iter()
+                .map(|a| a.placement_slot.as_str())
+                .collect();
+            assert_eq!(
+                rel_ids, frozen,
+                "release:R --group G must select EXACTLY the FROZEN partition"
+            );
+            for a in &rel {
+                assert_eq!(a.artifact.release, release);
+                assert_eq!(a.artifact.variant.as_str(), "standard");
+                assert_eq!(a.artifact.tree.as_str(), "tree-frozen");
+            }
+            assert_eq!(rel_source, PlanSource::ReleaseRef(release.clone()));
+            let rp = rel_rebinding
+                .expect("a release:<id> plan must carry the explicit RebindingPlan");
+            let rebound: Vec<&str> = rp
+                .current_physical_slots
+                .keys()
+                .map(|s| s.as_str())
+                .collect();
+            assert_eq!(
+                rebound, frozen,
+                "the rebinding records the frozen partition's slots, rebound to current locations"
+            );
+            for id in &frozen {
+                let got = &rp.current_physical_slots[&PlacementSlotId::new(id.to_string())];
+                assert_eq!(got.server.as_str(), &format!("s{}", &id[1..]));
+                assert_eq!(got.deploy_dir, format!("/srv/{id}"));
+            }
         }
     }
 

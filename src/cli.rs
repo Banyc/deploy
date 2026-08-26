@@ -139,9 +139,14 @@ variants (or restore a historical deployment) to every server in the target,\n\
 in rollout batches.\n\
 \n\
 SELECTION: by default every slot owned by the target is selected. Pass\n\
---group <name> to select exactly the target's slots whose `groups` list\n\
-contains the name (an unknown group, or a group selecting zero slots, is a\n\
-configuration error). A group push produces a COMPLETE target snapshot: the\n\
+--group <name> to select the rollout's slots: for a HEAD or rollback ref,\n\
+the target's slots whose CURRENT `groups` list contains the name; for a\n\
+release:<id> ref, the slots the RELEASE's frozen topology puts in the\n\
+group (a slot the release pushed inside the group but the current config\n\
+regrouped still belongs to the release push - the release's frozen group\n\
+partition governs). An unknown group, or a group selecting zero slots for\n\
+the selected era, is a configuration error. A group push produces a\n\
+COMPLETE target snapshot: the\n\
 selected slots are replaced with their new assignments while unselected\n\
 slots are carried forward unchanged, so a partial rollout stays fully\n\
 rollback-capable. On a target's first deployment a group must cover every\n\

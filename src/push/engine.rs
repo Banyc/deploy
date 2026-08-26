@@ -136,13 +136,20 @@ pub fn push(
         .ok_or_else(|| Error::not_found(format!("target '{target_name}'")))?;
     let project_root = config.project_root(config_path);
 
-    // 0. NORMALIZE THE SELECTION once near command entry: the owning target,
-    // the optional rollout group, and the EXACT selected slot IDs from the
-    // caller's current configuration (the selection source, including for
-    // historical references). Planning, execution, reporting, and persistence
-    // consume this normalized selection instead of independently filtering
-    // slots. An unknown group, or a group selecting zero slots, is a
-    // configuration error and fails here, before any lock or remote access.
+    // 0. NORMALIZE THE SELECTION once near command entry: the owning target
+    // and the requested rollout group only — a branch-agnostic {target,
+    // group} pair, WITHOUT resolving slot IDs from the caller's current
+    // configuration. Each reference branch resolves the selected slot IDs
+    // against its own declared temporal source at plan time (HEAD and
+    // deployment refs: the current group declarations; `release:<id>`: the
+    // release's FROZEN per-slot groups, rebound onto the current physical
+    // slots), so a historical release's frozen group partition governs its
+    // push even when it differs from the current one. An unknown/empty group
+    // is a configuration error for the branch's own era (the current config
+    // for HEAD/deployment refs, the release's frozen topology for release
+    // refs) and surfaces before any remote mutation. Planning, execution,
+    // reporting, and persistence consume this selection plus the per-branch
+    // resolution instead of independently filtering slots.
     let selection =
         crate::push::plan::SlotSelection::normalize(config, target_name, opts.group.as_deref())?;
 
@@ -195,8 +202,8 @@ pub fn push(
     // post-reconcile resolution is needed for the direct form.
     // The gate compares the FULL membership — `config.target_slots`, EVERY
     // slot whose owning target equals the target — never the group-filtered
-    // `selection.slot_ids`: a `release:<id> --group <g>` push validates the
-    // complete set here and then plans only the selected slots downstream.
+    // selection: a `release:<id> --group <g>` push validates the complete
+    // set here and then plans only the selected slots downstream.
     if let RefExpr::Release(release) = &ref_expr {
         let rec = store
             .read_release(release)
@@ -483,10 +490,14 @@ fn push_inner(
     //
     // The helpers/statuses cover ALL of the target's member slots (a pending
     // attempt may involve any of them, and deferred-rotation debt for any of
-    // them is serviced from here); the SELECTED slots (the normalized
-    // selection) are the ones this push plans, mutates, and refreshes.
+    // them is serviced from here); the SELECTED slots — the per-branch
+    // resolution of the {target, group} selection — are the ones this push
+    // plans, mutates, and refreshes, derived from the plan's assignments
+    // below (after `plan_assignments` resolved the group's slot IDs inside
+    // each reference branch: HEAD/deployment from the CURRENT topology,
+    // `release:<id>` from the release's FROZEN topology rebound to the
+    // current physical slots).
     let all_members = config.target_slots(target_name)?;
-    let members = selection.members(config)?;
     let mut remotes: HashMap<PlacementSlotId, Box<dyn Remote>> = HashMap::new();
     let mut helpers: HashMap<PlacementSlotId, RemoteHelper> = HashMap::new();
     let mut statuses: HashMap<PlacementSlotId, crate::remote::helper::RemoteStatus> =
@@ -654,14 +665,46 @@ fn push_inner(
         config,
     )?;
 
+    // THE SELECTED (slot, server) pairs this push plans, mutates, and
+    // refreshes: derived from the plan's assignments — the per-branch
+    // slot-ID resolution (`plan_assignments` resolved the group's slots
+    // inside each reference branch: HEAD/deployment from the CURRENT
+    // topology, a `release:<id>` from the RELEASE's FROZEN group topology,
+    // rebound onto the current physical slots), so the remote phase,
+    // verification, and refresh always operate on exactly the planned slots
+    // — even when the release's frozen group partition differs from the
+    // current one (the bug: the selection resolved the group from the
+    // caller's current config alone, so a historical release's frozen group
+    // selected the WRONG slots here).
+    let members: Vec<(&crate::config::SlotDef, &crate::config::ServerDef)> = assignments
+        .iter()
+        .map(|a| {
+            all_members
+                .iter()
+                .find(|(s, _)| s.id == a.placement_slot.as_str())
+                .copied()
+                .ok_or_else(|| {
+                    Error::internal(format!(
+                        "planned slot '{}' has no current physical declaration",
+                        a.placement_slot
+                    ))
+                })
+        })
+        .collect::<Result<_>>()?;
+
     // PARTIAL-ROLLOUT GUARDS (before any remote mutation): a group push
     // derives its complete snapshot by overlaying the selected slots onto the
     // latest successful target snapshot, so the base must be able to carry
     // every unselected slot forward — on a target's first deployment the
     // group must cover every target slot, and after membership changes every
     // current unselected slot must have a prior assignment with a matching
-    // physical binding. A full-target push (no group) is always allowed.
-    crate::push::plan::validate_partial_rollout(selection, config, store)?;
+    // physical binding. A full-target push (no group) is always allowed. The
+    // selected set is the plan's per-branch resolution (the assignments).
+    let planned_slot_ids: Vec<PlacementSlotId> = assignments
+        .iter()
+        .map(|a| a.placement_slot.clone())
+        .collect();
+    crate::push::plan::validate_partial_rollout(selection, &planned_slot_ids, config, store)?;
 
     // Behavior coverage gate: EVERY planned assignment's (release, variant)
     // must have a frozen behavior contract BEFORE any remote state is touched
