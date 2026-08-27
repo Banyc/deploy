@@ -247,19 +247,16 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
 
     let observed = store.read_observed("production", &config)?;
     let obs = &observed.slots[&deploy::model::SlotId::parse("app-1").unwrap()];
+    let deploy::records::Observation::Known(state) = &obs.observation else {
+        panic!("observed app-1 must be Known");
+    };
     assert_eq!(
-        obs.generation.as_ref(),
+        Some(&state.generation),
         Some(generation),
         "`deploy status` shows the deployed generation"
     );
-    assert_eq!(
-        obs.artifact.as_ref().map(|a| a.variant.as_str()),
-        Some("standard")
-    );
-    assert_eq!(
-        obs.artifact.as_ref().map(|a| &a.tree),
-        Some(&srv.artifact.tree)
-    );
+    assert_eq!(Some(state.artifact.variant.as_str()), Some("standard"));
+    assert_eq!(Some(&state.artifact.tree), Some(&srv.artifact.tree));
 
     // A second push with identical content is a no-op (no new attempt).
     let r2 = push(

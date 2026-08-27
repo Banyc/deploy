@@ -467,8 +467,8 @@ mod tests {
     };
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
-        NonEmptySlotTable, ObservedSlot, Pins, SlotOutcomeKind, SlotResult, SlotTable,
-        TerminalDisposition,
+        NonEmptySlotTable, Observation, ObservedSlot, ObservedState, Pins, SlotOutcomeKind,
+        SlotResult, SlotTable, TerminalDisposition,
     };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -740,13 +740,15 @@ interval_seconds = 0
 
         // The observed slot state (the ONE physical observed record).
         let observed = ObservedSlot {
-            generation: None,
-            artifact: Some(ArtifactRef {
-                release: ReleaseId::new("rel-sha256-obs".to_string()),
-                variant: VariantName::new("standard".to_string()),
-                tree: test_tree_digest("tree-obs"),
+            observation: Observation::Known(ObservedState {
+                generation: test_generation_id("gen-obs"),
+                artifact: ArtifactRef {
+                    release: ReleaseId::new("rel-sha256-obs".to_string()),
+                    variant: VariantName::new("standard".to_string()),
+                    tree: test_tree_digest("tree-obs"),
+                },
+                last_deployment: test_deployment_id("deploy-obs"),
             }),
-            last_deployment: Some(test_deployment_id("deploy-obs")),
         };
         store
             .write_slot_observed(&SlotId::new(SLOT.to_string()), &observed)

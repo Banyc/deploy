@@ -80,6 +80,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
+use crate::records::Observation;
+#[cfg(test)]
 use crate::testutil::step17_hook::Step17Hook;
 #[cfg(test)]
 use crate::testutil::test_faults::{FaultKind, FaultRegistry};
@@ -606,12 +608,12 @@ impl LocalStore {
     /// exactly one slot's physical record.
     pub fn write_slot_observed(&self, slot: &SlotId, observed: &ObservedSlot) -> Result<()> {
         #[cfg(test)]
-        if let Some(d) = observed.last_deployment.as_ref()
-            && self.fault_registry.consume_target(
-                FaultKind::WriteObserved,
-                d.as_str(),
-                slot.as_str(),
-            )
+        if let Some(d) = match &observed.observation {
+            Observation::Known(state) => Some(state.last_deployment.as_str()),
+            _ => None,
+        } && self
+            .fault_registry
+            .consume_target(FaultKind::WriteObserved, d, slot.as_str())
         {
             return Err(Error::store(
                 "test fault: write_slot_observed forced to fail once",
@@ -1269,11 +1271,14 @@ impl LocalStore {
             state
                 .last_observed
                 .as_ref()
-                .and_then(|o| o.last_deployment.as_ref()),
+                .and_then(|o| match &o.observation {
+                    Observation::Known(s) => Some(s.last_deployment.as_str()),
+                    _ => None,
+                }),
             state.last_seen_target.as_ref(),
         ) && self.fault_registry.consume_target(
             FaultKind::WriteServer,
-            deployment_id.as_str(),
+            deployment_id,
             target.as_str(),
         ) {
             return Err(Error::store("test fault: write_server forced to fail once"));
@@ -1533,9 +1538,9 @@ mod tests {
     use crate::push::lock::FileLock;
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerIntentWire, LedgerLine,
-        LedgerRollback, LedgerTerminal, LedgerTerminalWire, NonEmptySlotTable, PhysicalBinding,
-        PreviousGeneration, SlotOutcome, SlotOutcomeKind, SlotTable, SlotTransition,
-        TerminalDisposition,
+        LedgerRollback, LedgerTerminal, LedgerTerminalWire, NonEmptySlotTable, Observation,
+        ObservedGeneration, ObservedState, PhysicalBinding, PreviousGeneration, SlotOutcome,
+        SlotOutcomeKind, SlotTable, SlotTransition, TerminalDisposition,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
@@ -1668,7 +1673,9 @@ mod tests {
                     SlotId::new("p1".to_string()),
                     SlotOutcome {
                         outcome: SlotOutcomeKind::Activated,
-                        generation: Some(test_generation_id("1")),
+                        observation: Observation::Known(ObservedGeneration {
+                            generation: test_generation_id("1"),
+                        }),
                         compensated: false,
                         error: None,
                         transition: SlotTransition::Advanced,
@@ -1720,9 +1727,11 @@ mod tests {
             "a '..' slot must be confined to its own slot dir, not the store root"
         );
         let observed = ObservedSlot {
-            generation: Some(test_generation_id("evil")),
-            artifact: None,
-            last_deployment: None,
+            observation: Observation::Known(ObservedState {
+                generation: test_generation_id("evil"),
+                artifact: unknown_artifact(),
+                last_deployment: test_deployment_id("evil"),
+            }),
         };
         store.write_slot_observed(&evil, &observed).unwrap();
         assert!(
@@ -1958,7 +1967,9 @@ mod tests {
                             SlotId::new("p1".to_string()),
                             SlotOutcome {
                                 outcome: SlotOutcomeKind::Skipped,
-                                generation: Some(test_generation_id("1")),
+                                observation: Observation::Known(ObservedGeneration {
+                                    generation: test_generation_id("1"),
+                                }),
                                 compensated: false,
                                 error: None,
                                 transition: SlotTransition::NeverAdvanced,
@@ -2029,7 +2040,9 @@ mod tests {
                             SlotId::new("p1".to_string()),
                             SlotOutcome {
                                 outcome: SlotOutcomeKind::Restored,
-                                generation: Some(test_generation_id("gen-1")),
+                                observation: Observation::Known(ObservedGeneration {
+                                    generation: test_generation_id("gen-1"),
+                                }),
                                 compensated: true,
                                 error: None,
                                 transition: SlotTransition::Restored,
@@ -3363,7 +3376,9 @@ mod tests {
                     k,
                     SlotOutcome {
                         outcome: SlotOutcomeKind::Activated,
-                        generation: Some(test_generation_id(id)),
+                        observation: Observation::Known(ObservedGeneration {
+                            generation: test_generation_id(id),
+                        }),
                         compensated: false,
                         error: None,
                         transition: SlotTransition::Advanced,
@@ -3718,7 +3733,9 @@ mod tests {
             SlotId::new("extra-slot".to_string()),
             SlotOutcome {
                 outcome: SlotOutcomeKind::Activated,
-                generation: Some(test_generation_id("x")),
+                observation: Observation::Known(ObservedGeneration {
+                    generation: test_generation_id("x"),
+                }),
                 compensated: false,
                 error: None,
                 transition: SlotTransition::Advanced,

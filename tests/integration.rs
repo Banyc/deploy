@@ -315,17 +315,15 @@ fn end_to_end_push_rollback() -> Result<()> {
         "rollback succeeds"
     );
     let observed = store.read_observed("production", &config)?;
-    let restored = observed.slots[&SlotId::parse("p1").unwrap()]
-        .artifact
-        .as_ref()
-        .map(|a| a.tree.clone())
-        .unwrap();
+    let restored = match &observed.slots[&SlotId::parse("p1").unwrap()].observation {
+        deploy::records::Observation::Known(s) => s.artifact.tree.clone(),
+        _ => panic!("observed p1 must be Known"),
+    };
     assert_eq!(restored, std_v1, "server-01 rolled back to original tree");
-    let hc_restored = observed.slots[&SlotId::parse("p3").unwrap()]
-        .artifact
-        .as_ref()
-        .map(|a| a.tree.clone())
-        .unwrap();
+    let hc_restored = match &observed.slots[&SlotId::parse("p3").unwrap()].observation {
+        deploy::records::Observation::Known(s) => s.artifact.tree.clone(),
+        _ => panic!("observed p3 must be Known"),
+    };
     assert_eq!(
         hc_restored, hc_v1,
         "server-03 still on its tree (restored from s0)"
@@ -925,19 +923,22 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     );
     let observed = store.read_observed("production", &config0)?;
     let restored = &observed.slots[&SlotId::parse("p1").unwrap()];
+    let deploy::records::Observation::Known(state) = &restored.observation else {
+        panic!("observed p1 must be Known");
+    };
 
     assert_eq!(
-        restored.artifact.as_ref().map(|a| &a.tree),
+        Some(&state.artifact.tree),
         Some(&old_tree),
         "tree restored from s0"
     );
     assert_eq!(
-        restored.artifact.as_ref().map(|a| a.variant.as_str()),
+        Some(state.artifact.variant.as_str()),
         Some("old"),
         "variant restored from s0"
     );
     assert_eq!(
-        restored.artifact.as_ref().map(|a| &a.release),
+        Some(&state.artifact.release),
         Some(&old_release),
         "release restored from s0"
     );
@@ -4011,14 +4012,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "rollback must succeed once the current reserve is lowered"
     );
     let observed = store.read_observed("production", &config0)?;
-    assert_eq!(
-        observed.slots[&SlotId::parse("p1").unwrap()]
-            .artifact
-            .as_ref()
-            .map(|a| &a.tree),
-        Some(&t0),
-        "s0 tree restored"
-    );
+    let deploy::records::Observation::Known(s) =
+        &observed.slots[&SlotId::parse("p1").unwrap()].observation
+    else {
+        panic!("observed p1 must be Known");
+    };
+    assert_eq!(Some(&s.artifact.tree), Some(&t0), "s0 tree restored");
     Ok(())
 }
 
@@ -4452,14 +4451,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let obs_prod = store.read_observed("production", &config)?;
     let os = &obs_prod.slots[&SlotId::parse("p1").unwrap()];
 
+    let deploy::records::Observation::Known(os_state) = &os.observation else {
+        panic!("observed p1 must be Known");
+    };
     assert_eq!(
-        os.artifact.as_ref().expect("observed artifact").tree,
-        prod_v1,
+        os_state.artifact.tree, prod_v1,
         "production observed must carry the actual tree deployed by the production push"
     );
     assert_eq!(
-        os.generation.as_ref().expect("observed generation"),
-        &prod_gen,
+        &os_state.generation, &prod_gen,
         "production observed must carry the actual generation deployed by the production push"
     );
     assert!(
@@ -4498,23 +4498,24 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // and staging's p2 carries its fresh v2 actual.
     let obs_prod = store.read_observed("production", &config)?;
     let os = &obs_prod.slots[&SlotId::parse("p1").unwrap()];
-
+    let deploy::records::Observation::Known(os_state) = &os.observation else {
+        panic!("observed p1 must be Known");
+    };
     assert_eq!(
-        os.artifact.as_ref().expect("observed artifact").tree,
-        prod_v1,
+        os_state.artifact.tree, prod_v1,
         "production observed must be untouched by the staging push"
     );
     let obs_staging = store.read_observed("staging", &config)?;
     let os = &obs_staging.slots[&SlotId::parse("p2").unwrap()];
-
+    let deploy::records::Observation::Known(os_state2) = &os.observation else {
+        panic!("observed p2 must be Known");
+    };
     assert_eq!(
-        os.artifact.as_ref().expect("observed artifact").tree,
-        staging_v2,
+        os_state2.artifact.tree, staging_v2,
         "staging observed must carry the actual tree deployed by the staging push"
     );
     assert_eq!(
-        os.generation.as_ref().expect("observed generation"),
-        &staging_gen,
+        &os_state2.generation, &staging_gen,
         "staging observed must carry the actual generation deployed by the staging push"
     );
 
@@ -4539,29 +4540,29 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &rrb_prod.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()];
 
     let restored_prod = store.read_observed("production", &config)?;
+    let deploy::records::Observation::Known(rp_state) =
+        &restored_prod.slots[&SlotId::parse("p1").unwrap()].observation
+    else {
+        panic!("observed p1 must be Known");
+    };
     assert_eq!(
-        restored_prod.slots[&SlotId::parse("p1").unwrap()]
-            .artifact
-            .as_ref()
-            .unwrap()
-            .tree,
-        prod_v1,
+        rp_state.artifact.tree, prod_v1,
         "production rolled back to its own s0 tree"
     );
     assert_eq!(
-        restored_prod.slots[&SlotId::parse("p1").unwrap()].generation,
+        Some(rp_state.generation.clone()),
         restored_prod_slot.generation,
         "production's observed generation is the actual restored generation"
     );
     // The production rollback does NOT touch staging's observed state.
     let obs_staging = store.read_observed("staging", &config)?;
+    let deploy::records::Observation::Known(os_state) =
+        &obs_staging.slots[&SlotId::parse("p2").unwrap()].observation
+    else {
+        panic!("observed p2 must be Known");
+    };
     assert_eq!(
-        obs_staging.slots[&SlotId::parse("p2").unwrap()]
-            .artifact
-            .as_ref()
-            .unwrap()
-            .tree,
-        staging_v2,
+        os_state.artifact.tree, staging_v2,
         "staging's observed state is untouched by the production rollback"
     );
 
@@ -4579,13 +4580,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     )?;
     assert_eq!(rrb_staging.status, Some(DeploymentStatus::Successful));
     let restored_staging = store.read_observed("staging", &config)?;
+    let deploy::records::Observation::Known(rs_state) =
+        &restored_staging.slots[&SlotId::parse("p2").unwrap()].observation
+    else {
+        panic!("observed p2 must be Known");
+    };
     assert_eq!(
-        restored_staging.slots[&SlotId::parse("p2").unwrap()]
-            .artifact
-            .as_ref()
-            .unwrap()
-            .tree,
-        staging_v2,
+        rs_state.artifact.tree, staging_v2,
         "staging rolled back to its own s0 tree"
     );
     Ok(())
@@ -4688,10 +4689,12 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
     let tree_at = |idx: usize| trees[idx].clone();
     let observed_tree = |store: &LocalStore| -> Result<Option<TreeDigest>> {
         Ok(
-            store.read_observed("production", &config)?.slots[&SlotId::parse("p1").unwrap()]
-                .artifact
-                .as_ref()
-                .map(|a| a.tree.clone()),
+            match &store.read_observed("production", &config)?.slots[&SlotId::parse("p1").unwrap()]
+                .observation
+            {
+                deploy::records::Observation::Known(s) => Some(s.artifact.tree.clone()),
+                _ => None,
+            },
         )
     };
 

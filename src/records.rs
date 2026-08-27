@@ -1141,8 +1141,13 @@ pub enum SlotTransition {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotOutcome {
     pub outcome: SlotOutcomeKind,
-    /// The generation this slot advanced to, or `None` if it never started.
-    pub generation: Option<GenerationId>,
+    /// The THREE-STATE OBSERVATION of the slot's post-mutation state — the
+    /// observed generation the remaining-changes derivation compares against
+    /// pre_push. `Unknown(error)` when the post-mutation status read failed
+    /// (the slot may or may not have changed — never classified as
+    /// unchanged); `KnownAbsent` when the read succeeded showing no state
+    /// (never deployed).
+    pub observation: Observation<ObservedGeneration>,
     pub compensated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -1179,9 +1184,25 @@ impl SlotOutcome {
             // a `Compensated` outcome would be a restored slot.
             SlotOutcomeKind::Compensated => SlotTransition::Restored,
         };
+        // The THREE-STATE OBSERVATION is derived from the wire's fields: a
+        // recorded generation is a successful read (`Known`); a `None`
+        // generation with a preserved error is a FAILED observation
+        // (`Unknown` — the wire's error field carries the observation error
+        // when the observation failed, so the uncertainty survives the wire
+        // round trip); a `None` generation with no error is a slot with no
+        // observed state (`KnownAbsent`).
+        let observation = match r.generation {
+            Some(g) => Observation::Known(ObservedGeneration { generation: g }),
+            None => match r.error.as_deref() {
+                Some(e) => Observation::Unknown(ObservationError {
+                    message: e.to_string(),
+                }),
+                None => Observation::KnownAbsent,
+            },
+        };
         SlotOutcome {
             outcome: r.outcome,
-            generation: r.generation,
+            observation,
             compensated: r.compensated,
             error: r.error,
             transition,
@@ -1201,14 +1222,27 @@ impl From<SlotResult> for SlotOutcome {
 
 impl SlotResult {
     /// Re-attach the table key as the wire outcome's `slot_id` (the wire
-    /// keeps the on-disk shape; the domain value carries no slot).
+    /// keeps the on-disk shape; the domain value carries no slot) and encode
+    /// the domain's THREE-STATE OBSERVATION back into the wire's fields: the
+    /// `Known` half is the recorded generation; the `Unknown` half is carried
+    /// by the wire's error field (a `None` generation with a preserved error
+    /// reads back as `Unknown` — the uncertainty survives the round trip); a
+    /// `KnownAbsent` observation carries no error (a `None` generation with
+    /// an error would read back as `Unknown`, not `KnownAbsent`).
     pub fn from_outcome(key: &SlotId, o: &SlotOutcome) -> Self {
         SlotResult {
             slot_id: key.clone(),
             outcome: o.outcome.clone(),
-            generation: o.generation.clone(),
+            generation: match &o.observation {
+                Observation::Known(og) => Some(og.generation.clone()),
+                Observation::KnownAbsent | Observation::Unknown(_) => None,
+            },
             compensated: o.compensated,
-            error: o.error.clone(),
+            error: match &o.observation {
+                Observation::Unknown(e) => Some(e.message.clone()),
+                Observation::KnownAbsent => None,
+                Observation::Known(_) => o.error.clone(),
+            },
         }
     }
 }
@@ -1398,7 +1432,7 @@ impl LedgerTerminal {
     /// The REMAINING CHANGES of a [`TerminalDisposition::Degraded`] terminal
     /// — DERIVED from the disposition's OWN per-slot outcomes (the slots
     /// whose FINAL OBSERVED STATE differs from their pre_push state, each
-    /// mapped to the generation it is on), never stored. `None` for any
+    /// mapped to its THREE-STATE OBSERVATION), never stored. `None` for any
     /// non-Degraded disposition. For a Degraded terminal the set may be
     /// EMPTY (a `leave_changed` failure that advanced nothing — e.g. a
     /// pre-swap failure with every slot skipped — is Degraded with no
@@ -1413,14 +1447,25 @@ impl LedgerTerminal {
     /// `Advanced` slot is at the desired state (always a remaining change);
     /// an `AdvanceUnknown` slot (a pre-swap failure — the advance outcome is
     /// unknown) is a remaining change iff its OBSERVED state (the outcome's
-    /// generation, which the engine records as the actual post-state, never
+    /// observation, which the engine records as the actual post-state, never
     /// the desired one) differs from pre_push. The intent's `pre_push` per
     /// slot is the comparison baseline.
-    pub fn remaining_changes(&self, intent: &DeploymentIntent) -> Option<SlotTable<GenerationId>> {
+    ///
+    /// THE THREE-STATE OBSERVATION IS THE COMPARISON, NEVER A `None`
+    /// COLLAPSED INTO "UNCHANGED": an `Unknown` observation (the post-mutation
+    /// status read failed) is UNCERTAIN — the slot may or may not have
+    /// changed — so it is NEVER classified as unchanged: it IS a remaining
+    /// change, mapped to its `Unknown(error)` observation. A `KnownAbsent`
+    /// observation (the read succeeded showing no state) is a remaining
+    /// change only when the slot HAD a pre_push generation that is now gone.
+    pub fn remaining_changes(
+        &self,
+        intent: &DeploymentIntent,
+    ) -> Option<SlotTable<Observation<ObservedGeneration>>> {
         if !matches!(self.disposition, TerminalDisposition::Degraded { .. }) {
             return None;
         }
-        let remaining: BTreeMap<SlotId, GenerationId> = self
+        let remaining: BTreeMap<SlotId, Observation<ObservedGeneration>> = self
             .outcomes()
             .iter()
             .filter(|(sid, r)| match r.transition {
@@ -1429,29 +1474,34 @@ impl LedgerTerminal {
                 SlotTransition::AdvanceUnknown => {
                     // The advance outcome is unknown (a pre-swap failure):
                     // the slot is a remaining change iff its OBSERVED state
-                    // differs from pre_push. A `None` observed state (the
-                    // post-mutation status read failed) is not evidence of a
-                    // change.
+                    // differs from pre_push. An `Unknown` observation (the
+                    // post-mutation status read failed) is NOT evidence of
+                    // no change — the slot may have changed; it is UNCERTAIN
+                    // and therefore a remaining change.
                     let pre = intent
                         .slots
                         .get(sid)
                         .and_then(|s| s.pre_push.as_ref())
                         .and_then(|p| p.generation.clone());
-                    match (r.generation.as_ref(), pre.as_ref()) {
-                        (Some(obs), Some(pre_gen)) => obs != pre_gen,
-                        (Some(_), None) => true,
-                        _ => false,
+                    match &r.observation {
+                        Observation::Known(og) => {
+                            let obs = og.generation.clone();
+                            match (Some(obs), pre) {
+                                (Some(obs), Some(pre_gen)) => obs != pre_gen,
+                                (Some(_), None) => true,
+                                _ => false,
+                            }
+                        }
+                        // The read succeeded showing no state: a change only
+                        // when the slot HAD a pre_push generation that is now
+                        // gone.
+                        Observation::KnownAbsent => pre.is_some(),
+                        // The read FAILED: uncertain — never unchanged.
+                        Observation::Unknown(_) => true,
                     }
                 }
             })
-            .map(|(k, r)| {
-                (
-                    k.clone(),
-                    r.generation
-                        .clone()
-                        .expect("a remaining change records the generation it is on"),
-                )
-            })
+            .map(|(k, r)| (k.clone(), r.observation.clone()))
             .collect();
         Some(SlotTable::from_map(remaining))
     }
@@ -1801,15 +1851,58 @@ pub struct Pins {
     pub bindings: Vec<ArtifactRef>,
 }
 
+/// The THREE-STATE OBSERVATION of a slot's remote state: `KnownAbsent` (the
+/// slot has no observed state — never deployed), `Known(state)` (a
+/// successful read), or `Unknown(error)` (the read failed; the error is
+/// preserved). An `Unknown` observation is NOT evidence of no change — the
+/// slot may have changed; the failure just means we cannot see it. Every
+/// consumer (the observed record, the terminal disposition's per-slot
+/// outcomes, the remaining-changes derivation) must carry the `Unknown`
+/// through rather than collapsing it into an absent/`None` that downstream
+/// code reads as "unchanged".
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Observation<T> {
+    /// The slot has no observed state (never deployed).
+    #[default]
+    KnownAbsent,
+    /// A successful read of the slot's observed state.
+    Known(T),
+    /// The read failed: the error is preserved. NOT evidence of no change.
+    Unknown(ObservationError),
+}
+
+/// The payload of a SUCCESSFUL observation of a placement slot: the slot's
+/// live assignment as read from the remote (generation + artifact + the
+/// assignment's OWN minting deployment).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedState {
+    pub generation: GenerationId,
+    pub artifact: ArtifactRef,
+    pub last_deployment: DeploymentId,
+}
+
+/// The payload of a SUCCESSFUL observation of a slot's GENERATION — the
+/// per-slot fact the terminal's outcomes carry (the remaining-changes
+/// derivation compares it against pre_push).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedGeneration {
+    pub generation: GenerationId,
+}
+
+/// The preserved error of a FAILED observation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationError {
+    pub message: String,
+}
+
 /// Observed remote state for one placement slot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ObservedSlot {
-    #[serde(default)]
-    pub generation: Option<GenerationId>,
-    #[serde(default)]
-    pub artifact: Option<ArtifactRef>,
-    #[serde(default)]
-    pub last_deployment: Option<DeploymentId>,
+    /// The three-state observation of the slot's remote state: `KnownAbsent`
+    /// (never deployed), `Known(state)` (a successful read), or
+    /// `Unknown(error)` (the read failed — NOT evidence of no change).
+    pub observation: Observation<ObservedState>,
 }
 
 /// Observed remote state for a whole target (`observed.json`).
@@ -4098,10 +4191,13 @@ mod tests {
         };
         assert!(d.compensation().is_none());
         let remaining = d.remaining_changes(&intent).unwrap();
-        let expected: BTreeMap<SlotId, GenerationId> = outcomes
+        let expected: BTreeMap<SlotId, Observation<ObservedGeneration>> = outcomes
             .iter()
-            .filter(|(_, o)| o.outcome != SlotOutcomeKind::Restored && o.generation.is_some())
-            .map(|(k, o)| (k.clone(), o.generation.clone().unwrap()))
+            .filter(|(_, o)| {
+                o.outcome != SlotOutcomeKind::Restored
+                    && matches!(o.observation, Observation::Known(_))
+            })
+            .map(|(k, o)| (k.clone(), o.observation.clone()))
             .collect();
         assert_eq!(
             remaining.into_map(),
@@ -4115,8 +4211,12 @@ mod tests {
     // the wire exactly
     // =====================================================================
 
-    /// An arbitrary domain outcome value (any kind, optional generation,
-    /// any compensation flag, optional error note).
+    /// An arbitrary domain outcome value (any kind, a THREE-STATE
+    /// OBSERVATION with a CONSISTENT error note — the wire has one error
+    /// field, so the observation and the error must agree for the round trip
+    /// to be exact: a `Known` observation may carry any failure reason, an
+    /// `Unknown` observation's error IS the observation error, and a
+    /// `KnownAbsent` observation carries no error — any compensation flag).
     fn arbitrary_outcome() -> impl Strategy<Value = SlotOutcome> {
         (
             prop_oneof![
@@ -4126,14 +4226,40 @@ mod tests {
                 Just(SlotOutcomeKind::Skipped),
                 Just(SlotOutcomeKind::Restored),
             ],
-            prop::option::of((0u32..6).prop_map(|i| GenerationId::new(format!("gen-{i}")))),
+            prop_oneof![
+                // Known: a recorded generation, with an arbitrary error note
+                // (the failure reason — the observation itself succeeded).
+                (
+                    (0u32..6).prop_map(|i| GenerationId::new(format!("gen-{i}"))),
+                    prop::option::of(prop::sample::select(vec![
+                        "boom".to_string(),
+                        "verification failed".to_string(),
+                    ])),
+                )
+                    .prop_map(|(generation, error)| {
+                        (Observation::Known(ObservedGeneration { generation }), error)
+                    }),
+                // Unknown: the observation failed — the outcome's error IS
+                // the observation error (the wire has one error field, so
+                // the two must agree for the round trip to be exact).
+                prop::sample::select(vec![
+                    "status read failed: boom".to_string(),
+                    "assignment read failed: boom".to_string(),
+                ])
+                .prop_map(|e| {
+                    (
+                        Observation::Unknown(ObservationError { message: e.clone() }),
+                        Some(e),
+                    )
+                }),
+                // KnownAbsent: no observed state, no error (a `None`
+                // generation with an error would read back as `Unknown`,
+                // not `KnownAbsent`).
+                Just((Observation::KnownAbsent, None)),
+            ],
             any::<bool>(),
-            prop::option::of(prop::sample::select(vec![
-                "boom".to_string(),
-                "verification failed".to_string(),
-            ])),
         )
-            .prop_map(|(outcome, generation, compensated, error)| {
+            .prop_map(|(outcome, (observation, error), compensated)| {
                 let transition = match &outcome {
                     SlotOutcomeKind::Restored => SlotTransition::Restored,
                     SlotOutcomeKind::Skipped => SlotTransition::NeverAdvanced,
@@ -4149,7 +4275,7 @@ mod tests {
                 };
                 SlotOutcome {
                     outcome,
-                    generation,
+                    observation,
                     compensated,
                     error,
                     transition,
@@ -4187,7 +4313,9 @@ mod tests {
                         k.clone(),
                         SlotOutcome {
                             outcome: SlotOutcomeKind::Activated,
-                            generation: Some(GenerationId::new(format!("gen-{}", k.as_str()))),
+                            observation: Observation::Known(ObservedGeneration {
+                                generation: GenerationId::new(format!("gen-{}", k.as_str())),
+                            }),
                             compensated: false,
                             error: None,
                             transition: SlotTransition::Advanced,
@@ -4254,7 +4382,7 @@ mod tests {
                 };
                 SlotOutcome {
                     outcome,
-                    generation: Some(generation),
+                    observation: Observation::Known(ObservedGeneration { generation }),
                     compensated,
                     error,
                     transition,
@@ -5062,7 +5190,9 @@ mod tests {
         let remaining = terminal.remaining_changes(&intent).expect("Degraded");
         assert_eq!(
             remaining.get(&slot(1)),
-            Some(&GenerationId::new("new-1".to_string())),
+            Some(&Observation::Known(ObservedGeneration {
+                generation: GenerationId::new("new-1".to_string()),
+            })),
             "an advanced slot (Advanced) is a remaining change at the generation it is on"
         );
 
@@ -5129,8 +5259,144 @@ mod tests {
         let remaining = terminal.remaining_changes(&intent).expect("Degraded");
         assert_eq!(
             remaining.get(&slot(1)),
-            Some(&GenerationId::new("new-1".to_string())),
+            Some(&Observation::Known(ObservedGeneration {
+                generation: GenerationId::new("new-1".to_string()),
+            })),
             "an advance-unknown slot whose observed state differs from pre_push is a remaining change"
         );
+
+        // THE OBSERVATION-LEVEL FIX: an ADVANCE-UNKNOWN slot whose
+        // post-mutation OBSERVATION FAILED (the status read at the
+        // post-mutation point returned an error) is `Unknown(error)` — the
+        // slot may or may not have changed, so it is NEVER classified as
+        // unchanged: it IS a remaining change, mapped to its `Unknown`
+        // observation (the wire's `generation: None` + preserved error reads
+        // back as `Unknown`, never as a `None` that downstream code reads as
+        // "no change").
+        let (intent, terminal) = degraded_terminal_with(
+            vec![(
+                slot(1),
+                SlotResult {
+                    slot_id: slot(1),
+                    outcome: SlotOutcomeKind::Failed,
+                    generation: None,
+                    compensated: false,
+                    error: Some("status read failed: boom".to_string()),
+                },
+            )],
+            vec![(slot(1), Some(GenerationId::new("pre-1".to_string())))],
+        );
+        let remaining = terminal.remaining_changes(&intent).expect("Degraded");
+        assert_eq!(
+            remaining.get(&slot(1)),
+            Some(&Observation::Unknown(ObservationError {
+                message: "status read failed: boom".to_string(),
+            })),
+            "an advance-unknown slot whose post-mutation observation failed is a remaining \
+             change carrying the Unknown observation — never classified as unchanged"
+        );
+    }
+
+    // THE PROPERTY: STATUS-READ FAILURE AT EVERY POST-MUTATION POINT.
+    // For arbitrary slot sets, inject a FAILED observation (Unknown) at
+    // every post-mutation point (every slot's status read fails) and assert
+    // that the uncertainty REMAINS Unknown (the observation is the Unknown
+    // variant with the error) and is NEVER CLASSIFIED AS UNCHANGED (the
+    // consumers — the observed record, the terminal disposition, the
+    // remaining_changes derivation — must not treat the failed observation
+    // as KnownAbsent/unchanged). Bounded 16 cases, fixed seed 0x5EED_5EED.
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn status_read_failure_at_every_post_mutation_point_remains_unknown_never_unchanged(
+            slots in prop::collection::btree_set(slot_strategy(), 1..4),
+            err_msg in prop::sample::select(vec![
+                "status read failed: boom".to_string(),
+                "assignment read failed: boom".to_string(),
+            ]),
+        ) {
+            // Every slot's post-mutation status read fails: the wire carries
+            // `generation: None` + preserved error, which the domain reads as
+            // `Unknown(error)` — never as KnownAbsent/unchanged.
+            let results: Vec<(SlotId, SlotResult)> = slots
+                .iter()
+                .map(|sid| {
+                    (
+                        sid.clone(),
+                        SlotResult {
+                            slot_id: sid.clone(),
+                            outcome: SlotOutcomeKind::Failed,
+                            generation: None,
+                            compensated: false,
+                            error: Some(err_msg.clone()),
+                        },
+                    )
+                })
+                .collect();
+            let pre_push: Vec<(SlotId, Option<GenerationId>)> = slots
+                .iter()
+                .map(|sid| (sid.clone(), Some(GenerationId::new(format!("pre-{}", sid.as_str())))))
+                .collect();
+            let (intent, terminal) = degraded_terminal_with(results, pre_push);
+
+            // The terminal's per-slot outcomes preserve Unknown for every slot.
+            for sid in &slots {
+                let outcome = terminal.outcomes().get(sid).expect("every slot has an outcome");
+                assert_eq!(
+                    outcome.observation,
+                    Observation::Unknown(ObservationError {
+                        message: err_msg.clone(),
+                    }),
+                    "slot {sid}: the failed post-mutation observation must remain Unknown with the preserved error"
+                );
+                assert_eq!(
+                    outcome.transition,
+                    SlotTransition::AdvanceUnknown,
+                    "a failed uncompensated outcome is AdvanceUnknown"
+                );
+            }
+
+            // The remaining_changes derivation NEVER classifies Unknown as
+            // unchanged: every Unknown slot IS a remaining change carrying
+            // the Unknown observation.
+            let remaining = terminal.remaining_changes(&intent).expect("Degraded");
+            for sid in &slots {
+                assert_eq!(
+                    remaining.get(sid),
+                    Some(&Observation::Unknown(ObservationError {
+                        message: err_msg.clone(),
+                    })),
+                    "slot {sid}: Unknown is uncertain — never classified as unchanged, so it is a remaining change"
+                );
+            }
+            assert_eq!(
+                remaining.len(),
+                slots.len(),
+                "every failed observation is a remaining change"
+            );
+
+            // The wire round-trip preserves Unknown: the observation error
+            // survives the wire's single error field and reads back as
+            // Unknown, never as KnownAbsent.
+            for sid in &slots {
+                let outcome = terminal.outcomes().get(sid).unwrap();
+                let wire = SlotResult::from_outcome(sid, outcome);
+                assert_eq!(wire.generation, None);
+                assert_eq!(wire.error, Some(err_msg.clone()));
+                let back = SlotOutcome::from_wire(wire);
+                assert_eq!(
+                    back.observation,
+                    Observation::Unknown(ObservationError {
+                        message: err_msg.clone(),
+                    }),
+                );
+            }
+        }
     }
 }

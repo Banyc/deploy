@@ -25,9 +25,10 @@ use crate::push::server::{
 use crate::push::staging::{StagingCleanup, cleanup_dry_run_staging, remove_tree_restoring_write};
 use crate::records::{
     BehaviorIndex, DeploymentIntent, DeploymentPlan, DeploymentStatus, DesiredGeneration,
-    IntentSlot, LedgerIntentReport, LedgerTerminal, NonEmptySlotTable, ObservedSlot,
-    PreviousGeneration, SlotAttemptState, SlotOutcome, SlotOutcomeKind, SlotPlan, SlotResult,
-    SlotTable, TerminalDisposition,
+    IntentSlot, LedgerIntentReport, LedgerTerminal, NonEmptySlotTable, Observation,
+    ObservationError, ObservedGeneration, ObservedSlot, ObservedState, PreviousGeneration,
+    SlotAttemptState, SlotOutcome, SlotOutcomeKind, SlotPlan, SlotResult, SlotTable,
+    TerminalDisposition,
 };
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
 use crate::remote::transport::Remote;
@@ -1027,9 +1028,11 @@ fn push_inner(
                     observed_servers.insert(
                         slot_id.clone(),
                         ObservedSlot {
-                            generation: Some(asn.generation_id.clone()),
-                            artifact: Some(asn.artifact.clone()),
-                            last_deployment: Some(asn.deployment_id.clone()),
+                            observation: Observation::Known(ObservedState {
+                                generation: asn.generation_id.clone(),
+                                artifact: asn.artifact.clone(),
+                                last_deployment: asn.deployment_id.clone(),
+                            }),
                         },
                     );
                 }
@@ -1518,50 +1521,91 @@ fn push_inner(
     // `actual_servers` reflects each slot's *real* final state, read from the
     // remote generation it currently points at, rather than the desired plan
     // values. Failed/skipped/restored slots therefore report their actual
-    // artifact instead of the desired one.
+    // artifact instead of the desired one. The per-slot THREE-STATE
+    // OBSERVATION (the wire-shaped `actual_servers` keeps the current on-disk
+    // shape — generation only — so the observation's `Unknown` half lives in
+    // the parallel `actual_observations` map) feeds the never-advanced
+    // outcomes below: a FAILED post-mutation status read is `Unknown(error)`,
+    // never a `None` that downstream code reads as "unchanged".
     let mut actual_servers: BTreeMap<SlotId, SlotAttemptState> = BTreeMap::new();
+    let mut actual_observations: BTreeMap<SlotId, Observation<ObservedGeneration>> =
+        BTreeMap::new();
     for a in &assignments {
         let sid = &a.placement_slot;
         let helper = &helpers[sid];
-        let final_gen = helper.status().ok().and_then(|s| s.current_generation);
-        let actual = match final_gen {
-            Some(g) => match helper.read_assignment(g.as_str()) {
-                Ok(asn) => SlotAttemptState {
-                    artifact: asn.artifact.clone(),
-                    generation: Some(g),
+        let status = helper.status();
+        let (actual, observation) = match status {
+            Ok(s) => match s.current_generation {
+                Some(g) => match helper.read_assignment(g.as_str()) {
+                    Ok(asn) => (
+                        SlotAttemptState {
+                            artifact: asn.artifact.clone(),
+                            generation: Some(g.clone()),
+                        },
+                        Observation::Known(ObservedGeneration {
+                            generation: g.clone(),
+                        }),
+                    ),
+                    Err(e) => (
+                        SlotAttemptState {
+                            artifact: unknown_artifact(),
+                            generation: Some(g.clone()),
+                        },
+                        Observation::Unknown(ObservationError {
+                            message: format!("assignment read failed: {e}"),
+                        }),
+                    ),
                 },
-                Err(_) => {
-                    // The generation is observed (`g`), but its assignment could
-                    // not be read. Never substitute the planned (desired)
-                    // artifact for a failed observation: preserve the observed
-                    // generation and mark the assignment unknown rather than
-                    // fabricating desired state.
+                None => (
                     SlotAttemptState {
-                        artifact: unknown_artifact(),
-                        generation: Some(g),
-                    }
-                }
+                        artifact: a.artifact.clone(),
+                        generation: None,
+                    },
+                    Observation::KnownAbsent,
+                ),
             },
-            None => SlotAttemptState {
-                artifact: a.artifact.clone(),
-                generation: None,
-            },
+            Err(e) => (
+                SlotAttemptState {
+                    artifact: a.artifact.clone(),
+                    generation: None,
+                },
+                Observation::Unknown(ObservationError {
+                    message: format!("status read failed: {e}"),
+                }),
+            ),
         };
         actual_servers.insert(sid.clone(), actual);
+        actual_observations.insert(sid.clone(), observation);
     }
     // A pre-swap failure (never advanced) records the ACTUAL observed
-    // generation — the outcome's generation field is the observed post-state
-    // the remaining-changes derivation compares against pre_push, never the
+    // post-state — the outcome's observation is the observed post-state the
+    // remaining-changes derivation compares against pre_push, never the
     // desired generation. The post-mutation status read above reflects the
     // true state: the slot never advanced, so it is still on its pre-push
-    // generation (or `None` when the read fails — the state is unknown, and
-    // an unknown state is not evidence of a change). Skipped outcomes
-    // already record the reconciled current assignment.
+    // generation. A FAILED read is `Unknown(error)` — the state is unknown,
+    // and an unknown state is NOT evidence of no change: the wire records
+    // `generation: None` with the observation error preserved (the wire →
+    // domain conversion reads that back as `Unknown`, never as "unchanged").
+    // A successful read showing no state is `KnownAbsent` (no error — a
+    // `None` generation with an error would read back as `Unknown`). Skipped
+    // outcomes already record the reconciled current assignment.
     for sid in &never_advanced {
         if let Some(r) = results.get_mut(sid)
             && r.outcome == SlotOutcomeKind::Failed
         {
-            r.generation = actual_servers.get(sid).and_then(|a| a.generation.clone());
+            match actual_observations.get(sid) {
+                Some(Observation::Known(og)) => {
+                    r.generation = Some(og.generation.clone());
+                }
+                Some(Observation::Unknown(e)) => {
+                    r.generation = None;
+                    r.error = Some(e.message.clone());
+                }
+                Some(Observation::KnownAbsent) | None => {
+                    r.generation = None;
+                    r.error = None;
+                }
+            }
         }
     }
     // `desired` (each slot's minted generation for its planned artifact, as a
@@ -1747,7 +1791,9 @@ fn push_inner(
     // assignment's OWN deployment id — the deployment that actually created
     // the live generation — and, when the live assignment cannot be read,
     // carries its PRIOR physical observed record over verbatim (never
-    // fabricated, never re-stamped).
+    // fabricated, never re-stamped). A FAILED status read is NEVER carried
+    // over as "unchanged": the observation is `Unknown(error)` — the slot
+    // may have changed; the failure just means we cannot see it.
     let mut observed_warnings: Vec<String> = Vec::new();
     let mut observed_servers: BTreeMap<SlotId, ObservedSlot> = BTreeMap::new();
     for (slot, _sdef) in &members {
@@ -1758,33 +1804,61 @@ fn push_inner(
         // `process_server`, so this read reflects the true post-mutation
         // state: the new generation for an advanced slot, the PRIOR
         // generation for a skipped/unreachable one.
-        let live = helpers[&slot_id]
-            .status()
-            .ok()
-            .and_then(|s| s.current_generation)
-            .and_then(|g| helpers[&slot_id].read_assignment(g.as_str()).ok());
-        match live {
-            Some(asn) => {
+        let status = helpers[&slot_id].status();
+        match status {
+            Ok(s) => match s.current_generation {
+                Some(g) => match helpers[&slot_id].read_assignment(g.as_str()) {
+                    Ok(asn) => {
+                        observed_servers.insert(
+                            slot_id.clone(),
+                            ObservedSlot {
+                                observation: Observation::Known(ObservedState {
+                                    generation: asn.generation_id.clone(),
+                                    artifact: asn.artifact.clone(),
+                                    last_deployment: asn.deployment_id.clone(),
+                                }),
+                            },
+                        );
+                    }
+                    Err(_) => {
+                        // The generation is observed but its assignment
+                        // cannot be read (missing/corrupt): carry the slot's
+                        // PRIOR PHYSICAL observed record over VERBATIM, so
+                        // the projection never fabricates state this push did
+                        // not establish and never re-stamps a deployment that
+                        // did not touch the slot. A slot with no prior record
+                        // stays absent.
+                        if let Ok(Some(prior_server)) = store.read_slot_observed(&slot_id) {
+                            observed_servers.insert(slot_id.clone(), prior_server);
+                        }
+                    }
+                },
+                None => {
+                    // The read succeeded showing no state: the slot has no
+                    // observed state (never deployed) — keep it absent (no
+                    // prior record to carry, and an explicit KnownAbsent
+                    // would fabricate an entry for a slot never observed).
+                    // A slot with a prior record that is now absent would be
+                    // handled by carrying that prior record, but a
+                    // never-deployed slot stays absent.
+                    if let Ok(Some(prior_server)) = store.read_slot_observed(&slot_id) {
+                        observed_servers.insert(slot_id.clone(), prior_server);
+                    }
+                }
+            },
+            Err(e) => {
+                // THE OBSERVATION FAILED: a failed status read is NOT
+                // evidence of no change — the slot may have changed; the
+                // failure just means we cannot see it. Record `Unknown(error)`
+                // (never the prior record, which would claim "unchanged").
                 observed_servers.insert(
                     slot_id.clone(),
                     ObservedSlot {
-                        generation: Some(asn.generation_id.clone()),
-                        artifact: Some(asn.artifact.clone()),
-                        last_deployment: Some(asn.deployment_id.clone()),
+                        observation: Observation::Unknown(ObservationError {
+                            message: format!("status read failed: {e}"),
+                        }),
                     },
                 );
-            }
-            None => {
-                // No readable live assignment (the server was never deployed,
-                // or its status/assignment read failed — the
-                // pre-swap-unreachable slot): carry the slot's PRIOR PHYSICAL
-                // observed record over VERBATIM, so the projection never
-                // fabricates state this push did not establish and never
-                // re-stamps a deployment that did not touch the slot. A slot
-                // with no prior record and no live assignment stays absent.
-                if let Ok(Some(prior_server)) = store.read_slot_observed(&slot_id) {
-                    observed_servers.insert(slot_id.clone(), prior_server);
-                }
             }
         }
     }
@@ -4320,8 +4394,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         // Observed still reflects the successful push.
         let observed = h.store.read_observed("t1", &h.config).unwrap();
+        let Observation::Known(obs_state) = &observed.slots[&SlotId::new("p1")].observation else {
+            panic!("observed p1 must be a successful read");
+        };
         assert_eq!(
-            observed.slots[&SlotId::new("p1")].generation,
+            Some(obs_state.generation.clone()),
             r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")].generation
         );
     }
@@ -4504,8 +4581,11 @@ interval_seconds = 0
             "no new terminal event may be appended to the first deployment"
         );
         let observed = h.store.read_observed("t1", &h.config).unwrap();
+        let Observation::Known(obs_state) = &observed.slots[&SlotId::new("p1")].observation else {
+            panic!("observed p1 must be a successful read");
+        };
         assert_eq!(
-            observed.slots[&SlotId::new("p1")].generation.as_ref(),
+            Some(&obs_state.generation),
             Some(&assignment.generation_id),
             "observed.json must be unchanged"
         );
@@ -4808,8 +4888,11 @@ interval_seconds = 0
         // create.
         let observed = h.store.read_observed("t1", &h.config).unwrap();
         let os = &observed.slots[&SlotId::new("p1")];
-        assert_eq!(os.generation, Some(prior_gen.clone()));
-        let oa = os.artifact.as_ref().expect("observed artifact");
+        let Observation::Known(obs_state) = &os.observation else {
+            panic!("observed p1 must be a successful read");
+        };
+        assert_eq!(obs_state.generation, prior_gen.clone());
+        let oa = &obs_state.artifact;
         assert_eq!(
             oa.tree, prior_tree,
             "observed tree must be the restored prior tree"
@@ -4825,8 +4908,8 @@ interval_seconds = 0
             "observed must NOT reflect the desired (failed) v2 tree"
         );
         assert_eq!(
-            os.last_deployment,
-            Some(id1.clone()),
+            obs_state.last_deployment,
+            id1.clone(),
             "observed last_deployment must be the LIVE assignment's OWN minting deployment \
              (id1), not the failed attempt id2"
         );
@@ -4836,7 +4919,10 @@ interval_seconds = 0
             server_state
                 .last_observed
                 .as_ref()
-                .and_then(|o| o.generation.clone()),
+                .and_then(|o| match &o.observation {
+                    Observation::Known(s) => Some(s.generation.clone()),
+                    _ => None,
+                }),
             Some(prior_gen.clone())
         );
 
@@ -5492,8 +5578,12 @@ interval_seconds = 0
         );
         assert_eq!(h.store.read_attempts("t1").unwrap().len(), 1);
         assert_eq!(h.store.read_snapshots("t1").unwrap().len(), 1);
+        let observed = h.store.read_observed("t1", &h.config).unwrap();
+        let Observation::Known(obs_state) = &observed.slots[&SlotId::new("p1")].observation else {
+            panic!("observed p1 must be a successful read");
+        };
         assert_eq!(
-            h.store.read_observed("t1", &h.config).unwrap().slots[&SlotId::new("p1")].generation,
+            Some(obs_state.generation.clone()),
             Some(s0_gen),
             "observed state untouched by the dry run"
         );
@@ -5867,8 +5957,11 @@ interval_seconds = 0
         // did not leave live.
         let observed = h.store.read_observed("t1", &h.config).unwrap();
         let os = &observed.slots[&SlotId::new("p1")];
-        assert_eq!(os.generation, Some(prior_gen.clone()));
-        let oa = os.artifact.as_ref().expect("observed artifact");
+        let Observation::Known(obs_state) = &os.observation else {
+            panic!("observed p1 must be a successful read");
+        };
+        assert_eq!(obs_state.generation, prior_gen.clone());
+        let oa = &obs_state.artifact;
         assert_eq!(
             oa.tree, prior_tree,
             "observed tree must be the restored prior tree"
@@ -5884,8 +5977,8 @@ interval_seconds = 0
             "observed must NOT reflect the desired (failed) v2 tree"
         );
         assert_eq!(
-            os.last_deployment,
-            Some(id1.clone()),
+            obs_state.last_deployment,
+            id1.clone(),
             "observed last_deployment must be the LIVE assignment's OWN minting deployment \
              (id1), not the failed attempt id2"
         );
@@ -5997,11 +6090,11 @@ interval_seconds = 0
         );
         let observed = h.store.read_observed("t1", &h.config).unwrap();
         let os = &observed.slots[&SlotId::new("p1")];
-        assert_eq!(os.generation, Some(prior_gen.clone()));
-        assert_eq!(
-            os.artifact.as_ref().expect("observed artifact").tree,
-            prior_tree
-        );
+        let Observation::Known(obs_state) = &os.observation else {
+            panic!("observed p1 must be a successful read");
+        };
+        assert_eq!(obs_state.generation, prior_gen.clone());
+        assert_eq!(obs_state.artifact.tree, prior_tree);
     }
 
     // ---- First-deploy activation failure, preflight outcomes, observed

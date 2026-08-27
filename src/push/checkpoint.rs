@@ -455,8 +455,8 @@ mod tests {
     };
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
-        NonEmptySlotTable, ObservedSlot, Pins, SlotOutcomeKind, SlotResult, SlotTable,
-        TerminalDisposition,
+        NonEmptySlotTable, Observation, ObservedSlot, ObservedState, Pins, SlotOutcomeKind,
+        SlotResult, SlotTable, TerminalDisposition,
     };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -1464,13 +1464,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .write_slot_observed(
                 &SlotId::new("s-obs".to_string()),
                 &ObservedSlot {
-                    generation: None,
-                    artifact: Some(ArtifactRef {
-                        release: obs_rel.clone(),
-                        variant: VariantName::new("standard".to_string()),
-                        tree: test_tree_digest(PROPERTY_TREES[0]),
+                    observation: Observation::Known(ObservedState {
+                        generation: test_generation_id("gen-obs"),
+                        artifact: ArtifactRef {
+                            release: obs_rel.clone(),
+                            variant: VariantName::new("standard".to_string()),
+                            tree: test_tree_digest(PROPERTY_TREES[0]),
+                        },
+                        last_deployment: test_deployment_id(&format!("dep-t1-{at}")),
                     }),
-                    last_deployment: Some(test_deployment_id(&format!("dep-t1-{at}"))),
                 },
             )
             .unwrap();

@@ -61,7 +61,7 @@ use crate::error::{Error, Result};
 // reachability scan) and the preview side's `LedgerEntry` (the override
 // carries parsed entries) are both live imports — keep both.
 use crate::model::{DeploymentId, ReleaseId};
-use crate::records::{LedgerEntry, TerminalDisposition};
+use crate::records::{LedgerEntry, Observation, TerminalDisposition};
 use crate::store::atomic::{path_state, write_atomic_replace};
 use crate::store::gc::SweepStageStats;
 use crate::store::local::LocalStore;
@@ -382,12 +382,12 @@ impl LocalStore {
                 }
             }
             for slot in observed.values() {
-                if let Some(d) = &slot.last_deployment {
-                    out.deployments.insert(d.as_str().to_string());
-                }
-                if let Some(a) = &slot.artifact {
-                    out.releases.insert(a.release.as_str().to_string());
-                    out.trees.insert(a.tree.as_str().to_string());
+                if let Observation::Known(state) = &slot.observation {
+                    out.deployments
+                        .insert(state.last_deployment.as_str().to_string());
+                    out.releases
+                        .insert(state.artifact.release.as_str().to_string());
+                    out.trees.insert(state.artifact.tree.as_str().to_string());
                 }
             }
         }

@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::init::{InitOptions, init_project};
 use crate::model::DeploymentId;
 use crate::push::engine::{PushOptions, PushReport, push};
-use crate::records::{DeploymentStatus, LedgerEntry, ObservedTarget};
+use crate::records::{DeploymentStatus, LedgerEntry, Observation, ObservedTarget};
 use crate::remote::create_remote;
 use crate::remote::transport::Remote;
 use crate::store::local::LocalStore;
@@ -450,25 +450,34 @@ where
 
 /// Render `deploy status <target>` output: one line per observed slot with
 /// the generation, release, variant, and tree AS OBSERVED ON THE SERVER right
-/// now (never from local history). A slot with no known assignment renders
-/// `None` on every column; a known generation with an unreadable assignment
-/// renders the generation while the artifact columns stay `None`. The CLI
-/// prints exactly these lines; the unit test asserts on them directly because
-/// lib unit tests cannot capture the harness-owned stdout sink.
+/// now (never from local history). A slot with no observed state
+/// (`KnownAbsent`) renders `None` on every column; a FAILED observation
+/// (`Unknown`) renders `None` on every column with the preserved error
+/// appended — an unknown observation is never rendered as if the slot were
+/// unchanged. The CLI prints exactly these lines; the unit test asserts on
+/// them directly because lib unit tests cannot capture the harness-owned
+/// stdout sink.
 fn render_status(observed: &ObservedTarget) -> Vec<String> {
     observed
         .slots
         .iter()
-        .map(|(slot_id, srv)| {
-            let artifact = srv.artifact.as_ref();
-            format!(
+        .map(|(slot_id, srv)| match &srv.observation {
+            Observation::Known(state) => format!(
                 "{}  generation={:?} release={:?} variant={:?} tree={:?}",
                 slot_id,
-                srv.generation,
-                artifact.map(|a| &a.release),
-                artifact.map(|a| &a.variant),
-                artifact.map(|a| &a.tree),
-            )
+                Some(state.generation.clone()),
+                Some(state.artifact.release.clone()),
+                Some(state.artifact.variant.clone()),
+                Some(state.artifact.tree.clone()),
+            ),
+            Observation::KnownAbsent => format!(
+                "{}  generation=None release=None variant=None tree=None",
+                slot_id,
+            ),
+            Observation::Unknown(e) => format!(
+                "{}  generation=None release=None variant=None tree=None (observation failed: {})",
+                slot_id, e.message,
+            ),
         })
         .collect()
 }
@@ -890,13 +899,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .write_slot_observed(
                 &SlotId::new("p1".to_string()),
                 &ObservedSlot {
-                    generation: Some(test_generation_id("gen-41da")),
-                    artifact: Some(crate::model::ArtifactRef {
-                        release: ReleaseId::new("rel-sha256-status".to_string()),
-                        variant: VariantName::new("standard".to_string()),
-                        tree: test_tree_digest("tree-2c4f"),
+                    observation: Observation::Known(crate::records::ObservedState {
+                        generation: test_generation_id("gen-41da"),
+                        artifact: crate::model::ArtifactRef {
+                            release: ReleaseId::new("rel-sha256-status".to_string()),
+                            variant: VariantName::new("standard".to_string()),
+                            tree: test_tree_digest("tree-2c4f"),
+                        },
+                        last_deployment: test_deployment_id("deploy-status-1"),
                     }),
-                    last_deployment: Some(test_deployment_id("deploy-status-1")),
                 },
             )
             .unwrap();
@@ -904,9 +915,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .write_slot_observed(
                 &SlotId::new("p2".to_string()),
                 &ObservedSlot {
-                    generation: None,
-                    artifact: None,
-                    last_deployment: None,
+                    observation: Observation::KnownAbsent,
                 },
             )
             .unwrap();
@@ -914,9 +923,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .write_slot_observed(
                 &SlotId::new("p3".to_string()),
                 &ObservedSlot {
-                    generation: Some(test_generation_id("gen-9f00")),
-                    artifact: None,
-                    last_deployment: None,
+                    observation: Observation::Unknown(crate::records::ObservationError {
+                        message: "assignment read failed: boom".to_string(),
+                    }),
                 },
             )
             .unwrap();
@@ -959,21 +968,23 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             p1.contains(test_tree_digest("tree-2c4f").as_str()),
             "tree digest rendered: {p1}"
         );
-        // p2: an entirely unknown assignment renders as None on every column.
+        // p2: a slot with no observed state (KnownAbsent) renders as None on
+        // every column.
         assert_eq!(
             lines[1],
             "p2  generation=None release=None variant=None tree=None"
         );
-        // p3: a known generation with an unknown artifact renders the
-        // generation but None on the artifact columns.
+        // p3: a FAILED observation (Unknown) renders None on every column
+        // with the preserved error appended — an unknown observation is never
+        // rendered as if the slot were unchanged.
         assert!(
-            lines[2].contains(test_generation_id("gen-9f00").as_str()),
+            lines[2].contains("generation=None release=None variant=None tree=None"),
             "p3 line: {}",
             lines[2]
         );
         assert!(
-            lines[2].contains("release=None variant=None tree=None"),
-            "generation-only slot must keep the artifact columns None: {}",
+            lines[2].contains("observation failed: assignment read failed: boom"),
+            "the preserved observation error must be rendered: {}",
             lines[2]
         );
 

@@ -15,8 +15,8 @@ use crate::error::{Error, Result};
 use crate::history;
 use crate::model::{GenerationId, OperationId, SlotId};
 use crate::records::{
-    DeploymentIntent, LedgerTerminal, SlotOutcome, SlotOutcomeKind, SlotTable, SlotTransition,
-    TerminalDisposition,
+    DeploymentIntent, LedgerTerminal, Observation, ObservedGeneration, SlotOutcome,
+    SlotOutcomeKind, SlotTable, SlotTransition, TerminalDisposition,
 };
 use crate::remote::helper::RemoteHelper;
 use crate::store::local::LocalStore;
@@ -254,7 +254,9 @@ fn append_degraded(
                 sid.clone(),
                 SlotOutcome {
                     outcome: SlotOutcomeKind::Failed,
-                    generation: Some(slot.desired.generation.clone()),
+                    observation: Observation::Known(ObservedGeneration {
+                        generation: slot.desired.generation.clone(),
+                    }),
                     compensated: false,
                     error: None,
                     transition: SlotTransition::AdvanceUnknown,
