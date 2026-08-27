@@ -45,15 +45,17 @@
 //! slot declarations (each variant's `[[slots]]` canonicalized and sorted by
 //! slot id), and every declared variant's tree binding.
 //!
-//! The module is organized by feature: [`domain`] is THE CONFIG CORE — the
-//! raw wire shapes ([`raw`]), the validated [`ProjectConfig`] graph record,
+//! The module is organized by feature. [`domain`] is THE CONFIG CORE — a
+//! directory of single-concern modules: the serialization shapes ([`raw`] —
+//! the raw wire shapes, re-exported here — and the artifact-mapping leaf
+//! types + path/mode helpers), the validated [`ProjectConfig`] graph record,
 //! the total-fail-closed raw -> domain conversion, the derived slot/target
-//! resolution views, the validated mutation / graph-rebuild operations, the
-//! artifact-mapping leaf types + path/mode helpers, and the config test
-//! suite. The per-surface policy leaf modules ([`pins`], [`slots`],
-//! [`rollout`], [`retention`], [`activation`], [`verification`],
-//! [`servers`], [`capacity`], [`release_name`]) remain degree-2 siblings:
-//! each is a distinct, independently-validated config surface.
+//! resolution views, the validated mutation / graph-rebuild operations, and
+//! the config test suite. The per-surface policy leaf modules ([`pins`],
+//! [`slots`], [`rollout`], [`retention`], [`activation`], [`verification`],
+//! [`servers`], [`capacity`], [`release_name`]) are grouped under the
+//! [`policies`] directory and re-exported at their original paths: each is a
+//! distinct, independently-validated config surface.
 //!
 //! The crate-facing surface is re-exported here: `crate::config::Pin`,
 //! `crate::config::ProjectConfig`, `crate::config::raw::RawConfig`, ...
@@ -61,17 +63,12 @@
 //! `src/config.rs`.
 
 pub(crate) use domain::raw;
+pub(crate) use policies::{
+    activation, capacity, pins, release_name, retention, rollout, servers, slots, verification,
+};
 
-mod activation;
-mod capacity;
 mod domain;
-mod pins;
-mod release_name;
-mod retention;
-mod rollout;
-mod servers;
-mod slots;
-mod verification;
+mod policies;
 
 pub use activation::{Activation, ActivationConfig, ActivationScope, SystemdActivation, UnitDef};
 pub use capacity::CapacityConfig;
