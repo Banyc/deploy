@@ -1,32 +1,32 @@
 //! Deployment semantics (A1): the push transaction, its reference grammar,
 //! and the per-slot rollout machinery.
 //!
-//! Six cohesive feature modules (the ~25-module phase split was over-grained;
-//! related features are grouped under one module where maintenance makes sense):
+//! The area is nested RECURSIVELY: the three big feature modules became
+//! group directories whose related sub-modules are grouped again at the next
+//! level, down to single-concern leaves. The area-root re-export globs keep
+//! every former submodule path compiling:
 //!
-//! * [`push`] — THE PUSH OPERATION: the push spine (`push` / `push_inner`, the
-//!   numbered steps) plus the preflight phases, execute phases, commit phases,
-//!   the up-to-date no-op path, and the dry-run mode (the former `preflight`,
-//!   `execute`, `commit`, `noop`, `dryrun` modules).
-//! * [`plan`] — PLANNING: `plan_assignments` plus every pre-mutation semantic:
-//!   slot selection, the direct-release membership gate, capacity preflight,
-//!   staging lifecycle, partial-rollout guards, exact-rollback verification,
-//!   and the behavior-coverage gate (the former `selection`, `groups`,
-//!   `capacity`, `staging`, `partial_rollout`, `exact_rollback`, `coverage`
-//!   modules).
-//! * [`rollout`] — EXECUTION SEMANTICS: the batch loop, failure policies,
-//!   result/status/disposition shaping, compensation, and the per-server
-//!   pipeline (the former `batching`, `failure`, `results`, `status`,
-//!   `compensation`, `server` modules).
+//! * [`push`] — THE PUSH OPERATION, nested by phase: the spine
+//!   (`push` / `push_inner`, the numbered steps, report assembly) in
+//!   `push/mod.rs`, plus `execute`, `commit`, `noop`, `dryrun` and the
+//!   multi-phase [`push::preflight`] group (`gate`, `locks`, `remotes`,
+//!   `capacity`, `intent`).
+//! * [`plan`] — PLANNING, nested by concern: the planner core in
+//!   `plan/mod.rs`, plus `selection`, `groups`, the [`plan::preflight`]
+//!   pair (`capacity`, `staging`) and the [`plan::guards`] gates
+//!   (`partial_rollout`, `exact_rollback`, `coverage`).
+//! * [`rollout`] — EXECUTION SEMANTICS, nested by concern: the batch loop in
+//!   `rollout/mod.rs`, the [`rollout::attempt`] outcome derivation
+//!   (`failure`, `results`, `status`) and the [`rollout::server`] per-server
+//!   pipeline (`server`, `compensation`).
 //! * [`refs`] — the push reference GRAMMAR (pure, store-free).
 //! * [`maintenance`] — post-commit maintenance (step-17 retention loop,
 //!   deferred-retention retry, pending-sweep retry, observed refresh).
 //! * [`lock`] — the deployment lock.
 //!
-//! The area-root re-export globs keep every former submodule path compiling:
-//! items that lived in the merged-away modules are nameable at the area root
-//! (`crate::deploy::push::run_preflight`, `crate::deploy::plan::capacity_fits`,
-//! `crate::deploy::rollout::process_server`, …).
+//! Every directory's `mod.rs` re-exports its sub-modules' items, so the
+//! pre-nesting paths keep resolving (`crate::deploy::push::run_preflight`,
+//! `crate::deploy::plan::capacity_fits`, `crate::deploy::rollout::process_server`, …).
 
 pub mod lock;
 pub mod maintenance;
