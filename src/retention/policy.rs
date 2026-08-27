@@ -1,31 +1,13 @@
-//! Retention: the slot-owned mark-and-sweep policy and pass.
-//!
-//! Retention is evaluated per server. For each server, the retained content set
-//! is the union of:
-//! * the artifact referenced by the current generation
-//! * the prior distinct successful artifact when `protect_previous` is true
-//! * artifacts referenced by incomplete transactions
-//! * artifacts or releases selected by durable pins
-//! * the newest `keep_distinct_artifacts` distinct successful artifact bindings
-//! * artifacts successfully activated less than `keep_days` ago
-//! * that server's artifacts in the newest `protect_deployments` deployment window
-//!
-//! A slot has EXACTLY ONE retention policy, owned by the slot itself: the
-//! policy of the slot's OWNING VARIANT (the variant file whose `[[slots]]`
-//! entry declares the slot). A slot may be a member of SEVERAL targets (the
-//! multi-target feature) but its state is shared — one physical observed
-//! record, one retention policy — and targets are only selection views over
-//! that slot state. There is NO per-target policy and NO union across member
-//! targets: the caller resolves the slot's single policy from its owning
-//! variant (`ProjectConfig::slot_retention`) and passes it here; every generation
-//! record on the server is evaluated under that one policy, so changing a
-//! slot's target membership never changes what is retained.
-//!
-//! Retention is a mark-and-sweep operation: a tree object is deleted only when no
-//! retained binding or applicable pin references it.
+//! The slot-owned retention policy semantics (feature area A4): the retained-set
+//! computation [`compute_retained`] under the slot's ONE owning-variant policy
+//! (`per_server` `keep_distinct_artifacts` / `keep_days` / `protect_previous`,
+//! `deployment` `protect_deployments`), evaluated against every generation
+//! record on the server. Pin honoring lives in [`super::pins`]; the durable
+//! pins are expanded into the retained set by
+//! [`LocalStore::expand_retention_pins`].
 
 use crate::config::{Pin, RetentionConfig};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::layout;
 use crate::model::TreeDigest;
 use crate::remote::helper::{RemoteHelper, RemoteStatus};
@@ -105,36 +87,11 @@ pub fn compute_retained(
     // Durable pins. A pin protects the whole release: every variant's tree
     // recorded in the release record is retained, so the pinned release stays
     // fully rollback-able no matter how old it is or how far outside the
-    // count/age windows it falls.
-    //
-    // FAIL CLOSED — the receiver-side mirror of the pusher-side GC anchor
-    // semantics ([`LocalStore::honor_release_pin`]): a pin that names a
-    // release with NO record on disk, or whose record cannot be read or
-    // identity-verified, is an INTEGRITY error (see [`LocalStore::read_release`],
-    // which recomputes-and-verifies the record's identity from its own content
-    // and binds it to the requested release id). An un-honorable pin means the
-    // retained set cannot expand the content the pin protects, so it is
-    // INCOMPLETE — retention must ABORT BEFORE ANY DELETION, never treat the
-    // pin as absent and sweep the trees it protects. The retention caller
-    // converts the abort into the retention-debt machinery (a durable marker +
-    // warning, post-commit maintenance): the next push retries retention once
-    // the pinned release is repaired.
-    for pin in pins {
-        // The pin's release is the TYPED [`crate::model::ReleaseId`]: it was
-        // validated when the config was loaded, so this can never be a late
-        // release-id syntax error.
-        let rid = pin.release.clone();
-        let rec = store.read_release(&rid).map_err(|e| {
-            Error::integrity(format!(
-                "pin names release {rid} whose record cannot be read or verified ({e}): \
-                 the pin cannot be honored, so the retained set is incomplete — aborting \
-                 retention before any tree deletion"
-            ))
-        })?;
-        for tree in rec.variants.values() {
-            retained.insert(tree.clone());
-        }
-    }
+    // count/age windows it falls. FAIL CLOSED: an un-honorable pin (a release
+    // with no record on disk, or a record that cannot be read or
+    // identity-verified) is an INTEGRITY error that aborts retention BEFORE
+    // ANY DELETION — the honoring logic lives in [`super::pins`].
+    store.expand_retention_pins(&mut retained, pins)?;
 
     Ok(retained)
 }
@@ -233,6 +190,7 @@ pub fn retained_summary(retained: &HashSet<String>) -> Vec<TreeDigest> {
 mod tests {
     use super::*;
     use crate::config::{ProjectConfig, SlotConfig};
+    use crate::error::Error;
     use crate::layout;
     use crate::model::{
         RELEASE_RECORD_SCHEMA_VERSION, ReleaseId, ReleaseRecord, SlotId, TreeDigest, VariantName,
