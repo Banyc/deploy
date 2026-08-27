@@ -190,7 +190,7 @@ reported explicitly, including partial states like `degraded`.",
   deploy push production @-            # roll back to the previous deployment\n\
   deploy push production 'parent(@, 3)'  # roll back 3 deployments\n\
   deploy push production deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b  # roll back to that deployment's stored state\n\
-  deploy push production release:rel-sha256-2fda63a950  # DIRECT release deploy to this target (cross-target; no history needed)"
+  deploy push production release:rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1  # DIRECT release deploy to this target (cross-target; no history needed)"
     )]
     Push {
         target: String,
@@ -1337,6 +1337,103 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         ] {
             assert!(push_help.contains(needle), "push help missing {needle:?}");
         }
+    }
+
+    /// Every CONCRETE `deploy push` example in the documentation must parse
+    /// with the REAL ref parser — the docs cannot contradict the strict
+    /// grammar. The corpora are README.md and requirement.md (read via
+    /// `CARGO_MANIFEST_DIR`, the same precedent as
+    /// `tests/readme_quickstart.rs`) plus the `push` subcommand's own RENDERED
+    /// long help (exercised as rendered, not duplicated). A line is an example
+    /// iff it starts with `deploy push` (after indentation); everything from
+    /// the FIRST `#` is a shell comment (no valid ref contains `#`); the ref
+    /// token is the token after the target — flags like `--dry-run` /
+    /// `--group <name>` are not refs, and a bare `deploy push <target>` is the
+    /// default HEAD push; a quoted ref (`'parent(@, 3)'`) is unquoted the way
+    /// a shell would before parsing.
+    #[test]
+    fn documented_deploy_push_examples_parse() {
+        use crate::revset::parse_ref_expr;
+
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let readme = std::fs::read_to_string(format!("{manifest}/README.md"))
+            .expect("README.md must be readable via CARGO_MANIFEST_DIR");
+        let requirement = std::fs::read_to_string(format!("{manifest}/requirement.md"))
+            .expect("requirement.md must be readable via CARGO_MANIFEST_DIR");
+        let mut push_cmd = Cli::command();
+        let push_help = push_cmd
+            .find_subcommand_mut("push")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        let corpora: [(&str, &str); 3] = [
+            ("README.md", &readme),
+            ("requirement.md", &requirement),
+            ("deploy push --help", &push_help),
+        ];
+
+        let mut extracted = 0;
+        let mut skipped_placeholders = 0;
+        for (source, text) in corpora {
+            for (line_no, raw) in text.lines().enumerate() {
+                let line = raw.trim();
+                if !line.starts_with("deploy push") {
+                    continue;
+                }
+                let loc = format!("{source}:{}", line_no + 1);
+                // Everything from the first '#' is a shell comment — no valid
+                // ref contains '#', so the example is the code before it.
+                let code = line.split('#').next().unwrap().trim();
+                let mut toks = code.split_whitespace();
+                assert_eq!(toks.next(), Some("deploy"), "{loc}: malformed example");
+                assert_eq!(toks.next(), Some("push"), "{loc}: malformed example");
+                let _target = toks.next().expect("{loc}: missing target");
+                let mut ref_spec = toks.collect::<Vec<_>>().join(" ");
+                if ref_spec.is_empty() || ref_spec.starts_with("--") {
+                    // Flags (--dry-run, --group <name>) are not refs; a bare
+                    // `deploy push <target>` is the default HEAD push.
+                    ref_spec.clear();
+                } else {
+                    // Strip one surrounding pair of shell quotes, exactly as a
+                    // shell would before the token reaches the parser.
+                    let len = ref_spec.len();
+                    if len >= 2 {
+                        let b = ref_spec.as_bytes();
+                        if (b[0] == b'\'' && b[len - 1] == b'\'')
+                            || (b[0] == b'"' && b[len - 1] == b'"')
+                        {
+                            ref_spec = ref_spec[1..len - 1].to_string();
+                        }
+                    }
+                    // A `<...>` placeholder is not a concrete example and must
+                    // not parse; after the canonical-id fixes none should
+                    // remain in the example corpus, so skipping is a guarded
+                    // escape hatch that the final assert proves unused.
+                    if ref_spec.contains('<') || ref_spec.contains('>') {
+                        skipped_placeholders += 1;
+                        continue;
+                    }
+                }
+                extracted += 1;
+                if let Err(e) = parse_ref_expr(&ref_spec) {
+                    panic!(
+                        "{loc}: documented example contradicts the strict ref parser: \
+                         parse_ref_expr({ref_spec:?}) failed: {e}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            skipped_placeholders, 0,
+            "documented `<...>` placeholder examples must not remain: every `deploy push` line \
+             must be a concrete, parseable example"
+        );
+        // A floor on the extracted count guards against a refactor silently
+        // dropping the documentation out of the test's reach.
+        assert!(
+            extracted >= 30,
+            "expected >= 30 documented examples, extracted {extracted}"
+        );
     }
 
     // -------------------------------------------------------------------

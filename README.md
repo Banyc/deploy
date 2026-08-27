@@ -122,7 +122,7 @@ deploy push production 'parent(@, 3)'    # three deployments back from the lates
 # target capable (release:<id>; the refid forms below are snapshot ancestry).
 # The target's CURRENT slot membership must exactly match the slot set the
 # release froze for it; a drifted membership is rejected before remote access.
-deploy push production release:rel-sha256-41da2f63a950
+deploy push production release:rel-sha256-41da2f63a950c8494c3c0f1663cf15aacf35b209293b36d3d5c59f8f022805f1
 # deployment-id refs resolve to EXACT stored states, then step N ancestors
 # (N = 0 is the deployment itself; positions are DERIVED from the log order):
 deploy push production deploy-0190a1b2-3c4d-7e6f-8a9b-0c1d2e3f4a5b  # EXACT stored state of that deployment
