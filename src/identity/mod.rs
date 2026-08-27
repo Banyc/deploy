@@ -3,23 +3,22 @@
 //! The deployment core is deliberately ignorant of application semantics. It
 //! understands only filesystem entries, mappings, trees, artifacts, variants,
 //! releases, targets, and activation adapters. Every identity-bearing value
-//! lives in this area, one module per identity family:
+//! lives in this area, three modules:
 //!
-//! * [`release_id`] — [`ReleaseId`]: EXACT `rel-sha256-<64 lowercase hex>`;
-//!   bare/`rel-` forms rejected at the domain boundary (the CLI accepts a
-//!   bare 64-hex digest, converted first).
-//! * [`ids`] — [`DeploymentId`]/[`GenerationId`]/[`OperationId`]:
-//!   `deploy-`/`gen-`/`op-` + canonical hyphenated UUIDv7 (version nibble
-//!   enforced; v4 rejected).
-//! * [`digests`] — [`TreeDigest`]/[`ReleaseDigest`]: exactly 64 lowercase
-//!   hex.
-//! * [`segments`] — the segment identities [`SlotId`], [`ServerId`],
-//!   [`TargetName`], [`VariantName`]: a single safe path segment.
-//! * [`scalars`] — the validated scalar value types: [`Identifier`],
-//!   [`ApplicationStoreKey`], [`BatchSize`] (nonzero u64),
+//! * [`identity`] — THE IDENTITY TYPES (one cohesive feature, split into
+//!   sections): the release id ([`ReleaseId`]: EXACT
+//!   `rel-sha256-<64 lowercase hex>`; bare/`rel-` forms rejected at the
+//!   domain boundary — the CLI accepts a bare 64-hex digest, converted
+//!   first), the event ids ([`DeploymentId`]/[`GenerationId`]/
+//!   [`OperationId`]: `deploy-`/`gen-`/`op-` + canonical hyphenated UUIDv7,
+//!   version nibble enforced; v4 rejected), the digests
+//!   ([`TreeDigest`]/[`ReleaseDigest`]: exactly 64 lowercase hex), the
+//!   segment ids ([`SlotId`], [`ServerId`], [`TargetName`], [`VariantName`]:
+//!   a single safe path segment), and the validated scalars
+//!   ([`Identifier`], [`ApplicationStoreKey`], [`BatchSize`] (nonzero u64),
 //!   [`CapacityPercent`] (0..=100), [`AbsoluteDeployDir`] (absolute,
-//!   traversal-free), [`BehaviorDigest`], [`Timestamp`], [`RolloutGroupName`],
-//!   [`Host`], [`SshUser`].
+//!   traversal-free), [`BehaviorDigest`], [`Timestamp`],
+//!   [`RolloutGroupName`], [`Host`], [`SshUser`]).
 //! * [`payload`] — the release identity payload ([`CanonicalReleasePayload`]:
 //!   name-sorted mapping digest + behavior digest + slot-declaration digest +
 //!   variant→tree bindings; capacity excluded, slots ARE identity) and the
@@ -39,21 +38,18 @@
 //! `Deserialize` impls route every wire string through the same validation
 //! (an invalid wire identity fails deserialization — fail closed).
 
-mod digests;
-mod ids;
+// The identity-types module: the regroup spec names the file `identity.rs`
+// (the module of the identity types inside the identity area), so
+// `mod identity;` inside `src/identity/mod.rs` is intentionally
+// same-named — clippy::module_inception is suppressed deliberately.
+#[allow(clippy::module_inception)]
+mod identity;
 mod payload;
 mod proofs;
-mod release_id;
-mod scalars;
-mod segments;
 
-pub use digests::*;
-pub use ids::*;
+pub use identity::*;
 pub use payload::*;
 pub(crate) use proofs::*;
-pub use release_id::*;
-pub use scalars::*;
-pub use segments::*;
 
 /// The validated identity newtype: construction goes through [`parse`]
 /// (or `FromStr`/`TryFrom`), which enforces the type's format rule, and the

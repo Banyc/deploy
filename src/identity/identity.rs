@@ -1,36 +1,325 @@
-//! Validated scalar value types.
+//! THE IDENTITY TYPES — one cohesive feature: the validated identity and
+//! value types that name releases, events, digests, segments, and scalars.
 //!
-//! The domain model carries a set of small values whose validity is part of
-//! their meaning: an identifier must be a non-empty name, a behavior digest
-//! must be a sha256 digest, an on-server `deploy_dir` must be an absolute
-//! TRAVERSAL-FREE path with at least one normal component below the root,
-//! a batch size must be nonzero, a capacity percent
-//! must fit 0..=100, and a recorded timestamp must parse as RFC 3339. The
-//! application name is ONE safe identifier ([`ApplicationStoreKey`]): a
-//! single normal filesystem component used for BOTH display (messages and
-//! rendering) and storage (the one filesystem component that names the
-//! local store directory). Each
-//! such value is
-//! wrapped in a NEWTYPE whose CONSTRUCTION validates the invariant (a
-//! private inner value, reachable only through [`parse`]-style constructors
-//! and read-only accessors) — an invalid value cannot be constructed, so the
-//! domain never has to re-check what it holds.
+//! * Release ids ([`ReleaseId`]): EXACTLY `rel-sha256-<64 lowercase hex>`;
+//!   the loose bare-digest and `rel-` forms are rejected at the domain
+//!   boundary (the CLI accepts a bare 64-hex digest, converted first via
+//!   [`crate::cli::parse_release_input`]).
+//! * Deployment/generation/operation ids ([`DeploymentId`]/
+//!   [`GenerationId`]/[`OperationId`]): `deploy-`/`gen-`/`op-` + a canonical
+//!   hyphenated UUIDv7 (version nibble enforced; v4 rejected).
+//! * Digests ([`TreeDigest`]/[`ReleaseDigest`]): exactly 64 lowercase hex.
+//! * Segment ids ([`SlotId`], [`ServerId`], [`TargetName`], [`VariantName`]):
+//!   a single safe path segment.
+//! * Scalars ([`Identifier`], [`ApplicationStoreKey`], [`BatchSize`],
+//!   [`CapacityPercent`], [`AbsoluteDeployDir`], [`BehaviorDigest`],
+//!   [`Timestamp`], [`RolloutGroupName`], [`Host`], [`SshUser`]): the
+//!   validated scalar value types.
 //!
-//! The raw/wire layers keep the bare forms (strings, integers, paths) and
-//! the raw -> domain / wire -> domain conversions (in `crate::config` and
-//! `crate::ledger`) parse them into these scalars, REJECTING invalid input
-//! with a config/integrity error (fail closed). A scalar is deliberately NOT
-//! introduced for a plain string that carries no invariant ("do not overdo
-//! one-line wrappers when they carry no invariant") — only the fields below
-//! get a type.
+//! Deployment, operation, and generation IDs are opaque collision-resistant
+//! IDs (UUIDv7 in schema version 1). They identify events and are never used
+//! as content identity.
+//!
+//! Identities deliberately carry NO `Default` (an empty identity would be a
+//! malformed durable record constructible by anyone — the exact gap this
+//! hardening closes). An identity can only be built through the validated
+//! [`parse`]-style constructors (`parse` / `FromStr` / `TryFrom`); the serde
+//! `Deserialize` impls route every wire string through the same validation
+//! (an invalid wire identity fails deserialization — fail closed).
 
+use super::id_newtype;
+use crate::error::{Error, Result};
+use jiff::Timestamp as JiffTimestamp;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
+use uuid::Uuid;
 
-use jiff::Timestamp as JiffTimestamp;
+// ---- release ids ----
 
-use crate::error::{Error, Result};
+/// Release identifier: EXACTLY `rel-sha256-<64 lowercase hex>` — the canonical
+/// form [`ReleaseId::from_digest`] produces. The loose bare-digest and `rel-`
+/// forms are REJECTED at the domain boundary: a `ReleaseId` can only be built
+/// through the validated [`ReleaseId::parse`] (or `FromStr`/`TryFrom`/
+/// `from_digest`), so a malformed release id can never exist in a durable
+/// record. The CLI accepts a bare 64-hex digest as an input convenience via
+/// [`crate::cli::parse_release_input`], which converts it to the full form
+/// BEFORE the domain parse.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct ReleaseId(String);
+
+impl ReleaseId {
+    /// UNCHECKED constructor — TEST FIXTURES ONLY (mirrors the
+    /// [`id_newtype!`] contract). Production code must construct through
+    /// [`ReleaseId::parse`] (or `FromStr`/`TryFrom`/`from_digest`), so an
+    /// invalid release id can never be built outside tests.
+    #[cfg(test)]
+    pub fn new(s: impl Into<String>) -> Self {
+        ReleaseId(s.into())
+    }
+    pub fn from_digest(d: &ReleaseDigest) -> Self {
+        ReleaseId(format!("rel-sha256-{}", d.as_str()))
+    }
+    /// Validate `s` against the EXACT `rel-sha256-<64 lowercase hex>` rule
+    /// and construct the identity. The loose bare-digest and `rel-` forms
+    /// are rejected HERE, at the domain boundary.
+    pub fn parse(s: &str) -> Result<ReleaseId> {
+        if let Some(rest) = s.strip_prefix("rel-sha256-")
+            && valid_hex_digest(rest)
+        {
+            return Ok(ReleaseId(s.to_string()));
+        }
+        Err(Error::config(format!("invalid ReleaseId value {:?}", s)))
+    }
+    pub fn digest(&self) -> ReleaseDigest {
+        ReleaseDigest::from_validated_string(self.0.trim_start_matches("rel-sha256-").to_string())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ReleaseId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for ReleaseId {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<ReleaseId> {
+        ReleaseId::parse(s)
+    }
+}
+
+impl TryFrom<&str> for ReleaseId {
+    type Error = Error;
+    fn try_from(s: &str) -> Result<ReleaseId> {
+        ReleaseId::parse(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReleaseId {
+    /// Wire strings go through the validated parse: an invalid wire release
+    /// id fails deserialization (fail closed — a record that carries a
+    /// malformed release id is never silently accepted).
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        ReleaseId::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A deterministic canonical `rel-sha256-<64-hex>` release id derived from a
+/// tag (the canonical form [`ReleaseId::from_digest`] produces — the only
+/// form the strict [`ReleaseId::parse`] accepts).
+#[cfg(test)]
+pub(crate) fn test_release_id(tag: &str) -> ReleaseId {
+    ReleaseId::from_digest(
+        &ReleaseDigest::parse(&test_sha256_hex(tag)).expect("canonical test digest"),
+    )
+}
+
+// ---- deployment/generation/operation ids ----
+
+fn new_uuid_v7() -> String {
+    Uuid::now_v7().to_string()
+}
+
+/// A valid `deploy-`/`gen-`/`op-` prefixed UUIDv7 identity: the exact form
+/// [`new_uuid_v7`] produces (a canonical hyphenated UUIDv7 string). The
+/// hyphenated shape is required (the generator never emits the simple form)
+/// and the version nibble is enforced (v7 only), so a hand-written v4 UUID or
+/// any other malformed suffix is rejected.
+fn valid_uuid_v7_id(s: &str, prefix: &str) -> bool {
+    let Some(rest) = s.strip_prefix(prefix) else {
+        return false;
+    };
+    let b = rest.as_bytes();
+    b.len() == 36
+        && b[8] == b'-'
+        && b[13] == b'-'
+        && b[18] == b'-'
+        && b[23] == b'-'
+        && Uuid::parse_str(rest)
+            .map(|u| u.get_version() == Some(uuid::Version::SortRand))
+            .unwrap_or(false)
+}
+
+fn valid_deployment_id(s: &str) -> bool {
+    valid_uuid_v7_id(s, "deploy-")
+}
+
+fn valid_generation_id(s: &str) -> bool {
+    valid_uuid_v7_id(s, "gen-")
+}
+
+fn valid_operation_id(s: &str) -> bool {
+    valid_uuid_v7_id(s, "op-")
+}
+
+id_newtype!(
+    DeploymentId,
+    valid_deployment_id,
+    "A deployment identity: `deploy-<uuid-v7>` (the exact form \
+     [`DeploymentId::generate`] produces)."
+);
+id_newtype!(
+    GenerationId,
+    valid_generation_id,
+    "A generation identity: `gen-<uuid-v7>` (the exact form \
+     [`GenerationId::generate`] produces)."
+);
+id_newtype!(
+    OperationId,
+    valid_operation_id,
+    "An operation identity: `op-<uuid-v7>` (the exact form \
+     [`OperationId::generate`] produces)."
+);
+
+impl DeploymentId {
+    pub fn generate() -> Self {
+        DeploymentId(format!("deploy-{}", new_uuid_v7()))
+    }
+}
+
+impl GenerationId {
+    pub fn generate() -> Self {
+        GenerationId(format!("gen-{}", new_uuid_v7()))
+    }
+}
+
+impl OperationId {
+    pub fn generate() -> Self {
+        OperationId(format!("op-{}", new_uuid_v7()))
+    }
+}
+
+/// Deterministic canonical test identities: fixtures that ROUND-TRIP through
+/// the wire (ledger/observed records) must carry format-valid ids, so these
+/// helpers derive a canonical `deploy-<uuid-v7>` / `gen-<uuid-v7>` /
+/// `op-<uuid-v7>` / 64-hex-digest from a fixture tag. Deterministic per tag:
+/// the same tag yields the same id everywhere, so a fixture can write and
+/// assert the same value.
+#[cfg(test)]
+pub(crate) fn test_uuid_v7(tag: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    tag.hash(&mut h);
+    let r = h.finish();
+    let mut bytes = [0u8; 16];
+    // Fixed 48-bit timestamp (2024-01-01T00:00:00Z ≈ 0x018F_0000_0000 ms).
+    let ts: u64 = 0x018F_0000_0000;
+    bytes[0..6].copy_from_slice(&ts.to_be_bytes()[2..8]);
+    // Version 7 nibble + rand_a (12 bits) from the tag hash.
+    bytes[6] = 0x70 | ((r >> 8) & 0x0F) as u8;
+    bytes[7] = (r & 0xFF) as u8;
+    // Variant 10 + rand_b (58 bits) from the tag hash.
+    bytes[8] = 0x80 | ((r >> 56) & 0x3F) as u8;
+    bytes[9..16].copy_from_slice(&r.to_be_bytes()[1..8]);
+    Uuid::from_bytes(bytes).to_string()
+}
+
+#[cfg(test)]
+pub(crate) fn test_deployment_id(tag: &str) -> DeploymentId {
+    DeploymentId::parse(&format!("deploy-{}", test_uuid_v7(tag))).expect("canonical test id")
+}
+
+#[cfg(test)]
+pub(crate) fn test_generation_id(tag: &str) -> GenerationId {
+    GenerationId::parse(&format!("gen-{}", test_uuid_v7(tag))).expect("canonical test id")
+}
+
+#[cfg(test)]
+pub(crate) fn test_operation_id(tag: &str) -> OperationId {
+    OperationId::parse(&format!("op-{}", test_uuid_v7(tag))).expect("canonical test id")
+}
+
+// ---- digests ----
+
+/// A valid sha256 digest: exactly 64 lowercase hex characters (the exact form
+/// [`crate::digest::sha256_bytes`] produces). Any other string — empty, short,
+/// long, uppercase, non-hex, or prefixed — is rejected.
+pub(crate) fn valid_hex_digest(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+id_newtype!(
+    ReleaseDigest,
+    valid_hex_digest,
+    "A release digest: exactly 64 lowercase hex characters (sha256) — the \
+     exact form [`crate::digest::sha256_bytes`] produces."
+);
+
+id_newtype!(
+    TreeDigest,
+    valid_hex_digest,
+    "A tree digest: exactly 64 lowercase hex characters (sha256) — the exact \
+     form [`crate::digest::sha256_bytes`] produces."
+);
+
+impl ReleaseDigest {
+    /// Raw constructor from an ALREADY-VALIDATED digest string — identity
+    /// internal only: [`ReleaseId::digest`]
+    /// rebuilds the digest from a string stripped off a valid release id
+    /// (which is, by construction, exactly 64 lowercase hex). Production
+    /// code must construct through the validated [`parse`].
+    pub(crate) fn from_validated_string(s: String) -> Self {
+        ReleaseDigest(s)
+    }
+}
+
+/// A deterministic 64-lowercase-hex sha256 digest derived from a tag.
+#[cfg(test)]
+pub(crate) fn test_sha256_hex(tag: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    tag.hash(&mut h);
+    let r = h.finish();
+    let mut h2 = std::collections::hash_map::DefaultHasher::new();
+    (tag, r).hash(&mut h2);
+    let r2 = h2.finish();
+    format!("{r:016x}{r2:016x}{r:016x}{r2:016x}")
+}
+
+#[cfg(test)]
+pub(crate) fn test_tree_digest(tag: &str) -> TreeDigest {
+    TreeDigest::parse(&test_sha256_hex(tag)).expect("canonical test digest")
+}
+
+// ---- segment ids ----
+
+id_newtype!(
+    ServerId,
+    valid_name,
+    "A server identity: a single safe path segment (non-empty, no path \
+     separators or traversal components, no surrounding whitespace or control \
+     characters) — the shared segment rule from [`crate::identity`]."
+);
+id_newtype!(
+    SlotId,
+    valid_name,
+    "A slot identity: a single safe path segment (the shared \
+     segment rule from [`crate::identity`])."
+);
+id_newtype!(
+    TargetName,
+    valid_name,
+    "A target name: a single safe path segment (the shared segment rule \
+     from [`crate::identity`])."
+);
+id_newtype!(
+    VariantName,
+    valid_name,
+    "A variant name: a single safe path segment (the shared segment rule \
+     from [`crate::identity`])."
+);
+
+// ---- scalars ----
 
 /// A valid 64-lowercase-hex sha256 digest, shared by test fixtures that need
 /// a well-formed behavior digest.
@@ -39,7 +328,7 @@ pub(crate) const DIGEST_TEST_HEX_1: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// The name rule shared by the identifier-like scalars AND the identity
-/// newtypes in [`crate::identity::segments`] (ServerId, SlotId, TargetName,
+/// newtypes in this module (ServerId, SlotId, TargetName,
 /// VariantName): non-empty after trimming, no surrounding
 /// whitespace (a name is exactly what was written, never silently trimmed),
 /// no control characters, and no path separators or traversal components — a
@@ -418,6 +707,7 @@ impl FromStr for Timestamp {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::remote::transport::LocalTransport;
     use crate::store::local::{LocalStore, default_base};
@@ -425,6 +715,322 @@ mod tests {
     use proptest::test_runner::RngSeed;
 
     const DIGEST: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    #[test]
+    fn release_id_round_trip() {
+        let d = "7b278acf5041d50a9704392ac9fac4c6c02ca2cf3be9e5aee61668c8070526d2";
+        let rid = ReleaseId::from_digest(&ReleaseDigest::parse(d).expect("64 hex parses"));
+        assert_eq!(rid.as_str(), format!("rel-sha256-{d}"));
+        assert_eq!(
+            rid,
+            ReleaseId::from_digest(&ReleaseDigest::parse(d).expect("64 hex parses"))
+        );
+    }
+
+    #[test]
+    fn newtypes_parse_and_eq() {
+        let a = test_tree_digest("a");
+        let b = test_tree_digest("b");
+        assert_eq!(a, a);
+        assert_ne!(a, b);
+        assert_eq!(
+            test_generation_id("x").as_str(),
+            format!("gen-{}", test_uuid_v7("x"))
+        );
+    }
+
+    /// The canonical format of each uuid-v7 identity parses; every invalid
+    /// class (empty, bare prefix, wrong prefix, malformed uuid, v4 uuid,
+    /// padding, trailing junk) is rejected.
+    #[test]
+    fn uuid_v7_ids_accept_canonical_reject_invalid() {
+        let dep = test_deployment_id("ok");
+        assert_eq!(DeploymentId::parse(dep.as_str()).expect("canonical"), dep);
+        let gid = test_generation_id("ok");
+        assert_eq!(GenerationId::parse(gid.as_str()).expect("canonical"), gid);
+        let op = test_operation_id("ok");
+        assert_eq!(OperationId::parse(op.as_str()).expect("canonical"), op);
+        for bad in [
+            "",
+            "deploy-",
+            "gen-",
+            "op-",
+            "deploy",
+            "deploy-0192a3b4c5d6e7f8a9b0c1d2e3f4a5b6", // simple form, no hyphens
+            "deploy-0192a3b4-c5d6-4e7f-8a9b-0c1d2e3f4a5b6", // v4
+            "deploy-0192a3b4-c5d6-7e7f-8a9b-0c1d2e3f4a5b6 ", // trailing space
+            " deploy-0192a3b4-c5d6-7e7f-8a9b-0c1d2e3f4a5b6", // leading space
+            "deploy-0192a3b4-c5d6-7e7f-8a9b-0c1d2e3f4a5b6x", // trailing junk
+            "deploy-0192a3b4-c5d6-7e7f-8a9b-0c1d2e3f4a5", // too short
+            "deploy-0192a3b4-c5d6-7e7f-8a9b-0c1d2e3f4a5b6-7", // too long
+        ] {
+            DeploymentId::parse(bad).expect_err("invalid deployment id rejected");
+            GenerationId::parse(bad).expect_err("invalid generation id rejected");
+            OperationId::parse(bad).expect_err("invalid operation id rejected");
+        }
+        // A valid uuid under the WRONG prefix is rejected for that type.
+        let u = test_uuid_v7("x");
+        DeploymentId::parse(&format!("gen-{u}")).expect_err("wrong prefix rejected");
+        GenerationId::parse(&format!("deploy-{u}")).expect_err("wrong prefix rejected");
+        OperationId::parse(&format!("deploy-{u}")).expect_err("wrong prefix rejected");
+    }
+
+    /// Wire strings go through the validated parse: an invalid wire identity
+    /// fails deserialization, a valid one round-trips.
+    #[test]
+    fn deserialize_validates_wire_strings() {
+        let dep = test_deployment_id("wire");
+        let json = serde_json::to_string(&dep).expect("serializes");
+        assert_eq!(
+            serde_json::from_str::<DeploymentId>(&json).expect("valid wire parses"),
+            dep
+        );
+        for bad in [
+            "\"\"",
+            "\"deploy-1\"",
+            "\"gen-0192a3b4-c5d6-7e7f-8a9b-0c1d2e3f4a5b6\"",
+            "\"p1/..\"",
+        ] {
+            serde_json::from_str::<DeploymentId>(bad).expect_err("invalid wire rejected");
+        }
+        serde_json::from_str::<SlotId>("\"p1\"").expect("valid slot wire parses");
+        serde_json::from_str::<SlotId>("\"../x\"").expect_err("traversal wire rejected");
+        serde_json::from_str::<TreeDigest>(&format!("\"{DIGEST}\""))
+            .expect("valid digest wire parses");
+        serde_json::from_str::<TreeDigest>("\"t1\"").expect_err("short digest wire rejected");
+    }
+
+    // -------------------------------------------------------------------
+    // THE IDENTITY PROPERTY: over ARBITRARY strings (empty, whitespace,
+    // separators, wrong prefixes, wrong hex, unicode, control characters),
+    // each identity's parse accepts EXACTLY its format-valid values and
+    // rejects everything else, and a wire string that fails the parse fails
+    // deserialization. Bounded 16 cases, fixed seed 0x5EED_5EED per house
+    // style.
+    // -------------------------------------------------------------------
+
+    /// The independent characterization of the uuid-v7 id rule: the exact
+    /// canonical hyphenated UUIDv7 shape under the prefix.
+    fn is_valid_uuid_v7_id(s: &str, prefix: &str) -> bool {
+        let Some(rest) = s.strip_prefix(prefix) else {
+            return false;
+        };
+        let b = rest.as_bytes();
+        b.len() == 36
+            && b[8] == b'-'
+            && b[13] == b'-'
+            && b[18] == b'-'
+            && b[23] == b'-'
+            && b[14] == b'7'
+            && matches!(b[19], b'8' | b'9' | b'a' | b'b')
+            && b.iter()
+                .enumerate()
+                .all(|(i, c)| matches!(i, 8 | 13 | 18 | 23) || c.is_ascii_hexdigit())
+    }
+
+    fn is_valid_hex_digest(s: &str) -> bool {
+        s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    fn is_safe_segment(s: &str) -> bool {
+        !s.is_empty()
+            && s.trim() == s
+            && !s.chars().any(|c| c.is_control())
+            && !s.contains('/')
+            && !s.contains('\\')
+            && s != "."
+            && s != ".."
+    }
+
+    /// Arbitrary identity strings covering every invalid class: empty,
+    /// whitespace, separators, wrong prefixes, malformed uuids, wrong hex,
+    /// unicode, control characters, and clean canonical values.
+    fn arbitrary_identity_text() -> impl Strategy<Value = String> {
+        let u = test_uuid_v7("prop");
+        prop_oneof![
+            prop::sample::select(vec![
+                String::new(),
+                " ".to_string(),
+                "deploy-".to_string(),
+                "gen-".to_string(),
+                "op-".to_string(),
+                "deploy".to_string(),
+                format!("deploy-{u}"),
+                format!("gen-{u}"),
+                format!("op-{u}"),
+                format!("deploy-{}", u.to_uppercase()),
+                "deploy-0192a3b4c5d6e7f8a9b0c1d2e3f4a5b6".to_string(),
+                "deploy-0192a3b4-c5d6-4e7f-8a9b-0c1d2e3f4a5b6".to_string(),
+                "deploy-0192a3b4-c5d6-7e7f-8a9b-0c1d2e3f4a5b6 ".to_string(),
+                " deploy-0192a3b4-c5d6-7e7f-8a9b-0c1d2e3f4a5b6".to_string(),
+                "deploy-0192a3b4-c5d6-7e7f-8a9b-0c1d2e3f4a5b6x".to_string(),
+                "t1".to_string(),
+                "tree-1".to_string(),
+                "abc123".to_string(),
+                DIGEST.to_string(),
+                format!("sha256-{DIGEST}"),
+                DIGEST.to_uppercase(),
+                "p1".to_string(),
+                "s1".to_string(),
+                "standard".to_string(),
+                "a/b".to_string(),
+                "a\\b".to_string(),
+                "..".to_string(),
+                ".".to_string(),
+                "../x".to_string(),
+                " x".to_string(),
+                "x ".to_string(),
+                "\u{0}".to_string(),
+                "a\nb".to_string(),
+                "α".to_string(),
+            ]),
+            prop::collection::vec(prop::char::any(), 0..48).prop_map(|v| v.into_iter().collect()),
+        ]
+    }
+
+    proptest! {
+        // THE PROPERTY: each identity's parse accepts EXACTLY its
+        // format-valid values — every invalid class (empty, whitespace,
+        // separators, wrong prefixes, wrong hex, unicode, control chars) is
+        // rejected, every canonical value is accepted — and a wire string
+        // that fails the parse fails deserialization. Bounded 16 cases,
+        // fixed seed 0x5EED_5EED (house style), no failure persistence.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn identity_parses_accept_exactly_format_valid_values(s in arbitrary_identity_text()) {
+            let expected_dep = is_valid_uuid_v7_id(&s, "deploy-");
+            let expected_gen = is_valid_uuid_v7_id(&s, "gen-");
+            let expected_op = is_valid_uuid_v7_id(&s, "op-");
+            let expected_digest = is_valid_hex_digest(&s);
+            let expected_segment = is_safe_segment(&s);
+            assert_eq!(
+                DeploymentId::parse(&s).is_ok(),
+                expected_dep,
+                "DeploymentId: {s:?}"
+            );
+            assert_eq!(
+                GenerationId::parse(&s).is_ok(),
+                expected_gen,
+                "GenerationId: {s:?}"
+            );
+            assert_eq!(
+                OperationId::parse(&s).is_ok(),
+                expected_op,
+                "OperationId: {s:?}"
+            );
+            assert_eq!(
+                TreeDigest::parse(&s).is_ok(),
+                expected_digest,
+                "TreeDigest: {s:?}"
+            );
+            assert_eq!(
+                ReleaseDigest::parse(&s).is_ok(),
+                expected_digest,
+                "ReleaseDigest: {s:?}"
+            );
+            assert_eq!(
+                ServerId::parse(&s).is_ok(),
+                expected_segment,
+                "ServerId: {s:?}"
+            );
+            assert_eq!(
+                SlotId::parse(&s).is_ok(),
+                expected_segment,
+                "SlotId: {s:?}"
+            );
+            assert_eq!(
+                TargetName::parse(&s).is_ok(),
+                expected_segment,
+                "TargetName: {s:?}"
+            );
+            assert_eq!(
+                RolloutGroupName::parse(&s).is_ok(),
+                expected_segment,
+                "RolloutGroupName: {s:?}"
+            );
+            assert_eq!(
+                VariantName::parse(&s).is_ok(),
+                expected_segment,
+                "VariantName: {s:?}"
+            );
+            // A wire string that fails the parse fails deserialization.
+            let json = serde_json::to_string(&s).expect("string serializes");
+            assert_eq!(
+                serde_json::from_str::<DeploymentId>(&json).is_ok(),
+                expected_dep,
+                "DeploymentId wire: {s:?}"
+            );
+            assert_eq!(
+                serde_json::from_str::<TreeDigest>(&json).is_ok(),
+                expected_digest,
+                "TreeDigest wire: {s:?}"
+            );
+            assert_eq!(
+                serde_json::from_str::<SlotId>(&json).is_ok(),
+                expected_segment,
+                "SlotId wire: {s:?}"
+            );
+        }
+    }
+
+    /// The digest identities require exactly 64 lowercase hex characters.
+    #[test]
+    fn digests_require_64_lowercase_hex() {
+        let d = test_tree_digest("ok");
+        assert_eq!(TreeDigest::parse(d.as_str()).expect("canonical"), d);
+        assert_eq!(
+            ReleaseDigest::parse(d.as_str()).expect("canonical"),
+            ReleaseDigest::parse(d.as_str()).expect("canonical")
+        );
+        for bad in [
+            "",
+            "abc",
+            &DIGEST.to_uppercase(),
+            &format!("sha256-{DIGEST}"),
+            &format!("{DIGEST}ff"),
+            &DIGEST[..63],
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        ] {
+            TreeDigest::parse(bad).expect_err("invalid tree digest rejected");
+            ReleaseDigest::parse(bad).expect_err("invalid release digest rejected");
+        }
+    }
+
+    /// The segment identities require a single safe path segment.
+    #[test]
+    fn segment_ids_require_safe_single_segment() {
+        for ok in [
+            "p1",
+            "s1",
+            "standard",
+            "production",
+            "wave-1",
+            "α",
+            "a..b",
+            "a.b",
+        ] {
+            assert!(ServerId::parse(ok).is_ok(), "{ok:?}");
+            assert!(SlotId::parse(ok).is_ok(), "{ok:?}");
+            assert!(TargetName::parse(ok).is_ok(), "{ok:?}");
+            assert!(RolloutGroupName::parse(ok).is_ok(), "{ok:?}");
+            assert!(VariantName::parse(ok).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "", "   ", " x", "x ", "\u{0}", "a\nb", "a/b", "a\\b", ".", "..", "../x", "x/..",
+        ] {
+            ServerId::parse(bad).expect_err("invalid server id rejected");
+            SlotId::parse(bad).expect_err("invalid slot id rejected");
+            TargetName::parse(bad).expect_err("invalid target name rejected");
+            RolloutGroupName::parse(bad).expect_err("invalid group name rejected");
+            VariantName::parse(bad).expect_err("invalid variant name rejected");
+        }
+    }
 
     #[test]
     fn identifier_accepts_valid_rejects_invalid() {
@@ -592,19 +1198,6 @@ mod tests {
     // traversal-free, single-segment values and rejects everything else.
     // Bounded 16 cases, fixed seed 0x5EED_5EED per house style.
     // -------------------------------------------------------------------
-
-    /// The independent characterization of the name rule: a value is a safe
-    /// single path segment iff it is non-empty, unpadded, control-free, has
-    /// no path separator, and is not a `.`/`..` traversal component.
-    fn is_safe_segment(s: &str) -> bool {
-        !s.is_empty()
-            && s.trim() == s
-            && !s.chars().any(|c| c.is_control())
-            && !s.contains('/')
-            && !s.contains('\\')
-            && s != "."
-            && s != ".."
-    }
 
     /// Arbitrary name/path-segment values covering every traversal class:
     /// `..`, `.`, `/`, `\`, empty, whitespace, control characters, unicode,

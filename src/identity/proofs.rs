@@ -17,7 +17,7 @@
 //! replay of an already-verified proof (the record's wire -> domain
 //! conversion re-checks the plan's key-set projections on read).
 
-use super::segments::SlotId;
+use super::SlotId;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
