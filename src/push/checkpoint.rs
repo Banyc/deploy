@@ -225,32 +225,51 @@ fn checkpoint_inner(
     //    `?` is correct here: a failed replacement is a PRE-COMMIT failure
     //    and the checkpoint returns a plain `Err`.
     store.write_ledger_suffix(target, &suffix)?;
-    //
-    // ==================== THE EXPLICIT COMMIT BOUNDARY ====================
-    // `write_ledger_suffix` returned Ok: the checkpoint is IRREVERSIBLY
-    // committed — the pre-checkpoint history is gone. From this line on the
-    // checkpoint CANNOT return `Err`. Everything below — the sweep (the
-    // reachable-set scan, the directory enumeration, the deployment-dir /
-    // release / tree-object deletion stages) and the sweep-debt marker — is
-    // POST-COMMIT MAINTENANCE: every failure is converted into a report
-    // with `established: true`, `sweep_completed: false`, and a warning
-    // surfaced on the report (`sweep_warning` / `sweep_debt_warning`). The
-    // durable sweep-debt marker records the pending sweep so the NEXT PUSH
-    // (not just a re-run) recomputes reachability FRESH (no persisted
-    // deletion worklist) and finishes it.
-    //
-    // 3. Best-effort global sweep of unreachable deployments / releases /
-    //    objects — computed with the SAME override the preview used (after
-    //    the atomic replacement the on-disk ledger IS the suffix, so the
-    //    override and the current ledger agree; passing it keeps the sweep
-    //    structurally identical to the preview's calculation). The sweep's
-    //    DELETION stages are internally absorbed into `complete = false` by
-    //    `run_sweep` itself (stage faults and deletion errors); its READ
-    //    stages — the reachable-set scan and the directory enumeration —
-    //    escape `run_sweep` as `Err` and are converted HERE into a warning:
-    //    the committed ledger stands, the sweep is retry-required.
-    let (sweep, complete, sweep_failed) =
-        match store.run_sweep(config, deployment_id.as_str(), Some(&ledger_override)) {
+    // 3. POST-COMMIT MAINTENANCE: the ledger commit is irreversible, so the
+    //    sweep + debt marker run in the non-fallible [`run_post_commit_sweep`]
+    //    — never an `Err` from this point on.
+    let post = run_post_commit_sweep(store, config, deployment_id.as_str(), &ledger_override);
+    Ok(CheckpointReport {
+        target: target.to_string(),
+        deployment_id: deployment_id.clone(),
+        discards: LedgerDiscards {
+            discarded_entries,
+            ..post.discards
+        },
+        established: true,
+        sweep_completed: post.completed,
+        sweep_warning: post.warning,
+        sweep_debt_warning: post.debt_warning,
+        dry_run: false,
+    })
+}
+
+/// Post-commit maintenance after the irreversible ledger commit: the
+/// best-effort global sweep (with the SAME override the preview used) and
+/// the durable sweep-debt marker. NON-FALLIBLE BY CONSTRUCTION — returns a
+/// plain [`PostCommitSweep`], never `Result`; every failure surfaces as a
+/// warning (or `completed: false` from `run_sweep` itself), so the caller's
+/// report carries `established: true` regardless.
+struct PostCommitSweep {
+    discards: LedgerDiscards,
+    completed: bool,
+    /// A sweep failure (its READ stages) — the retry-required warning.
+    warning: Option<String>,
+    /// A sweep-debt marker write/clear failure.
+    debt_warning: Option<String>,
+}
+
+fn run_post_commit_sweep(
+    store: &LocalStore,
+    config: &ProjectConfig,
+    deployment_id: &str,
+    ledger_override: &LedgerOverride,
+) -> PostCommitSweep {
+    // The sweep's DELETION stages are absorbed into `completed = false` by
+    // `run_sweep` itself (stage faults and deletion errors); its READ stages
+    // escape as `Err` and are converted here into the retry-required warning.
+    let (discards, completed, warning) =
+        match store.run_sweep(config, deployment_id, Some(ledger_override)) {
             Ok((sweep, complete)) => (sweep, complete, None),
             Err(e) => (
                 LedgerDiscards::default(),
@@ -262,18 +281,11 @@ fn checkpoint_inner(
             ),
         };
     // The DURABLE sweep-debt marker: an incomplete OR failed sweep records
-    // retry-required so the next push (or a re-run of the same checkpoint)
-    // retries it; a COMPLETED sweep clears any stale marker a prior
-    // incomplete sweep left (this re-run just serviced it — convergence).
-    // The marker write/clear is itself non-fallible maintenance: a failure
-    // is a warning on the report, never an `Err`.
-    let debt_reason = match &sweep_failed {
-        Some(failed) => failed.clone(),
-        None => "checkpoint sweep did not complete; the next push retries it".to_string(),
-    };
-    let sweep_debt_warning = if complete {
-        // The sweep ran clean: clear the pending-sweep marker (a prior
-        // incomplete sweep left it; it is serviced now).
+    // retry-required so the NEXT PUSH recomputes reachability FRESH (no
+    // persisted deletion worklist) and finishes it; a COMPLETED sweep clears
+    // any stale marker. The write/clear is itself non-fallible maintenance:
+    // a failure is a warning on the report, never an `Err`.
+    let debt_warning = if completed {
         match store.write_sweep_debt(None) {
             Ok(()) => None,
             Err(e) => Some(format!(
@@ -281,26 +293,23 @@ fn checkpoint_inner(
             )),
         }
     } else {
-        match store.write_sweep_debt(Some(&debt_reason)) {
+        let reason = match &warning {
+            Some(failed) => failed.clone(),
+            None => "checkpoint sweep did not complete; the next push retries it".to_string(),
+        };
+        match store.write_sweep_debt(Some(&reason)) {
             Ok(()) => None,
             Err(e) => Some(format!(
                 "sweep debt maintenance deferred: failed to write sweep debt: {e}"
             )),
         }
     };
-    Ok(CheckpointReport {
-        target: target.to_string(),
-        deployment_id: deployment_id.clone(),
-        discards: LedgerDiscards {
-            discarded_entries,
-            ..sweep
-        },
-        established: true,
-        sweep_completed: complete,
-        sweep_warning: sweep_failed,
-        sweep_debt_warning,
-        dry_run: false,
-    })
+    PostCommitSweep {
+        discards,
+        completed,
+        warning,
+        debt_warning,
+    }
 }
 
 /// The read-only preview (`--dry-run`): the same validation (successful
