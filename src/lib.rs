@@ -5,6 +5,7 @@
 pub mod adapter;
 pub mod cli;
 pub mod config;
+pub(crate) mod deploy;
 pub mod digest;
 pub mod error;
 pub mod history;
