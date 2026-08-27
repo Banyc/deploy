@@ -5,7 +5,7 @@
 //!
 //! * RECEIVER side (every server's deployment root): swept by ROTATION. The
 //!   slot's single owning-variant retention policy computes the retained
-//!   digest set ([`super::policy::compute_retained`]); the mark-and-sweep
+//!   digest set ([`super::compute_retained`]); the mark-and-sweep
 //!   pass ([`crate::remote::helper::RemoteHelper::rotate`]) deletes every
 //!   tree object NOT in the retained set and every abandoned incoming
 //!   directory. Generation/release/commit metadata is small and kept by
@@ -16,5 +16,5 @@
 //! (the retention-debt retry that fires the rotation on the next push) lives
 //! in [`crate::deploy`] — both owned by other passes; this module holds
 //! the retention-side contract the rotation honors. The pusher side of the
-//! two-sided sweep (checkpoint) lives in [`super::checkpoint`], and the
-//! two-sided no-leak contract tests live in [`super::sweep_tests`].
+//! two-sided sweep (checkpoint) lives in [`crate::retention::checkpoint`], and the
+//! two-sided no-leak contract tests live in [`crate::retention::sweep_tests`].

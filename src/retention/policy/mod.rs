@@ -5,6 +5,14 @@
 //! record on the server. Pin honoring lives in [`super::pins`]; the durable
 //! pins are expanded into the retained set by
 //! [`LocalStore::expand_retention_pins`].
+//!
+//! The policy group also owns the two selection concerns that feed the
+//! retained set: [`pins`] (durable pin honoring, fail closed on BOTH sweep
+//! sides) and [`rotate`] (the receiver-side rotation contract the
+//! mark-and-sweep pass honors).
+
+pub mod pins;
+pub mod rotate;
 
 use crate::config::{Pin, RetentionConfig};
 use crate::error::Result;

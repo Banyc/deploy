@@ -24,48 +24,54 @@
 //! Retention is a mark-and-sweep operation: a tree object is deleted only when no
 //! retained binding or applicable pin references it.
 //!
-//! # Modules
+//! # Modules (recursively nested by relatedness)
 //!
 //! * [`policy`] — the slot-owned retention policy semantics ([`compute_retained`]):
 //!   `per_server` (`keep_distinct_artifacts` / `keep_days` / `protect_previous`),
 //!   `deployment` (`protect_deployments`), and the retained-set computation.
-//! * [`pins`] — pin honoring, fail closed on BOTH sweep sides: the pusher-side
-//!   GC anchor semantics ([`LocalStore::honor_release_pin`]) and the
-//!   receiver-side retention pin expansion. The config/store pin types live in
-//!   [`crate::config::pins`] and the store; the honoring logic lives here.
-//! * [`gc`] — the global artifact garbage collection (moved from
-//!   `crate::store::gc`): reachability, the sweep stages, the
-//!   PLANNED-vs-REMOVED counting, and the sweep-debt interactions.
-//! * [`history_floor`] — the pusher-side ledger/history semantics (moved from
-//!   `crate::store::history_floor`): `reachable_set`,
-//!   the retained-suffix [`LedgerOverride`](history_floor::LedgerOverride), the
-//!   Unknown-observation conservatism, and the post-commit sweep.
+//!   The policy group also owns its selection concerns:
+//!   * [`policy::pins`] — pin honoring, fail closed on BOTH sweep sides: the
+//!     pusher-side GC anchor semantics ([`LocalStore::honor_release_pin`]) and the
+//!     receiver-side retention pin expansion. The config/store pin types live in
+//!     [`crate::config::pins`] and the store; the honoring logic lives here.
+//!   * [`policy::rotate`] — receiver-side rotation semantics: the mark-and-sweep
+//!     pass ([`crate::remote::helper::RemoteHelper::rotate`]) deletes every tree
+//!     object NOT in the retained set; the rotation I/O lives in
+//!     [`crate::remote::helper`].
+//! * [`reachability`] — the reachability / mark-and-sweep machinery that
+//!   computes WHAT survives and reclaims WHAT does not:
+//!   * [`reachability::gc`] — the global artifact garbage collection (moved from
+//!     `crate::store::gc`): reachability, the sweep stages, the
+//!     PLANNED-vs-REMOVED counting, and the sweep-debt interactions.
+//!   * [`reachability::history_floor`] — the pusher-side ledger/history
+//!     semantics (moved from `crate::store::history_floor`): `reachable_set`,
+//!     the retained-suffix
+//!     [`LedgerOverride`](reachability::history_floor::LedgerOverride), the
+//!     Unknown-observation conservatism, and the post-commit sweep.
 //! * [`checkpoint`] — the checkpoint command (moved from `crate::push::checkpoint`):
-//!   the retained suffix, the atomic replace, the
-//!   post-commit sweep, preview/override parity, and the post-commit warnings.
-//! * [`debt`] — the sweep-debt orchestration: when a sweep is incomplete the
-//!   durable marker is recorded so the next push retries it; a completed sweep
-//!   clears the marker. The marker I/O lives in
-//!   [`crate::store::local::LocalStore`] ([`LocalStore::read_sweep_debt`] /
-//!   [`LocalStore::write_sweep_debt`]); the orchestration lives here.
-//! * [`rotate`] — receiver-side rotation semantics: the mark-and-sweep pass
-//!   ([`crate::remote::helper::RemoteHelper::rotate`]) deletes every tree
-//!   object NOT in the retained set; the rotation I/O lives in
-//!   [`crate::remote::helper`].
+//!   the retained suffix, the atomic replace, the post-commit sweep,
+//!   preview/override parity, and the post-commit warnings. Its sweep-debt
+//!   orchestration nests with it:
+//!   * [`checkpoint::debt`] — when a sweep is incomplete the durable marker is
+//!     recorded so the next push retries it; a completed sweep clears the
+//!     marker. The marker I/O lives in
+//!     [`crate::store::local::LocalStore`] ([`LocalStore::read_sweep_debt`] /
+//!     [`LocalStore::write_sweep_debt`]); the orchestration lives here.
 //! * [`sweep_tests`] (test-only) — the two-sided sweep contract tests (moved
 //!   from `crate::sweep`): receiver retention +
 //!   pusher checkpoint independence, no-leak, and maintenance-not-correction.
 
 pub mod checkpoint;
-pub mod gc;
-pub mod history_floor;
-pub mod pins;
 pub mod policy;
-pub mod rotate;
+pub mod reachability;
 
-pub(crate) mod debt;
+// Keep the pre-nesting flat paths resolving (`crate::retention::gc::X`,
+// `crate::retention::history_floor::X`, `crate::retention::pins::X`,
+// `crate::retention::rotate::X`) for the rest of the crate.
+pub use policy::{pins, rotate};
+pub use reachability::{gc, history_floor};
+
+pub use policy::{compute_retained, retained_summary};
 
 #[cfg(test)]
 mod sweep_tests;
-
-pub use policy::{compute_retained, retained_summary};

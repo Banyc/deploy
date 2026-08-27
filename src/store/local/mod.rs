@@ -8,6 +8,16 @@
 //! [`default_base`] so callers keep the `crate::store::local::default_base`
 //! path.
 //!
+//! # Submodules (the per-feature record I/O)
+//!
+//! Each sibling module is one facet of the [`LocalStore`] as inherent
+//! `impl LocalStore` blocks: [`ledger`] (A2 target ledger), [`objects`] (A3
+//! content-addressed store + recovery), [`observed`] (slot observed state),
+//! [`deployments`] (deployment dirs), [`debt`] (sweep-debt marker I/O),
+//! [`layout`] (store layout paths), [`pins`] (durable release pins), and
+//! [`releases`] (release records). The generic atomic-write infra stays at
+//! [`crate::store::atomic`].
+//!
 //! # Test-only fault injection (per-fixture registry)
 //!
 //! Under `#[cfg(test)]` each [`LocalStore`] owns a per-fixture
@@ -22,7 +32,7 @@
 
 use crate::error::{Error, Result};
 use crate::identity::ApplicationStoreKey;
-use crate::remote::layout;
+use crate::remote::layout as remote_layout;
 use crate::store::atomic::{ensure_private_dir, set_private};
 use serde::Serialize;
 use std::io::Write;
@@ -37,7 +47,16 @@ use crate::testutil::test_faults::FaultRegistry;
 #[cfg(test)]
 use std::sync::Arc;
 
-pub(crate) use crate::store::layout::default_base;
+pub(crate) use self::layout::default_base;
+
+pub mod debt;
+pub mod deployments;
+pub mod layout;
+pub mod ledger;
+pub mod objects;
+pub mod observed;
+pub mod pins;
+pub mod releases;
 
 pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -171,8 +190,8 @@ impl LocalStore {
     /// Create a store rooted at an explicit base (used in tests).
     pub fn with_base(base: PathBuf) -> Result<LocalStore> {
         ensure_private_dir(&base)?;
-        ensure_private_dir(&base.join(layout::objects()))?;
-        ensure_private_dir(&base.join(layout::RELEASES))?;
+        ensure_private_dir(&base.join(remote_layout::objects()))?;
+        ensure_private_dir(&base.join(remote_layout::RELEASES))?;
         ensure_private_dir(&base.join("targets"))?;
         ensure_private_dir(&base.join("slots"))?;
         ensure_private_dir(&base.join("servers"))?;

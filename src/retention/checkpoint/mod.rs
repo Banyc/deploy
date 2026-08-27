@@ -2,8 +2,9 @@
 //! rest.
 //!
 //! Moved from `crate::push::checkpoint` during the encapsulation restructure;
-//! the ledger / history-floor primitives live in [`super::history_floor`] and
-//! the sweep-debt orchestration in [`super::debt`].
+//! the ledger / history-floor primitives live in
+//! [`super::reachability::history_floor`] and the sweep-debt orchestration in
+//! [`debt`].
 //!
 //! `deploy checkpoint <target> <deployment-id>` compacts the target's ONE
 //! deployment LEDGER (`targets/<target>/ledger.jsonl`) to the retained
@@ -82,10 +83,15 @@
 //! exactly what the replacement + sweep would discard.
 
 use crate::config::ProjectConfig;
+
+// The sweep-debt orchestration for the checkpoint's post-commit sweep
+// (retry-required marker / clear on completion).
+pub(crate) mod debt;
+
 use crate::deploy::lock::FileLock;
 use crate::error::Result;
 use crate::identity::{DeploymentId, OperationId};
-use crate::retention::history_floor::{LedgerDiscards, LedgerOverride};
+use crate::retention::reachability::history_floor::{LedgerDiscards, LedgerOverride};
 use crate::store::local::LocalStore;
 
 /// The outcome of one checkpoint invocation (preview or real).
@@ -289,8 +295,8 @@ fn run_post_commit_sweep(
     // persisted deletion worklist) and finishes it; a COMPLETED sweep clears
     // any stale marker. The write/clear is itself non-fallible maintenance:
     // a failure is a warning on the report, never an `Err` — the
-    // orchestration lives in [`super::debt`].
-    let debt_warning = super::debt::reconcile_sweep_debt(store, completed, &warning);
+    // orchestration lives in [`debt`].
+    let debt_warning = debt::reconcile_sweep_debt(store, completed, &warning);
     PostCommitSweep {
         discards,
         completed,

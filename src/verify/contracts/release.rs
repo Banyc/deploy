@@ -15,7 +15,7 @@
 //! [`crate::verify::release`] (including `behavior_digest`, which the
 //! integration tests reach as `deploy::verify::release::behavior_digest`).
 
-pub use crate::verify::behavior::*;
+pub use super::behavior::*;
 
 use crate::config::{Mapping, SlotConfig};
 use crate::digest::sha256_bytes;

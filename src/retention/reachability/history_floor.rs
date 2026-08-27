@@ -2,8 +2,9 @@
 //!
 //! Moved from `crate::store::history_floor` during the encapsulation
 //! restructure; the checkpoint command orchestration lives in
-//! [`super::checkpoint`], the pin honoring in [`super::pins`], and the
-//! artifact reclamation in [`super::gc`].
+//! [`crate::retention::checkpoint`], the pin honoring in
+//! [`crate::retention::pins`], and the artifact reclamation in
+//! [`super::gc`].
 //!
 //! A target's entire deployment history is ONE ordered, append-only JSONL
 //! ledger (`targets/<target>/ledger.jsonl`, see [`crate::ledger`]): each
@@ -65,9 +66,9 @@ use crate::error::{Error, Result};
 // KEEP-BOTH (merge): the gc side's `ReleaseId` (pins honored by name in the
 // reachability scan) and the preview side's `LedgerEntry` (the override
 // carries parsed entries) are both live imports — keep both.
+use super::gc::SweepStageStats;
 use crate::identity::DeploymentId;
 use crate::ledger::{LedgerEntry, Observation, TerminalDisposition};
-use crate::retention::gc::SweepStageStats;
 use crate::store::atomic::{path_state, write_atomic_replace};
 use crate::store::local::LocalStore;
 use std::collections::BTreeSet;
@@ -570,7 +571,7 @@ impl LocalStore {
     /// ([`FaultKind::SweepObjects`]) each fire at the stage's entry, so a
     /// faulted stage deletes nothing and the report says sweep
     /// retry-required. The release-record and tree-object stages are performed
-    /// by the GLOBAL ARTIFACT GC ([`crate::retention::gc::LocalStore::gc_artifacts`])
+    /// by the GLOBAL ARTIFACT GC ([`super::gc::LocalStore::gc_artifacts`])
     /// — its own faults ([`FaultKind::GcScan`] / [`FaultKind::GcDeleteReleases`]
     /// / [`FaultKind::GcDeleteTrees`]) fire inside the pass, and its
     /// per-candidate unlink faults ([`FaultKind::GcUnlinkReleases`] /

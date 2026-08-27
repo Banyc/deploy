@@ -63,7 +63,7 @@
 //! # Post-commit best-effort maintenance
 //!
 //! The GC runs as part of the checkpoint's post-commit sweep (the release /
-//! object stages of [`crate::retention::history_floor::LocalStore::run_sweep`]).
+//! object stages of [`super::history_floor::LocalStore::run_sweep`]).
 //! Its failure model is best-effort with retry-by-recompute: a GC failure
 //! NEVER deletes anything in the retained set — the run aborts (fail
 //! closed) before any unlink it cannot prove safe, the checkpoint report
@@ -95,12 +95,12 @@
 //! garbage on disk (never less), which the retry reclaims once the store is
 //! readable again.
 
+use super::history_floor::{LedgerOverride, ReachableSet};
 use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
 #[cfg(test)]
 use crate::identity::ReleaseId;
 use crate::remote::layout;
-use crate::retention::history_floor::{LedgerOverride, ReachableSet};
 use crate::store::atomic::{path_state, sync_parent_dir};
 use crate::store::local::LocalStore;
 use std::path::Path;

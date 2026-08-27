@@ -2,7 +2,10 @@
 //!
 //! The adapters that translate the canonical behavior contract into concrete
 //! host operations, plus the frozen behavior-contract and release-identity
-//! semantics that pin a release's activation/verification behavior:
+//! semantics that pin a release's activation/verification behavior. The two
+//! concerns are nested recursively: [`adapters`] owns the concrete host
+//! operations ([`command`], [`systemd`]) and [`contracts`] owns the frozen
+//! semantics ([`behavior`], [`release`]):
 //!
 //! * [`command`] — the `command` verification adapter: the configured argv is
 //!   executed directly (never through a shell) with the configured timeout,
@@ -25,7 +28,10 @@
 //! in [`crate::remote`] (`hostkey`, `helper`, `runner`) — an earlier pass
 //! owns them.
 
-pub mod behavior;
-pub mod command;
-pub mod release;
-pub mod systemd;
+pub mod adapters;
+pub mod contracts;
+
+// Keep the pre-nesting flat paths resolving (`crate::verify::command::X`,
+// `crate::verify::release::X`, ...) for the rest of the crate.
+pub use adapters::{command, systemd};
+pub use contracts::{behavior, release};
