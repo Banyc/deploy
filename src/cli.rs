@@ -630,6 +630,7 @@ mod tests {
         TerminalDisposition,
     };
     use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
 
     fn pending_attempt(id: &str) -> DeploymentIntent {
         let p1 = SlotId::new("p1".to_string());
@@ -663,7 +664,7 @@ mod tests {
     /// terminal carrying a rollback state, so `sN`/log prefixes apply). The
     /// terminal is the EXACT-EQUAL shape: one Activated outcome per slotted
     /// generation, and a rollback whose slots/bindings key the same
-    /// membership (the four-set equality is enforced by the conversion).
+    /// membership (the membership equations (outcomes == selected == full == rollback slots) are enforced by the conversion).
     fn seed_successful(store: &LocalStore, id: &str, attempted_at: &str) {
         let mut it = pending_attempt(id);
         it.attempted_at = attempted_at.to_string();
@@ -719,6 +720,11 @@ mod tests {
                         observation_error: None,
                     },
                 )])),
+                // THE EXACT-EQUAL MEMBERSHIPS: selected == full == the
+                // one-slot membership (the rollback's slots / the outcomes'
+                // keys) — the proven shape the conversion + read require.
+                selected_membership: BTreeSet::from([p1.clone()]),
+                full_membership: BTreeSet::from([p1.clone()]),
             },
             reason: Some(reason.to_string()),
         }

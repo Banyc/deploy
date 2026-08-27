@@ -1295,14 +1295,17 @@ pub type CompensationReport = SlotTable<SlotOutcome>;
 ///   rollback payload (a successful deployment always records its rollback
 ///   state — the generation refs + physical bindings, the ONE fact the
 ///   per-slot outcomes cannot express) AND its OWN per-slot outcomes table
-///   (every outcome Activated, each outcome key covered by the rollback's
-///   slots — enforced by the conversion). The rollback is the COMPLETE
-///   resulting target snapshot: for a GROUP push the base-overlay carries
-///   the unselected slots forward, so the rollback's slots ⊇ the outcomes'
-///   keys (the outcomes cover the SELECTED slots; the strict four-set
-///   equality — outcomes == rollback slots == rollback bindings == intent
-///   membership — applies only to a FULL push, enforced where the terminal
-///   merges into its entry).
+///   (every outcome Activated) AND the TWO PERSISTED MEMBERSHIPS —
+///   `selected_membership` (the slots the push actually deployed, EQUAL to
+///   the outcomes' keys) and `full_membership` (the COMPLETE target
+///   membership at terminal time, EQUAL to the rollback's slots) — so the
+///   record PROVES the membership equations instead of implying them. The
+///   rollback is the COMPLETE resulting target snapshot: for a GROUP push
+///   the base-overlay carries the unselected slots forward, so the
+///   rollback's slots ⊇ the outcomes' keys (the outcomes cover the
+///   SELECTED slots; for a FULL push the terminal's own memberships satisfy
+///   selected == full — enforced where the terminal merges into its entry,
+///   via the intent's `group`).
 /// * [`TerminalDisposition::FailedPreflight`] carries NOTHING — a
 ///   pre-mutation failure cannot carry a rollback, and no slot was touched
 ///   (the conversion refuses outcomes).
@@ -1333,17 +1336,38 @@ pub type CompensationReport = SlotTable<SlotOutcome>;
 pub enum TerminalDisposition {
     /// The deployment succeeded: the complete rollback payload (the full
     /// snapshot: per-slot generations + physical bindings — the ONE fact
-    /// the per-slot outcomes cannot express) AND the disposition's OWN
-    /// per-slot outcomes table (every outcome Activated, each outcome key
-    /// covered by the rollback's slots — enforced by the conversion). The
-    /// rollback is the COMPLETE resulting target snapshot: for a GROUP
+    /// the per-slot outcomes cannot express), the disposition's OWN
+    /// per-slot outcomes table (every outcome Activated — enforced by the
+    /// conversion), and the TWO PERSISTED MEMBERSHIPS that PROVE the
+    /// membership equations: `selected_membership` (the slots the push
+    /// actually deployed — EQUAL to the outcomes' keys, enforced by the
+    /// conversion) and `full_membership` (the COMPLETE target membership
+    /// at terminal time — EQUAL to the rollback's slots, enforced by the
+    /// conversion). `selected_membership ⊆ full_membership` is enforced by
+    /// the conversion; the FULL-push equality `selected_membership ==
+    /// full_membership` is enforced where the terminal merges into its
+    /// entry (the mode — group vs full — lives in the intent's `group`).
+    /// The rollback is the COMPLETE resulting target snapshot: for a GROUP
     /// push the base-overlay carries the unselected slots forward, so the
     /// rollback's slots ⊇ the outcomes' keys (the outcomes cover the
-    /// SELECTED slots; the strict four-set equality applies only to a FULL
-    /// push, enforced where the terminal merges into its entry).
+    /// SELECTED slots; the full-push EQUALITY selected == full applies only
+    /// to a FULL push, enforced where the terminal merges into its entry
+    /// (the mode lives in the intent's `group`).
     Successful {
         rollback: CompleteRollback,
         outcomes: SlotTable<SlotOutcome>,
+        /// The SELECTED membership: the slots this deployment actually
+        /// selected / deployed — the outcomes' keys (a group push's group
+        /// slots; a full push's every target slot). EQUAL to the outcomes'
+        /// keys by construction — the conversion refuses a disagreement,
+        /// so the record PROVES which slots were selected.
+        selected_membership: BTreeSet<SlotId>,
+        /// The FULL membership: the COMPLETE target membership at terminal
+        /// time — the rollback's key set (the `current_slot_ids` the
+        /// engine computes). EQUAL to the rollback's slots by construction
+        /// — the conversion refuses a disagreement, so the record PROVES
+        /// the complete membership the rollback snapshot covers.
+        full_membership: BTreeSet<SlotId>,
     },
     /// The attempt failed before any slot mutation: no payload (no
     /// rollback — and the conversion also refuses outcomes, since a
@@ -1452,6 +1476,41 @@ impl LedgerTerminal {
         }
     }
 
+    /// The terminal's SELECTED MEMBERSHIP — the slots this deployment
+    /// actually selected / deployed (the outcomes' keys; for a group push
+    /// the group's slots; for a full push every target slot). PERSISTED in
+    /// the record and EQUAL to the outcomes' keys by construction (the
+    /// wire → domain conversion refuses a disagreement), so a consumer can
+    /// display or prove which slots the push selected WITHOUT re-deriving
+    /// it from the intent. `None` for every non-Successful disposition
+    /// (a failed attempt never proves a membership).
+    pub fn selected_membership(&self) -> Option<&BTreeSet<SlotId>> {
+        match &self.disposition {
+            TerminalDisposition::Successful {
+                selected_membership,
+                ..
+            } => Some(selected_membership),
+            _ => None,
+        }
+    }
+
+    /// The terminal's FULL MEMBERSHIP — the COMPLETE target membership at
+    /// terminal time (the `current_slot_ids` the engine computed; the
+    /// rollback's key set). PERSISTED in the record and EQUAL to the
+    /// rollback's slots by construction (the wire → domain conversion
+    /// refuses a disagreement), so a consumer can display or prove the
+    /// complete membership the rollback snapshot covers WITHOUT
+    /// re-deriving it from the current configuration. `None` for every
+    /// non-Successful disposition.
+    pub fn full_membership(&self) -> Option<&BTreeSet<SlotId>> {
+        match &self.disposition {
+            TerminalDisposition::Successful {
+                full_membership, ..
+            } => Some(full_membership),
+            _ => None,
+        }
+    }
+
     /// The REMAINING CHANGES of a [`TerminalDisposition::Degraded`] terminal
     /// — DERIVED from the disposition's OWN per-slot outcomes (the slots
     /// whose FINAL OBSERVED STATE differs from their pre_push state, each
@@ -1550,12 +1609,19 @@ impl LedgerTerminal {
 /// JSONL carries: the current `status` + optional `rollback`
 /// tag-plus-optional-payload shape, plus the deployment/target identity the
 /// ENTRY owns in the domain (the wire keeps them; the conversion and the
-/// reader verify they equal the enclosing entry's). The terminal's own
-/// duplicates — the STATUS/ROLLBACK TRUTH TABLE (`Successful` ⇔ rollback
-/// present) and each outcome's value naming its own key — are verified by
-/// the conversion; the CROSS-RECORD agreement (outcome key set vs the
-/// intent's authoritative `slot_ids`, the `target` field vs the read path
-/// and the intent) is enforced where the intent and terminal merge
+/// reader verify they equal the enclosing entry's). A SUCCESSFUL terminal
+/// additionally persists BOTH memberships (`selected_membership` /
+/// `full_membership`) — REQUIRED fields since schema v3 (no serde default,
+/// so an old-shape terminal line fails deserialization fail-closed) — so
+/// the record PROVES the membership equations instead of implying them. The
+/// terminal's own duplicates — the STATUS/ROLLBACK TRUTH TABLE
+/// (`Successful` ⇔ rollback present), each outcome's value naming its own
+/// key, and the membership equations (outcomes == selected_membership,
+/// rollback slots == full_membership, selected ⊆ full) — are verified by
+/// the conversion; the CROSS-RECORD agreement (every outcome key a member
+/// of the intent's `slot_ids`, the FULL-push selected == full equality via
+/// the intent's `group`, the `target` field vs the read path and the
+/// intent) is enforced where the intent and terminal merge
 /// ([`crate::store::local::LocalStore::read_ledger`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerTerminalWire {
@@ -1566,8 +1632,48 @@ pub struct LedgerTerminalWire {
     pub outcomes: BTreeMap<SlotId, SlotResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback: Option<LedgerRollbackWire>,
+    /// The SELECTED membership — the slots this deployment actually
+    /// selected / deployed (the outcomes' keys; a group push's group
+    /// slots; a full push's every target slot). REQUIRED since schema v3
+    /// (no serde default — an old-shape terminal line fails
+    /// deserialization fail-closed): the wire → domain conversion requires
+    /// it DUPLICATE-FREE and — for a `Successful` status — NON-EMPTY and
+    /// EXACTLY EQUAL to the outcomes' keys, so the record PROVES which
+    /// slots were selected.
+    pub selected_membership: Vec<SlotId>,
+    /// The FULL membership — the COMPLETE target membership at terminal
+    /// time (the `current_slot_ids` the engine computes). REQUIRED since
+    /// schema v3 (no serde default): the wire → domain conversion requires
+    /// it DUPLICATE-FREE and — for a `Successful` status — NON-EMPTY and
+    /// EXACTLY EQUAL to the rollback's slots, so the record PROVES the
+    /// complete membership the rollback snapshot covers.
+    pub full_membership: Vec<SlotId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// Validate ONE wire membership list ([`LedgerTerminalWire::selected_membership`]
+/// / [`LedgerTerminalWire::full_membership`]): DUPLICATE-FREE and converted to
+/// the SORTED UNIQUE SET the domain carries ([`BTreeSet`]). A duplicated
+/// member would silently weaken the set equations (the set collapses the
+/// duplicate, so the duplicated id would never be checked against the
+/// outcomes / rollback) — a duplicate fails closed, like the intent's
+/// `slot_ids`. The equations themselves are enforced by the caller
+/// ([`LedgerTerminalWire::into_domain`]).
+fn membership_wire_to_set(
+    deployment_id: &DeploymentId,
+    what: &str,
+    wire: Vec<SlotId>,
+) -> Result<BTreeSet<SlotId>> {
+    let mut set: BTreeSet<SlotId> = BTreeSet::new();
+    for sid in wire {
+        if !set.insert(sid.clone()) {
+            return Err(Error::integrity(format!(
+                "terminal {deployment_id}: {what} carries duplicate slot '{sid}' — the membership must be unique"
+            )));
+        }
+    }
+    Ok(set)
 }
 
 impl LedgerTerminalWire {
@@ -1579,23 +1685,27 @@ impl LedgerTerminalWire {
     /// map key (the outcome's `slot_id` is the placement slot it records —
     /// the redundant slot is then DROPPED into the key, since the domain
     /// value carries no slot), and the disposition's duplicated projections
-    /// must AGREE with the authoritative outcomes, BY STATUS: a `Successful`
-    /// wire's outcomes must be NON-EMPTY with every key covered by the
-    /// rollback's slots (the rollback is the COMPLETE resulting snapshot —
-    /// for a GROUP push the base-overlay carries the unselected slots
-    /// forward, so the rollback's slots ⊇ the outcomes' keys; the strict
-    /// four-set equality applies only to a FULL push and its membership leg
-    /// is enforced by the ledger read; every outcome must also be
-    /// Activated), a `FailedPreflight` wire must carry NO outcomes (a
-    /// pre-mutation failure touched no slot), and a `Degraded` wire's
-    /// outcomes must derive a NON-EMPTY remaining-changes set (all-restored
-    /// outcomes are refused). A disagreement → `Error::integrity`. The
-    /// cross-record claims (the outcome key set vs the intent's `slot_ids` —
-    /// the membership leg, BY INTENT GROUP: strict four-set for a full
-    /// push, the relaxed rule for a group push — and the `target` field
-    /// vs the read path / intent) are enforced by the ledger read that merges
-    /// the intent and the terminal
-    /// ([`crate::store::local::LocalStore::read_ledger`]).
+    /// must AGREE with the authoritative outcomes, BY STATUS. A `Successful`
+    /// wire must additionally carry NON-EMPTY, DUPLICATE-FREE
+    /// `selected_membership` / `full_membership` lists satisfying THE
+    /// MEMBERSHIP EQUATIONS (the terminal-local half): outcomes ==
+    /// selected_membership (the outcomes are the selected slots' results),
+    /// rollback slots == full_membership (the rollback is the COMPLETE
+    /// resulting snapshot), and selected_membership ⊆ full_membership (a
+    /// group push's selected set is a subset of the full target; the
+    /// FULL-push EQUALITY — selected == full — is the cross-record leg
+    /// enforced by the ledger read, where the intent's `group` carries the
+    /// mode). Every other status must carry NO memberships (only a
+    /// Successful terminal proves them — a failed status with memberships is
+    /// a disagreement, refused). A `FailedPreflight` wire must carry NO
+    /// outcomes (a pre-mutation failure touched no slot), and a `Degraded`
+    /// wire's outcomes must derive a NON-EMPTY remaining-changes set
+    /// (all-restored outcomes are refused). A disagreement →
+    /// `Error::integrity`. The cross-record claims (every outcome key a
+    /// member of the intent's `slot_ids`, the FULL-push selected == full
+    /// equality via the intent's `group`, and the `target` field vs the read
+    /// path / intent) are enforced by the ledger read that merges the intent
+    /// and the terminal ([`crate::store::local::LocalStore::read_ledger`]).
     pub fn into_domain(self) -> Result<LedgerTerminal> {
         // The recorded timestamp must parse as RFC 3339 (fail closed).
         Timestamp::parse(&self.recorded_at).map_err(|_| {
@@ -1604,6 +1714,30 @@ impl LedgerTerminalWire {
                 self.deployment_id, self.recorded_at
             ))
         })?;
+        // THE MEMBERSHIPS ARE VALIDATED FIRST: each wire membership list must
+        // be DUPLICATE-FREE — a duplicated member would silently weaken the
+        // set equations below (the set collapses the duplicate, so the
+        // duplicated id would never be checked against the outcomes /
+        // rollback). The validated form is the SORTED UNIQUE SET
+        // ([`BTreeSet`]) the domain carries.
+        let selected_membership = membership_wire_to_set(
+            &self.deployment_id,
+            "selected_membership",
+            self.selected_membership,
+        )?;
+        let full_membership =
+            membership_wire_to_set(&self.deployment_id, "full_membership", self.full_membership)?;
+        // Only a Successful terminal proves a membership: a failed status
+        // carrying memberships is dead, unenforced data — refused (fail
+        // closed), never silently dropped.
+        if self.status != DeploymentStatus::Successful
+            && (!selected_membership.is_empty() || !full_membership.is_empty())
+        {
+            return Err(Error::integrity(format!(
+                "terminal {}: status {:?} must carry NO memberships — only a Successful terminal records its selected/full membership (the memberships prove the push)",
+                self.deployment_id, self.status
+            )));
+        }
         let rollback = match self.rollback {
             Some(wire) => Some(wire.into_domain()?),
             None => None,
@@ -1634,31 +1768,59 @@ impl LedgerTerminalWire {
         let disposition = match (&self.status, rollback) {
             (DeploymentStatus::Successful, Some(rollback)) => {
                 // THE SUCCESSFUL SNAPSHOT RULE (terminal-local half): the
-                // outcomes are the SELECTED slots' results and the rollback
-                // is the COMPLETE resulting target snapshot — for a GROUP
-                // push the rollback carries the unselected slots forward
-                // from the base, so the rollback's slots ⊇ the outcomes'
-                // keys (the strict four-set equality — outcomes == rollback
-                // slots == rollback bindings == intent membership — applies
-                // only to a FULL push, and its membership leg is enforced
-                // where the terminal merges into its entry). The terminal
-                // local rule: NON-EMPTY outcomes whose keys are ALL covered
-                // by the rollback's slots (the rollback's own conversion
-                // already guarantees bindings == slots; the NON-EMPTY
-                // refusal closes the "successful with no outcomes" hole —
-                // an empty outcome table can never be covered by a
-                // non-empty rollback).
-                let outcome_keys: BTreeSet<&SlotId> = outcomes.keys().collect();
-                let rollback_slot_keys: BTreeSet<&SlotId> = rollback.slots.keys().collect();
+                // outcomes are the SELECTED slots' results, the rollback is
+                // the COMPLETE resulting target snapshot (for a GROUP push
+                // the rollback carries the unselected slots forward from the
+                // base), and the PERSISTED MEMBERSHIPS PROVE the equations:
+                // outcomes == selected_membership, rollback slots ==
+                // full_membership, and selected_membership ⊆
+                // full_membership. The rollback's own conversion already
+                // guarantees bindings == slots; the FULL-push EQUALITY
+                // (selected == full) is the cross-record leg enforced where
+                // the terminal merges into its entry (the mode — group vs
+                // full — lives in the intent's `group`). A successful
+                // deployment always records non-empty outcomes and both
+                // memberships NON-EMPTY (a successful deployment selected
+                // and covered at least one slot).
+                let outcome_keys: BTreeSet<SlotId> = outcomes.keys().cloned().collect();
+                let rollback_slot_keys: BTreeSet<SlotId> = rollback.slots.keys().cloned().collect();
+                if selected_membership.is_empty() || full_membership.is_empty() {
+                    return Err(Error::integrity(format!(
+                        "terminal {}: status Successful requires NON-EMPTY selected_membership and full_membership — a successful deployment records the slots it selected and the complete target membership it covered",
+                        self.deployment_id
+                    )));
+                }
                 if outcome_keys.is_empty() {
                     return Err(Error::integrity(format!(
                         "terminal {}: status Successful requires NON-EMPTY outcomes — a successful deployment records outcomes for the slots it selected",
                         self.deployment_id
                     )));
                 }
-                if !outcome_keys.is_subset(&rollback_slot_keys) {
+                if outcome_keys != selected_membership {
+                    let missing: Vec<&SlotId> =
+                        selected_membership.difference(&outcome_keys).collect();
+                    let extra: Vec<&SlotId> =
+                        outcome_keys.difference(&selected_membership).collect();
                     return Err(Error::integrity(format!(
-                        "terminal {}: status Successful requires every outcome key to be covered by the rollback's slots (outcomes {outcome_keys:?} vs rollback slots {rollback_slot_keys:?} — a group push's rollback is the complete snapshot and carries the unselected slots forward)",
+                        "terminal {}: status Successful requires the outcomes to EXACTLY equal the selected_membership (outcomes {outcome_keys:?} vs selected_membership {selected_membership:?}; missing outcomes for {missing:?}, extra outcomes for {extra:?} — the outcomes ARE the selected slots' results)",
+                        self.deployment_id
+                    )));
+                }
+                if rollback_slot_keys != full_membership {
+                    let missing: Vec<&SlotId> =
+                        full_membership.difference(&rollback_slot_keys).collect();
+                    let extra: Vec<&SlotId> =
+                        rollback_slot_keys.difference(&full_membership).collect();
+                    return Err(Error::integrity(format!(
+                        "terminal {}: status Successful requires the rollback's slots to EXACTLY equal the full_membership (rollback slots {rollback_slot_keys:?} vs full_membership {full_membership:?}; missing rollback coverage for {missing:?}, extra rollback slots for {extra:?} — the rollback IS the complete snapshot over the full membership)",
+                        self.deployment_id
+                    )));
+                }
+                if !selected_membership.is_subset(&full_membership) {
+                    let outside: Vec<&SlotId> =
+                        selected_membership.difference(&full_membership).collect();
+                    return Err(Error::integrity(format!(
+                        "terminal {}: status Successful requires selected_membership ⊆ full_membership (selected slots outside the full membership: {outside:?} — a push can only select slots the target covers)",
                         self.deployment_id
                     )));
                 }
@@ -1674,7 +1836,12 @@ impl LedgerTerminalWire {
                         self.deployment_id, r.outcome
                     )));
                 }
-                TerminalDisposition::Successful { rollback, outcomes }
+                TerminalDisposition::Successful {
+                    rollback,
+                    outcomes,
+                    selected_membership,
+                    full_membership,
+                }
             }
             (DeploymentStatus::Successful, None) => {
                 return Err(Error::integrity(format!(
@@ -1759,7 +1926,10 @@ impl LedgerTerminalWire {
     /// Build the WIRE form of a domain terminal for a given (deployment,
     /// target) identity — the enclosing [`LedgerEntry`] owns the identity,
     /// so the wire's `deployment_id` / `target` come from the CALLER (the
-    /// append path), never from the domain terminal.
+    /// append path), never from the domain terminal. A Successful terminal's
+    /// two memberships are emitted from the disposition; every other
+    /// disposition emits EMPTY memberships (only a Successful terminal
+    /// records them — the conversion refuses a failed status carrying any).
     pub fn from_domain(
         deployment_id: &DeploymentId,
         target: &TargetName,
@@ -1770,6 +1940,17 @@ impl LedgerTerminalWire {
                 Some(LedgerRollbackWire::from(rollback))
             }
             _ => None,
+        };
+        let (selected_membership, full_membership) = match &t.disposition {
+            TerminalDisposition::Successful {
+                selected_membership,
+                full_membership,
+                ..
+            } => (
+                selected_membership.iter().cloned().collect(),
+                full_membership.iter().cloned().collect(),
+            ),
+            _ => (Vec::new(), Vec::new()),
         };
         LedgerTerminalWire {
             deployment_id: deployment_id.clone(),
@@ -1786,6 +1967,8 @@ impl LedgerTerminalWire {
                 .map(|(k, o)| (k.clone(), SlotResult::from_outcome(k, o)))
                 .collect(),
             rollback,
+            selected_membership,
+            full_membership,
             reason: t.reason.clone(),
         }
     }
@@ -2606,6 +2789,13 @@ mod tests {
     // closed on EVERY tamper while accepting the untampered record.
 
     fn agreeing_intent(keys: &[SlotId]) -> LedgerIntentWire {
+        agreeing_intent_with_group(keys, None)
+    }
+
+    /// [`agreeing_intent`] with an explicit GROUP MODE: `Some(g)` selects a
+    /// group push (the intent's `slot_ids` are the group's slots), `None` a
+    /// full push (the intent's `slot_ids` are every target slot).
+    fn agreeing_intent_with_group(keys: &[SlotId], group: Option<&str>) -> LedgerIntentWire {
         let desired: BTreeMap<SlotId, GenerationRef> =
             keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
         let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> =
@@ -2614,7 +2804,7 @@ mod tests {
             deployment_schema_version: crate::model::LEDGER_SCHEMA_VERSION,
             deployment_id: test_deployment_id("deploy-w"),
             target: TargetName::new("t1".to_string()),
-            group: None,
+            group: group.map(str::to_string),
             slot_ids: keys.to_vec(),
             behavior_sha256: "sha256-w".to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
@@ -2641,14 +2831,18 @@ mod tests {
     /// status: 0 Successful (complete rollback over the membership), 1
     /// FailedPreflight (no outcomes, no rollback), 2 FailedRolledBack
     /// (outcomes = the compensation report), 3 Degraded (non-restored
-    /// outcomes over the membership → non-empty remaining changes).
+    /// outcomes over the membership → non-empty remaining changes). The
+    /// Successful shape carries the EXACT-EQUAL memberships (selected ==
+    /// full == the membership — the full-push proven shape; the mode is the
+    /// intent's `group`, chosen by the caller).
     fn agreeing_terminal(keys: &[SlotId], status_idx: u32) -> LedgerTerminalWire {
         let deployment_id = test_deployment_id("deploy-w");
         let target = TargetName::new("t1".to_string());
         match status_idx {
-            // Successful: EVERY member slot recorded Activated, and the
+            // Successful: EVERY member slot recorded Activated, the
             // COMPLETE rollback payload covers the same membership with
-            // exact bindings.
+            // exact bindings, and BOTH memberships equal that membership
+            // (the proven exact-equal shape).
             0 => LedgerTerminalWire {
                 deployment_id: deployment_id.clone(),
                 target: target.clone(),
@@ -2664,9 +2858,12 @@ mod tests {
                     behavior_sha256: None,
                     release: None,
                 }),
+                selected_membership: keys.to_vec(),
+                full_membership: keys.to_vec(),
                 reason: Some("push completed".to_string()),
             },
-            // FailedPreflight: pre-mutation — NO outcomes, NO rollback.
+            // FailedPreflight: pre-mutation — NO outcomes, NO rollback, NO
+            // memberships (only a Successful terminal proves them).
             1 => LedgerTerminalWire {
                 deployment_id,
                 target,
@@ -2674,6 +2871,8 @@ mod tests {
                 recorded_at: "2026-01-01T00:00:00Z".to_string(),
                 outcomes: BTreeMap::new(),
                 rollback: None,
+                selected_membership: vec![],
+                full_membership: vec![],
                 reason: Some("preflight failed".to_string()),
             },
             // FailedRolledBack: the outcome table IS the compensation
@@ -2688,6 +2887,8 @@ mod tests {
                     .map(|k| (k.clone(), outcome_for(k, SlotOutcomeKind::Restored)))
                     .collect(),
                 rollback: None,
+                selected_membership: vec![],
+                full_membership: vec![],
                 reason: Some("rolled back".to_string()),
             },
             // Degraded: every member's outcome is a REMAINING change — an
@@ -2706,6 +2907,8 @@ mod tests {
                     .map(|k| (k.clone(), outcome_for(k, SlotOutcomeKind::Failed)))
                     .collect(),
                 rollback: None,
+                selected_membership: vec![],
+                full_membership: vec![],
                 reason: Some("degraded".to_string()),
             },
         }
@@ -2752,10 +2955,11 @@ mod tests {
     /// entry (the entry owns identity: the terminal's id is the entry key,
     /// its target must equal the entry's, every outcome key must be a
     /// member of the intent's membership, and the outcome key set must
-    /// agree with the membership BY STATUS: Successful → EXACTLY equal
-    /// (the four-set equality's membership leg), FailedPreflight → empty,
-    /// every other state → EXACT coverage) — returning the validated domain
-    /// pair.
+    /// agree with the membership BY STATUS: Successful → the FULL-push
+    /// equality leg only (the terminal's own memberships satisfy the
+    /// terminal-local equations; the read requires selected == full when
+    /// the intent has no group), FailedPreflight → empty, every other
+    /// state → EXACT coverage) — returning the validated domain pair.
     fn pair_to_domain(
         pair: &(LedgerIntentWire, LedgerTerminalWire),
     ) -> Result<(DeploymentIntent, LedgerTerminal)> {
@@ -2781,35 +2985,35 @@ mod tests {
             }
         }
         let terminal = pair.1.clone().into_domain()?;
-        // STATUS-SPECIFIC OUTCOME AGREEMENT (the membership leg of the
-        // Successful snapshot rule — the same rules `read_ledger` enforces
-        // when it merges the terminal into its entry): a FULL push (no
-        // group) keeps the strict four-set equality — the outcomes AND the
-        // rollback's slots must EXACTLY equal the intent's membership; a
-        // GROUP push is the relaxed rule — the outcomes cover the SELECTED
-        // slots (⊆ the membership, checked above) and the rollback is the
-        // complete snapshot (its slots ⊇ the outcomes' keys, enforced by
-        // the conversion).
+        // STATUS-SPECIFIC OUTCOME AGREEMENT (the membership leg — the same
+        // rules `read_ledger` enforces when it merges the terminal into its
+        // entry). The terminal carries its OWN proven memberships (the
+        // conversion enforced outcomes == selected, rollback == full,
+        // selected ⊆ full — the record is self-proving), so the only
+        // Successful leg is the FULL-push equality: a FULL push (no group)
+        // selects every target slot, so selected == full; a GROUP push
+        // allows a proper subset (the ⊆ is already enforced by the
+        // conversion). The intent's `slot_ids` is NOT compared to either
+        // membership (it is the historical selected set written before the
+        // push; the terminal's memberships are proven at terminal time).
         let outcome_keys: BTreeSet<&SlotId> = terminal.outcomes().keys().collect();
         let membership: BTreeSet<&SlotId> = intent.slots.keys().collect();
         match terminal.status() {
             DeploymentStatus::Successful => {
                 if intent.group.is_none() {
-                    if outcome_keys != membership {
-                        return Err(Error::integrity(format!(
-                            "terminal {}: Successful outcomes {outcome_keys:?} must EXACTLY equal the intent's membership {membership:?} (the strict four-set equality: outcomes == rollback slots == rollback bindings == intent membership)",
-                            pair.1.deployment_id
-                        )));
-                    }
-                    let rollback_slot_keys: BTreeSet<&SlotId> = match &terminal.disposition {
-                        TerminalDisposition::Successful { rollback, .. } => {
-                            rollback.slots.keys().collect()
+                    let (selected, full) = match &terminal.disposition {
+                        TerminalDisposition::Successful {
+                            selected_membership,
+                            full_membership,
+                            ..
+                        } => (selected_membership, full_membership),
+                        _ => {
+                            unreachable!("a Successful terminal carries its rollback + memberships")
                         }
-                        _ => unreachable!("a Successful terminal carries its rollback"),
                     };
-                    if rollback_slot_keys != membership {
+                    if selected != full {
                         return Err(Error::integrity(format!(
-                            "terminal {}: Successful rollback slots {rollback_slot_keys:?} must EXACTLY equal the intent's membership {membership:?} (the strict four-set equality: outcomes == rollback slots == rollback bindings == intent membership)",
+                            "terminal {}: Successful records selected membership {selected:?} and full membership {full:?} — a FULL push (no group) selects every target slot, so its selected membership must EXACTLY equal its full membership",
                             pair.1.deployment_id
                         )));
                     }
@@ -2891,7 +3095,12 @@ mod tests {
             // its per-slot data.
         }
         match (&terminal.disposition, status_idx) {
-            (TerminalDisposition::Successful { rollback, outcomes }, 0) => {
+            (
+                TerminalDisposition::Successful {
+                    rollback, outcomes, ..
+                },
+                0,
+            ) => {
                 assert_eq!(
                     rollback.slots.len(),
                     keys.len(),
@@ -2920,6 +3129,20 @@ mod tests {
                         .values()
                         .all(|o| o.outcome == SlotOutcomeKind::Activated),
                     "a Successful disposition's outcomes are all Activated"
+                );
+                // THE PERSISTED MEMBERSHIPS: the domain exposes both, equal
+                // to the membership (the exact-equal proven shape) — the
+                // record PROVES selected == full == the outcome/rollback key
+                // set.
+                assert_eq!(
+                    terminal.selected_membership(),
+                    Some(&BTreeSet::from_iter(keys.iter().cloned())),
+                    "the Successful disposition exposes its selected membership (== the outcomes' keys)"
+                );
+                assert_eq!(
+                    terminal.full_membership(),
+                    Some(&BTreeSet::from_iter(keys.iter().cloned())),
+                    "the Successful disposition exposes its full membership (== the rollback's slots)"
                 );
             }
             (TerminalDisposition::FailedPreflight, 1) => {
@@ -3188,14 +3411,15 @@ mod tests {
         }
     }
 
-    // ---- THE FOUR-SET EQUALITY PROPERTY (Successful) -----------------------
+    // ---- THE MEMBERSHIP-EQUATIONS PROPERTY (Successful) --------------------
 
-    /// One key-set operation applied to ONE of the four sets (outcomes,
-    /// rollback slots, rollback bindings, intent membership). The ops are
-    /// chosen INDEPENDENTLY per set; the application is deterministic given
-    /// the op (delete the first key / add the first absent slot / replace
-    /// the first key with the first absent slot), so the property's
-    /// "succeeds iff all four sets are identical" verdict is exact.
+    /// One key-set operation applied to ONE of the four INDEPENDENT SETS
+    /// (outcomes, selected_membership, full_membership, rollback slots).
+    /// The ops are chosen INDEPENDENTLY per set; the application is
+    /// deterministic given the op (delete the first key / add the first
+    /// absent slot / replace the first key with a different absent slot), so
+    /// the property's "acceptance iff the membership equations hold" verdict
+    /// is exact.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum KeyOp {
         Unchanged,
@@ -3239,7 +3463,7 @@ mod tests {
                     out.remove(&k);
                     for i in 0..6u32 {
                         let nk = slot(i);
-                        if !out.contains(&nk) {
+                        if !out.contains(&nk) && nk != k {
                             out.insert(nk);
                             break;
                         }
@@ -3277,59 +3501,132 @@ mod tests {
     }
 
     /// Apply the four INDEPENDENT key ops to a valid Successful pair and
-    /// return the tampered pair: (a) the outcomes keys, (b) the rollback's
-    /// slots keys, (c) the rollback's bindings keys, (d) the intent's
-    /// membership (rebuilt so the intent stays internally agreeing).
+    /// return the tampered pair: (1) the outcomes keys, (2) the
+    /// selected_membership, (3) the full_membership, (4) the rollback's
+    /// slots keys — with the rollback's BINDINGS COUPLED to its slots
+    /// (slots == bindings is the separate structural rollback invariant,
+    /// NOT one of the four independent sets — the user's requirement
+    /// couples them here). The intent is REBUILT over the UNION of the four
+    /// resulting sets (so the intent never adds a verdict of its own: every
+    /// outcome key is an intent member by construction, and the read's
+    /// Successful leg compares only the terminal's OWN memberships) with the
+    /// given MODE applied to its `group` (`Some("g1")` = group push,
+    /// `None` = full push).
     fn apply_four_set_tamper(
         pair: &(LedgerIntentWire, LedgerTerminalWire),
         ops: [KeyOp; 4],
+        group: bool,
     ) -> (LedgerIntentWire, LedgerTerminalWire) {
         let (intent, terminal) = pair;
         let mut terminal = terminal.clone();
-        // (a) outcomes keys.
+        // (1) outcomes keys.
         let outcome_keys: BTreeSet<SlotId> = terminal.outcomes.keys().cloned().collect();
         let new_outcomes = apply_key_op(&outcome_keys, ops[0]);
         terminal.outcomes = new_outcomes
             .iter()
             .map(|k| (k.clone(), outcome_for(k, SlotOutcomeKind::Activated)))
             .collect();
-        // (b) rollback slots keys, (c) rollback bindings keys.
+        // (2) selected_membership, (3) full_membership.
+        let selected: BTreeSet<SlotId> = terminal.selected_membership.iter().cloned().collect();
+        terminal.selected_membership = apply_key_op(&selected, ops[1]).into_iter().collect();
+        let full: BTreeSet<SlotId> = terminal.full_membership.iter().cloned().collect();
+        terminal.full_membership = apply_key_op(&full, ops[2]).into_iter().collect();
+        // (4) rollback slots keys (bindings coupled to the slots).
         let rb = terminal
             .rollback
             .as_mut()
             .expect("a Successful terminal carries its rollback");
         let slot_keys: BTreeSet<SlotId> = rb.slots.keys().cloned().collect();
-        let new_slots = apply_key_op(&slot_keys, ops[1]);
+        let new_slots = apply_key_op(&slot_keys, ops[3]);
         rb.slots = new_slots
             .iter()
             .map(|k| (k.clone(), gen_ref_for(k)))
             .collect();
-        let binding_keys: BTreeSet<SlotId> = rb.bindings.keys().cloned().collect();
-        let new_bindings = apply_key_op(&binding_keys, ops[2]);
-        rb.bindings = new_bindings
-            .iter()
-            .map(|k| (k.clone(), binding(k)))
+        rb.bindings = new_slots.iter().map(|k| (k.clone(), binding(k))).collect();
+        // The intent: rebuilt over the UNION of the four resulting sets so it
+        // never adds a verdict (every outcome key is an intent member), with
+        // the mode applied to its `group`.
+        let union: BTreeSet<SlotId> = terminal
+            .outcomes
+            .keys()
+            .cloned()
+            .chain(terminal.selected_membership.iter().cloned())
+            .chain(terminal.full_membership.iter().cloned())
+            .chain(rb.slots.keys().cloned())
             .collect();
-        // (d) the intent's membership.
-        let membership: BTreeSet<SlotId> = intent.slot_ids.iter().cloned().collect();
-        let new_membership = apply_key_op(&membership, ops[3]);
-        let intent = intent_with_membership(intent, &new_membership);
+        let mut intent = intent_with_membership(intent, &union);
+        intent.group = if group { Some("g1".to_string()) } else { None };
         (intent, terminal)
     }
 
+    /// Evaluate THE MEMBERSHIP EQUATIONS for a written pair (the four sets +
+    /// the mode) — the acceptance criterion the properties assert
+    /// `read_ledger` is EXACTLY EQUIVALENT to:
+    ///
+    /// * outcomes == selected_membership
+    /// * rollback slots == full_membership (bindings == slots by
+    ///   construction — the coupled structural invariant)
+    /// * selected_membership ⊆ full_membership
+    /// * (FULL mode) selected_membership == full_membership — in GROUP mode
+    ///   a proper-subset selected is allowed
+    ///
+    /// plus the Successful NON-EMPTINESS (a successful deployment records
+    /// non-empty outcomes and both memberships non-empty).
+    fn membership_equations_hold(pair: &(LedgerIntentWire, LedgerTerminalWire)) -> bool {
+        let terminal = &pair.1;
+        let outcomes: BTreeSet<SlotId> = terminal.outcomes.keys().cloned().collect();
+        let selected: BTreeSet<SlotId> = terminal.selected_membership.iter().cloned().collect();
+        let full: BTreeSet<SlotId> = terminal.full_membership.iter().cloned().collect();
+        let rollback_slots: BTreeSet<SlotId> = terminal
+            .rollback
+            .as_ref()
+            .map(|rb| rb.slots.keys().cloned().collect())
+            .unwrap_or_default();
+        let full_mode = pair.0.group.is_none();
+        outcomes == selected
+            && rollback_slots == full
+            && selected.is_subset(&full)
+            && (!full_mode || selected == full)
+            && !outcomes.is_empty()
+            && !selected.is_empty()
+            && !full.is_empty()
+            && !rollback_slots.is_empty()
+    }
+
+    /// The GROUP/FULL MODE of a Successful pair, generated per house style.
+    fn membership_mode() -> impl Strategy<Value = bool> {
+        prop_oneof![Just(true), Just(false)]
+    }
+
     proptest! {
-        // PROPERTY (the directive's point 4): generate a VALID
-        // intent/successful-terminal pair, then INDEPENDENTLY DELETE / ADD /
-        // REPLACE keys in (a) the outcomes, (b) the rollback's slots, (c)
-        // the rollback's bindings — and (d) the intent's membership (the
-        // fourth set, so the "a tamper happens to keep the sets equal — e.g.
-        // adding the same key to all four — succeeds" direction is exercised
-        // too). READING (the real `read_ledger` conversion) SUCCEEDS IFF
-        // ALL FOUR SETS ARE IDENTICAL (and non-empty — the Successful
-        // rule's non-emptiness): the untampered case and any tamper that
-        // keeps the four sets equal succeed; any single-set divergence
-        // fails. Bounded 16 cases, fixed seed 0x5EED_5EED per house style,
-        // no persistence.
+        // PROPERTY 1 (the user's requirement — the acceptance equivalence):
+        // generate the FOUR INDEPENDENT SETS — (1) the outcome keys, (2)
+        // the selected_membership, (3) the full_membership, (4) the
+        // rollback's slot keys (bindings generated EQUAL to the slots — the
+        // separate structural rollback invariant, kept coupled here) — by
+        // INDEPENDENTLY DELETE / ADD / REPLACE ops from a valid base pair,
+        // plus a group/full MODE. READING (the real `read_ledger` of the
+        // written pair — the durable write → re-read path) SUCCEEDS IFF
+        // THE MEMBERSHIP EQUATIONS HOLD FOR THAT MODE: outcomes ==
+        // selected_membership, rollback slots == full_membership, selected
+        // ⊆ full, and (full mode) selected == full — with a group mode a
+        // proper-subset selected is allowed — plus the Successful
+        // non-emptiness. The intent is rebuilt over the union of the four
+        // sets so it never adds a verdict of its own; the mode is applied to
+        // the intent's `group`. Bounded 16 cases, fixed seed 0x5EED_5EED
+        // per house style, no persistence.
+        //
+        // PROPERTY 2 (the user's requirement — single-set mutation
+        // rejection): start from a VALID pair (all equations hold), apply a
+        // tamper to EXACTLY ONE of the four sets (add/remove/change a key)
+        // while leaving the other three AND the mode fixed, and assert
+        // read_ledger REJECTS — every single-set mutation breaks at least
+        // one equation (mutating the outcomes or the selected membership
+        // alone breaks outcomes == selected; mutating the full membership or
+        // the rollback slots alone breaks rollback == full). The rejection
+        // is asserted through the REAL ledger file (write → re-read — the
+        // crash-recovery read path), so a tampered record is refused even
+        // after a durable write.
         #![proptest_config(ProptestConfig {
             cases: 16,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
@@ -3338,33 +3635,58 @@ mod tests {
         })]
 
         #[test]
-        fn successful_four_set_equality_is_necessary_and_sufficient(
+        fn successful_membership_equations_are_necessary_and_sufficient(
             (intent, terminal) in agreeing_pair().prop_filter(
                 "the property needs a Successful pair",
                 |(_, t)| t.status == DeploymentStatus::Successful,
             ),
             ops in prop::array::uniform4(key_op()),
+            group in membership_mode(),
         ) {
-            let (t_intent, t_terminal) = apply_four_set_tamper(&(intent, terminal), ops);
-            // The four resulting sets (owned — the pair is consumed by the
-            // ledger write below).
-            let outcomes: BTreeSet<SlotId> = t_terminal.outcomes.keys().cloned().collect();
-            let rb = t_terminal
-                .rollback
-                .as_ref()
-                .expect("Successful carries its rollback");
-            let rollback_slots: BTreeSet<SlotId> = rb.slots.keys().cloned().collect();
-            let rollback_bindings: BTreeSet<SlotId> = rb.bindings.keys().cloned().collect();
-            let membership: BTreeSet<SlotId> = t_intent.slot_ids.iter().cloned().collect();
-            let all_identical = outcomes == rollback_slots
-                && outcomes == rollback_bindings
-                && outcomes == membership;
-            let expect_ok = all_identical && !outcomes.is_empty();
-            let read = write_pair_ledger(&(t_intent, t_terminal));
+            let (t_intent, t_terminal) = apply_four_set_tamper(&(intent, terminal), ops, group);
+            let pair = (t_intent, t_terminal);
+            let expect_ok = membership_equations_hold(&pair);
+            let read = write_pair_ledger(&pair);
             assert_eq!(
                 read.is_ok(),
                 expect_ok,
-                "read_ledger must succeed iff the four sets are identical and non-empty (outcomes {outcomes:?}, rollback slots {rollback_slots:?}, rollback bindings {rollback_bindings:?}, membership {membership:?}); read: {read:?}"
+                "read_ledger must succeed iff the membership equations hold for the mode (outcomes {:?}, selected {:?}, full {:?}, rollback slots {:?}, full mode: {}); read: {:?}",
+                pair.1.outcomes.keys().collect::<BTreeSet<_>>(),
+                pair.1.selected_membership,
+                pair.1.full_membership,
+                pair.1.rollback.as_ref().map(|rb| rb.slots.keys().collect::<BTreeSet<_>>()),
+                pair.0.group.is_none(),
+                read
+            );
+        }
+
+        #[test]
+        fn mutating_any_single_membership_set_causes_rejection(
+            (intent, terminal) in agreeing_pair().prop_filter(
+                "the property needs a Successful pair",
+                |(_, t)| t.status == DeploymentStatus::Successful,
+            ),
+            set_idx in 0u32..4,
+            op in key_op().prop_filter("the tamper must change the set", |op| {
+                *op != KeyOp::Unchanged
+            }),
+            group in membership_mode(),
+        ) {
+            let mut ops = [KeyOp::Unchanged; 4];
+            ops[set_idx as usize] = op;
+            let (t_intent, t_terminal) = apply_four_set_tamper(&(intent, terminal), ops, group);
+            let pair = (t_intent, t_terminal);
+            // A VALID base pair satisfies every equation, so tampering EXACTLY
+            // ONE of the four sets must break at least one equation — and the
+            // read (the durable write → re-read crash-recovery path) must
+            // reject.
+            assert!(
+                !membership_equations_hold(&pair),
+                "mutating exactly one set must break an equation (set {set_idx}, op {op:?})"
+            );
+            assert!(
+                write_pair_ledger(&pair).is_err(),
+                "mutating exactly one of the four sets (set {set_idx}, op {op:?}) must be rejected by read_ledger — the durable write → re-read is the crash-recovery read"
             );
         }
     }
@@ -3419,23 +3741,25 @@ mod tests {
 
     // ---- deterministic unit tests -----------------------------------------
 
-    /// THE FOUR-SET EQUALITY, SUFFICIENCY DIRECTION (deterministic): a
-    /// tamper that happens to KEEP the four sets identical — e.g. adding
-    /// the SAME key to all four (outcomes, rollback slots, rollback
-    /// bindings, intent membership) — is NOT a disagreement: the read
-    /// succeeds. (The necessity direction — any single-set divergence fails
-    /// — is the property's verdict; this pins the sufficiency case the
-    /// bounded property may not draw.)
+    /// THE MEMBERSHIP EQUATIONS, SUFFICIENCY DIRECTION (deterministic): a
+    /// tamper that happens to KEEP the equations satisfied is NOT a
+    /// disagreement — the read succeeds. (The necessity direction — any
+    /// single-set divergence fails — is Property 2's verdict; this pins the
+    /// sufficiency cases the bounded property may not draw: a FULL push with
+    /// the SAME key added to ALL FOUR sets, a GROUP push whose FULL side
+    /// grows alone (selected stays a proper subset), and a GROUP push whose
+    /// SELECTED side grows alone.)
     #[test]
-    fn successful_four_set_equality_suffices_when_a_tamper_keeps_the_sets_equal() {
+    fn successful_membership_equations_suffice_when_a_tamper_keeps_them_satisfied() {
         let keys = vec![slot(1), slot(2)];
         let intent = agreeing_intent(&keys);
         let terminal = agreeing_terminal(&keys, 0);
         // The untampered pair reads.
         write_pair_ledger(&(intent.clone(), terminal.clone()))
             .expect("the exact-equal Successful pair reads");
-        // Add the SAME key (slot-9) to all four sets: the sets stay
-        // identical, so the read still succeeds.
+        // FULL mode: add the SAME key (slot-9) to ALL FOUR sets — the
+        // equations stay satisfied (outcomes == selected == full ==
+        // rollback slots), so the read still succeeds.
         let mut intent = intent;
         intent.slot_ids.push(slot(9));
         intent.desired.insert(slot(9), gen_ref_for(&slot(9)));
@@ -3444,17 +3768,185 @@ mod tests {
         terminal
             .outcomes
             .insert(slot(9), outcome_for(&slot(9), SlotOutcomeKind::Activated));
+        terminal.selected_membership.push(slot(9));
+        terminal.full_membership.push(slot(9));
         let rb = terminal.rollback.as_mut().unwrap();
         rb.slots.insert(slot(9), gen_ref_for(&slot(9)));
         rb.bindings.insert(slot(9), binding(&slot(9)));
         let entries = write_pair_ledger(&(intent, terminal)).expect(
-            "adding the same key to all four sets keeps them identical — the read succeeds",
+            "adding the same key to all four sets keeps the equations satisfied — the read succeeds",
         );
         assert_eq!(entries.len(), 1);
         assert_eq!(
             entries[0].intent.slots.len(),
             3,
             "the intent's membership grew with the added key"
+        );
+
+        // GROUP mode: a proper-subset selected (selected = {slot-1} ⊊ full =
+        // {slot-1, slot-2}) is LEGAL and reads.
+        let selected = vec![slot(1)];
+        let full = vec![slot(1), slot(2)];
+        let mut terminal = agreeing_terminal(&full, 0);
+        terminal.outcomes =
+            BTreeMap::from([(slot(1), outcome_for(&slot(1), SlotOutcomeKind::Activated))]);
+        terminal.selected_membership = selected.clone();
+        let intent = agreeing_intent_with_group(&selected, Some("g1"));
+        write_pair_ledger(&(intent.clone(), terminal.clone()))
+            .expect("the group-proper-subset pair reads");
+        // GROW THE FULL SIDE ONLY (full + rollback): selected ⊊ full stays —
+        // the read succeeds.
+        let mut terminal2 = terminal.clone();
+        terminal2.full_membership.push(slot(3));
+        let rb = terminal2.rollback.as_mut().unwrap();
+        rb.slots.insert(slot(3), gen_ref_for(&slot(3)));
+        rb.bindings.insert(slot(3), binding(&slot(3)));
+        write_pair_ledger(&(intent.clone(), terminal2))
+            .expect("growing only the full membership keeps selected ⊆ full — the read succeeds");
+        // GROW THE SELECTED SIDE ONLY, WITHIN the full membership
+        // (selected + outcomes grow to equal full): selected ⊆ full stays —
+        // the read succeeds. The intent (whose slot_ids ARE the selected
+        // set for a group push) grows with the selection.
+        let mut terminal3 = terminal;
+        terminal3.selected_membership.push(slot(2));
+        terminal3
+            .outcomes
+            .insert(slot(2), outcome_for(&slot(2), SlotOutcomeKind::Activated));
+        let intent3 = agreeing_intent_with_group(&[slot(1), slot(2)], Some("g1"));
+        write_pair_ledger(&(intent3, terminal3)).expect(
+            "growing the selected membership (and its outcomes) within the full membership keeps selected ⊆ full — the read succeeds",
+        );
+    }
+
+    /// Write the pair as a two-line ledger AND a `deploy.toml` whose target
+    /// `t1` owns exactly the given SIMULATED current configuration slots,
+    /// then read the ledger back through the REAL consumer path. The
+    /// membership equations NEVER consult this configuration — the helper
+    /// exists to demonstrate (in
+    /// [`acceptance_is_pure_function_of_persisted_sets_and_mode_ignores_config`])
+    /// that acceptance is a PURE function of the persisted sets + mode:
+    /// re-reading the SAME pair under a DIFFERENT simulated config
+    /// membership yields the SAME verdict.
+    fn write_pair_ledger_under_config(
+        pair: &(LedgerIntentWire, LedgerTerminalWire),
+        simulated_slots: &[SlotId],
+    ) -> Result<Vec<LedgerEntry>> {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        // A real, LOADABLE project config whose target `t1` owns exactly
+        // `simulated_slots` (one server, one release). `read_ledger` never
+        // touches it — the config exists only to make the simulation
+        // concrete: a hypothetical config-reading consumer would see THIS
+        // current membership.
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(project.join("releases").join("v1")).unwrap();
+        let mut release = String::from("[artifact]\nmappings = []\n\n");
+        for s in simulated_slots {
+            release.push_str(&format!(
+                "[[slots]]\nid = \"{}\"\nserver = \"s1\"\ntarget = \"t1\"\ngroups = []\ndeploy_dir = \"/srv\"\n\n",
+                s.as_str()
+            ));
+        }
+        release.push_str(
+            "[retention.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n[retention.deployment]\nprotect_deployments = 1\n\n[activation]\nadapter = \"none\"\n\n[verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
+        );
+        std::fs::write(
+            project.join("releases").join("v1").join("standard.toml"),
+            release,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("deploy.toml"),
+            "schema_version = 2\napplication = \"records-tests\"\nrelease = \"v1\"\n\n\
+             [[servers]]\nid = \"s1\"\naddress = \"a\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n\
+             [targets.t1]\nrollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }\n",
+        )
+        .unwrap();
+        let line1 = serde_json::to_string(&LedgerLine::Intent(pair.0.clone())).unwrap();
+        let line2 = serde_json::to_string(&LedgerLine::Terminal(pair.1.clone())).unwrap();
+        let p = store.ledger_path("t1");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, format!("{line1}\n{line2}\n")).unwrap();
+        store.read_ledger("t1")
+    }
+
+    /// CONFIGURATION MEMBERSHIP INDEPENDENCE (the user's requirement):
+    /// acceptance of a Successful pair is a PURE function of the persisted
+    /// sets + mode — the read path ([`LocalStore::read_ledger`]) NEVER
+    /// consults the live configuration for the membership equations. The
+    /// SAME written pair is read back while simulating DIFFERENT current
+    /// configuration memberships (a target config whose slots differ from
+    /// the pair's persisted sets), and the verdict is unchanged: a valid
+    /// pair stays accepted, a tampered pair stays rejected.
+    #[test]
+    fn acceptance_is_pure_function_of_persisted_sets_and_mode_ignores_config() {
+        // A valid GROUP-mode pair: selected = {slot-1} ⊊ full = {slot-1,
+        // slot-2} — the group-proper-subset shape a group push legitimately
+        // records (outcomes == selected, rollback == full, selected ⊆ full).
+        let selected = vec![slot(1)];
+        let full = vec![slot(1), slot(2)];
+        let mut terminal = agreeing_terminal(&full, 0);
+        terminal.outcomes =
+            BTreeMap::from([(slot(1), outcome_for(&slot(1), SlotOutcomeKind::Activated))]);
+        terminal.selected_membership = selected.clone();
+        let intent = agreeing_intent_with_group(&selected, Some("g1"));
+        let pair = (intent, terminal);
+        assert!(membership_equations_hold(&pair), "the group pair is valid");
+        // Accepted under a config whose membership equals the FULL set …
+        write_pair_ledger_under_config(&pair, &full)
+            .expect("the valid pair reads under a config matching the full membership");
+        // … and accepted under a config whose membership is a DIFFERENT set
+        // (a simulated membership change): the verdict is unchanged.
+        write_pair_ledger_under_config(&pair, &[slot(9)])
+            .expect("the valid pair's acceptance is a PURE function of the persisted sets + mode — a different current configuration membership does not change it");
+
+        // A tampered variant: add a key to the SELECTED set only — outcomes
+        // == selected breaks. Rejected under BOTH simulated configs.
+        let mut bad = pair.clone();
+        bad.1.selected_membership.push(slot(3));
+        assert!(
+            !membership_equations_hold(&bad),
+            "the single-set mutation breaks the equations"
+        );
+        write_pair_ledger_under_config(&bad, &full).expect_err(
+            "the tampered pair must stay rejected under a config matching the full membership",
+        );
+        write_pair_ledger_under_config(&bad, &[slot(9)]).expect_err(
+            "the tampered pair must stay rejected under a DIFFERENT current configuration membership",
+        );
+
+        // A valid FULL-mode pair (selected == full) and its tamper: same
+        // independence.
+        let keys = vec![slot(1), slot(2)];
+        let pair = (agreeing_intent(&keys), agreeing_terminal(&keys, 0));
+        assert!(membership_equations_hold(&pair), "the full pair is valid");
+        write_pair_ledger_under_config(&pair, &keys)
+            .expect("the valid full pair reads under a config matching its membership");
+        write_pair_ledger_under_config(&pair, &[slot(5)]).expect(
+            "the valid full pair's acceptance is a PURE function of the persisted sets + mode — a different current configuration membership does not change it",
+        );
+        let mut bad = pair.clone();
+        bad.1.full_membership.push(slot(3));
+        bad.1
+            .rollback
+            .as_mut()
+            .unwrap()
+            .slots
+            .insert(slot(3), gen_ref_for(&slot(3)));
+        bad.1
+            .rollback
+            .as_mut()
+            .unwrap()
+            .bindings
+            .insert(slot(3), binding(&slot(3)));
+        assert!(
+            !membership_equations_hold(&bad),
+            "the full-side mutation breaks the equations"
+        );
+        write_pair_ledger_under_config(&bad, &keys)
+            .expect_err("the tampered full pair must stay rejected");
+        write_pair_ledger_under_config(&bad, &[slot(5)]).expect_err(
+            "the tampered full pair must stay rejected under a DIFFERENT current configuration membership",
         );
     }
 
@@ -3630,8 +4122,11 @@ mod tests {
         let wire = agreeing_terminal(&keys, 0);
         let d = wire.into_domain().unwrap();
         assert_eq!(d.status(), DeploymentStatus::Successful);
-        let TerminalDisposition::Successful { rollback, outcomes } = d.disposition else {
-            panic!("Successful maps to Successful {{ rollback, outcomes }}");
+        let TerminalDisposition::Successful {
+            rollback, outcomes, ..
+        } = d.disposition
+        else {
+            panic!("Successful maps to Successful {{ rollback, outcomes, memberships }}");
         };
         assert_eq!(rollback.slots.len(), 2, "the complete rollback payload");
         assert_eq!(
@@ -3741,14 +4236,13 @@ mod tests {
         );
     }
 
-    /// THE STATUS-SPECIFIC OUTCOME RULES (the directive's fix, enforced BY
-    /// STATUS): a `Successful` terminal's outcomes must be NON-EMPTY with
-    /// every key covered by the rollback's slots (the rollback is the
-    /// COMPLETE resulting snapshot — for a group push the base-overlay
-    /// carries the unselected slots forward, so the rollback's slots ⊇ the
-    /// outcomes' keys; the strict four-set equality applies only to a FULL
-    /// push and its membership leg — outcomes == rollback slots == the
-    /// intent's membership — is enforced by the pair/ledger read), a
+    /// THE STATUS-SPECIFIC OUTCOME RULES (enforced BY STATUS) + THE
+    /// MEMBERSHIP EQUATIONS (the user's requirement): a `Successful`
+    /// terminal must carry NON-EMPTY, DUPLICATE-FREE memberships satisfying
+    /// outcomes == selected_membership, rollback slots == full_membership,
+    /// and selected ⊆ full (terminal-local, enforced by the conversion —
+    /// the record is SELF-PROVING), and a FULL push (no group) additionally
+    /// requires selected == full (the read leg, via the intent's `group`); a
     /// `FailedPreflight` terminal must carry NO outcomes, and every other
     /// terminal state's outcomes must EXACTLY COVER the intent's membership
     /// (no missing, no extra).
@@ -3756,9 +4250,8 @@ mod tests {
     fn status_specific_outcome_rules_fail_closed() {
         let keys = vec![slot(1), slot(2)];
 
-        // THE EXACT-EQUAL SUCCESSFUL → Ok (the four sets are identical and
-        // non-empty: outcomes == rollback slots == rollback bindings == the
-        // intent's membership).
+        // THE EXACT-EQUAL SUCCESSFUL → Ok (outcomes == selected == full ==
+        // rollback slots — the exact-equal proven shape).
         let intent = agreeing_intent(&keys);
         let terminal = agreeing_terminal(&keys, 0);
         let (d_intent, d_terminal) = pair_to_domain(&(intent.clone(), terminal.clone()))
@@ -3774,24 +4267,42 @@ mod tests {
         };
         assert_eq!(rollback.slots.len(), d_intent.slots.len());
         assert_eq!(rollback.bindings.len(), d_intent.slots.len());
+        // The PERSISTED memberships are exposed and prove the equations.
+        assert_eq!(
+            d_terminal.selected_membership(),
+            Some(&BTreeSet::from_iter(keys.iter().cloned()))
+        );
+        assert_eq!(
+            d_terminal.full_membership(),
+            Some(&BTreeSet::from_iter(keys.iter().cloned()))
+        );
 
-        // SUCCESSFUL with a MISSING outcome key → the terminal-local rule
-        // still accepts (the outcomes ⊆ the rollback's slots), but the FULL
-        // push's membership leg refuses (the outcomes no longer equal the
-        // intent's membership).
+        // A GROUP push with a PROPER-SUBSET selected → Ok (the group shape
+        // the base-overlay produces: outcomes == selected ⊊ full ==
+        // rollback — legal in group mode).
+        let selected = vec![slot(1)];
+        let mut group_terminal = agreeing_terminal(&keys, 0);
+        group_terminal.outcomes =
+            BTreeMap::from([(slot(1), outcome_for(&slot(1), SlotOutcomeKind::Activated))]);
+        group_terminal.selected_membership = selected.clone();
+        let group_intent = agreeing_intent_with_group(&selected, Some("g1"));
+        pair_to_domain(&(group_intent, group_terminal))
+            .expect("a group push with selected ⊊ full converts (the group-proper-subset shape)");
+
+        // SUCCESSFUL with a MISSING outcome key → Err (outcomes != selected
+        // — the terminal-local equation; no cross-record leg needed).
         let mut bad = terminal.clone();
         bad.outcomes.remove(&slot(1));
         assert!(
-            bad.clone().into_domain().is_ok(),
-            "a missing outcome key is not a terminal-local disagreement (the outcomes ⊆ the rollback's slots)"
+            bad.clone().into_domain().is_err(),
+            "a missing outcome key fails the conversion (outcomes must EXACTLY equal the selected_membership)"
         );
         assert!(
             pair_to_domain(&(intent.clone(), bad)).is_err(),
-            "Successful with a missing outcome key fails the pair read (the full push's outcomes must exactly equal the membership)"
+            "Successful with a missing outcome key fails the pair read"
         );
 
-        // SUCCESSFUL with an EXTRA outcome key → Err (an outcome for a slot
-        // the rollback does not cover).
+        // SUCCESSFUL with an EXTRA outcome key → Err (outcomes != selected).
         let mut bad = terminal.clone();
         bad.outcomes
             .insert(slot(9), outcome_for(&slot(9), SlotOutcomeKind::Activated));
@@ -3800,43 +4311,87 @@ mod tests {
             "Successful with an extra outcome key fails the conversion"
         );
 
-        // SUCCESSFUL with a MISSING rollback slot (and binding) → Err (an
-        // outcome key the rollback no longer covers).
+        // SUCCESSFUL with a MISSING rollback slot (and binding) → Err
+        // (rollback != full).
         let mut bad = terminal.clone();
         let rb = bad.rollback.as_mut().unwrap();
         rb.slots.remove(&slot(1));
         rb.bindings.remove(&slot(1));
         assert!(
             bad.into_domain().is_err(),
-            "Successful with a missing rollback slot fails the conversion"
+            "Successful with a missing rollback slot fails the conversion (rollback must EXACTLY equal the full_membership)"
         );
 
-        // SUCCESSFUL with an EXTRA rollback slot (and binding) → the
-        // terminal-local rule still accepts (the outcomes ⊆ the rollback's
-        // slots — the complete-snapshot shape), but the FULL push's
-        // membership leg refuses (the rollback no longer equals the
+        // SUCCESSFUL with an EXTRA rollback slot (and binding) → Err
+        // (rollback != full — the complete snapshot covers EXACTLY the full
         // membership).
         let mut bad = terminal.clone();
         let rb = bad.rollback.as_mut().unwrap();
         rb.slots.insert(slot(9), gen_ref_for(&slot(9)));
         rb.bindings.insert(slot(9), binding(&slot(9)));
         assert!(
-            bad.clone().into_domain().is_ok(),
-            "an extra rollback slot is not a terminal-local disagreement (the outcomes ⊆ the rollback's slots)"
-        );
-        assert!(
-            pair_to_domain(&(intent.clone(), bad)).is_err(),
-            "Successful with an extra rollback slot fails the pair read (the full push's rollback must exactly equal the membership)"
+            bad.into_domain().is_err(),
+            "Successful with an extra rollback slot fails the conversion"
         );
 
-        // SUCCESSFUL with EMPTY outcomes → Err (the four sets must be
-        // NON-EMPTY — a successful deployment records a complete rollback
-        // over exactly the slots it reports outcomes for).
+        // SUCCESSFUL with EMPTY outcomes → Err (Successful requires
+        // NON-EMPTY outcomes).
         let mut bad = terminal.clone();
         bad.outcomes = BTreeMap::new();
         assert!(
             bad.into_domain().is_err(),
             "Successful with empty outcomes fails the conversion"
+        );
+        // EMPTY selected_membership → Err (Successful requires NON-EMPTY
+        // memberships).
+        let mut bad = terminal.clone();
+        bad.selected_membership = vec![];
+        assert!(
+            bad.into_domain().is_err(),
+            "Successful with empty selected_membership fails the conversion"
+        );
+
+        // SELECTED ⊄ FULL → Err (terminal-local).
+        let mut bad = terminal.clone();
+        bad.selected_membership = vec![slot(9)];
+        assert!(
+            bad.into_domain().is_err(),
+            "selected ⊄ full fails the conversion"
+        );
+
+        // A DUPLICATE membership member → Err (the set equations would be
+        // silently weakened).
+        let mut bad = terminal.clone();
+        bad.selected_membership.push(slot(1));
+        assert!(
+            bad.into_domain().is_err(),
+            "a duplicated membership member fails the conversion"
+        );
+
+        // FULL push with selected != full (a proper subset): the
+        // terminal-local equations hold (outcomes == selected, rollback ==
+        // full, selected ⊆ full) — the conversion accepts — but the FULL-push
+        // read leg (the mode lives in the intent's `group`) refuses.
+        let mut group_shaped = terminal.clone();
+        group_shaped.outcomes =
+            BTreeMap::from([(slot(1), outcome_for(&slot(1), SlotOutcomeKind::Activated))]);
+        group_shaped.selected_membership = vec![slot(1)];
+        assert!(
+            group_shaped.clone().into_domain().is_ok(),
+            "a proper-subset selected is not a terminal-local disagreement"
+        );
+        assert!(
+            pair_to_domain(&(intent.clone(), group_shaped)).is_err(),
+            "a FULL push (no group) with selected != full fails the pair read (the read leg)"
+        );
+
+        // A NON-SUCCESSFUL status carrying memberships → Err (only a
+        // Successful terminal proves them).
+        let mut bad = agreeing_terminal(&keys, 2); // FailedRolledBack
+        bad.selected_membership = keys.clone();
+        assert!(
+            bad.into_domain().is_err(),
+            "a failed status carrying memberships fails the conversion"
         );
 
         // FAILEDPREFLIGHT with an outcome → Err (a pre-mutation failure
@@ -4067,6 +4622,8 @@ mod tests {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
             outcomes: BTreeMap::from([(slot(1), outcome())]),
             rollback: Some(rollback()),
+            selected_membership: vec![slot(1)],
+            full_membership: vec![slot(1)],
             reason: None,
         };
         let domain = wire.clone().into_domain().unwrap();
@@ -4131,11 +4688,14 @@ mod tests {
         );
 
         // The other truth-table variant stays VALID: a failed terminal with
-        // NO rollback and NO outcomes converts fine.
+        // NO rollback, NO outcomes, and NO memberships (only a Successful
+        // terminal records them) converts fine.
         let failed = LedgerTerminalWire {
             status: DeploymentStatus::FailedRolledBack,
             outcomes: BTreeMap::new(),
             rollback: None,
+            selected_membership: vec![],
+            full_membership: vec![],
             ..wire.clone()
         };
         assert!(
@@ -4160,8 +4720,11 @@ mod tests {
         let intent = agreeing_intent(&keys).into_domain().unwrap();
         // Successful: the disposition owns its outcomes next to the rollback.
         let d = agreeing_terminal(&keys, 0).into_domain().unwrap();
-        let TerminalDisposition::Successful { rollback, outcomes } = &d.disposition else {
-            panic!("Successful carries rollback + outcomes");
+        let TerminalDisposition::Successful {
+            rollback, outcomes, ..
+        } = &d.disposition
+        else {
+            panic!("Successful carries rollback + outcomes + memberships");
         };
         assert_eq!(
             d.outcomes(),
@@ -4356,12 +4919,15 @@ mod tests {
 
     /// An arbitrary SUCCESSFUL domain terminal: an arbitrary rollback plus
     /// the disposition's OWN outcomes — every outcome Activated, each key
-    /// covered by the rollback's slots (the conversion's agreement).
+    /// covered by the rollback's slots — AND the PERSISTED MEMBERSHIPS
+    /// (selected == full == the rollback's slots — the exact-equal proven
+    /// shape; the mode is a separate record's concern).
     fn arbitrary_successful() -> impl Strategy<Value = LedgerTerminal> {
         arbitrary_rollback().prop_map(|rollback| {
-            // The four-set equality: the Successful disposition's outcomes
+            // The exact-equal shape: the Successful disposition's outcomes
             // EXACTLY cover the rollback's slots (one Activated outcome per
-            // slotted generation).
+            // slotted generation), and both memberships equal that set — the
+            // proven shape the round trip preserves.
             let outcomes: BTreeMap<SlotId, SlotOutcome> = rollback
                 .slots
                 .keys()
@@ -4380,11 +4946,14 @@ mod tests {
                     )
                 })
                 .collect();
+            let membership: BTreeSet<SlotId> = rollback.slots.keys().cloned().collect();
             LedgerTerminal {
                 recorded_at: "2026-01-01T00:00:00Z".to_string(),
                 disposition: TerminalDisposition::Successful {
                     rollback,
                     outcomes: SlotTable::from_map(outcomes),
+                    selected_membership: membership.clone(),
+                    full_membership: membership,
                 },
                 reason: None,
             }
@@ -4602,6 +5171,8 @@ mod tests {
                     recorded_at: v,
                     outcomes: BTreeMap::new(),
                     rollback: None,
+                    selected_membership: vec![],
+                    full_membership: vec![],
                     reason: None,
                 };
                 (ScalarWire::Terminal(terminal), ok)

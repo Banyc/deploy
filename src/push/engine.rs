@@ -1680,10 +1680,11 @@ fn push_inner(
         // SELECTED slots' actuals overlaid on the latest successful base,
         // unselected slots carried forward — so the rollback's slots are the
         // FULL current target membership, never just the selected slots. The
-        // conversion's Successful rule distinguishes the two cases by the
-        // intent's group: a group push's outcomes cover the SELECTED slots
-        // (⊆ the rollback's full membership), a full push's outcomes equal
-        // the rollback's full membership (the strict four-set equality).
+        // terminal PERSISTS both memberships (selected = the outcome keys,
+        // full = these current slots) and the read path enforces the
+        // equations: outcomes == selected, rollback == full, selected ⊆
+        // full, and — for a FULL push (no group, distinguished by the
+        // intent's `group`) — selected == full.
         let current_slot_ids: Vec<SlotId> = config
             .target_slots(target_name)?
             .into_iter()
@@ -3160,12 +3161,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &LedgerTerminal {
                     recorded_at: "2026-01-01T00:00:00Z".to_string(),
                     // The EXACT-EQUAL shape: the outcomes keys equal the
-                    // rollback's slots keys (and bindings keys) — the
-                    // four-set equality (outcomes == rollback slots ==
-                    // rollback bindings == intent membership) is enforced
-                    // by the conversion, so a seeded Successful terminal
-                    // must carry one Activated outcome per slotted
-                    // generation.
+                    // rollback's slots keys (and bindings keys), and the
+                    // memberships PROVE the equations (outcomes == selected
+                    // == full == the rollback's slots — the read enforces
+                    // them, so a seeded Successful terminal must carry one
+                    // Activated outcome per slotted generation).
                     disposition: TerminalDisposition::Successful {
                         rollback: crate::records::LedgerRollback {
                             slots: slots.clone(),
@@ -3189,6 +3189,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                                 })
                                 .collect(),
                         ),
+                        // THE EXACT-EQUAL MEMBERSHIPS: selected == full ==
+                        // the slotted generations' keys (the rollback's
+                        // slots / the outcomes' keys) — the proven shape the
+                        // conversion + read require.
+                        selected_membership: slots.keys().cloned().collect(),
+                        full_membership: slots.keys().cloned().collect(),
                     },
                     reason: None,
                 },
@@ -7191,9 +7197,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     /// DETERMINISTIC: a group push's snapshot has the FULL membership (the
     /// base-overlay carried the unselected slot forward) while its OUTCOMES
-    /// cover the SELECTED slots only — the relaxed Successful rule (outcomes
-    /// ⊆ rollback slots) accepts the snapshot, and the strict four-set
-    /// equality is NOT required for a group push.
+    /// cover the SELECTED slots only — the group rule (selected ⊊ full,
+    /// outcomes == selected, rollback == full) accepts the snapshot, and
+    /// selected == full is NOT required for a group push.
     #[test]
     fn group_push_snapshot_has_full_membership_and_selected_outcomes() {
         let h = TwoSlotHarness::new();
@@ -7257,13 +7263,26 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "the bindings cover the full membership"
         );
         // The OUTCOMES cover the SELECTED slots only (the group), and the
-        // conversion accepts the snapshot (the relaxed Successful rule).
+        // conversion accepts the snapshot (the group rule: selected ⊊ full,
+        // outcomes == selected, rollback == full). The PERSISTED memberships
+        // prove it: selected == the group's slot, full == the complete
+        // membership.
         let entries = h.store.read_ledger("t1").unwrap();
         let terminal = entries[1].terminal.as_ref().unwrap();
         assert_eq!(
             terminal.outcomes().keys().cloned().collect::<BTreeSet<_>>(),
             BTreeSet::from([slot_a.clone()]),
             "the outcomes cover the selected group slot only"
+        );
+        assert_eq!(
+            terminal.selected_membership(),
+            Some(&BTreeSet::from([slot_a.clone()])),
+            "the terminal PERSISTS the selected membership (== the outcomes' keys == the group's slot)"
+        );
+        assert_eq!(
+            terminal.full_membership(),
+            Some(&full_membership),
+            "the terminal PERSISTS the full membership (== the complete target membership == the rollback's slots)"
         );
         assert_eq!(
             terminal.outcomes()[&slot_a].outcome,
@@ -7324,9 +7343,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         }
     }
 
-    /// DETERMINISTIC: a FULL push still enforces the strict four-set
-    /// equality — the successful snapshot's outcomes == rollback slots ==
-    /// rollback bindings == the intent's membership (all equal, non-empty).
+    /// DETERMINISTIC: a FULL push still enforces the strict equality — the
+    /// membership equations (outcomes == selected == full == rollback slots
+    /// == bindings, with the full-push selected == full leg) imply the
+    /// snapshot's outcomes == rollback slots == rollback bindings == the
+    /// intent's membership (all equal, non-empty).
     #[test]
     fn full_push_still_enforces_the_strict_four_set_equality() {
         let h = TwoSlotHarness::new();
@@ -7349,6 +7370,16 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             terminal.outcomes().keys().cloned().collect::<BTreeSet<_>>(),
             full_membership,
             "the full push's outcomes equal the membership"
+        );
+        assert_eq!(
+            terminal.selected_membership(),
+            Some(&full_membership),
+            "the terminal PERSISTS the selected membership == the full membership (a full push selects every target slot)"
+        );
+        assert_eq!(
+            terminal.full_membership(),
+            Some(&full_membership),
+            "the terminal PERSISTS the full membership == the complete target membership"
         );
         let TerminalDisposition::Successful { rollback, .. } = &terminal.disposition else {
             panic!("the full push is Successful");

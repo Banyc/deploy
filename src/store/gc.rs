@@ -478,7 +478,7 @@ mod tests {
     };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
     const TARGET: &str = "t1";
@@ -668,8 +668,8 @@ interval_seconds = 0
         LedgerTerminal {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
             // The EXACT-EQUAL shape: one Activated outcome per slotted
-            // generation (the four-set equality is enforced by the
-            // conversion).
+            // generation (the membership equations — outcomes == selected ==
+            // full == rollback slots — are enforced by the conversion).
             disposition: TerminalDisposition::Successful {
                 rollback: LedgerRollback {
                     slots: BTreeMap::from([(
@@ -708,6 +708,11 @@ interval_seconds = 0
                         observation_error: None,
                     },
                 )])),
+                // THE EXACT-EQUAL MEMBERSHIPS: selected == full == the
+                // one-slot membership (the rollback's slots / the outcomes'
+                // keys) — the proven shape the conversion + read require.
+                selected_membership: BTreeSet::from([SlotId::new(SLOT.to_string())]),
+                full_membership: BTreeSet::from([SlotId::new(SLOT.to_string())]),
             },
             reason: None,
         }

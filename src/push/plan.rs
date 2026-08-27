@@ -1133,8 +1133,11 @@ interval_seconds = 0
                 &LedgerTerminal {
                     recorded_at: "2026-01-01T00:00:00Z".to_string(),
                     // The EXACT-EQUAL shape: one Activated outcome per
-                    // slotted generation (the four-set equality is enforced
-                    // by the conversion).
+                    // slotted generation, and the memberships PROVE the
+                    // equations (outcomes == selected == full == the
+                    // rollback's slots — the read enforces them, so a
+                    // seeded Successful terminal must carry one outcome per
+                    // slotted generation).
                     disposition: TerminalDisposition::Successful {
                         rollback: LedgerRollback {
                             slots: slots.clone(),
@@ -1158,6 +1161,12 @@ interval_seconds = 0
                                 })
                                 .collect(),
                         ),
+                        // THE EXACT-EQUAL MEMBERSHIPS: selected == full ==
+                        // the slotted generations' keys (the rollback's
+                        // slots / the outcomes' keys) — the proven shape the
+                        // conversion + read require.
+                        selected_membership: slots.keys().cloned().collect(),
+                        full_membership: slots.keys().cloned().collect(),
                     },
                     reason: None,
                 },

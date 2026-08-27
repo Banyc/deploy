@@ -72,7 +72,7 @@ use crate::records::{
     PhysicalBinding, SlotAttemptState, SlotOutcome, SlotResult, SlotTable, TerminalDisposition,
 };
 use crate::store::local::LocalStore;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The reference LANGUAGE (types + parser) is re-exported here from
 /// [`crate::revset`], which owns the grammar; this module keeps only the
@@ -242,6 +242,20 @@ pub fn ref_name(target: &TargetName, deployment_id: &DeploymentId) -> String {
 /// bindings, unselected slots are carried forward unchanged, and slots
 /// removed from the current target configuration (`current_slot_ids`) are
 /// omitted.
+///
+/// THE PERSISTED MEMBERSHIPS: the terminal records BOTH memberships so the
+/// record PROVES the membership equations — `selected_membership` = the
+/// outcome keys (the slots this attempt actually deployed; ==
+/// `attempt.membership()` on the happy path — the outcomes are the ground
+/// truth the conversion verifies against) and `full_membership` =
+/// `current_slot_ids` (the COMPLETE target membership at terminal time).
+/// The writer also VERIFIES `build_rollback`'s result key set EQUALS
+/// `current_slot_ids` (fail closed): the read side rejects a mismatch
+/// (rollback slots == full_membership), so the writer must produce
+/// equality — by construction the overlay covers exactly the current slots
+/// (unselected slots carried forward from the base, removed slots omitted,
+/// and the partial-rollout guards in [`crate::push::plan::validate_partial_rollout`]
+/// refuse any current slot without a base entry), and this check pins it.
 pub fn finalize_successful_attempt(
     store: &LocalStore,
     attempt: &DeploymentIntent,
@@ -263,12 +277,33 @@ pub fn finalize_successful_attempt(
     // BEFORE this attempt (this attempt's terminal is not yet appended).
     let base = crate::push::plan::latest_successful_rollback(store, attempt.target.as_str())?;
     let rollback = build_rollback(actuals, bindings, base.as_ref(), current_slot_ids)?;
+    // THE WRITER'S EQUALITY (fail closed): the rollback's key set must
+    // EXACTLY equal the full membership (`current_slot_ids`) — the read
+    // path rejects a mismatch (rollback slots == full_membership), so the
+    // writer must produce equality. By construction the overlay covers
+    // exactly the current slots; this check pins the invariant at the
+    // WRITER so a drift surfaces as a clear error here rather than as a
+    // ledger that can never be read again.
+    let rollback_keys: BTreeSet<SlotId> = rollback.slots.keys().cloned().collect();
+    let current: BTreeSet<SlotId> = current_slot_ids.iter().cloned().collect();
+    if rollback_keys != current {
+        return Err(Error::integrity(format!(
+            "finalize {}: the rollback snapshot covers slots {rollback_keys:?} but the current target membership is {current:?} — the complete snapshot must cover exactly the current slots (unselected slots are carried forward from the base; slots removed from the configuration are omitted)",
+            attempt.deployment_id
+        )));
+    }
     let terminal = LedgerTerminal {
         recorded_at: crate::remote::helper::now_rfc3339(),
         // The Successful disposition ALWAYS carries the complete rollback
         // payload (the truth table is structural in the domain) AND its OWN
         // outcomes table (the wire-shaped outcomes' redundant `slot_id` is
-        // dropped into the key — the domain value carries no slot).
+        // dropped into the key — the domain value carries no slot) AND the
+        // TWO PERSISTED MEMBERSHIPS: `selected_membership` = the outcome
+        // keys (the slots this attempt actually deployed) and
+        // `full_membership` = `current_slot_ids` (the complete target
+        // membership at terminal time) — the record PROVES the membership
+        // equations (outcomes == selected, rollback == full, selected ⊆
+        // full, full-push selected == full).
         disposition: TerminalDisposition::Successful {
             rollback,
             outcomes: SlotTable::from_map(
@@ -277,6 +312,8 @@ pub fn finalize_successful_attempt(
                     .map(|(k, r)| (k.clone(), SlotOutcome::from(r.clone())))
                     .collect(),
             ),
+            selected_membership: outcomes.keys().cloned().collect(),
+            full_membership: current,
         },
         reason: Some(reason.to_string()),
     };
@@ -544,13 +581,13 @@ mod tests {
     /// its rollback (one slot `p1`, deterministic payload derived from the
     /// deployment id so "exactly its stored state" is a meaningful equality).
     /// The EXACT-EQUAL shape: one Activated outcome per slotted generation
-    /// (the four-set equality is enforced by the conversion).
+    /// (the membership equations (outcomes == selected == full == rollback slots) are enforced by the conversion).
     fn successful_terminal(dep: &str, release: &str) -> LedgerTerminal {
         LedgerTerminal {
             recorded_at: "2026-01-01T00:00:00Z".to_string(),
             // The EXACT-EQUAL shape: one Activated outcome per slotted
-            // generation (the four-set equality is enforced by the
-            // conversion).
+            // generation (the membership equations — outcomes == selected ==
+            // full == rollback slots — are enforced by the conversion).
             disposition: TerminalDisposition::Successful {
                 rollback: LedgerRollback {
                     slots: BTreeMap::from([(
@@ -586,6 +623,11 @@ mod tests {
                         observation_error: None,
                     },
                 )])),
+                // THE EXACT-EQUAL MEMBERSHIPS: selected == full == the
+                // one-slot membership (the rollback's slots / the outcomes'
+                // keys) — the proven shape the conversion + read require.
+                selected_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
+                full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
             },
             reason: None,
         }
@@ -1002,13 +1044,20 @@ mod tests {
         assert_eq!(rollback.slots.len(), 0, "no fake GenerationRef is inserted");
     }
 
-    /// A legacy ledger line whose rollback has no `bindings` key must still
+    /// A legacy LEDGER LINE whose rollback has no `bindings` key must still
     /// deserialize; its `bindings` map defaults to empty, which rollback
     /// treats as unverifiable rather than guessing the host/location. The
     /// line ALSO carries the OLD snapshot-wide `behavior_sha256`/`release`
     /// members — serde ignores the unknown fields, and the rollback payload
     /// is interpreted purely through the per-slot bindings (legacy lines stay
-    /// readable after the snapshot-wide fields were removed).
+    /// readable after the snapshot-wide fields were removed). The line is
+    /// otherwise in the CURRENT v3 shape — it carries the REQUIRED
+    /// `selected_membership` / `full_membership` members (empty here) so the
+    /// legacy aspect under test is the rollback's missing `bindings` and the
+    /// snapshot-wide members, not the membership fields. A line WITHOUT the
+    /// v3 membership members is an OLD-SHAPE record and fails
+    /// DESERIALIZATION fail-closed (the fields are REQUIRED — no serde
+    /// default), pinned below.
     #[test]
     fn legacy_rollback_without_bindings_deserializes_with_empty_map() {
         // The id must be a canonical (validated) deployment id — the legacy
@@ -1017,7 +1066,7 @@ mod tests {
         let did = test_deployment_id("deploy-old");
         let rel = crate::model::test_release_id("old");
         let line = format!(
-            r#"{{"kind":"terminal","deployment_id":"{did}","target":"production","status":"successful","recorded_at":"2026-01-01T00:00:00Z","outcomes":{{}},"rollback":{{"behavior_sha256":"sha256-aa","release":"{rel}","slots":{{}}}}}}"#
+            r#"{{"kind":"terminal","deployment_id":"{did}","target":"production","status":"successful","recorded_at":"2026-01-01T00:00:00Z","outcomes":{{}},"selected_membership":[],"full_membership":[],"rollback":{{"behavior_sha256":"sha256-aa","release":"{rel}","slots":{{}}}}}}"#
         );
         // The legacy line PARSES at the wire level (the legacy snapshot-wide
         // members are tolerated by serde — unknown members are skipped), and
@@ -1029,6 +1078,23 @@ mod tests {
             "a legacy release that disagrees with the derived snapshot releases fails closed",
         );
         assert!(err.to_string().contains("release"), "error: {err}");
+
+        // AN OLD-SHAPE TERMINAL LINE (no `selected_membership` /
+        // `full_membership` members — the v2 shape) fails DESERIALIZATION
+        // fail-closed: the v3 membership fields are REQUIRED (no serde
+        // default), so a pre-v3 record can never be read as if it carried
+        // proven memberships (the intent-line `deployment_schema_version`
+        // check refuses its intent the same way).
+        let old_line = format!(
+            r#"{{"kind":"terminal","deployment_id":"{did}","target":"production","status":"successful","recorded_at":"2026-01-01T00:00:00Z","outcomes":{{}},"rollback":{{"slots":{{}}}}}}"#
+        );
+        let err = serde_json::from_str::<crate::records::LedgerTerminalWire>(&old_line)
+            .expect_err("an old-shape terminal line without the v3 memberships must fail deserialization fail-closed");
+        assert!(
+            err.to_string().contains("selected_membership")
+                || err.to_string().contains("full_membership"),
+            "the deserialization error must name the missing REQUIRED membership field, got: {err}"
+        );
     }
 
     /// A deployment-history shape: 0..=8 (deployment_id, successful?) pairs

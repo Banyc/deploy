@@ -853,6 +853,14 @@ impl LocalStore {
                     bindings: BTreeMap::new(),
                 },
                 outcomes: SlotTable::new(),
+                // Status-only append: no memberships are supplied. NOTE: a
+                // Successful terminal with EMPTY memberships is refused by
+                // the read path (a successful deployment proves its
+                // memberships) — this TEST adapter only ever appends; the
+                // successful variant exists for compile/type symmetry and is
+                // not expected to round-trip through a read.
+                selected_membership: BTreeSet::new(),
+                full_membership: BTreeSet::new(),
             },
             DeploymentStatus::FailedPreflight => TerminalDisposition::FailedPreflight,
             DeploymentStatus::FailedRolledBack => TerminalDisposition::FailedRolledBack {

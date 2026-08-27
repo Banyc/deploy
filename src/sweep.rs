@@ -54,7 +54,7 @@ use crate::testutil::test_faults::FaultKind;
 use crate::testutil::test_remotes::FailOnceInventoryRemote;
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -234,12 +234,13 @@ fn intent(id: &str, target: &str) -> DeploymentIntent {
 /// A SUCCESSFUL terminal whose rollback references `release` and `tree` —
 /// the exact bindings the checkpoint's reachability scan keeps. The
 /// EXACT-EQUAL shape: one Activated outcome per slotted generation (the
-/// four-set equality is enforced by the conversion).
+/// membership equations — outcomes == selected == full == rollback slots —
+/// are enforced by the conversion).
 fn terminal_for(release: &str, tree: &str) -> LedgerTerminal {
     LedgerTerminal {
         recorded_at: "2026-01-01T00:00:00Z".to_string(),
         // The EXACT-EQUAL shape: one Activated outcome per slotted
-        // generation (the four-set equality is enforced by the conversion).
+        // generation (the membership equations (outcomes == selected == full == rollback slots) are enforced by the conversion).
         disposition: TerminalDisposition::Successful {
             rollback: LedgerRollback {
                 slots: BTreeMap::from([(
@@ -275,6 +276,11 @@ fn terminal_for(release: &str, tree: &str) -> LedgerTerminal {
                     observation_error: None,
                 },
             )])),
+            // THE EXACT-EQUAL MEMBERSHIPS: selected == full == the
+            // one-slot membership (the rollback's slots / the outcomes'
+            // keys) — the proven shape the conversion + read require.
+            selected_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
+            full_membership: BTreeSet::from([SlotId::new("p1".to_string())]),
         },
         reason: None,
     }
