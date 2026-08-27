@@ -6,6 +6,7 @@ use deploy::error::Result;
 use deploy::model::{ServerId, SlotId, TreeDigest};
 use deploy::push::engine::{PushOptions, push};
 use deploy::records::{DeploymentStatus, LedgerEntry, LedgerRollback, PhysicalBinding};
+
 use deploy::remote::transport::{FsBytes, LocalTransport, Remote};
 use deploy::store::local::LocalStore;
 use std::path::Path;

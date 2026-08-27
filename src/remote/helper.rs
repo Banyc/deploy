@@ -788,7 +788,7 @@ mod tests {
             deployment_id: test_deployment_id("deploy-1"),
             generation_id: test_generation_id(gen_id),
             artifact: ArtifactRef {
-                release: ReleaseId::new("rel-sha256-x".to_string()),
+                release: crate::model::test_release_id("rel-sha256-x"),
                 variant: crate::model::VariantName::new("standard".to_string()),
                 tree: crate::model::test_tree_digest(tree),
             },

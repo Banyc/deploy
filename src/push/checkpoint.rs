@@ -473,7 +473,7 @@ mod tests {
                 desired: DesiredGeneration {
                     generation: test_generation_id("gen-1"),
                     artifact: ArtifactRef {
-                        release: ReleaseId::new("rel-1".to_string()),
+                        release: crate::model::test_release_id("rel-1"),
                         variant: VariantName::new("standard".to_string()),
                         tree: test_tree_digest("tree-1"),
                     },
@@ -501,7 +501,7 @@ mod tests {
                     assignment: PlacementSlotAssignment {
                         placement_slot: SlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
-                            release: ReleaseId::new(release.to_string()),
+                            release: crate::model::test_release_id(release),
                             variant: VariantName::new("standard".to_string()),
                             tree: test_tree_digest("tree-1"),
                         },
@@ -556,7 +556,11 @@ mod tests {
             let id = format!("{prefix}-{i}");
             store.append_intent(target, &intent(&id, target)).unwrap();
             if *ok {
-                let rel = format!("rel-sha256-{id}");
+                // The terminal's rollback canonicalizes its raw tag
+                // (rollback_for → test_release_id), so the ledger references
+                // test_release_id(id) — the same canonical id the seeded
+                // release dirs use.
+                let rel = id.clone();
                 store
                     .append_terminal(target, &test_deployment_id(&id), &terminal_for(&rel))
                     .unwrap();
@@ -646,7 +650,7 @@ interval_seconds = 0
         let dir = store.deployment_dir(test_deployment_id(deployment).as_str());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("plan.json"), "{}").unwrap();
-        let rel_dir = store.release_dir(&ReleaseId::new(release.to_string()));
+        let rel_dir = store.release_dir(&crate::model::test_release_id(release));
         std::fs::create_dir_all(&rel_dir).unwrap();
         std::fs::write(rel_dir.join("release.json"), "{}").unwrap();
         let obj_dir = store.object_root(&test_tree_digest(tree));
@@ -719,7 +723,7 @@ interval_seconds = 0
     /// names the ledgers/observations reference; only PINNED releases are
     /// read, and they need a real record seeded via [`seed_named_release`]).
     fn seed_named_release_dir(store: &LocalStore, name: &str) {
-        let dir = store.release_dir(&ReleaseId::new(name.to_string()));
+        let dir = store.release_dir(&crate::model::test_release_id(name));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("release.json"), "{}").unwrap();
     }
@@ -815,10 +819,11 @@ interval_seconds = 0
             "the pre-suffix deployment dir must be previewed for deletion"
         );
         assert!(
-            preview
-                .discards
-                .sweep_releases
-                .contains(&"rel-sha256-old".to_string()),
+            preview.discards.sweep_releases.contains(
+                &crate::model::test_release_id("rel-sha256-old")
+                    .as_str()
+                    .to_string()
+            ),
             "the pre-suffix release must be previewed for deletion"
         );
         assert!(
@@ -836,10 +841,11 @@ interval_seconds = 0
                 .contains(&test_deployment_id("deploy-1").as_str().to_string())
         );
         assert!(
-            !preview
-                .discards
-                .sweep_releases
-                .contains(&"rel-sha256-mid".to_string())
+            !preview.discards.sweep_releases.contains(
+                &crate::model::test_release_id("rel-sha256-mid")
+                    .as_str()
+                    .to_string()
+            )
         );
         assert!(
             !preview
@@ -896,7 +902,7 @@ interval_seconds = 0
         );
         assert!(
             !store
-                .release_dir(&ReleaseId::new("rel-sha256-ghost"))
+                .release_dir(&crate::model::test_release_id("rel-sha256-ghost"))
                 .exists()
         );
         assert!(!store.object_root(&test_tree_digest("tree-ghost")).exists());
@@ -956,9 +962,9 @@ interval_seconds = 0
         seed_history(&store, TARGET, "deploy", &[true]);
         seed_history(&store, "t2", "dep2", &[true]);
         // The referenced release dirs (kept by NAME: the ledgers reference
-        // them).
-        seed_named_release_dir(&store, "rel-sha256-deploy-0");
-        seed_named_release_dir(&store, "rel-sha256-dep2-0");
+        // them — seeded under the same canonical tags the ledgers use).
+        seed_named_release_dir(&store, "deploy-0");
+        seed_named_release_dir(&store, "dep2-0");
         // Unreachable ghost release.
         seed_named_release_dir(&store, "rel-sha256-ghost");
 
@@ -971,19 +977,19 @@ interval_seconds = 0
         // ledger's release, and the pinned release.
         assert!(
             store
-                .release_dir(&ReleaseId::new("rel-sha256-deploy-0"))
+                .release_dir(&crate::model::test_release_id("deploy-0"))
                 .exists()
         );
         assert!(
             store
-                .release_dir(&ReleaseId::new("rel-sha256-dep2-0"))
+                .release_dir(&crate::model::test_release_id("dep2-0"))
                 .exists()
         );
         assert!(store.release_dir(&pinned).exists());
         // The ghost release was swept.
         assert!(
             !store
-                .release_dir(&ReleaseId::new("rel-sha256-ghost"))
+                .release_dir(&crate::model::test_release_id("rel-sha256-ghost"))
                 .exists()
         );
     }
@@ -1558,10 +1564,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         // The pre-suffix-only artifact MUST be in both (the fix).
         assert!(
-            executed
-                .discards
-                .sweep_releases
-                .contains(&PROPERTY_RELEASES[3].to_string()),
+            executed.discards.sweep_releases.contains(
+                &crate::model::test_release_id(PROPERTY_RELEASES[3])
+                    .as_str()
+                    .to_string()
+            ),
             "the pre-suffix-only release must be deleted (t1_len={t1_len}, at={at})"
         );
         assert!(
@@ -1628,7 +1635,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             );
             assert!(
                 clone
-                    .release_dir(&ReleaseId::new(PROPERTY_RELEASES[r].to_string()))
+                    .release_dir(&crate::model::test_release_id(PROPERTY_RELEASES[r]))
                     .exists()
             );
             assert!(

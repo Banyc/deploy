@@ -151,7 +151,7 @@ fn tree_size_on_host(root: &Path) -> u64 {
 mod tests {
     use super::*;
     use crate::model::{
-        ArtifactRef, DeploymentId, OperationId, ReleaseId, SlotId, VariantName, test_tree_digest,
+        ArtifactRef, DeploymentId, OperationId, SlotId, VariantName, test_tree_digest,
     };
     use crate::push::plan::PlannedAssignment;
     use crate::remote::helper::RemoteHelper;
@@ -324,7 +324,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let assignment = PlannedAssignment {
             placement_slot: SlotId::new("p1".to_string()),
             artifact: ArtifactRef {
-                release: ReleaseId::new("rel-sha256-cap".to_string()),
+                release: crate::model::test_release_id("rel-sha256-cap"),
                 variant: VariantName::new("standard".to_string()),
                 tree: tree.clone(),
             },
@@ -469,7 +469,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let assignment = PlannedAssignment {
             placement_slot: SlotId::new("p1".to_string()),
             artifact: ArtifactRef {
-                release: ReleaseId::new("rel-sha256-cap".to_string()),
+                release: crate::model::test_release_id("rel-sha256-cap"),
                 variant: VariantName::new("standard".to_string()),
                 tree,
             },

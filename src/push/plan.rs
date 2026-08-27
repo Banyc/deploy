@@ -1206,7 +1206,8 @@ interval_seconds = 0
         rec.release_id = crate::model::ReleaseId::from_digest(&digest)
             .as_str()
             .to_string();
-        ReleaseId::new(rec.release_id.clone())
+        crate::model::ReleaseId::parse(&rec.release_id)
+            .expect("consistent record carries a validated release id")
     }
 
     /// A `PushRef::Release` resolution against a release record that carries
@@ -1246,7 +1247,7 @@ interval_seconds = 0
             &PushRef::Release {
                 release: release.clone(),
             },
-            &ReleaseId::new("unused-local".to_string()),
+            &crate::model::test_release_id("unused-local"),
             &BTreeMap::new(),
             &store,
             &config,
@@ -1282,7 +1283,7 @@ interval_seconds = 0
     fn empty_slot_snapshot_record_fails_closed_at_read() {
         let (_dir, config) = project_with_config();
         let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
-        let release = ReleaseId::new("rel-sha256-legacy".to_string());
+        let release = crate::model::test_release_id("rel-sha256-legacy");
         // `write_release` refuses empty-snapshot records, so install the
         // legacy-shaped record directly (as pre-refactor on-disk data would
         // appear).
@@ -1300,7 +1301,7 @@ interval_seconds = 0
             &PushRef::Release {
                 release: release.clone(),
             },
-            &ReleaseId::new("unused-local".to_string()),
+            &crate::model::test_release_id("unused-local"),
             &BTreeMap::new(),
             &store,
             &config,
@@ -1345,7 +1346,7 @@ interval_seconds = 0
             &PushRef::Release {
                 release: release.clone(),
             },
-            &ReleaseId::new("unused".to_string()),
+            &crate::model::test_release_id("unused"),
             &BTreeMap::new(),
             &store,
             &config,
@@ -1446,7 +1447,7 @@ interval_seconds = 0
             &PushRef::Release {
                 release: release.clone(),
             },
-            &ReleaseId::new("unused".to_string()),
+            &crate::model::test_release_id("unused"),
             &BTreeMap::new(),
             &store,
             &config,
@@ -1497,7 +1498,7 @@ interval_seconds = 0
             &PushRef::Release {
                 release: release.clone(),
             },
-            &ReleaseId::new("unused".to_string()),
+            &crate::model::test_release_id("unused"),
             &BTreeMap::new(),
             &store,
             &config,
@@ -1584,7 +1585,7 @@ interval_seconds = 0
             &PushRef::Release {
                 release: release.clone(),
             },
-            &ReleaseId::new("unused".to_string()),
+            &crate::model::test_release_id("unused"),
             &BTreeMap::new(),
             &store,
             &config,
@@ -1628,7 +1629,7 @@ interval_seconds = 0
             &PushRef::Release {
                 release: release.clone(),
             },
-            &ReleaseId::new("unused".to_string()),
+            &crate::model::test_release_id("unused"),
             &BTreeMap::new(),
             &store,
             &config,
@@ -1681,7 +1682,7 @@ interval_seconds = 0
             &PushRef::Release {
                 release: release.clone(),
             },
-            &ReleaseId::new("unused".to_string()),
+            &crate::model::test_release_id("unused"),
             &BTreeMap::new(),
             &store,
             &config,
@@ -1779,7 +1780,7 @@ interval_seconds = 0
                 target: TargetName::new("t1".to_string()),
                 deployment_id: test_deployment_id("deploy-snapshot-histvar"),
             },
-            &ReleaseId::new("unused".to_string()),
+            &crate::model::test_release_id("unused"),
             &BTreeMap::new(),
             &store,
             &config,
@@ -1834,7 +1835,7 @@ interval_seconds = 0
                     assignment: PlacementSlotAssignment {
                         placement_slot: SlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
-                            release: ReleaseId::new("rel-sha256-legacy".to_string()),
+                            release: crate::model::test_release_id("rel-sha256-legacy"),
                             variant: VariantName::new("standard".to_string()),
                             tree: test_tree_digest("tree-legacy"),
                         },
@@ -1850,7 +1851,7 @@ interval_seconds = 0
                 target: TargetName::new("t1".to_string()),
                 deployment_id: test_deployment_id("deploy-legacy-snapshot"),
             },
-            &ReleaseId::new("unused".to_string()),
+            &crate::model::test_release_id("unused"),
             &BTreeMap::new(),
             &store,
             &config,
@@ -2020,7 +2021,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &PushRef::Release {
                     release: release.clone(),
                 },
-                &ReleaseId::new("unused-local".to_string()),
+                &crate::model::test_release_id("unused-local"),
                 &BTreeMap::new(),
                 &store,
                 &config,
@@ -2098,7 +2099,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &PushRef::Release {
                     release: release.clone(),
                 },
-                &ReleaseId::new("unused-local".to_string()),
+                &crate::model::test_release_id("unused-local"),
                 &BTreeMap::new(),
                 &store,
                 &drifted,
@@ -2261,7 +2262,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         store.write_release(&rec).unwrap();
 
         let selection = SlotSelection::normalize(&config, "t1", Some("G")).unwrap();
-        let local_release = ReleaseId::new("unused-local".to_string());
+        let local_release = crate::model::test_release_id("unused-local");
         let variant_trees =
             BTreeMap::from([("standard".to_string(), test_tree_digest("tree-current"))]);
 
@@ -2604,7 +2605,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             assert!(!frozen.is_empty(), "the frozen partition is non-empty");
             assert!(!current.is_empty(), "the current partition is non-empty");
             let selection = SlotSelection::normalize(&config, "t1", Some("G")).unwrap();
-            let local_release = ReleaseId::new("unused-local".to_string());
+            let local_release = crate::model::test_release_id("unused-local");
             let variant_trees = BTreeMap::from([(
                 "standard".to_string(),
                 test_tree_digest("tree-current"),
@@ -2842,7 +2843,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 let (assignments, desired, origin) = plan_assignments(
                     &SlotSelection::normalize(&config, dest, None).unwrap(),
                     &release_ref,
-                    &ReleaseId::new("unused-local".to_string()),
+                    &crate::model::test_release_id("unused-local"),
                     &BTreeMap::new(),
                     &store,
                     &config,
@@ -2879,7 +2880,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     target: TargetName::new("t1".to_string()),
                     deployment_id: test_deployment_id("deploy-source"),
                 },
-                &ReleaseId::new("unused".to_string()),
+                &crate::model::test_release_id("unused"),
                 &BTreeMap::new(),
                 &store,
                 &config,
@@ -3101,7 +3102,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     let (assignments, desired, origin) = plan_assignments(
                         &SlotSelection::normalize(&config, dest, None).unwrap(),
                         &release_ref,
-                        &ReleaseId::new("unused-local".to_string()),
+                        &crate::model::test_release_id("unused-local"),
                         &BTreeMap::new(),
                         &store,
                         &config,
@@ -3177,7 +3178,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 let err = plan_assignments(
                     &SlotSelection::normalize(&config, "t1", None).unwrap(),
                     &release_ref,
-                    &ReleaseId::new("unused-local".to_string()),
+                    &crate::model::test_release_id("unused-local"),
                     &BTreeMap::new(),
                     &store,
                     &config,
@@ -3194,7 +3195,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 let (assignments, _, _) = plan_assignments(
                     &SlotSelection::normalize(&config, "t2", None).unwrap(),
                     &release_ref,
-                    &ReleaseId::new("unused-local".to_string()),
+                    &crate::model::test_release_id("unused-local"),
                     &BTreeMap::new(),
                     &store,
                     &config,
@@ -3242,7 +3243,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let (_dir, config) = project_with_config();
             let store = LocalStore::with_base(_dir.path().join("store")).unwrap();
             let deployment_id = test_deployment_id("deploy-prop-plan");
-            let snapshot_release = ReleaseId::new(format!("rel-sha256-{tree}"));
+            let snapshot_release = crate::model::test_release_id(&tree);
             let slots = BTreeMap::from([(
                 SlotId::new("p1".to_string()),
                 GenerationRef {
@@ -3277,7 +3278,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     target: TargetName::new("t1".to_string()),
                     deployment_id: deployment_id.clone(),
                 },
-                &ReleaseId::new("unused-local".to_string()),
+                &crate::model::test_release_id("unused-local"),
                 &BTreeMap::new(),
                 &store,
                 &config,
@@ -3313,7 +3314,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     target: TargetName::new("t1".to_string()),
                     deployment_id: missing.clone(),
                 },
-                &ReleaseId::new("unused".to_string()),
+                &crate::model::test_release_id("unused"),
                 &BTreeMap::new(),
                 &store,
                 &config,
@@ -3585,7 +3586,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 target: TargetName::new("t1".to_string()),
                 deployment_id: rollback_id.clone(),
             },
-            &ReleaseId::new("unused".to_string()),
+            &crate::model::test_release_id("unused"),
             &BTreeMap::new(),
             &store,
             &config,
@@ -3843,7 +3844,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     assignment: PlacementSlotAssignment {
                         placement_slot: SlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
-                            release: ReleaseId::new("rel-deploy".to_string()),
+                            release: crate::model::test_release_id("rel-deploy"),
                             variant: VariantName::new("standard".to_string()),
                             tree: test_tree_digest("tree-deploy"),
                         },
@@ -3857,7 +3858,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     assignment: PlacementSlotAssignment {
                         placement_slot: SlotId::new("p2".to_string()),
                         artifact: ArtifactRef {
-                            release: ReleaseId::new("rel-deploy".to_string()),
+                            release: crate::model::test_release_id("rel-deploy"),
                             variant: VariantName::new("standard".to_string()),
                             tree: test_tree_digest("tree-deploy"),
                         },
@@ -3915,7 +3916,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         ) {
             let (_dir, config, store, release) =
                 temporal_sources_fixture(release_variant, release_drift, binding_drift);
-            let local_release = ReleaseId::new("unused-local".to_string());
+            let local_release = crate::model::test_release_id("unused-local");
             let variant_trees: BTreeMap<String, TreeDigest> = if head_broken {
                 BTreeMap::new()
             } else {
@@ -4093,7 +4094,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 for a in &assignments {
                     assert_eq!(
                         a.artifact.release.as_str(),
-                        "rel-deploy",
+                        crate::model::test_release_id("rel-deploy").as_str(),
                         "the artifact comes from the deployment's exact stored state"
                     );
                     assert_eq!(a.artifact.variant.as_str(), "standard");
@@ -4101,7 +4102,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 }
                 assert_eq!(
                     desired,
-                    BTreeSet::from([ReleaseId::new("rel-deploy".to_string())])
+                    BTreeSet::from([crate::model::test_release_id("rel-deploy")])
                 );
                 assert_eq!(
                     origin,
@@ -4254,7 +4255,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let planned = plan_assignments(
                 &SlotSelection::normalize(&config2, "t1", None).unwrap(),
                 &PushRef::Head,
-                &ReleaseId::new("local".to_string()),
+                &crate::model::test_release_id("local"),
                 &BTreeMap::from([(
                     "standard".to_string(),
                     test_tree_digest("tree"),

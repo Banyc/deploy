@@ -2301,7 +2301,7 @@ pub fn resolved_mode(mode: &Option<String>) -> Result<Option<u32>> {
 mod tests {
     use super::*;
     use crate::model::{
-        ArtifactRef, LEDGER_SCHEMA_VERSION, ReleaseId, TargetName, VariantName, test_deployment_id,
+        ArtifactRef, LEDGER_SCHEMA_VERSION, TargetName, VariantName, test_deployment_id,
         test_generation_id, test_tree_digest,
     };
     use crate::records::{
@@ -3578,7 +3578,7 @@ interval_seconds = 0
                 desired: DesiredGeneration {
                     generation: test_generation_id("gen-1"),
                     artifact: ArtifactRef {
-                        release: ReleaseId::new("rel-1".to_string()),
+                        release: crate::model::test_release_id("rel-1"),
                         variant: VariantName::new("standard".to_string()),
                         tree: test_tree_digest("tree-1"),
                     },

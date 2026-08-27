@@ -1906,24 +1906,43 @@ pub struct ObservedSlot {
 }
 
 /// Observed remote state for a whole target (`observed.json`).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservedTarget {
     pub target: TargetName,
     #[serde(default)]
     pub slots: BTreeMap<SlotId, ObservedSlot>,
 }
 
+impl Default for ObservedTarget {
+    fn default() -> Self {
+        Self {
+            target: TargetName::parse("default").expect("default target is a safe segment"),
+            slots: BTreeMap::new(),
+        }
+    }
+}
+
 /// Persisted per-server local record (`servers/<id>.json`). Keyed by the
 /// ACTUAL server identity ([`ServerId`], transport addressing); the
 /// slot→assignment maps live in [`ObservedTarget`] keyed by
 /// [`SlotId`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerState {
     pub id: ServerId,
     #[serde(default)]
     pub last_seen_target: Option<TargetName>,
     #[serde(default)]
     pub last_observed: Option<ObservedSlot>,
+}
+
+impl Default for ServerState {
+    fn default() -> Self {
+        Self {
+            id: ServerId::parse("default").expect("default server is a safe segment"),
+            last_seen_target: None,
+            last_observed: None,
+        }
+    }
 }
 
 /// Where a plan's desired assignment comes from — the WIRE (on-disk) form
@@ -2502,7 +2521,7 @@ mod tests {
     use super::*;
     use crate::model::{
         PlacementSlotAssignment, SlotSet, VariantName, test_deployment_id, test_generation_id,
-        test_tree_digest, unknown_artifact,
+        test_release_id, test_tree_digest, unknown_artifact,
     };
     use crate::store::local::LocalStore;
     use proptest::prelude::*;
@@ -2533,7 +2552,7 @@ mod tests {
             assignment: PlacementSlotAssignment {
                 placement_slot: key.clone(),
                 artifact: ArtifactRef {
-                    release: ReleaseId::new(format!("rel-{}", key.as_str())),
+                    release: test_release_id(key.as_str()),
                     variant: VariantName::new("standard".to_string()),
                     tree: test_tree_digest(key.as_str()),
                 },
@@ -2825,7 +2844,12 @@ mod tests {
         for key in keys {
             let entry = &intent.slots[key];
             assert!(
-                entry.desired.artifact.release.as_str().starts_with("rel-"),
+                entry
+                    .desired
+                    .artifact
+                    .release
+                    .as_str()
+                    .starts_with("rel-sha256-"),
                 "each member carries its desired assignment"
             );
             // The pre_push ENTRY is structural: every member slot has an
@@ -3414,7 +3438,7 @@ mod tests {
         assert_eq!(domain.membership(), vec![slot(1)]);
         assert_eq!(
             domain.releases(),
-            BTreeSet::from([ReleaseId::new("rel-slot-1".to_string())])
+            BTreeSet::from([test_release_id("slot-1")])
         );
         assert_eq!(domain.slots.len(), 1, "one table, one member");
         assert!(
@@ -3423,7 +3447,7 @@ mod tests {
                 .artifact
                 .release
                 .as_str()
-                .starts_with("rel-")
+                .starts_with("rel-sha256-")
         );
         // Round trip: the one table re-expands into the wire split shape and
         // back unchanged.
@@ -3935,7 +3959,7 @@ mod tests {
         let domain = wire.clone().into_domain().unwrap();
         assert_eq!(
             domain.releases(),
-            BTreeSet::from([ReleaseId::new("rel-slot-1".to_string())])
+            BTreeSet::from([test_release_id("slot-1")])
         );
         let json = serde_json::to_string(&domain).unwrap();
         let wire2: LedgerRollbackWire = serde_json::from_str(&json).unwrap();
@@ -3965,13 +3989,13 @@ mod tests {
             "an assignment naming another placement fails closed"
         );
         let mut bad = wire.clone();
-        bad.release = Some(ReleaseId::new("rel-other".to_string()));
+        bad.release = Some(test_release_id("rel-other"));
         assert!(
             bad.into_domain().is_err(),
             "a legacy release disagreeing with the derived release fails closed"
         );
         let mut good = wire.clone();
-        good.release = Some(ReleaseId::new("rel-slot-1".to_string()));
+        good.release = Some(test_release_id("slot-1"));
         assert!(
             good.into_domain().is_ok(),
             "an agreeing legacy release passes"
@@ -4685,7 +4709,7 @@ mod tests {
     /// agreeing, and — for a Release source — a claimed rebinding agreeing
     /// with the plan's own source/target/membership.
     fn agreeing_plan_wire(source_kind: u32, keys: &[SlotId]) -> DeploymentPlanWire {
-        let release = ReleaseId::new("rel-plan".to_string());
+        let release = test_release_id("rel-plan");
         let target = TargetName::new("t1".to_string());
         let slots: BTreeMap<SlotId, SlotPlan> = keys
             .iter()
@@ -4730,7 +4754,7 @@ mod tests {
     /// source: Head/Deployment → ReleaseRef (no rebinding — a Release
     /// origin without its proof is unrepresentable).
     fn source_to_release(w: &mut DeploymentPlanWire) {
-        w.source = PlanSource::ReleaseRef(ReleaseId::new("rel-plan".to_string()));
+        w.source = PlanSource::ReleaseRef(test_release_id("rel-plan"));
     }
 
     /// rebinding presence: remove the claimed rebinding from a Release
@@ -4742,7 +4766,7 @@ mod tests {
     /// rebinding presence: add a claimed rebinding (internally agreeing
     /// with the plan's own data) to a Head/Deployment plan.
     fn rebinding_added(w: &mut DeploymentPlanWire) {
-        let release = ReleaseId::new("rel-plan".to_string());
+        let release = test_release_id("rel-plan");
         let target = TargetName::new("t1".to_string());
         let keys: Vec<SlotId> = w.slots.keys().cloned().collect();
         w.rebinding = Some(agreeing_rebinding(&release, &target, &keys));
@@ -4755,13 +4779,13 @@ mod tests {
             .rebinding
             .as_mut()
             .expect("a release plan carries a rebinding");
-        rp.release = ReleaseId::new("rel-other".to_string());
+        rp.release = test_release_id("rel-other");
     }
 
     /// release: change the SOURCE's release (disagrees with the claimed
     /// rebinding's release).
     fn source_release_changed(w: &mut DeploymentPlanWire) {
-        w.source = PlanSource::ReleaseRef(ReleaseId::new("rel-other".to_string()));
+        w.source = PlanSource::ReleaseRef(test_release_id("rel-other"));
     }
 
     /// target: change the claimed rebinding's target (disagrees with the
@@ -4870,7 +4894,7 @@ mod tests {
             // carry none.
             match &domain.source {
                 PlanOrigin::Release { release, rebinding } => {
-                    assert_eq!(release.as_str(), "rel-plan");
+                    assert_eq!(release.as_str(), test_release_id("rel-plan").as_str());
                     assert_eq!(
                         rebinding.selected_plan_slots,
                         keys.iter().cloned().collect::<BTreeSet<_>>(),
@@ -5079,7 +5103,7 @@ mod tests {
             serde_json::from_str(&json).expect("the wire deserializes back into the domain");
         match &back.source {
             PlanOrigin::Release { release, rebinding } => {
-                assert_eq!(release.as_str(), "rel-plan");
+                assert_eq!(release.as_str(), test_release_id("rel-plan").as_str());
                 assert_eq!(
                     rebinding.selected_plan_slots,
                     BTreeSet::from([slot(1), slot(2)]),
@@ -5120,7 +5144,7 @@ mod tests {
             intent_wire.pre_push.insert(
                 k,
                 Some(SlotAttemptState {
-                    artifact: ArtifactRef::default(),
+                    artifact: crate::model::unknown_artifact(),
                     generation: g,
                 }),
             );

@@ -381,14 +381,30 @@ impl LocalStore {
                     }
                 }
             }
-            for slot in observed.values() {
-                if let Observation::Known(state) = &slot.observation {
+        }
+        for slot in observed.values() {
+            match &slot.observation {
+                Observation::Known(state) => {
                     out.deployments
                         .insert(state.last_deployment.as_str().to_string());
                     out.releases
                         .insert(state.artifact.release.as_str().to_string());
                     out.trees.insert(state.artifact.tree.as_str().to_string());
                 }
+                // FAIL CLOSED: an UNKNOWN observation means the slot's
+                // live assignment could not be read — the GC cannot verify
+                // what the slot is running, so it must NOT delete anything
+                // it cannot verify. The sweep aborts (an integrity error)
+                // BEFORE any deletion; the Unknown contributes nothing to
+                // the retained set.
+                Observation::Unknown(_) => {
+                    return Err(Error::integrity(
+                        "an observed slot records an UNKNOWN observation (its live assignment \
+                         could not be read): the GC cannot verify what the slot is running, \
+                         so the sweep aborts before any deletion",
+                    ));
+                }
+                Observation::KnownAbsent => {}
             }
         }
         // Durable pins: a pin marks the WHOLE release — its record and every
@@ -401,7 +417,7 @@ impl LocalStore {
         // — the pin cannot be honored, so reachability is incomplete and the
         // sweep must abort before any deletion.
         for pin in config.pins() {
-            let rid = crate::model::ReleaseId::parse(&pin.release);
+            let rid = crate::model::ReleaseId::parse(&pin.release)?;
             self.honor_release_pin(&mut out, &rid, true)?;
         }
         // Store-level pins (`pins.json`): a MISSING file is the empty pin set

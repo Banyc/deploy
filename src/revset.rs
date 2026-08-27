@@ -380,18 +380,16 @@ fn release_form(input: &mut &str, token: &str) -> ModalResult<RefExpr, RefErr> {
 
 fn release_id(input: &mut &str, token: &str) -> ModalResult<ReleaseId, RefErr> {
     let id = rest.parse_next(input)?;
-    let valid = if let Some(r) = id.strip_prefix("rel-sha256-") {
-        !r.is_empty()
-    } else {
-        !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit())
-    };
-    if !valid {
-        return Err(ErrMode::Cut(RefErr(format!(
+    // The CLI input parser accepts the full `rel-sha256-<64 hex>` form OR a
+    // bare 64-hex digest (converting the latter to the full form BEFORE the
+    // domain parse); the DOMAIN [`ReleaseId`] stays strict. Anything else is
+    // a CLI error.
+    crate::cli::parse_release_input(id).map_err(|_| {
+        ErrMode::Cut(RefErr(format!(
             "unrecognized release id '{id}' in '{token}' (expected 'release:<rel-sha256-...>' or \
             'release:<hex digest>')"
-        ))));
-    }
-    Ok(ReleaseId::parse(id))
+        )))
+    })
 }
 
 /// The removed/legacy grammar, each shape failing with its migration hint.
@@ -595,14 +593,16 @@ pub(crate) mod tests {
     /// ancestor forms are removed).
     #[test]
     fn parse_ref_direct_release_form() {
+        let digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let full = format!("rel-sha256-{digest}");
         assert_eq!(
-            parse_ref_expr("release:rel-sha256-deadbeef").unwrap(),
-            RefExpr::Release(ReleaseId::new("rel-sha256-deadbeef".to_string()))
+            parse_ref_expr(&format!("release:{full}")).unwrap(),
+            RefExpr::Release(crate::model::ReleaseId::parse(&full).unwrap())
         );
         // A bare digest is normalized to the full `rel-sha256-` id.
         assert_eq!(
-            parse_ref_expr("release:deadbeef").unwrap(),
-            RefExpr::Release(ReleaseId::new("rel-sha256-deadbeef".to_string()))
+            parse_ref_expr(&format!("release:{digest}")).unwrap(),
+            RefExpr::Release(crate::model::ReleaseId::parse(&full).unwrap())
         );
     }
 

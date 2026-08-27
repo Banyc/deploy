@@ -140,7 +140,7 @@ fn valid_operation_id(s: &str) -> bool {
 /// A valid sha256 digest: exactly 64 lowercase hex characters (the exact form
 /// [`crate::digest::sha256_bytes`] produces). Any other string — empty, short,
 /// long, uppercase, non-hex, or prefixed — is rejected.
-fn valid_hex_digest(s: &str) -> bool {
+pub(crate) fn valid_hex_digest(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
@@ -155,7 +155,11 @@ fn valid_hex_digest(s: &str) -> bool {
 macro_rules! id_newtype {
     ($name:ident, $validator:expr, $doc:expr) => {
         #[doc = $doc]
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Default)]
+        // NOTE: deliberately NO `Default` — a `Default` identity would be an
+        // EMPTY string, a malformed durable record constructible by anyone
+        // (the exact gap this hardening closes). An identity can only be
+        // built through the validated [`parse`] (or `FromStr`/`TryFrom`).
+        #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -251,25 +255,40 @@ id_newtype!(
      exact form [`crate::digest::sha256_bytes`] produces."
 );
 
-/// Release identifier: `rel-sha256-<release-digest>`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// Release identifier: EXACTLY `rel-sha256-<64 lowercase hex>` — the canonical
+/// form [`ReleaseId::from_digest`] produces. The loose bare-digest and `rel-`
+/// forms are REJECTED at the domain boundary: a `ReleaseId` can only be built
+/// through the validated [`ReleaseId::parse`] (or `FromStr`/`TryFrom`/
+/// `from_digest`), so a malformed release id can never exist in a durable
+/// record. The CLI accepts a bare 64-hex digest as an input convenience via
+/// [`crate::cli::parse_release_input`], which converts it to the full form
+/// BEFORE the domain parse.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct ReleaseId(String);
 
 impl ReleaseId {
+    /// UNCHECKED constructor — TEST FIXTURES ONLY (mirrors the
+    /// [`id_newtype!`] contract). Production code must construct through
+    /// [`ReleaseId::parse`] (or `FromStr`/`TryFrom`/`from_digest`), so an
+    /// invalid release id can never be built outside tests.
+    #[cfg(test)]
     pub fn new(s: impl Into<String>) -> Self {
         ReleaseId(s.into())
     }
     pub fn from_digest(d: &ReleaseDigest) -> Self {
         ReleaseId(format!("rel-sha256-{}", d.0))
     }
-    /// Parse a full or prefixed release id; also accepts a bare digest.
-    pub fn parse(s: &str) -> Self {
-        if s.starts_with("rel-sha256-") {
-            ReleaseId(s.to_string())
-        } else {
-            ReleaseId(format!("rel-sha256-{}", s.trim_start_matches("rel-")))
+    /// Validate `s` against the EXACT `rel-sha256-<64 lowercase hex>` rule
+    /// and construct the identity. The loose bare-digest and `rel-` forms
+    /// are rejected HERE, at the domain boundary.
+    pub fn parse(s: &str) -> Result<ReleaseId> {
+        if let Some(rest) = s.strip_prefix("rel-sha256-")
+            && valid_hex_digest(rest)
+        {
+            return Ok(ReleaseId(s.to_string()));
         }
+        Err(Error::config(format!("invalid ReleaseId value {:?}", s)))
     }
     pub fn digest(&self) -> ReleaseDigest {
         ReleaseDigest(self.0.trim_start_matches("rel-sha256-").to_string())
@@ -282,6 +301,33 @@ impl ReleaseId {
 impl fmt::Display for ReleaseId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for ReleaseId {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<ReleaseId> {
+        ReleaseId::parse(s)
+    }
+}
+
+impl TryFrom<&str> for ReleaseId {
+    type Error = Error;
+    fn try_from(s: &str) -> Result<ReleaseId> {
+        ReleaseId::parse(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReleaseId {
+    /// Wire strings go through the validated parse: an invalid wire release
+    /// id fails deserialization (fail closed — a record that carries a
+    /// malformed release id is never silently accepted).
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        ReleaseId::parse(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -506,7 +552,11 @@ pub struct ResolvedVariant {
 /// the artifact relationship — plans, attempts, observed state, generation
 /// records, and snapshots all express it through [`ArtifactRef`] instead
 /// of re-declaring the three fields.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default)]
+///
+/// NOTE: deliberately NO `Default` — a `Default` artifact would carry an
+/// EMPTY (malformed) release id, the exact gap this hardening closes. An
+/// artifact can only be built from validated identities.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ArtifactRef {
     pub release: ReleaseId,
     pub variant: VariantName,
@@ -514,15 +564,24 @@ pub struct ArtifactRef {
 }
 
 /// The "assignment unknown" sentinel artifact: a VALID artifact reference
-/// marking a live assignment that could not be read. The wire validates
-/// identities, so the old empty-string `ArtifactRef::default()` can no
-/// longer round-trip a ledger/observed record; this sentinel is valid by
-/// construction (variant `unknown` is a safe segment, the tree digest is a
-/// fixed valid sha256) and is never substituted for a real assignment — it
+/// marking a live assignment that could not be read (the ATTEMPT model's
+/// [`crate::records::SlotAttemptState`] — the OBSERVED model uses the
+/// explicit [`crate::records::Observation::Unknown`] variant instead,
+/// never a sentinel). The sentinel is valid by construction (the release is
+/// the canonical empty-content sha256 id, variant `unknown` is a safe
+/// segment, the tree digest is a fixed valid sha256) so it round-trips the
+/// wire — the old `rel-sha256-unknown` release id was NOT a valid release
+/// id and failed the strict wire parse, the exact malformed-record gap this
+/// hardening closes. It is never substituted for a real assignment — it
 /// only ever marks "the live assignment could not be read".
 pub fn unknown_artifact() -> ArtifactRef {
     ArtifactRef {
-        release: ReleaseId::new("rel-sha256-unknown"),
+        release: ReleaseId::from_digest(
+            &ReleaseDigest::parse(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            )
+            .expect("sentinel digest is a valid sha256"),
+        ),
         variant: VariantName::parse("unknown").expect("sentinel variant is a safe segment"),
         tree: TreeDigest::parse("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
             .expect("sentinel digest is a valid sha256"),
@@ -775,6 +834,16 @@ pub(crate) fn test_sha256_hex(tag: &str) -> String {
 #[cfg(test)]
 pub(crate) fn test_tree_digest(tag: &str) -> TreeDigest {
     TreeDigest::parse(&test_sha256_hex(tag)).expect("canonical test digest")
+}
+
+/// A deterministic canonical `rel-sha256-<64-hex>` release id derived from a
+/// tag (the canonical form [`ReleaseId::from_digest`] produces — the only
+/// form the strict [`ReleaseId::parse`] accepts).
+#[cfg(test)]
+pub(crate) fn test_release_id(tag: &str) -> ReleaseId {
+    ReleaseId::from_digest(
+        &ReleaseDigest::parse(&test_sha256_hex(tag)).expect("canonical test digest"),
+    )
 }
 
 #[cfg(test)]

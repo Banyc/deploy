@@ -213,7 +213,7 @@ fn intent(id: &str, target: &str) -> DeploymentIntent {
             desired: DesiredGeneration {
                 generation: test_generation_id("gen-1"),
                 artifact: ArtifactRef {
-                    release: ReleaseId::new("rel-1".to_string()),
+                    release: crate::model::test_release_id("rel-1"),
                     variant: VariantName::new("standard".to_string()),
                     tree: test_tree_digest("tree-1"),
                 },
@@ -312,7 +312,7 @@ fn seed_history(store: &LocalStore, target: &str, prefix: &str, history: &[bool]
         let canonical = test_deployment_id(&id);
         store.append_intent(target, &intent(&id, target)).unwrap();
         if *ok {
-            let rel = format!("rel-sha256-{id}");
+            let rel = crate::model::test_release_id(&id).as_str().to_string();
             let tree = format!("tree-{id}");
             store
                 .append_terminal(target, &canonical, &terminal_for(&rel, &tree))
@@ -427,10 +427,15 @@ fn run_no_leak_case(
     let ids = seed_history(&store, TARGET, "deploy", &pusher_history);
     for (i, _) in pusher_history.iter().enumerate() {
         let id = format!("deploy-{i}");
-        seed_named_release(&store, &format!("rel-sha256-{id}"));
+        seed_named_release(&store, crate::model::test_release_id(&id).as_str());
         seed_object(&store, &format!("tree-{id}"));
     }
-    seed_unreachable(&store, "ghost-deploy", "rel-sha256-ghost", "tree-ghost");
+    seed_unreachable(
+        &store,
+        "ghost-deploy",
+        crate::model::test_release_id("rel-sha256-ghost").as_str(),
+        "tree-ghost",
+    );
 
     // ---- independence snapshots -------------------------------------------
     let ledger_before = store.read_ledger_lines(TARGET).unwrap();
@@ -494,7 +499,7 @@ fn run_no_leak_case(
         let reachable = *ok && i >= pos;
         assert_eq!(
             store
-                .release_dir(&ReleaseId::new(format!("rel-sha256-{id}")))
+                .release_dir(&crate::model::test_release_id(&id))
                 .exists(),
             reachable,
             "release of entry {id} must survive iff it is in the retained suffix"
@@ -511,7 +516,7 @@ fn run_no_leak_case(
     assert!(!store.deployment_dir("ghost-deploy").exists());
     assert!(
         !store
-            .release_dir(&ReleaseId::new("rel-sha256-ghost"))
+            .release_dir(&crate::model::test_release_id("rel-sha256-ghost"))
             .exists()
     );
     assert!(!store.object_root(&test_tree_digest("tree-ghost")).exists());
@@ -606,10 +611,15 @@ fn run_fault_case(pusher_history: Vec<bool>, checkpoint_at: usize, fault: SweepF
     let ids = seed_history(&store, TARGET, "deploy", &pusher_history);
     for (i, _) in pusher_history.iter().enumerate() {
         let id = format!("deploy-{i}");
-        seed_named_release(&store, &format!("rel-sha256-{id}"));
+        seed_named_release(&store, crate::model::test_release_id(&id).as_str());
         seed_object(&store, &format!("tree-{id}"));
     }
-    seed_unreachable(&store, "ghost-deploy", "rel-sha256-ghost", "tree-ghost");
+    seed_unreachable(
+        &store,
+        "ghost-deploy",
+        crate::model::test_release_id("rel-sha256-ghost").as_str(),
+        "tree-ghost",
+    );
     let at = checkpoint_at % ids.len();
     let checkpoint_id = &ids[at];
     // The checkpoint entry's RAW tag (its release/tree dirs are seeded under
@@ -659,7 +669,7 @@ fn run_fault_case(pusher_history: Vec<bool>, checkpoint_at: usize, fault: SweepF
         | SweepFault::GcDeleteReleases => {
             assert!(
                 store
-                    .release_dir(&ReleaseId::new("rel-sha256-ghost"))
+                    .release_dir(&crate::model::test_release_id("rel-sha256-ghost"))
                     .exists()
             );
         }
@@ -682,14 +692,14 @@ fn run_fault_case(pusher_history: Vec<bool>, checkpoint_at: usize, fault: SweepF
     assert!(!store.deployment_dir("ghost-deploy").exists());
     assert!(
         !store
-            .release_dir(&ReleaseId::new("rel-sha256-ghost"))
+            .release_dir(&crate::model::test_release_id("rel-sha256-ghost"))
             .exists()
     );
     assert!(!store.object_root(&test_tree_digest("tree-ghost")).exists());
     // Reachable + pinned content survives the converged sweep.
     assert!(
         store
-            .release_dir(&ReleaseId::new(format!("rel-sha256-deploy-{pos}")))
+            .release_dir(&crate::model::test_release_id(&format!("deploy-{pos}")))
             .exists()
     );
     assert!(

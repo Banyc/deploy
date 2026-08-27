@@ -1103,7 +1103,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let members = h.config.target_slots("t1").unwrap();
             let (slot, server) = members[0];
             let desired = ArtifactRef {
-                release: ReleaseId::new("rel-sha256-desired"),
+                release: crate::model::test_release_id("rel-sha256-desired"),
                 variant: VariantName::new("standard"),
                 tree: TreeDigest::new("desired-tree"),
             };

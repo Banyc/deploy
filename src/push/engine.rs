@@ -595,7 +595,8 @@ fn push_inner(
             &variant_slots,
             project_root,
         );
-        let rid = ReleaseId::new(rec.release_id.clone());
+        let rid = ReleaseId::parse(&rec.release_id)
+            .expect("newly built release record carries a validated release id");
         if !opts.dry_run {
             store.write_release(&rec)?;
             let release_json = serde_json::to_string(&rec)
@@ -659,7 +660,13 @@ fn push_inner(
                 });
             }
         }
-        (releases.first().cloned().unwrap_or_default(), index)
+        (
+            releases
+                .first()
+                .cloned()
+                .expect("releases non-empty after empty check"),
+            index,
+        )
     };
 
     // The behavior digest this attempt is bound to: the canonical digest of
@@ -1789,11 +1796,12 @@ fn push_inner(
     // (same generation, artifact, and deployment id as before — behavior
     // preserved), while a skipped/unreachable/unadvanced slot keeps the
     // assignment's OWN deployment id — the deployment that actually created
-    // the live generation — and, when the live assignment cannot be read,
-    // carries its PRIOR physical observed record over verbatim (never
-    // fabricated, never re-stamped). A FAILED status read is NEVER carried
-    // over as "unchanged": the observation is `Unknown(error)` — the slot
-    // may have changed; the failure just means we cannot see it.
+    // the live generation — and, when the live assignment cannot be read, the
+    // observed state is `Unknown(error)` — never a fabricated artifact, never
+    // a stale prior record presented as current. A FAILED status read is
+    // likewise NEVER carried over as "unchanged": the observation is
+    // `Unknown(error)` — the slot may have changed; the failure just means we
+    // cannot see it.
     let mut observed_warnings: Vec<String> = Vec::new();
     let mut observed_servers: BTreeMap<SlotId, ObservedSlot> = BTreeMap::new();
     for (slot, _sdef) in &members {
@@ -1822,28 +1830,25 @@ fn push_inner(
                     }
                     Err(_) => {
                         // The generation is observed but its assignment
-                        // cannot be read (missing/corrupt): carry the slot's
-                        // PRIOR PHYSICAL observed record over VERBATIM, so
-                        // the projection never fabricates state this push did
-                        // not establish and never re-stamps a deployment that
-                        // did not touch the slot. A slot with no prior record
-                        // stays absent.
-                        if let Ok(Some(prior_server)) = store.read_slot_observed(&slot_id) {
-                            observed_servers.insert(slot_id.clone(), prior_server);
-                        }
+                        // cannot be read (missing/corrupt): the observed
+                        // state is UNKNOWN — never a fabricated artifact,
+                        // never a stale prior record presented as current.
+                        observed_servers.insert(
+                            slot_id.clone(),
+                            ObservedSlot {
+                                observation: Observation::Unknown(ObservationError {
+                                    message: format!("assignment read failed for {g}"),
+                                }),
+                            },
+                        );
                     }
                 },
                 None => {
                     // The read succeeded showing no state: the slot has no
-                    // observed state (never deployed) — keep it absent (no
-                    // prior record to carry, and an explicit KnownAbsent
-                    // would fabricate an entry for a slot never observed).
-                    // A slot with a prior record that is now absent would be
-                    // handled by carrying that prior record, but a
-                    // never-deployed slot stays absent.
-                    if let Ok(Some(prior_server)) = store.read_slot_observed(&slot_id) {
-                        observed_servers.insert(slot_id.clone(), prior_server);
-                    }
+                    // observed state (never deployed) — keep it absent (an
+                    // explicit KnownAbsent would fabricate an entry for a slot
+                    // never observed; a stale prior record is never presented
+                    // as current).
                 }
             },
             Err(e) => {
@@ -7341,6 +7346,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let id1 = test_deployment_id("deploy-obs-fallback-baseline");
         let r1 = push_main_with_id(&h, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+        // The baseline's REAL live generation: the generation the prior
+        // observed record carried (an unreadable assignment must fall back to
+        // it, not to a fabricated/unknown marker).
         let gen1 = r1.attempt.as_ref().expect("attempt").slots[&SlotId::new("p1")]
             .generation
             .clone()
@@ -8317,7 +8325,7 @@ interval_seconds = 0
             let h = RecoveryHarness::new();
             let slot = SlotId::new("p1".to_string());
             let artifact = ArtifactRef {
-                release: ReleaseId::new("rel-sha256-1111".to_string()),
+                release: crate::model::test_release_id("rel-sha256-1111"),
                 variant: VariantName::new("p1".to_string()),
                 tree: test_tree_digest("aa"),
             };

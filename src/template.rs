@@ -589,7 +589,7 @@ mod tests {
         // The prior artifact differs in every artifact-scoped variable: a
         // historical release, a different variant, a different tree.
         let prior = v.with_artifact(&ArtifactRef {
-            release: ReleaseId::new("rel-sha256-999"),
+            release: crate::model::test_release_id("rel-sha256-999"),
             variant: VariantName::new("legacy"),
             tree: test_tree_digest("t9"),
         });
@@ -602,7 +602,8 @@ mod tests {
             )
             .unwrap(),
             format!(
-                "legacy|/srv/a|rel-sha256-999|deploy|app-1|g1|{}",
+                "legacy|/srv/a|{}|deploy|app-1|g1|{}",
+                crate::model::test_release_id("rel-sha256-999"),
                 test_tree_digest("t9")
             )
         );
@@ -638,7 +639,7 @@ mod tests {
             deployment_id: DeploymentId::new("d-prior"),
             generation_id: GenerationId::new("g-prior"),
             artifact: ArtifactRef {
-                release: ReleaseId::new("rel-sha256-999"),
+                release: crate::model::test_release_id("rel-sha256-999"),
                 variant: VariantName::new("legacy"),
                 tree: test_tree_digest("t9"),
             },
@@ -656,7 +657,8 @@ mod tests {
             )
             .unwrap(),
             format!(
-                "legacy|rel-sha256-999|{}|d-prior|g-prior",
+                "legacy|{}|{}|d-prior|g-prior",
+                crate::model::test_release_id("rel-sha256-999"),
                 test_tree_digest("t9")
             )
         );

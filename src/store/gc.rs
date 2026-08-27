@@ -33,7 +33,12 @@
 //! 2. **Every target's CURRENT OBSERVED state** (`slots/<id>/observed.json`
 //!    — the ONE physical observed record per slot; target views are a
 //!    selection over it): the observed artifact (release + tree) and the
-//!    observed `last_deployment` id.
+//!    observed `last_deployment` id. An observed slot whose observation
+//!    is `Unknown` ([`crate::records::Observation::Unknown`]; its live
+//!    assignment could not be read) is treated CONSERVATIVELY: the GC
+//!    cannot verify what the slot runs, so it must NOT delete anything it
+//!    cannot verify — the sweep aborts with an integrity error before any
+//!    deletion (never silently sweeping an unknown slot's content).
 //! 3. **Every pin** ([`crate::records::Pins`], `<base>/pins.json`, and the
 //!    caller's `deploy.toml` `[[pins]]`): a RELEASE pin marks every
 //!    variant/tree in that release record; an exact-binding entry keeps
@@ -89,6 +94,7 @@
 use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
 use crate::layout;
+#[cfg(test)]
 use crate::model::ReleaseId;
 use crate::store::atomic::{path_state, sync_parent_dir};
 use crate::store::history_floor::{LedgerOverride, ReachableSet};
@@ -293,7 +299,7 @@ impl LocalStore {
         let planned = candidates.len();
         let mut removed = 0usize;
         for name in &candidates {
-            let dir = self.release_dir(&ReleaseId::new(name.clone()));
+            let dir = self.release_dir_named(name);
             // TRI-STATE: an already-removed dir (a previous interrupted
             // pass) is a skip — it is neither removed now nor pending. ANY
             // other stat failure stops the stage (fail closed) with the
@@ -577,7 +583,7 @@ interval_seconds = 0
                 desired: DesiredGeneration {
                     generation: test_generation_id("gen-1"),
                     artifact: ArtifactRef {
-                        release: ReleaseId::new("rel-1".to_string()),
+                        release: crate::model::test_release_id("rel-1"),
                         variant: VariantName::new("standard".to_string()),
                         tree: test_tree_digest("tree-1"),
                     },
@@ -646,6 +652,9 @@ interval_seconds = 0
 
     /// Create a release directory under the given NAME with junk content —
     /// the sweep keeps or sweeps it by NAME (only PINNED releases are read).
+    /// The dir is created under the EXACT name given: callers pass the
+    /// canonical `rel-sha256-<64hex>` form the ledgers/observations/pins
+    /// reference (or a raw junk name for a pure-garbage candidate).
     fn seed_named_release(store: &LocalStore, name: &str) {
         let dir = store.release_dir(&ReleaseId::new(name.to_string()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -731,7 +740,10 @@ interval_seconds = 0
                 .append_terminal(
                     TARGET,
                     &canonical,
-                    &terminal_for(&format!("rel-sha256-ret-{i}"), &format!("tree-ret-{i}")),
+                    &terminal_for(
+                        crate::model::test_release_id(&format!("ret-{i}")).as_str(),
+                        &format!("tree-ret-{i}"),
+                    ),
                 )
                 .unwrap();
             retained_deployments.push(canonical.as_str().to_string());
@@ -743,7 +755,7 @@ interval_seconds = 0
             observation: Observation::Known(ObservedState {
                 generation: test_generation_id("gen-obs"),
                 artifact: ArtifactRef {
-                    release: ReleaseId::new("rel-sha256-obs".to_string()),
+                    release: crate::model::test_release_id("rel-sha256-obs"),
                     variant: VariantName::new("standard".to_string()),
                     tree: test_tree_digest("tree-obs"),
                 },
@@ -774,11 +786,22 @@ interval_seconds = 0
         // Physical dirs for every retained reference. The pinned releases'
         // dirs already exist (written by `write_release`); the rest get
         // junk-named dirs (kept/swept by NAME — only pinned records are
-        // read).
-        let mut retained_releases = vec!["rel-sha256-obs".to_string()];
+        // read). Every name here is the CANONICAL form the ledger/observed
+        // record/pin references (the observed slot references
+        // `test_release_id("rel-sha256-obs")`, so its dir carries the same
+        // canonical id).
+        let mut retained_releases = vec![
+            crate::model::test_release_id("rel-sha256-obs")
+                .as_str()
+                .to_string(),
+        ];
         let mut retained_trees = vec![test_tree_digest("tree-obs").as_str().to_string()];
         for i in 0..retained {
-            retained_releases.push(format!("rel-sha256-ret-{i}"));
+            retained_releases.push(
+                crate::model::test_release_id(&format!("ret-{i}"))
+                    .as_str()
+                    .to_string(),
+            );
             retained_trees.push(
                 test_tree_digest(&format!("tree-ret-{i}"))
                     .as_str()
@@ -803,7 +826,9 @@ interval_seconds = 0
         let mut garbage_releases = Vec::new();
         let mut garbage_trees = Vec::new();
         for i in 0..garbage {
-            let r = format!("rel-sha256-garbage-{i}");
+            let r = crate::model::test_release_id(&format!("garbage-{i}"))
+                .as_str()
+                .to_string();
             let t = test_tree_digest(&format!("tree-garbage-{i}"))
                 .as_str()
                 .to_string();
@@ -814,6 +839,7 @@ interval_seconds = 0
         }
         // The sweep's discard lists are SORTED (deletion order is the sorted
         // enumeration), so the oracle lists must be sorted too.
+        garbage_releases.sort();
         garbage_trees.sort();
         retained_trees.sort();
 
@@ -1087,19 +1113,25 @@ interval_seconds = 0
     fn config_pin_naming_missing_release_aborts_with_integrity() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let missing = ReleaseId::new("rel-sha256-missing".to_string());
+        let missing = crate::model::test_release_id("rel-sha256-missing");
         let config = config_with_pin(dir.path(), Some(&missing));
-        seed_named_release(&store, "rel-sha256-garbage");
+        seed_named_release(
+            &store,
+            crate::model::test_release_id("rel-sha256-garbage").as_str(),
+        );
         seed_object(&store, test_tree_digest("tree-garbage").as_str());
         let err = store.run_sweep(&config, "anchor", None).unwrap_err();
         assert!(
             matches!(err, Error::Integrity(_)),
             "a missing pinned release must abort with an integrity error, got: {err}"
         );
-        assert!(err.to_string().contains("missing"), "got: {err}");
+        assert!(
+            err.to_string().contains("has no release record on disk"),
+            "got: {err}"
+        );
         assert!(
             store
-                .release_dir(&ReleaseId::new("rel-sha256-garbage"))
+                .release_dir(&crate::model::test_release_id("rel-sha256-garbage"))
                 .exists(),
             "zero deletions: the garbage release survives"
         );
@@ -1141,7 +1173,10 @@ interval_seconds = 0
             serde_json::to_vec_pretty(&rec).unwrap(),
         )
         .unwrap();
-        seed_named_release(&store, "rel-sha256-garbage");
+        seed_named_release(
+            &store,
+            crate::model::test_release_id("rel-sha256-garbage").as_str(),
+        );
         seed_object(&store, test_tree_digest("tree-garbage").as_str());
         let config = config_with_pin(dir.path(), None);
         let err = store.run_sweep(&config, "anchor", None).unwrap_err();
@@ -1152,7 +1187,7 @@ interval_seconds = 0
         assert!(err.to_string().contains("pin"), "got: {err}");
         assert!(
             store
-                .release_dir(&ReleaseId::new("rel-sha256-garbage"))
+                .release_dir(&crate::model::test_release_id("rel-sha256-garbage"))
                 .exists(),
             "zero deletions: the garbage release survives"
         );
@@ -1171,7 +1206,7 @@ interval_seconds = 0
     fn exact_binding_pin_naming_missing_release_aborts_with_integrity() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let missing = ReleaseId::new("rel-sha256-missing".to_string());
+        let missing = crate::model::test_release_id("rel-sha256-missing");
         store
             .write_pins(&Pins {
                 schema_version: crate::model::PINS_SCHEMA_VERSION,
@@ -1183,7 +1218,10 @@ interval_seconds = 0
                 }],
             })
             .unwrap();
-        seed_named_release(&store, "rel-sha256-garbage");
+        seed_named_release(
+            &store,
+            crate::model::test_release_id("rel-sha256-garbage").as_str(),
+        );
         seed_object(&store, test_tree_digest("tree-garbage").as_str());
         let config = config_with_pin(dir.path(), None);
         let err = store.run_sweep(&config, "anchor", None).unwrap_err();
@@ -1193,7 +1231,7 @@ interval_seconds = 0
         );
         assert!(
             store
-                .release_dir(&ReleaseId::new("rel-sha256-garbage"))
+                .release_dir(&crate::model::test_release_id("rel-sha256-garbage"))
                 .exists(),
             "zero deletions: the garbage release survives"
         );

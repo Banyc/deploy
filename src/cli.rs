@@ -9,7 +9,7 @@
 use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
 use crate::init::{InitOptions, init_project};
-use crate::model::DeploymentId;
+use crate::model::{DeploymentId, ReleaseId, valid_hex_digest};
 use crate::push::engine::{PushOptions, PushReport, push};
 use crate::records::{DeploymentStatus, LedgerEntry, Observation, ObservedTarget};
 use crate::remote::create_remote;
@@ -448,6 +448,24 @@ where
     Ok(())
 }
 
+/// Parse a CLI release input: the full `rel-sha256-<64 lowercase hex>` form
+/// OR a bare 64-lowercase-hex digest (a convenience, converted to the full
+/// form BEFORE the domain parse). Anything else is a CLI error. The DOMAIN
+/// [`ReleaseId`] stays strict — the bare-digest convenience lives HERE, at
+/// the CLI boundary, never in the domain.
+pub fn parse_release_input(s: &str) -> Result<ReleaseId> {
+    if s.starts_with("rel-sha256-") {
+        ReleaseId::parse(s)
+    } else if valid_hex_digest(s) {
+        ReleaseId::parse(&format!("rel-sha256-{s}"))
+    } else {
+        Err(Error::config(format!(
+            "invalid release id {s:?}: expected 'rel-sha256-<64 lowercase hex>' or a bare \
+             64-hex digest"
+        )))
+    }
+}
+
 /// Render `deploy status <target>` output: one line per observed slot with
 /// the generation, release, variant, and tree AS OBSERVED ON THE SERVER right
 /// now (never from local history). A slot with no observed state
@@ -594,7 +612,8 @@ mod tests {
     use super::*;
     use crate::model::{
         ArtifactRef, GenerationRef, PlacementSlotAssignment, ReleaseId, ServerId, SlotId,
-        TargetName, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
+        TargetName, VariantName, test_deployment_id, test_generation_id, test_release_id,
+        test_tree_digest,
     };
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
@@ -612,7 +631,7 @@ mod tests {
                 desired: DesiredGeneration {
                     generation: test_generation_id("gen-1"),
                     artifact: ArtifactRef {
-                        release: ReleaseId::new("rel-1".to_string()),
+                        release: test_release_id("rel-1"),
                         variant: VariantName::new("standard".to_string()),
                         tree: test_tree_digest("tree-1"),
                     },
@@ -665,7 +684,7 @@ mod tests {
                             assignment: PlacementSlotAssignment {
                                 placement_slot: p1.clone(),
                                 artifact: ArtifactRef {
-                                    release: ReleaseId::new("rel-1".to_string()),
+                                    release: test_release_id("rel-1"),
                                     variant: VariantName::new("standard".to_string()),
                                     tree: test_tree_digest("tree-1"),
                                 },
@@ -890,8 +909,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // Point the store at a hermetic `$TMPDIR` and seed the ONE
         // physical observed record per slot (`slots/<slot-id>/observed.json`)
         // with three slots: p1 has a full assignment, p2 has NO known
-        // assignment (never observed / rotated away), and p3 has a known
-        // generation but no known artifact (the assignment could not be read).
+        // with three slots: p1 has a full assignment, p2 has NO known
+        // assignment (never observed / rotated away), and p3 has a FAILED
+        // observation (the assignment could not be read — recorded as an
+        // `Unknown` observation with its error preserved, never a forged
+        // artifact).
         let store_root = crate::testutil::hermetic_tmpdir_root();
         unsafe { std::env::set_var("TMPDIR", &store_root) };
         let store = LocalStore::with_base(crate::store::local::default_base()).unwrap();
@@ -902,7 +924,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     observation: Observation::Known(crate::records::ObservedState {
                         generation: test_generation_id("gen-41da"),
                         artifact: crate::model::ArtifactRef {
-                            release: ReleaseId::new("rel-sha256-status".to_string()),
+                            release: test_release_id("rel-sha256-status"),
                             variant: VariantName::new("standard".to_string()),
                             tree: test_tree_digest("tree-2c4f"),
                         },
@@ -960,7 +982,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "generation id rendered: {p1}"
         );
         assert!(
-            p1.contains("rel-sha256-status"),
+            p1.contains(test_release_id("rel-sha256-status").as_str()),
             "release id rendered: {p1}"
         );
         assert!(p1.contains("standard"), "variant rendered: {p1}");
@@ -1314,6 +1336,252 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "deploy push production @-",
         ] {
             assert!(push_help.contains(needle), "push help missing {needle:?}");
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // HARDENING: ReleaseId exact form + CLI bare-digest parser + no Default
+    // + the Unknown observation half (deterministic + property, 16 cases
+    // fixed seed 0x5EED_5EED per house style).
+    // -------------------------------------------------------------------
+
+    const HARDENING_DIGEST: &str =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    #[test]
+    fn release_id_parse_is_exact() {
+        let full = format!("rel-sha256-{HARDENING_DIGEST}");
+        assert_eq!(ReleaseId::parse(&full).unwrap().as_str(), full);
+        assert_eq!(ReleaseId::parse(&full).unwrap().to_string(), full);
+        // from_digest round-trips the exact form.
+        let d = crate::model::ReleaseDigest::parse(HARDENING_DIGEST).unwrap();
+        assert_eq!(ReleaseId::from_digest(&d).as_str(), full);
+        for bad in [
+            "",
+            HARDENING_DIGEST,
+            "rel-sha256-",
+            "rel-sha256-ABCD",
+            &format!("rel-sha256-{}gg", &HARDENING_DIGEST[..62]),
+            &format!("rel-sha256-{}", &HARDENING_DIGEST[..63]),
+            &HARDENING_DIGEST.to_uppercase(),
+            "rel-unknown",
+            "rel-sha256-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            &format!(" rel-sha256-{HARDENING_DIGEST}"),
+            &format!("rel-sha256-{HARDENING_DIGEST} "),
+        ] {
+            ReleaseId::parse(bad)
+                .expect_err(format!("bare/loose form must be rejected: {bad:?}").as_str());
+            // Wire deserialization also rejects the loose forms.
+            let json = serde_json::to_string(bad).unwrap();
+            serde_json::from_str::<ReleaseId>(&json).expect_err("loose wire must be rejected");
+        }
+    }
+
+    #[test]
+    fn cli_parser_accepts_full_and_bare_converts() {
+        let full = format!("rel-sha256-{HARDENING_DIGEST}");
+        assert_eq!(parse_release_input(&full).unwrap().as_str(), full);
+        assert_eq!(
+            parse_release_input(HARDENING_DIGEST).unwrap().as_str(),
+            full
+        );
+        assert!(
+            !parse_release_input(&HARDENING_DIGEST.to_uppercase()).is_ok(),
+            "uppercase bare digest must be rejected"
+        );
+        for bad in [
+            "",
+            "rel-sha256-",
+            "rel-sha256-abc",
+            "rel-unknown",
+            "not-hex",
+            &HARDENING_DIGEST[..32],
+            &format!("rel-sha256-{}", HARDENING_DIGEST.to_uppercase()),
+        ] {
+            parse_release_input(bad).expect_err(format!("cli must reject {bad:?}").as_str());
+        }
+    }
+
+    #[test]
+    fn artifact_ref_and_identities_have_no_default() {
+        // A Default identity would be an EMPTY string — a malformed durable
+        // record. The derive is gone, so Default::default() must not exist;
+        // empty string is rejected at the domain boundary.
+        for bad in ["", "a/b", "..", " x"] {
+            crate::model::SlotId::parse(bad).expect_err("empty/traversal must be rejected");
+        }
+        crate::model::ReleaseId::parse("").expect_err("empty ReleaseId must be rejected");
+        // ArtifactRef likewise has no Default — empty release would be
+        // malformed. A wire artifact with an empty release fails.
+        let bad_json =
+            format!(r#"{{"release":"","variant":"standard","tree":"{HARDENING_DIGEST}"}}"#);
+        serde_json::from_str::<crate::model::ArtifactRef>(&bad_json)
+            .expect_err("empty release in artifact must be rejected");
+    }
+
+    #[test]
+    fn observed_unknown_never_forged() {
+        // An UNKNOWN observation serializes as the tagged `state: "unknown"`
+        // variant with its preserved error — never as a forged ArtifactRef —
+        // and round-trips. The bare string "unknown" is NOT a valid
+        // Observation (the tagged three-state enum is the only wire form).
+        let unknown = Observation::<crate::records::ObservedState>::Unknown(
+            crate::records::ObservationError {
+                message: "boom".to_string(),
+            },
+        );
+        let json = serde_json::to_string(&unknown).unwrap();
+        assert!(
+            json.contains(r#""state":"unknown""#),
+            "Unknown must serialize as the tagged unknown state, got: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Observation<crate::records::ObservedState>>(&json).unwrap(),
+            unknown
+        );
+        assert!(
+            serde_json::from_str::<Observation<crate::records::ObservedState>>("\"unknown\"")
+                .is_err(),
+            "the bare \"unknown\" string is not an Observation"
+        );
+        // A slot with no observed state is KnownAbsent, not Unknown.
+        let slot_none = ObservedSlot {
+            observation: Observation::KnownAbsent,
+        };
+        let json_none = serde_json::to_string(&slot_none).unwrap();
+        let back: ObservedSlot = serde_json::from_str(&json_none).unwrap();
+        assert_eq!(back.observation, Observation::KnownAbsent);
+        // An unreadable observed state is Unknown, never a forged artifact.
+        let slot_unknown = ObservedSlot {
+            observation: Observation::Unknown(crate::records::ObservationError {
+                message: "assignment read failed: boom".to_string(),
+            }),
+        };
+        let lines = render_status(&ObservedTarget {
+            target: crate::model::TargetName::parse("production").unwrap(),
+            slots: std::collections::BTreeMap::from([(
+                crate::model::SlotId::parse("p1").unwrap(),
+                slot_unknown,
+            )]),
+        });
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("release=None"),
+            "Unknown must not render as a forged artifact: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn gc_unknown_aborts_before_deletion() {
+        // Fail-closed: an UNKNOWN observation makes the GC abort with an
+        // integrity error before any deletion (never retain nothing).
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        store
+            .write_slot_observed(
+                &crate::model::SlotId::parse("p1").unwrap(),
+                &ObservedSlot {
+                    observation: Observation::Unknown(crate::records::ObservationError {
+                        message: "assignment read failed: boom".to_string(),
+                    }),
+                },
+            )
+            .unwrap();
+        let cfg = {
+            let proj = dir.path().join("proj");
+            std::fs::create_dir_all(proj.join("releases").join("v1")).unwrap();
+            std::fs::write(
+                proj.join("releases").join("v1").join("standard.toml"),
+                "[[slots]]\nid = \"p1\"\nserver = \"s1\"\ntarget = \"t1\"\ndeploy_dir = \"/srv\"\n[[artifact.mappings]]\nfrom = \"artifacts/build/output/\"\nto = \"app/\"\nrecursive = true\n[retention.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n[retention.deployment]\nprotect_deployments = 1\n[activation]\nadapter = \"none\"\n[verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
+            )
+            .unwrap();
+            std::fs::write(
+                proj.join("deploy.toml"),
+                "schema_version = 2\napplication = \"gc-unknown\"\nrelease = \"v1\"\n[[servers]]\nid = \"s1\"\naddress = \"a\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n[targets.t1]\nrollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }\n",
+            )
+            .unwrap();
+            crate::config::ProjectConfig::load(&proj.join("deploy.toml")).unwrap()
+        };
+        let err = store.reachable_set(&cfg, None).unwrap_err();
+        assert!(
+            err.to_string().contains("UNKNOWN") || err.to_string().contains("Unknown"),
+            "GC must abort on Unknown, got: {err}"
+        );
+    }
+
+    // Property: arbitrary strings — ReleaseId exact, CLI full+bare, reject else.
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+
+    fn is_valid_hex64(s: &str) -> bool {
+        s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    fn is_valid_release_id(s: &str) -> bool {
+        s.strip_prefix("rel-sha256-").is_some_and(is_valid_hex64)
+    }
+
+    fn arbitrary_release_input() -> impl Strategy<Value = String> {
+        prop_oneof![
+            prop::sample::select(vec![
+                String::new(),
+                "rel-sha256-".to_string(),
+                "rel-sha256-abc".to_string(),
+                "rel-".to_string(),
+                "rel-sha256-ABCD".to_string(),
+                HARDENING_DIGEST.to_string(),
+                HARDENING_DIGEST.to_uppercase(),
+                format!("rel-sha256-{HARDENING_DIGEST}"),
+                format!("rel-sha256-{}", &HARDENING_DIGEST[..63]),
+                "not-hex".to_string(),
+            ]),
+            prop::collection::vec(prop::char::any(), 0..80).prop_map(|v| v.into_iter().collect()),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..proptest::test_runner::Config::default()
+        })]
+        #[test]
+        fn hardening_property_release_id_cli_unknown(s in arbitrary_release_input()) {
+            let expected_release = is_valid_release_id(&s);
+            assert_eq!(ReleaseId::parse(&s).is_ok(), expected_release, "ReleaseId exact: {s:?}");
+            let expected_cli = is_valid_release_id(&s) || is_valid_hex64(&s);
+            let cli_ok = parse_release_input(&s).is_ok();
+            assert_eq!(cli_ok, expected_cli, "CLI parser: {s:?}");
+            if is_valid_hex64(&s) && !is_valid_release_id(&s) {
+                let got = parse_release_input(&s).unwrap();
+                assert_eq!(got.as_str(), format!("rel-sha256-{s}"));
+            }
+            if is_valid_release_id(&s) {
+                let got = parse_release_input(&s).unwrap();
+                assert_eq!(got.as_str(), s);
+            }
+            // Wire ReleaseId rejects non-exact forms.
+            let json = serde_json::to_string(&s).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ReleaseId>(&json).is_ok(),
+                expected_release,
+                "wire ReleaseId: {s:?}"
+            );
+            // Unknown is never a forged artifact: the bare "unknown" string
+            // is NOT a valid Observation wire form (the tagged three-state
+            // enum expresses Unknown with its preserved error); a forged
+            // artifact would be a valid ArtifactRef JSON.
+            if s == "unknown" {
+                assert!(
+                    serde_json::from_str::<Observation<crate::records::ObservedState>>(
+                        "\"unknown\""
+                    )
+                    .is_err(),
+                    "bare \"unknown\" must not parse as an Observation"
+                );
+            }
         }
     }
 }

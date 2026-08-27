@@ -1773,7 +1773,7 @@ impl Fixture {
                 stored.artifact.variant = VariantName::new("canary".to_string())
             }
             TamperKind::AssignmentRelease => {
-                stored.artifact.release = ReleaseId::new("rel-sha256-tampered".to_string())
+                stored.artifact.release = crate::model::test_release_id("rel-sha256-tampered")
             }
             TamperKind::BehaviorJson => unreachable!("handled above"),
             TamperKind::ReleaseSchemaVersion => {
@@ -3579,7 +3579,7 @@ fn identity_duplicates_are_rejected_and_canonicalize_identically() {
 #[test]
 fn identity_canonical_serialization_round_trips() {
     let art = ArtifactRef {
-        release: ReleaseId::new("rel-sha256-abc".to_string()),
+        release: crate::model::test_release_id("rel-sha256-abc"),
         variant: VariantName::new("standard".to_string()),
         tree: test_tree_digest("tree-1"),
     };
@@ -3594,8 +3594,14 @@ fn identity_canonical_serialization_round_trips() {
         serde_json::to_vec(&back).unwrap(),
         "canonical serialization is stable"
     );
-    let rid = ReleaseId::parse("rel-sha256-abc");
-    assert_eq!(rid.as_str(), "rel-sha256-abc");
+    let rid = ReleaseId::parse(
+        "rel-sha256-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    )
+    .expect("valid release id");
+    assert_eq!(
+        rid.as_str(),
+        "rel-sha256-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
     assert_eq!(
         ReleaseId::from_digest(&rid.digest()),
         rid,

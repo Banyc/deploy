@@ -385,6 +385,14 @@ impl LocalStore {
         self.base.join(layout::RELEASES).join(sanitize(id.as_str()))
     }
 
+    /// The on-disk directory for a release dir NAME (an arbitrary store dir
+    /// name). The GC computes deletion paths for candidate dirs that may not
+    /// be valid release ids (junk-named dirs are still candidates), so this
+    /// takes the raw name — never a validated [`ReleaseId`].
+    pub(crate) fn release_dir_named(&self, name: &str) -> PathBuf {
+        self.base.join(layout::RELEASES).join(sanitize(name))
+    }
+
     pub fn release_exists(&self, id: &ReleaseId) -> bool {
         self.release_dir(id).join("release.json").exists()
     }
@@ -404,7 +412,10 @@ impl LocalStore {
     pub fn write_release(&self, rec: &ReleaseRecord) -> Result<()> {
         // (a) Verify the incoming record from its content before any write.
         crate::release::verify_release_identity(rec)?;
-        let dir = self.release_dir(&ReleaseId::new(rec.release_id.clone()));
+        let dir = self.release_dir(
+            &ReleaseId::parse(&rec.release_id)
+                .expect("incoming release record carries a validated release id"),
+        );
         if dir.exists() {
             // (b) Verify the EXISTING record from its content too, then
             // compare the recomputed identities (both records verified above,
@@ -1619,7 +1630,7 @@ mod tests {
                 desired: DesiredGeneration {
                     generation: test_generation_id("1"),
                     artifact: ArtifactRef {
-                        release: ReleaseId::new("rel-1".to_string()),
+                        release: crate::model::test_release_id("rel-1"),
                         variant: VariantName::new("standard".to_string()),
                         tree: test_tree_digest("1"),
                     },
@@ -1654,7 +1665,7 @@ mod tests {
                             assignment: PlacementSlotAssignment {
                                 placement_slot: SlotId::new("p1".to_string()),
                                 artifact: ArtifactRef {
-                                    release: ReleaseId::new("rel-sha256-a".to_string()),
+                                    release: crate::model::test_release_id("rel-sha256-a"),
                                     variant: VariantName::new("standard".to_string()),
                                     tree: test_tree_digest("1"),
                                 },
@@ -1789,7 +1800,7 @@ mod tests {
                 .artifact
                 .release
                 .as_str(),
-            "rel-sha256-a"
+            crate::model::test_release_id("rel-sha256-a").as_str()
         );
         // A terminal without its intent is refused (fail closed).
         let err = store
@@ -1894,7 +1905,7 @@ mod tests {
                 assignment: PlacementSlotAssignment {
                     placement_slot: SlotId::new("not-a-member".to_string()),
                     artifact: ArtifactRef {
-                        release: ReleaseId::new("rel-1".to_string()),
+                        release: crate::model::test_release_id("rel-1"),
                         variant: VariantName::new("standard".to_string()),
                         tree: test_tree_digest("1"),
                     },
@@ -1922,7 +1933,7 @@ mod tests {
                 assignment: PlacementSlotAssignment {
                     placement_slot: extra.clone(),
                     artifact: ArtifactRef {
-                        release: ReleaseId::new("rel-2".to_string()),
+                        release: crate::model::test_release_id("rel-2"),
                         variant: VariantName::new("standard".to_string()),
                         tree: test_tree_digest("2"),
                     },

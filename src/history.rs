@@ -506,7 +506,7 @@ mod tests {
                 desired: DesiredGeneration {
                     generation: test_generation_id("gen-1"),
                     artifact: ArtifactRef {
-                        release: ReleaseId::new("rel-1".to_string()),
+                        release: crate::model::test_release_id("rel-1"),
                         variant: VariantName::new("standard".to_string()),
                         tree: test_tree_digest("tree-1"),
                     },
@@ -587,7 +587,7 @@ mod tests {
                 .append_terminal(
                     "production",
                     &canonical,
-                    &successful_terminal(&id, &format!("rel-sha256-{id}")),
+                    &successful_terminal(&id, crate::model::test_release_id(&id).as_str()),
                 )
                 .unwrap();
             ids.push(canonical.as_str().to_string());
@@ -720,42 +720,46 @@ mod tests {
     fn resolve_ref_direct_release_form_ignores_chain_and_store() {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        // The canonical full form AND the bare 64-hex digest (converted by
+        // the CLI parser BEFORE the strict domain parse) both resolve to the
+        // same canonical release.
+        let rid = crate::model::test_release_id("rel-sha256-cccc");
+        let bare = rid.digest();
         assert_eq!(
             resolve_ref_expr(
-                &parse_ref_expr("release:rel-sha256-cccc").expect("token must parse"),
+                &parse_ref_expr(&format!("release:{rid}")).expect("token must parse"),
                 "production",
                 &store
             )
             .unwrap(),
             PushRef::Release {
-                release: ReleaseId::new("rel-sha256-cccc".to_string())
+                release: rid.clone()
             }
         );
         assert_eq!(
             resolve_ref_expr(
-                &parse_ref_expr("release:cccc").expect("token must parse"),
+                &parse_ref_expr(&format!("release:{bare}")).expect("token must parse"),
                 "production",
                 &store
             )
             .unwrap(),
             PushRef::Release {
-                release: ReleaseId::new("rel-sha256-cccc".to_string())
+                release: rid.clone()
             }
         );
         // A release that is not referenced by any ledger — and a target with
         // an EMPTY chain — resolve the same way: resolution never reads the
         // store.
         let empty = LocalStore::with_base(tmp.path().join("store2")).unwrap();
+        let rid2 = crate::model::test_release_id("rel-sha256-zzzz");
         assert_eq!(
             resolve_ref_expr(
-                &parse_ref_expr("release:rel-sha256-zzzz").expect("must parse"),
+                &parse_ref_expr(&format!("release:{rid2}")).expect("must parse"),
                 "brand-new-target",
                 &empty
             )
             .unwrap(),
-            PushRef::Release {
-                release: ReleaseId::new("rel-sha256-zzzz".to_string())
-            }
+            PushRef::Release { release: rid2 }
         );
     }
 
@@ -924,8 +928,9 @@ mod tests {
         // aspect under test is the missing `bindings` key and the
         // snapshot-wide members, not the id format.
         let did = test_deployment_id("deploy-old");
+        let rel = crate::model::test_release_id("old");
         let line = format!(
-            r#"{{"kind":"terminal","deployment_id":"{did}","target":"production","status":"successful","recorded_at":"2026-01-01T00:00:00Z","outcomes":{{}},"rollback":{{"behavior_sha256":"sha256-aa","release":"rel-sha256-old","slots":{{}}}}}}"#
+            r#"{{"kind":"terminal","deployment_id":"{did}","target":"production","status":"successful","recorded_at":"2026-01-01T00:00:00Z","outcomes":{{}},"rollback":{{"behavior_sha256":"sha256-aa","release":"{rel}","slots":{{}}}}}}"#
         );
         // The legacy line PARSES at the wire level (the legacy snapshot-wide
         // members are tolerated by serde — unknown members are skipped), and
@@ -1048,7 +1053,7 @@ mod tests {
                 // Each successful deployment is a rollback payload keyed by
                 // its id, with a deterministic payload derived from the id
                 // (so "exactly its stored state" is a meaningful equality).
-                let release = id.replace("deploy-", "rel-sha256-");
+                let release = crate::model::test_release_id(id).as_str().to_string();
                 store
                     .append_terminal(
                         "production",

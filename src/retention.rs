@@ -120,7 +120,7 @@ pub fn compute_retained(
     // warning, post-commit maintenance): the next push retries retention once
     // the pinned release is repaired.
     for pin in pins {
-        let rid = ReleaseId::parse(&pin.release);
+        let rid = ReleaseId::parse(&pin.release)?;
         let rec = store.read_release(&rid).map_err(|e| {
             Error::integrity(format!(
                 "pin names release {rid} whose record cannot be read or verified ({e}): \
@@ -325,7 +325,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     deployment_id: test_deployment_id("d1"),
                     generation_id: test_generation_id("g1"),
                     artifact: crate::model::ArtifactRef {
-                        release: crate::model::ReleaseId::new("r".to_string()),
+                        release: crate::model::test_release_id("r"),
                         variant: VariantName::new("standard"),
                         tree: test_tree_digest("t1"),
                     },
@@ -343,7 +343,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     deployment_id: test_deployment_id("d2"),
                     generation_id: test_generation_id("g2"),
                     artifact: crate::model::ArtifactRef {
-                        release: crate::model::ReleaseId::new("r".to_string()),
+                        release: crate::model::test_release_id("r"),
                         variant: VariantName::new("standard"),
                         tree: test_tree_digest("t2"),
                     },
@@ -474,7 +474,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     deployment_id: test_deployment_id(deployment_id),
                     generation_id: test_generation_id(generation_id),
                     artifact: crate::model::ArtifactRef {
-                        release: crate::model::ReleaseId::new("r".to_string()),
+                        release: crate::model::test_release_id("r"),
                         variant: VariantName::new("standard"),
                         tree: canonical_tree,
                     },
