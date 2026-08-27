@@ -4,13 +4,21 @@
 //!
 //! # Modules
 //!
-//! * [`helper`] — [`RemoteHelper`](helper::RemoteHelper): status inspection,
-//!   locking, generation switching, commit markers, inventory, rotation, and
-//!   transaction records (the object-store-facing helpers — `tree_exists`,
-//!   `stage_incoming`, `publish_from_incoming`, `remove_incoming` — stay here:
-//!   they are [`RemoteHelper`](helper::RemoteHelper) methods interdependent
-//!   with the rest of the struct, and splitting them would loosen the struct's
-//!   field encapsulation).
+//! * [`helper`] — [`RemoteHelper`](helper::RemoteHelper): the struct,
+//!   constructor, and the core read/status plumbing everything shares
+//!   (assignment/behavior reads, the mutation lock + RAII guard, generation
+//!   records, inventory writes).
+//! * [`current`] — the `current` symlink chain: full-chain integrity
+//!   validation in `status`, the canonical-target parse, `swap_current`
+//!   (the CAS precondition), and `remove_current_if`.
+//! * [`markers`] — commit markers (write-once create-or-compare).
+//! * [`transactions`] — transaction records (`prepared` → `committed` →
+//!   `compensated`).
+//! * [`publish`] — object-store-facing publication: `tree_exists`,
+//!   `stage_incoming`, `publish_from_incoming`, `remove_incoming`,
+//!   `publish_tree`, `publish_release` (identity re-verified before install).
+//! * [`rotate`] — receiver rotation I/O (contract in `crate::retention::rotate`).
+//! * [`protocol`] — the protocol handshake (A5).
 //! * [`canonical`] — canonical tree objects (moved from `crate::tree`).
 //! * [`materialize`] — mapping resolution + the template renderer (moved from
 //!   `crate::mapper` / `crate::template`).
@@ -21,13 +29,19 @@
 //!   execution layers.
 
 pub mod canonical;
+pub mod current;
 pub mod helper;
 pub mod hostkey;
 pub mod layout;
+pub mod markers;
 pub mod materialize;
 pub mod observed;
+pub mod protocol;
+pub mod publish;
+pub mod rotate;
 pub mod runner;
 pub mod ssh;
+pub mod transactions;
 pub mod transport;
 
 use crate::config::{ServerConnection, ServerDef};
