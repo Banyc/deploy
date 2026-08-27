@@ -25,6 +25,7 @@ pub mod store;
 pub(crate) mod sweep;
 pub mod template;
 pub mod tree;
+mod verify;
 
 #[cfg(test)]
 pub(crate) mod semantic_invariants;
