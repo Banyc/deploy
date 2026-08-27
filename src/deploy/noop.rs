@@ -237,11 +237,11 @@ pub(crate) fn check_up_to_date(
 mod tests {
     use super::*;
     use crate::config::ProjectConfig;
-    use crate::deploy::push::tests::{
+    use crate::deploy::push::{PushOptions, push};
+    use crate::deploy::testsupport::{
         NONE_TOML, RecordingRemote, RecoveryHarness, known_artifact, push_clean, push_main_with_id,
         snapshot_files,
     };
-    use crate::deploy::push::{PushOptions, push};
     use crate::identity::{SlotId, test_deployment_id};
     use crate::ledger::{DeploymentStatus, Observation};
     use crate::remote::helper::GenerationAssignment;

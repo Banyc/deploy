@@ -589,7 +589,7 @@ pub(crate) fn maintenance_warning(deferred: &[String]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::deploy::push::tests::{RecoveryHarness, engine_pin_release, push_clean};
+    use crate::deploy::testsupport::{RecoveryHarness, engine_pin_release, push_clean};
     use crate::identity::ReleaseId;
     use crate::ledger::DeploymentStatus;
     use crate::remote::helper::RemoteHelper;

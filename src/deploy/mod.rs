@@ -80,10 +80,12 @@
 
 pub mod batching;
 pub mod capacity;
+pub mod commit;
 pub mod compensation;
 pub mod coverage;
 pub mod dryrun;
 pub mod exact_rollback;
+pub mod execute;
 pub mod failure;
 pub mod groups;
 pub mod lock;
@@ -91,6 +93,7 @@ pub mod maintenance;
 pub mod noop;
 pub mod partial_rollout;
 pub mod plan;
+pub mod preflight;
 pub mod push;
 pub mod refs;
 pub mod results;
@@ -98,6 +101,12 @@ pub mod selection;
 pub mod server;
 pub mod staging;
 pub mod status;
+
+// The shared test fixtures for the push spine and its phase modules
+// (test-only; consumed by the phase modules' tests and by
+// [`noop`]/[`maintenance`] tests).
+#[cfg(test)]
+pub(crate) mod testsupport;
 
 // The area-root re-export globs make every submodule's items nameable at
 // `crate::deploy::…` (the old `push::engine::*` / `revset::*` call sites
@@ -108,6 +117,8 @@ pub(crate) use batching::*;
 #[allow(unused_imports)]
 pub(crate) use capacity::*;
 #[allow(unused_imports)]
+pub(crate) use commit::*;
+#[allow(unused_imports)]
 pub(crate) use compensation::*;
 #[allow(unused_imports)]
 pub(crate) use coverage::*;
@@ -115,6 +126,8 @@ pub(crate) use coverage::*;
 pub(crate) use dryrun::*;
 #[allow(unused_imports)]
 pub(crate) use exact_rollback::*;
+#[allow(unused_imports)]
+pub(crate) use execute::*;
 #[allow(unused_imports)]
 pub(crate) use failure::*;
 #[allow(unused_imports)]
@@ -126,6 +139,8 @@ pub(crate) use noop::*;
 #[allow(unused_imports)]
 pub(crate) use partial_rollout::*;
 pub use plan::*;
+#[allow(unused_imports)]
+pub(crate) use preflight::*;
 pub use push::*;
 #[allow(unused_imports)]
 pub(crate) use refs::*;
