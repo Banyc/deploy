@@ -19,7 +19,7 @@
 //!   a debt I/O failure becomes a warning entry, never an `Err`.
 //!
 //! The push spine ([`crate::deploy::push`]) wires this module into step 17
-//! of `push_inner`; the no-op path ([`crate::deploy::noop`]) services the
+//! of `push_inner`; the no-op path ([`crate::deploy::push`]) services the
 //! same debt before reporting "Everything up to date".
 
 use crate::config::{ProjectConfig, RetentionConfig};

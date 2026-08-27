@@ -4,12 +4,12 @@
 //! group fixtures, and the push entry points that drive
 //! [`crate::deploy::push::push_inner`] directly with caller-supplied
 //! deployment ids. Round-5 decision: these are consumed by every phase
-//! module's tests AND by [`crate::deploy::noop`] /
+//! module's tests AND by [`crate::deploy::push`] /
 //! [`crate::deploy::maintenance`] tests, so they live in a shared
 //! test-support module rather than being duplicated per phase.
 
 // The whole push-test vocabulary, re-exported so every phase module's tests
-// (and the [`crate::deploy::noop`] / [`crate::deploy::maintenance`] tests)
+// (and the [`crate::deploy::push`] / [`crate::deploy::maintenance`] tests)
 // glob ONE module: `use crate::deploy::testsupport::*;`.
 pub(crate) use crate::config::{Mapping, ProjectConfig, SlotConfig};
 pub(crate) use crate::deploy::push::{PushOptions, PushReport, push, push_inner, push_ref_with_id};
@@ -238,7 +238,7 @@ pub(crate) fn two_slot_push(
         &h.store,
         &factory,
         "t1",
-        &crate::deploy::selection::SlotSelection::normalize(config, "t1", group).unwrap(),
+        &crate::deploy::plan::SlotSelection::normalize(config, "t1", group).unwrap(),
         ref_expr,
         None,
         deployment_id,
@@ -651,7 +651,7 @@ pub(crate) fn push_main_with_id(
         &h.store,
         &factory,
         "t1",
-        &crate::deploy::selection::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
+        &crate::deploy::plan::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
         &RefExpr::Head,
         None,
         deployment_id,
@@ -881,7 +881,7 @@ impl SysdHarness {
             &self.store,
             &factory,
             "t1",
-            &crate::deploy::selection::SlotSelection::normalize(&self.config, "t1", None).unwrap(),
+            &crate::deploy::plan::SlotSelection::normalize(&self.config, "t1", None).unwrap(),
             &RefExpr::Head,
             None,
             deployment_id,
@@ -899,7 +899,7 @@ impl SysdHarness {
 
 /// A transport wrapper that reports a FIXED number of available bytes,
 /// letting a test control the headroom the capacity preflight sees
-/// deterministically (mirrors `push::capacity::tests`).
+/// deterministically (mirrors `plan::capacity_tests`).
 pub(crate) struct FakeCapacityRemote {
     pub(crate) inner: LocalTransport,
     pub(crate) avail: u64,

@@ -61,12 +61,9 @@ impl LocalStore {
         // `store.store_object` persist a mixed (stale leftovers + fresh content)
         // tree under the digest. A missing temp is a no-op.
         if tmp.exists() {
-            crate::deploy::staging::remove_tree_restoring_write(
-                &tmp,
-                "remove stale recovery temp",
-            )?;
+            crate::deploy::plan::remove_tree_restoring_write(&tmp, "remove stale recovery temp")?;
         }
-        crate::deploy::server::download_tree_to_host(remote, &root_rel, &tmp)?;
+        crate::deploy::rollout::download_tree_to_host(remote, &root_rel, &tmp)?;
         self.store_object(digest, &tmp)?;
         // Explicit FALLIBLE cleanup of the disposable download temp before
         // returning, so a successful recovery never leaves `recover-<digest>`
@@ -74,7 +71,7 @@ impl LocalStore {
         // could accumulate read-only content). `store_object` copies, so the temp
         // is no longer needed; a cleanup failure surfaces as an error naming the
         // path, mirroring the dry-run staging cleanup.
-        crate::deploy::staging::remove_tree_restoring_write(&tmp, "remove recovery temp")?;
+        crate::deploy::plan::remove_tree_restoring_write(&tmp, "remove recovery temp")?;
         Ok(())
     }
 

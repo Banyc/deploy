@@ -1,106 +1,39 @@
 //! Deployment semantics (A1): the push transaction, its reference grammar,
 //! and the per-slot rollout machinery.
 //!
-//! Module ownership (the encapsulation-run split of `push::engine` +
-//! `push::plan` + `push::server` + `push::staging` + `push::capacity` +
-//! `revset`):
+//! Six cohesive feature modules (the ~25-module phase split was over-grained;
+//! related features are grouped under one module where maintenance makes sense):
 //!
-//! * [`push`] — the push ORCHESTRATION: `push`/`push_inner` (the numbered
-//!   steps), the ref-resolution ordering, the preflight/batch/finalization
-//!   calls, the maintenance wiring, and the status/terminal wiring (the
-//!   per-slot decisions themselves live in the dedicated modules below) —
-//!   the spine of the old `push::engine`, kept together with the
-//!   interdependent private helpers and the giant `#[cfg(test)] mod tests`
-//!   (which drives `push_inner` directly).
-//! * [`noop`] — the "Everything up to date" no-op (A1): the up-to-date
-//!   detection (complete [`ArtifactRef`] equality + per-slot verification
-//!   rendering the EXISTING generation's identities) and the no-op path's
-//!   hidden maintenance wiring (A7: deferred-retention retry, pending-sweep
-//!   retry, observed refresh).
-//! * [`maintenance`] — post-commit maintenance (A4): the step-17 per-slot
-//!   retention loop + [`maintenance::retain_slot_post_commit`] +
-//!   [`maintenance::retry_deferred_retentions`] +
-//!   [`maintenance::retry_pending_sweep`] + the observed-refresh call (A7
-//!   durable debt wiring; shared by the real-push path and the no-op path).
-//! * [`coverage`] — the behavior-coverage gate (A5):
-//!   [`coverage::validate_behavior_coverage`].
-//! * [`refs`] — the push reference GRAMMAR (pure, store-free): the old
-//!   `revset` module, `parse_ref_expr`, [`refs::RefExpr`], and the
-//!   `@`/`@-`/`@--`/`parent(...)`/deployment-id/`release:<id>` forms.
-//! * [`groups`] — the DIRECT-RELEASE MEMBERSHIP GATE
-//!   ([`groups::validate_direct_release_membership`]): a `release:<id>` push
-//!   deploys onto the CURRENT target's slots, so the release's frozen slot
-//!   set must EXACTLY equal the target's current membership — refused before
-//!   any lock or remote access.
-//! * [`selection`] — the slot SELECTION semantics: the branch-agnostic
-//!   {target, group} selection ([`selection::SlotSelection`]) normalized once
-//!   near command entry, its frozen-vs-current topology resolution
-//!   (`current_members` / `release_members`), and the PROOF-BEARING
-//!   per-reference resolution ([`selection::ResolvedSelection`]) the planner
-//!   produces.
-//! * [`batching`] — the deployment-order batch loop (`batch_size`,
-//!   `stop_on_failure`, the `'batches` iteration).
-//! * [`failure`] — failure-policy semantics (`rollback_changed` /
-//!   `leave_changed`), the step-13 batch compensation pass, the degraded
-//!   derivation, and never-advanced outcome handling.
-//! * [`plan`] — assignment planning (the old `push::plan`):
-//!   `plan_assignments` (+ `release_behavior_index`), the proof-bearing
-//!   [`selection::ResolvedSelection`] it consumes, the
-//!   `VerifiedReleaseRebinding` usage, and `latest_successful_rollback`.
-//! * [`server`] — the per-server mutation pipeline (the old `push::server`):
-//!   `process_server` (publish/swap/activate/verify/commit per slot), the
-//!   step hooks.
-//! * [`partial_rollout`] — the PARTIAL-ROLLOUT GUARDS (A1):
-//!   [`partial_rollout::validate_partial_rollout`], the first-deployment /
-//!   membership-change rules a group push must satisfy before any remote
-//!   mutation.
-//! * [`exact_rollback`] — the EXACT ROLLBACK verification (A2):
-//!   [`exact_rollback::verify_exact_rollback_bindings`], the per-slot
-//!   physical-binding checks (recorded binding missing / rebound / moved
-//!   deploy_dir refuses) a deployment rollback runs before planning.
-//! * [`compensation`] — per-slot COMPENSATION (A1 step 11):
-//!   [`compensation::compensate_server`], the prior-generation restore /
-//!   remove-`current`-on-first-deploy logic with its CAS precondition.
-//! * [`staging`] — the disposable staging lifecycle (the old `push::staging`)
-//!   plus the A7 abandoned-incoming cleanup.
-//! * [`results`] — the A1 result-table shaping: the skipped-slots filler and
-//!   the post-mutation actual-observation.
-//! * [`status`] — the A7 post-mutation status / disposition decision: the
-//!   pending-commit demotion reasons ("recoverable metadata failure", "commit
-//!   diverged", "marker integrity conflict") and the status → terminal
-//!   disposition mapping.
-//! * [`dryrun`] — the dry-run plan computation/rendering from the push spine.
-//! * [`capacity`] — capacity preflight (the old `push::capacity`).
+//! * [`push`] — THE PUSH OPERATION: the push spine (`push` / `push_inner`, the
+//!   numbered steps) plus the preflight phases, execute phases, commit phases,
+//!   the up-to-date no-op path, and the dry-run mode (the former `preflight`,
+//!   `execute`, `commit`, `noop`, `dryrun` modules).
+//! * [`plan`] — PLANNING: `plan_assignments` plus every pre-mutation semantic:
+//!   slot selection, the direct-release membership gate, capacity preflight,
+//!   staging lifecycle, partial-rollout guards, exact-rollback verification,
+//!   and the behavior-coverage gate (the former `selection`, `groups`,
+//!   `capacity`, `staging`, `partial_rollout`, `exact_rollback`, `coverage`
+//!   modules).
+//! * [`rollout`] — EXECUTION SEMANTICS: the batch loop, failure policies,
+//!   result/status/disposition shaping, compensation, and the per-server
+//!   pipeline (the former `batching`, `failure`, `results`, `status`,
+//!   `compensation`, `server` modules).
+//! * [`refs`] — the push reference GRAMMAR (pure, store-free).
+//! * [`maintenance`] — post-commit maintenance (step-17 retention loop,
+//!   deferred-retention retry, pending-sweep retry, observed refresh).
+//! * [`lock`] — the deployment lock.
 //!
-//! The old `push::engine` / `push::plan` / `push::server` / `push::staging` /
-//! `push::capacity` and `revset` modules have been folded in here, and their
-//! items are reachable either at the area root (the re-export globs below) or
-//! through the submodule paths (`crate::deploy::plan::…`,
-//! `crate::deploy::refs::…`, …).
+//! The area-root re-export globs keep every former submodule path compiling:
+//! items that lived in the merged-away modules are nameable at the area root
+//! (`crate::deploy::push::run_preflight`, `crate::deploy::plan::capacity_fits`,
+//! `crate::deploy::rollout::process_server`, …).
 
-pub mod batching;
-pub mod capacity;
-pub mod commit;
-pub mod compensation;
-pub mod coverage;
-pub mod dryrun;
-pub mod exact_rollback;
-pub mod execute;
-pub mod failure;
-pub mod groups;
 pub mod lock;
 pub mod maintenance;
-pub mod noop;
-pub mod partial_rollout;
 pub mod plan;
-pub mod preflight;
 pub mod push;
 pub mod refs;
-pub mod results;
-pub mod selection;
-pub mod server;
-pub mod staging;
-pub mod status;
+pub mod rollout;
 
 // The shared test fixtures for the push spine and its phase modules
 // (test-only; consumed by the phase modules' tests and by
@@ -109,47 +42,13 @@ pub mod status;
 pub(crate) mod testsupport;
 
 // The area-root re-export globs make every submodule's items nameable at
-// `crate::deploy::…` (the old `push::engine::*` / `revset::*` call sites
-// resolve here); the `pub(crate)` globs are kept for the items the engine
-// consumes by the area-root path rather than by submodule path.
-#[allow(unused_imports)]
-pub(crate) use batching::*;
-#[allow(unused_imports)]
-pub(crate) use capacity::*;
-#[allow(unused_imports)]
-pub(crate) use commit::*;
-#[allow(unused_imports)]
-pub(crate) use compensation::*;
-#[allow(unused_imports)]
-pub(crate) use coverage::*;
-#[allow(unused_imports)]
-pub(crate) use dryrun::*;
-#[allow(unused_imports)]
-pub(crate) use exact_rollback::*;
-#[allow(unused_imports)]
-pub(crate) use execute::*;
-#[allow(unused_imports)]
-pub(crate) use failure::*;
-#[allow(unused_imports)]
-pub(crate) use groups::*;
+// `crate::deploy::…`; the `pub(crate)` globs are kept for the items the
+// engine consumes by the area-root path rather than by submodule path.
 #[allow(unused_imports)]
 pub(crate) use maintenance::*;
-#[allow(unused_imports)]
-pub(crate) use noop::*;
-#[allow(unused_imports)]
-pub(crate) use partial_rollout::*;
 pub use plan::*;
-#[allow(unused_imports)]
-pub(crate) use preflight::*;
 pub use push::*;
 #[allow(unused_imports)]
 pub(crate) use refs::*;
 #[allow(unused_imports)]
-pub(crate) use results::*;
-pub use selection::*;
-#[allow(unused_imports)]
-pub(crate) use server::*;
-#[allow(unused_imports)]
-pub(crate) use staging::*;
-#[allow(unused_imports)]
-pub(crate) use status::*;
+pub(crate) use rollout::*;

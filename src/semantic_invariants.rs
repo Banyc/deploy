@@ -71,7 +71,7 @@
 //! | Bounds: `need + reserve > available` wraps | `bounds_capacity_matches_u128_reference_over_grid` |
 
 use crate::config::{FailurePolicy, ProjectConfig, SlotConfig};
-use crate::deploy::capacity::capacity_fits;
+use crate::deploy::plan::capacity_fits;
 use crate::deploy::{PushOptions, PushReport, push, push_with_id};
 use crate::error::Result;
 use crate::identity::{
