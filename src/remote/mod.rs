@@ -1,7 +1,33 @@
-//! Transport, remote helper, and remote adapter orchestration.
+//! Transport, remote helper, remote adapter orchestration, and the remote-
+//! facing semantics: canonical tree objects, mapping/template materialization,
+//! and the canonical on-server layout.
+//!
+//! # Modules
+//!
+//! * [`helper`] — [`RemoteHelper`](helper::RemoteHelper): status inspection,
+//!   locking, generation switching, commit markers, inventory, rotation, and
+//!   transaction records (the object-store-facing helpers — `tree_exists`,
+//!   `stage_incoming`, `publish_from_incoming`, `remove_incoming` — stay here:
+//!   they are [`RemoteHelper`](helper::RemoteHelper) methods interdependent
+//!   with the rest of the struct, and splitting them would loosen the struct's
+//!   field encapsulation).
+//! * [`canonical`] — canonical tree objects (moved from `crate::tree`, which
+//!   is now a re-export shim).
+//! * [`materialize`] — mapping resolution + the template renderer (moved from
+//!   `crate::mapper` / `crate::template`, both now re-export shims).
+//! * [`layout`] — canonical on-server layout paths (moved from `crate::layout`,
+//!   now a re-export shim).
+//! * [`observed`] — the three-state observation types, re-exported from
+//!   `crate::records` (a later pass owns them).
+//! * [`transport`], [`ssh`], [`hostkey`], [`runner`] — transport and
+//!   execution layers.
 
+pub mod canonical;
 pub mod helper;
 pub mod hostkey;
+pub mod layout;
+pub mod materialize;
+pub mod observed;
 pub mod runner;
 pub mod ssh;
 pub mod transport;
