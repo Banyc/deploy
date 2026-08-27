@@ -3,7 +3,7 @@
 //! raw -> domain conversion enforces.
 
 use crate::config::activation::{ActivationConfig, default_true};
-use crate::config::domain::ArtifactConfig;
+use crate::config::mapping::ArtifactConfig;
 use crate::config::release_name::ReleaseName;
 use crate::config::retention::RetentionConfig;
 use crate::config::rollout::{FailurePolicy, default_failure_policy};
