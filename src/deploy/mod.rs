@@ -7,10 +7,11 @@
 //!
 //! * [`push`] — the push ORCHESTRATION: `push`/`push_inner` (the numbered
 //!   steps), the ref-resolution ordering, the preflight/batch/finalization
-//!   calls, the maintenance wiring, the abandoned-incoming cleanup and the
-//!   commit-diverged handling (A7) — the spine of the old `push::engine`,
-//!   kept together with the interdependent private helpers and the giant
-//!   `#[cfg(test)] mod tests` (which drives `push_inner` directly).
+//!   calls, the maintenance wiring, and the status/terminal wiring (the
+//!   per-slot decisions themselves live in the dedicated modules below) —
+//!   the spine of the old `push::engine`, kept together with the
+//!   interdependent private helpers and the giant `#[cfg(test)] mod tests`
+//!   (which drives `push_inner` directly).
 //! * [`noop`] — the "Everything up to date" no-op (A1): the up-to-date
 //!   detection (complete [`ArtifactRef`] equality + per-slot verification
 //!   rendering the EXISTING generation's identities) and the no-op path's
@@ -52,7 +53,14 @@
 //! * [`compensation`] — per-slot COMPENSATION (A1 step 11):
 //!   [`compensation::compensate_server`], the prior-generation restore /
 //!   remove-`current`-on-first-deploy logic with its CAS precondition.
-//! * [`staging`] — the disposable staging lifecycle (the old `push::staging`).
+//! * [`staging`] — the disposable staging lifecycle (the old `push::staging`)
+//!   plus the A7 abandoned-incoming cleanup.
+//! * [`results`] — the A1 result-table shaping: the skipped-slots filler and
+//!   the post-mutation actual-observation.
+//! * [`status`] — the A7 post-mutation status / disposition decision: the
+//!   pending-commit demotion reasons ("recoverable metadata failure", "commit
+//!   diverged", "marker integrity conflict") and the status → terminal
+//!   disposition mapping.
 //! * [`dryrun`] — the dry-run plan computation/rendering from the push spine.
 //! * [`capacity`] — capacity preflight (the old `push::capacity`).
 //!
@@ -77,8 +85,10 @@ pub mod partial_rollout;
 pub mod plan;
 pub mod push;
 pub mod refs;
+pub mod results;
 pub mod server;
 pub mod staging;
+pub mod status;
 
 // The area-root re-export globs make every submodule's items nameable at
 // `crate::deploy::…` (the old `push::engine::*` / `revset::*` call sites
@@ -110,6 +120,10 @@ pub use push::*;
 #[allow(unused_imports)]
 pub(crate) use refs::*;
 #[allow(unused_imports)]
+pub(crate) use results::*;
+#[allow(unused_imports)]
 pub(crate) use server::*;
 #[allow(unused_imports)]
 pub(crate) use staging::*;
+#[allow(unused_imports)]
+pub(crate) use status::*;

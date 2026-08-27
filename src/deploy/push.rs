@@ -17,22 +17,22 @@
 //! [`crate::deploy::coverage`].
 //!
 //! This module keeps the genuinely-interdependent private helpers
-//! (`run_capacity_and_staging`, `slot_vars`, `recover_if_missing` — the A3
-//! local-object recovery called from the mutating remote phase, next to the
-//! A7 abandoned-incoming cleanup) and the giant `#[cfg(test)] mod tests`
-//! (which drives `push_inner` directly through the fault-matrix entry
-//! points), so the A1/A7 features that are inseparable from the spine — the
-//! ref-resolution ordering, the lock acquisition, the abandoned-incoming
-//! cleanup, the pending-commit demotion reasons, the commit-diverged
-//! handling — live here too.
+//! (`run_capacity_and_staging`, `slot_vars`) and the giant `#[cfg(test)] mod
+//! tests` (which drives `push_inner` directly through the fault-matrix entry
+//! points). The round-4 split moved the other push.rs facets into dedicated
+//! modules: the A1 skipped-slots filler + post-mutation observation
+//! ([`crate::deploy::results`]), the A7 pending-commit demotion /
+//! status-disposition decision ([`crate::deploy::status`]), the A7
+//! abandoned-incoming cleanup ([`crate::deploy::staging`]), and the A3
+//! local-object recovery ([`crate::store::objects::LocalStore::recover_if_missing`]).
+//! The FAKE_SYSTEMCTL test shim stays here with its push-spine activation
+//! tests (it drives `push_inner` through the `SysdHarness`; see the tests).
 
 use crate::config::{Mapping, ProjectConfig, SlotConfig};
 use crate::deploy::capacity::capacity_preflight;
 use crate::deploy::lock::FileLock;
-use crate::deploy::server::{REMOTE_RELEASE_JSON, download_tree_to_host};
-use crate::deploy::staging::{
-    StagingCleanup, cleanup_dry_run_staging, remove_tree_restoring_write,
-};
+use crate::deploy::server::REMOTE_RELEASE_JSON;
+use crate::deploy::staging::{StagingCleanup, cleanup_dry_run_staging};
 use crate::error::{Error, Result};
 use crate::identity::{
     ArtifactRef, BehaviorContract, DeploymentId, GenerationId, OperationId, ReleaseId, SlotId,
@@ -43,12 +43,11 @@ use crate::ledger::{self, PushRef, RefExpr};
 use crate::ledger::{
     BehaviorIndex, DeploymentIntent, DeploymentPlan, DeploymentStatus, DesiredGeneration,
     IntentSlot, LedgerIntentReport, LedgerTerminal, NonEmptySlotTable, Observation,
-    ObservationError, ObservedGeneration, PreviousGeneration, SlotAttemptState, SlotOutcome,
-    SlotOutcomeKind, SlotPlan, SlotResult, SlotTable, TerminalDisposition,
+    ObservationError, PreviousGeneration, SlotAttemptState, SlotOutcome, SlotPlan, SlotResult,
+    SlotTable, TerminalDisposition,
 };
 use crate::remote::canonical as tree;
 use crate::remote::helper::RemoteHelper;
-use crate::remote::layout;
 use crate::remote::transport::Remote;
 use crate::store::local::LocalStore;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -850,7 +849,10 @@ fn push_inner(
     // layout mutation; a dry run never reaches this, so an unprovisioned
     // remote stays untouched. Deliberately AFTER planning: a plan rejection
     // (ref failure, membership, behavior) fails before any remote byte is
-    // written.
+    // written. The abandoned-incoming cleanup lives in
+    // [`crate::deploy::staging::cleanup_abandoned_incoming`] (A7) and the
+    // local-object recovery in
+    // [`crate::store::objects::LocalStore::recover_if_missing`] (A3).
     if !opts.dry_run {
         for (slot, _s) in &members {
             let slot_id =
@@ -860,11 +862,11 @@ fn push_inner(
             let status = &statuses[&slot_id];
             helper.handshake()?;
             remotes.get(&slot_id).unwrap().provision_layout()?;
-            for pend in &status.pending_incoming {
-                if pend != deployment_id.as_str() {
-                    helper.remove_incoming(pend)?;
-                }
-            }
+            super::staging::cleanup_abandoned_incoming(
+                helper,
+                &status.pending_incoming,
+                deployment_id,
+            )?;
             if let Some(held) = &status.lock
                 && held != op_id.as_str()
             {
@@ -874,7 +876,7 @@ fn push_inner(
             }
             for a in &assignments {
                 if a.placement_slot == slot_id {
-                    recover_if_missing(helper.remote(), store, &a.artifact.tree)?;
+                    store.recover_if_missing(helper.remote(), &a.artifact.tree)?;
                 }
             }
         }
@@ -1140,172 +1142,33 @@ fn push_inner(
         &mut results,
     )?;
 
-    // 15. Commit markers (only for otherwise-successful attempts). The
-    // demotion reason is recorded alongside the final transition so `deploy
-    // log` can explain why an attempt ended up `PendingCommit` or `Degraded`
-    // (e.g. "recoverable metadata failure", "marker integrity conflict").
-    let mut commit_status = status.clone();
-    let mut commit_reason: Option<&'static str> = None;
-    if status == DeploymentStatus::Successful {
-        // The full placement-slot set participating in this commit.
-        let slot_ids: Vec<String> = servers_order
-            .iter()
-            .map(|s| s.as_str().to_string())
-            .collect();
-        for sid in &servers_order {
-            let helper = &helpers[sid];
-            // Hold the lock for the whole commit step so a failure cannot leak it
-            // (a `?` on a manual lock would otherwise leave the lock held).
-            let _guard = match helper.acquire_lock_guard(op_id.as_str()) {
-                Ok(g) => g,
-                Err(_) => {
-                    commit_status = DeploymentStatus::PendingCommit;
-                    commit_reason = Some("recoverable metadata failure");
-                    continue;
-                }
-            };
-            // Check the generation *before* writing the marker; a mismatch means
-            // another controller changed `current` and this marker would be wrong.
-            let cur = match helper.status() {
-                Ok(s) => s.current_generation,
-                Err(_) => {
-                    // Recoverable metadata failure: do not abort the whole push
-                    // (which would leave the attempt unrecorded); mark the
-                    // commit incomplete and keep going. A later push reconciles
-                    // this `PendingCommit` attempt (see
-                    // `reconcile_pending_commits`) before its own no-op check.
-                    commit_status = DeploymentStatus::PendingCommit;
-                    commit_reason = Some("recoverable metadata failure");
-                    continue;
-                }
-            };
-            if cur.as_ref().map(|g| g.as_str()) != Some(new_gen[sid].as_str()) {
-                // The live generation no longer matches what we deployed: the
-                // controller's view diverged, so this marker would be wrong.
-                // Report Degraded rather than a falsely successful commit.
-                commit_status = DeploymentStatus::Degraded;
-                commit_reason = Some("commit diverged");
-                continue;
-            }
-            match helper.write_commit_marker(
-                deployment_id.as_str(),
-                new_gen[sid].as_str(),
-                &slot_ids,
-                Some(target_name),
-            ) {
-                Err(Error::Integrity(_)) => {
-                    // A conflicting marker already exists with different
-                    // content: a concurrent controller recorded a different
-                    // fact, or the remote state diverged/corrupted. This is a
-                    // PERMANENT condition — retrying will never fix it, and
-                    // leaving the attempt `PendingCommit` would strand it
-                    // forever (every later push re-hits the same integrity
-                    // error). Finalize as `Degraded` (no snapshot entry) rather
-                    // than falsely reporting `Successful`.
-                    commit_status = DeploymentStatus::Degraded;
-                    commit_reason = Some("marker integrity conflict");
-                    continue;
-                }
-                Err(_) => {
-                    // Recoverable metadata failure writing the marker: the
-                    // attempt is recorded `PendingCommit` and a later push's
-                    // `reconcile_pending_commits` completes the marker set
-                    // before its no-op check.
-                    commit_status = DeploymentStatus::PendingCommit;
-                    continue;
-                }
-                Ok(_) => {}
-            }
-            // `_guard` drops here, releasing the lock.
-        }
-    }
-
-    // A server whose committed-transaction record write failed is still active
-    // but not durably bookkept. Do not report the attempt as `Successful`:
-    // demote to `PendingCommit` so the metadata gap is visible.
-    if commit_status == DeploymentStatus::Successful {
-        for sid in &servers_order {
-            if let Some(r) = results.get(sid)
-                && r.outcome == SlotOutcomeKind::Activated
-                && r.error.is_some()
-            {
-                commit_status = DeploymentStatus::PendingCommit;
-                commit_reason = Some("recoverable metadata failure");
-                break;
-            }
-        }
-    }
+    // 15. Commit markers (only for otherwise-successful attempts) and the
+    // resulting status/disposition decision live in [`crate::deploy::status`]:
+    // [`status::decide_commit_status`] runs the per-slot marker step and
+    // demotes to `PendingCommit` / `Degraded` with the recorded reason (e.g.
+    // "recoverable metadata failure", "commit diverged", "marker integrity
+    // conflict") so `deploy log` can explain why an attempt ended up there.
+    let (commit_status, commit_reason) = super::status::decide_commit_status(
+        &status,
+        &results,
+        &helpers,
+        &servers_order,
+        &new_gen,
+        deployment_id,
+        target_name,
+        op_id,
+    );
 
     // 16 & 17. Record attempt, history, retention.
     //
-    // `actual_servers` reflects each slot's *real* final state, read from the
-    // remote generation it currently points at, rather than the desired plan
-    // values. Failed/skipped/restored slots therefore report their actual
-    // artifact instead of the desired one. The per-slot THREE-STATE
-    // OBSERVATION: the actual's `artifact` is itself an
-    // [`Observation<ArtifactRef>`] — a FAILED assignment read is
-    // `Observation::Unknown(error)`, a distinct value that never looks like a
-    // known artifact (there is no sentinel artifact) — and the parallel
-    // `actual_observations` map carries the GENERATION half of the
-    // observation (a different fact, feeding the never-advanced outcomes
-    // below): a FAILED post-mutation status read is `Unknown(error)`, never a
-    // `None` that downstream code reads as "unchanged". The wire-shaped
-    // `actual_servers` keeps the current on-disk shape — generation only —
-    // so the observation's `Unknown` half is recorded into the never-advanced
-    // outcomes' `observation_error` field below, while the outcome's OWN
-    // operation error (`error`) is left untouched.
-    let mut actual_servers: BTreeMap<SlotId, SlotAttemptState> = BTreeMap::new();
-    let mut actual_observations: BTreeMap<SlotId, Observation<ObservedGeneration>> =
-        BTreeMap::new();
-    for a in &assignments {
-        let sid = &a.placement_slot;
-        let helper = &helpers[sid];
-        let status = helper.status();
-        let (actual, observation) = match status {
-            Ok(s) => match s.current_generation {
-                Some(g) => match helper.read_assignment(g.as_str()) {
-                    Ok(asn) => (
-                        SlotAttemptState {
-                            artifact: Observation::Known(asn.artifact.clone()),
-                            generation: Some(g.clone()),
-                        },
-                        Observation::Known(ObservedGeneration {
-                            generation: g.clone(),
-                        }),
-                    ),
-                    Err(e) => (
-                        SlotAttemptState {
-                            artifact: Observation::Unknown(ObservationError {
-                                message: format!("assignment read failed: {e}"),
-                            }),
-                            generation: Some(g.clone()),
-                        },
-                        Observation::Unknown(ObservationError {
-                            message: format!("assignment read failed: {e}"),
-                        }),
-                    ),
-                },
-                None => (
-                    SlotAttemptState {
-                        artifact: Observation::Known(a.artifact.clone()),
-                        generation: None,
-                    },
-                    Observation::KnownAbsent,
-                ),
-            },
-            Err(e) => (
-                SlotAttemptState {
-                    artifact: Observation::Known(a.artifact.clone()),
-                    generation: None,
-                },
-                Observation::Unknown(ObservationError {
-                    message: format!("status read failed: {e}"),
-                }),
-            ),
-        };
-        actual_servers.insert(sid.clone(), actual);
-        actual_observations.insert(sid.clone(), observation);
-    }
+    // The per-slot ACTUAL observation (each slot's *real* final state, read
+    // from the remote generation it currently points at, as the two parallel
+    // tables `actual_servers` + `actual_observations` — including the
+    // THREE-STATE `Observation::Unknown(error)` handling for failed reads)
+    // lives in [`crate::deploy::results::observe_actual_servers`] (the
+    // result-table shaping module).
+    let (actual_servers, actual_observations) =
+        super::results::observe_actual_servers(&assignments, &helpers);
     // A pre-swap failure (never advanced) records the ACTUAL observed
     // post-state — the outcome's observation is the observed post-state the
     // remaining-changes derivation compares against pre_push, never the
@@ -1397,48 +1260,15 @@ fn push_inner(
         // The wire outcomes are converted to the DOMAIN outcomes, deriving
         // each slot's TRANSITION STATE from the wire's status/outcome fields
         // and DROPPING the wire outcome's redundant `slot_id` into the key
-        // (the domain value carries no slot — the table key owns identity).
+        // (the domain value carries no slot — the table key owns identity);
+        // the STATUS → DISPOSITION mapping lives in
+        // [`crate::deploy::status::disposition_for`] (the structural domain
+        // truth table: FailedPreflight carries nothing, FailedRolledBack owns
+        // the outcomes as its compensation report, Degraded owns the outcomes
+        // its remaining changes are derived from — and refuses an
+        // all-restored Degraded wire).
         let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(outcomes_map);
-        // MAP the final status to its DISPOSITION (the domain truth table is
-        // structural): FailedPreflight carries nothing (no slot touched),
-        // FailedRolledBack owns the outcome table as its compensation
-        // report, Degraded owns the outcome table its remaining changes are
-        // derived from (the slots whose FINAL OBSERVED STATE differs from
-        // their pre_push state) — the same derivation the read path applies,
-        // so the domain and the wire conversion stay in sync.
-        let disposition = match &commit_status {
-            DeploymentStatus::FailedPreflight => TerminalDisposition::FailedPreflight,
-            DeploymentStatus::FailedRolledBack => {
-                TerminalDisposition::FailedRolledBack { outcomes }
-            }
-            DeploymentStatus::Degraded => {
-                // The Degraded disposition's remaining changes are DERIVED
-                // from the outcomes (the slots whose final observed state
-                // differs from their pre_push state) — never stored. The
-                // conversion refuses a Degraded wire whose outcomes are ALL
-                // restored (a fully-compensated attempt must be
-                // `FailedRolledBack`, never `Degraded`); a Degraded terminal
-                // whose outcomes are all never-advanced (e.g. a
-                // `leave_changed` failure that advanced nothing) is
-                // legitimate — the policy marks the attempt Degraded even
-                // though no slot changed.
-                if outcomes
-                    .values()
-                    .all(|r| r.outcome == SlotOutcomeKind::Restored)
-                {
-                    return Err(Error::store(
-                        "a Degraded terminal requires at least one non-restored outcome — none recorded"
-                            .to_string(),
-                    ));
-                }
-                TerminalDisposition::Degraded { outcomes }
-            }
-            other => {
-                return Err(Error::store(format!(
-                    "internal: cannot append a terminal for status {other:?} — only FailedPreflight / FailedRolledBack / Degraded reach the terminal append"
-                )));
-            }
-        };
+        let disposition = super::status::disposition_for(&commit_status, outcomes)?;
         store.append_terminal(
             target_name,
             deployment_id,
@@ -1506,41 +1336,6 @@ fn push_inner(
     })
 }
 
-/// Download a tree from a server into the local object store if missing.
-fn recover_if_missing(remote: &dyn Remote, store: &LocalStore, digest: &TreeDigest) -> Result<()> {
-    if store.object_exists(digest) {
-        return Ok(());
-    }
-    let root_rel = layout::tree_root(digest.as_str());
-    if !remote.exists(&root_rel) {
-        return Ok(());
-    }
-    let tmp = store
-        .staging_dir()
-        .join(format!("recover-{}", digest.as_str()));
-    // A stale `recover-<digest>` dir can survive an interrupted earlier
-    // recovery, and downloaded trees carry remote file modes (read-only
-    // dirs/files), so removal can fail with EACCES. Removal is EXPLICIT and
-    // FALLIBLE: restore owner-write inside the stale tree, then remove it. A
-    // stale temp that cannot be removed aborts the recovery loudly instead of
-    // letting `download_tree_to_host` write INTO the stale dir and
-    // `store.store_object` persist a mixed (stale leftovers + fresh content)
-    // tree under the digest. A missing temp is a no-op.
-    if tmp.exists() {
-        remove_tree_restoring_write(&tmp, "remove stale recovery temp")?;
-    }
-    download_tree_to_host(remote, &root_rel, &tmp)?;
-    store.store_object(digest, &tmp)?;
-    // Explicit FALLIBLE cleanup of the disposable download temp before
-    // returning, so a successful recovery never leaves `recover-<digest>`
-    // behind (a leftover that a later recovery would treat as stale and that
-    // could accumulate read-only content). `store_object` copies, so the temp
-    // is no longer needed; a cleanup failure surfaces as an error naming the
-    // path, mirroring the dry-run staging cleanup.
-    remove_tree_restoring_write(&tmp, "remove recovery temp")?;
-    Ok(())
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1549,6 +1344,7 @@ pub(crate) mod tests {
         test_deployment_id, test_generation_id, test_tree_digest,
     };
     use crate::ledger::LedgerEntry;
+    use crate::ledger::SlotOutcomeKind;
     use crate::remote::helper::GenerationAssignment;
     use crate::remote::transport::{FsBytes, LocalTransport};
     use crate::testutil::test_remotes::{
@@ -4464,6 +4260,13 @@ interval_seconds = 0
     /// `restart` (exit 1) while the marker file exists; with `once` it
     /// CONSUMES the marker on the first failure, so a later restart (e.g. the
     /// compensation's prior-activation restart) succeeds.
+    ///
+    /// Round-4 decision: kept HERE (not moved to `crate::verify::systemd`
+    /// tests) because its only consumers are the push-spine activation
+    /// tests below (activation failure → compensation → status), which drive
+    /// `push_inner` through the `SysdHarness` — push-internal plumbing. The
+    /// systemd adapter's own tests use a simpler inline `exit 0` shim; the
+    /// FAIL/ONCE failure-injection semantics have no consumer there.
     fn install_fake_systemctl(
         base: &std::path::Path,
         marker: &std::path::Path,

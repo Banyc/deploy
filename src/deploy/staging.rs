@@ -1,12 +1,17 @@
 //! Disposable staging lifecycle and cleanup.
 //!
 //! The dry-run staging guard ([`StagingCleanup`]), the explicit fallible
-//! dry-run cleanup ([`cleanup_dry_run_staging`]), and the shared
+//! dry-run cleanup ([`cleanup_dry_run_staging`]), the shared
 //! restore-owner-write + remove helpers ([`restore_owner_write_recursive`],
 //! [`remove_tree_restoring_write`]) used by both the dry-run cleanup and
-//! recovery-temp removal. Extracted from `push::engine`.
+//! recovery-temp removal, and the A7 abandoned-incoming cleanup
+//! ([`cleanup_abandoned_incoming`]: the pre-mutation removal of OTHER
+//! deployments' leftover incoming staging trees). Extracted from
+//! `push::engine`.
 
 use crate::error::{Error, Result};
+use crate::identity::DeploymentId;
+use crate::remote::helper::RemoteHelper;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -71,6 +76,27 @@ pub(crate) fn remove_tree_restoring_write(root: &Path, what: &str) -> Result<()>
 /// instead of silently leaving `staging/dry-<id>` behind forever.
 pub(crate) fn cleanup_dry_run_staging(root: &Path) -> Result<()> {
     remove_tree_restoring_write(root, "remove dry-run staging")
+}
+
+/// The A7 abandoned-incoming cleanup: before THIS deployment mutates a server,
+/// remove every OTHER deployment's leftover `incoming/<id>` staging tree still
+/// pending on that server (a crashed controller's abandoned staging). The
+/// deployment's own id is never removed — its incoming was just staged by the
+/// preflight and is still in use. Each removal is fallible and aborts the
+/// push: an incoming tree that cannot be removed is a remote mutation that
+/// would interleave with the abandoned staging. Extracted from the `push_inner`
+/// mutating-remote phase (A7 hidden semantics).
+pub(crate) fn cleanup_abandoned_incoming(
+    helper: &RemoteHelper,
+    pending_incoming: &[String],
+    deployment_id: &DeploymentId,
+) -> Result<()> {
+    for pend in pending_incoming {
+        if pend != deployment_id.as_str() {
+            helper.remove_incoming(pend)?;
+        }
+    }
+    Ok(())
 }
 
 /// Removes the disposable dry-run staging tree on drop (error, panic, or

@@ -7,11 +7,15 @@
 //! the first failed batch when `stop_on_failure` is set. Extracted from the
 //! old `push::engine` spine ([`crate::deploy::push`]); `push_inner` consumes
 //! the outcome and hands the failure-policy signals to
-//! [`crate::deploy::failure::apply_failure_policy`].
+//! [`crate::deploy::failure::apply_failure_policy`]. The never-started
+//! `Skipped` filler that completes the result table lives in
+//! [`crate::deploy::results::fill_skipped_slots`] (the round-4 result-table
+//! shaping module).
 
 use crate::config::{ProjectConfig, ServerDef, SlotConfig};
 use crate::deploy::plan::PlannedAssignment;
 use crate::deploy::push::slot_vars;
+use crate::deploy::results::fill_skipped_slots;
 use crate::deploy::server::{ServerProc, process_server};
 use crate::error::Result;
 use crate::identity::{DeploymentId, GenerationId, OperationId, SlotId};
@@ -23,10 +27,10 @@ use std::collections::{BTreeMap, HashMap};
 
 /// The outcome of one deployment-order batch run: the per-slot results
 /// (every SELECTED slot appears — never-started slots are filled as
-/// `Skipped` with their reconciled current assignment), plus the
-/// failure-policy signals: which slots this deployment advanced, which
-/// compensated, which never advanced (pre-swap failure or compare-and-swap
-/// skip), and whether any slot failed.
+/// `Skipped` with their reconciled current assignment via
+/// [`fill_skipped_slots`]), plus the failure-policy signals: which slots this
+/// deployment advanced, which compensated, which never advanced (pre-swap
+/// failure or compare-and-swap skip), and whether any slot failed.
 pub(crate) struct BatchRun {
     pub(crate) results: BTreeMap<SlotId, SlotResult>,
     pub(crate) advanced: Vec<SlotId>,
@@ -182,25 +186,10 @@ pub(crate) fn run_batches(
 
     // Any slot never started (e.g. skipped after an earlier failure under
     // stop_on_failure) still appears in the attempt, with its reconciled
-    // current assignment rather than a generated desired generation.
-    for a in assignments {
-        if !results.contains_key(&a.placement_slot) {
-            let cur = statuses
-                .get(&a.placement_slot)
-                .and_then(|s| s.current_generation.clone());
-            results.insert(
-                a.placement_slot.clone(),
-                SlotResult {
-                    slot_id: a.placement_slot.clone(),
-                    outcome: SlotOutcomeKind::Skipped,
-                    generation: cur,
-                    compensated: false,
-                    error: None,
-                    observation_error: None,
-                },
-            );
-        }
-    }
+    // current assignment rather than a generated desired generation. The
+    // filler lives in [`crate::deploy::results::fill_skipped_slots`] (the
+    // result-table shaping module).
+    fill_skipped_slots(&mut results, assignments, statuses);
     Ok(BatchRun {
         results,
         advanced,

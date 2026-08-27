@@ -1,11 +1,14 @@
 //! The content-addressed object store (A3): tree objects under
 //! `objects/sha256/<digest>/root/` + `tree.json`, with store-or-reuse,
-//! read-time verification, and digest-bound tree metadata reads.
+//! read-time verification, and digest-bound tree metadata reads — plus the
+//! A3 local-object recovery ([`LocalStore::recover_if_missing`]: download a
+//! missing digest from a retaining server).
 
 use crate::error::{Error, Result};
 use crate::identity::{TreeDigest, TreeMetadata};
 use crate::remote::canonical::TREE_SCHEMA_VERSION;
 use crate::remote::layout;
+use crate::remote::transport::Remote;
 use crate::store::atomic::{copy_dir_recursive, read_json};
 use crate::store::local::{LocalStore, write_atomic_cas};
 use std::path::{Path, PathBuf};
@@ -29,6 +32,50 @@ impl LocalStore {
 
     pub fn object_exists(&self, digest: &TreeDigest) -> bool {
         self.object_root(digest).exists()
+    }
+
+    /// A3 local object recovery: download a tree from a retaining server into
+    /// the local object store if the digest is missing locally. The remote
+    /// tree (`objects/sha256/<digest>/root/` on the server) is the source of
+    /// truth for a digest the local store never saw (e.g. a rollback to a
+    /// generation whose tree was never materialized locally); when the server
+    /// no longer retains it either, recovery is a no-op and the later
+    /// verification/staging steps surface the missing tree.
+    pub fn recover_if_missing(&self, remote: &dyn Remote, digest: &TreeDigest) -> Result<()> {
+        if self.object_exists(digest) {
+            return Ok(());
+        }
+        let root_rel = layout::tree_root(digest.as_str());
+        if !remote.exists(&root_rel) {
+            return Ok(());
+        }
+        let tmp = self
+            .staging_dir()
+            .join(format!("recover-{}", digest.as_str()));
+        // A stale `recover-<digest>` dir can survive an interrupted earlier
+        // recovery, and downloaded trees carry remote file modes (read-only
+        // dirs/files), so removal can fail with EACCES. Removal is EXPLICIT and
+        // FALLIBLE: restore owner-write inside the stale tree, then remove it. A
+        // stale temp that cannot be removed aborts the recovery loudly instead of
+        // letting `download_tree_to_host` write INTO the stale dir and
+        // `store.store_object` persist a mixed (stale leftovers + fresh content)
+        // tree under the digest. A missing temp is a no-op.
+        if tmp.exists() {
+            crate::deploy::staging::remove_tree_restoring_write(
+                &tmp,
+                "remove stale recovery temp",
+            )?;
+        }
+        crate::deploy::server::download_tree_to_host(remote, &root_rel, &tmp)?;
+        self.store_object(digest, &tmp)?;
+        // Explicit FALLIBLE cleanup of the disposable download temp before
+        // returning, so a successful recovery never leaves `recover-<digest>`
+        // behind (a leftover that a later recovery would treat as stale and that
+        // could accumulate read-only content). `store_object` copies, so the temp
+        // is no longer needed; a cleanup failure surfaces as an error naming the
+        // path, mirroring the dry-run staging cleanup.
+        crate::deploy::staging::remove_tree_restoring_write(&tmp, "remove recovery temp")?;
+        Ok(())
     }
 
     /// Store (or reuse) a tree object. Verifies the digest after copy. Reusing an
