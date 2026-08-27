@@ -67,7 +67,7 @@ use crate::model::{
 };
 use crate::records::{
     DeploymentIntent, DeploymentStatus, LedgerEntry, LedgerIntentWire, LedgerLine, LedgerTerminal,
-    LedgerTerminalWire, ObservedSlot, ObservedTarget, Pins, ServerState,
+    LedgerTerminalWire, ObservedSlot, ObservedTarget, Pins, ServerState, TerminalDisposition,
 };
 use crate::scalar::ApplicationStoreKey;
 use crate::store::atomic::{
@@ -978,10 +978,14 @@ impl LocalStore {
     /// names a different slot, a rollback whose binding keys are not exactly
     /// its generation keys), or whose cross-record claims disagree (the
     /// terminal's target vs the read path / its intent, the outcome key set
-    /// vs the intent's `slot_ids` — BY STATUS: a Successful terminal's
-    /// outcomes must EXACTLY equal its membership (the four-set equality:
-    /// outcomes == rollback slots == rollback bindings == intent
-    /// membership, non-empty), a FailedPreflight terminal must carry NO
+    /// vs the intent's `slot_ids` — BY STATUS AND INTENT GROUP: a FULL
+    /// push's Successful terminal must satisfy the strict four-set equality
+    /// (outcomes == rollback slots == rollback bindings == intent
+    /// membership, non-empty), a GROUP push's Successful terminal is the
+    /// relaxed rule (the outcomes cover the SELECTED slots — the intent's
+    /// membership — and the rollback is the COMPLETE resulting snapshot
+    /// whose slots ⊇ the outcomes' keys, the base-overlay carrying the
+    /// unselected slots forward), a FailedPreflight terminal must carry NO
     /// outcomes, and every other terminal state's outcomes must EXACTLY
     /// cover the membership), is REFUSED with an integrity
     /// error — a hand-constructed or tampered record is never read as
@@ -1115,25 +1119,28 @@ impl LocalStore {
                     // terminal carries no identity (the enclosing entry owns
                     // it), so there is nothing further to check here.
                     // OUTCOME KEY SET AGREEMENT (cross-record invariant,
-                    // outcome leg): when the terminal carries outcomes, its
-                    // outcome key set must equal the intent's AUTHORITATIVE
-                    // membership EXACTLY — every member slot has one outcome,
-                    // no extras, no missing. An EMPTY outcome map is the
-                    // documented pre-mutation / legacy no-outcomes state
-                    // (e.g. a preflight failure that touched no slot) and
-                    // stays valid; a PARTIAL outcome map — the shape that
-                    // would let a consumer absorb only some members — is
-                    // always refused.
-                    // outcome leg), BY STATUS: the terminal's outcome key
-                    // set must agree with the intent's AUTHORITATIVE
-                    // membership EXACTLY — the outcomes are the
-                    // disposition's OWN table ([`LedgerTerminal::outcomes`]
-                    // — a FailedPreflight terminal yields an empty table):
-                    // - Successful: the four sets (outcomes, rollback
-                    //   slots, rollback bindings, intent membership) are
-                    //   EXACTLY EQUAL and NON-EMPTY — the terminal-local
-                    //   three-set equality is enforced by the wire → domain
-                    //   conversion; the membership leg is enforced here.
+                    // outcome leg), BY STATUS AND INTENT GROUP: the
+                    // terminal's outcome key set must agree with the
+                    // intent's AUTHORITATIVE membership — the outcomes are
+                    // the disposition's OWN table
+                    // ([`LedgerTerminal::outcomes`] — a FailedPreflight
+                    // terminal yields an empty table):
+                    // - Successful, FULL push (no group): the four sets
+                    //   (outcomes, rollback slots, rollback bindings,
+                    //   intent membership) are EXACTLY EQUAL and
+                    //   NON-EMPTY — the terminal-local subset rule is
+                    //   enforced by the wire → domain conversion; the
+                    //   membership leg (outcomes == membership AND
+                    //   rollback slots == membership) is enforced here.
+                    // - Successful, GROUP push: the relaxed rule — the
+                    //   outcomes cover the SELECTED slots (the intent's
+                    //   membership; every outcome names a member slot,
+                    //   checked above) and the rollback is the COMPLETE
+                    //   resulting snapshot (the base-overlay carried the
+                    //   unselected slots forward), so the rollback's slots
+                    //   ⊇ the outcomes' keys (the terminal-local half,
+                    //   enforced by the conversion) — the rollback covers
+                    //   the FULL membership, never just the group.
                     // - FailedPreflight: outcomes EMPTY (a pre-mutation
                     //   failure touched no slot).
                     // - every other terminal state (FailedRolledBack,
@@ -1144,10 +1151,41 @@ impl LocalStore {
                     let membership: BTreeSet<&SlotId> = entry.intent.slots.keys().collect();
                     match terminal.status() {
                         DeploymentStatus::Successful => {
-                            if outcome_keys != membership {
-                                return Err(Error::integrity(format!(
-                                    "ledger of target '{target}': Successful terminal for deployment '{id}' carries outcomes for slots {outcome_keys:?} but its intent's slot_ids are {membership:?} — a successful deployment's outcomes must EXACTLY equal its membership (the rollback's slots and bindings equal them by the conversion)"
-                                )));
+                            // THE SUCCESSFUL SNAPSHOT RULE (membership leg),
+                            // BY INTENT GROUP: a FULL push (no group) keeps
+                            // the strict four-set equality — the outcomes
+                            // AND the rollback's slots must EXACTLY equal
+                            // the intent's membership (the rollback's
+                            // bindings equal its slots by the rollback
+                            // conversion). A GROUP push is the relaxed
+                            // rule: the outcomes cover the SELECTED slots
+                            // (the group — every outcome names a member
+                            // slot, checked above) and the rollback is the
+                            // COMPLETE resulting snapshot (the base-overlay
+                            // carried the unselected slots forward), so the
+                            // rollback's slots ⊇ the outcomes' keys (the
+                            // terminal-local half, enforced by the
+                            // conversion) — the rollback covers the FULL
+                            // membership, never just the group.
+                            if entry.intent.group.is_none() {
+                                if outcome_keys != membership {
+                                    return Err(Error::integrity(format!(
+                                        "ledger of target '{target}': Successful terminal for deployment '{id}' carries outcomes for slots {outcome_keys:?} but its intent's slot_ids are {membership:?} — a FULL push's outcomes must EXACTLY equal its membership (the strict four-set equality: outcomes == rollback slots == rollback bindings == intent membership)"
+                                    )));
+                                }
+                                let rollback_slot_keys: BTreeSet<&SlotId> = match &terminal
+                                    .disposition
+                                {
+                                    TerminalDisposition::Successful { rollback, .. } => {
+                                        rollback.slots.keys().collect()
+                                    }
+                                    _ => unreachable!("a Successful terminal carries its rollback"),
+                                };
+                                if rollback_slot_keys != membership {
+                                    return Err(Error::integrity(format!(
+                                        "ledger of target '{target}': Successful terminal for deployment '{id}' carries a rollback over slots {rollback_slot_keys:?} but its intent's slot_ids are {membership:?} — a FULL push's rollback must EXACTLY equal its membership (the strict four-set equality: outcomes == rollback slots == rollback bindings == intent membership)"
+                                    )));
+                                }
                             }
                         }
                         DeploymentStatus::FailedPreflight => {

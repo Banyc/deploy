@@ -1238,11 +1238,14 @@ pub type CompensationReport = SlotTable<SlotOutcome>;
 ///   rollback payload (a successful deployment always records its rollback
 ///   state — the generation refs + physical bindings, the ONE fact the
 ///   per-slot outcomes cannot express) AND its OWN per-slot outcomes table
-///   (every outcome Activated, each key covered by the rollback's slots —
-///   enforced by the conversion). The outcomes keys, the rollback's
-///   slots keys, and the rollback's bindings keys are EXACTLY EQUAL and
-///   NON-EMPTY (enforced by the conversion; the intent's membership is the
-///   fourth equal set, enforced where the terminal merges into its entry).
+///   (every outcome Activated, each outcome key covered by the rollback's
+///   slots — enforced by the conversion). The rollback is the COMPLETE
+///   resulting target snapshot: for a GROUP push the base-overlay carries
+///   the unselected slots forward, so the rollback's slots ⊇ the outcomes'
+///   keys (the outcomes cover the SELECTED slots; the strict four-set
+///   equality — outcomes == rollback slots == rollback bindings == intent
+///   membership — applies only to a FULL push, enforced where the terminal
+///   merges into its entry).
 /// * [`TerminalDisposition::FailedPreflight`] carries NOTHING — a
 ///   pre-mutation failure cannot carry a rollback, and no slot was touched
 ///   (the conversion refuses outcomes).
@@ -1275,7 +1278,12 @@ pub enum TerminalDisposition {
     /// snapshot: per-slot generations + physical bindings — the ONE fact
     /// the per-slot outcomes cannot express) AND the disposition's OWN
     /// per-slot outcomes table (every outcome Activated, each outcome key
-    /// covered by the rollback's slots — enforced by the conversion).
+    /// covered by the rollback's slots — enforced by the conversion). The
+    /// rollback is the COMPLETE resulting target snapshot: for a GROUP
+    /// push the base-overlay carries the unselected slots forward, so the
+    /// rollback's slots ⊇ the outcomes' keys (the outcomes cover the
+    /// SELECTED slots; the strict four-set equality applies only to a FULL
+    /// push, enforced where the terminal merges into its entry).
     Successful {
         rollback: CompleteRollback,
         outcomes: SlotTable<SlotOutcome>,
@@ -1499,14 +1507,19 @@ impl LedgerTerminalWire {
     /// the redundant slot is then DROPPED into the key, since the domain
     /// value carries no slot), and the disposition's duplicated projections
     /// must AGREE with the authoritative outcomes, BY STATUS: a `Successful`
-    /// wire's outcomes keys, rollback slots keys, and rollback bindings keys
-    /// must be EXACTLY EQUAL and NON-EMPTY (every outcome must also be
+    /// wire's outcomes must be NON-EMPTY with every key covered by the
+    /// rollback's slots (the rollback is the COMPLETE resulting snapshot —
+    /// for a GROUP push the base-overlay carries the unselected slots
+    /// forward, so the rollback's slots ⊇ the outcomes' keys; the strict
+    /// four-set equality applies only to a FULL push and its membership leg
+    /// is enforced by the ledger read; every outcome must also be
     /// Activated), a `FailedPreflight` wire must carry NO outcomes (a
     /// pre-mutation failure touched no slot), and a `Degraded` wire's
     /// outcomes must derive a NON-EMPTY remaining-changes set (all-restored
     /// outcomes are refused). A disagreement → `Error::integrity`. The
     /// cross-record claims (the outcome key set vs the intent's `slot_ids` —
-    /// the membership leg of the four-set equality — and the `target` field
+    /// the membership leg, BY INTENT GROUP: strict four-set for a full
+    /// push, the relaxed rule for a group push — and the `target` field
     /// vs the read path / intent) are enforced by the ledger read that merges
     /// the intent and the terminal
     /// ([`crate::store::local::LocalStore::read_ledger`]).
@@ -1547,32 +1560,32 @@ impl LedgerTerminalWire {
         // conversion error (fail closed).
         let disposition = match (&self.status, rollback) {
             (DeploymentStatus::Successful, Some(rollback)) => {
-                // THE FOUR-SET AGREEMENT (terminal-local half): the
-                // outcomes keys, the rollback's slots keys, and the
-                // rollback's bindings keys must be EXACTLY EQUAL and
-                // NON-EMPTY — a successful deployment records a COMPLETE
-                // rollback over EXACTLY the slots it reports outcomes for
-                // (a missing OR extra key in any of the three
-                // terminal-local sets is a disagreement; the fourth set —
-                // the intent's membership — is enforced where the terminal
-                // merges into its entry). The rollback's own conversion
-                // already guarantees bindings == slots; the equality is
-                // checked here against the outcomes so the invariant is
-                // enforced in ONE place, and the NON-EMPTY refusal closes
-                // the "successful with no outcomes" hole (an empty outcome
-                // table can never agree with a non-empty rollback).
+                // THE SUCCESSFUL SNAPSHOT RULE (terminal-local half): the
+                // outcomes are the SELECTED slots' results and the rollback
+                // is the COMPLETE resulting target snapshot — for a GROUP
+                // push the rollback carries the unselected slots forward
+                // from the base, so the rollback's slots ⊇ the outcomes'
+                // keys (the strict four-set equality — outcomes == rollback
+                // slots == rollback bindings == intent membership — applies
+                // only to a FULL push, and its membership leg is enforced
+                // where the terminal merges into its entry). The terminal
+                // local rule: NON-EMPTY outcomes whose keys are ALL covered
+                // by the rollback's slots (the rollback's own conversion
+                // already guarantees bindings == slots; the NON-EMPTY
+                // refusal closes the "successful with no outcomes" hole —
+                // an empty outcome table can never be covered by a
+                // non-empty rollback).
                 let outcome_keys: BTreeSet<&SlotId> = outcomes.keys().collect();
                 let rollback_slot_keys: BTreeSet<&SlotId> = rollback.slots.keys().collect();
-                let rollback_binding_keys: BTreeSet<&SlotId> = rollback.bindings.keys().collect();
                 if outcome_keys.is_empty() {
                     return Err(Error::integrity(format!(
-                        "terminal {}: status Successful requires NON-EMPTY outcomes — a successful deployment records a complete rollback over exactly the slots it reports outcomes for",
+                        "terminal {}: status Successful requires NON-EMPTY outcomes — a successful deployment records outcomes for the slots it selected",
                         self.deployment_id
                     )));
                 }
-                if outcome_keys != rollback_slot_keys || outcome_keys != rollback_binding_keys {
+                if !outcome_keys.is_subset(&rollback_slot_keys) {
                     return Err(Error::integrity(format!(
-                        "terminal {}: status Successful requires the outcomes keys, the rollback's slots keys, and the rollback's bindings keys to be EXACTLY EQUAL (outcomes {outcome_keys:?} vs rollback slots {rollback_slot_keys:?} vs rollback bindings {rollback_binding_keys:?})",
+                        "terminal {}: status Successful requires every outcome key to be covered by the rollback's slots (outcomes {outcome_keys:?} vs rollback slots {rollback_slot_keys:?} — a group push's rollback is the complete snapshot and carries the unselected slots forward)",
                         self.deployment_id
                     )));
                 }
@@ -2624,17 +2637,37 @@ mod tests {
         }
         let terminal = pair.1.clone().into_domain()?;
         // STATUS-SPECIFIC OUTCOME AGREEMENT (the membership leg of the
-        // four-set equality — the same rules `read_ledger` enforces when it
-        // merges the terminal into its entry).
+        // Successful snapshot rule — the same rules `read_ledger` enforces
+        // when it merges the terminal into its entry): a FULL push (no
+        // group) keeps the strict four-set equality — the outcomes AND the
+        // rollback's slots must EXACTLY equal the intent's membership; a
+        // GROUP push is the relaxed rule — the outcomes cover the SELECTED
+        // slots (⊆ the membership, checked above) and the rollback is the
+        // complete snapshot (its slots ⊇ the outcomes' keys, enforced by
+        // the conversion).
         let outcome_keys: BTreeSet<&SlotId> = terminal.outcomes().keys().collect();
         let membership: BTreeSet<&SlotId> = intent.slots.keys().collect();
         match terminal.status() {
             DeploymentStatus::Successful => {
-                if outcome_keys != membership {
-                    return Err(Error::integrity(format!(
-                        "terminal {}: Successful outcomes {outcome_keys:?} must EXACTLY equal the intent's membership {membership:?} (the four-set equality: outcomes == rollback slots == rollback bindings == intent membership)",
-                        pair.1.deployment_id
-                    )));
+                if intent.group.is_none() {
+                    if outcome_keys != membership {
+                        return Err(Error::integrity(format!(
+                            "terminal {}: Successful outcomes {outcome_keys:?} must EXACTLY equal the intent's membership {membership:?} (the strict four-set equality: outcomes == rollback slots == rollback bindings == intent membership)",
+                            pair.1.deployment_id
+                        )));
+                    }
+                    let rollback_slot_keys: BTreeSet<&SlotId> = match &terminal.disposition {
+                        TerminalDisposition::Successful { rollback, .. } => {
+                            rollback.slots.keys().collect()
+                        }
+                        _ => unreachable!("a Successful terminal carries its rollback"),
+                    };
+                    if rollback_slot_keys != membership {
+                        return Err(Error::integrity(format!(
+                            "terminal {}: Successful rollback slots {rollback_slot_keys:?} must EXACTLY equal the intent's membership {membership:?} (the strict four-set equality: outcomes == rollback slots == rollback bindings == intent membership)",
+                            pair.1.deployment_id
+                        )));
+                    }
                 }
             }
             DeploymentStatus::FailedPreflight => {
@@ -3555,13 +3588,16 @@ mod tests {
     }
 
     /// THE STATUS-SPECIFIC OUTCOME RULES (the directive's fix, enforced BY
-    /// STATUS): a `Successful` terminal's outcomes keys, rollback slots
-    /// keys, and rollback bindings keys must be EXACTLY EQUAL and NON-EMPTY
-    /// (a missing/extra key in ANY of the three terminal-local sets fails
-    /// the conversion; the fourth set — the intent's membership — fails the
-    /// pair/ledger read), a `FailedPreflight` terminal must carry NO
-    /// outcomes, and every other terminal state's outcomes must EXACTLY
-    /// COVER the intent's membership (no missing, no extra).
+    /// STATUS): a `Successful` terminal's outcomes must be NON-EMPTY with
+    /// every key covered by the rollback's slots (the rollback is the
+    /// COMPLETE resulting snapshot — for a group push the base-overlay
+    /// carries the unselected slots forward, so the rollback's slots ⊇ the
+    /// outcomes' keys; the strict four-set equality applies only to a FULL
+    /// push and its membership leg — outcomes == rollback slots == the
+    /// intent's membership — is enforced by the pair/ledger read), a
+    /// `FailedPreflight` terminal must carry NO outcomes, and every other
+    /// terminal state's outcomes must EXACTLY COVER the intent's membership
+    /// (no missing, no extra).
     #[test]
     fn status_specific_outcome_rules_fail_closed() {
         let keys = vec![slot(1), slot(2)];
@@ -3585,17 +3621,19 @@ mod tests {
         assert_eq!(rollback.slots.len(), d_intent.slots.len());
         assert_eq!(rollback.bindings.len(), d_intent.slots.len());
 
-        // SUCCESSFUL with a MISSING outcome key → Err (the outcomes no
-        // longer equal the rollback's slots / the membership).
+        // SUCCESSFUL with a MISSING outcome key → the terminal-local rule
+        // still accepts (the outcomes ⊆ the rollback's slots), but the FULL
+        // push's membership leg refuses (the outcomes no longer equal the
+        // intent's membership).
         let mut bad = terminal.clone();
         bad.outcomes.remove(&slot(1));
         assert!(
-            bad.clone().into_domain().is_err(),
-            "Successful with a missing outcome key fails the conversion (the three terminal-local sets diverge)"
+            bad.clone().into_domain().is_ok(),
+            "a missing outcome key is not a terminal-local disagreement (the outcomes ⊆ the rollback's slots)"
         );
         assert!(
             pair_to_domain(&(intent.clone(), bad)).is_err(),
-            "Successful with a missing outcome key fails the pair read"
+            "Successful with a missing outcome key fails the pair read (the full push's outcomes must exactly equal the membership)"
         );
 
         // SUCCESSFUL with an EXTRA outcome key → Err (an outcome for a slot
@@ -3608,8 +3646,8 @@ mod tests {
             "Successful with an extra outcome key fails the conversion"
         );
 
-        // SUCCESSFUL with a MISSING rollback slot (and binding) → Err (the
-        // rollback no longer equals the outcomes).
+        // SUCCESSFUL with a MISSING rollback slot (and binding) → Err (an
+        // outcome key the rollback no longer covers).
         let mut bad = terminal.clone();
         let rb = bad.rollback.as_mut().unwrap();
         rb.slots.remove(&slot(1));
@@ -3619,15 +3657,22 @@ mod tests {
             "Successful with a missing rollback slot fails the conversion"
         );
 
-        // SUCCESSFUL with an EXTRA rollback slot (and binding) → Err (the
-        // rollback covers a slot the outcomes do not).
+        // SUCCESSFUL with an EXTRA rollback slot (and binding) → the
+        // terminal-local rule still accepts (the outcomes ⊆ the rollback's
+        // slots — the complete-snapshot shape), but the FULL push's
+        // membership leg refuses (the rollback no longer equals the
+        // membership).
         let mut bad = terminal.clone();
         let rb = bad.rollback.as_mut().unwrap();
         rb.slots.insert(slot(9), gen_ref_for(&slot(9)));
         rb.bindings.insert(slot(9), binding(&slot(9)));
         assert!(
-            bad.into_domain().is_err(),
-            "Successful with an extra rollback slot fails the conversion"
+            bad.clone().into_domain().is_ok(),
+            "an extra rollback slot is not a terminal-local disagreement (the outcomes ⊆ the rollback's slots)"
+        );
+        assert!(
+            pair_to_domain(&(intent.clone(), bad)).is_err(),
+            "Successful with an extra rollback slot fails the pair read (the full push's rollback must exactly equal the membership)"
         );
 
         // SUCCESSFUL with EMPTY outcomes → Err (the four sets must be

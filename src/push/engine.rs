@@ -1604,20 +1604,21 @@ fn push_inner(
         let slot_bindings = config.target_slot_bindings(target_name)?;
         // The CURRENT target slot set: the complete snapshot omits slots
         // removed from the current configuration and carries every current
-        // unselected slot forward from the base.
-        // The rollback must key EXACTLY the deployment's membership (the
-        // four-set equality: outcomes == rollback slots == rollback bindings
-        // == intent membership, enforced by the conversion). The membership
-        // is the SELECTED slots (`assignments` — the full target for a full
-        // push, the group for a group push), so the rollback records exactly
-        // what the deployment touched: slots removed from the current
-        // configuration are omitted (they are not selected), and the
-        // partial-rollout overlay (carrying unselected base slots forward)
-        // is gone — a successful terminal's rollback must equal its
-        // outcomes.
-        let current_slot_ids: Vec<SlotId> = assignments
-            .iter()
-            .map(|a| a.placement_slot.clone())
+        // unselected slot forward from the base. The rollback is the
+        // COMPLETE resulting target state (the base-overlay semantics): the
+        // SELECTED slots' actuals overlaid on the latest successful base,
+        // unselected slots carried forward — so the rollback's slots are the
+        // FULL current target membership, never just the selected slots. The
+        // conversion's Successful rule distinguishes the two cases by the
+        // intent's group: a group push's outcomes cover the SELECTED slots
+        // (⊆ the rollback's full membership), a full push's outcomes equal
+        // the rollback's full membership (the strict four-set equality).
+        let current_slot_ids: Vec<SlotId> = config
+            .target_slots(target_name)?
+            .into_iter()
+            .map(|(slot, _)| {
+                SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment")
+            })
             .collect();
         history::finalize_successful_attempt(
             store,
@@ -6729,26 +6730,28 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
     }
 
-    /// GROUP-PUSH ROLLBACK COVERS EXACTLY THE GROUP (the four-set equality,
-    /// end to end): a successful terminal's outcomes keys, rollback slots
-    /// keys, rollback bindings keys, and the intent's membership are EXACTLY
-    /// EQUAL — so a group push's rollback records EXACTLY its selected
-    /// slots (never the unselected base slots carried forward), and a
-    /// rollback of that deployment restores EXACTLY the group, resolving
+    /// GROUP-PUSH ROLLBACK IS THE COMPLETE RESULTING SNAPSHOT (the
+    /// base-overlay semantics, end to end): a successful group push's
+    /// rollback is the COMPLETE target state — the selected outcomes
+    /// overlaid on the latest successful base, the unselected slots carried
+    /// forward — so the rollback's slots are the FULL current target
+    /// membership (⊇ the outcomes' keys, which cover the SELECTED slots).
+    /// A rollback of that deployment restores the FULL membership, resolving
     /// EACH slot's behavior from ITS OWN (release, variant) binding — never
     /// a snapshot-wide single release.
     ///
     /// Drives the REAL push path on a two-group harness: a full push
     /// establishes both slots under contract A (release R1), a group-b push
     /// advances only `p2` to contract B (release R2) and records a rollback
-    /// covering EXACTLY `p2` (the four-set equality — the unselected `p1`
-    /// is NOT carried into the rollback). A rollback of that deployment
-    /// restores `p2` to R2's variant behavior digest while `p1` stays on
-    /// R1's (each slot's OWN release — under the old snapshot-wide behavior
-    /// `p2` would receive R1's digest), and the referenced release's record
-    /// is published on its server's remote.
+    /// covering BOTH slots (the unselected `p1` is carried forward at R1,
+    /// `p2` at R2). A FULL rollback of that group-b deployment now SUCCEEDS
+    /// (the rollback covers the full membership), restoring `p2` to R2's
+    /// variant behavior digest while `p1` stays on R1's (each slot's OWN
+    /// release — under the old snapshot-wide behavior `p2` would receive
+    /// R1's digest), and the referenced release's record is published on its
+    /// server's remote.
     #[test]
-    fn group_push_rollback_covers_exactly_the_group_and_publishes_per_slot_behavior() {
+    fn group_push_rollback_covers_the_complete_membership_and_publishes_per_slot_behavior() {
         let h = TwoSlotHarness::new();
         let slot_a = SlotId::new("p1".to_string());
         let slot_b = SlotId::new("p2".to_string());
@@ -6812,9 +6815,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
 
         // Push 2: PARTIAL group-b push under contract B — p2 advances to R2,
-        // p1 stays R1. The rollback covers EXACTLY the group (the four-set
-        // equality: outcomes == rollback slots == rollback bindings == the
-        // intent's membership — the selected slots only).
+        // p1 stays R1. The rollback is the COMPLETE resulting snapshot: the
+        // base-overlay carries the unselected p1 forward at R1 and overlays
+        // p2 at R2 — the rollback's slots are the FULL membership (⊇ the
+        // outcomes' keys, which cover the SELECTED group-b slot only).
         let id2 = test_deployment_id("deploy-mr-group-b");
 
         let r2 = two_slot_push(&h, &config2, &RefExpr::Head, Some("group-b"), &id2).unwrap();
@@ -6839,56 +6843,59 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let s1 = rollback_of(&snapshots[1]);
         assert_eq!(
             s1.slots.len(),
-            1,
-            "the group push's rollback covers EXACTLY its membership (the four-set equality) — the unselected slot is NOT carried forward"
+            2,
+            "the group push's rollback is the COMPLETE resulting snapshot — the unselected slot is carried forward from the base"
+        );
+        assert_eq!(
+            s1.slots[&slot_a].assignment.artifact.release, r1_release,
+            "the unselected slot is carried forward at its base release (R1)"
         );
         assert_eq!(
             s1.slots[&slot_b].assignment.artifact.release, r2_release,
             "the group push's rollback records its selected slot's own release (R2)"
         );
+        assert_eq!(
+            s1.bindings.len(),
+            2,
+            "the complete snapshot binds the full membership"
+        );
 
-        // A FULL rollback to the group-b deployment is REFUSED: the
-        // rollback must key EXACTLY the deployment's membership (the
-        // four-set equality), so a full rollback of a group-only snapshot
-        // cannot cover the unselected slot — exact rollback requires an
-        // identical stable placement-slot set.
+        // A FULL rollback to the group-b deployment now SUCCEEDS: the group
+        // push's rollback is the COMPLETE resulting snapshot (the
+        // base-overlay carried the unselected slot forward), so it covers the
+        // full membership and an exact full rollback can restore BOTH slots
+        // to their recorded state (p1 → R1, p2 → R2).
         let id3 = test_deployment_id("deploy-mr-rollback");
-        let err = two_slot_push(
+        let r3 = two_slot_push(
             &h,
             &config2,
             &history::parse_ref_expr(id2.as_str()).unwrap(),
             None,
             &id3,
         )
-        .expect_err(
-            "a FULL rollback of a group-only snapshot must be refused (the rollback keys exactly the deployment's membership)",
-        );
-        assert!(
-            err.to_string()
-                .contains("identical stable placement-slot set"),
-            "expected the exact-rollback membership error, got: {err}"
-        );
+        .unwrap();
+        assert_eq!(r3.status, Some(DeploymentStatus::Successful));
 
-        // Push 3: FULL rollback of the BASELINE deployment (id1 — a full
+        // Push 4: FULL rollback of the BASELINE deployment (id1 — a full
         // push whose rollback covers both slots) restores BOTH slots to
         // their recorded state (R1, contract A).
-
-        let r3 = two_slot_push(
+        let id4 = test_deployment_id("deploy-mr-rollback-base");
+        let r4 = two_slot_push(
             &h,
             &config2,
             &history::parse_ref_expr(id1.as_str()).unwrap(),
             None,
-            &id3,
+            &id4,
         )
         .unwrap();
-        assert_eq!(r3.status, Some(DeploymentStatus::Successful));
+        assert_eq!(r4.status, Some(DeploymentStatus::Successful));
 
         // The persisted plan carries the frozen PER-RELEASE behavior index
         // for the rollback's referenced release (R1 — the baseline's own
         // release) and the referenced-release set derived from the
         // snapshot's slots.
         let plan: DeploymentPlan = serde_json::from_str(
-            &std::fs::read_to_string(h.store.deployment_dir(id3.as_str()).join("plan.json"))
+            &std::fs::read_to_string(h.store.deployment_dir(id4.as_str()).join("plan.json"))
                 .unwrap(),
         )
         .unwrap();
@@ -6957,13 +6964,284 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_ne!(digest_a, digest_b);
     }
 
-    /// A corrupt CURRENT generation assignment is detected by `status()`
-    /// itself — the complete symlink layout is validated (`current` ->
-    /// generation dir -> `assignment.json` -> generation id) — so a push
-    /// against a remote whose live assignment is corrupt FAILS CLOSED with an
-    /// integrity error BEFORE any mutation or intent persistence: never a
-    /// panic, never a fabricated observation, never a silent proceed on an
-    /// unverifiable current.
+    // A corrupt CURRENT generation assignment is detected by `status()`
+    // itself — the complete symlink layout is validated (`current` ->
+    // generation dir -> `assignment.json` -> generation id) — so a push
+    // against a remote whose live assignment is corrupt FAILS CLOSED with an
+    // integrity error BEFORE any mutation or intent persistence: never a
+    // panic, never a fabricated observation, never a silent proceed on an
+    // unverifiable current.
+    proptest! {
+        // THE USER'S GROUP-SEQUENCE PROPERTY: a FULL BASELINE followed by
+        // ARBITRARY VALID GROUP-PUSH SEQUENCES (any group, any order,
+        // repeats) — every push edits the artifact content so it mints a
+        // NEW release (never a no-op). Asserts: EVERY SUCCESSFUL SNAPSHOT
+        // CONTAINS THE COMPLETE CURRENT TARGET MEMBERSHIP (the rollback's
+        // slots == the full membership — the base-overlay carried the
+        // unselected slots forward), and REPEATING ANY GROUP REMAINS VALID
+        // (a group push whose group was already pushed succeeds — the
+        // conversion accepts its snapshot). Bounded 16 cases, fixed seed
+        // 0x5EED_5EED (house style), no persistence.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn group_push_sequences_keep_complete_snapshots_and_repeats_are_valid(
+            groups in prop::collection::vec(
+                prop::sample::select(vec!["group-a", "group-b"]),
+                1..=4,
+            ),
+        ) {
+            let h = TwoSlotHarness::new();
+            let slot_a = SlotId::new("p1".to_string());
+            let slot_b = SlotId::new("p2".to_string());
+            let full_membership: BTreeSet<SlotId> =
+                BTreeSet::from([slot_a.clone(), slot_b.clone()]);
+
+            // Push 0: FULL baseline — both slots under release R0.
+            let id0 = test_deployment_id("deploy-prop-base");
+            let r0 = two_slot_push(&h, &h.config, &RefExpr::Head, None, &id0).unwrap();
+            assert_eq!(r0.status, Some(DeploymentStatus::Successful));
+            let snapshots = h.store.read_snapshots("t1").unwrap();
+            assert_eq!(snapshots.len(), 1, "the full baseline is the first snapshot");
+            assert_eq!(
+                rollback_of(&snapshots[0])
+                    .slots
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                full_membership,
+                "the full baseline's snapshot covers the complete membership"
+            );
+
+            // Each group push edits the artifact content so the push mints a
+            // NEW release (never a no-op), then pushes the generated group.
+            let project_root = h.config.project_root(&h.cfg_path);
+            let artifact_path = project_root
+                .join("releases")
+                .join("v1")
+                .join("artifacts")
+                .join("build/output/app/server");
+            for (i, group) in groups.iter().enumerate() {
+                std::fs::write(&artifact_path, format!("v{}\n", i + 2)).unwrap();
+                let config = ProjectConfig::load(&h.cfg_path).unwrap();
+                let id = test_deployment_id(&format!("deploy-prop-{i}"));
+                let r = two_slot_push(&h, &config, &RefExpr::Head, Some(group), &id).unwrap();
+                assert_eq!(
+                    r.status,
+                    Some(DeploymentStatus::Successful),
+                    "group push {i} ({group}) must succeed — repeating a group stays valid"
+                );
+                // EVERY successful snapshot contains the COMPLETE current
+                // target membership: the base-overlay carried the unselected
+                // slots forward.
+                let snapshots = h.store.read_snapshots("t1").unwrap();
+                let last = rollback_of(snapshots.last().unwrap());
+                assert_eq!(
+                    last.slots.keys().cloned().collect::<BTreeSet<_>>(),
+                    full_membership,
+                    "group push {i} ({group}) must record the complete membership in its snapshot (the unselected slot is carried forward)"
+                );
+                assert_eq!(
+                    last.bindings.keys().cloned().collect::<BTreeSet<_>>(),
+                    full_membership,
+                    "group push {i} ({group}) must bind the complete membership"
+                );
+                // The conversion accepts the snapshot (read_ledger — the
+                // first consumer — succeeds on the whole ledger).
+                h.store.read_ledger("t1").unwrap();
+            }
+        }
+    }
+
+    /// DETERMINISTIC: a group push's snapshot has the FULL membership (the
+    /// base-overlay carried the unselected slot forward) while its OUTCOMES
+    /// cover the SELECTED slots only — the relaxed Successful rule (outcomes
+    /// ⊆ rollback slots) accepts the snapshot, and the strict four-set
+    /// equality is NOT required for a group push.
+    #[test]
+    fn group_push_snapshot_has_full_membership_and_selected_outcomes() {
+        let h = TwoSlotHarness::new();
+        let slot_a = SlotId::new("p1".to_string());
+        let slot_b = SlotId::new("p2".to_string());
+        let full_membership: BTreeSet<SlotId> = BTreeSet::from([slot_a.clone(), slot_b.clone()]);
+
+        // Push 1: FULL baseline (both slots under R1).
+        let id1 = test_deployment_id("deploy-det-base");
+        let r1 = two_slot_push(&h, &h.config, &RefExpr::Head, None, &id1).unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+        let r1_release = r1.attempt.as_ref().expect("attempt").desired[&slot_a]
+            .assignment
+            .artifact
+            .release
+            .clone();
+
+        // Push 2: group-a push with a NEW release (edit the artifact).
+        let project_root = h.config.project_root(&h.cfg_path);
+        std::fs::write(
+            project_root
+                .join("releases")
+                .join("v1")
+                .join("artifacts")
+                .join("build/output/app/server"),
+            "v2\n",
+        )
+        .unwrap();
+        let config2 = ProjectConfig::load(&h.cfg_path).unwrap();
+        let id2 = test_deployment_id("deploy-det-group-a");
+        let r2 = two_slot_push(&h, &config2, &RefExpr::Head, Some("group-a"), &id2).unwrap();
+        assert_eq!(r2.status, Some(DeploymentStatus::Successful));
+        let r2_release = r2.attempt.as_ref().expect("attempt").desired[&slot_a]
+            .assignment
+            .artifact
+            .release
+            .clone();
+        assert_ne!(r1_release, r2_release, "the group push mints a new release");
+
+        // The snapshot: FULL membership (p1 at R2, p2 carried forward at R1)
+        // with bindings over the full membership.
+        let snapshots = h.store.read_snapshots("t1").unwrap();
+        assert_eq!(snapshots.len(), 2);
+        let last = rollback_of(&snapshots[1]);
+        assert_eq!(
+            last.slots.keys().cloned().collect::<BTreeSet<_>>(),
+            full_membership,
+            "the group push's snapshot has the full membership"
+        );
+        assert_eq!(
+            last.slots[&slot_a].assignment.artifact.release, r2_release,
+            "the selected slot records its own release"
+        );
+        assert_eq!(
+            last.slots[&slot_b].assignment.artifact.release, r1_release,
+            "the unselected slot is carried forward at its base release"
+        );
+        assert_eq!(
+            last.bindings.keys().cloned().collect::<BTreeSet<_>>(),
+            full_membership,
+            "the bindings cover the full membership"
+        );
+        // The OUTCOMES cover the SELECTED slots only (the group), and the
+        // conversion accepts the snapshot (the relaxed Successful rule).
+        let entries = h.store.read_ledger("t1").unwrap();
+        let terminal = entries[1].terminal.as_ref().unwrap();
+        assert_eq!(
+            terminal.outcomes().keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([slot_a.clone()]),
+            "the outcomes cover the selected group slot only"
+        );
+        assert_eq!(
+            terminal.outcomes()[&slot_a].outcome,
+            SlotOutcomeKind::Activated
+        );
+    }
+
+    /// DETERMINISTIC: REPEATING THE SAME GROUP REMAINS VALID — a group push
+    /// whose group was already pushed succeeds (the conversion accepts its
+    /// complete-snapshot rollback), and each repeat still records the full
+    /// membership.
+    #[test]
+    fn repeating_the_same_group_succeeds() {
+        let h = TwoSlotHarness::new();
+        let slot_a = SlotId::new("p1".to_string());
+        let slot_b = SlotId::new("p2".to_string());
+        let full_membership: BTreeSet<SlotId> = BTreeSet::from([slot_a.clone(), slot_b.clone()]);
+
+        // Push 1: FULL baseline.
+        let id1 = test_deployment_id("deploy-repeat-base");
+        let r1 = two_slot_push(&h, &h.config, &RefExpr::Head, None, &id1).unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+
+        // Push 2 and 3: group-a TWICE, each with a NEW release.
+        let project_root = h.config.project_root(&h.cfg_path);
+        let artifact_path = project_root
+            .join("releases")
+            .join("v1")
+            .join("artifacts")
+            .join("build/output/app/server");
+        for (i, id) in ["deploy-repeat-a1", "deploy-repeat-a2"]
+            .into_iter()
+            .enumerate()
+        {
+            std::fs::write(&artifact_path, format!("v{}\n", i + 2)).unwrap();
+            let config = ProjectConfig::load(&h.cfg_path).unwrap();
+            let r = two_slot_push(
+                &h,
+                &config,
+                &RefExpr::Head,
+                Some("group-a"),
+                &test_deployment_id(id),
+            )
+            .unwrap();
+            assert_eq!(
+                r.status,
+                Some(DeploymentStatus::Successful),
+                "repeating group-a (push {i}) must succeed"
+            );
+            let snapshots = h.store.read_snapshots("t1").unwrap();
+            let last = rollback_of(snapshots.last().unwrap());
+            assert_eq!(
+                last.slots.keys().cloned().collect::<BTreeSet<_>>(),
+                full_membership,
+                "the repeated group push still records the complete membership"
+            );
+            h.store.read_ledger("t1").unwrap();
+        }
+    }
+
+    /// DETERMINISTIC: a FULL push still enforces the strict four-set
+    /// equality — the successful snapshot's outcomes == rollback slots ==
+    /// rollback bindings == the intent's membership (all equal, non-empty).
+    #[test]
+    fn full_push_still_enforces_the_strict_four_set_equality() {
+        let h = TwoSlotHarness::new();
+        let slot_a = SlotId::new("p1".to_string());
+        let slot_b = SlotId::new("p2".to_string());
+        let full_membership: BTreeSet<SlotId> = BTreeSet::from([slot_a.clone(), slot_b.clone()]);
+
+        let id1 = test_deployment_id("deploy-strict-base");
+        let r1 = two_slot_push(&h, &h.config, &RefExpr::Head, None, &id1).unwrap();
+        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
+        let entries = h.store.read_ledger("t1").unwrap();
+        let entry = &entries[0];
+        assert_eq!(
+            entry.intent.slots.keys().cloned().collect::<BTreeSet<_>>(),
+            full_membership,
+            "the full push's intent membership is the full target"
+        );
+        let terminal = entry.terminal.as_ref().unwrap();
+        assert_eq!(
+            terminal.outcomes().keys().cloned().collect::<BTreeSet<_>>(),
+            full_membership,
+            "the full push's outcomes equal the membership"
+        );
+        let TerminalDisposition::Successful { rollback, .. } = &terminal.disposition else {
+            panic!("the full push is Successful");
+        };
+        assert_eq!(
+            rollback.slots.keys().cloned().collect::<BTreeSet<_>>(),
+            full_membership,
+            "the full push's rollback slots equal the membership"
+        );
+        assert_eq!(
+            rollback.bindings.keys().cloned().collect::<BTreeSet<_>>(),
+            full_membership,
+            "the full push's rollback bindings equal the membership"
+        );
+    }
+
+    /// OBSERVED-REFRESH UNKNOWN-ASSIGNMENT FALLBACK: when a live generation's
+    /// `assignment.json` cannot be read (missing/corrupt), the refresh must
+    /// preserve the OBSERVED generation and mark the assignment UNKNOWN
+    /// (`unknown_artifact()`) — never substitute the desired/planned
+    /// artifact. BOTH the pre-push intent (`pre_push`) and the post-push
+    /// observed refresh use this contract; results.json records the slot's
+    /// pre-swap failure, `current` stays on the observed (corrupt) generation,
+    /// and no stale snapshot/ref is produced.
     #[test]
     fn corrupt_current_assignment_fails_status_and_push_closed() {
         let h = RecoveryHarness::new();
