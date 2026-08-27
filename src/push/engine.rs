@@ -373,6 +373,55 @@ pub(crate) fn push_ref_with_id(
     )
 }
 
+/// A preflight failure tagged with the failing phase, so the terminal reason
+/// is DERIVED from the error at the failure site — never a hand-maintained
+/// string that a new failure source could leave naming the wrong phase.
+struct PreflightFailure {
+    /// The `FailedPreflight` terminal reason naming the failing phase.
+    reason: &'static str,
+    /// The ORIGINAL error, returned unchanged by the caller.
+    source: Error,
+}
+
+/// Capacity + staging preflight for one push, run AFTER the attempt intent
+/// was persisted and BEFORE any `current` change. A failure in either phase
+/// is tagged with the failing phase's terminal reason (see
+/// [`PreflightFailure`]); the caller ends the attempt `FailedPreflight`,
+/// cleans incoming staging best-effort, and returns the ORIGINAL error.
+fn run_capacity_and_staging(
+    store: &LocalStore,
+    assignments: &[crate::push::plan::PlannedAssignment],
+    helpers: &HashMap<SlotId, RemoteHelper>,
+    op_id: &OperationId,
+    deployment_id: &DeploymentId,
+    config: &ProjectConfig,
+) -> std::result::Result<(), PreflightFailure> {
+    if let Err(source) =
+        capacity_preflight(store, assignments, helpers, op_id, deployment_id, config)
+    {
+        return Err(PreflightFailure {
+            reason: "preflight failed",
+            source,
+        });
+    }
+    // Stage every needed tree into operation-unique incoming paths.
+    for a in assignments {
+        let helper = &helpers[&a.placement_slot];
+        if !helper.tree_exists(a.artifact.tree.as_str()) {
+            let host_obj = store.object_root(&a.artifact.tree);
+            if let Err(source) =
+                helper.stage_incoming(deployment_id.as_str(), a.artifact.tree.as_str(), &host_obj)
+            {
+                return Err(PreflightFailure {
+                    reason: "staging failed",
+                    source,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 // The 10 parameters are the full push operation (data: project_root, store,
 // factory, target_name, ref_expr, deployment_id, op_id; policy: config,
 // target, opts). The `config` + `opts` pair is already the settings half,
@@ -1134,63 +1183,21 @@ fn push_inner(
     };
     store.append_intent(target_name, &attempt_intent)?;
 
-    // 8 & 9. Capacity preflight and staging. Capacity is a per-server policy
-    // read from the caller's CURRENT `deploy.toml` (`ServerDef.capacity`), not
-    // from any release snapshot: servers have no per-release history, so a
-    // historical or rollback push applies the server's current headroom
-    // exactly as a HEAD push does. Only the per-slot variant behavior
-    // contracts resolve from the immutable snapshots (see `behavior_index`
-    // above).
-    //
-    // Capacity AND staging form ONE pre-mutation result block: a failure in
-    // EITHER phase happens AFTER the attempt intent and its initial
-    // `InProgress` transition were persisted (requirement.md step 14 orders
-    // the intent before capacity, step 8) and BEFORE any `current` change, so
-    // the attempt must end terminal `FailedPreflight` — "an attempt that
-    // fails before any `current` change is `failed_preflight`" — never
-    // stranded `InProgress` (which would be misreported later as a
-    // recoverable/pending attempt or falsely degraded as "generation
-    // diverged" by a later reconcile). On EVERY error in the block the
-    // terminal `FailedPreflight` transition is appended (the reason names the
-    // failing phase), any incoming directories the staging phase may have
-    // created on the remotes are removed best-effort (mirroring the
-    // post-push cleanup below), and the ORIGINAL error is returned unchanged.
-    // Failures BEFORE the intent is persisted (plan resolution, historical
-    // behavior snapshot, handshake) surface as the push error with no attempt
-    // record at all.
-    let mut preflight_reason = "preflight failed";
-    let preflight = (|| -> Result<()> {
-        capacity_preflight(store, &assignments, &helpers, op_id, deployment_id, config)?;
-        // Stage every needed tree into operation-unique incoming paths.
-        preflight_reason = "staging failed";
-        for a in &assignments {
-            let _remote = remotes[&a.placement_slot].as_ref();
-            let helper = &helpers[&a.placement_slot];
-            if !helper.tree_exists(a.artifact.tree.as_str()) {
-                let host_obj = store.object_root(&a.artifact.tree);
-                helper.stage_incoming(
-                    deployment_id.as_str(),
-                    a.artifact.tree.as_str(),
-                    &host_obj,
-                )?;
-            }
-        }
-        Ok(())
-    })();
-    if let Err(e) = preflight {
-        // The preflight failure is the attempt's TERMINAL EVENT (status
-        // `FailedPreflight`, empty outcomes — no slot was touched): appended to
-        // the ledger like every other terminal. Incoming staging dirs created
-        // by the failed phase are removed best-effort.
+    // 8 & 9. Capacity + staging preflight — capacity is the caller's CURRENT
+    // per-server policy; every failure ends the attempt `FailedPreflight`
+    // (see `run_capacity_and_staging`).
+    if let Err(failure) =
+        run_capacity_and_staging(store, &assignments, &helpers, op_id, deployment_id, config)
+    {
+        // FailedPreflight terminal (empty outcomes — no slot was touched) +
+        // best-effort incoming cleanup, then the ORIGINAL error.
         let _ = store.append_terminal(
             target_name,
             deployment_id,
             &LedgerTerminal {
                 recorded_at: crate::remote::helper::now_rfc3339(),
-                // FailedPreflight carries no payload: no rollback and no
-                // outcomes (a pre-mutation failure touched no slot).
                 disposition: TerminalDisposition::FailedPreflight,
-                reason: Some(preflight_reason.to_string()),
+                reason: Some(failure.reason.to_string()),
             },
         );
         for a in &assignments {
@@ -1198,7 +1205,7 @@ fn push_inner(
                 .remove_incoming(deployment_id.as_str())
                 .ok();
         }
-        return Err(e);
+        return Err(failure.source);
     }
 
     // 10-13. Process slots in batches. The batch size is a validated NONZERO
