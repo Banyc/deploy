@@ -371,6 +371,7 @@ pub fn recovery_outcomes(
                 generation: Some(slot.desired.generation.clone()),
                 compensated: false,
                 error: None,
+                observation_error: None,
             },
         );
         actuals.insert(
@@ -568,6 +569,7 @@ mod tests {
                         generation: Some(test_generation_id(&format!("gen-{dep}"))),
                         compensated: false,
                         error: None,
+                        observation_error: None,
                     },
                 )])),
             },
@@ -844,6 +846,7 @@ mod tests {
                 generation: Some(test_generation_id("gen-1")),
                 compensated: false,
                 error: None,
+                observation_error: None,
             },
         )]);
 
@@ -1080,6 +1083,7 @@ mod tests {
                                         generation: Some(test_generation_id("gen-1")),
                                         compensated: true,
                                         error: None,
+                                        observation_error: None,
                                     },
                                 )])),
                             },

@@ -643,6 +643,7 @@ interval_seconds = 0
                         generation: Some(test_generation_id("gen-1")),
                         compensated: false,
                         error: None,
+                        observation_error: None,
                     },
                 )])),
             },

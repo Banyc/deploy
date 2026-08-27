@@ -1152,6 +1152,7 @@ interval_seconds = 0
                                             generation: Some(g.generation.clone()),
                                             compensated: false,
                                             error: None,
+                                            observation_error: None,
                                         },
                                     )
                                 })

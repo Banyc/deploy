@@ -1252,6 +1252,7 @@ fn push_inner(
                             "internal: no behavior contract for variant '{}' after coverage check",
                             a.artifact.variant
                         )),
+                        observation_error: None,
                     },
                 );
                 if stop_on_failure {
@@ -1319,6 +1320,7 @@ fn push_inner(
                     generation: Some(generation),
                     compensated: did_compensate,
                     error,
+                    observation_error: None,
                 },
             );
             if had_failure && stop_on_failure {
@@ -1344,6 +1346,7 @@ fn push_inner(
                     generation: cur,
                     compensated: false,
                     error: None,
+                    observation_error: None,
                 },
             );
         }
@@ -1529,11 +1532,13 @@ fn push_inner(
     // remote generation it currently points at, rather than the desired plan
     // values. Failed/skipped/restored slots therefore report their actual
     // artifact instead of the desired one. The per-slot THREE-STATE
-    // OBSERVATION (the wire-shaped `actual_servers` keeps the current on-disk
-    // shape — generation only — so the observation's `Unknown` half lives in
-    // the parallel `actual_observations` map) feeds the never-advanced
-    // outcomes below: a FAILED post-mutation status read is `Unknown(error)`,
-    // never a `None` that downstream code reads as "unchanged".
+    // OBSERVATION feeds the never-advanced outcomes below: a FAILED
+    // post-mutation status read is `Unknown(error)`, never a `None` that
+    // downstream code reads as "unchanged". The wire-shaped `actual_servers`
+    // keeps the current on-disk shape — generation only — so the
+    // observation's `Unknown` half is recorded into the never-advanced
+    // outcomes' `observation_error` field below, while the outcome's OWN
+    // operation error (`error`) is left untouched.
     let mut actual_servers: BTreeMap<SlotId, SlotAttemptState> = BTreeMap::new();
     let mut actual_observations: BTreeMap<SlotId, Observation<ObservedGeneration>> =
         BTreeMap::new();
@@ -1589,12 +1594,16 @@ fn push_inner(
     // remaining-changes derivation compares against pre_push, never the
     // desired generation. The post-mutation status read above reflects the
     // true state: the slot never advanced, so it is still on its pre-push
-    // generation. A FAILED read is `Unknown(error)` — the state is unknown,
-    // and an unknown state is NOT evidence of no change: the wire records
-    // `generation: None` with the observation error preserved (the wire →
-    // domain conversion reads that back as `Unknown`, never as "unchanged").
-    // A successful read showing no state is `KnownAbsent` (no error — a
-    // `None` generation with an error would read back as `Unknown`). Skipped
+    // generation. The observation is written into the wire's OBSERVATION
+    // fields only, INDEPENDENTLY of the outcome's operation error (`error`,
+    // which already carries the failure that stopped the slot — e.g.
+    // "swap failed: ..."): a FAILED read is `Unknown(error)` — the state is
+    // unknown, and an unknown state is NOT evidence of no change — so the
+    // wire records `generation: None` with the observation error in
+    // `observation_error` (the wire → domain conversion reads that back as
+    // `Unknown`, never as "unchanged"); a successful read showing no state
+    // is `KnownAbsent` (generation `None`, no observation error). The
+    // operation error is NEVER rewritten by the observation. Skipped
     // outcomes already record the reconciled current assignment.
     for sid in &never_advanced {
         if let Some(r) = results.get_mut(sid)
@@ -1606,11 +1615,11 @@ fn push_inner(
                 }
                 Some(Observation::Unknown(e)) => {
                     r.generation = None;
-                    r.error = Some(e.message.clone());
+                    r.observation_error = Some(e.message.clone());
                 }
                 Some(Observation::KnownAbsent) | None => {
                     r.generation = None;
-                    r.error = None;
+                    r.observation_error = None;
                 }
             }
         }
@@ -3152,6 +3161,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                                             generation: Some(g.generation.clone()),
                                             compensated: false,
                                             error: None,
+                                            observation_error: None,
                                         },
                                     )
                                 })
