@@ -3232,7 +3232,11 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
             target: None,
         },
     )?;
-    foreign_helper.swap_current(None, foreign_gen.as_str(), "op-foreign")?;
+    foreign_helper.swap_current(
+        &deploy::remote::helper::ExpectedCurrent::Absent,
+        foreign_gen.as_str(),
+        "op-foreign",
+    )?;
     write_file(
         &proj
             .join("releases")

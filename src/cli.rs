@@ -1389,7 +1389,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 // unquoted ref as ONE argument (the shell would unquote it),
                 // or the raw flag tokens (`--dry-run`, `--group <name>`).
                 let mut argv: Vec<&str> = vec!["deploy", "push"];
-                let target = code.split_whitespace().nth(2).expect("{loc}: missing target");
+                let target = code
+                    .split_whitespace()
+                    .nth(2)
+                    .expect("{loc}: missing target");
                 argv.push(target);
                 if ref_spec.is_empty() {
                     argv.extend(code.split_whitespace().skip(3));
@@ -1404,13 +1407,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 }
                 // And the reference token itself must satisfy the strict ref
                 // grammar (the CLI defers ref validation to push()).
-                if !ref_spec.is_empty() {
-                    if let Err(e) = parse_ref_expr(&ref_spec) {
-                        panic!(
-                            "{loc}: documented example contradicts the strict ref parser: \
-                             parse_ref_expr({ref_spec:?}) failed: {e}"
-                        );
-                    }
+                if !ref_spec.is_empty()
+                    && let Err(e) = parse_ref_expr(&ref_spec)
+                {
+                    panic!(
+                        "{loc}: documented example contradicts the strict ref parser: \
+                         parse_ref_expr({ref_spec:?}) failed: {e}"
+                    );
                 }
             }
         }

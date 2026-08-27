@@ -9,7 +9,7 @@
 //! * [`assignment`] — the generation assignment record.
 
 mod assignment;
-mod current;
+pub mod current;
 mod markers;
 
 pub use assignment::GenerationAssignment;

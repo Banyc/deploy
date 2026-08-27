@@ -397,7 +397,7 @@ fn run_no_leak_case(
     }
     helper
         .swap_current(
-            None,
+            &crate::remote::helper::ExpectedCurrent::Absent,
             test_generation_id(&format!("g{}", n - 1)).as_str(),
             "op",
         )

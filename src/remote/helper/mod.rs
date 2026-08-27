@@ -27,6 +27,7 @@ pub use observed::{
     Observation, ObservationError, ObservedGeneration, ObservedSlot, ObservedState, ObservedTarget,
 };
 pub use state::GenerationAssignment;
+pub use state::current::{CurrentState, ExpectedCurrent};
 
 use crate::error::{Error, Result};
 use crate::identity::{BehaviorContract, GenerationId, ReleaseId, ReleaseRecord};

@@ -75,7 +75,11 @@ pub(crate) fn compensate_server(
             // generation we just activated. Otherwise another controller changed
             // it and we must not clobber their state.
             if helper
-                .swap_current(Some(advanced_gen.as_str()), prior.as_str(), op_id.as_str())
+                .swap_current(
+                    &crate::remote::helper::ExpectedCurrent::Generation(advanced_gen.clone()),
+                    prior.as_str(),
+                    op_id.as_str(),
+                )
                 .is_err()
             {
                 return Ok(false);
@@ -104,7 +108,9 @@ pub(crate) fn compensate_server(
             // First deploy: remove `current` only if it still points at the
             // generation we advanced (compare-and-swap style).
             Ok(helper
-                .remove_current_if(advanced_gen.as_str())
+                .remove_current_if(&crate::remote::helper::ExpectedCurrent::Generation(
+                    advanced_gen.clone(),
+                ))
                 .unwrap_or(false))
         }
     }
@@ -341,7 +347,11 @@ mod compensation_tests {
             )
             .unwrap();
         helper
-            .swap_current(Some(first.generation.as_str()), g2.as_str(), "op2")
+            .swap_current(
+                &crate::remote::helper::ExpectedCurrent::Generation(first.generation.clone()),
+                g2.as_str(),
+                "op2",
+            )
             .unwrap();
         // ...but a concurrent controller moved `current` to g3 BEFORE this
         // op's compensation ran: the CAS precondition (current == g2) fails.
@@ -365,7 +375,11 @@ mod compensation_tests {
             )
             .unwrap();
         helper
-            .swap_current(Some(g2.as_str()), g3.as_str(), "op3")
+            .swap_current(
+                &crate::remote::helper::ExpectedCurrent::Generation(g2.clone()),
+                g3.as_str(),
+                "op3",
+            )
             .unwrap();
 
         // The prior generation's behavior must be readable for compensation to

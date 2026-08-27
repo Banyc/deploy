@@ -327,7 +327,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             )
             .unwrap();
         helper
-            .swap_current(None, test_generation_id("g2").as_str(), "op")
+            .swap_current(
+                &crate::remote::helper::ExpectedCurrent::Absent,
+                test_generation_id("g2").as_str(),
+                "op",
+            )
             .unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let c = cfg();
@@ -500,7 +504,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             None,
         );
         helper
-            .swap_current(None, test_generation_id("g3").as_str(), "op")
+            .swap_current(
+                &crate::remote::helper::ExpectedCurrent::Absent,
+                test_generation_id("g3").as_str(),
+                "op",
+            )
             .unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let mut c = cfg();
@@ -556,7 +564,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         make_gen(&helper, "d1", "g1", "t-old", &old, None, None);
         make_gen(&helper, "d2", "g2", "t-recent", &recent, Some("g1"), None);
         helper
-            .swap_current(None, test_generation_id("g2").as_str(), "op")
+            .swap_current(
+                &crate::remote::helper::ExpectedCurrent::Absent,
+                test_generation_id("g2").as_str(),
+                "op",
+            )
             .unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let mut c = cfg();
@@ -640,7 +652,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             None,
         );
         helper
-            .swap_current(None, test_generation_id("g3").as_str(), "op")
+            .swap_current(
+                &crate::remote::helper::ExpectedCurrent::Absent,
+                test_generation_id("g3").as_str(),
+                "op",
+            )
             .unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let mut c = cfg();
@@ -710,7 +726,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         // current -> g2, whose assignment records g1 as prior.
         helper
-            .swap_current(None, test_generation_id("g2").as_str(), "op")
+            .swap_current(
+                &crate::remote::helper::ExpectedCurrent::Absent,
+                test_generation_id("g2").as_str(),
+                "op",
+            )
             .unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let mut c = cfg();
@@ -771,7 +791,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             None,
         );
         helper
-            .swap_current(None, test_generation_id("g1").as_str(), "op")
+            .swap_current(
+                &crate::remote::helper::ExpectedCurrent::Absent,
+                test_generation_id("g1").as_str(),
+                "op",
+            )
             .unwrap();
         // Corrupt the live generation's assignment record.
         std::fs::write(
@@ -874,7 +898,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             Some("production"),
         );
         helper
-            .swap_current(None, test_generation_id("g3").as_str(), "op")
+            .swap_current(
+                &crate::remote::helper::ExpectedCurrent::Absent,
+                test_generation_id("g3").as_str(),
+                "op",
+            )
             .unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
@@ -1001,7 +1029,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             None,
         );
         helper
-            .swap_current(None, test_generation_id("g3").as_str(), "op")
+            .swap_current(
+                &crate::remote::helper::ExpectedCurrent::Absent,
+                test_generation_id("g3").as_str(),
+                "op",
+            )
             .unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let mut c = cfg();
@@ -1087,7 +1119,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             None,
         );
         helper
-            .swap_current(None, test_generation_id("g2").as_str(), "op")
+            .swap_current(
+                &crate::remote::helper::ExpectedCurrent::Absent,
+                test_generation_id("g2").as_str(),
+                "op",
+            )
             .unwrap();
         // A garbage object referenced by nothing — genuinely unretained.
         helper

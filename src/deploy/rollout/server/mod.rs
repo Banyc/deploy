@@ -241,7 +241,10 @@ pub(crate) fn process_server(
 
     // Atomically move `current` (the per-slot commit point).
     let swap = helper.swap_current(
-        expected_gen.map(|g| g.as_str()),
+        &match expected_gen {
+            Some(g) => crate::remote::helper::ExpectedCurrent::Generation(g.clone()),
+            None => crate::remote::helper::ExpectedCurrent::Absent,
+        },
         new_gen.as_str(),
         op_id.as_str(),
     );

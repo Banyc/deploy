@@ -11,6 +11,28 @@ use std::path::Path;
 
 use super::super::{RemoteHelper, RemoteStatus};
 
+/// The ACTUAL resolved state of the top-level `current` link: genuine absence
+/// or the exact canonical generation it points at. Produced ONLY by
+/// [`RemoteHelper::resolve_current`] (a fallible single resolution); a
+/// present-but-malformed link or a transport failure is an `Err`, never a
+/// state — there is NO wildcard/malformed state that a mutation could match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CurrentState {
+    Absent,
+    Generation(GenerationId),
+}
+
+/// The TYPED compare-and-swap expectation of a swap/removal: `Absent` (the
+/// caller believes there is no `current` — the first-deployment path) or a
+/// specific generation. There is deliberately NO wildcard/`None` form: the
+/// mutation succeeds only when the resolved actual state agrees EXACTLY, so a
+/// first deployment can never overwrite a concurrently-swapped link.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExpectedCurrent {
+    Absent,
+    Generation(GenerationId),
+}
+
 impl<'a> RemoteHelper<'a> {
     /// Inspect the actual remote generation, object inventory, lock, and
     /// pending incoming directories.
@@ -152,6 +174,19 @@ impl<'a> RemoteHelper<'a> {
     /// canonical form — no `generations` component, unparseable id, missing
     /// `root` suffix, extra components, empty/absolute/`..` targets).
     ///
+    /// Resolve the ACTUAL state of the `current` link ONCE, through a
+    /// fallible read: `Absent` for genuine absence, `Generation(gid)` for an
+    /// exact canonical `generations/<gen-id>/root` target, and an `Err` for
+    /// ANY present-but-malformed entry (non-symlink, non-canonical target)
+    /// or a transport failure — the error propagates and the link is never
+    /// touched. Every swap/removal gates on this single resolution.
+    pub fn resolve_current(&self) -> Result<CurrentState> {
+        Ok(match self.canonical_current_target()? {
+            None => CurrentState::Absent,
+            Some(gid) => CurrentState::Generation(gid),
+        })
+    }
+
     /// `exists` FOLLOWS the link while `metadata` is an lstat: a DANGLING
     /// `current` (one whose target does not resolve) is still PRESENT here
     /// and validated rather than silently treated as absent. Both `status()`
@@ -197,21 +232,36 @@ impl<'a> RemoteHelper<'a> {
     /// The same rule governs [`Self::remove_current_if`]. A swap performed
     /// without the flock can race a concurrent activation between its status
     /// read and the rename.
-    pub fn swap_current(&self, expected: Option<&str>, gen_id: &str, op_id: &str) -> Result<()> {
-        // A present-but-malformed `current` (non-symlink, or a target that is
-        // not the exact canonical `generations/<gen>/root` form with a
-        // parseable id) fails closed here, so a corrupt link can never be
-        // mistaken for absence and silently overwritten by a swap — even on
-        // the first-deployment (`expected = None`) path.
-        let actual = self.canonical_current_target()?;
-        if let Some(actual) = &actual
-            && let Some(exp) = expected
-            && actual.as_str() != exp
-        {
-            return Err(Error::remote(format!(
-                "compare-and-swap precondition failed: current generation is {:?}, expected {exp}",
-                Some(actual.as_str())
-            )));
+    pub fn swap_current(
+        &self,
+        expected: &ExpectedCurrent,
+        gen_id: &str,
+        op_id: &str,
+    ) -> Result<()> {
+        // Resolve the actual state ONCE (fallible: a malformed present link
+        // or a transport error propagates and the link is never touched).
+        // Then require EXACT equality with the typed expectation — there is
+        // NO wildcard state, so a first deployment (`ExpectedCurrent::Absent`)
+        // can never overwrite a concurrently-swapped present link.
+        let actual = self.resolve_current()?;
+        match (expected, &actual) {
+            (ExpectedCurrent::Absent, CurrentState::Absent) => {}
+            (ExpectedCurrent::Generation(exp), CurrentState::Generation(act)) if exp == act => {}
+            (ExpectedCurrent::Absent, CurrentState::Generation(act)) => {
+                return Err(Error::remote(format!(
+                    "compare-and-swap precondition failed: expected no current, but current is generation {act}"
+                )));
+            }
+            (ExpectedCurrent::Generation(exp), CurrentState::Absent) => {
+                return Err(Error::remote(format!(
+                    "compare-and-swap precondition failed: expected current generation {exp}, but current is absent"
+                )));
+            }
+            (ExpectedCurrent::Generation(exp), CurrentState::Generation(act)) => {
+                return Err(Error::remote(format!(
+                    "compare-and-swap precondition failed: current generation is {act}, expected {exp}"
+                )));
+            }
         }
         let new_target = layout::generation(gen_id).join("root");
         let tmp_name = format!(".current.tmp.{op_id}");
@@ -230,24 +280,34 @@ impl<'a> RemoteHelper<'a> {
     /// activation cannot be clobbered.
     /// Remove `current` only if it currently points at `expected`. Returns true
     /// if it was removed, false if `current` pointed elsewhere (or did not exist).
-    pub fn remove_current_if(&self, expected: &str) -> Result<bool> {
-        if !self.remote.exists(layout::current()) {
-            return Ok(false);
-        }
-        let target = self.remote.read_link(layout::current())?;
-        let comps: Vec<String> = target
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect();
-        let actual = comps
-            .iter()
-            .position(|c| c == layout::GENERATIONS_COMPONENT)
-            .and_then(|i| comps.get(i + 1).cloned());
-        if actual.as_deref() == Some(expected) {
-            self.remote.remove_file(layout::current())?;
-            Ok(true)
-        } else {
-            Ok(false)
+    pub fn remove_current_if(&self, expected: &ExpectedCurrent) -> Result<bool> {
+        // Same exact-equality gate as the swap: resolve the actual state once
+        // (malformed/transport errors propagate, link byte-identical) and
+        // remove ONLY on an exact generation match. `Absent` expectation with
+        // genuine absence removes nothing (`Ok(false)`); any disagreement is
+        // an error — a removal can never clobber an unexpected state.
+        let actual = self.resolve_current()?;
+        match (expected, &actual) {
+            (ExpectedCurrent::Generation(exp), CurrentState::Generation(act)) if exp == act => {
+                self.remote.remove_file(layout::current())?;
+                Ok(true)
+            }
+            (ExpectedCurrent::Absent, CurrentState::Absent) => Ok(false),
+            (ExpectedCurrent::Absent, CurrentState::Generation(act)) => {
+                Err(Error::remote(format!(
+                    "remove-current precondition failed: expected no current, but current is generation {act}"
+                )))
+            }
+            (ExpectedCurrent::Generation(exp), CurrentState::Absent) => {
+                Err(Error::remote(format!(
+                    "remove-current precondition failed: expected current generation {exp}, but current is absent"
+                )))
+            }
+            (ExpectedCurrent::Generation(exp), CurrentState::Generation(act)) => {
+                Err(Error::remote(format!(
+                    "remove-current precondition failed: current generation is {act}, expected {exp}"
+                )))
+            }
         }
     }
 }
@@ -716,7 +776,7 @@ mod tests_current {
             let helper = RemoteHelper::new(&remote);
             let new_gen = GenerationId::generate();
             let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                helper.swap_current(None, new_gen.as_str(), "op")
+                helper.swap_current(&ExpectedCurrent::Absent, new_gen.as_str(), "op")
             }))
             .expect("swap must never panic on a malformed current link")
             .expect_err("a malformed present current must never be swapped over");
@@ -732,7 +792,11 @@ mod tests_current {
             );
             // The CAS form (with an expected generation) fails the same way.
             let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                helper.swap_current(Some(new_gen.as_str()), new_gen.as_str(), "op")
+                helper.swap_current(
+                    &ExpectedCurrent::Generation(new_gen.clone()),
+                    new_gen.as_str(),
+                    "op",
+                )
             }))
             .expect("swap must never panic on a malformed current link")
             .expect_err("a malformed present current must fail even with an expected generation");
@@ -765,7 +829,7 @@ mod tests_current {
         let helper = RemoteHelper::new(&remote);
         let new_gen = GenerationId::generate();
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            helper.swap_current(None, new_gen.as_str(), "op")
+            helper.swap_current(&ExpectedCurrent::Absent, new_gen.as_str(), "op")
         }))
         .expect("swap must never panic on a plain-file current")
         .expect_err("a plain-file current must never be swapped over");
@@ -794,7 +858,7 @@ mod tests_current {
         let helper = RemoteHelper::new(&remote);
         let new_gen = GenerationId::generate();
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            helper.swap_current(None, new_gen.as_str(), "op")
+            helper.swap_current(&ExpectedCurrent::Absent, new_gen.as_str(), "op")
         }))
         .expect("swap must never panic on genuine absence")
         .expect("first deployment over genuine absence must succeed");
@@ -828,7 +892,11 @@ mod tests_current {
 
         // Mismatched expected: refuse (remote CAS error), link untouched.
         let err = helper
-            .swap_current(Some(next_gen.as_str()), next_gen.as_str(), "op")
+            .swap_current(
+                &ExpectedCurrent::Generation(next_gen.clone()),
+                next_gen.as_str(),
+                "op",
+            )
             .expect_err("a mismatched CAS precondition must refuse");
         assert!(
             err.to_string().contains("compare-and-swap"),
@@ -842,7 +910,11 @@ mod tests_current {
 
         // Matching expected: proceeds and moves the link.
         helper
-            .swap_current(Some(cas_gid.as_str()), next_gen.as_str(), "op")
+            .swap_current(
+                &ExpectedCurrent::Generation(cas_gid.clone()),
+                next_gen.as_str(),
+                "op",
+            )
             .expect("a matching CAS precondition must swap");
         assert_eq!(
             std::fs::read_link(base.join("current")).unwrap(),
@@ -1230,18 +1302,20 @@ mod tests_current {
                 }
             }
 
-            // ---- swap_current(None, ...): never panic; succeed only on
-            // genuine absence or an exact canonical current target;
-            // malformed-present must fail and leave the entry unchanged. ----
+            // ---- swap_current(ExpectedCurrent::Absent, ...): never panic;
+            // the EXACT gate succeeds ONLY on genuine absence; a present
+            // canonical current is a CAS disagreement (remote error), a
+            // malformed-present current is an integrity error — both leave
+            // the entry byte-identical. ----
             let swap = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                helper.swap_current(None, new_gen.as_str(), "op")
+                helper.swap_current(&ExpectedCurrent::Absent, new_gen.as_str(), "op")
             }))
             .expect("swap must never panic on arbitrary symlink layouts");
             match swap {
                 Ok(()) => {
                     assert!(
-                        layout.current.is_none() || current_gid.is_some(),
-                        "swap must not succeed over a malformed present current"
+                        layout.current.is_none(),
+                        "swap must not succeed over a present current: a first deployment can never overwrite a concurrent link"
                     );
                     // The swap installed the canonical target for the new gen.
                     assert_eq!(
@@ -1251,13 +1325,20 @@ mod tests_current {
                 }
                 Err(e) => {
                     assert!(
-                        layout.current.is_some() && current_gid.is_none(),
-                        "swap failed for an unexpected reason: {e}"
+                        layout.current.is_some(),
+                        "swap must not fail on genuine absence: {e}"
                     );
-                    assert!(
-                        e.to_string().contains("integrity"),
-                        "a refused swap must be an integrity error, got: {e}"
-                    );
+                    if current_gid.is_some() {
+                        assert!(
+                            e.to_string().contains("precondition failed"),
+                            "a present canonical current must refuse a first-deployment swap with the CAS error, got: {e}"
+                        );
+                    } else {
+                        assert!(
+                            e.to_string().contains("integrity"),
+                            "a malformed present current must fail with an integrity error, got: {e}"
+                        );
+                    }
                     // The entry is byte-identical after the failed swap.
                     match &layout.current {
                         Some(CurrentKind::Symlink(t)) => assert_eq!(
@@ -1272,6 +1353,204 @@ mod tests_current {
                         ),
                         None => {}
                     }
+                }
+            }
+        }
+    }
+    /// A transport whose `current`-link reads ALWAYS fail with a transport
+    /// error (the TRANSPORT-ERROR arm of the current-state property): every
+    /// other operation delegates to the inner local transport untouched.
+    struct FailCurrentRemote {
+        inner: crate::remote::transport::LocalTransport,
+    }
+    impl crate::remote::transport::Remote for FailCurrentRemote {
+        fn root(&self) -> &std::path::Path {
+            self.inner.root()
+        }
+        fn exists(&self, rel: &std::path::Path) -> bool {
+            if rel == crate::remote::layout::current() {
+                return true;
+            }
+            self.inner.exists(rel)
+        }
+        fn metadata(
+            &self,
+            rel: &std::path::Path,
+        ) -> crate::error::Result<crate::remote::transport::RemoteMeta> {
+            if rel == crate::remote::layout::current() {
+                return Err(crate::error::Error::transport(
+                    "current read failed: injected transport fault",
+                ));
+            }
+            self.inner.metadata(rel)
+        }
+        fn read_link(&self, rel: &std::path::Path) -> crate::error::Result<std::path::PathBuf> {
+            if rel == crate::remote::layout::current() {
+                return Err(crate::error::Error::transport(
+                    "current read failed: injected transport fault",
+                ));
+            }
+            self.inner.read_link(rel)
+        }
+        fn read(&self, rel: &std::path::Path) -> crate::error::Result<Vec<u8>> {
+            self.inner.read(rel)
+        }
+        fn write(&self, rel: &std::path::Path, data: &[u8], mode: u32) -> crate::error::Result<()> {
+            self.inner.write(rel, data, mode)
+        }
+        fn try_write_new(&self, rel: &std::path::Path, data: &[u8]) -> crate::error::Result<bool> {
+            self.inner.try_write_new(rel, data)
+        }
+        fn create_dir(&self, rel: &std::path::Path) -> crate::error::Result<()> {
+            self.inner.create_dir(rel)
+        }
+        fn create_dir_all(&self, rel: &std::path::Path) -> crate::error::Result<()> {
+            self.inner.create_dir_all(rel)
+        }
+        fn set_mode(&self, rel: &std::path::Path, mode: u32) -> crate::error::Result<()> {
+            self.inner.set_mode(rel, mode)
+        }
+        fn list(
+            &self,
+            rel: &std::path::Path,
+        ) -> crate::error::Result<Vec<crate::remote::transport::RemoteEntry>> {
+            self.inner.list(rel)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> crate::error::Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn symlink(
+            &self,
+            target: &std::path::Path,
+            link: &std::path::Path,
+        ) -> crate::error::Result<()> {
+            self.inner.symlink(target, link)
+        }
+        fn remove_file(&self, rel: &std::path::Path) -> crate::error::Result<()> {
+            self.inner.remove_file(rel)
+        }
+        fn remove_dir_all(&self, rel: &std::path::Path) -> crate::error::Result<()> {
+            self.inner.remove_dir_all(rel)
+        }
+        fn exec(
+            &self,
+            argv: &[String],
+            timeout: std::time::Duration,
+        ) -> crate::error::Result<crate::remote::transport::ExecOutcome> {
+            self.inner.exec(argv, timeout)
+        }
+        fn filesystem_bytes(&self) -> crate::error::Result<crate::remote::transport::FsBytes> {
+            self.inner.filesystem_bytes()
+        }
+        fn prepare_identity(&self) -> crate::error::Result<()> {
+            self.inner.prepare_identity()
+        }
+        fn provision_layout(&self) -> crate::error::Result<()> {
+            self.inner.provision_layout()
+        }
+    }
+
+    // THE USER'S CURRENT-STATE GATE PROPERTY: generate the ACTUAL state
+    // (absent / canonical generation / malformed present / transport-error)
+    // and the EXPECTED state (absent / a generation), and apply BOTH the
+    // swap and the compensation REMOVAL. The mutation succeeds (or reports
+    // "nothing to remove") IFF the actual and expected agree EXACTLY:
+    // absent+absent, or Generation(g)+Generation(g). Every disagreement,
+    // every malformed-present actual, and every transport error PROPAGATES
+    // (an `Err`) and leaves the `current` link byte-identical — there is no
+    // wildcard state a mutation could match.
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+        // 0 absent, 1 canonical, 2 malformed-present, 3 transport-error.
+        #[test]
+        fn gates(
+            a in 0u8..4,
+            actual_g in "[a-z0-9]{1,8}".prop_map(|tag| crate::identity::test_generation_id(&tag)),
+            expected_kind in 0u8..2,
+            expected_g in "[a-z0-9]{1,8}".prop_map(|tag| crate::identity::test_generation_id(&tag)),
+            new_gen in "[a-z0-9]{1,8}".prop_map(|tag| crate::identity::test_generation_id(&tag)),
+        ) {
+            let expected = if expected_kind == 0 {
+                ExpectedCurrent::Absent
+            } else {
+                ExpectedCurrent::Generation(expected_g.clone())
+            };
+            let actual_canonical: Option<crate::identity::GenerationId> = match a {
+                1 => Some(actual_g.clone()),
+                _ => None,
+            };
+            let agrees = match (a, &expected, actual_canonical.as_ref()) {
+                (0, ExpectedCurrent::Absent, _) => true,
+                (1, ExpectedCurrent::Generation(e), Some(act)) => e == act,
+                _ => false,
+            };
+            let transport_err = a == 3;
+            let malformed = a == 2;
+
+            for name in ["swap", "remove"] {
+                // Fresh fixture per mutation: a swap may legitimately
+                // rewrite the link, so the removal must never observe the
+                // swap's aftermath.
+                let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+                let base = dir.path().join("remote");
+                std::fs::create_dir_all(&base).unwrap();
+                match a {
+                    0 => {}
+                    1 => {
+                        std::os::unix::fs::symlink(
+                            layout::generation(actual_g.as_str()).join("root"),
+                            base.join("current"),
+                        )
+                        .unwrap();
+                    }
+                    2 => {
+                        std::os::unix::fs::symlink("objects/not-canonical", base.join("current")).unwrap();
+                    }
+                    3 => {}
+                    _ => unreachable!(),
+                }
+                let link_bytes_before = std::fs::symlink_metadata(base.join("current"))
+                    .map(|_| std::fs::read_link(base.join("current")).unwrap())
+                    .unwrap_or_default();
+                let inner = crate::remote::transport::LocalTransport::new(&crate::testutil::fixture_env(), base.clone()).unwrap();
+                let remote: Box<dyn crate::remote::transport::Remote> = if a == 3 {
+                    Box::new(FailCurrentRemote { inner })
+                } else {
+                    Box::new(inner)
+                };
+                let helper = RemoteHelper::new(remote.as_ref());
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match name {
+                    "swap" => helper
+                        .swap_current(&expected, new_gen.as_str(), "op")
+                        .map(|_| true),
+                    _ => helper.remove_current_if(&expected),
+                }));
+                match result {
+                    Ok(Ok(_)) => {
+                        assert!(
+                            agrees,
+                            "{name}: mutation must not succeed when actual and expected disagree (a={a}, expected {expected:?})"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        assert!(
+                            !agrees || malformed || transport_err,
+                            "{name}: mutation must succeed on exact agreement, got: {e}"
+                        );
+                        let after = std::fs::symlink_metadata(base.join("current"))
+                            .map(|_| std::fs::read_link(base.join("current")).unwrap())
+                            .unwrap_or_default();
+                        assert_eq!(
+                            after, link_bytes_before,
+                            "{name}: a failed mutation must leave the current link byte-identical"
+                        );
+                    }
+                    Err(_) => panic!("{name}: the gate must never panic"),
                 }
             }
         }
