@@ -14,7 +14,7 @@ use crate::history::{self, PushRef, RefExpr};
 use crate::layout;
 use crate::model::{
     ArtifactRef, BehaviorContract, DeploymentId, GenerationId, OperationId, ReleaseId, SlotId,
-    TargetName, TreeDigest, VariantName, unknown_artifact,
+    TargetName, TreeDigest, VariantName,
 };
 use crate::push::capacity::capacity_preflight;
 use crate::push::lock::FileLock;
@@ -834,17 +834,21 @@ fn push_inner(
                 // remote generation), not the desired one. When the live
                 // generation's assignment cannot be read (a missing or corrupt
                 // `assignment.json`), never substitute the planned (desired)
-                // artifact: preserve the observed generation and mark the
-                // assignment unknown — the same contract the post-push
-                // `actual_servers` refresh uses (see below).
+                // artifact: preserve the observed generation and record the
+                // assignment as `Observation::Unknown(error)` — the same
+                // contract the post-push `actual_servers` refresh uses (see
+                // below). An unknown assignment is a DISTINCT value, never a
+                // valid-looking artifact (there is no sentinel artifact).
                 helpers[slot_id]
                     .read_assignment(g.as_str())
                     .map(|asn| SlotAttemptState {
-                        artifact: asn.artifact.clone(),
+                        artifact: Observation::Known(asn.artifact.clone()),
                         generation: Some(g.clone()),
                     })
-                    .unwrap_or_else(|_| SlotAttemptState {
-                        artifact: unknown_artifact(),
+                    .unwrap_or_else(|e| SlotAttemptState {
+                        artifact: Observation::Unknown(ObservationError {
+                            message: format!("assignment read failed: {e}"),
+                        }),
                         generation: Some(g.clone()),
                     })
             }),
@@ -1532,11 +1536,16 @@ fn push_inner(
     // remote generation it currently points at, rather than the desired plan
     // values. Failed/skipped/restored slots therefore report their actual
     // artifact instead of the desired one. The per-slot THREE-STATE
-    // OBSERVATION feeds the never-advanced outcomes below: a FAILED
-    // post-mutation status read is `Unknown(error)`, never a `None` that
-    // downstream code reads as "unchanged". The wire-shaped `actual_servers`
-    // keeps the current on-disk shape — generation only — so the
-    // observation's `Unknown` half is recorded into the never-advanced
+    // OBSERVATION: the actual's `artifact` is itself an
+    // [`Observation<ArtifactRef>`] — a FAILED assignment read is
+    // `Observation::Unknown(error)`, a distinct value that never looks like a
+    // known artifact (there is no sentinel artifact) — and the parallel
+    // `actual_observations` map carries the GENERATION half of the
+    // observation (a different fact, feeding the never-advanced outcomes
+    // below): a FAILED post-mutation status read is `Unknown(error)`, never a
+    // `None` that downstream code reads as "unchanged". The wire-shaped
+    // `actual_servers` keeps the current on-disk shape — generation only —
+    // so the observation's `Unknown` half is recorded into the never-advanced
     // outcomes' `observation_error` field below, while the outcome's OWN
     // operation error (`error`) is left untouched.
     let mut actual_servers: BTreeMap<SlotId, SlotAttemptState> = BTreeMap::new();
@@ -1551,7 +1560,7 @@ fn push_inner(
                 Some(g) => match helper.read_assignment(g.as_str()) {
                     Ok(asn) => (
                         SlotAttemptState {
-                            artifact: asn.artifact.clone(),
+                            artifact: Observation::Known(asn.artifact.clone()),
                             generation: Some(g.clone()),
                         },
                         Observation::Known(ObservedGeneration {
@@ -1560,7 +1569,9 @@ fn push_inner(
                     ),
                     Err(e) => (
                         SlotAttemptState {
-                            artifact: unknown_artifact(),
+                            artifact: Observation::Unknown(ObservationError {
+                                message: format!("assignment read failed: {e}"),
+                            }),
                             generation: Some(g.clone()),
                         },
                         Observation::Unknown(ObservationError {
@@ -1570,7 +1581,7 @@ fn push_inner(
                 },
                 None => (
                     SlotAttemptState {
-                        artifact: a.artifact.clone(),
+                        artifact: Observation::Known(a.artifact.clone()),
                         generation: None,
                     },
                     Observation::KnownAbsent,
@@ -1578,7 +1589,7 @@ fn push_inner(
             },
             Err(e) => (
                 SlotAttemptState {
-                    artifact: a.artifact.clone(),
+                    artifact: Observation::Known(a.artifact.clone()),
                     generation: None,
                 },
                 Observation::Unknown(ObservationError {
@@ -2506,6 +2517,18 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    /// The KNOWN artifact of a report actual ([`SlotAttemptState`]): a
+    /// successful push's actuals are always `Known` — the post-push refresh
+    /// only records `Unknown` for an unreadable live assignment, which fails
+    /// the status read before any successful finalize. Test code asserting
+    /// on a real actual artifact unwraps the observation here.
+    fn known_artifact(s: &SlotAttemptState) -> &ArtifactRef {
+        match &s.artifact {
+            Observation::Known(a) => a,
+            other => panic!("expected a Known actual artifact, got {other:?}"),
+        }
+    }
+
     const NONE_VARIANT: &str = r#"
 [[slots]]
 id = "p1"
@@ -2865,8 +2888,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .expect("first push records an attempt")
             .deployment_id
             .clone();
-        let tree = r0.attempt.expect("attempt recorded").slots[&SlotId::new("p1")]
-            .artifact
+        let tree = known_artifact(&r0.attempt.expect("attempt recorded").slots[&SlotId::new("p1")])
             .tree
             .clone();
 
@@ -4282,7 +4304,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             rollback_of(snap).slots[&SlotId::new("p1")]
                 .assignment
                 .artifact,
-            actual.artifact
+            known_artifact(actual).clone()
         );
     }
 
@@ -4777,8 +4799,8 @@ interval_seconds = 0
         let prior =
             r1.attempt.as_ref().expect("attempt recorded").slots[&SlotId::new("p1")].clone();
         let prior_gen = prior.generation.clone().expect("prior generation");
-        let prior_tree = prior.artifact.tree.clone();
-        let prior_release = prior.artifact.release.clone();
+        let prior_tree = known_artifact(&prior).tree.clone();
+        let prior_release = known_artifact(&prior).release.clone();
         // Behavior digest A (verification argv "true") frozen into s0.
         let var_a = h.config.variant("standard").unwrap();
         let a_digest = crate::release::behavior_contract_digest(&crate::model::BehaviorContract {
@@ -4856,7 +4878,8 @@ interval_seconds = 0
         let actual = &r2.attempt.as_ref().expect("attempt recorded").slots[&SlotId::new("p1")];
         assert_eq!(actual.generation, Some(prior_gen.clone()));
         assert_eq!(
-            actual.artifact.tree, prior_tree,
+            known_artifact(actual).tree,
+            prior_tree,
             "the actual artifact must be the restored prior tree, not the desired v2 tree"
         );
 
@@ -5529,7 +5552,7 @@ interval_seconds = 0
         let r1 = push_main_with_id(&h, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let s0 = &r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")];
-        let s0_tree = s0.artifact.tree.clone();
+        let s0_tree = known_artifact(s0).tree.clone();
         let s0_gen = s0.generation.clone().expect("s0 generation");
 
         let store_before = snapshot_files(h.store.base());
@@ -5611,7 +5634,7 @@ interval_seconds = 0
         let r1 = push_main_with_id(&h, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let s0 = &r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")];
-        let tree = s0.artifact.tree.clone();
+        let tree = known_artifact(s0).tree.clone();
 
         let store_before = snapshot_files(h.store.base());
         let remotes_before = snapshot_files(&h.remotes_base);
@@ -5874,8 +5897,8 @@ interval_seconds = 0
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let prior = r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")].clone();
         let prior_gen = prior.generation.clone().expect("prior generation");
-        let prior_tree = prior.artifact.tree.clone();
-        let prior_release = prior.artifact.release.clone();
+        let prior_tree = known_artifact(&prior).tree.clone();
+        let prior_release = known_artifact(&prior).release.clone();
         let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
         let prior_assignment: crate::remote::helper::GenerationAssignment = serde_json::from_slice(
             &remote
@@ -5927,7 +5950,8 @@ interval_seconds = 0
         let actual = &r2.attempt.as_ref().expect("attempt recorded").slots[&SlotId::new("p1")];
         assert_eq!(actual.generation, Some(prior_gen.clone()));
         assert_eq!(
-            actual.artifact.tree, prior_tree,
+            known_artifact(actual).tree,
+            prior_tree,
             "the actual artifact must be the restored prior tree, not the desired v2 tree"
         );
 
@@ -6034,8 +6058,7 @@ interval_seconds = 0
             .generation
             .clone()
             .expect("prior generation");
-        let prior_tree = r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")]
-            .artifact
+        let prior_tree = known_artifact(&r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")])
             .tree
             .clone();
 
@@ -7344,12 +7367,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     /// OBSERVED-REFRESH UNKNOWN-ASSIGNMENT FALLBACK: when a live generation's
     /// `assignment.json` cannot be read (missing/corrupt), the refresh must
-    /// preserve the OBSERVED generation and mark the assignment UNKNOWN
-    /// (`unknown_artifact()`) — never substitute the desired/planned
-    /// artifact. BOTH the pre-push intent (`pre_push`) and the post-push
-    /// observed refresh use this contract; results.json records the slot's
-    /// pre-swap failure, `current` stays on the observed (corrupt) generation,
-    /// and no stale snapshot/ref is produced.
+    /// preserve the OBSERVED generation and record the assignment as
+    /// `Observation::Unknown(ObservationError)` — a DISTINCT value, never a
+    /// substitute of the desired/planned artifact (there is no sentinel
+    /// artifact: an `ArtifactRef` always means a known artifact). BOTH the
+    /// pre-push intent (`pre_push`) and the post-push observed refresh use
+    /// this contract; results.json records the slot's pre-swap failure,
+    /// `current` stays on the observed (corrupt) generation, and no stale
+    /// snapshot/ref is produced.
     #[test]
     fn corrupt_current_assignment_fails_status_and_push_closed() {
         let h = RecoveryHarness::new();
@@ -7661,8 +7686,7 @@ interval_seconds = 0
         let id1 = test_deployment_id("deploy-bare-atf");
         let r1 = push_main_with_id(&h, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-        let s0_tree = r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")]
-            .artifact
+        let s0_tree = known_artifact(&r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")])
             .tree
             .clone();
 
@@ -7864,8 +7888,8 @@ interval_seconds = 0
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let first_attempt = r1.attempt.as_ref().expect("attempt recorded");
         let first_slot = &first_attempt.slots[&SlotId::new("p1")];
-        assert_eq!(first_slot.artifact.variant.as_str(), "standard");
-        let first_tree = first_slot.artifact.tree.clone();
+        assert_eq!(known_artifact(first_slot).variant.as_str(), "standard");
+        let first_tree = known_artifact(first_slot).tree.clone();
         let first_gen = first_slot.generation.clone().expect("generation minted");
         let argv1 = executed.lock().unwrap().clone();
         assert_eq!(argv1.len(), 1, "push 1 runs verification once: {argv1:?}");
@@ -7914,9 +7938,10 @@ interval_seconds = 0
         assert_eq!(r2.status, Some(DeploymentStatus::Successful));
         let second_attempt = r2.attempt.as_ref().expect("attempt recorded");
         let second_slot = &second_attempt.slots[&SlotId::new("p1")];
-        assert_eq!(second_slot.artifact.variant.as_str(), "other");
+        assert_eq!(known_artifact(second_slot).variant.as_str(), "other");
         assert_eq!(
-            second_slot.artifact.tree, first_tree,
+            known_artifact(second_slot).tree,
+            first_tree,
             "both variants materialize the SAME tree bytes; only the variant differs"
         );
         let second_gen = second_slot.generation.clone().expect("generation minted");
@@ -8114,7 +8139,7 @@ interval_seconds = 0
             assert_eq!(rp.status, Some(DeploymentStatus::PendingCommit));
             let pending = rp.attempt.as_ref().expect("the pending push records an attempt");
             let pending_id = pending.deployment_id.clone();
-            let pending_artifact = pending.slots[&slot].artifact.clone();
+            let pending_artifact = known_artifact(&pending.slots[&slot]).clone();
             assert!(
                 h.store.read_snapshots("t1").unwrap().is_empty(),
                 "the pending attempt appends no snapshot yet"

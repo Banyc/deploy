@@ -1544,7 +1544,6 @@ mod tests {
     use crate::model::{
         ArtifactRef, GenerationRef, PlacementSlotAssignment, ReleaseId, ServerId, SlotId,
         TargetName, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
-        unknown_artifact,
     };
     use crate::push::lock::FileLock;
     use crate::records::{
@@ -1740,7 +1739,11 @@ mod tests {
         let observed = ObservedSlot {
             observation: Observation::Known(ObservedState {
                 generation: test_generation_id("evil"),
-                artifact: unknown_artifact(),
+                artifact: ArtifactRef {
+                    release: crate::model::test_release_id("rel-sha256-evil"),
+                    variant: VariantName::new("standard".to_string()),
+                    tree: test_tree_digest("evil"),
+                },
                 last_deployment: test_deployment_id("evil"),
             }),
         };
@@ -3318,7 +3321,11 @@ mod tests {
             generation: test_generation_id(slot.as_str()),
             assignment: PlacementSlotAssignment {
                 placement_slot: slot.clone(),
-                artifact: unknown_artifact(),
+                artifact: ArtifactRef {
+                    release: crate::model::test_release_id(slot.as_str()),
+                    variant: VariantName::new("standard".to_string()),
+                    tree: test_tree_digest(slot.as_str()),
+                },
             },
         }
     }
@@ -3347,10 +3354,18 @@ mod tests {
                     IntentSlot {
                         desired: DesiredGeneration {
                             generation: test_generation_id(k.as_str()),
-                            artifact: unknown_artifact(),
+                            artifact: ArtifactRef {
+                                release: crate::model::test_release_id(k.as_str()),
+                                variant: VariantName::new("standard".to_string()),
+                                tree: test_tree_digest(k.as_str()),
+                            },
                         },
                         pre_push: Some(PreviousGeneration {
-                            artifact: unknown_artifact(),
+                            artifact: Observation::Known(ArtifactRef {
+                                release: crate::model::test_release_id(k.as_str()),
+                                variant: VariantName::new("standard".to_string()),
+                                tree: test_tree_digest(k.as_str()),
+                            }),
                             generation: Some(test_generation_id("0")),
                         }),
                     },

@@ -56,15 +56,18 @@ pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 /// the deployment records version themselves separately from the
 /// configuration format, so bumping one never invalidates the other.
 ///
-/// The current format is version 2: deployment records use the canonical
-/// placement-slot-keyed shape (`BTreeMap<SlotId, _>` maps, nested
-/// artifact/generation refs) and carry the exclusive owning target + the
-/// optional rollout group of the attempt. Version 1 records (the
-/// multi-target `targets` membership shape) are REJECTED on read — no
-/// compatibility fallback. A hypothetical pre-rekeying shape that keyed
-/// these maps by server ID with flat artifact fields is NOT the current
-/// schema and never loads.
-pub const LEDGER_SCHEMA_VERSION: u32 = 2;
+/// The current format is version 3: the intent's `pre_push` per-slot state
+/// carries the pre-push ASSIGNMENT as a three-state observation
+/// ([`crate::records::Observation<ArtifactRef>`] — `Known` / `KnownAbsent` /
+/// `Unknown`) instead of a raw artifact, so an unreadable pre-push
+/// assignment is a DISTINCT `Unknown` value, never a valid-looking artifact
+/// (version 2 = the pre-observation `pre_push` shape that carried a raw
+/// artifact, including the removed `unknown_artifact()` sentinel). Version 1
+/// records (the multi-target `targets` membership shape) are REJECTED on
+/// read — no compatibility fallback. A hypothetical pre-rekeying shape that
+/// keyed these maps by server ID with flat artifact fields is NOT the
+/// current schema and never loads.
+pub const LEDGER_SCHEMA_VERSION: u32 = 3;
 
 /// The canonical release identity PAYLOAD version
 /// (`CanonicalReleasePayload.schema_version`), FROZEN INTO the release
@@ -561,31 +564,6 @@ pub struct ArtifactRef {
     pub release: ReleaseId,
     pub variant: VariantName,
     pub tree: TreeDigest,
-}
-
-/// The "assignment unknown" sentinel artifact: a VALID artifact reference
-/// marking a live assignment that could not be read (the ATTEMPT model's
-/// [`crate::records::SlotAttemptState`] — the OBSERVED model uses the
-/// explicit [`crate::records::Observation::Unknown`] variant instead,
-/// never a sentinel). The sentinel is valid by construction (the release is
-/// the canonical empty-content sha256 id, variant `unknown` is a safe
-/// segment, the tree digest is a fixed valid sha256) so it round-trips the
-/// wire — the old `rel-sha256-unknown` release id was NOT a valid release
-/// id and failed the strict wire parse, the exact malformed-record gap this
-/// hardening closes. It is never substituted for a real assignment — it
-/// only ever marks "the live assignment could not be read".
-pub fn unknown_artifact() -> ArtifactRef {
-    ArtifactRef {
-        release: ReleaseId::from_digest(
-            &ReleaseDigest::parse(
-                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            )
-            .expect("sentinel digest is a valid sha256"),
-        ),
-        variant: VariantName::parse("unknown").expect("sentinel variant is a safe segment"),
-        tree: TreeDigest::parse("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
-            .expect("sentinel digest is a valid sha256"),
-    }
 }
 
 /// The canonical slot→artifact assignment: one placement slot running one

@@ -20,6 +20,16 @@ use deploy::remote::transport::{LocalTransport, Remote};
 use deploy::store::local::LocalStore;
 use std::path::Path;
 
+/// The KNOWN artifact of a report actual ([`deploy::records::SlotAttemptState`]):
+/// a successful push's actuals are always `Known`. Test code asserting on a
+/// real actual artifact unwraps the observation here.
+fn known_artifact(s: &deploy::records::SlotAttemptState) -> &deploy::model::ArtifactRef {
+    match &s.artifact {
+        deploy::records::Observation::Known(a) => a,
+        other => panic!("expected a Known actual artifact, got {other:?}"),
+    }
+}
+
 const PLACEHOLDER: &str = "Hello from deploy!\n\
 \n\
 This placeholder is mapped into the artifact as `app/hello` by the\n\
@@ -189,7 +199,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         "current symlink points at the deployed generation"
     );
     let tree_path = layout::objects()
-        .join(srv.artifact.tree.as_str())
+        .join(known_artifact(srv).tree.as_str())
         .join("root");
     assert!(
         endpoint.exists(&tree_path.join("app/hello")),
@@ -256,7 +266,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
         "`deploy status` shows the deployed generation"
     );
     assert_eq!(Some(state.artifact.variant.as_str()), Some("standard"));
-    assert_eq!(Some(&state.artifact.tree), Some(&srv.artifact.tree));
+    assert_eq!(Some(&state.artifact.tree), Some(&known_artifact(srv).tree));
 
     // A second push with identical content is a no-op (no new attempt).
     let r2 = push(

@@ -68,7 +68,7 @@ use crate::model::{
     DeploymentId, GenerationRef, PlacementSlotAssignment, ReleaseId, SlotId, TargetName,
 };
 use crate::records::{
-    DeploymentIntent, DeploymentStatus, LedgerEntry, LedgerRollback, LedgerTerminal,
+    DeploymentIntent, DeploymentStatus, LedgerEntry, LedgerRollback, LedgerTerminal, Observation,
     PhysicalBinding, SlotAttemptState, SlotOutcome, SlotResult, SlotTable, TerminalDisposition,
 };
 use crate::store::local::LocalStore;
@@ -262,7 +262,7 @@ pub fn finalize_successful_attempt(
     // The base for the complete snapshot: the latest successful snapshot
     // BEFORE this attempt (this attempt's terminal is not yet appended).
     let base = crate::push::plan::latest_successful_rollback(store, attempt.target.as_str())?;
-    let rollback = build_rollback(actuals, bindings, base.as_ref(), current_slot_ids);
+    let rollback = build_rollback(actuals, bindings, base.as_ref(), current_slot_ids)?;
     let terminal = LedgerTerminal {
         recorded_at: crate::remote::helper::now_rfc3339(),
         // The Successful disposition ALWAYS carries the complete rollback
@@ -306,7 +306,7 @@ pub fn build_rollback(
     bindings: &BTreeMap<SlotId, PhysicalBinding>,
     base: Option<&LedgerRollback>,
     current_slot_ids: &[SlotId],
-) -> LedgerRollback {
+) -> Result<LedgerRollback> {
     // Start from the base (or empty): unselected slots are carried forward
     // unchanged.
     let mut slots: BTreeMap<SlotId, GenerationRef> =
@@ -317,13 +317,28 @@ pub fn build_rollback(
     // and current physical bindings.
     for (slot, s) in actuals {
         if let Some(generation) = s.generation.clone() {
+            // FAIL CLOSED on the artifact: the rollback payload must never
+            // carry an unknown assignment. A Successful attempt's actuals are
+            // `Known` in practice (the post-mutation refresh only records
+            // `Unknown` when a live assignment read fails, and the successful
+            // path validates the layout before it ever finalizes); an
+            // `Unknown`/`KnownAbsent` artifact with a recorded generation
+            // would be a corrupted payload, so the finalize REFUSES it rather
+            // than fabricating a `GenerationRef` with a fake artifact.
+            let Observation::Known(artifact) = &s.artifact else {
+                return Err(Error::integrity(format!(
+                    "successful rollback for slot '{slot}' carries an unknown assignment \
+                     (the artifact observation is not Known): the rollback payload must \
+                     never contain an unknown artifact"
+                )));
+            };
             slots.insert(
                 slot.clone(),
                 GenerationRef {
                     generation,
                     assignment: PlacementSlotAssignment {
                         placement_slot: slot.clone(),
-                        artifact: s.artifact.clone(),
+                        artifact: artifact.clone(),
                     },
                 },
             );
@@ -337,10 +352,10 @@ pub fn build_rollback(
         current_slot_ids.iter().map(|s| s.as_str()).collect();
     slots.retain(|k, _| current.contains(k.as_str()));
     out_bindings.retain(|k, _| current.contains(k.as_str()));
-    LedgerRollback {
+    Ok(LedgerRollback {
         slots,
         bindings: out_bindings,
-    }
+    })
 }
 
 /// Resolve the per-slot OUTCOMES used to finalize a pending deployment when
@@ -377,7 +392,7 @@ pub fn recovery_outcomes(
         actuals.insert(
             sid.clone(),
             SlotAttemptState {
-                artifact: slot.desired.artifact.clone(),
+                artifact: crate::records::Observation::Known(slot.desired.artifact.clone()),
                 generation: Some(slot.desired.generation.clone()),
             },
         );
@@ -480,10 +495,9 @@ mod tests {
     use crate::model::{
         ArtifactRef, DeploymentId, GenerationRef, PlacementSlotAssignment, ReleaseId, ServerId,
         SlotId, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
-        unknown_artifact,
     };
     use crate::records::{
-        DeploymentIntent, DesiredGeneration, IntentSlot, NonEmptySlotTable, SlotTable,
+        DeploymentIntent, DesiredGeneration, IntentSlot, NonEmptySlotTable, Observation, SlotTable,
         TerminalDisposition,
     };
     use proptest::prelude::*;
@@ -834,7 +848,11 @@ mod tests {
         let actuals = BTreeMap::from([(
             SlotId::new("p1".to_string()),
             SlotAttemptState {
-                artifact: unknown_artifact(),
+                artifact: Observation::Known(ArtifactRef {
+                    release: crate::model::test_release_id("rel-1"),
+                    variant: VariantName::new("standard".to_string()),
+                    tree: test_tree_digest("tree-1"),
+                }),
                 generation: Some(test_generation_id("gen-1")),
             },
         )]);
@@ -893,7 +911,11 @@ mod tests {
         let actuals = BTreeMap::from([(
             slot.clone(),
             SlotAttemptState {
-                artifact: unknown_artifact(),
+                artifact: Observation::Known(ArtifactRef {
+                    release: crate::model::test_release_id("rel-1"),
+                    variant: VariantName::new("standard".to_string()),
+                    tree: test_tree_digest("tree-1"),
+                }),
                 generation: Some(test_generation_id("gen-x")),
             },
         )]);
@@ -905,7 +927,8 @@ mod tests {
             },
         )]);
 
-        let rollback = build_rollback(&actuals, &bindings, None, std::slice::from_ref(&slot));
+        let rollback = build_rollback(&actuals, &bindings, None, std::slice::from_ref(&slot))
+            .expect("a Known actual builds the rollback");
         assert_eq!(
             rollback.bindings.get(&slot),
             Some(&PhysicalBinding {
@@ -916,6 +939,67 @@ mod tests {
         );
         assert_eq!(rollback.slots.len(), 1, "generation refs preserved intact");
         assert_eq!(rollback.bindings.len(), 1);
+    }
+
+    /// The rollback payload must NEVER carry an unknown assignment: an actual
+    /// whose artifact is `Unknown` (or `KnownAbsent`) with a recorded
+    /// generation is a corrupted payload for a Successful rollback, so
+    /// `build_rollback` FAILS CLOSED with an integrity error rather than
+    /// fabricating a `GenerationRef` with a fake artifact. An actual with
+    /// `generation: None` stays dropped regardless of its artifact (the
+    /// existing "no coherent rollback" rule).
+    #[test]
+    fn build_rollback_refuses_unknown_actuals() {
+        let slot = SlotId::new("p1".to_string());
+        let bindings: BTreeMap<SlotId, PhysicalBinding> = BTreeMap::from([(
+            slot.clone(),
+            PhysicalBinding {
+                server: ServerId::new("server-01"),
+                deploy_dir: "/srv/deploy/p1".to_string(),
+            },
+        )]);
+        // An UNKNOWN actual with a generation: refused.
+        let actuals = BTreeMap::from([(
+            slot.clone(),
+            SlotAttemptState {
+                artifact: Observation::Unknown(crate::records::ObservationError {
+                    message: "assignment read failed: fixture".to_string(),
+                }),
+                generation: Some(test_generation_id("gen-x")),
+            },
+        )]);
+        let err = build_rollback(&actuals, &bindings, None, std::slice::from_ref(&slot))
+            .expect_err("an Unknown actual must not build a rollback");
+        assert!(
+            err.to_string().contains("unknown assignment"),
+            "the refusal names the unknown assignment, got: {err}"
+        );
+        // A KnownAbsent actual with a generation is equally a corrupted
+        // payload: refused (an advanced slot always has a Known artifact).
+        let actuals = BTreeMap::from([(
+            slot.clone(),
+            SlotAttemptState {
+                artifact: Observation::KnownAbsent,
+                generation: Some(test_generation_id("gen-x")),
+            },
+        )]);
+        build_rollback(&actuals, &bindings, None, std::slice::from_ref(&slot))
+            .expect_err("a KnownAbsent actual with a generation must not build a rollback");
+        // An Unknown actual WITHOUT a generation is dropped (no rollback
+        // entry), never an error: the "no recorded generation" rule applies
+        // regardless of the artifact observation.
+        let actuals = BTreeMap::from([(
+            slot.clone(),
+            SlotAttemptState {
+                artifact: Observation::Unknown(crate::records::ObservationError {
+                    message: "assignment read failed: fixture".to_string(),
+                }),
+                generation: None,
+            },
+        )]);
+        let rollback = build_rollback(&actuals, &bindings, None, std::slice::from_ref(&slot))
+            .expect("an Unknown actual without a generation is simply dropped");
+        assert_eq!(rollback.slots.len(), 0, "no fake GenerationRef is inserted");
     }
 
     /// A legacy ledger line whose rollback has no `bindings` key must still

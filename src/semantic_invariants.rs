@@ -2187,10 +2187,11 @@ fn identity_artifact_component_change_prevents_noop() {
     // never proceed, and certainly never no-op.
     let f = Fixture::new();
     let r1 = f.push("t1").expect("push v1");
-    let first_tree = r1.attempt.as_ref().expect("attempt").slots[&SlotId::new("p1")]
-        .artifact
-        .tree
-        .clone();
+    let first_tree = match &r1.attempt.as_ref().expect("attempt").slots[&SlotId::new("p1")].artifact
+    {
+        crate::records::Observation::Known(a) => a.tree.clone(),
+        other => panic!("a successful push's actual artifact is Known, got {other:?}"),
+    };
     f.apply(Action::Build(2));
     f.push("t1").expect("push v2 (current is now T2)");
     f.tamper_stored_tree(&first_tree);

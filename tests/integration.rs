@@ -40,6 +40,18 @@ fn rollback_of(e: &LedgerEntry) -> &LedgerRollback {
     }
 }
 
+/// The KNOWN artifact of a report actual ([`deploy::records::SlotAttemptState`]):
+/// a successful push's actuals are always `Known` — an `Unknown` actual only
+/// arises for an unreadable live assignment, which fails the status read
+/// before any successful finalize. Test code asserting on a real actual
+/// artifact unwraps the observation here.
+fn known_artifact(s: &deploy::records::SlotAttemptState) -> &deploy::model::ArtifactRef {
+    match &s.artifact {
+        deploy::records::Observation::Known(a) => a,
+        other => panic!("expected a Known actual artifact, got {other:?}"),
+    }
+}
+
 /// Shared per-variant policy body. Its mappings use only `{{ variant }}` — the
 /// only variable the template module exposes at materialization (trees are
 /// content-addressed and shared across slots) — so the same file content
@@ -234,12 +246,10 @@ fn end_to_end_push_rollback() -> Result<()> {
         "first push should succeed"
     );
     let attempt0 = r0.attempt.expect("attempt recorded");
-    let std_v1: TreeDigest = attempt0.slots[&SlotId::parse("p1").unwrap()]
-        .artifact
+    let std_v1: TreeDigest = known_artifact(&attempt0.slots[&SlotId::parse("p1").unwrap()])
         .tree
         .clone();
-    let hc_v1: TreeDigest = attempt0.slots[&SlotId::parse("p3").unwrap()]
-        .artifact
+    let hc_v1: TreeDigest = known_artifact(&attempt0.slots[&SlotId::parse("p3").unwrap()])
         .tree
         .clone();
 
@@ -285,8 +295,7 @@ fn end_to_end_push_rollback() -> Result<()> {
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
     let attempt1 = r1.attempt.expect("attempt recorded");
-    let std_v2: TreeDigest = attempt1.slots[&SlotId::parse("p1").unwrap()]
-        .artifact
+    let std_v2: TreeDigest = known_artifact(&attempt1.slots[&SlotId::parse("p1").unwrap()])
         .tree
         .clone();
 
@@ -857,8 +866,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let attempt0 = r0.attempt.expect("attempt recorded");
     let old_server = &attempt0.slots[&SlotId::parse("p1").unwrap()];
 
-    let old_tree = old_server.artifact.tree.clone();
-    let old_release = old_server.artifact.release.clone();
+    let old_tree = known_artifact(old_server).tree.clone();
+    let old_release = known_artifact(old_server).release.clone();
 
     // Rename the variant: the configuration now declares `new`, and the
     // `old.toml` variant file is removed entirely. The slot moves with the
@@ -894,10 +903,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-    let new_tree = r1.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()]
-        .artifact
-        .tree
-        .clone();
+    let new_tree =
+        known_artifact(&r1.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()])
+            .tree
+            .clone();
     assert_ne!(
         old_tree, new_tree,
         "renamed variant materializes a new tree"
@@ -1938,17 +1947,17 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
     // The historical release's remote `behavior.json` must NOT be overwritten by
     // the current (B) config. Read the release that s0 published and confirm it
     // still describes behavior A (verification argv "true").
-    let hist_release = r0
-        .attempt
-        .as_ref()
-        .unwrap()
-        .slots
-        .get(&SlotId::parse("p1").unwrap())
-        .unwrap()
-        .artifact
-        .release
-        .as_str()
-        .to_string();
+    let hist_release = known_artifact(
+        r0.attempt
+            .as_ref()
+            .unwrap()
+            .slots
+            .get(&SlotId::parse("p1").unwrap())
+            .unwrap(),
+    )
+    .release
+    .as_str()
+    .to_string();
     let behavior_path = Path::new("releases")
         .join(&hist_release)
         .join("behavior.json");
@@ -2006,17 +2015,17 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
 
     // The historical release published by s0.
-    let hist_release = r0
-        .attempt
-        .as_ref()
-        .unwrap()
-        .slots
-        .get(&SlotId::parse("p1").unwrap())
-        .unwrap()
-        .artifact
-        .release
-        .as_str()
-        .to_string();
+    let hist_release = known_artifact(
+        r0.attempt
+            .as_ref()
+            .unwrap()
+            .slots
+            .get(&SlotId::parse("p1").unwrap())
+            .unwrap(),
+    )
+    .release
+    .as_str()
+    .to_string();
 
     // Remove the historical release's immutable behavior.json, then attempt a
     // rollback to s0 with a DIFFERENT current configuration (behavior B). The
@@ -2129,17 +2138,17 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
-    let hist_release = r0
-        .attempt
-        .as_ref()
-        .unwrap()
-        .slots
-        .get(&SlotId::parse("p1").unwrap())
-        .unwrap()
-        .artifact
-        .release
-        .as_str()
-        .to_string();
+    let hist_release = known_artifact(
+        r0.attempt
+            .as_ref()
+            .unwrap()
+            .slots
+            .get(&SlotId::parse("p1").unwrap())
+            .unwrap(),
+    )
+    .release
+    .as_str()
+    .to_string();
 
     // Corrupt the historical release's immutable behavior.json so it still
     // PARSEs but its canonical contract set no longer digests to the release
@@ -3510,7 +3519,7 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
     let first = r0.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()].clone();
 
-    assert_eq!(first.artifact.variant.as_str(), "standard");
+    assert_eq!(known_artifact(&first).variant.as_str(), "standard");
 
     // Capacity-only change: identical inputs except the server's `capacity`.
     let body = std::fs::read_to_string(&config_path)?;
@@ -3551,10 +3560,10 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
     );
 
     // The SAME tree bytes at the same release: capacity never entered identity.
-    let after = store.read_release(&first.artifact.release)?;
+    let after = store.read_release(&known_artifact(&first).release)?;
     assert_eq!(
         after.release_sha256,
-        first.artifact.release.digest().as_str(),
+        known_artifact(&first).release.digest().as_str(),
         "stored release still matches the s0 identity"
     );
 
@@ -3586,7 +3595,8 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
     let third = r2.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()].clone();
 
     assert_ne!(
-        third.artifact.release, first.artifact.release,
+        known_artifact(&third).release,
+        known_artifact(&first).release,
         "a content change must produce a new release identity"
     );
 
@@ -3703,8 +3713,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
     let first = r0.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()].clone();
 
-    let old_release = first.artifact.release.clone();
-    let tree = first.artifact.tree.clone();
+    let old_release = known_artifact(&first).release.clone();
+    let tree = known_artifact(&first).tree.clone();
 
     // Slot-only change: rebind p1 to server-02. No content, mapping, behavior,
     // or capacity change anywhere else.
@@ -3726,11 +3736,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let second = r1.attempt.expect("attempt").slots[&SlotId::parse("p1").unwrap()].clone();
 
     assert_ne!(
-        second.artifact.release, old_release,
+        known_artifact(&second).release,
+        old_release,
         "a slot-only change must produce a new release identity"
     );
     assert_eq!(
-        second.artifact.tree, tree,
+        known_artifact(&second).tree,
+        tree,
         "the tree bytes are unchanged by a slot-only change"
     );
     assert_eq!(
@@ -3741,7 +3753,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     // Each release persists ITS OWN canonical slot snapshot.
     let rec_old = store.read_release(&old_release)?;
-    let rec_new = store.read_release(&second.artifact.release)?;
+    let rec_new = store.read_release(&known_artifact(&second).release)?;
     assert_eq!(rec_old.slots["standard"].slots[0].server, "server-01");
     assert_eq!(rec_new.slots["standard"].slots[0].server, "server-02");
 
@@ -3818,8 +3830,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         .to_string();
     let first = r0.attempt.expect("attempt").slots[&SlotId::parse("p1").unwrap()].clone();
 
-    let old_release = first.artifact.release.clone();
-    let old_tree = first.artifact.tree.clone();
+    let old_release = known_artifact(&first).release.clone();
+    let old_tree = known_artifact(&first).tree.clone();
 
     // v2: the slot declaration MOVES to a new `canary` variant file; `standard`
     // still exists (with the same mappings) but no longer declares any slot.
@@ -3851,8 +3863,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     assert_eq!(r1.status, Some(DeploymentStatus::Successful));
     let current = r1.attempt.expect("attempt").slots[&SlotId::parse("p1").unwrap()].clone();
 
-    assert_eq!(current.artifact.variant.as_str(), "canary");
-    assert_ne!(current.artifact.release, old_release);
+    assert_eq!(known_artifact(&current).variant.as_str(), "canary");
+    assert_ne!(known_artifact(&current).release, old_release);
 
     // Historical push of the OLD release: the plan must resolve p1's variant
     // from the OLD release's stored slot snapshot (`standard`) and its old
@@ -3872,13 +3884,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     assert_eq!(rh.status, Some(DeploymentStatus::Successful));
     let hist = rh.attempt.expect("attempt").slots[&SlotId::parse("p1").unwrap()].clone();
 
-    assert_eq!(hist.artifact.release, old_release);
+    assert_eq!(known_artifact(&hist).release, old_release);
     assert_eq!(
-        hist.artifact.variant.as_str(),
+        known_artifact(&hist).variant.as_str(),
         "standard",
         "historical resolution must use the stored slot snapshot, not the current variant file"
     );
-    assert_eq!(hist.artifact.tree, old_tree);
+    assert_eq!(known_artifact(&hist).tree, old_tree);
 
     Ok(())
 }
@@ -3951,10 +3963,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         },
     )?;
     assert_eq!(r0.status, Some(DeploymentStatus::Successful));
-    let t0 = r0.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()]
-        .artifact
-        .tree
-        .clone();
+    let t0 =
+        known_artifact(&r0.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()])
+            .tree
+            .clone();
 
     // s1: new content -> T1; the s0 tree is rotated out of the remote.
     write_file(
@@ -4262,10 +4274,10 @@ fn server_policy_change_does_not_change_release_identity() -> Result<()> {
         1,
         "no new release may be created by a server-policy change"
     );
-    let after = store.read_release(&first.artifact.release)?;
+    let after = store.read_release(&known_artifact(&first).release)?;
     assert_eq!(
         after.release_sha256,
-        first.artifact.release.digest().as_str(),
+        known_artifact(&first).release.digest().as_str(),
         "stored release identity unchanged by server policy"
     );
     Ok(())
@@ -4345,12 +4357,12 @@ interval_seconds = 0
     let slot = &r.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()];
 
     // Both variants bind to the SAME tree digest in the release record.
-    let rec = store.read_release(&slot.artifact.release)?;
+    let rec = store.read_release(&known_artifact(slot).release)?;
     assert_eq!(
         rec.variants["standard"], rec.variants["mirror"],
         "identical bytes must yield the identical tree digest for both variants"
     );
-    assert_eq!(rec.variants["standard"], slot.artifact.tree.as_str());
+    assert_eq!(rec.variants["standard"], known_artifact(slot).tree.as_str());
 
     // Exactly ONE tree object in the local store and on the remote.
     let local_objs: Vec<_> = std::fs::read_dir(store_base.join("objects/sha256"))?
@@ -4475,7 +4487,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     assert_eq!(rp.status, Some(DeploymentStatus::Successful));
     let prod_slot = &rp.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()];
 
-    let prod_v1 = prod_slot.artifact.tree.clone();
+    let prod_v1 = known_artifact(prod_slot).tree.clone();
     let prod_gen = prod_slot
         .generation
         .clone()
@@ -4517,7 +4529,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     assert_eq!(rs.status, Some(DeploymentStatus::Successful));
     let staging_slot = &rs.attempt.expect("attempt recorded").slots[&SlotId::parse("p2").unwrap()];
 
-    let staging_v2 = staging_slot.artifact.tree.clone();
+    let staging_v2 = known_artifact(staging_slot).tree.clone();
     let staging_gen = staging_slot
         .generation
         .clone()
@@ -4718,9 +4730,9 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
         let attempt = r.attempt.expect("attempt recorded");
         let slot = &attempt.slots[&SlotId::parse("p1").unwrap()];
 
-        trees.push(slot.artifact.tree.clone());
+        trees.push(known_artifact(slot).tree.clone());
         deploys.push(attempt.deployment_id.clone());
-        releases.push(slot.artifact.release.clone());
+        releases.push(known_artifact(slot).release.clone());
     }
     let tree_at = |idx: usize| trees[idx].clone();
     let observed_tree = |store: &LocalStore| -> Result<Option<TreeDigest>> {

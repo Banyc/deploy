@@ -473,8 +473,8 @@ mod tests {
     };
     use crate::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
-        NonEmptySlotTable, Observation, ObservedSlot, ObservedState, Pins, SlotOutcomeKind,
-        SlotResult, SlotTable, TerminalDisposition,
+        NonEmptySlotTable, Observation, ObservationError, ObservedSlot, ObservedState, Pins,
+        PreviousGeneration, SlotOutcomeKind, SlotResult, SlotTable, TerminalDisposition,
     };
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -593,6 +593,68 @@ interval_seconds = 0
         )]);
         DeploymentIntent {
             deployment_id: test_deployment_id(id),
+            target: TargetName::new(TARGET.to_string()),
+            group: None,
+            behavior_sha256: "sha256-aa".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            slots: NonEmptySlotTable::build(slots)
+                .expect("a fixture intent always has at least one slot"),
+        }
+    }
+
+    /// An ARBITRARY but VALID artifact: canonical `rel-sha256-<64hex>`
+    /// release and `<64hex>` tree digest (the strict parsers accept exactly
+    /// the generated forms), fixed variant. Used as the `Known` payload of a
+    /// generated pre-push assignment observation.
+    fn arbitrary_artifact() -> impl Strategy<Value = ArtifactRef> {
+        ("[a-f0-9]{64}", "[a-f0-9]{64}").prop_map(|(rel, tree)| ArtifactRef {
+            release: ReleaseId::parse(&format!("rel-sha256-{rel}"))
+                .expect("generated hex is a canonical release id"),
+            variant: VariantName::new("standard".to_string()),
+            tree: TreeDigest::parse(&tree).expect("generated hex is a valid tree digest"),
+        })
+    }
+
+    /// The GENERATED ASSIGNMENT-READ space: `Unknown(error)` with an
+    /// arbitrary message (the read FAILED — the user's requirement), plus
+    /// `KnownAbsent` (never deployed) and `Known(arbitrary artifact)` (a
+    /// successful read — the positive control). This is exactly the value
+    /// space the engine's pre-push/refresh fallback produces.
+    fn arbitrary_assignment_observation() -> impl Strategy<Value = Observation<ArtifactRef>> {
+        prop_oneof![
+            prop::collection::vec(any::<char>(), 0..64)
+                .prop_map(|v| v.into_iter().collect::<String>())
+                .prop_map(|message| Observation::Unknown(ObservationError { message })),
+            Just(Observation::KnownAbsent),
+            arbitrary_artifact().prop_map(Observation::Known),
+        ]
+    }
+
+    /// An EXACT intent whose pre-push assignment carries the GENERATED
+    /// artifact observation: one slot, a FIXED known desired artifact, and
+    /// the generated pre-push `Some(SlotAttemptState)`. The desired artifact
+    /// is the reachability baseline every case shares.
+    fn intent_with_pre_push(artifact: Observation<ArtifactRef>) -> DeploymentIntent {
+        let p1 = SlotId::new(SLOT.to_string());
+        let slots = BTreeMap::from([(
+            p1.clone(),
+            IntentSlot {
+                desired: DesiredGeneration {
+                    generation: test_generation_id("gen-1"),
+                    artifact: ArtifactRef {
+                        release: crate::model::test_release_id("desired-rel"),
+                        variant: VariantName::new("standard".to_string()),
+                        tree: test_tree_digest("tree-desired"),
+                    },
+                },
+                pre_push: Some(PreviousGeneration {
+                    artifact,
+                    generation: Some(test_generation_id("gen-pre")),
+                }),
+            },
+        )]);
+        DeploymentIntent {
+            deployment_id: test_deployment_id("deploy-prop-unknown"),
             target: TargetName::new(TARGET.to_string()),
             group: None,
             behavior_sha256: "sha256-aa".to_string(),
@@ -1077,6 +1139,140 @@ interval_seconds = 0
                 run_anchor_case(class, retained, garbage);
             }
         }
+    }
+
+    // ---- THE USER'S PROPERTY: an assignment-read failure is a distinct
+    // value, never an artifact, and never a reachability anchor -------------
+
+    /// Run ONE generated pre-push assignment observation through the REAL
+    /// collection logic: the intent is appended to a REAL store and the REAL
+    /// [`LocalStore::reachable_set`] scan reads it back through the wire
+    /// (append_intent → read_ledger → into_domain) and collects the
+    /// reachability entries. This is the production code path the sweep and
+    /// the checkpoint preview share — not a copy of its logic.
+    fn run_assignment_observation_case(artifact: Observation<ArtifactRef>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_with_pin(tmp.path(), None);
+        let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
+        let intent = intent_with_pre_push(artifact.clone());
+        store.append_intent(TARGET, &intent).unwrap();
+
+        // ---- 1. NEVER an ArtifactRef from a failure, and the wire round
+        // trip preserves the observation EXACTLY (an `Unknown` pre-push
+        // assignment can never be re-read as a fabricated/known ArtifactRef).
+        let entries = store.read_ledger(TARGET).unwrap();
+        let read_back = &entries[0].intent.slots[&SlotId::new(SLOT.to_string())]
+            .pre_push
+            .as_ref()
+            .expect("the pre_push entry round-trips")
+            .artifact;
+        assert_eq!(
+            read_back, &artifact,
+            "the pre-push assignment observation must round-trip the wire EXACTLY — \
+             an Unknown assignment never becomes a fabricated/known ArtifactRef"
+        );
+
+        // ---- 2. The reachability effect, through the REAL collection logic:
+        // `Unknown` FAILS the sweep CLOSED (reachability is incomplete — the
+        // GC cannot verify what the slot ran before the attempt, so the scan
+        // aborts BEFORE any deletion and no release/tree entry can ever be
+        // derived from it); `KnownAbsent` contributes NOTHING beyond the
+        // desired artifact; a `Known` artifact DOES contribute its release +
+        // tree (the positive control).
+        match &artifact {
+            Observation::Unknown(_) => {
+                let err = store.reachable_set(&config, None).unwrap_err();
+                assert!(
+                    err.to_string().contains("UNKNOWN pre-push assignment"),
+                    "an Unknown pre-push assignment must fail the sweep closed \
+                     with the UNKNOWN-pre-push integrity error, got: {err}"
+                );
+            }
+            Observation::KnownAbsent => {
+                let retained = store.reachable_set(&config, None).unwrap();
+                assert_eq!(
+                    retained.releases.len(),
+                    1,
+                    "KnownAbsent contributes nothing: only the desired release is retained, got {retained:?}"
+                );
+                assert_eq!(
+                    retained.trees.len(),
+                    1,
+                    "KnownAbsent contributes nothing: only the desired tree is retained, got {retained:?}"
+                );
+                assert!(
+                    retained
+                        .releases
+                        .contains(crate::model::test_release_id("desired-rel").as_str())
+                );
+                assert!(
+                    retained
+                        .trees
+                        .contains(test_tree_digest("tree-desired").as_str())
+                );
+            }
+            Observation::Known(a) => {
+                let retained = store.reachable_set(&config, None).unwrap();
+                assert!(
+                    retained.releases.contains(a.release.as_str()),
+                    "a Known pre-push artifact retains its release, got {retained:?}"
+                );
+                assert!(
+                    retained.trees.contains(a.tree.as_str()),
+                    "a Known pre-push artifact retains its tree, got {retained:?}"
+                );
+            }
+        }
+
+        // ---- 3. NO domain value simultaneously means "unknown" and "known
+        // artifact": the only carrier of an `ArtifactRef` is the `Known`
+        // variant — `Unknown` holds ONLY an `ObservationError` (matched
+        // structurally above: no artifact is ever bound from it) and
+        // `KnownAbsent` holds nothing, so neither can ever be mistaken for a
+        // known artifact. The `unknown_artifact()` SENTINEL API is REMOVED
+        // from [`crate::model`] (any residual reference would not compile):
+        // an `ArtifactRef` in the system always means a known artifact.
+        match &artifact {
+            Observation::Known(a) => {
+                assert!(a.release.as_str().starts_with("rel-sha256-"));
+                assert!(a.tree.as_str().len() == 64);
+            }
+            Observation::Unknown(_) | Observation::KnownAbsent => {}
+        }
+    }
+
+    proptest! {
+        // THE USER'S PROPERTY: GENERATED assignment-read outcomes (Unknown
+        // with arbitrary messages, KnownAbsent, Known arbitrary artifacts)
+        // must NEVER produce an ArtifactRef or a release/tree reachability
+        // entry from a FAILURE, and no domain value can simultaneously mean
+        // "unknown" and "known artifact". Runs through the REAL store + the
+        // REAL reachable_set scan (the production collection logic). Bounded
+        // 16 cases, fixed seed 0x5EED_5EED (house style), no persistence.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn assignment_read_failures_never_produce_an_artifact_or_reachability_entry(
+            artifact in arbitrary_assignment_observation(),
+        ) {
+            run_assignment_observation_case(artifact);
+        }
+    }
+
+    /// The DETERMINISTIC companion: an `Unknown` pre-push assignment with a
+    /// realistic message fails the sweep closed (the generated property's
+    /// `Unknown` arm, pinned with a fixed message so the failure text is
+    /// asserted exactly).
+    #[test]
+    fn unknown_pre_push_assignment_fails_the_sweep_closed() {
+        run_assignment_observation_case(Observation::Unknown(ObservationError {
+            message: "assignment read failed: fixture corruption".to_string(),
+        }));
     }
 
     // ---- the deterministic unit tests, one per anchor class ----------------

@@ -600,10 +600,19 @@ fn print_report(report: &PushReport) {
     }
     if let Some(attempt) = &report.attempt {
         for (slot_id, s) in &attempt.slots {
-            println!(
-                "  {slot_id}  variant={} tree={} generation={:?}",
-                s.artifact.variant, s.artifact.tree, s.generation
-            );
+            // The actual artifact is an observation: render a `Known`
+            // artifact, and a non-`Known` actual explicitly rather than
+            // printing a fabricated variant/tree.
+            let artifact = match &s.artifact {
+                crate::records::Observation::Known(a) => {
+                    format!("variant={} tree={}", a.variant, a.tree)
+                }
+                crate::records::Observation::KnownAbsent => "artifact=known_absent".to_string(),
+                crate::records::Observation::Unknown(e) => {
+                    format!("artifact=unknown ({})", e.message)
+                }
+            };
+            println!("  {slot_id}  {artifact} generation={:?}", s.generation);
         }
     }
 }

@@ -442,10 +442,16 @@ pub enum SlotOutcomeKind {
 /// under `stop_on_failure`), or when only the pre-push state is unknown.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotAttemptState {
-    pub artifact: ArtifactRef,
+    /// The slot's assignment as a THREE-STATE observation
+    /// ([`Observation<ArtifactRef>`]): `Known(artifact)` is a real artifact
+    /// read from the remote, `KnownAbsent` carries no artifact, and
+    /// `Unknown(error)` preserves the read failure. An unknown assignment is
+    /// a DISTINCT value — never a valid-looking [`ArtifactRef`] (there is no
+    /// sentinel artifact: an `ArtifactRef` always means a known artifact).
+    pub artifact: Observation<ArtifactRef>,
     /// The generation this slot actually advanced to. `None` when the slot's
     /// server was never started (e.g. skipped after an earlier failure under
-    /// `stop_on_failure`).
+    /// `stop_on_failure`), or when only the pre-push state is unknown.
     pub generation: Option<GenerationId>,
 }
 
@@ -485,7 +491,11 @@ pub struct LedgerIntentWire {
     /// its own map key.
     pub desired: BTreeMap<SlotId, GenerationRef>,
     /// Pre-push per-slot state before mutation (`None` if first deployment).
-    /// The key set must equal `slot_ids` EXACTLY.
+    /// Each entry's assignment artifact is a THREE-STATE observation
+    /// ([`Observation<ArtifactRef>`]: `Known` / `KnownAbsent` / `Unknown`)
+    /// — an unreadable pre-push assignment is `Unknown(error)`, a distinct
+    /// value that can never be mistaken for a known artifact. The key set
+    /// must equal `slot_ids` EXACTLY.
     pub pre_push: BTreeMap<SlotId, Option<SlotAttemptState>>,
     /// Actual per-slot result after the attempt. The persisted ledger intent
     /// keeps this map EMPTY (outcomes are recorded in the terminal event's
@@ -670,13 +680,15 @@ pub struct DesiredGeneration {
 }
 
 /// One slot's PRE-PUSH state before the attempt: what the slot ran
-/// (`artifact`) and the generation it was on (`None` when only the pre-push
-/// state is unknown / the slot was never deployed). The DOMAIN form of the
-/// wire's [`SlotAttemptState`] under the table's name; the enclosing table
-/// key owns the slot.
+/// (`artifact`, a three-state observation) and the generation it was on
+/// (`None` when only the pre-push state is unknown / the slot was never
+/// deployed). The DOMAIN form of the wire's [`SlotAttemptState`] under the
+/// table's name; the enclosing table key owns the slot. The artifact is an
+/// [`Observation`]: an unreadable pre-push assignment is `Unknown(error)` —
+/// a distinct value, never a valid-looking artifact.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreviousGeneration {
-    pub artifact: ArtifactRef,
+    pub artifact: Observation<ArtifactRef>,
     pub generation: Option<GenerationId>,
 }
 
@@ -822,6 +834,10 @@ pub struct LedgerIntentReport {
     /// Desired per-slot assignments, re-expanded from the domain table (the
     /// report is display-facing and keeps the wire's split shape).
     pub desired: BTreeMap<SlotId, GenerationRef>,
+    /// Pre-push per-slot state before mutation, re-expanded from the domain
+    /// table (same observation-shaped [`SlotAttemptState`] as the wire — an
+    /// unknown assignment is `Observation::Unknown`, never a sentinel
+    /// artifact).
     pub pre_push: BTreeMap<SlotId, Option<SlotAttemptState>>,
     /// Actual per-slot result after the attempt, for display. The report is
     /// in-memory only — the persisted intent never carries this map.
@@ -2537,7 +2553,7 @@ mod tests {
     use super::*;
     use crate::model::{
         PlacementSlotAssignment, SlotSet, VariantName, test_deployment_id, test_generation_id,
-        test_release_id, test_tree_digest, unknown_artifact,
+        test_release_id, test_tree_digest,
     };
     use crate::store::local::LocalStore;
     use proptest::prelude::*;
@@ -3534,7 +3550,9 @@ mod tests {
         bad.slots.insert(
             slot(9),
             SlotAttemptState {
-                artifact: unknown_artifact(),
+                artifact: Observation::Unknown(ObservationError {
+                    message: "fixture: unknown assignment".to_string(),
+                }),
                 generation: None,
             },
         );
@@ -3574,7 +3592,9 @@ mod tests {
         report.slots.insert(
             slot(1),
             SlotAttemptState {
-                artifact: unknown_artifact(),
+                artifact: Observation::Unknown(ObservationError {
+                    message: "fixture: unknown assignment".to_string(),
+                }),
                 generation: None,
             },
         );
@@ -5157,7 +5177,9 @@ mod tests {
             intent_wire.pre_push.insert(
                 k,
                 Some(SlotAttemptState {
-                    artifact: crate::model::unknown_artifact(),
+                    artifact: Observation::Unknown(ObservationError {
+                        message: "fixture: unknown assignment".to_string(),
+                    }),
                     generation: g,
                 }),
             );

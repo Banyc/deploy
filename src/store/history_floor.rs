@@ -277,8 +277,11 @@ impl LocalStore {
     /// * EVERY target's CURRENT ledger (after a checkpoint the retained
     ///   suffix IS the ledger, so this is "or its retained suffix"): each
     ///   entry's deployment id (its `deployments/<id>/` dir), the artifacts
-    ///   referenced by its intent (`desired` + `pre_push`), and its terminal
-    ///   rollback's release + per-slot trees,
+    ///   referenced by its intent (`desired` + `pre_push` — the pre-push
+    ///   assignment is an [`Observation`], and an `Unknown` pre-push
+    ///   assignment fails the sweep closed, exactly like an `Unknown`
+    ///   observed slot), and its terminal rollback's release + per-slot
+    ///   trees,
     /// * the CURRENT/INCOMPLETE state: every target's `observed.json`
     ///   artifacts (release + tree) and `last_deployment` ids, plus
     ///   in-flight pending entries (intent without a terminal — their
@@ -355,15 +358,42 @@ impl LocalStore {
                 out.deployments
                     .insert(entry.deployment_id.as_str().to_string());
                 // Intent-referenced artifacts (desired + pre-push): the ONE
-                // authoritative slot table carries both.
+                // authoritative slot table carries both. The DESIRED artifact
+                // is always `Known` (a planned artifact); the PRE-PUSH
+                // assignment is an [`Observation`] — a `Known` artifact
+                // contributes its release + tree, `KnownAbsent` contributes
+                // nothing, and an `Unknown` assignment FAILS CLOSED below
+                // (the sweep cannot verify what the slot ran before the
+                // attempt, so reachability would be incomplete).
                 for s in entry.intent.slots.values() {
                     out.releases
                         .insert(s.desired.artifact.release.as_str().to_string());
                     out.trees
                         .insert(s.desired.artifact.tree.as_str().to_string());
                     if let Some(p) = &s.pre_push {
-                        out.releases.insert(p.artifact.release.as_str().to_string());
-                        out.trees.insert(p.artifact.tree.as_str().to_string());
+                        match &p.artifact {
+                            Observation::Known(artifact) => {
+                                out.releases.insert(artifact.release.as_str().to_string());
+                                out.trees.insert(artifact.tree.as_str().to_string());
+                            }
+                            // FAIL CLOSED: an UNKNOWN pre-push assignment means
+                            // the slot's live assignment before the attempt
+                            // could not be read — the GC cannot verify what
+                            // the slot was running, so it must NOT delete
+                            // anything it cannot verify. The sweep aborts (an
+                            // integrity error) BEFORE any deletion; the
+                            // Unknown contributes nothing to the retained set
+                            // (mirrors the observed-slot Unknown rule below).
+                            Observation::Unknown(_) => {
+                                return Err(Error::integrity(
+                                    "an intent records an UNKNOWN pre-push assignment (the \
+                                     slot's live assignment could not be read): the GC cannot \
+                                     verify what the slot was running before the attempt, so \
+                                     the sweep aborts before any deletion",
+                                ));
+                            }
+                            Observation::KnownAbsent => {}
+                        }
                     }
                 }
                 // The terminal's rollback payload: every slot's OWN artifact
