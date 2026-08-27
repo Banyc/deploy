@@ -168,7 +168,7 @@ pub fn push(
     // refs) and surfaces before any remote mutation. Planning, execution,
     // reporting, and persistence consume this selection plus the per-branch
     // resolution instead of independently filtering slots.
-    let selection = crate::deploy::groups::SlotSelection::normalize(
+    let selection = crate::deploy::selection::SlotSelection::normalize(
         config,
         target_name,
         opts.group.as_deref(),
@@ -322,7 +322,7 @@ pub(crate) fn push_with_id(
         .target(target_name)
         .ok_or_else(|| Error::not_found(format!("target '{target_name}'")))?;
     let project_root = config.project_root(config_path);
-    let selection = crate::deploy::groups::SlotSelection::normalize(
+    let selection = crate::deploy::selection::SlotSelection::normalize(
         config,
         target_name,
         opts.group.as_deref(),
@@ -372,7 +372,7 @@ pub(crate) fn push_ref_with_id(
         Some(t) => ledger::parse_ref_expr(t)?,
         None => RefExpr::Head,
     };
-    let selection = crate::deploy::groups::SlotSelection::normalize(
+    let selection = crate::deploy::selection::SlotSelection::normalize(
         config,
         target_name,
         opts.group.as_deref(),
@@ -458,7 +458,7 @@ fn push_inner(
     store: &LocalStore,
     factory: &RemoteFactory,
     target_name: &str,
-    selection: &crate::deploy::groups::SlotSelection,
+    selection: &crate::deploy::selection::SlotSelection,
     ref_expr: &RefExpr,
     // The PRE-RESOLVED ref: `Some` for a dry run (resolved by [`push`]
     // BEFORE any lock or remote factory invocation, against the pre-reconcile
@@ -755,7 +755,7 @@ fn push_inner(
     // topology onto the CURRENT physical slots) carries its
     // [`crate::ledger::VerifiedReleaseRebinding`] proof INSIDE the source;
     // HEAD and deployment refs carry none. The planner ALSO produces the
-    // PROOF-BEARING resolution ([`crate::deploy::plan::ResolvedSelection`]:
+    // PROOF-BEARING resolution ([`crate::deploy::selection::ResolvedSelection`]:
     // target + declared temporal source + the non-empty resolved slot set),
     // which the engine consumes BY ACCESSOR below (`planned.resolved()`) —
     // never by construction.
@@ -792,7 +792,7 @@ fn push_inner(
     // caller's current config alone, so a historical release's frozen group
     // selected the WRONG slots here).
     //
-    // The plan's PROOF-BEARING resolution ([`crate::deploy::plan::ResolvedSelection`])
+    // The plan's PROOF-BEARING resolution ([`crate::deploy::selection::ResolvedSelection`])
     // is consumed by accessor: the planner built it (target + declared
     // temporal source + the non-empty resolved slot set), the engine never
     // constructs one.
@@ -820,7 +820,7 @@ fn push_inner(
     // current unselected slot must have a prior assignment with a matching
     // physical binding. A full-target push (no group) is always allowed. The
     // selected set is the plan's per-branch resolution — consumed from the
-    // planner's PROOF-BEARING [`crate::deploy::plan::ResolvedSelection`] by
+    // planner's PROOF-BEARING [`crate::deploy::selection::ResolvedSelection`] by
     // accessor (`planned.resolved().slots()`), the exact non-empty slot set
     // the planner resolved against the reference's declared temporal source.
     let planned_slot_ids: Vec<SlotId> = resolved.slots().iter().cloned().collect();
@@ -1563,7 +1563,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.store,
             &factory,
             "t1",
-            &crate::deploy::groups::SlotSelection::normalize(config, "t1", group).unwrap(),
+            &crate::deploy::selection::SlotSelection::normalize(config, "t1", group).unwrap(),
             ref_expr,
             None,
             deployment_id,
@@ -2468,7 +2468,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.store,
             &factory,
             "t1",
-            &crate::deploy::groups::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
+            &crate::deploy::selection::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
             &RefExpr::Head,
             None,
             deployment_id,
@@ -3049,7 +3049,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.store,
             &fault_factory,
             "t1",
-            &crate::deploy::groups::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
+            &crate::deploy::selection::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
             &RefExpr::Head,
             None,
             &id,
@@ -3347,7 +3347,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.store,
             &factory,
             "t1",
-            &crate::deploy::groups::SlotSelection::normalize(&config2, "t1", None).unwrap(),
+            &crate::deploy::selection::SlotSelection::normalize(&config2, "t1", None).unwrap(),
             &RefExpr::Head,
             None,
             &id2,
@@ -3627,7 +3627,7 @@ interval_seconds = 0
             &store,
             &factory,
             "t1",
-            &crate::deploy::groups::SlotSelection::normalize(&config, "t1", None).unwrap(),
+            &crate::deploy::selection::SlotSelection::normalize(&config, "t1", None).unwrap(),
             &RefExpr::Head,
             None,
             &id,
@@ -3873,7 +3873,7 @@ interval_seconds = 0
             &store,
             &factory,
             "t1",
-            &crate::deploy::groups::SlotSelection::normalize(&config, "t1", None).unwrap(),
+            &crate::deploy::selection::SlotSelection::normalize(&config, "t1", None).unwrap(),
             &RefExpr::Head,
             None,
             &id,
@@ -4369,7 +4369,8 @@ interval_seconds = 0
                 &self.store,
                 &factory,
                 "t1",
-                &crate::deploy::groups::SlotSelection::normalize(&self.config, "t1", None).unwrap(),
+                &crate::deploy::selection::SlotSelection::normalize(&self.config, "t1", None)
+                    .unwrap(),
                 &RefExpr::Head,
                 None,
                 deployment_id,
@@ -4844,7 +4845,7 @@ interval_seconds = 0
             &h.store,
             &factory,
             "t1",
-            &crate::deploy::groups::SlotSelection::normalize(&config, "t1", None).unwrap(),
+            &crate::deploy::selection::SlotSelection::normalize(&config, "t1", None).unwrap(),
             &RefExpr::Head,
             None,
             &id,
@@ -4944,7 +4945,7 @@ interval_seconds = 0
             &h.store,
             &factory,
             "t1",
-            &crate::deploy::groups::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
+            &crate::deploy::selection::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
             &RefExpr::Head,
             None,
             &id,
@@ -5122,7 +5123,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &store,
             &factory,
             "t1",
-            &crate::deploy::groups::SlotSelection::normalize(&config, "t1", None).unwrap(),
+            &crate::deploy::selection::SlotSelection::normalize(&config, "t1", None).unwrap(),
             &RefExpr::Head,
             None,
             &id,
@@ -5294,7 +5295,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.store,
             &factory,
             "t1",
-            &crate::deploy::groups::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
+            &crate::deploy::selection::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
             &ledger::parse_ref_expr(test_deployment_id("deploy-hist-behavior-fixture").as_str())
                 .unwrap(),
             None,
@@ -5350,7 +5351,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &h.store,
             &factory,
             "t1",
-            &crate::deploy::groups::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
+            &crate::deploy::selection::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
             &ledger::parse_ref_expr(test_deployment_id("deploy-hist-behavior-fixture").as_str())
                 .unwrap(),
             None,
@@ -6149,7 +6150,7 @@ interval_seconds = 0
             &store,
             &factory,
             "t1",
-            &crate::deploy::groups::SlotSelection::normalize(&config, "t1", None).unwrap(),
+            &crate::deploy::selection::SlotSelection::normalize(&config, "t1", None).unwrap(),
             &RefExpr::Head,
             None,
             &id,

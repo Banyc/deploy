@@ -1,146 +1,12 @@
-//! Rollout-group selection semantics (A1 deployment semantics).
-//!
-//! The branch-agnostic {target, group} selection
-//! ([`SlotSelection`]), normalized once near command entry and resolved PER
-//! REFERENCE BRANCH against that branch's declared temporal source: HEAD and
-//! deployment references resolve the selected slots from the CURRENT config's
-//! group declarations ([`SlotSelection::current_members`]), a `release:<id>`
-//! reference from the RELEASE's FROZEN per-slot groups rebound onto the
-//! current physical slots ([`SlotSelection::release_members`] — the frozen
-//! partition governs, so a group named only in the frozen topology still
-//! resolves). Also owns the DIRECT-RELEASE MEMBERSHIP GATE
-//! ([`validate_direct_release_membership`]): a `release:<id>` push deploys
-//! onto the CURRENT target's slots, so the release's frozen slot set must
-//! EXACTLY equal the target's current membership — refused before any lock
-//! or remote access. Extracted from the old `push::plan`.
+//! DIRECT-RELEASE MEMBERSHIP GATE (A1 deployment semantics): a `release:<id>`
+//! push deploys onto the CURRENT target's slots, so the release's frozen
+//! slot set must EXACTLY equal the target's current membership — refused
+//! before any lock or remote access. The {target, group} selection and the
+//! frozen-vs-current topology resolution moved to
+//! [`crate::deploy::selection`]. Split from the old `push::plan`.
 
-use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
-use crate::identity::{MatchingMembership, ReleaseId, ReleaseRecord, SlotId, SlotSet, TargetName};
-
-/// The NORMALIZED selection of one push/status invocation: the owning target
-/// and the optional rollout group. Normalized once near command entry as the
-/// branch-agnostic {target, group} pair — the selection deliberately does
-/// NOT resolve slot IDs from the caller's current configuration. Each
-/// reference branch resolves the selected slot IDs against ITS OWN declared
-/// temporal source ([`crate::deploy::plan::plan_assignments`]): HEAD and deployment references
-/// from the CURRENT config's group declarations, `release:<id>` from the
-/// release record's FROZEN per-slot groups (rebound onto the current
-/// physical slots). Planning, execution, reporting, and persistence consume
-/// this selection plus the per-branch resolution instead of independently
-/// filtering slots.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SlotSelection {
-    pub target: TargetName,
-    /// The optional rollout group (`deploy push <target> --group <name>`).
-    /// `None` selects every slot owned by the target.
-    pub group: Option<String>,
-}
-
-impl SlotSelection {
-    /// Normalize a target + optional group into the branch-agnostic
-    /// selection: ONLY the owning target and the requested group, without
-    /// resolving slot IDs from the caller's current configuration. Slot-ID
-    /// resolution is deliberately deferred to each reference branch: the
-    /// CURRENT group partition governs a HEAD push, while a `release:<id>`
-    /// push must select from the RELEASE's FROZEN per-slot groups (a group
-    /// named in the release's frozen topology but unknown in the current
-    /// config still works — the frozen partition governs), so resolving the
-    /// group against the current config here would both reject release-only
-    /// groups and select the wrong slot IDs for a historical release whose
-    /// frozen partition drifted. The target must exist in the current config
-    /// (validated here, before any lock or remote access).
-    pub fn normalize(config: &ProjectConfig, target: &str, group: Option<&str>) -> Result<Self> {
-        config
-            .target(target)
-            .ok_or_else(|| Error::not_found(format!("target '{target}'")))?;
-        Ok(SlotSelection {
-            target: TargetName::parse(target).expect("target name is a safe segment"),
-            group: group.map(str::to_string),
-        })
-    }
-
-    /// The selected (slot, server) pairs resolved from the caller's CURRENT
-    /// configuration — the declared temporal source for HEAD and deployment
-    /// references, and the physical-rebinding half of a release reference
-    /// (each frozen slot id looked up in the target's current member
-    /// declarations). `None` selects every slot owned by the target; a group
-    /// selects exactly the target's slots whose CURRENT `groups` list
-    /// contains it (an unknown group, or a group selecting zero slots in the
-    /// current config, is a configuration error — HEAD/deployment behavior,
-    /// unchanged). Deterministic order: variants in name order, then each
-    /// variant's slots in file order.
-    pub fn current_members<'a>(
-        &self,
-        config: &'a ProjectConfig,
-    ) -> Result<Vec<(&'a crate::config::SlotConfig, &'a crate::config::ServerDef)>> {
-        match &self.group {
-            Some(g) => config.target_group_slots(self.target.as_str(), g),
-            None => config.target_slots(self.target.as_str()),
-        }
-    }
-
-    /// The selected (slot, server) pairs for a DIRECT RELEASE reference: the
-    /// group's slot IDs resolve from the RELEASE's FROZEN topology — each
-    /// frozen [`crate::identity::CanonicalSlot`] in the record's own snapshot
-    /// carries its era's `groups` list, so the frozen partition governs (a
-    /// slot the release pushed inside the group but the current config moved
-    /// OUT of it still belongs to this push; a group named only in the
-    /// frozen topology — unknown in the current config — still resolves).
-    /// The frozen IDs are then REBOUND onto their current physical locations
-    /// (server / deploy_dir from the target's CURRENT member declarations) —
-    /// composing with the explicit [`RebindingPlan`]'s frozen-topology →
-    /// current-physical-slot record built in the `PushRef::Release` plan
-    /// branch. Deterministic order follows the frozen snapshot: variants in
-    /// name order, then each variant's slots in the canonical slot order.
-    /// `None` selects every slot the release froze for the target; a group
-    /// selecting zero frozen slots is a configuration error as today.
-    pub fn release_members<'a>(
-        &self,
-        config: &'a ProjectConfig,
-        rec: &ReleaseRecord,
-    ) -> Result<Vec<(&'a crate::config::SlotConfig, &'a crate::config::ServerDef)>> {
-        let frozen_ids: Vec<SlotId> = rec
-            .slots
-            .values()
-            .flat_map(|cs| cs.slots.iter())
-            .filter(|s| s.target == self.target.as_str())
-            .filter(|s| match &self.group {
-                Some(g) => s.groups.iter().any(|x| x == g),
-                None => true,
-            })
-            .map(|s| SlotId::parse(s.id.as_str()).expect("validated slot id is a safe segment"))
-            .collect();
-        if self.group.is_some() && frozen_ids.is_empty() {
-            return Err(Error::config(format!(
-                "group '{}' selects no slots of target '{}' in the release's frozen topology",
-                self.group.as_deref().unwrap_or(""),
-                self.target
-            )));
-        }
-        // Rebind the frozen slot IDs onto the CURRENT physical locations.
-        // The direct-release membership gate (which the caller runs first)
-        // guarantees the frozen slot-ID set equals the target's complete
-        // current membership, so every frozen id has a current declaration.
-        let all = config.target_slots(self.target.as_str())?;
-        let mut out = Vec::with_capacity(frozen_ids.len());
-        for id in &frozen_ids {
-            out.push(
-                all.iter()
-                    .find(|(s, _)| s.id == id.as_str())
-                    .copied()
-                    .ok_or_else(|| {
-                        Error::rollback(format!(
-                            "release's frozen slot '{id}' is not declared by target '{}' today; \
-                             membership drift is rejected before planning",
-                            self.target
-                        ))
-                    })?,
-            );
-        }
-        Ok(out)
-    }
-}
+use crate::identity::{MatchingMembership, ReleaseId, ReleaseRecord, SlotId, SlotSet};
 
 /// DIRECT-RELEASE MEMBERSHIP VALIDATION (before any remote access): a
 /// `release:<id>` push deploys onto the CURRENT target's slots, so the
@@ -198,4 +64,378 @@ pub(crate) fn validate_direct_release_membership(
             current_list.join(", "),
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ProjectConfig;
+    use crate::deploy::plan::plan_assignments;
+    use crate::deploy::selection::SlotSelection;
+    use crate::identity::{
+        CanonicalSlot, CanonicalSlots, Provenance, ReleaseRecord, SlotId, test_tree_digest,
+    };
+    use crate::ledger::{PlanOrigin, PushRef, VerifiedReleaseRebinding};
+    use crate::store::local::LocalStore;
+    use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// A release record in the pre-snapshot SHAPE: an EMPTY `slots` map (the
+    /// shape written before the slots-into-identity refactor, and what
+    /// `#[serde(default)]` yields for records without a `slots` member). The
+    /// store now REJECTS empty slot snapshots at write and read (an empty
+    /// snapshot cannot be verified from content), so fixtures that need a
+    /// WRITABLE record must fill `slots` and recompute the identity with
+    /// [`consistent`]. The bare empty-snapshot record is used directly only
+    /// when a test needs the on-disk legacy shape. It still carries the
+    /// per-variant tree bindings.
+    fn legacy_record(id: &str, tree: &str) -> ReleaseRecord {
+        ReleaseRecord {
+            release_schema_version: RELEASE_RECORD_SCHEMA_VERSION,
+            release_id: id.to_string(),
+            release_sha256: format!("sha256-{id}"),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            provenance: Provenance {
+                mapping_sha256: "m".to_string(),
+                behavior_sha256: "b".to_string(),
+            },
+            // The variant tree must be a VALID digest (the record is read
+            // back through the validated parse), so derive the canonical
+            // 64-hex form of the tag.
+            variants: BTreeMap::from([(
+                "standard".to_string(),
+                test_tree_digest(tree).as_str().to_string(),
+            )]),
+            slots: BTreeMap::new(),
+        }
+    }
+
+    /// Recompute a release record's stored identity from its own content so
+    /// `read_release`'s recompute-and-verify passes: the digest is derived
+    /// from the record's slot snapshot, bindings, and provenance digests
+    /// exactly as `build_release` derives it. Returns the record's release id
+    /// (the digest form, which is also the store directory key).
+    fn consistent(rec: &mut ReleaseRecord) -> ReleaseId {
+        let digest = crate::verify::release::recompute_release_digest(rec)
+            .expect("consistent record must carry a slot snapshot");
+        rec.release_sha256 = digest.as_str().to_string();
+        rec.release_id = crate::identity::ReleaseId::from_digest(&digest)
+            .as_str()
+            .to_string();
+        crate::identity::ReleaseId::parse(&rec.release_id)
+            .expect("consistent record carries a validated release id")
+    }
+
+    /// Assert the planned origin is a Release origin naming the given
+    /// release and carrying the VERIFIED rebinding proof; returns the proof
+    /// (the caller then asserts its frozen topology / membership / physical
+    /// slots). A Release origin without its proof is unrepresentable, so
+    /// this single assertion covers both the release identity and the
+    /// proof's presence.
+    fn release_origin<'a>(
+        origin: &'a PlanOrigin,
+        release: &ReleaseId,
+    ) -> &'a VerifiedReleaseRebinding {
+        match origin {
+            PlanOrigin::Release {
+                release: r,
+                rebinding,
+            } => {
+                assert_eq!(
+                    r, release,
+                    "the release origin must name the planned release"
+                );
+                rebinding
+            }
+            other => panic!("expected a Release origin for {release}, got {other:?}"),
+        }
+    }
+
+    // The slot universe + fixed members the membership property draws from:
+    // `p1`/`p2`/`p3` are the generated COMMON members (declared for BOTH
+    // targets), `iso` is a `t2`-ONLY member (cross-target isolation: it must
+    // never leak into t1's derived membership), and `phys` is a constant
+    // member whose PHYSICAL binding (server) the fixture may drift while its
+    // id stays (logical-only comparison). Each slot owns a distinct server so
+    // the config's per-target server-uniqueness validation passes for every
+    // generated membership.
+    const SLOT_UNIVERSE: [&str; 3] = ["p1", "p2", "p3"];
+
+    /// Build the membership-drift property fixture from two generated
+    /// membership sets: `release_inc[i]` says whether universe slot `i` is
+    /// frozen in the release record's OWN canonical slot snapshot (targets
+    /// `t1`+`t2`); `current_inc[i]` says whether it is declared in the
+    /// CURRENT config for both targets. `iso` (t2-only) and `phys`
+    /// (t1+t2) are constant members of BOTH the record and the config;
+    /// `physical_drift` rebinds `phys` to a different server in the config
+    /// only (its id stays — logical membership unchanged). Returns the
+    /// fixture plus the written record (so the test can cross-check the
+    /// realized physical drift against the canonical binding).
+    fn membership_drift_fixture(
+        release_inc: [bool; 3],
+        current_inc: [bool; 3],
+        physical_drift: bool,
+    ) -> (
+        tempfile::TempDir,
+        ProjectConfig,
+        LocalStore,
+        ReleaseId,
+        ReleaseRecord,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let release_dir = project.join("releases").join("v1");
+        std::fs::create_dir_all(&release_dir).unwrap();
+
+        // Current variant file: one slot entry per generated current member,
+        // plus the constant `iso` (t2-only) and `phys` (rebound when
+        // `physical_drift`).
+        let mut variant = String::new();
+        let add_slot = |variant: &mut String, id: &str, server: &str, target: &str, dir: &str| {
+            variant.push_str(&format!(
+                "[[slots]]\nid = \"{id}\"\nserver = \"{server}\"\ntarget = \"{target}\"\ndeploy_dir = \"{dir}\"\n\n"
+            ));
+        };
+        for (i, inc) in current_inc.iter().enumerate() {
+            if *inc {
+                let id = SLOT_UNIVERSE[i];
+                add_slot(
+                    &mut variant,
+                    id,
+                    &format!("s{}", i + 1),
+                    "t1",
+                    &format!("/srv/{id}"),
+                );
+            }
+        }
+        add_slot(&mut variant, "iso", "s4", "t2", "/srv/iso");
+        add_slot(
+            &mut variant,
+            "phys",
+            if physical_drift { "s6" } else { "s5" },
+            "t1",
+            "/srv/phys",
+        );
+        variant.push_str(
+            "[[artifact.mappings]]\nfrom = \"artifacts/build/output/\"\nto = \"app/\"\nrecursive = true\n\n[retention.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n[retention.deployment]\nprotect_deployments = 1\n\n[activation]\nadapter = \"none\"\n\n[verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
+        );
+        std::fs::write(release_dir.join("standard.toml"), variant).unwrap();
+
+        let mut servers = String::new();
+        for i in 1..=6 {
+            servers.push_str(&format!(
+                "[[servers]]\nid = \"s{i}\"\naddress = \"a{i}\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n"
+            ));
+        }
+        let cfg_path = project.join("deploy.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "schema_version = 2\napplication = \"plan\"\nrelease = \"v1\"\n\n\
+                 {servers}\
+                 [targets.t1]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n\n\
+                 [targets.t2]\nrollout = {{ batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }}\n"
+            ),
+        )
+        .unwrap();
+        let config = ProjectConfig::load(&cfg_path).unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+
+        // The release's OWN frozen canonical snapshot: the generated
+        // membership (targets t1+t2) plus the constant phys (t1+t2, at its
+        // ORIGINAL server s5) and iso (t2-only), exactly mirroring the
+        // current config's targets lists.
+        let mut rec = legacy_record("unused", "tree-x");
+        let mut canonical: Vec<CanonicalSlot> = Vec::new();
+        for (i, id) in SLOT_UNIVERSE.iter().enumerate() {
+            if release_inc[i] {
+                canonical.push(CanonicalSlot {
+                    id: id.to_string(),
+                    server: format!("s{}", i + 1),
+                    deploy_dir: format!("/srv/{id}"),
+                    target: "t1".to_string(),
+                    groups: Vec::new(),
+                });
+            }
+        }
+        canonical.push(CanonicalSlot {
+            id: "phys".to_string(),
+            server: "s5".to_string(),
+            deploy_dir: "/srv/phys".to_string(),
+            target: "t1".to_string(),
+            groups: Vec::new(),
+        });
+        canonical.push(CanonicalSlot {
+            id: "iso".to_string(),
+            server: "s4".to_string(),
+            deploy_dir: "/srv/iso".to_string(),
+            target: "t2".to_string(),
+            groups: Vec::new(),
+        });
+        canonical.sort_by(|a, b| a.id.cmp(&b.id));
+        rec.slots = BTreeMap::from([("standard".to_string(), CanonicalSlots { slots: canonical })]);
+        let release = consistent(&mut rec);
+        store.write_release(&rec).unwrap();
+
+        (dir, config, store, release, rec)
+    }
+
+    // THE REQUIRED DIRECT-RELEASE MEMBERSHIP PROPERTY: for generated
+    // release-versioned and current membership sets, direct release planning
+    // onto the destination target SUCCEEDS iff the two slot-ID sets match
+    // EXACTLY (logical equality) and REFUSES with the membership-drift error
+    // otherwise — the drift refusal lands at PLAN time, before any remote
+    // access. Also: cross-target isolation (t2's extra `iso` member never
+    // disturbs t1's derived membership) and logical-only comparison (phys's
+    // SERVER rebind with an unchanged id still plans).
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            // Bounded + fixed seed: deterministic floor, fast.
+            cases: 4,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn direct_release_membership_must_match_release_record(
+            release_inc in prop::array::uniform3(prop::bool::ANY),
+            current_inc in prop::array::uniform3(prop::bool::ANY),
+            physical_drift in prop::bool::ANY,
+        ) {
+            let (_dir, config, store, release, rec) =
+                membership_drift_fixture(release_inc, current_inc, physical_drift);
+            let release_ref = PushRef::Release {
+                release: release.clone(),
+            };
+            let expected: BTreeSet<String> = SLOT_UNIVERSE
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| release_inc[*i])
+                .map(|(_, id)| id.to_string())
+                .collect();
+            let current: BTreeSet<String> = SLOT_UNIVERSE
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| current_inc[*i])
+                .map(|(_, id)| id.to_string())
+                .collect();
+
+            if expected == current {
+                // Membership match: the direct release plans on BOTH targets.
+                // Cross-target isolation: t2's extra `iso` member (frozen in
+                // the record AND declared in the config) must not disturb
+                // t1's derived membership — t1 plans exactly its own set.
+                for dest in ["t1", "t2"] {
+                    let (assignments, desired, origin) = plan_assignments(
+                        &SlotSelection::normalize(&config, dest, None).unwrap(),
+                        &release_ref,
+                        &crate::identity::test_release_id("unused-local"),
+                        &BTreeMap::new(),
+                        &store,
+                        &config,
+                    )
+                        .map(|planned| (planned.assignments, planned.releases, planned.origin))
+                    .unwrap_or_else(|e| {
+                        panic!("release:<id> must plan on target {dest} when the membership matches: {e}")
+                    });
+                    // The universe slots and `phys` are t1's; `iso` is
+                    // t2's (a slot has exactly one owning target).
+                    let mut want: Vec<String> = if dest == "t1" {
+                        let mut w: Vec<String> = expected.iter().cloned().collect();
+                        w.push("phys".to_string());
+                        w
+                    } else {
+                        vec!["iso".to_string()]
+                    };
+                    want.sort();
+                    let mut got: Vec<String> = assignments
+                        .iter()
+                        .map(|a| a.placement_slot.as_str().to_string())
+                        .collect();
+                    got.sort();
+                    assert_eq!(
+                        got, want,
+                        "target {dest} must plan exactly its frozen membership"
+                    );
+                    for a in &assignments {
+                        assert_eq!(a.artifact.variant.as_str(), "standard");
+                        assert_eq!(a.artifact.release, release);
+                    }
+                    assert_eq!(desired, BTreeSet::from([release.clone()]));
+                    release_origin(&origin, &release);
+                }
+                // LOGICAL-ONLY: when the fixture realized a physical binding
+                // change (phys's server rebound), planning still succeeded
+                // above — the membership check compares slot IDs only, never
+                // server or deploy_dir. Cross-check the fixture actually
+                // drifted (config server differs from the record's frozen
+                // canonical binding) so the assertion is meaningful.
+                if physical_drift {
+                    let rec_phys = rec
+                        .slots["standard"]
+                        .slots
+                        .iter()
+                        .find(|s| s.id == "phys")
+                        .expect("phys is frozen in the record");
+                    let bindings = config.target_slot_bindings("t1").unwrap();
+                    let cfg_phys = bindings
+                        .get(&SlotId::new("phys"))
+                        .expect("phys is a member of t1");
+                    assert_ne!(
+                        cfg_phys.server.as_str(),
+                        rec_phys.server,
+                        "the fixture must realize the physical drift: config server {} vs record server {}",
+                        cfg_phys.server,
+                        rec_phys.server
+                    );
+                    assert_eq!(
+                        cfg_phys.deploy_dir, rec_phys.deploy_dir,
+                        "only the server drifted; deploy_dir stays put"
+                    );
+                }
+            } else {
+                // Membership drift (missing / extra / renamed slots): REFUSED
+                // at plan time on the DRIFTED target (`t1` — the universe
+                // slots are t1's), with the drift error naming the release,
+                // the expected vs current slot sets, and the
+                // before-remote-access clause. `t2`'s membership is
+                // unchanged ({iso} in both the record and the config), so it
+                // still plans — a slot has exactly one owning target, so a
+                // drift on t1 never disturbs t2.
+                let err = plan_assignments(
+                    &SlotSelection::normalize(&config, "t1", None).unwrap(),
+                    &release_ref,
+                    &crate::identity::test_release_id("unused-local"),
+                    &BTreeMap::new(),
+                    &store,
+                    &config,
+                )
+                .expect_err("membership drift must refuse direct release planning");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("release")
+                        && msg.contains("drift")
+                        && msg.contains("before remote access"),
+                    "refusal must be the membership-drift error, got: {msg}"
+                );
+                // t2's membership is unchanged: it plans its own slot.
+                let (assignments, _, _) = plan_assignments(
+                    &SlotSelection::normalize(&config, "t2", None).unwrap(),
+                    &release_ref,
+                    &crate::identity::test_release_id("unused-local"),
+                    &BTreeMap::new(),
+                    &store,
+                    &config,
+                )
+                    .map(|planned| (planned.assignments, planned.releases, planned.origin))
+                .expect("t2's membership is unchanged, so it still plans");
+                assert_eq!(assignments.len(), 1);
+                assert_eq!(assignments[0].placement_slot, SlotId::new("iso"));
+            }
+        }
+    }
 }

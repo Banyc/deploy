@@ -27,17 +27,25 @@
 //! * [`refs`] — the push reference GRAMMAR (pure, store-free): the old
 //!   `revset` module, `parse_ref_expr`, [`refs::RefExpr`], and the
 //!   `@`/`@-`/`@--`/`parent(...)`/deployment-id/`release:<id>` forms.
-//! * [`groups`] — rollout-group selection semantics: the {target, group}
-//!   selection ([`groups::SlotSelection`]), frozen-vs-current topology
-//!   selection (`current_members` / `release_members`), and the
-//!   direct-release membership gate (`validate_direct_release_membership`).
+//! * [`groups`] — the DIRECT-RELEASE MEMBERSHIP GATE
+//!   ([`groups::validate_direct_release_membership`]): a `release:<id>` push
+//!   deploys onto the CURRENT target's slots, so the release's frozen slot
+//!   set must EXACTLY equal the target's current membership — refused before
+//!   any lock or remote access.
+//! * [`selection`] — the slot SELECTION semantics: the branch-agnostic
+//!   {target, group} selection ([`selection::SlotSelection`]) normalized once
+//!   near command entry, its frozen-vs-current topology resolution
+//!   (`current_members` / `release_members`), and the PROOF-BEARING
+//!   per-reference resolution ([`selection::ResolvedSelection`]) the planner
+//!   produces.
 //! * [`batching`] — the deployment-order batch loop (`batch_size`,
 //!   `stop_on_failure`, the `'batches` iteration).
 //! * [`failure`] — failure-policy semantics (`rollback_changed` /
 //!   `leave_changed`), the step-13 batch compensation pass, the degraded
 //!   derivation, and never-advanced outcome handling.
 //! * [`plan`] — assignment planning (the old `push::plan`):
-//!   `plan_assignments`, the proof-bearing [`plan::ResolvedSelection`], the
+//!   `plan_assignments` (+ `release_behavior_index`), the proof-bearing
+//!   [`selection::ResolvedSelection`] it consumes, the
 //!   `VerifiedReleaseRebinding` usage, and `latest_successful_rollback`.
 //! * [`server`] — the per-server mutation pipeline (the old `push::server`):
 //!   `process_server` (publish/swap/activate/verify/commit per slot), the
@@ -86,6 +94,7 @@ pub mod plan;
 pub mod push;
 pub mod refs;
 pub mod results;
+pub mod selection;
 pub mod server;
 pub mod staging;
 pub mod status;
@@ -108,7 +117,8 @@ pub(crate) use dryrun::*;
 pub(crate) use exact_rollback::*;
 #[allow(unused_imports)]
 pub(crate) use failure::*;
-pub use groups::*;
+#[allow(unused_imports)]
+pub(crate) use groups::*;
 #[allow(unused_imports)]
 pub(crate) use maintenance::*;
 #[allow(unused_imports)]
@@ -121,6 +131,7 @@ pub use push::*;
 pub(crate) use refs::*;
 #[allow(unused_imports)]
 pub(crate) use results::*;
+pub use selection::*;
 #[allow(unused_imports)]
 pub(crate) use server::*;
 #[allow(unused_imports)]

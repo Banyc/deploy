@@ -10,8 +10,8 @@ use crate::ledger::PhysicalBinding;
 use crate::store::local::LocalStore;
 use std::collections::HashSet;
 
-use super::groups::SlotSelection;
 use super::plan::latest_successful_rollback;
+use super::selection::SlotSelection;
 
 /// PARTIAL-ROLLOUT GUARDS, validated BEFORE any remote mutation: a group push
 /// derives its complete snapshot by overlaying the selected slots onto the
