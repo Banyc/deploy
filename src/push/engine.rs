@@ -1772,41 +1772,6 @@ fn push_inner(
     let (_observed, observed_warnings) =
         refresh_observed_from_live(store, target_name, &members, &helpers);
 
-    // 17. Per-slot retention under each slot's mutation lock. Retention uses
-    // the slot's ACTUAL final assignment (read after any compensation), not
-    // the desired plan: a compensated slot restored its prior variant.
-    //
-    // RETENTION IS SLOT-OWNED: each slot has ONE policy — the policy of its
-    // OWNING VARIANT (the variant file whose `[[slots]]` entry declares the
-    // slot), resolved from the caller's current `deploy.toml` via
-    // `ProjectConfig::slot_retention` (retention is never part of a release
-    // snapshot). There is NO per-target policy and NO union across the
-    // slot's member targets: a slot shared across targets rotates under its
-    // single owning-variant policy, so which target triggered this push (or
-    // which targets the slot is a member of) never changes what is retained.
-    //
-    // POST-COMMIT MAINTENANCE: by this point the deployment has ALREADY
-    // committed (servers advanced, snapshot recorded, attempt recorded), so a
-    // retention failure must NOT change the reported outcome — the push still
-    // returns `Ok` with the real `commit_status`. A failure is instead
-    // recorded as a PERSISTENT debt marker (per target+slot, under the local
-    // store) and surfaced as a warning on the report; later pushes —
-    // including no-ops — retry the maintenance and clear the marker once the
-    // retention succeeds. The capacity-path preflight retention in
-    // `capacity.rs` is already best-effort with `.ok()`; this step-17 path is
-    // what used to propagate retention errors as push failures.
-    //
-    // The mutation lock is held via an RAII guard for the whole retention
-    // block, so an error from `compute_retained` or `rotate` releases the
-    // lock on drop instead of leaking it (a manual acquire/release pair would
-    // strand every later operation on this slot with "mutation lock held by
-    // ..."). A lock acquisition conflict (held by another operation) NEVER
-    // skips silently: it defers the maintenance the same way a retention
-    // failure does — a best-effort debt marker plus an explicit warning
-    // naming the slot — so after a successful push every slot is either
-    // ROTATED or carries debt + a warning, and a later push (including a
-    // no-op) services the marker once the lock is free.
-    //
     let mut maintenance: Vec<String> = Vec::new();
     // Observed-refresh deferrals (post-commit projection lag) ride the same
     // warning channel as retention; unlike retention there is no debt marker to
@@ -1834,81 +1799,25 @@ fn push_inner(
     // an `Err` — a debt-file fault must not change the outcome of a
     // deployment that already committed.
     maintenance.extend(retry_pending_sweep(store, config, deployment_id.as_str()));
+    // Step 17: per-slot retention — post-commit maintenance, never a push
+    // failure (the contract is structural in `retain_slot_post_commit`).
     for sid in &servers_order {
-        let helper = &helpers[sid];
         // The slot's ONE retention policy, from its OWNING VARIANT (the
         // variant that declares the slot) — never a member-target union.
         let slot_retention = config
             .slot_retention(sid.as_str())
             .expect("every planned slot is declared by some variant");
-        // TEST-ONLY step-17 phase hook: when a test armed the barrier for
-        // THIS deployment id, signal "at step-17 lock acquisition" (with the
-        // FRESH-STEP-17 phase — this push's own per-slot retention, whose
-        // contended else-branch defers the maintenance as a debt marker) and
-        // park until the test releases the engine (the fixture holds the
-        // competing guard meanwhile) — per-slot lock contention becomes
-        // DETERMINISTIC, with no thread racing the lock file. A no-op in
-        // production builds (both this call and the store method are
-        // `#[cfg(test)]`) and in unarmed tests.
-        #[cfg(test)]
-        store.step17_hook_barrier(deployment_id, HookPhase::FreshStep17);
-        if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
-            match rotate_slot_locked(helper, store, config, slot_retention, deployment_id) {
-                Ok(()) => {
-                    // Maintenance done for this slot: clear any marker left by
-                    // an earlier push whose retention failed after commit. The
-                    // clear is NON-FALLIBLE post-commit maintenance: a debt
-                    // read/write failure becomes a warning, never an `Err`.
-                    maintenance.extend(clear_retention_deferred(store, target_name, sid));
-                }
-                Err(e) => {
-                    // The deployment already committed; defer the maintenance
-                    // (marker + warning) instead of failing the push. The
-                    // deferral is NON-FALLIBLE: a debt read/write failure here
-                    // (e.g. the marker cannot be persisted) is a warning, never
-                    // an `Err` — the committed outcome is unchanged.
-                    maintenance.extend(set_retention_deferred(
-                        store,
-                        target_name,
-                        sid,
-                        &e.to_string(),
-                    ));
-                    maintenance.push(format!(
-                        "retention deferred for slot '{}': {e}",
-                        sid.as_str()
-                    ));
-                }
-            }
-        } else {
-            // The slot's mutation lock is CONTENDED (held by another
-            // operation), so the retention cannot run now. The deployment has
-            // already committed, so this must NEVER fail the push: record the
-            // deferral as best-effort debt (persistence faults are
-            // warning-only per the post-commit lifecycle) and surface an
-            // explicit warning naming the slot. The marker makes the
-            // deferral retryable — a later push (including an up-to-date
-            // no-op) services the maintenance once the lock is free and
-            // clears the marker.
-            maintenance.push(format!(
-                "retention deferred for slot '{}': slot lock held by another operation",
-                sid.as_str()
-            ));
-            // Best-effort debt record; NEVER propagates an error out of
-            // post-commit maintenance: every debt read/write failure becomes
-            // a warning in the returned vec (merged into the report's
-            // `maintenance` channel), never an `Err` — the committed outcome
-            // is unchanged. On persistence failure there is no marker, but
-            // the explicit "retention debt maintenance deferred" warning
-            // names the slot, so the report distinguishes a retryable
-            // deferral (marker persisted) from one that must be re-deferred
-            // by a later push.
-            maintenance.extend(set_retention_deferred(
-                store,
-                target_name,
-                sid,
-                "slot lock held by another operation",
-            ));
-        }
+        retain_slot_post_commit(
+            store,
+            config,
+            target_name,
+            &helpers[sid],
+            sid,
+            slot_retention,
+            op_id,
+            deployment_id,
+            &mut maintenance,
+        );
         // Clean up this deployment's incoming directory. Best-effort by
         // design: the push already succeeded, so a leftover here cannot change
         // the reported outcome, and the next push's reconciliation removes
@@ -1926,6 +1835,73 @@ fn push_inner(
         warning: maintenance_warning(&maintenance),
         dry_run: false,
     })
+}
+
+/// Step-17 per-slot retention, run as POST-COMMIT maintenance: the
+/// deployment already durably committed, so this NEVER fails the push — a
+/// retention failure (or a contended slot lock) defers the slot as a durable
+/// debt marker + a warning, never a silent skip. `slot_retention` is the
+/// slot's ONE policy, already resolved by the caller from its OWNING VARIANT
+/// (never a per-target union); the RAII mutation lock guards the whole block.
+// The 9 parameters are one slot's full per-slot maintenance context (store,
+// config, target_name, helper, sid, slot_retention, op_id, deployment_id)
+// plus the shared `maintenance` warning channel; bundling them would obscure
+// the slot-owned-policy contract this signature enforces, so the allow
+// documents the deliberate choice rather than a band-aid (mirrors
+// `push_inner`).
+#[allow(clippy::too_many_arguments)]
+fn retain_slot_post_commit(
+    store: &LocalStore,
+    config: &ProjectConfig,
+    target_name: &str,
+    helper: &RemoteHelper,
+    sid: &SlotId,
+    slot_retention: &RetentionConfig,
+    op_id: &OperationId,
+    deployment_id: &DeploymentId,
+    maintenance: &mut Vec<String>,
+) {
+    // TEST-ONLY step-17 phase hook: when a test armed the barrier for
+    // THIS deployment id, signal "at step-17 lock acquisition" (with the
+    // FRESH-STEP-17 phase — this push's own per-slot retention, whose
+    // contended else-branch defers the maintenance as a debt marker) and
+    // park until the test releases the engine (the fixture holds the
+    // competing guard meanwhile) — per-slot lock contention becomes
+    // DETERMINISTIC, with no thread racing the lock file. A no-op in
+    // production builds (both this call and the store method are
+    // `#[cfg(test)]`) and in unarmed tests.
+    #[cfg(test)]
+    store.step17_hook_barrier(deployment_id, HookPhase::FreshStep17);
+    if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
+        match rotate_slot_locked(helper, store, config, slot_retention, deployment_id) {
+            Ok(()) => {
+                maintenance.extend(clear_retention_deferred(store, target_name, sid));
+            }
+            Err(e) => {
+                maintenance.extend(set_retention_deferred(
+                    store,
+                    target_name,
+                    sid,
+                    &e.to_string(),
+                ));
+                maintenance.push(format!(
+                    "retention deferred for slot '{}': {e}",
+                    sid.as_str()
+                ));
+            }
+        }
+    } else {
+        maintenance.push(format!(
+            "retention deferred for slot '{}': slot lock held by another operation",
+            sid.as_str()
+        ));
+        maintenance.extend(set_retention_deferred(
+            store,
+            target_name,
+            sid,
+            "slot lock held by another operation",
+        ));
+    }
 }
 
 /// Run one slot's retention — retained-set computation plus mark-and-sweep —
