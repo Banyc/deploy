@@ -45,29 +45,26 @@
 //! slot declarations (each variant's `[[slots]]` canonicalized and sorted by
 //! slot id), and every declared variant's tree binding.
 //!
-//! The module is organized by surface: [`raw`] (serde shapes + the schema
-//! version gate), [`domain`] (the validated [`ProjectConfig`] graph record,
-//! the raw -> domain conversion, and the load / read accessors), [`ops`]
-//! (the validated mutation / graph-rebuild operations + their tests),
-//! [`derived`] (the derived slot/target resolution views), [`mapping`] (the
-//! artifact-mapping leaf types + path/mode helpers), and the per-surface
-//! leaf modules ([`pins`], [`slots`], [`rollout`], [`retention`],
-//! [`activation`], [`verification`], [`servers`], [`capacity`],
-//! [`release_name`]).
+//! The module is organized by feature: [`domain`] is THE CONFIG CORE — the
+//! raw wire shapes ([`raw`]), the validated [`ProjectConfig`] graph record,
+//! the total-fail-closed raw -> domain conversion, the derived slot/target
+//! resolution views, the validated mutation / graph-rebuild operations, the
+//! artifact-mapping leaf types + path/mode helpers, and the config test
+//! suite. The per-surface policy leaf modules ([`pins`], [`slots`],
+//! [`rollout`], [`retention`], [`activation`], [`verification`],
+//! [`servers`], [`capacity`], [`release_name`]) remain degree-2 siblings:
+//! each is a distinct, independently-validated config surface.
 //!
 //! The crate-facing surface is re-exported here: `crate::config::Pin`,
 //! `crate::config::ProjectConfig`, `crate::config::raw::RawConfig`, ...
 //! resolve exactly as they did when the whole config surface lived in
 //! `src/config.rs`.
 
-pub(crate) mod raw;
+pub(crate) use domain::raw;
 
 mod activation;
 mod capacity;
-mod derived;
 mod domain;
-mod mapping;
-mod ops;
 mod pins;
 mod release_name;
 mod retention;
@@ -76,15 +73,12 @@ mod servers;
 mod slots;
 mod verification;
 
-#[cfg(test)]
-mod tests;
-
 pub use activation::{Activation, ActivationConfig, ActivationScope, SystemdActivation, UnitDef};
 pub use capacity::CapacityConfig;
-pub use domain::{DomainConfig, ProjectConfig, TargetConfig, VariantConfig};
-pub use mapping::{
-    ArtifactConfig, ConflictPolicy, Mapping, destinations_overlap, normalize_destination,
-    parse_octal_mode, resolved_mode, validate_relative_path,
+pub use domain::{
+    ArtifactConfig, ConflictPolicy, DomainConfig, Mapping, ProjectConfig, TargetConfig,
+    VariantConfig, destinations_overlap, normalize_destination, parse_octal_mode, resolved_mode,
+    validate_relative_path,
 };
 pub use pins::Pin;
 pub use release_name::ReleaseName;
