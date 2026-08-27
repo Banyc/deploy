@@ -3,29 +3,39 @@
 //! The deployment core is deliberately ignorant of application semantics. It
 //! understands only filesystem entries, mappings, trees, artifacts, variants,
 //! releases, targets, and activation adapters. Every identity-bearing value
-//! lives in this area, three modules:
+//! lives in this area, TWO group directories:
 //!
-//! * [`identity`] — THE IDENTITY TYPES (one cohesive feature, split into
-//!   sections): the release id ([`ReleaseId`]: EXACT
+//! * [`identity`] — THE IDENTITY TYPES: a group directory of the identity
+//!   modules — [`identity::release_id`] ([`ReleaseId`]: EXACT
 //!   `rel-sha256-<64 lowercase hex>`; bare/`rel-` forms rejected at the
 //!   domain boundary — the CLI accepts a bare 64-hex digest, converted
-//!   first), the event ids ([`DeploymentId`]/[`GenerationId`]/
-//!   [`OperationId`]: `deploy-`/`gen-`/`op-` + canonical hyphenated UUIDv7,
-//!   version nibble enforced; v4 rejected), the digests
-//!   ([`TreeDigest`]/[`ReleaseDigest`]: exactly 64 lowercase hex), the
-//!   segment ids ([`SlotId`], [`ServerId`], [`TargetName`], [`VariantName`]:
-//!   a single safe path segment), and the validated scalars
-//!   ([`Identifier`], [`ApplicationStoreKey`], [`BatchSize`] (nonzero u64),
+//!   first), [`identity::scalars`] (the validated scalar value types
+//!   [`Identifier`], [`ApplicationStoreKey`], [`BatchSize`] (nonzero u64),
 //!   [`CapacityPercent`] (0..=100), [`AbsoluteDeployDir`] (absolute,
 //!   traversal-free), [`BehaviorDigest`], [`Timestamp`],
-//!   [`RolloutGroupName`], [`Host`], [`SshUser`]).
-//! * [`payload`] — the release identity payload ([`CanonicalReleasePayload`]:
-//!   name-sorted mapping digest + behavior digest + slot-declaration digest +
-//!   variant→tree bindings; capacity excluded, slots ARE identity) and the
-//!   canonical payload/record types.
-//! * [`proofs`] — the membership proofs [`SlotSet`]/[`NonEmptySlotSet`]/
-//!   [`MatchingMembership`]: the ONLY construction path is
-//!   [`MatchingMembership::verify`] (frozen == current).
+//!   [`RolloutGroupName`], [`Host`], [`SshUser`]), and the ID FAMILY
+//!   [`identity::id`] — a deeper group of the format-validated identity
+//!   newtypes: the event ids ([`DeploymentId`]/[`GenerationId`]/
+//!   [`OperationId`]: `deploy-`/`gen-`/`op-` + canonical hyphenated UUIDv7,
+//!   version nibble enforced; v4 rejected), the digests
+//!   ([`TreeDigest`]/[`ReleaseDigest`]: exactly 64 lowercase hex), and the
+//!   segment ids ([`SlotId`], [`ServerId`], [`TargetName`], [`VariantName`]:
+//!   a single safe path segment).
+//! * [`proof`] — THE PROOF MACHINERY: a group directory of the payload +
+//!   proofs modules — [`proof::payload`] (the release identity payload
+//!   [`CanonicalReleasePayload`]: name-sorted mapping digest + behavior
+//!   digest + slot-declaration digest + variant→tree bindings; capacity
+//!   excluded, slots ARE identity, plus the canonical payload/record types)
+//!   and [`proof::proofs`] (the membership proofs
+//!   [`SlotSet`]/[`NonEmptySlotSet`]/[`MatchingMembership`]: the ONLY
+//!   construction path is [`MatchingMembership::verify`] (frozen ==
+//!   current)).
+//!
+//! The area re-exports the whole surface FLAT AND keeps the module paths,
+//! so every identity resolves both ways: `crate::identity::ReleaseId` and
+//! `crate::identity::release_id::ReleaseId` (and the deeper
+//! `crate::identity::id::segments::SlotId` / `crate::identity::segments::SlotId`
+//! aliases through the re-export chain).
 //!
 //! Deployment, operation, and generation IDs are opaque collision-resistant
 //! IDs (UUIDv7 in schema version 1). They identify events and are never used
@@ -38,18 +48,22 @@
 //! `Deserialize` impls route every wire string through the same validation
 //! (an invalid wire identity fails deserialization — fail closed).
 
-// The identity-types module: the regroup spec names the file `identity.rs`
-// (the module of the identity types inside the identity area), so
-// `mod identity;` inside `src/identity/mod.rs` is intentionally
-// same-named — clippy::module_inception is suppressed deliberately.
+// The identity-types group: `mod identity;` inside `src/identity/mod.rs` is
+// intentionally same-named — clippy::module_inception is suppressed
+// deliberately. The group re-exports the whole identity surface flat, so
+// both `crate::identity::ReleaseId` and `crate::identity::release_id::ReleaseId`
+// (and the deeper `crate::identity::id::segments::SlotId` /
+// `crate::identity::segments::SlotId` aliases) resolve.
 #[allow(clippy::module_inception)]
 mod identity;
-mod payload;
-mod proofs;
+// The proof-machinery group: the release identity payload + the membership
+// proofs, nested together; the area re-exports the payload types flat and
+// the crate-internal proof types via the pub(crate) glob.
+mod proof;
 
 pub use identity::*;
-pub use payload::*;
-pub(crate) use proofs::*;
+pub use proof::payload::*;
+pub(crate) use proof::proofs::*;
 
 /// The validated identity newtype: construction goes through [`parse`]
 /// (or `FromStr`/`TryFrom`), which enforces the type's format rule, and the

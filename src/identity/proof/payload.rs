@@ -20,8 +20,8 @@
 //! later encapsulation passes; they are parked here with the identity
 //! payload for now.
 
-use super::{GenerationId, ReleaseId, SlotId, TreeDigest, VariantName};
 use crate::config::{ActivationConfig, VerificationConfig};
+use crate::identity::{GenerationId, ReleaseId, SlotId, TreeDigest, VariantName};
 use serde::{Deserialize, Serialize};
 
 /// The canonical behavior contract (activation + verification) that fully
