@@ -15,7 +15,7 @@
 //! boundary — arg parsing + printing; the rendering semantics live HERE.
 //!
 use crate::error::Result;
-use crate::ledger::append::LedgerEntry;
+use crate::ledger::finalize::LedgerEntry;
 use crate::ledger::records::DeploymentStatus;
 use crate::store::local::LocalStore;
 

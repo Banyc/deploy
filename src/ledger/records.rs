@@ -1,41 +1,54 @@
-//! The core RECORD types of the deployment ledger (feature area A2: Ledger
-//! semantics) that the FEATURE MODULES share — the shapes that do NOT
-//! belong to a dedicated module.
+//! THE LEDGER RECORD MODEL — the wire + domain record shapes of the
+//! deployment ledger (feature area A2: Ledger semantics), one cohesive
+//! feature module.
 //!
-//! The ledger's records are split into per-feature modules (see the area
-//! root [`crate::ledger`] for the module map): the INTENT records
-//! ([`crate::ledger::intent::LedgerIntentWire`] /
-//! [`crate::ledger::intent::DeploymentIntent`]) and the TERMINAL records
-//! ([`crate::ledger::terminal::LedgerTerminalWire`] /
-//! [`crate::ledger::terminal::LedgerTerminal`] /
-//! [`crate::ledger::terminal::TerminalDisposition`]) own the two line
-//! kinds; the per-slot OUTCOMES ([`crate::ledger::outcomes::SlotOutcome`] /
-//! [`crate::ledger::outcomes::SlotOutcomeKind`] /
-//! [`crate::ledger::outcomes::SlotTransition`] + the wire outcome
-//! [`crate::ledger::outcomes::SlotResult`] + the remaining-changes /
-//! compensation derivations) live in [`crate::ledger::outcomes`]; the
-//! per-slot ordered TABLES ([`SlotTable`] / [`NonEmptySlotTable`] over the
-//! private ordered map) live in [`crate::ledger::tables`]; the three-state
-//! observations live in [`crate::ledger::observation`]; the merged
-//! deployment entry ([`crate::ledger::entry::LedgerEntry`]) lives in
-//! [`crate::ledger::entry`]; the format-version constants live in
-//! [`crate::ledger::schema`]; and the rebinding proof records live in
-//! [`crate::ledger::rebinding`].
+//! The ledger's records are organized here by facet, all one feature: the
+//! record model the append/read path carries. The SHARED core comes first
+//! — the deployment-record fields ([`SlotAttemptState`] /
+//! [`DeploymentStatus`]), the ROLLBACK records ([`LedgerRollback`] /
+//! [`LedgerRollbackWire`] / [`PhysicalBinding`] / [`CompleteRollback`]),
+//! the PLAN/report records ([`BehaviorIndex`], [`SlotPlan`],
+//! [`DeploymentPlanWire`] / [`DeploymentPlan`], [`PlanSource`] /
+//! [`PlanOrigin`]), and the pins/server records ([`Pins`] /
+//! [`ServerState`]) — then the per-facet sections:
 //!
-//! THIS module keeps the SHARED core:
+//! * **intent** — the durable intent wire/domain pair ([`LedgerIntentWire`]
+//!   / [`DeploymentIntent`]) with the VERIFYING CONVERSION, the per-slot
+//!   payload types ([`IntentSlot`], [`DesiredGeneration`],
+//!   [`PreviousGeneration`]), and the in-memory push report
+//!   ([`LedgerIntentReport`]) (the "two line kinds — intent" half);
+//! * **terminal** — the terminal wire/domain pair ([`LedgerTerminalWire`] /
+//!   [`LedgerTerminal`]) with the VERIFYING CONVERSION, the
+//!   [`TerminalDisposition`] enum, and the status accessor (the "two line
+//!   kinds — terminal" half);
+//! * **outcomes** — the per-slot outcomes ([`SlotOutcome`] /
+//!   [`SlotOutcomeKind`] / [`SlotTransition`], the WIRE outcome row
+//!   [`SlotResult`]) + the remaining-changes / compensation derivations;
+//! * **observation** — the three-state observations ([`Observation`] and
+//!   friends);
+//! * **entries / merge** — the merged deployment entry ([`LedgerEntry`]):
+//!   the intent + optional terminal merge type the append/read path
+//!   carries;
+//! * **rollback payload** — the rollback PAYLOAD builder
+//!   ([`build_rollback`]): the complete-snapshot overlay + exact-rollback
+//!   verification semantics;
+//! * **rebinding proof** — the rebinding proof records ([`RebindingPlan`] /
+//!   [`VerifiedReleaseRebinding`] / [`FrozenSlotTopology`]);
+//! * **membership equations** — the SUCCESSFUL membership-equation
+//!   enforcement ([`verify_successful_membership_equations`]);
+//! * **schema versions** — the format-version constants
+//!   ([`LEDGER_SCHEMA_VERSION`] / [`PINS_SCHEMA_VERSION`]).
 //!
-//! * the deployment records' shared fields ([`SlotAttemptState`],
-//!   [`DeploymentStatus`]);
-//! * the ROLLBACK records ([`LedgerRollback`] / [`LedgerRollbackWire`] /
-//!   [`PhysicalBinding`] / [`CompleteRollback`]);
-//! * the plan/report records ([`BehaviorIndex`], [`SlotPlan`],
-//!   [`DeploymentPlanWire`] / [`DeploymentPlan`], [`PlanSource`] /
-//!   [`PlanOrigin`]);
-//! * the retained pins + per-server records ([`Pins`], [`ServerState`]);
-//! * the re-exports of the moved shared collections ([`SlotTable`] /
-//!   [`NonEmptySlotTable`] from [`crate::ledger::tables`], [`SlotResult`]
-//!   from [`crate::ledger::outcomes`]) so the pre-split
-//!   `crate::ledger::records::X` paths keep compiling.
+//! The per-slot ordered TABLES ([`crate::ledger::tables::SlotTable`] /
+//! [`crate::ledger::tables::NonEmptySlotTable`] over the private ordered
+//! map) are generic slot collection INFRASTRUCTURE and stay in
+//! [`crate::ledger::tables`]; the ledger WRITE path (replay-safe
+//! finalization [`crate::ledger::finalize::finalize_successful_attempt`]
+//! and the two physical append line kinds
+//! [`crate::ledger::finalize::LedgerLine`]) lives in
+//! [`crate::ledger::finalize`]; reconciliation lives in
+//! [`crate::ledger::recovery`]; reference resolution in
+//! [`crate::ledger::refs`]; rendering in [`crate::ledger::log`].
 //!
 //! Assignment relationships are expressed exclusively through the canonical
 //! model types ([`crate::identity::ArtifactRef`],
@@ -51,59 +64,42 @@
 //!
 //! Every record keeps ONE authoritative collection and derives the rest
 //! through methods (`membership()`, `releases()`, `behavior_digest()`,
-//! [`crate::ledger::terminal::LedgerTerminal::remaining_changes`],
-//! [`crate::ledger::terminal::LedgerTerminal::compensation`]); the redundant
-//! on-disk members exist only in the WIRE types (the raw serde shapes,
-//! [`LedgerIntentWire`], [`LedgerRollbackWire`], [`LedgerTerminalWire`],
+//! [`LedgerTerminal::remaining_changes`], [`LedgerTerminal::compensation`]);
+//! the redundant on-disk members exist only in the WIRE types (the raw serde
+//! shapes, [`LedgerIntentWire`], [`LedgerRollbackWire`], [`LedgerTerminalWire`],
 //! [`DeploymentPlanWire`]) and are RECONCILED by a VERIFYING CONVERSION
-//! (`Wire::into_domain`). The conversion checks that every duplicate
-//! projection AGREES — e.g. the intent's `slot_ids` is DUPLICATE-FREE and
-//! its `desired`/`pre_push` key sets EQUAL the authoritative `slot_ids`
-//! membership EXACTLY, each [`crate::identity::GenerationRef`]'s assignment
-//! names its own map key, and the stored `behavior_sha256` equals the digest
-//! derived from the behavior index. A disagreement is an
-//! [`crate::error::Error::integrity`] error (fail closed — a hand-constructed
-//! record can never put the duplicates out of agreement, and the code then
-//! reads whichever projection it happens to use). The rest of the codebase
-//! consumes ONLY the validated domain types; the store's readers convert
-//! wire → domain on read and refuse disagreeing records.
+//! (`Wire::into_domain`). A disagreement is an
+//! [`crate::error::Error::integrity`] error (fail closed). The rest of the
+//! codebase consumes ONLY the validated domain types; the store's readers
+//! convert wire → domain on read and refuse disagreeing records.
 //!
 //! # ONE history ledger per target
 //!
 //! A target's ENTIRE deployment history lives in ONE ordered, append-only
 //! JSONL file: `targets/<target>/ledger.jsonl` — the two physical line
-//! kinds and the merged entry are
-//! [`crate::ledger::append::LedgerLine`] /
-//! [`crate::ledger::entry::LedgerEntry`], owned by
-//! [`crate::ledger::append`] / [`crate::ledger::entry`] (which also
-//! document the crash-atomic append and deployment-id keying contracts):
-//! an intent line ([`crate::ledger::append::LedgerLine::Intent`] → verified
-//! [`crate::ledger::intent::DeploymentIntent`]) is appended BEFORE any
-//! remote mutation and never edited; a terminal line
-//! ([`crate::ledger::append::LedgerLine::Terminal`] → verified
-//! [`crate::ledger::terminal::LedgerTerminal`]) is appended once, after the
-//! mutation loop. A merged entry (intent + optional terminal) is the
-//! deployment's full history record; an entry WITHOUT a terminal is the
-//! CURRENT/INCOMPLETE state (recoverable — the next push reconciles it).
+//! kinds and the merged entry are [`crate::ledger::finalize::LedgerLine`] /
+//! [`LedgerEntry`], owned by [`crate::ledger::finalize`] (which documents
+//! the crash-atomic append and deployment-id keying contracts): an intent
+//! line is appended BEFORE any remote mutation and never edited; a terminal
+//! line is appended once, after the mutation loop. A merged entry (intent +
+//! optional terminal) is the deployment's full history record; an entry
+//! WITHOUT a terminal is the CURRENT/INCOMPLETE state (recoverable — the
+//! next push reconciles it).
 
 use crate::error::{Error, Result};
-use crate::identity::BehaviorDigest;
 use crate::identity::{
-    ArtifactRef, BehaviorContract, DeploymentId, GenerationId, GenerationRef, ReleaseId, ServerId,
-    SlotId, TargetName, TreeDigest,
+    ArtifactRef, BehaviorContract, BehaviorDigest, DeploymentId, GenerationId, GenerationRef,
+    MatchingMembership, PlacementSlotAssignment, ReleaseId, RolloutGroupName, ServerId, SlotId,
+    TargetName, Timestamp, TreeDigest,
 };
-use crate::ledger::observation::{Observation, ObservedSlot};
-use crate::ledger::rebinding::{RebindingPlan, VerifiedReleaseRebinding};
+pub use crate::ledger::tables::{NonEmptySlotTable, SlotTable};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 
-// Re-exports of the moved SHARED collections (their new homes are
-// authoritative): the ordered tables live in [`crate::ledger::tables`], the
-// wire outcome row in [`crate::ledger::outcomes`]. The pre-split
-// `crate::ledger::records::X` paths (e.g. the store/finalize/refs readers)
-// keep compiling through these.
-pub use crate::ledger::outcomes::SlotResult;
-pub use crate::ledger::tables::{NonEmptySlotTable, SlotTable};
+// The shared ordered slot tables are re-exported below (their home is
+// [`crate::ledger::tables`] — generic collection infrastructure, kept
+// separate from the record model) so the pre-split
+// `crate::ledger::records::X` paths keep compiling.
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -794,11 +790,11 @@ mod tests {
         ServerId, SlotSet, Timestamp, VariantName, test_deployment_id, test_generation_id,
         test_release_id, test_tree_digest,
     };
-    use crate::ledger::intent::{DeploymentIntent, LedgerIntentReport, LedgerIntentWire};
-    use crate::ledger::observation::{ObservationError, ObservedGeneration};
-    use crate::ledger::outcomes::{SlotOutcome, SlotOutcomeKind, SlotTransition};
-    use crate::ledger::rebinding::FrozenSlotTopology;
-    use crate::ledger::terminal::{LedgerTerminal, LedgerTerminalWire, TerminalDisposition};
+    use crate::ledger::records::FrozenSlotTopology;
+    use crate::ledger::records::{DeploymentIntent, LedgerIntentReport, LedgerIntentWire};
+    use crate::ledger::records::{LedgerTerminal, LedgerTerminalWire, TerminalDisposition};
+    use crate::ledger::records::{ObservationError, ObservedGeneration};
+    use crate::ledger::records::{SlotOutcome, SlotOutcomeKind, SlotTransition};
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
 
@@ -3061,3 +3057,3546 @@ mod tests {
     // post-mutation observation round-trip and survive failure injection
     // independently
 }
+
+// ---- intent ----
+// The INTENT records of the deployment ledger (feature area A2 "two line
+// kinds — intent"): the durable intent wire/domain pair
+// ([`LedgerIntentWire`] / [`DeploymentIntent`]) with the VERIFYING
+// CONVERSION, the per-slot payload types ([`IntentSlot`],
+// [`DesiredGeneration`], [`PreviousGeneration`]), and the in-memory push
+// report ([`LedgerIntentReport`]). The physical [`crate::ledger::finalize::LedgerLine::Intent`]
+// line lives in [`crate::ledger::finalize`].
+/// The WIRE shape of a durable intent line: the RAW serde form the ledger's
+/// JSONL carries, holding every redundant member the domain reconciles (the
+/// per-slot maps' key sets next to the authoritative `slot_ids` membership,
+/// each [`crate::identity::GenerationRef`]'s assignment slot next to its map
+/// key). [`crate::ledger::finalize::LedgerLine::Intent`] serializes this type; the ledger's wire
+/// format is therefore unchanged (existing ledgers keep loading — the wire
+/// reads the current format). The VERIFYING CONVERSION
+/// ([`LedgerIntentWire::into_domain`]) checks every duplicate projection and
+/// exposes only the validated [`DeploymentIntent`] domain type.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerIntentWire {
+    pub deployment_schema_version: u32,
+    pub deployment_id: DeploymentId,
+    pub target: TargetName,
+    /// The optional rollout group this attempt selected (`deploy push
+    /// <target> --group <name>`). `None` means the attempt selected every
+    /// slot owned by the target. The group name is DESCRIPTIVE (later
+    /// releases may change group membership); the exact selected slot IDs in
+    /// `slot_ids` are the authoritative historical evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// The placement slots participating in this deployment, in deployment
+    /// order (the same set the commit marker `slots` payload records). This
+    /// is the AUTHORITATIVE membership: it must be DUPLICATE-FREE, and the
+    /// `desired` / `pre_push` maps' key sets must EQUAL it EXACTLY (every
+    /// member slot has exactly one desired + one pre_push entry), verified by
+    /// the wire → domain conversion.
+    pub slot_ids: Vec<SlotId>,
+    pub behavior_sha256: String,
+    pub attempted_at: String,
+    /// Desired per-slot assignments (what the plan intended): each slot's
+    /// minted generation for its planned artifact. The key set must equal
+    /// `slot_ids` EXACTLY, and each `GenerationRef`'s assignment must name
+    /// its own map key.
+    pub desired: BTreeMap<SlotId, GenerationRef>,
+    /// Pre-push per-slot state before mutation (`None` if first deployment).
+    /// Each entry's assignment artifact is a THREE-STATE observation
+    /// ([`Observation<ArtifactRef>`]: `Known` / `KnownAbsent` / `Unknown`)
+    /// — an unreadable pre-push assignment is `Unknown(error)`, a distinct
+    /// value that can never be mistaken for a known artifact. The key set
+    /// must equal `slot_ids` EXACTLY.
+    pub pre_push: BTreeMap<SlotId, Option<SlotAttemptState>>,
+    /// Actual per-slot result after the attempt. The persisted ledger intent
+    /// keeps this map EMPTY (outcomes are recorded in the terminal event's
+    /// `outcomes` map); the in-memory REPORT ([`LedgerIntentReport`]) carries
+    /// the observed actuals for display — the verified domain [`DeploymentIntent`]
+    /// does NOT carry this map, so it is not part of the intent's key-set
+    /// invariant. Every key must be a member of `slot_ids`.
+    pub slots: BTreeMap<SlotId, SlotAttemptState>,
+}
+
+impl LedgerIntentWire {
+    /// VERIFYING CONVERSION (wire → domain): every duplicate projection must
+    /// AGREE, and the DOMAIN then enforces the key-set invariant
+    /// STRUCTURALLY. The authoritative membership is `slot_ids`, which must
+    /// be DUPLICATE-FREE and NON-EMPTY, and the `desired` / `pre_push` key
+    /// sets must EQUAL it EXACTLY — every member slot has exactly one
+    /// desired + one pre_push entry; a missing OR extra key (and a duplicated
+    /// member id) fails closed, so an incomplete authoritative projection is
+    /// never read as if the maps were authoritative. Each desired
+    /// [`crate::identity::GenerationRef`]'s assignment must name its own map key,
+    /// and every wire `slots` (actuals) key must be a member of `slot_ids`
+    /// (the persisted intent keeps that map EMPTY — outcomes live in the
+    /// terminal event's `outcomes` map and the in-memory report
+    /// [`LedgerIntentReport`]). The AGREED slots are then COLLAPSED into ONE
+    /// authoritative [`NonEmptySlotTable`] (the domain's
+    /// [`DeploymentIntent::slots`]): the membership + the per-slot maps are a
+    /// single table, so the exact-key-set invariant is STRUCTURAL in the
+    /// domain (no duplicates, no missing keys — `BTreeMap` uniqueness + the
+    /// non-empty refusal below). A disagreement is an [`Error::integrity`]
+    /// error (fail closed — a hand-constructed record can never be read as
+    /// whichever projection a consumer happens to use).
+    pub fn into_domain(self) -> Result<DeploymentIntent> {
+        // The scalar invariants are validated HERE (fail closed): the attempt
+        // timestamp must parse as RFC 3339, and the optional rollout group
+        // must be a well-formed group name. A wire record violating either is
+        // refused with an integrity error before any membership check runs.
+        // (The stored `behavior_sha256` is NOT format-gated here: legacy
+        // records may carry a snapshot-wide digest that is only carried, and
+        // the canonical sha256-form digest is enforced where the value is
+        // INTERPRETED — the in-memory report's [`BehaviorDigest`] and the
+        // plan conversion's derived-digest check.)
+        Timestamp::parse(&self.attempted_at).map_err(|_| {
+            Error::integrity(format!(
+                "intent {}: attempted_at {:?} is not an RFC 3339 timestamp",
+                self.deployment_id, self.attempted_at
+            ))
+        })?;
+        if let Some(g) = &self.group {
+            RolloutGroupName::parse(g).map_err(|_| {
+                Error::integrity(format!(
+                    "intent {}: rollout group {g:?} is not a valid group name",
+                    self.deployment_id
+                ))
+            })?;
+        }
+        // `slot_ids` is the AUTHORITATIVE membership and must be
+        // DUPLICATE-FREE: a duplicated member would silently weaken the
+        // key-set equality below (a set collapses the duplicate, so the
+        // duplicated id would never be checked against the maps).
+        let mut seen: BTreeSet<&SlotId> = BTreeSet::new();
+        for sid in &self.slot_ids {
+            if !seen.insert(sid) {
+                return Err(Error::integrity(format!(
+                    "intent {}: slot_ids carries duplicate slot '{sid}' — the membership must be unique",
+                    self.deployment_id
+                )));
+            }
+        }
+        let membership: BTreeSet<&SlotId> = self.slot_ids.iter().collect();
+        let desired_keys: BTreeSet<&SlotId> = self.desired.keys().collect();
+        let pre_push_keys: BTreeSet<&SlotId> = self.pre_push.keys().collect();
+        // EXACT KEY-SET EQUALITY: every member slot has exactly one desired +
+        // one pre_push entry, and neither map carries a slot the membership
+        // omits — a missing OR extra key fails the conversion (an incomplete
+        // authoritative projection is a disagreement, never read as if the
+        // maps were the membership).
+        if membership != desired_keys {
+            return Err(Error::integrity(format!(
+                "intent {}: slot_ids {:?} disagrees with the desired key set {:?} — every member slot needs exactly one desired entry",
+                self.deployment_id, membership, desired_keys
+            )));
+        }
+        if membership != pre_push_keys {
+            return Err(Error::integrity(format!(
+                "intent {}: slot_ids {:?} disagrees with the pre_push key set {:?} — every member slot needs exactly one pre_push entry",
+                self.deployment_id, membership, pre_push_keys
+            )));
+        }
+        // An EMPTY membership is refused here: the domain intent's slots are
+        // a [`NonEmptySlotTable`], so a deployment that selects no slot is
+        // unrepresentable in the domain (and meaningless — a push always
+        // selects at least one slot).
+        if membership.is_empty() {
+            return Err(Error::integrity(format!(
+                "intent {}: slot_ids is empty — the domain refuses an empty deployment membership",
+                self.deployment_id
+            )));
+        }
+        for (key, g) in &self.desired {
+            if &g.assignment.placement_slot != key {
+                return Err(Error::integrity(format!(
+                    "intent {}: desired assignment for slot '{key}' names placement '{}'",
+                    self.deployment_id, g.assignment.placement_slot
+                )));
+            }
+        }
+        // The wire `slots` (actuals) map is the REPORT's map in the old
+        // single-datatype design; it is persisted EMPTY. The domain intent
+        // does NOT carry it; any wire key must still be a member — fail
+        // closed.
+        for key in self.slots.keys() {
+            if !membership.contains(key) {
+                return Err(Error::integrity(format!(
+                    "intent {}: slots key '{key}' is not in slot_ids",
+                    self.deployment_id
+                )));
+            }
+        }
+        // COLLAPSE the three projections into ONE table, in the wire's
+        // `slot_ids` SEQUENCE order (the deployment order) — never the
+        // sorted-by-id order of the per-slot maps. The exact-key-set
+        // equality verified above guarantees every member has its desired +
+        // pre_push entry, so each member's facts are read by member id.
+        let slots: Vec<(SlotId, IntentSlot)> =
+            self.slot_ids
+                .iter()
+                .map(|key| {
+                    let desired = &self.desired[key];
+                    let pre_push = self.pre_push.get(key).and_then(|p| p.clone()).map(|p| {
+                        PreviousGeneration {
+                            artifact: p.artifact,
+                            generation: p.generation,
+                        }
+                    });
+                    (
+                        key.clone(),
+                        IntentSlot {
+                            desired: DesiredGeneration {
+                                generation: desired.generation.clone(),
+                                artifact: desired.assignment.artifact.clone(),
+                            },
+                            pre_push,
+                        },
+                    )
+                })
+                .collect();
+        Ok(DeploymentIntent {
+            deployment_id: self.deployment_id,
+            target: self.target,
+            group: self.group,
+            behavior_sha256: self.behavior_sha256,
+            attempted_at: self.attempted_at,
+            slots: NonEmptySlotTable::build(slots)?,
+        })
+    }
+}
+
+/// ONE member slot's slot-table entry: the DESIRED assignment (the
+/// generation the plan minted for the slot's planned artifact) plus the
+/// OPTIONAL PRE-PUSH state (what the slot ran before the attempt — `None`
+/// for a first deployment). The slot id itself is the enclosing
+/// [`NonEmptySlotTable`] key — the enclosing object owns identity, so
+/// neither payload re-declares it (the wire's redundant projections are
+/// verified and dropped by the conversion).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentSlot {
+    pub desired: DesiredGeneration,
+    pub pre_push: Option<PreviousGeneration>,
+}
+
+/// One slot's DESIRED generation: the generation the plan minted for the
+/// slot's planned artifact. The DOMAIN form of the wire's per-slot
+/// [`crate::identity::GenerationRef`] with the REDUNDANT assignment slot
+/// dropped (the enclosing table key owns the slot identity — "store each
+/// fact exactly once"); the wire conversion verifies the assignment named
+/// its own map key before dropping it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesiredGeneration {
+    pub generation: GenerationId,
+    /// The artifact (release, variant, tree) the slot planned to advance to.
+    pub artifact: ArtifactRef,
+}
+
+/// One slot's PRE-PUSH state before the attempt: what the slot ran
+/// (`artifact`, a three-state observation) and the generation it was on
+/// (`None` when only the pre-push state is unknown / the slot was never
+/// deployed). The DOMAIN form of the wire's [`SlotAttemptState`] under the
+/// table's name; the enclosing table key owns the slot. The artifact is an
+/// [`Observation`]: an unreadable pre-push assignment is `Unknown(error)` —
+/// a distinct value, never a valid-looking artifact.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviousGeneration {
+    pub artifact: Observation<ArtifactRef>,
+    pub generation: Option<GenerationId>,
+}
+
+/// The durable INTENT of one deployment attempt, the VALIDATED DOMAIN form
+/// of [`LedgerIntentWire`]: what was planned and observed BEFORE any server
+/// mutation. Appended once to the target's ledger ([`crate::ledger::finalize::LedgerLine::Intent`])
+/// BEFORE the remote mutation phase (a crash after servers advanced to new
+/// generations can never lose the deployment: the intent is already durable
+/// and the next push reconciles it) and never edited. The attempt's STATUS,
+/// per-slot OUTCOMES and (when successful) ROLLBACK STATE come from its
+/// TERMINAL EVENT ([`LedgerTerminal`]), never from this record.
+///
+/// STORE EACH FACT EXACTLY ONCE: the wire's `slot_ids` / `desired` /
+/// `pre_push` split collapses into ONE authoritative table
+/// [`DeploymentIntent::slots`] — the membership AND the per-slot maps are a
+/// single [`NonEmptySlotTable<IntentSlot>`], so the exact-key-set invariant
+/// (`slot_ids == desired == pre_push`, no duplicates) is STRUCTURAL: the
+/// table has no duplicates (`BTreeMap` keys) and no missing keys (non-empty,
+/// every member carries its desired + pre_push entry). The `group`,
+/// `behavior_sha256` and `attempted_at` members are SINGLE facts (display /
+/// rollback context), not duplicated projections — they are not part of the
+/// reshape. The wire `deployment_schema_version` is a WIRE format concern
+/// (checked by the reader on the wire, refused if not
+/// [`crate::ledger::LEDGER_SCHEMA_VERSION`]); the validated domain does not
+/// carry it and writers emit exactly the constant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeploymentIntent {
+    pub deployment_id: DeploymentId,
+    pub target: TargetName,
+    /// The optional rollout group this attempt selected (`deploy push
+    /// <target> --group <name>`). `None` means the attempt selected every
+    /// slot owned by the target. The group name is DESCRIPTIVE (later
+    /// releases may change group membership); the exact selected slot IDs in
+    /// `slots` are the authoritative historical evidence. Single fact
+    /// (display), not a duplicated projection.
+    pub group: Option<String>,
+    /// The attempt's behavior digest (see [`LedgerIntentWire`]). Single
+    /// fact (wire round-trip), not a duplicated projection.
+    pub behavior_sha256: String,
+    /// When the intent was recorded (RFC 3339). Single fact (display).
+    pub attempted_at: String,
+    /// THE AUTHORITATIVE SLOT TABLE: the deployment's membership (the keys)
+    /// and each member's desired + pre-push entries, ONE table. Non-empty +
+    /// unique by construction ([`NonEmptySlotTable`]) — the exact-key-set
+    /// invariant is structural here, not checked.
+    pub slots: NonEmptySlotTable<IntentSlot>,
+}
+
+impl DeploymentIntent {
+    /// The deployment's membership: the AUTHORITATIVE selected placement
+    /// slots (in deployment order — the table's key order).
+    pub fn membership(&self) -> Vec<SlotId> {
+        self.slots.keys().cloned().collect()
+    }
+
+    /// The distinct releases referenced by the intent's per-slot desired
+    /// assignments — DERIVED from the authoritative `slots` table, never
+    /// stored separately (a partial snapshot can span several releases).
+    pub fn releases(&self) -> BTreeSet<ReleaseId> {
+        self.slots
+            .values()
+            .map(|s| s.desired.artifact.release.clone())
+            .collect()
+    }
+}
+
+impl From<&DeploymentIntent> for LedgerIntentWire {
+    fn from(i: &DeploymentIntent) -> Self {
+        // Re-expand the ONE table into the wire's split shape (slot_ids +
+        // desired + pre_push) for serialization; the reader re-collapses it.
+        // The member order is the table's key order (deployment order).
+        let slot_ids: Vec<SlotId> = i.slots.keys().cloned().collect();
+        let desired: BTreeMap<SlotId, GenerationRef> = i
+            .slots
+            .iter()
+            .map(|(key, s)| {
+                (
+                    key.clone(),
+                    GenerationRef {
+                        generation: s.desired.generation.clone(),
+                        assignment: PlacementSlotAssignment {
+                            placement_slot: key.clone(),
+                            artifact: s.desired.artifact.clone(),
+                        },
+                    },
+                )
+            })
+            .collect();
+        let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> = i
+            .slots
+            .iter()
+            .map(|(key, s)| {
+                (
+                    key.clone(),
+                    s.pre_push.as_ref().map(|p| SlotAttemptState {
+                        artifact: p.artifact.clone(),
+                        generation: p.generation.clone(),
+                    }),
+                )
+            })
+            .collect();
+        LedgerIntentWire {
+            deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
+            deployment_id: i.deployment_id.clone(),
+            target: i.target.clone(),
+            group: i.group.clone(),
+            slot_ids,
+            behavior_sha256: i.behavior_sha256.clone(),
+            attempted_at: i.attempted_at.clone(),
+            desired,
+            pre_push,
+            // The persisted intent carries NO outcomes: the wire keeps the
+            // `slots` member EMPTY (outcomes live in the terminal event's
+            // `outcomes` map; the in-memory report [`LedgerIntentReport`]
+            // carries the observed actuals).
+            slots: BTreeMap::new(),
+        }
+    }
+}
+
+/// The in-memory push REPORT form of a deployment attempt: the verified
+/// intent fields PLUS the observed per-slot ACTUALS (`slots`). Built in
+/// memory from the durable intent at push time and NEVER persisted: the
+/// ledger's intent line carries NO outcomes (the wire [`LedgerIntentWire`]
+/// keeps its `slots` map empty; outcomes live in the terminal event's
+/// `outcomes` map and the rollback payload). Keeping the report as its OWN
+/// type — rather than reusing [`DeploymentIntent`] — means the verified
+/// intent object never carries an outcomes map, so the intent's structural
+/// key-set invariant is not weakened by a report map that is not part of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LedgerIntentReport {
+    pub deployment_id: DeploymentId,
+    pub target: TargetName,
+    /// The optional rollout group this attempt selected, as a validated
+    /// [`RolloutGroupName`] (parsed from the verified intent's group string).
+    pub group: Option<RolloutGroupName>,
+    pub slot_ids: Vec<SlotId>,
+    /// The attempt's behavior digest, as a validated [`BehaviorDigest`]
+    /// (parsed from the wire's `behavior_sha256` string).
+    pub behavior_sha256: BehaviorDigest,
+    /// When the attempt was recorded, as a parsed RFC 3339 [`Timestamp`].
+    pub attempted_at: Timestamp,
+    /// Desired per-slot assignments, re-expanded from the domain table (the
+    /// report is display-facing and keeps the wire's split shape).
+    pub desired: BTreeMap<SlotId, GenerationRef>,
+    /// Pre-push per-slot state before mutation, re-expanded from the domain
+    /// table (same observation-shaped [`SlotAttemptState`] as the wire — an
+    /// unknown assignment is `Observation::Unknown`, never a sentinel
+    /// artifact).
+    pub pre_push: BTreeMap<SlotId, Option<SlotAttemptState>>,
+    /// Actual per-slot result after the attempt, for display. The report is
+    /// in-memory only — the persisted intent never carries this map.
+    pub slots: BTreeMap<SlotId, SlotAttemptState>,
+}
+
+impl LedgerIntentReport {
+    /// Build the in-memory report from a verified domain intent, parsing the
+    /// intent's bare strings into the validated scalars AND re-expanding the
+    /// one slot table into the display-facing split maps. The intent's values
+    /// were already scalar-gated by the wire → domain conversion
+    /// ([`LedgerIntentWire::into_domain`]), so the parses succeed in
+    /// practice; a violation still fails closed with an integrity error
+    /// rather than constructing an invalid report.
+    pub fn from_intent(i: &DeploymentIntent) -> Result<LedgerIntentReport> {
+        let group = match &i.group {
+            Some(g) => Some(RolloutGroupName::parse(g).map_err(|_| {
+                Error::integrity(format!(
+                    "intent {}: rollout group {g:?} is not a valid group name",
+                    i.deployment_id
+                ))
+            })?),
+            None => None,
+        };
+        // Re-expand the ONE table into the display-facing split maps.
+        let slot_ids: Vec<SlotId> = i.slots.keys().cloned().collect();
+        let desired: BTreeMap<SlotId, GenerationRef> = i
+            .slots
+            .iter()
+            .map(|(key, s)| {
+                (
+                    key.clone(),
+                    GenerationRef {
+                        generation: s.desired.generation.clone(),
+                        assignment: PlacementSlotAssignment {
+                            placement_slot: key.clone(),
+                            artifact: s.desired.artifact.clone(),
+                        },
+                    },
+                )
+            })
+            .collect();
+        let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> = i
+            .slots
+            .iter()
+            .map(|(key, s)| {
+                (
+                    key.clone(),
+                    s.pre_push.as_ref().map(|p| SlotAttemptState {
+                        artifact: p.artifact.clone(),
+                        generation: p.generation.clone(),
+                    }),
+                )
+            })
+            .collect();
+        Ok(LedgerIntentReport {
+            deployment_id: i.deployment_id.clone(),
+            target: i.target.clone(),
+            group,
+            slot_ids,
+            behavior_sha256: BehaviorDigest::parse(&i.behavior_sha256).map_err(|_| {
+                Error::integrity(format!(
+                    "intent {}: stored behavior_sha256 {:?} is not a sha256 digest",
+                    i.deployment_id, i.behavior_sha256
+                ))
+            })?,
+            attempted_at: Timestamp::parse(&i.attempted_at).map_err(|_| {
+                Error::integrity(format!(
+                    "intent {}: attempted_at {:?} is not an RFC 3339 timestamp",
+                    i.deployment_id, i.attempted_at
+                ))
+            })?,
+            desired,
+            pre_push,
+            slots: BTreeMap::new(),
+        })
+    }
+}
+
+impl Serialize for DeploymentIntent {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        LedgerIntentWire::from(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DeploymentIntent {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = LedgerIntentWire::deserialize(deserializer)?;
+        wire.into_domain()
+            .map_err(|e| serde::de::Error::custom(e.to_string()))
+    }
+}
+
+// ---- terminal ----
+// The TERMINAL records of the deployment ledger (feature area A2 "two line
+// kinds — terminal"): the terminal wire/domain pair ([`LedgerTerminalWire`]
+// / [`LedgerTerminal`]) with the VERIFYING CONVERSION, the
+// [`TerminalDisposition`] enum (each disposition OWNS its per-slot outcome
+// table), and the status accessor. The outcome DERIVATIONS
+// ([`LedgerTerminal::remaining_changes`], [`LedgerTerminal::compensation`])
+// live in [`crate::ledger::records`]; the physical
+// [`crate::ledger::finalize::LedgerLine::Terminal`] line lives in
+// [`crate::ledger::finalize`].
+/// The DISPOSITION of a deployment's terminal event — the DOMAIN replaces
+/// the wire's `status: String` + optional rollback TAG-PLUS-OPTIONAL-PAYLOAD
+/// shape with an ENUM whose variants carry exactly the payload their
+/// disposition allows, so the STATUS/ROLLBACK TRUTH TABLE is STRUCTURAL
+/// (unrepresentable-invalid states simply do not exist in the domain):
+///
+/// * [`TerminalDisposition::Successful`] ALWAYS carries its complete
+///   rollback payload (a successful deployment always records its rollback
+///   state — the generation refs + physical bindings, the ONE fact the
+///   per-slot outcomes cannot express) AND its OWN per-slot outcomes table
+///   (every outcome Activated) AND the TWO PERSISTED MEMBERSHIPS —
+///   `selected_membership` (the slots the push actually deployed, EQUAL to
+///   the outcomes' keys) and `full_membership` (the COMPLETE target
+///   membership at terminal time, EQUAL to the rollback's slots) — so the
+///   record PROVES the membership equations instead of implying them. The
+///   rollback is the COMPLETE resulting target snapshot: for a GROUP push
+///   the base-overlay carries the unselected slots forward, so the
+///   rollback's slots ⊇ the outcomes' keys (the outcomes cover the
+///   SELECTED slots; for a FULL push the terminal's own memberships satisfy
+///   selected == full — enforced where the terminal merges into its entry,
+///   via the intent's `group`).
+/// * [`TerminalDisposition::FailedPreflight`] carries NOTHING — a
+///   pre-mutation failure cannot carry a rollback, and no slot was touched
+///   (the conversion refuses outcomes).
+/// * [`TerminalDisposition::FailedRolledBack`] carries its OWN per-slot
+///   outcomes table — the COMPENSATION REPORT (the per-slot results of the
+///   compensation pass) IS that table, exposed via
+///   [`LedgerTerminal::compensation`], never stored twice.
+/// * [`TerminalDisposition::Degraded`] carries its OWN per-slot outcomes
+///   table — its REMAINING CHANGES (the slots that did not reach a restored
+///   state, each mapped to the generation it recorded) are DERIVED from that
+///   table via [`LedgerTerminal::remaining_changes`], never stored twice
+///   (NON-EMPTY by construction — the conversion refuses a Degraded wire
+///   whose outcomes show all-restored).
+///
+/// LET EACH DISPOSITION OWN ITS OUTCOME TABLE: the per-slot OUTCOMES are
+/// the authoritative per-slot facts and they live ONCE, INSIDE the
+/// disposition — there is no separate `LedgerTerminal.outcomes` field to
+/// disagree with. The disposition carries ONLY what the outcomes cannot
+/// express (the Successful rollback payload). The WIRE keeps the current
+/// `status` + `rollback` shape; the wire → domain conversion maps every
+/// status to EXACTLY ONE disposition and refuses a status whose payload does
+/// not match its disposition (a `Successful` with no rollback, a failed
+/// status carrying a rollback, a `Degraded` whose outcomes show all-restored,
+/// a `Successful` whose outcomes disagree with the rollback's slots, an
+/// `InProgress`/`PendingCommit` terminal — all are conversion errors, fail
+/// closed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalDisposition {
+    /// The deployment succeeded: the complete rollback payload (the full
+    /// snapshot: per-slot generations + physical bindings — the ONE fact
+    /// the per-slot outcomes cannot express), the disposition's OWN
+    /// per-slot outcomes table (every outcome Activated — enforced by the
+    /// conversion), and the TWO PERSISTED MEMBERSHIPS that PROVE the
+    /// membership equations: `selected_membership` (the slots the push
+    /// actually deployed — EQUAL to the outcomes' keys, enforced by the
+    /// conversion) and `full_membership` (the COMPLETE target membership
+    /// at terminal time — EQUAL to the rollback's slots, enforced by the
+    /// conversion). `selected_membership ⊆ full_membership` is enforced by
+    /// the conversion; the FULL-push equality `selected_membership ==
+    /// full_membership` is enforced where the terminal merges into its
+    /// entry (the mode — group vs full — lives in the intent's `group`).
+    /// The rollback is the COMPLETE resulting target snapshot: for a GROUP
+    /// push the base-overlay carries the unselected slots forward, so the
+    /// rollback's slots ⊇ the outcomes' keys (the outcomes cover the
+    /// SELECTED slots; the full-push EQUALITY selected == full applies only
+    /// to a FULL push, enforced where the terminal merges into its entry
+    /// (the mode lives in the intent's `group`).
+    Successful {
+        rollback: CompleteRollback,
+        outcomes: SlotTable<SlotOutcome>,
+        /// The SELECTED membership: the slots this deployment actually
+        /// selected / deployed — the outcomes' keys (a group push's group
+        /// slots; a full push's every target slot). EQUAL to the outcomes'
+        /// keys by construction — the conversion refuses a disagreement,
+        /// so the record PROVES which slots were selected.
+        selected_membership: BTreeSet<SlotId>,
+        /// The FULL membership: the COMPLETE target membership at terminal
+        /// time — the rollback's key set (the `current_slot_ids` the
+        /// engine computes). EQUAL to the rollback's slots by construction
+        /// — the conversion refuses a disagreement, so the record PROVES
+        /// the complete membership the rollback snapshot covers.
+        full_membership: BTreeSet<SlotId>,
+    },
+    /// The attempt failed before any slot mutation: no payload (no
+    /// rollback — and the conversion also refuses outcomes, since a
+    /// pre-mutation failure touched no slot).
+    FailedPreflight,
+    /// The attempt failed after mutating slots and was rolled back: the
+    /// disposition's OWN per-slot outcomes table — the compensation report
+    /// (each slot's per-slot result of the compensation pass: which slots
+    /// were restored and which compensation failed) IS that table, exposed
+    /// via [`LedgerTerminal::compensation`].
+    FailedRolledBack { outcomes: SlotTable<SlotOutcome> },
+    /// The attempt ended degraded (some slots advanced and were not
+    /// restored, or the commit could not be finalized): the disposition's
+    /// OWN per-slot outcomes table — the REMAINING CHANGES (the slots that
+    /// did not reach a restored state, each mapped to the generation it
+    /// recorded) are DERIVED from that table via
+    /// [`LedgerTerminal::remaining_changes`] (NON-EMPTY by construction —
+    /// the conversion refuses a Degraded wire whose outcomes show
+    /// all-restored).
+    Degraded { outcomes: SlotTable<SlotOutcome> },
+}
+
+impl TerminalDisposition {
+    /// The disposition's status — the inverse of the wire's
+    /// status→disposition mapping (a domain terminal derives its status
+    /// from its disposition; the two are never stored side by side).
+    pub fn status(&self) -> DeploymentStatus {
+        match self {
+            TerminalDisposition::Successful { .. } => DeploymentStatus::Successful,
+            TerminalDisposition::FailedPreflight => DeploymentStatus::FailedPreflight,
+            TerminalDisposition::FailedRolledBack { .. } => DeploymentStatus::FailedRolledBack,
+            TerminalDisposition::Degraded { .. } => DeploymentStatus::Degraded,
+        }
+    }
+
+    pub fn is_successful(&self) -> bool {
+        matches!(self, TerminalDisposition::Successful { .. })
+    }
+}
+
+/// The TERMINAL EVENT of one deployment, the VALIDATED DOMAIN form of
+/// [`LedgerTerminalWire`]. Appended ONCE to the target's ledger after the
+/// mutation loop; the entry's current status is the status of its terminal
+/// event (an entry WITHOUT a terminal is the recoverable in-progress /
+/// pending-commit state).
+///
+/// LET THE ENCLOSING OBJECT OWN IDENTITY: the domain terminal does NOT carry
+/// `deployment_id` / `target` — the merged [`crate::ledger::finalize::LedgerEntry`] owns them (the
+/// intent's, verified equal by the reader when the terminal merges into its
+/// entry). The terminal's own shape is the disposition enum: the
+/// status/rollback TRUTH TABLE is STRUCTURAL (see [`TerminalDisposition`])
+/// — an invalid status/payload combination is unrepresentable.
+///
+/// LET EACH DISPOSITION OWN ITS OUTCOME TABLE: the per-slot OUTCOMES are
+/// the authoritative per-slot facts and they live ONCE, INSIDE the
+/// disposition ([`TerminalDisposition`]) — there is NO separate
+/// `LedgerTerminal.outcomes` field to disagree with. The disposition's
+/// per-slot projections — the Degraded REMAINING CHANGES and the
+/// FailedRolledBack COMPENSATION REPORT — are DERIVED from the
+/// disposition's OWN table ([`LedgerTerminal::remaining_changes`],
+/// [`LedgerTerminal::compensation`]), never stored twice, so they can never
+/// disagree with the outcomes. `reason` carries optional human context
+/// (e.g. "push completed", "recovery finalized", "preflight failed") — a
+/// free-form human NOTE, not a fact: it never participates in any invariant
+/// (the disposition IS the machine fact).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LedgerTerminal {
+    /// When the terminal event was recorded (RFC 3339).
+    pub recorded_at: String,
+    /// HOW the attempt ended — the enum whose variants carry exactly their
+    /// payload: each disposition OWNS its per-slot outcomes table (the
+    /// truth table is structural; the per-slot projections are derived from
+    /// the disposition's OWN table).
+    pub disposition: TerminalDisposition,
+    /// Optional human context: why this terminal event happened. A
+    /// free-form NOTE, not a fact — it never participates in invariants
+    /// (the disposition is the machine fact).
+    pub reason: Option<String>,
+}
+
+/// The empty outcomes table a [`TerminalDisposition::FailedPreflight`]
+/// terminal yields through [`LedgerTerminal::outcomes`] — the disposition
+/// carries NO outcomes (a pre-mutation failure touched no slot), so the
+/// accessor yields an empty table rather than `None`.
+static EMPTY_OUTCOMES: SlotTable<SlotOutcome> = SlotTable::new();
+
+impl LedgerTerminal {
+    /// The terminal's status, DERIVED from its disposition (never stored
+    /// separately — a status and a disposition can never disagree).
+    pub fn status(&self) -> DeploymentStatus {
+        self.disposition.status()
+    }
+
+    /// The terminal's per-slot outcomes — the disposition's OWN table (each
+    /// disposition carries its outcomes; a
+    /// [`TerminalDisposition::FailedPreflight`] terminal carries none, so
+    /// the accessor yields an empty table). THE AUTHORITATIVE per-slot
+    /// facts live ONCE, inside the disposition — there is no separate
+    /// outcomes field to disagree with.
+    pub fn outcomes(&self) -> &SlotTable<SlotOutcome> {
+        match &self.disposition {
+            TerminalDisposition::Successful { outcomes, .. } => outcomes,
+            TerminalDisposition::FailedPreflight => &EMPTY_OUTCOMES,
+            TerminalDisposition::FailedRolledBack { outcomes } => outcomes,
+            TerminalDisposition::Degraded { outcomes } => outcomes,
+        }
+    }
+
+    /// The terminal's SELECTED MEMBERSHIP — the slots this deployment
+    /// actually selected / deployed (the outcomes' keys; for a group push
+    /// the group's slots; for a full push every target slot). PERSISTED in
+    /// the record and EQUAL to the outcomes' keys by construction (the
+    /// wire → domain conversion refuses a disagreement), so a consumer can
+    /// display or prove which slots the push selected WITHOUT re-deriving
+    /// it from the intent. `None` for every non-Successful disposition
+    /// (a failed attempt never proves a membership).
+    pub fn selected_membership(&self) -> Option<&BTreeSet<SlotId>> {
+        match &self.disposition {
+            TerminalDisposition::Successful {
+                selected_membership,
+                ..
+            } => Some(selected_membership),
+            _ => None,
+        }
+    }
+
+    /// The terminal's FULL MEMBERSHIP — the COMPLETE target membership at
+    /// terminal time (the `current_slot_ids` the engine computed; the
+    /// rollback's key set). PERSISTED in the record and EQUAL to the
+    /// rollback's slots by construction (the wire → domain conversion
+    /// refuses a disagreement), so a consumer can display or prove the
+    /// complete membership the rollback snapshot covers WITHOUT
+    /// re-deriving it from the current configuration. `None` for every
+    /// non-Successful disposition.
+    pub fn full_membership(&self) -> Option<&BTreeSet<SlotId>> {
+        match &self.disposition {
+            TerminalDisposition::Successful {
+                full_membership, ..
+            } => Some(full_membership),
+            _ => None,
+        }
+    }
+}
+
+/// The WIRE shape of a terminal event — the RAW serde form the ledger's
+/// JSONL carries: the current `status` + optional `rollback`
+/// tag-plus-optional-payload shape, plus the deployment/target identity the
+/// ENTRY owns in the domain (the wire keeps them; the conversion and the
+/// reader verify they equal the enclosing entry's). A SUCCESSFUL terminal
+/// additionally persists BOTH memberships (`selected_membership` /
+/// `full_membership`) — REQUIRED fields since schema v3 (no serde default,
+/// so an old-shape terminal line fails deserialization fail-closed) — so
+/// the record PROVES the membership equations instead of implying them. The
+/// terminal's own duplicates — the STATUS/ROLLBACK TRUTH TABLE
+/// (`Successful` ⇔ rollback present), each outcome's value naming its own
+/// key, and the membership equations (outcomes == selected_membership,
+/// rollback slots == full_membership, selected ⊆ full) — are verified by
+/// the conversion; the CROSS-RECORD agreement (every outcome key a member
+/// of the intent's `slot_ids`, the FULL-push selected == full equality via
+/// the intent's `group`, the `target` field vs the read path and the
+/// intent) is enforced where the intent and terminal merge
+/// ([`crate::store::local::LocalStore::read_ledger`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerTerminalWire {
+    pub deployment_id: DeploymentId,
+    pub target: TargetName,
+    pub status: DeploymentStatus,
+    pub recorded_at: String,
+    pub outcomes: BTreeMap<SlotId, SlotResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback: Option<LedgerRollbackWire>,
+    /// The SELECTED membership — the slots this deployment actually
+    /// selected / deployed (the outcomes' keys; a group push's group
+    /// slots; a full push's every target slot). REQUIRED since schema v3
+    /// (no serde default — an old-shape terminal line fails
+    /// deserialization fail-closed): the wire → domain conversion requires
+    /// it DUPLICATE-FREE and — for a `Successful` status — NON-EMPTY and
+    /// EXACTLY EQUAL to the outcomes' keys, so the record PROVES which
+    /// slots were selected.
+    pub selected_membership: Vec<SlotId>,
+    /// The FULL membership — the COMPLETE target membership at terminal
+    /// time (the `current_slot_ids` the engine computes). REQUIRED since
+    /// schema v3 (no serde default): the wire → domain conversion requires
+    /// it DUPLICATE-FREE and — for a `Successful` status — NON-EMPTY and
+    /// EXACTLY EQUAL to the rollback's slots, so the record PROVES the
+    /// complete membership the rollback snapshot covers.
+    pub full_membership: Vec<SlotId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Validate ONE wire membership list ([`LedgerTerminalWire::selected_membership`]
+/// / [`LedgerTerminalWire::full_membership`]): DUPLICATE-FREE and converted to
+/// the SORTED UNIQUE SET the domain carries ([`BTreeSet`]). A duplicated
+/// member would silently weaken the set equations (the set collapses the
+/// duplicate, so the duplicated id would never be checked against the
+/// outcomes / rollback) — a duplicate fails closed, like the intent's
+/// `slot_ids`. The equations themselves are enforced by the caller
+/// ([`LedgerTerminalWire::into_domain`]).
+fn membership_wire_to_set(
+    deployment_id: &DeploymentId,
+    what: &str,
+    wire: Vec<SlotId>,
+) -> Result<BTreeSet<SlotId>> {
+    let mut set: BTreeSet<SlotId> = BTreeSet::new();
+    for sid in wire {
+        if !set.insert(sid.clone()) {
+            return Err(Error::integrity(format!(
+                "terminal {deployment_id}: {what} carries duplicate slot '{sid}' — the membership must be unique"
+            )));
+        }
+    }
+    Ok(set)
+}
+
+impl LedgerTerminalWire {
+    /// VERIFYING CONVERSION (wire → domain): the rollback payload is
+    /// converted through [`LedgerRollbackWire::into_domain`] (which fails
+    /// closed on any disagreement), the STATUS/ROLLBACK TRUTH TABLE is
+    /// enforced (`Successful` always records its rollback state; every other
+    /// status never carries one), each wire outcome's value must name its OWN
+    /// map key (the outcome's `slot_id` is the placement slot it records —
+    /// the redundant slot is then DROPPED into the key, since the domain
+    /// value carries no slot), and the disposition's duplicated projections
+    /// must AGREE with the authoritative outcomes, BY STATUS. A `Successful`
+    /// wire must additionally carry NON-EMPTY, DUPLICATE-FREE
+    /// `selected_membership` / `full_membership` lists satisfying THE
+    /// MEMBERSHIP EQUATIONS (the terminal-local half): outcomes ==
+    /// selected_membership (the outcomes are the selected slots' results),
+    /// rollback slots == full_membership (the rollback is the COMPLETE
+    /// resulting snapshot), and selected_membership ⊆ full_membership (a
+    /// group push's selected set is a subset of the full target; the
+    /// FULL-push EQUALITY — selected == full — is the cross-record leg
+    /// enforced by the ledger read, where the intent's `group` carries the
+    /// mode). Every other status must carry NO memberships (only a
+    /// Successful terminal proves them — a failed status with memberships is
+    /// a disagreement, refused). A `FailedPreflight` wire must carry NO
+    /// outcomes (a pre-mutation failure touched no slot), and a `Degraded`
+    /// wire's outcomes must derive a NON-EMPTY remaining-changes set
+    /// (all-restored outcomes are refused). A disagreement →
+    /// `Error::integrity`. The cross-record claims (every outcome key a
+    /// member of the intent's `slot_ids`, the FULL-push selected == full
+    /// equality via the intent's `group`, and the `target` field vs the read
+    /// path / intent) are enforced by the ledger read that merges the intent
+    /// and the terminal ([`crate::store::local::LocalStore::read_ledger`]).
+    pub fn into_domain(self) -> Result<LedgerTerminal> {
+        // The recorded timestamp must parse as RFC 3339 (fail closed).
+        Timestamp::parse(&self.recorded_at).map_err(|_| {
+            Error::integrity(format!(
+                "terminal {}: recorded_at {:?} is not an RFC 3339 timestamp",
+                self.deployment_id, self.recorded_at
+            ))
+        })?;
+        // THE MEMBERSHIPS ARE VALIDATED FIRST: each wire membership list must
+        // be DUPLICATE-FREE — a duplicated member would silently weaken the
+        // set equations below (the set collapses the duplicate, so the
+        // duplicated id would never be checked against the outcomes /
+        // rollback). The validated form is the SORTED UNIQUE SET
+        // ([`BTreeSet`]) the domain carries.
+        let selected_membership = membership_wire_to_set(
+            &self.deployment_id,
+            "selected_membership",
+            self.selected_membership,
+        )?;
+        let full_membership =
+            membership_wire_to_set(&self.deployment_id, "full_membership", self.full_membership)?;
+        // Only a Successful terminal proves a membership: a failed status
+        // carrying memberships is dead, unenforced data — refused (fail
+        // closed), never silently dropped.
+        if self.status != DeploymentStatus::Successful
+            && (!selected_membership.is_empty() || !full_membership.is_empty())
+        {
+            return Err(Error::integrity(format!(
+                "terminal {}: status {:?} must carry NO memberships — only a Successful terminal records its selected/full membership (the memberships prove the push)",
+                self.deployment_id, self.status
+            )));
+        }
+        let rollback = match self.rollback {
+            Some(wire) => Some(wire.into_domain()?),
+            None => None,
+        };
+        // OUTCOME OWN-KEY AGREEMENT (self-contained half): each wire
+        // outcome's value names ITS OWN map key — an outcome for a different
+        // slot is a disagreement. (The other half — the outcome KEY SET vs
+        // the intent's authoritative membership — is cross-record and lives
+        // in the ledger read that merges intent + terminal.)
+        for (key, result) in &self.outcomes {
+            if &result.slot_id != key {
+                return Err(Error::integrity(format!(
+                    "terminal {}: outcome for slot '{key}' names placement '{}'",
+                    self.deployment_id, result.slot_id
+                )));
+            }
+        }
+        // The wire outcomes are converted to the DOMAIN outcomes, deriving
+        // each slot's TRANSITION STATE from the wire's status/outcome fields
+        // ([`SlotOutcome::from_wire`]) and DROPPING the wire outcome's
+        // redundant `slot_id` into the key (the domain value carries no slot
+        // — the table key owns identity; the own-key agreement above
+        // verified the wire's claim before the drop).
+        let outcomes: SlotTable<SlotOutcome> = SlotTable::from_map(self.outcomes);
+        // STATUS → DISPOSITION: each status maps to exactly one disposition,
+        // and a status whose payload does not match its disposition is a
+        // conversion error (fail closed).
+        let disposition = match (&self.status, rollback) {
+            (DeploymentStatus::Successful, Some(rollback)) => {
+                // THE SUCCESSFUL SNAPSHOT RULE (terminal-local half): the
+                // outcomes are the SELECTED slots' results, the rollback is
+                // the COMPLETE resulting target snapshot (for a GROUP push
+                // the rollback carries the unselected slots forward from the
+                // base), and the PERSISTED MEMBERSHIPS PROVE the equations:
+                // outcomes == selected_membership, rollback slots ==
+                // full_membership, and selected_membership ⊆
+                // full_membership. The rollback's own conversion already
+                // guarantees bindings == slots; the FULL-push EQUALITY
+                // (selected == full) is the cross-record leg enforced where
+                // the terminal merges into its entry (the mode — group vs
+                // full — lives in the intent's `group`). A successful
+                // deployment always records non-empty outcomes and both
+                // memberships NON-EMPTY (a successful deployment selected
+                // and covered at least one slot).
+                let outcome_keys: BTreeSet<SlotId> = outcomes.keys().cloned().collect();
+                let rollback_slot_keys: BTreeSet<SlotId> = rollback.slots.keys().cloned().collect();
+                // THE MEMBERSHIP EQUATIONS (terminal-local half) are enforced
+                // by the SHARED helper in [`crate::ledger::records`]:
+                // outcomes == selected_membership, rollback slots ==
+                // full_membership, and selected_membership ⊆
+                // full_membership (plus the non-empty guards — a successful
+                // deployment always records non-empty outcomes and both
+                // memberships). The FULL-push EQUALITY (selected == full) is
+                // the cross-record leg enforced where the terminal merges
+                // into its entry (the mode — group vs full — lives in the
+                // intent's `group`).
+                crate::ledger::records::verify_successful_membership_equations(
+                    &self.deployment_id,
+                    &outcome_keys,
+                    &rollback_slot_keys,
+                    &selected_membership,
+                    &full_membership,
+                )?;
+                // A Successful deployment implies every slot activated: a
+                // non-activated outcome is a disagreement (the disposition's
+                // implied state vs the recorded outcome).
+                if let Some((key, r)) = outcomes
+                    .iter()
+                    .find(|(_, r)| r.outcome != SlotOutcomeKind::Activated)
+                {
+                    return Err(Error::integrity(format!(
+                        "terminal {}: status Successful requires every outcome Activated — slot '{key}' records {:?}",
+                        self.deployment_id, r.outcome
+                    )));
+                }
+                TerminalDisposition::Successful {
+                    rollback,
+                    outcomes,
+                    selected_membership,
+                    full_membership,
+                }
+            }
+            (DeploymentStatus::Successful, None) => {
+                return Err(Error::integrity(format!(
+                    "terminal {}: status Successful requires the complete rollback payload — a successful deployment always records its rollback state",
+                    self.deployment_id
+                )));
+            }
+            (DeploymentStatus::FailedPreflight, None) => {
+                if !outcomes.is_empty() {
+                    return Err(Error::integrity(format!(
+                        "terminal {}: status FailedPreflight must carry NO outcomes (a pre-mutation failure touched no slot)",
+                        self.deployment_id
+                    )));
+                }
+                TerminalDisposition::FailedPreflight
+            }
+            (DeploymentStatus::FailedPreflight, Some(_)) => {
+                return Err(Error::integrity(format!(
+                    "terminal {}: status FailedPreflight must not carry a rollback payload (only Successful does)",
+                    self.deployment_id
+                )));
+            }
+            (DeploymentStatus::FailedRolledBack, None) => {
+                // The compensation report IS the disposition's outcome table:
+                // the record of what the compensation pass did to each slot
+                // — exposed via [`LedgerTerminal::compensation`], never
+                // stored as a duplicate that could disagree with them.
+                TerminalDisposition::FailedRolledBack { outcomes }
+            }
+            (DeploymentStatus::FailedRolledBack, Some(_)) => {
+                return Err(Error::integrity(format!(
+                    "terminal {}: status FailedRolledBack must not carry a rollback payload (only Successful does)",
+                    self.deployment_id
+                )));
+            }
+            (DeploymentStatus::Degraded, None) => {
+                // REMAINING CHANGES: the slots whose FINAL OBSERVED STATE
+                // differs from their pre_push state, each mapped to the
+                // generation it is on. DERIVED from the wire outcomes
+                // ([`LedgerTerminal::remaining_changes`]) — never stored.
+                // The conversion refuses a Degraded wire whose outcomes are
+                // ALL restored (a fully-compensated attempt must be
+                // `FailedRolledBack`, never `Degraded` — and an EMPTY
+                // outcome table is vacuously all-restored, so a Degraded
+                // terminal with no outcomes is refused too). A Degraded
+                // terminal whose outcomes are all never-advanced (e.g. a
+                // `leave_changed` failure that advanced nothing) is
+                // legitimate: the policy marks the attempt Degraded even
+                // though no slot changed, and the derived remaining-changes
+                // set is empty.
+                if outcomes
+                    .values()
+                    .all(|r| r.outcome == SlotOutcomeKind::Restored)
+                {
+                    return Err(Error::integrity(format!(
+                        "terminal {}: status Degraded requires at least one non-restored outcome (an all-restored attempt is FailedRolledBack, never Degraded)",
+                        self.deployment_id
+                    )));
+                }
+                TerminalDisposition::Degraded { outcomes }
+            }
+            (DeploymentStatus::Degraded, Some(_)) => {
+                return Err(Error::integrity(format!(
+                    "terminal {}: status Degraded must not carry a rollback payload (only Successful does)",
+                    self.deployment_id
+                )));
+            }
+            (DeploymentStatus::InProgress | DeploymentStatus::PendingCommit, _) => {
+                return Err(Error::integrity(format!(
+                    "terminal {}: status {:?} never appears on a terminal event (it is the recoverable intent-only state)",
+                    self.deployment_id, self.status
+                )));
+            }
+        };
+        Ok(LedgerTerminal {
+            recorded_at: self.recorded_at,
+            disposition,
+            reason: self.reason,
+        })
+    }
+
+    /// Build the WIRE form of a domain terminal for a given (deployment,
+    /// target) identity — the enclosing [`crate::ledger::finalize::LedgerEntry`] owns the identity,
+    /// so the wire's `deployment_id` / `target` come from the CALLER (the
+    /// append path), never from the domain terminal. A Successful terminal's
+    /// two memberships are emitted from the disposition; every other
+    /// disposition emits EMPTY memberships (only a Successful terminal
+    /// records them — the conversion refuses a failed status carrying any).
+    pub fn from_domain(
+        deployment_id: &DeploymentId,
+        target: &TargetName,
+        t: &LedgerTerminal,
+    ) -> Self {
+        let rollback = match &t.disposition {
+            TerminalDisposition::Successful { rollback, .. } => {
+                Some(LedgerRollbackWire::from(rollback))
+            }
+            _ => None,
+        };
+        let (selected_membership, full_membership) = match &t.disposition {
+            TerminalDisposition::Successful {
+                selected_membership,
+                full_membership,
+                ..
+            } => (
+                selected_membership.iter().cloned().collect(),
+                full_membership.iter().cloned().collect(),
+            ),
+            _ => (Vec::new(), Vec::new()),
+        };
+        LedgerTerminalWire {
+            deployment_id: deployment_id.clone(),
+            target: target.clone(),
+            status: t.disposition.status(),
+            recorded_at: t.recorded_at.clone(),
+            // The WIRE keeps the current on-disk shape: the domain outcomes'
+            // transition state is a DOMAIN fact and is dropped here, and each
+            // outcome's table key is re-attached as the wire value's
+            // `slot_id` (the domain value carries no slot).
+            outcomes: t
+                .outcomes()
+                .iter()
+                .map(|(k, o)| (k.clone(), SlotResult::from_outcome(k, o)))
+                .collect(),
+            rollback,
+            selected_membership,
+            full_membership,
+            reason: t.reason.clone(),
+        }
+    }
+}
+
+// ---- outcomes ----
+// The per-slot OUTCOME records of the deployment ledger (feature areas A1
+// "outcome dispositions" / "per-slot outcome kinds" / "degraded
+// semantics"): the per-slot outcome kinds ([`SlotOutcomeKind`]) and the
+// domain outcome ([`SlotOutcome`]) with its [`SlotTransition`] state, the
+// WIRE outcome row ([`SlotResult`] — the raw serde form the ledger's
+// JSONL carries, owned HERE next to its domain sibling), the wire → domain
+// derivations ([`SlotOutcome::from_wire`], [`SlotResult::from_outcome`]),
+// the [`CompensationReport`] alias, and the
+// [`LedgerTerminal::remaining_changes`],
+// [`LedgerTerminal::compensation`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotOutcomeKind {
+    Activated,
+    Failed,
+    /// Reserved: never emitted today. In-process compensation (a post-swap
+    /// activation/verification failure restored by the per-server pipeline,
+    /// step 11) is recorded as [`SlotOutcomeKind::Failed`] with
+    /// `SlotResult.compensated = true` — "record both the failure and the
+    /// compensation result" — and failure-policy compensation (step 13)
+    /// upgrades the slot to [`SlotOutcomeKind::Restored`].
+    Compensated,
+    Skipped,
+    Restored,
+}
+
+/// The per-slot TRANSITION STATE of one slot during a deployment attempt —
+/// the per-slot fact the terminal's outcomes carry (the DOMAIN form; the
+/// WIRE keeps the current on-disk shape and the wire → domain conversion
+/// derives the transition from the wire's status/outcome fields). The
+/// remaining-changes derivation is based on THIS state, never on the
+/// outcome's generation field alone: a slot that was never advanced (or
+/// whose advance outcome is unknown) records a generation that is not
+/// evidence of a change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotTransition {
+    /// The slot was NEVER mutated: skipped (stop_on_failure) or a
+    /// pre-mutation failure. Its final observed state equals its pre_push
+    /// state, so it is never a remaining change.
+    NeverAdvanced,
+    /// The slot successfully advanced to the new state: its outcome's
+    /// generation is the generation it is on (a remaining change whenever
+    /// the new state differs from pre_push).
+    Advanced,
+    /// The slot advanced then was compensated back to its pre_push state
+    /// (never a remaining change).
+    Restored,
+    /// The advance outcome is UNKNOWN: a pre-swap failure — the slot may or
+    /// may not have changed. The outcome's generation is the OBSERVED
+    /// post-state (the engine records the actual generation, never the
+    /// desired one); the slot is a remaining change iff that observed state
+    /// differs from pre_push.
+    AdvanceUnknown,
+}
+
+/// The WIRE outcome of one slot during a deployment's mutation loop — the
+/// RAW serde form the ledger's JSONL carries, with the REDUNDANT `slot_id`
+/// next to its map key (the wire keeps the on-disk shape; the wire → domain
+/// conversion verifies the outcome names its own key and then DROPS the
+/// slot into the key — the domain value [`SlotOutcome`] carries no slot).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotResult {
+    pub slot_id: SlotId,
+    pub outcome: SlotOutcomeKind,
+    /// The generation this slot advanced to, or `None` if it never started.
+    pub generation: Option<GenerationId>,
+    pub compensated: bool,
+    /// The pure OPERATION error (e.g. a swap failure) — the slot's own
+    /// failure, INDEPENDENT of the post-mutation observation. NEVER
+    /// rewritten by the post-observation pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The preserved error of a FAILED post-mutation OBSERVATION, or `None`
+    /// when the observation succeeded (a recorded generation) or showed no
+    /// state (`KnownAbsent`). Independent of `error`: an operation failure
+    /// and a failed observation are TWO facts and both survive the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_error: Option<String>,
+}
+
+/// The per-slot OUTCOME of one slot during a deployment's mutation loop —
+/// the DOMAIN value of the wire's [`SlotResult`] with the REDUNDANT
+/// `slot_id` DROPPED: the enclosing [`SlotTable`] key owns the slot
+/// identity, so the value stores each fact exactly once (the wire keeps the
+/// on-disk shape — the wire outcome carries the slot; the wire → domain
+/// conversion verifies the outcome names its own key and then drops it into
+/// the key). The value ALSO carries the per-slot TRANSITION STATE
+/// ([`SlotTransition`]) the remaining-changes derivation is based on (the
+/// wire keeps the current on-disk shape; the wire → domain conversion
+/// derives the transition from the wire's status/outcome fields).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotOutcome {
+    pub outcome: SlotOutcomeKind,
+    /// The THREE-STATE OBSERVATION of the slot's post-mutation state — the
+    /// observed generation the remaining-changes derivation compares against
+    /// pre_push. `Unknown(error)` when the post-mutation status read failed
+    /// (the slot may or may not have changed — never classified as
+    /// unchanged); `KnownAbsent` when the read succeeded showing no state
+    /// (never deployed).
+    pub observation: Observation<ObservedGeneration>,
+    pub compensated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The per-slot transition state (see [`SlotTransition`]).
+    pub transition: SlotTransition,
+}
+
+impl SlotOutcome {
+    /// Derive the per-slot TRANSITION STATE from the wire's status/outcome
+    /// fields (the wire keeps the current on-disk shape; the transition is
+    /// the per-slot fact the domain outcomes carry). `Restored` and a
+    /// compensated `Failed` are a compensation that restored the slot;
+    /// `Skipped` never advanced; `Activated` advanced; an UNCOMPENSATED
+    /// `Failed` is a pre-swap failure OR a post-swap failure whose
+    /// compensation failed — the wire cannot distinguish them, so the
+    /// advance outcome is UNKNOWN (the slot may or may not have changed;
+    /// the remaining-changes derivation compares the outcome's OBSERVED
+    /// generation against pre_push).
+    pub fn from_wire(r: SlotResult) -> SlotOutcome {
+        let transition = match r.outcome {
+            SlotOutcomeKind::Restored => SlotTransition::Restored,
+            SlotOutcomeKind::Skipped => SlotTransition::NeverAdvanced,
+            SlotOutcomeKind::Activated => SlotTransition::Advanced,
+            SlotOutcomeKind::Failed => {
+                if r.compensated {
+                    SlotTransition::Restored
+                } else {
+                    SlotTransition::AdvanceUnknown
+                }
+            }
+            // Reserved: never emitted today. The in-process compensation
+            // marker (a post-swap failure restored by the per-server
+            // pipeline) is recorded as `Failed` with `compensated = true`;
+            // a `Compensated` outcome would be a restored slot.
+            SlotOutcomeKind::Compensated => SlotTransition::Restored,
+        };
+        // The THREE-STATE OBSERVATION is derived from the wire's fields: a
+        // recorded generation is a successful read (`Known`); a `None`
+        // generation with a preserved OBSERVATION error is a FAILED
+        // observation (`Unknown` — the wire's `observation_error` field
+        // carries the observation error INDEPENDENTLY of the operation
+        // error, so the uncertainty survives the wire round trip); a `None`
+        // generation with no observation error is a slot with no observed
+        // state (`KnownAbsent`). `error` is the pure OPERATION error — it
+        // NEVER participates in the observation.
+        let observation = match r.generation {
+            Some(g) => Observation::Known(ObservedGeneration { generation: g }),
+            None => match r.observation_error.as_deref() {
+                Some(e) => Observation::Unknown(ObservationError {
+                    message: e.to_string(),
+                }),
+                None => Observation::KnownAbsent,
+            },
+        };
+        SlotOutcome {
+            outcome: r.outcome,
+            observation,
+            compensated: r.compensated,
+            error: r.error,
+            transition,
+        }
+    }
+}
+
+impl From<SlotResult> for SlotOutcome {
+    /// Drop the wire outcome's redundant `slot_id` (the table key owns the
+    /// slot identity — the wire → domain conversion verifies the outcome
+    /// named its own key before dropping it) and derive the per-slot
+    /// TRANSITION STATE from the wire's status/outcome fields.
+    fn from(r: SlotResult) -> SlotOutcome {
+        SlotOutcome::from_wire(r)
+    }
+}
+
+impl SlotResult {
+    /// Re-attach the table key as the wire outcome's `slot_id` (the wire
+    /// keeps the on-disk shape; the domain value carries no slot) and encode
+    /// the domain's TWO INDEPENDENT error facts back into the wire's fields:
+    /// `error` carries the pure OPERATION error (always, regardless of the
+    /// observation — the two facts never share a slot); the THREE-STATE
+    /// OBSERVATION is encoded in the wire's `generation` + `observation_error`
+    /// fields — the `Known` half is the recorded generation, the `Unknown`
+    /// half is its OWN preserved error in `observation_error` (a `None`
+    /// generation with an observation error reads back as `Unknown` — the
+    /// uncertainty survives the round trip), and a `KnownAbsent` observation
+    /// carries no observation error (a `None` generation with an observation
+    /// error would read back as `Unknown`, not `KnownAbsent`). Every
+    /// (operation_error, observation) combination round-trips EXACTLY.
+    pub fn from_outcome(key: &SlotId, o: &SlotOutcome) -> Self {
+        SlotResult {
+            slot_id: key.clone(),
+            outcome: o.outcome.clone(),
+            generation: match &o.observation {
+                Observation::Known(og) => Some(og.generation.clone()),
+                Observation::KnownAbsent | Observation::Unknown(_) => None,
+            },
+            compensated: o.compensated,
+            error: o.error.clone(),
+            observation_error: match &o.observation {
+                Observation::Unknown(e) => Some(e.message.clone()),
+                Observation::Known(_) | Observation::KnownAbsent => None,
+            },
+        }
+    }
+}
+
+/// The COMPENSATION REPORT of a [`TerminalDisposition::FailedRolledBack`]
+/// terminal — the disposition's OWN per-slot outcomes table under the
+/// disposition's name: each slot's result during the failed-then-rolled-back
+/// attempt (which slots were compensated back and which compensation
+/// failed). The report IS the disposition's outcomes table
+/// ([`LedgerTerminal::compensation`]) — never a stored duplicate that could
+/// disagree with the outcomes.
+pub type CompensationReport = SlotTable<SlotOutcome>;
+
+impl LedgerTerminal {
+    /// The REMAINING CHANGES of a [`TerminalDisposition::Degraded`] terminal
+    /// — DERIVED from the disposition's OWN per-slot outcomes (the slots
+    /// whose FINAL OBSERVED STATE differs from their pre_push state, each
+    /// mapped to its THREE-STATE OBSERVATION), never stored. `None` for any
+    /// non-Degraded disposition. For a Degraded terminal the set may be
+    /// EMPTY (a `leave_changed` failure that advanced nothing — e.g. a
+    /// pre-swap failure with every slot skipped — is Degraded with no
+    /// remaining change); the conversion refuses only a Degraded wire whose
+    /// outcomes are ALL restored (a fully-compensated attempt must be
+    /// `FailedRolledBack`, never Degraded).
+    ///
+    /// THE DERIVATION IS THE TRANSITION STATE, NOT THE OUTCOME'S GENERATION
+    /// FIELD: each slot's [`SlotTransition`] classifies it — a
+    /// `NeverAdvanced` slot (skipped) and a `Restored` slot (compensated
+    /// back) are back at their pre_push state (never remaining changes); an
+    /// `Advanced` slot is at the desired state (always a remaining change);
+    /// an `AdvanceUnknown` slot (a pre-swap failure — the advance outcome is
+    /// unknown) is a remaining change iff its OBSERVED state (the outcome's
+    /// observation, which the engine records as the actual post-state, never
+    /// the desired one) differs from pre_push. The intent's `pre_push` per
+    /// slot is the comparison baseline.
+    ///
+    /// THE THREE-STATE OBSERVATION IS THE COMPARISON, NEVER A `None`
+    /// COLLAPSED INTO "UNCHANGED": an `Unknown` observation (the post-mutation
+    /// status read failed) is UNCERTAIN — the slot may or may not have
+    /// changed — so it is NEVER classified as unchanged: it IS a remaining
+    /// change, mapped to its `Unknown(error)` observation. A `KnownAbsent`
+    /// observation (the read succeeded showing no state) is a remaining
+    /// change only when the slot HAD a pre_push generation that is now gone.
+    pub fn remaining_changes(
+        &self,
+        intent: &DeploymentIntent,
+    ) -> Option<SlotTable<Observation<ObservedGeneration>>> {
+        if !matches!(self.disposition, TerminalDisposition::Degraded { .. }) {
+            return None;
+        }
+        let remaining: BTreeMap<SlotId, Observation<ObservedGeneration>> = self
+            .outcomes()
+            .iter()
+            .filter(|(sid, r)| match r.transition {
+                SlotTransition::NeverAdvanced | SlotTransition::Restored => false,
+                SlotTransition::Advanced => true,
+                SlotTransition::AdvanceUnknown => {
+                    // The advance outcome is unknown (a pre-swap failure):
+                    // the slot is a remaining change iff its OBSERVED state
+                    // differs from pre_push. An `Unknown` observation (the
+                    // post-mutation status read failed) is NOT evidence of
+                    // no change — the slot may have changed; it is UNCERTAIN
+                    // and therefore a remaining change.
+                    let pre = intent
+                        .slots
+                        .get(sid)
+                        .and_then(|s| s.pre_push.as_ref())
+                        .and_then(|p| p.generation.clone());
+                    match &r.observation {
+                        Observation::Known(og) => {
+                            let obs = og.generation.clone();
+                            match (Some(obs), pre) {
+                                (Some(obs), Some(pre_gen)) => obs != pre_gen,
+                                (Some(_), None) => true,
+                                _ => false,
+                            }
+                        }
+                        // The read succeeded showing no state: a change only
+                        // when the slot HAD a pre_push generation that is now
+                        // gone.
+                        Observation::KnownAbsent => pre.is_some(),
+                        // The read FAILED: uncertain — never unchanged.
+                        Observation::Unknown(_) => true,
+                    }
+                }
+            })
+            .map(|(k, r)| (k.clone(), r.observation.clone()))
+            .collect();
+        Some(SlotTable::from_map(remaining))
+    }
+
+    /// The COMPENSATION REPORT of a [`TerminalDisposition::FailedRolledBack`]
+    /// terminal — the disposition's OWN per-slot outcomes table itself (the
+    /// record of what the compensation pass did to each slot: which slots
+    /// were restored and which compensation failed), never a stored
+    /// duplicate. `None` for any other disposition.
+    pub fn compensation(&self) -> Option<&CompensationReport> {
+        if matches!(
+            self.disposition,
+            TerminalDisposition::FailedRolledBack { .. }
+        ) {
+            Some(self.outcomes())
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_outcomes {
+    use super::*;
+    use crate::identity::{GenerationId, SlotId, test_generation_id};
+    use crate::ledger::records::{ObservationError, ObservedGeneration};
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+
+    // ---- fixtures ----------------------------------------------------------
+
+    fn slot(i: u32) -> SlotId {
+        SlotId::new(format!("slot-{i}"))
+    }
+
+    // =====================================================================
+
+    /// An arbitrary OPERATION error (the slot's pure failure — the wire's
+    /// `error` field): any failure reason, or none.
+    fn arbitrary_operation_error() -> impl Strategy<Value = Option<String>> {
+        prop::option::of(prop::sample::select(vec![
+            "swap failed: boom".to_string(),
+            "verification failed".to_string(),
+            "internal: no behavior contract for variant 'x'".to_string(),
+        ]))
+    }
+
+    /// An arbitrary THREE-STATE OBSERVATION: `Known` with an arbitrary
+    /// VALID generation id, `KnownAbsent`, or `Unknown` with an arbitrary
+    /// preserved message (the wire's `observation_error` field) — generated
+    /// INDEPENDENTLY of the operation error.
+    fn arbitrary_observation() -> impl Strategy<Value = Observation<ObservedGeneration>> {
+        prop_oneof![
+            (0u32..6).prop_map(|i| Observation::Known(ObservedGeneration {
+                generation: test_generation_id(&format!("obs-{i}")),
+            })),
+            Just(Observation::KnownAbsent),
+            prop::sample::select(vec![
+                "status read failed: boom".to_string(),
+                "assignment read failed: boom".to_string(),
+            ])
+            .prop_map(|e| Observation::Unknown(ObservationError { message: e })),
+        ]
+    }
+
+    /// MIRROR of the engine's post-observation pass (`src/push/engine.rs`'s
+    /// `never_advanced` loop): apply a generated post-mutation observation
+    /// to a wire [`SlotResult`], mutating ONLY the observation fields
+    /// (`generation` / `observation_error`) — the operation error (`error`)
+    /// is NEVER touched. The engine loop is not cleanly reachable from a
+    /// records-level unit test, so this helper mirrors its fixed logic.
+    fn apply_post_observation(r: &mut SlotResult, observation: &Observation<ObservedGeneration>) {
+        match observation {
+            Observation::Known(og) => r.generation = Some(og.generation.clone()),
+            Observation::Unknown(e) => {
+                r.generation = None;
+                r.observation_error = Some(e.message.clone());
+            }
+            Observation::KnownAbsent => {
+                r.generation = None;
+                r.observation_error = None;
+            }
+        }
+    }
+
+    /// (a) An outcome carrying BOTH an operation error AND an `Unknown`
+    /// observation round-trips preserving both — the two facts are
+    /// INDEPENDENT on the wire (the old single-error wire could not carry a
+    /// distinct operation error alongside a failed observation).
+    #[test]
+    fn operation_error_and_unknown_observation_round_trip_preserves_both() {
+        let outcome = SlotOutcome {
+            outcome: SlotOutcomeKind::Failed,
+            observation: Observation::Unknown(ObservationError {
+                message: "status read failed: boom".to_string(),
+            }),
+            compensated: false,
+            error: Some("swap failed: boom".to_string()),
+            transition: SlotTransition::AdvanceUnknown,
+        };
+        let wire = SlotResult::from_outcome(&slot(1), &outcome);
+        assert_eq!(wire.generation, None);
+        assert_eq!(
+            wire.error,
+            Some("swap failed: boom".to_string()),
+            "the operation error is written to the wire's error field"
+        );
+        assert_eq!(
+            wire.observation_error,
+            Some("status read failed: boom".to_string()),
+            "the observation error is written to the wire's observation_error field"
+        );
+        // A full serde_json round trip of the wire keeps both fields.
+        let json = serde_json::to_string(&wire).unwrap();
+        let wire_json: SlotResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(wire_json.error, Some("swap failed: boom".to_string()));
+        assert_eq!(
+            wire_json.observation_error,
+            Some("status read failed: boom".to_string())
+        );
+        let back = SlotOutcome::from_wire(wire);
+        assert_eq!(
+            back.error,
+            Some("swap failed: boom".to_string()),
+            "the operation error survives the wire untouched"
+        );
+        assert_eq!(
+            back.observation,
+            Observation::Unknown(ObservationError {
+                message: "status read failed: boom".to_string(),
+            }),
+            "the Unknown observation survives the wire untouched"
+        );
+    }
+
+    /// (b) The engine's post-observation semantics preserve the operation
+    /// error: a `KnownAbsent` observation must NOT wipe it and an `Unknown`
+    /// observation must NOT overwrite it (the old loop did both).
+    #[test]
+    fn post_observation_preserves_the_operation_error() {
+        // A pre-swap FAILED outcome ALREADY carries its operation error; the
+        // post-observation pass mutates only the observation fields.
+        let mut known_absent = SlotResult {
+            slot_id: slot(1),
+            outcome: SlotOutcomeKind::Failed,
+            generation: Some(GenerationId::new("desired-1".to_string())),
+            compensated: false,
+            error: Some("swap failed: boom".to_string()),
+            observation_error: None,
+        };
+        apply_post_observation(&mut known_absent, &Observation::KnownAbsent);
+        assert_eq!(
+            known_absent.error,
+            Some("swap failed: boom".to_string()),
+            "KnownAbsent must NOT wipe the operation error"
+        );
+        assert_eq!(
+            known_absent.generation, None,
+            "KnownAbsent clears the generation"
+        );
+        assert_eq!(known_absent.observation_error, None);
+
+        let mut unknown = SlotResult {
+            slot_id: slot(1),
+            outcome: SlotOutcomeKind::Failed,
+            generation: Some(GenerationId::new("desired-1".to_string())),
+            compensated: false,
+            error: Some("swap failed: boom".to_string()),
+            observation_error: None,
+        };
+        apply_post_observation(
+            &mut unknown,
+            &Observation::Unknown(ObservationError {
+                message: "status read failed: boom".to_string(),
+            }),
+        );
+        assert_eq!(
+            unknown.error,
+            Some("swap failed: boom".to_string()),
+            "Unknown must NOT overwrite the operation error"
+        );
+        assert_eq!(unknown.generation, None);
+        assert_eq!(
+            unknown.observation_error,
+            Some("status read failed: boom".to_string()),
+            "the observation error lands in observation_error, never in error"
+        );
+
+        let mut known = SlotResult {
+            slot_id: slot(1),
+            outcome: SlotOutcomeKind::Failed,
+            generation: Some(GenerationId::new("desired-1".to_string())),
+            compensated: false,
+            error: Some("swap failed: boom".to_string()),
+            observation_error: None,
+        };
+        apply_post_observation(
+            &mut known,
+            &Observation::Known(ObservedGeneration {
+                generation: GenerationId::new("observed-1".to_string()),
+            }),
+        );
+        assert_eq!(
+            known.error,
+            Some("swap failed: boom".to_string()),
+            "Known must not touch the operation error"
+        );
+        assert_eq!(
+            known.generation,
+            Some(GenerationId::new("observed-1".to_string()))
+        );
+        assert_eq!(known.observation_error, None);
+    }
+
+    proptest! {
+        // THE USER'S PROPERTY: the operation error and the post-mutation
+        // observation are TWO INDEPENDENT facts. (1) Every (operation_error,
+        // observation) pair round-trips domain → wire → domain EXACTLY,
+        // including a full serde_json round trip of the wire. (2) Failure
+        // injection (the engine's post-observation pass, mirrored by
+        // [`apply_post_observation`]) never rewrites the operation error and
+        // reflects the observation in the observation fields. The cross
+        // product covers the directions where the OLD code was wrong: an
+        // `Unknown` observation + a distinct operation error both survive,
+        // and a `KnownAbsent` observation + an operation error survives.
+        // Bounded 16 cases, fixed seed 0x5EED_5EED (house style), no
+        // persistence.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn outcome_wire_round_trip_preserves_operation_error_and_observation_independently(
+            operation_error in arbitrary_operation_error(),
+            observation in arbitrary_observation(),
+        ) {
+            // A domain outcome carrying EXACTLY the two generated facts.
+            let outcome = SlotOutcome {
+                outcome: SlotOutcomeKind::Failed,
+                observation: observation.clone(),
+                compensated: false,
+                error: operation_error.clone(),
+                transition: SlotTransition::AdvanceUnknown,
+            };
+            // Domain → wire: each fact lands in its OWN wire field.
+            let wire = SlotResult::from_outcome(&slot(0), &outcome);
+            assert_eq!(
+                wire.error,
+                operation_error,
+                "the operation error is written to the wire's error field"
+            );
+            // Wire → domain: both facts survive INDEPENDENTLY.
+            let back = SlotOutcome::from_wire(wire.clone());
+            assert_eq!(
+                back.error,
+                operation_error.clone(),
+                "the operation error survives the wire untouched"
+            );
+            assert_eq!(
+                back.observation,
+                observation,
+                "the observation survives the wire untouched"
+            );
+            // A full serde_json round trip of the wire preserves both fields.
+            let json = serde_json::to_string(&wire).unwrap();
+            let wire2: SlotResult = serde_json::from_str(&json).unwrap();
+            assert_eq!(wire2.error, operation_error.clone());
+            assert_eq!(wire2.observation_error, wire.observation_error);
+            let back2 = SlotOutcome::from_wire(wire2);
+            assert_eq!(back2.error, operation_error);
+            assert_eq!(back2.observation, observation);
+        }
+
+        #[test]
+        fn post_observation_preserves_both_facts(
+            operation_error in arbitrary_operation_error(),
+            observation in arbitrary_observation(),
+        ) {
+            // A pre-swap FAILED wire outcome ALREADY carries the original
+            // operation error (e.g. "swap failed: ..."); its desired
+            // generation is about to be replaced by the observed post-state.
+            let mut wire = SlotResult {
+                slot_id: slot(0),
+                outcome: SlotOutcomeKind::Failed,
+                generation: Some(GenerationId::new("desired-0".to_string())),
+                compensated: false,
+                error: operation_error.clone(),
+                observation_error: None,
+            };
+            // Failure injection: the engine's post-observation pass.
+            apply_post_observation(&mut wire, &observation);
+            // The operation error is NEVER rewritten by the observation.
+            assert_eq!(
+                wire.error,
+                operation_error.clone(),
+                "the operation error must never be rewritten by the post-mutation observation"
+            );
+            // The observation facts reflect the observation.
+            match &observation {
+                Observation::Known(og) => {
+                    assert_eq!(wire.generation, Some(og.generation.clone()));
+                    assert_eq!(wire.observation_error, None);
+                }
+                Observation::KnownAbsent => {
+                    assert_eq!(wire.generation, None);
+                    assert_eq!(wire.observation_error, None);
+                }
+                Observation::Unknown(e) => {
+                    assert_eq!(wire.generation, None);
+                    assert_eq!(
+                        wire.observation_error,
+                        Some(e.message.clone()),
+                        "the observation error lands in observation_error, never in error"
+                    );
+                }
+            }
+            // The injected wire still converts back to the SAME two facts.
+            let back = SlotOutcome::from_wire(wire);
+            assert_eq!(
+                back.error,
+                operation_error,
+                "the operation error survives the injection untouched"
+            );
+            assert_eq!(
+                back.observation,
+                observation,
+                "the observation survives the injection untouched"
+            );
+        }
+    }
+}
+
+// ---- observation ----
+// The THREE-STATE OBSERVATION records of the deployment ledger (feature
+// area A3 "three-state observation"): [`Observation<T>`] and its payload
+// types ([`ObservedState`], [`ObservedGeneration`], [`ObservationError`]),
+// plus the per-slot / per-target observed records ([`ObservedSlot`],
+// [`ObservedTarget`]). Re-exported by [`crate::remote::observed`].
+/// The THREE-STATE OBSERVATION of a slot's remote state: `KnownAbsent` (the
+/// slot has no observed state — never deployed), `Known(state)` (a
+/// successful read), or `Unknown(error)` (the read failed; the error is
+/// preserved). An `Unknown` observation is NOT evidence of no change — the
+/// slot may have changed; the failure just means we cannot see it. Every
+/// consumer (the observed record, the terminal disposition's per-slot
+/// outcomes, the remaining-changes derivation) must carry the `Unknown`
+/// through rather than collapsing it into an absent/`None` that downstream
+/// code reads as "unchanged".
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Observation<T> {
+    /// The slot has no observed state (never deployed).
+    #[default]
+    KnownAbsent,
+    /// A successful read of the slot's observed state.
+    Known(T),
+    /// The read failed: the error is preserved. NOT evidence of no change.
+    Unknown(ObservationError),
+}
+
+/// The payload of a SUCCESSFUL observation of a placement slot: the slot's
+/// live assignment as read from the remote (generation + artifact + the
+/// assignment's OWN minting deployment).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedState {
+    pub generation: GenerationId,
+    pub artifact: ArtifactRef,
+    pub last_deployment: DeploymentId,
+}
+
+/// The payload of a SUCCESSFUL observation of a slot's GENERATION — the
+/// per-slot fact the terminal's outcomes carry (the remaining-changes
+/// derivation compares it against pre_push).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedGeneration {
+    pub generation: GenerationId,
+}
+
+/// The preserved error of a FAILED observation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationError {
+    pub message: String,
+}
+
+/// Observed remote state for one placement slot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ObservedSlot {
+    /// The three-state observation of the slot's remote state: `KnownAbsent`
+    /// (never deployed), `Known(state)` (a successful read), or
+    /// `Unknown(error)` (the read failed — NOT evidence of no change).
+    pub observation: Observation<ObservedState>,
+}
+
+/// Observed remote state for a whole target (`observed.json`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedTarget {
+    pub target: TargetName,
+    #[serde(default)]
+    pub slots: BTreeMap<SlotId, ObservedSlot>,
+}
+
+impl Default for ObservedTarget {
+    fn default() -> Self {
+        Self {
+            target: TargetName::parse("default").expect("default target is a safe segment"),
+            slots: BTreeMap::new(),
+        }
+    }
+}
+
+// ---- entries / merge ----
+// The MERGED deployment entry (feature area A2: Ledger semantics) — the
+// intent + optional terminal merge type the ledger's append/read path
+// carries.
+//
+// The two physical line kinds ([`crate::ledger::finalize::LedgerLine`] —
+// the WIRE enum the append-only JSONL stream carries) live in
+// [`crate::ledger::finalize`]; the merged ENTRY is this module's
+// [`LedgerEntry`]: the durable INTENT plus the optional TERMINAL EVENT
+// (absent while the deployment is in flight or recoverable-pending), with
+// the entry owning the deployment identity (the terminal carries none).
+// [`crate::store::local::LocalStore::read_ledger`] parses the wire lines,
+// runs the VERIFYING CONVERSION (refusing disagreeing records — an
+// entry's terminal must key the same deployment id, name the same target,
+// and cover exactly the intent's membership), and merges the validated
+// domain records into [`LedgerEntry`]s keyed by deployment id.
+/// A merged deployment entry of the target's ledger: the durable INTENT plus
+/// the optional TERMINAL EVENT (absent while the deployment is in flight or
+/// recoverable-pending). The append order is the history order; `seq` is the
+/// position of the intent line in the ledger. Only VALIDATED domain records
+/// ([`DeploymentIntent`], [`LedgerTerminal`]) live here — never raw wire shapes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LedgerEntry {
+    pub deployment_id: DeploymentId,
+    pub target: TargetName,
+    pub intent: DeploymentIntent,
+    pub terminal: Option<LedgerTerminal>,
+    /// The position of this entry's intent line in the ledger (0-based
+    /// append order — the entry's history position).
+    pub seq: u64,
+}
+
+#[cfg(test)]
+mod tests_entry {
+    use super::*;
+    // The ledger's two line kinds live in [`crate::ledger::finalize`]; the
+    // wire shapes + their conversions live with the records.
+    use crate::error::{Error, Result};
+    use crate::identity::{
+        ArtifactRef, GenerationRef, PlacementSlotAssignment, ServerId, SlotId, TargetName,
+        VariantName, test_deployment_id, test_generation_id, test_release_id, test_tree_digest,
+    };
+    use crate::ledger::finalize::LedgerLine;
+    use crate::ledger::records::SlotOutcomeKind;
+    use crate::ledger::records::{DeploymentIntent, LedgerIntentWire};
+    use crate::ledger::records::{
+        DeploymentStatus, LedgerRollbackWire, PhysicalBinding, SlotAttemptState, SlotResult,
+    };
+    use crate::ledger::records::{LedgerTerminal, LedgerTerminalWire, TerminalDisposition};
+    use crate::store::local::LocalStore;
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // ---- fixtures ----------------------------------------------------------
+
+    fn slot(i: u32) -> SlotId {
+        SlotId::new(format!("slot-{i}"))
+    }
+
+    fn slot_strategy() -> impl Strategy<Value = SlotId> {
+        (0u32..6).prop_map(slot)
+    }
+
+    fn binding(sid: &SlotId) -> PhysicalBinding {
+        PhysicalBinding {
+            server: ServerId::new("s1".to_string()),
+            deploy_dir: format!("/srv/deploy/{}", sid.as_str()),
+        }
+    }
+
+    /// A generation ref whose assignment names its own key (the agreeing
+    /// form); the artifact's release is derived from the slot id.
+    fn gen_ref_for(key: &SlotId) -> GenerationRef {
+        GenerationRef {
+            generation: test_generation_id(key.as_str()),
+            assignment: PlacementSlotAssignment {
+                placement_slot: key.clone(),
+                artifact: ArtifactRef {
+                    release: test_release_id(key.as_str()),
+                    variant: VariantName::new("standard".to_string()),
+                    tree: test_tree_digest(key.as_str()),
+                },
+            },
+        }
+    }
+    fn agreeing_intent(keys: &[SlotId]) -> LedgerIntentWire {
+        agreeing_intent_with_group(keys, None)
+    }
+
+    /// [`agreeing_intent`] with an explicit GROUP MODE: `Some(g)` selects a
+    /// group push (the intent's `slot_ids` are the group's slots), `None` a
+    /// full push (the intent's `slot_ids` are every target slot).
+    fn agreeing_intent_with_group(keys: &[SlotId], group: Option<&str>) -> LedgerIntentWire {
+        let desired: BTreeMap<SlotId, GenerationRef> =
+            keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
+        let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> =
+            keys.iter().map(|k| (k.clone(), None)).collect();
+        LedgerIntentWire {
+            deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
+            deployment_id: test_deployment_id("deploy-w"),
+            target: TargetName::new("t1".to_string()),
+            group: group.map(str::to_string),
+            slot_ids: keys.to_vec(),
+            behavior_sha256: "sha256-w".to_string(),
+            attempted_at: "2026-01-01T00:00:00Z".to_string(),
+            desired,
+            pre_push,
+            slots: BTreeMap::new(),
+        }
+    }
+
+    fn outcome_for(key: &SlotId, kind: SlotOutcomeKind) -> SlotResult {
+        let compensated = matches!(&kind, SlotOutcomeKind::Restored);
+        SlotResult {
+            slot_id: key.clone(),
+            outcome: kind,
+            generation: Some(test_generation_id(key.as_str())),
+            compensated,
+            error: None,
+            observation_error: None,
+        }
+    }
+
+    /// A terminal wire AGREEING with its intent (identity + outcome-key
+    /// membership + status→disposition payload). `status_idx` selects the
+    /// status: 0 Successful (complete rollback over the membership), 1
+    /// FailedPreflight (no outcomes, no rollback), 2 FailedRolledBack
+    /// (outcomes = the compensation report), 3 Degraded (non-restored
+    /// outcomes over the membership → non-empty remaining changes). The
+    /// Successful shape carries the EXACT-EQUAL memberships (selected ==
+    /// full == the membership — the full-push proven shape; the mode is the
+    fn agreeing_terminal(keys: &[SlotId], status_idx: u32) -> LedgerTerminalWire {
+        let deployment_id = test_deployment_id("deploy-w");
+        let target = TargetName::new("t1".to_string());
+        match status_idx {
+            // Successful: EVERY member slot recorded Activated, the
+            // COMPLETE rollback payload covers the same membership with
+            // exact bindings, and BOTH memberships equal that membership
+            // (the proven exact-equal shape).
+            0 => LedgerTerminalWire {
+                deployment_id: deployment_id.clone(),
+                target: target.clone(),
+                status: DeploymentStatus::Successful,
+                recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                outcomes: keys
+                    .iter()
+                    .map(|k| (k.clone(), outcome_for(k, SlotOutcomeKind::Activated)))
+                    .collect(),
+                rollback: Some(LedgerRollbackWire {
+                    slots: keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect(),
+                    bindings: keys.iter().map(|k| (k.clone(), binding(k))).collect(),
+                    behavior_sha256: None,
+                    release: None,
+                }),
+                selected_membership: keys.to_vec(),
+                full_membership: keys.to_vec(),
+                reason: Some("push completed".to_string()),
+            },
+            // FailedPreflight: pre-mutation — NO outcomes, NO rollback, NO
+            // memberships (only a Successful terminal proves them).
+            1 => LedgerTerminalWire {
+                deployment_id,
+                target,
+                status: DeploymentStatus::FailedPreflight,
+                recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                outcomes: BTreeMap::new(),
+                rollback: None,
+                selected_membership: vec![],
+                full_membership: vec![],
+                reason: Some("preflight failed".to_string()),
+            },
+            // FailedRolledBack: the outcome table IS the compensation
+            // report.
+            2 => LedgerTerminalWire {
+                deployment_id,
+                target,
+                status: DeploymentStatus::FailedRolledBack,
+                recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                outcomes: keys
+                    .iter()
+                    .map(|k| (k.clone(), outcome_for(k, SlotOutcomeKind::Restored)))
+                    .collect(),
+                rollback: None,
+                selected_membership: vec![],
+                full_membership: vec![],
+                reason: Some("rolled back".to_string()),
+            },
+            // Degraded: every member's outcome is a REMAINING change — an
+            // UNCOMPENSATED `Failed` (a pre-swap failure / failed
+            // compensation: the advance outcome is unknown, and the
+            // outcome's observed generation differs from the intent's
+            // `pre_push` (None — a first deployment), so the derived
+            // remaining-changes set is non-empty).
+            _ => LedgerTerminalWire {
+                deployment_id,
+                target,
+                status: DeploymentStatus::Degraded,
+                recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                outcomes: keys
+                    .iter()
+                    .map(|k| (k.clone(), outcome_for(k, SlotOutcomeKind::Failed)))
+                    .collect(),
+                rollback: None,
+                selected_membership: vec![],
+                full_membership: vec![],
+                reason: Some("degraded".to_string()),
+            },
+        }
+    }
+
+    /// A valid (intent + terminal) WIRE PAIR strategy: non-empty membership
+    /// K, exact key-set equality in the intent, and a terminal AGREEING with
+    /// the intent's identity and membership.
+    fn agreeing_pair() -> impl Strategy<Value = (LedgerIntentWire, LedgerTerminalWire)> {
+        (prop::collection::btree_set(slot_strategy(), 1..4), 0u32..4).prop_map(
+            |(keys, status_idx)| {
+                let keys: Vec<SlotId> = keys.into_iter().collect();
+                (
+                    agreeing_intent(keys.as_slice()),
+                    agreeing_terminal(keys.as_slice(), status_idx),
+                )
+            },
+        )
+    }
+
+    // ---- THE VERIFYING PAIR CONVERSION + the read_ledger consumer ---------
+
+    /// Run the full verifying conversion of an intent + terminal pair — the
+    /// SAME checks `read_ledger` runs when it merges a terminal into its
+    /// entry (the entry owns identity: the terminal's id is the entry key,
+    /// its target must equal the entry's, every outcome key must be a
+    /// member of the intent's membership, and the outcome key set must
+    /// agree with the membership BY STATUS: Successful → the FULL-push
+    /// equality leg only (the terminal's own memberships satisfy the
+    /// terminal-local equations; the read requires selected == full when
+    /// the intent has no group), FailedPreflight → empty, every other
+    /// state → EXACT coverage) — returning the validated domain pair.
+    fn pair_to_domain(
+        pair: &(LedgerIntentWire, LedgerTerminalWire),
+    ) -> Result<(DeploymentIntent, LedgerTerminal)> {
+        let intent = pair.0.clone().into_domain()?;
+        if pair.1.deployment_id != intent.deployment_id {
+            return Err(Error::integrity(format!(
+                "terminal {}: deployment_id disagrees with its entry (the intent's)",
+                pair.1.deployment_id
+            )));
+        }
+        if pair.1.target != intent.target {
+            return Err(Error::integrity(format!(
+                "terminal {}: target '{}' disagrees with its entry (the intent's target '{}')",
+                pair.1.deployment_id, pair.1.target, intent.target
+            )));
+        }
+        for key in pair.1.outcomes.keys() {
+            if !intent.slots.contains_key(key) {
+                return Err(Error::integrity(format!(
+                    "terminal {}: outcome for slot '{key}' is outside the intent's membership",
+                    pair.1.deployment_id
+                )));
+            }
+        }
+        let terminal = pair.1.clone().into_domain()?;
+        // STATUS-SPECIFIC OUTCOME AGREEMENT (the membership leg — the same
+        // rules `read_ledger` enforces when it merges the terminal into its
+        // entry). The terminal carries its OWN proven memberships (the
+        // conversion enforced outcomes == selected, rollback == full,
+        // selected ⊆ full — the record is self-proving), so the only
+        // Successful leg is the FULL-push equality: a FULL push (no group)
+        // selects every target slot, so selected == full; a GROUP push
+        // allows a proper subset (the ⊆ is already enforced by the
+        // conversion). The intent's `slot_ids` is NOT compared to either
+        // membership (it is the historical selected set written before the
+        // push; the terminal's memberships are proven at terminal time).
+        let outcome_keys: BTreeSet<&SlotId> = terminal.outcomes().keys().collect();
+        let membership: BTreeSet<&SlotId> = intent.slots.keys().collect();
+        match terminal.status() {
+            DeploymentStatus::Successful => {
+                if intent.group.is_none() {
+                    let (selected, full) = match &terminal.disposition {
+                        TerminalDisposition::Successful {
+                            selected_membership,
+                            full_membership,
+                            ..
+                        } => (selected_membership, full_membership),
+                        _ => {
+                            unreachable!("a Successful terminal carries its rollback + memberships")
+                        }
+                    };
+                    if selected != full {
+                        return Err(Error::integrity(format!(
+                            "terminal {}: Successful records selected membership {selected:?} and full membership {full:?} — a FULL push (no group) selects every target slot, so its selected membership must EXACTLY equal its full membership",
+                            pair.1.deployment_id
+                        )));
+                    }
+                }
+            }
+            DeploymentStatus::FailedPreflight => {
+                if !outcome_keys.is_empty() {
+                    return Err(Error::integrity(format!(
+                        "terminal {}: FailedPreflight must carry NO outcomes (a pre-mutation failure touched no slot)",
+                        pair.1.deployment_id
+                    )));
+                }
+            }
+            _ => {
+                if outcome_keys != membership {
+                    return Err(Error::integrity(format!(
+                        "terminal {}: outcomes {outcome_keys:?} must EXACTLY cover the intent's membership {membership:?} — no missing, no extra",
+                        pair.1.deployment_id
+                    )));
+                }
+            }
+        }
+        Ok((intent, terminal))
+    }
+
+    /// Write the pair as a two-line ledger and read it back through the REAL
+    /// consumer path (`read_ledger` — the FIRST consumer; rollback resolve
+    /// and GC reachability consume its output, so failing here means failing
+    /// BEFORE every consumer).
+    fn write_pair_ledger(
+        pair: &(LedgerIntentWire, LedgerTerminalWire),
+    ) -> Result<Vec<LedgerEntry>> {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        let line1 = serde_json::to_string(&LedgerLine::Intent(pair.0.clone())).unwrap();
+        let line2 = serde_json::to_string(&LedgerLine::Terminal(pair.1.clone())).unwrap();
+        let p = store.ledger_path("t1");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, format!("{line1}\n{line2}\n")).unwrap();
+        store.read_ledger("t1")
+    }
+
+    /// Inspect the DOMAIN shapes produced from a VALID pair: the intent's
+    /// ONE table (non-empty, unique keys, every member carries its desired +
+    /// pre_push), and the terminal's disposition — each disposition OWNS its
+    /// outcomes table (the accessor returns the disposition's OWN table; a
+    fn assert_domain_shape(
+        intent: &DeploymentIntent,
+        terminal: &LedgerTerminal,
+        keys: &[SlotId],
+        status_idx: u32,
+    ) {
+        assert!(!intent.slots.is_empty(), "the membership is non-empty");
+        assert_eq!(
+            intent.slots.len(),
+            keys.len(),
+            "the table's key count equals the membership count (no duplicates, no missing)"
+        );
+        assert_eq!(
+            intent.membership(),
+            keys.to_vec(),
+            "the membership is exactly the wire's slot_ids (deployment order)"
+        );
+        for key in keys {
+            let entry = &intent.slots[key];
+            assert!(
+                entry
+                    .desired
+                    .artifact
+                    .release
+                    .as_str()
+                    .starts_with("rel-sha256-"),
+                "each member carries its desired assignment"
+            );
+            // The pre_push ENTRY is structural: every member slot has an
+            // IntentSlot (with `pre_push: Option<PreviousGeneration>`,
+            // `None` for a first deployment) — there is no member without
+            // its per-slot data.
+        }
+        match (&terminal.disposition, status_idx) {
+            (
+                TerminalDisposition::Successful {
+                    rollback, outcomes, ..
+                },
+                0,
+            ) => {
+                assert_eq!(
+                    rollback.slots.len(),
+                    keys.len(),
+                    "the complete rollback covers every member slot"
+                );
+                assert_eq!(
+                    rollback.bindings.len(),
+                    keys.len(),
+                    "every slotted generation carries its physical binding"
+                );
+                // The Successful disposition OWNS its outcome table: the
+                // accessor returns the disposition's OWN table, and every
+                // outcome is Activated (the conversion's agreement).
+                assert_eq!(
+                    terminal.outcomes(),
+                    outcomes,
+                    "the accessor reads the disposition's OWN table"
+                );
+                assert_eq!(
+                    outcomes.len(),
+                    keys.len(),
+                    "the Successful disposition owns one outcome per member"
+                );
+                assert!(
+                    outcomes
+                        .values()
+                        .all(|o| o.outcome == SlotOutcomeKind::Activated),
+                    "a Successful disposition's outcomes are all Activated"
+                );
+                // THE PERSISTED MEMBERSHIPS: the domain exposes both, equal
+                // to the membership (the exact-equal proven shape) — the
+                // record PROVES selected == full == the outcome/rollback key
+                // set.
+                assert_eq!(
+                    terminal.selected_membership(),
+                    Some(&BTreeSet::from_iter(keys.iter().cloned())),
+                    "the Successful disposition exposes its selected membership (== the outcomes' keys)"
+                );
+                assert_eq!(
+                    terminal.full_membership(),
+                    Some(&BTreeSet::from_iter(keys.iter().cloned())),
+                    "the Successful disposition exposes its full membership (== the rollback's slots)"
+                );
+            }
+            (TerminalDisposition::FailedPreflight, 1) => {
+                assert!(
+                    terminal.outcomes().is_empty(),
+                    "preflight touched no slot (the disposition carries no outcomes)"
+                );
+            }
+            (TerminalDisposition::FailedRolledBack { .. }, 2) => {
+                let compensation = terminal.compensation().expect(
+                    "a FailedRolledBack terminal's compensation report IS its own outcomes table",
+                );
+                assert_eq!(
+                    compensation.len(),
+                    keys.len(),
+                    "the compensation report covers every compensated slot"
+                );
+                assert!(
+                    compensation
+                        .iter()
+                        .all(|(_, r)| r.outcome == SlotOutcomeKind::Restored),
+                    "the compensation records the restored slots"
+                );
+            }
+            (TerminalDisposition::Degraded { .. }, 3) => {
+                let remaining_changes = terminal
+                    .remaining_changes(intent)
+                    .expect("a Degraded terminal derives its remaining changes from the outcomes");
+                assert!(
+                    !remaining_changes.is_empty(),
+                    "degraded keeps non-empty remaining changes"
+                );
+                assert_eq!(
+                    remaining_changes.len(),
+                    keys.len(),
+                    "every non-restored slot is a remaining change"
+                );
+                // The Degraded disposition OWNS its outcome table: the
+                // accessor returns the disposition's OWN table (the
+                // remaining changes derive from it).
+                let TerminalDisposition::Degraded { outcomes } = &terminal.disposition else {
+                    unreachable!("matched above");
+                };
+                assert_eq!(
+                    terminal.outcomes(),
+                    outcomes,
+                    "the accessor reads the disposition's OWN table"
+                );
+            }
+            (d, s) => panic!("disposition {d:?} does not match the wire status index {s}"),
+        }
+    }
+
+    // ---- the mutations: ONE field at a time --------------------------------
+
+    /// A single-field terminal tamper (the property applies ONE per case).
+    type TerminalMutation = fn(&mut LedgerTerminalWire);
+    fn tamper_status(t: &mut LedgerTerminalWire) {
+        t.status = match &t.status {
+            DeploymentStatus::Successful => DeploymentStatus::FailedPreflight,
+            DeploymentStatus::FailedPreflight => DeploymentStatus::Successful,
+            DeploymentStatus::FailedRolledBack => DeploymentStatus::Successful,
+            DeploymentStatus::Degraded => DeploymentStatus::FailedPreflight,
+            other => other.clone(),
+        };
+    }
+    fn rollback_added_to_failed(t: &mut LedgerTerminalWire) {
+        if t.status != DeploymentStatus::Successful {
+            t.rollback = Some(LedgerRollbackWire {
+                slots: BTreeMap::new(),
+                bindings: BTreeMap::new(),
+                behavior_sha256: None,
+                release: None,
+            });
+        } else {
+            t.rollback = None;
+        }
+    }
+    fn rollback_extra_binding(t: &mut LedgerTerminalWire) {
+        if let Some(rb) = t.rollback.as_mut() {
+            rb.bindings.insert(slot(9), binding(&slot(9)));
+        } else {
+            t.rollback = Some(LedgerRollbackWire {
+                slots: BTreeMap::new(),
+                bindings: BTreeMap::new(),
+                behavior_sha256: None,
+                release: None,
+            });
+        }
+    }
+    fn outcome_slot_mismatch(t: &mut LedgerTerminalWire) {
+        if let Some((_, r)) = t.outcomes.iter_mut().next() {
+            // An outcome value naming a DIFFERENT placement than its key.
+            r.slot_id = slot(9);
+        } else {
+            // No outcomes (FailedPreflight): add one whose value names a
+            // different placement than its key.
+            t.outcomes
+                .insert(slot(0), outcome_for(&slot(9), SlotOutcomeKind::Activated));
+        }
+    }
+    fn outcome_outside_membership(t: &mut LedgerTerminalWire) {
+        t.outcomes
+            .insert(slot(9), outcome_for(&slot(9), SlotOutcomeKind::Activated));
+    }
+    fn outcome_status_vs_disposition(t: &mut LedgerTerminalWire) {
+        match &t.status {
+            DeploymentStatus::Degraded => {
+                // The Degraded disposition implies non-restored remaining
+                // changes; an all-restored outcome table is a disagreement.
+                for r in t.outcomes.values_mut() {
+                    r.outcome = SlotOutcomeKind::Restored;
+                }
+            }
+            DeploymentStatus::FailedPreflight => {
+                // A pre-mutation failure touched no slot; any outcome is a
+                // disagreement.
+                t.outcomes
+                    .insert(slot(0), outcome_for(&slot(0), SlotOutcomeKind::Activated));
+            }
+            DeploymentStatus::Successful => {
+                // The Successful disposition implies every slot activated; a
+                // failed outcome is a disagreement.
+                if let Some(r) = t.outcomes.values_mut().next() {
+                    r.outcome = SlotOutcomeKind::Failed;
+                }
+            }
+            DeploymentStatus::FailedRolledBack => {
+                // The compensation report IS the outcome table — no per-slot
+                // status can disagree with it; the disagreement is a
+                // rollback payload on a failed status.
+                t.rollback = Some(LedgerRollbackWire {
+                    slots: BTreeMap::new(),
+                    bindings: BTreeMap::new(),
+                    behavior_sha256: None,
+                    release: None,
+                });
+            }
+            other => panic!("unexpected wire status {other:?}"),
+        }
+    }
+    fn outcome_key_vs_rollback_slots(t: &mut LedgerTerminalWire) {
+        if t.status == DeploymentStatus::Successful {
+            // The Successful rollback is the authoritative rollback fact; an
+            // outcome key the rollback no longer covers is a disagreement.
+            let Some(rb) = t.rollback.as_mut() else {
+                return;
+            };
+            let Some(key) = rb.slots.keys().next().cloned() else {
+                return;
+            };
+            rb.slots.remove(&key);
+            rb.bindings.remove(&key);
+        } else {
+            // Only Successful may carry a rollback; a failed status with one
+            // is a disagreement.
+            t.rollback = Some(LedgerRollbackWire {
+                slots: BTreeMap::new(),
+                bindings: BTreeMap::new(),
+                behavior_sha256: None,
+                release: None,
+            });
+        }
+    }
+    fn reason_mutated(t: &mut LedgerTerminalWire) {
+        // The reason is a free-form human NOTE, not a fact: it never
+        // participates in invariants, so mutating it is NOT a disagreement.
+        t.reason = Some("tampered note".to_string());
+    }
+    fn target_mismatch(t: &mut LedgerTerminalWire) {
+        t.target = TargetName::new("other-target".to_string());
+    }
+    fn deployment_id_mismatch(t: &mut LedgerTerminalWire) {
+        t.deployment_id = test_deployment_id("deploy-other");
+    }
+
+    proptest! {
+        // PROPERTY (the directive's point 4): generate VALID wire pairs
+        // (intent + terminal), then mutate ONE duplicated fact at a time —
+        // the status→disposition mapping, the rollback payload, an outcome
+        // slot, an outcome's status vs the disposition's implied state, an
+        // outcome key vs the rollback's slots, the target identity — and
+        // assert EVERY disagreement fails the verifying conversion BEFORE
+        // any consumer (the REAL read_ledger consumer path), while the
+        // VALID pair converts to a DOMAIN whose SHAPE has no
+        // duplicates/missing keys (asserted by inspection of the
+        // NonEmptySlotTable / outcomes / disposition) and whose DERIVED
+        // methods (`remaining_changes`, `compensation`) agree with the
+        // outcomes by construction. The REASON is a free-form human note,
+        // NOT a fact: mutating it never creates a disagreement — the
+        // conversion succeeds and carries the note through unchanged.
+        // Bounded 16 cases, fixed seed 0x5EED_5EED (house style), no
+        // persistence.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn wire_pair_mutations_fail_before_any_consumer_and_valid_pairs_shape(
+            (intent, terminal) in agreeing_pair()
+        ) {
+            let keys: Vec<SlotId> = intent.slot_ids.clone();
+            let status_idx = match terminal.status {
+                DeploymentStatus::Successful => 0,
+                DeploymentStatus::FailedPreflight => 1,
+                DeploymentStatus::FailedRolledBack => 2,
+                DeploymentStatus::Degraded => 3,
+                other => panic!("unexpected wire status {other:?}"),
+            };
+            let (d_intent, d_terminal) = pair_to_domain(&(intent.clone(), terminal.clone()))
+                .expect("the agreeing pair converts");
+            assert_domain_shape(&d_intent, &d_terminal, &keys, status_idx);
+            let entries = write_pair_ledger(&(intent.clone(), terminal.clone()))
+                .expect("the agreeing pair reads through the real ledger");
+            assert_eq!(entries.len(), 1, "one merged entry");
+            assert_domain_shape(
+                &entries[0].intent,
+                entries[0].terminal.as_ref().unwrap(),
+                &keys,
+                status_idx,
+            );
+
+            let mutations: [(&str, TerminalMutation); 9] = [
+                ("status→disposition mismatch", tamper_status),
+                ("rollback payload mismatch (missing on Successful / added to a failed status)", rollback_added_to_failed),
+                ("rollback binding without a generation", rollback_extra_binding),
+                ("outcome value naming a different slot", outcome_slot_mismatch),
+                ("outcome key outside the membership", outcome_outside_membership),
+                ("outcome status vs the disposition's implied state", outcome_status_vs_disposition),
+                ("outcome key vs the rollback's slots", outcome_key_vs_rollback_slots),
+                ("terminal target disagrees with the entry", target_mismatch),
+                ("terminal deployment id keys no intent line", deployment_id_mismatch),
+            ];
+            for (name, mutate) in mutations {
+                let mut bad = (intent.clone(), terminal.clone());
+                mutate(&mut bad.1);
+                let err = pair_to_domain(&bad);
+                assert!(
+                    err.is_err(),
+                    "{name} must fail the conversion BEFORE any consumer"
+                );
+                let ledger_err = write_pair_ledger(&bad);
+                assert!(
+                    ledger_err.is_err(),
+                    "{name} must fail read_ledger (the first consumer)"
+                );
+            }
+
+            // The REASON is a free-form human note, NOT a fact: mutating it
+            // never creates a disagreement — the conversion succeeds and
+            // carries the note through unchanged (it never participates in
+            // invariants).
+            let mut noted = (intent, terminal);
+            reason_mutated(&mut noted.1);
+            let (_, d_terminal) =
+                pair_to_domain(&noted).expect("a mutated reason is not a disagreement");
+            assert_eq!(
+                d_terminal.reason.as_deref(),
+                Some("tampered note"),
+                "the note is carried through unchanged"
+            );
+        }
+    }
+
+    // ---- THE MEMBERSHIP-EQUATIONS PROPERTY (Successful) --------------------
+
+    /// One key-set operation applied to ONE of the four INDEPENDENT SETS
+    /// (outcomes, selected_membership, full_membership, rollback slots).
+    /// The ops are chosen INDEPENDENTLY per set; the application is
+    /// deterministic given the op (delete the first key / add the first
+    /// absent slot / replace the first key with a different absent slot), so
+    /// the property's "acceptance iff the membership equations hold" verdict
+    /// is exact.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum KeyOp {
+        Unchanged,
+        Delete,
+        Add,
+        Replace,
+    }
+    fn key_op() -> impl Strategy<Value = KeyOp> {
+        prop_oneof![
+            Just(KeyOp::Unchanged),
+            Just(KeyOp::Delete),
+            Just(KeyOp::Add),
+            Just(KeyOp::Replace),
+        ]
+    }
+
+    /// Apply one key op to a slot set (deterministic: delete the first
+    /// key, add the first slot absent from the set, replace the first key
+    /// with the first absent slot).
+    fn apply_key_op(set: &BTreeSet<SlotId>, op: KeyOp) -> BTreeSet<SlotId> {
+        let mut out = set.clone();
+        match op {
+            KeyOp::Unchanged => {}
+            KeyOp::Delete => {
+                if let Some(k) = out.iter().next().cloned() {
+                    out.remove(&k);
+                }
+            }
+            KeyOp::Add => {
+                for i in 0..6u32 {
+                    let k = slot(i);
+                    if !out.contains(&k) {
+                        out.insert(k);
+                        break;
+                    }
+                }
+            }
+            KeyOp::Replace => {
+                if let Some(k) = out.iter().next().cloned() {
+                    out.remove(&k);
+                    for i in 0..6u32 {
+                        let nk = slot(i);
+                        if !out.contains(&nk) && nk != k {
+                            out.insert(nk);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Rebuild the intent wire with a NEW membership, keeping the intent's
+    /// internal agreement (slot_ids == desired == pre_push, each assignment
+    /// names its own key, the wire actuals map empty).
+    fn intent_with_membership(
+        intent: &LedgerIntentWire,
+        membership: &BTreeSet<SlotId>,
+    ) -> LedgerIntentWire {
+        let keys: Vec<SlotId> = membership.iter().cloned().collect();
+        let desired: BTreeMap<SlotId, GenerationRef> =
+            keys.iter().map(|k| (k.clone(), gen_ref_for(k))).collect();
+        let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> =
+            keys.iter().map(|k| (k.clone(), None)).collect();
+        LedgerIntentWire {
+            deployment_schema_version: intent.deployment_schema_version,
+            deployment_id: intent.deployment_id.clone(),
+            target: intent.target.clone(),
+            group: intent.group.clone(),
+            slot_ids: keys.clone(),
+            behavior_sha256: intent.behavior_sha256.clone(),
+            attempted_at: intent.attempted_at.clone(),
+            desired,
+            pre_push,
+            slots: BTreeMap::new(),
+        }
+    }
+
+    /// Apply the four INDEPENDENT key ops to a valid Successful pair and
+    /// return the tampered pair: (1) the outcomes keys, (2) the
+    /// selected_membership, (3) the full_membership, (4) the rollback's
+    /// slots keys — with the rollback's BINDINGS COUPLED to its slots
+    /// (slots == bindings is the separate structural rollback invariant,
+    /// NOT one of the four independent sets — the user's requirement
+    /// couples them here). The intent is REBUILT over the UNION of the four
+    /// resulting sets (so the intent never adds a verdict of its own: every
+    /// outcome key is an intent member by construction, and the read's
+    /// Successful leg compares only the terminal's OWN memberships) with the
+    /// given MODE applied to its `group` (`Some("g1")` = group push,
+    /// `None` = full push).
+    fn apply_four_set_tamper(
+        pair: &(LedgerIntentWire, LedgerTerminalWire),
+        ops: [KeyOp; 4],
+        group: bool,
+    ) -> (LedgerIntentWire, LedgerTerminalWire) {
+        let (intent, terminal) = pair;
+        let mut terminal = terminal.clone();
+        // (1) outcomes keys.
+        let outcome_keys: BTreeSet<SlotId> = terminal.outcomes.keys().cloned().collect();
+        let new_outcomes = apply_key_op(&outcome_keys, ops[0]);
+        terminal.outcomes = new_outcomes
+            .iter()
+            .map(|k| (k.clone(), outcome_for(k, SlotOutcomeKind::Activated)))
+            .collect();
+        // (2) selected_membership, (3) full_membership.
+        let selected: BTreeSet<SlotId> = terminal.selected_membership.iter().cloned().collect();
+        terminal.selected_membership = apply_key_op(&selected, ops[1]).into_iter().collect();
+        let full: BTreeSet<SlotId> = terminal.full_membership.iter().cloned().collect();
+        terminal.full_membership = apply_key_op(&full, ops[2]).into_iter().collect();
+        // (4) rollback slots keys (bindings coupled to the slots).
+        let rb = terminal
+            .rollback
+            .as_mut()
+            .expect("a Successful terminal carries its rollback");
+        let slot_keys: BTreeSet<SlotId> = rb.slots.keys().cloned().collect();
+        let new_slots = apply_key_op(&slot_keys, ops[3]);
+        rb.slots = new_slots
+            .iter()
+            .map(|k| (k.clone(), gen_ref_for(k)))
+            .collect();
+        rb.bindings = new_slots.iter().map(|k| (k.clone(), binding(k))).collect();
+        // The intent: rebuilt over the UNION of the four resulting sets so it
+        // never adds a verdict (every outcome key is an intent member), with
+        // the mode applied to its `group`.
+        let union: BTreeSet<SlotId> = terminal
+            .outcomes
+            .keys()
+            .cloned()
+            .chain(terminal.selected_membership.iter().cloned())
+            .chain(terminal.full_membership.iter().cloned())
+            .chain(rb.slots.keys().cloned())
+            .collect();
+        let mut intent = intent_with_membership(intent, &union);
+        intent.group = if group { Some("g1".to_string()) } else { None };
+        (intent, terminal)
+    }
+
+    /// Evaluate THE MEMBERSHIP EQUATIONS for a written pair (the four sets +
+    /// the mode) — the acceptance criterion the properties assert
+    /// `read_ledger` is EXACTLY EQUIVALENT to:
+    ///
+    /// * outcomes == selected_membership
+    /// * rollback slots == full_membership (bindings == slots by
+    ///   construction — the coupled structural invariant)
+    /// * selected_membership ⊆ full_membership
+    /// * (FULL mode) selected_membership == full_membership — in GROUP mode
+    ///   a proper-subset selected is allowed
+    ///
+    /// plus the Successful NON-EMPTINESS (a successful deployment records
+    /// non-empty outcomes and both memberships non-empty).
+    fn membership_equations_hold(pair: &(LedgerIntentWire, LedgerTerminalWire)) -> bool {
+        let terminal = &pair.1;
+        let outcomes: BTreeSet<SlotId> = terminal.outcomes.keys().cloned().collect();
+        let selected: BTreeSet<SlotId> = terminal.selected_membership.iter().cloned().collect();
+        let full: BTreeSet<SlotId> = terminal.full_membership.iter().cloned().collect();
+        let rollback_slots: BTreeSet<SlotId> = terminal
+            .rollback
+            .as_ref()
+            .map(|rb| rb.slots.keys().cloned().collect())
+            .unwrap_or_default();
+        let full_mode = pair.0.group.is_none();
+        outcomes == selected
+            && rollback_slots == full
+            && selected.is_subset(&full)
+            && (!full_mode || selected == full)
+            && !outcomes.is_empty()
+            && !selected.is_empty()
+            && !full.is_empty()
+            && !rollback_slots.is_empty()
+    }
+
+    /// The GROUP/FULL MODE of a Successful pair, generated per house style.
+    fn membership_mode() -> impl Strategy<Value = bool> {
+        prop_oneof![Just(true), Just(false)]
+    }
+
+    proptest! {
+        // PROPERTY 1 (the user's requirement — the acceptance equivalence):
+        // generate the FOUR INDEPENDENT SETS — (1) the outcome keys, (2)
+        // the selected_membership, (3) the full_membership, (4) the
+        // rollback's slot keys (bindings generated EQUAL to the slots — the
+        // separate structural rollback invariant, kept coupled here) — by
+        // INDEPENDENTLY DELETE / ADD / REPLACE ops from a valid base pair,
+        // plus a group/full MODE. READING (the real `read_ledger` of the
+        // written pair — the durable write → re-read path) SUCCEEDS IFF
+        // THE MEMBERSHIP EQUATIONS HOLD FOR THAT MODE: outcomes ==
+        // selected_membership, rollback slots == full_membership, selected
+        // ⊆ full, and (full mode) selected == full — with a group mode a
+        // proper-subset selected is allowed — plus the Successful
+        // non-emptiness. The intent is rebuilt over the union of the four
+        // sets so it never adds a verdict of its own; the mode is applied to
+        // the intent's `group`. Bounded 16 cases, fixed seed 0x5EED_5EED
+        // per house style, no persistence.
+        //
+        // PROPERTY 2 (the user's requirement — single-set mutation
+        // rejection): start from a VALID pair (all equations hold), apply a
+        // tamper to EXACTLY ONE of the four sets (add/remove/change a key)
+        // while leaving the other three AND the mode fixed, and assert
+        // read_ledger REJECTS — every single-set mutation breaks at least
+        // one equation (mutating the outcomes or the selected membership
+        // alone breaks outcomes == selected; mutating the full membership or
+        // the rollback slots alone breaks rollback == full). The rejection
+        // is asserted through the REAL ledger file (write → re-read — the
+        // crash-recovery read path), so a tampered record is refused even
+        // after a durable write.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn successful_membership_equations_are_necessary_and_sufficient(
+            (intent, terminal) in agreeing_pair().prop_filter(
+                "the property needs a Successful pair",
+                |(_, t)| t.status == DeploymentStatus::Successful,
+            ),
+            ops in prop::array::uniform4(key_op()),
+            group in membership_mode(),
+        ) {
+            let (t_intent, t_terminal) = apply_four_set_tamper(&(intent, terminal), ops, group);
+            let pair = (t_intent, t_terminal);
+            let expect_ok = membership_equations_hold(&pair);
+            let read = write_pair_ledger(&pair);
+            assert_eq!(
+                read.is_ok(),
+                expect_ok,
+                "read_ledger must succeed iff the membership equations hold for the mode (outcomes {:?}, selected {:?}, full {:?}, rollback slots {:?}, full mode: {}); read: {:?}",
+                pair.1.outcomes.keys().collect::<BTreeSet<_>>(),
+                pair.1.selected_membership,
+                pair.1.full_membership,
+                pair.1.rollback.as_ref().map(|rb| rb.slots.keys().collect::<BTreeSet<_>>()),
+                pair.0.group.is_none(),
+                read
+            );
+        }
+
+        #[test]
+        fn mutating_any_single_membership_set_causes_rejection(
+            (intent, terminal) in agreeing_pair().prop_filter(
+                "the property needs a Successful pair",
+                |(_, t)| t.status == DeploymentStatus::Successful,
+            ),
+            set_idx in 0u32..4,
+            op in key_op().prop_filter("the tamper must change the set", |op| {
+                *op != KeyOp::Unchanged
+            }),
+            group in membership_mode(),
+        ) {
+            let mut ops = [KeyOp::Unchanged; 4];
+            ops[set_idx as usize] = op;
+            let (t_intent, t_terminal) = apply_four_set_tamper(&(intent, terminal), ops, group);
+            let pair = (t_intent, t_terminal);
+            // A VALID base pair satisfies every equation, so tampering EXACTLY
+            // ONE of the four sets must break at least one equation — and the
+            // read (the durable write → re-read crash-recovery path) must
+            // reject.
+            assert!(
+                !membership_equations_hold(&pair),
+                "mutating exactly one set must break an equation (set {set_idx}, op {op:?})"
+            );
+            assert!(
+                write_pair_ledger(&pair).is_err(),
+                "mutating exactly one of the four sets (set {set_idx}, op {op:?}) must be rejected by read_ledger — the durable write → re-read is the crash-recovery read"
+            );
+        }
+    }
+
+    #[test]
+    fn successful_membership_equations_suffice_when_a_tamper_keeps_them_satisfied() {
+        let keys = vec![slot(1), slot(2)];
+        let intent = agreeing_intent(&keys);
+        let terminal = agreeing_terminal(&keys, 0);
+        // The untampered pair reads.
+        write_pair_ledger(&(intent.clone(), terminal.clone()))
+            .expect("the exact-equal Successful pair reads");
+        // FULL mode: add the SAME key (slot-9) to ALL FOUR sets — the
+        // equations stay satisfied (outcomes == selected == full ==
+        // rollback slots), so the read still succeeds.
+        let mut intent = intent;
+        intent.slot_ids.push(slot(9));
+        intent.desired.insert(slot(9), gen_ref_for(&slot(9)));
+        intent.pre_push.insert(slot(9), None);
+        let mut terminal = terminal;
+        terminal
+            .outcomes
+            .insert(slot(9), outcome_for(&slot(9), SlotOutcomeKind::Activated));
+        terminal.selected_membership.push(slot(9));
+        terminal.full_membership.push(slot(9));
+        let rb = terminal.rollback.as_mut().unwrap();
+        rb.slots.insert(slot(9), gen_ref_for(&slot(9)));
+        rb.bindings.insert(slot(9), binding(&slot(9)));
+        let entries = write_pair_ledger(&(intent, terminal)).expect(
+            "adding the same key to all four sets keeps the equations satisfied — the read succeeds",
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].intent.slots.len(),
+            3,
+            "the intent's membership grew with the added key"
+        );
+
+        // GROUP mode: a proper-subset selected (selected = {slot-1} ⊊ full =
+        // {slot-1, slot-2}) is LEGAL and reads.
+        let selected = vec![slot(1)];
+        let full = vec![slot(1), slot(2)];
+        let mut terminal = agreeing_terminal(&full, 0);
+        terminal.outcomes =
+            BTreeMap::from([(slot(1), outcome_for(&slot(1), SlotOutcomeKind::Activated))]);
+        terminal.selected_membership = selected.clone();
+        let intent = agreeing_intent_with_group(&selected, Some("g1"));
+        write_pair_ledger(&(intent.clone(), terminal.clone()))
+            .expect("the group-proper-subset pair reads");
+        // GROW THE FULL SIDE ONLY (full + rollback): selected ⊊ full stays —
+        // the read succeeds.
+        let mut terminal2 = terminal.clone();
+        terminal2.full_membership.push(slot(3));
+        let rb = terminal2.rollback.as_mut().unwrap();
+        rb.slots.insert(slot(3), gen_ref_for(&slot(3)));
+        rb.bindings.insert(slot(3), binding(&slot(3)));
+        write_pair_ledger(&(intent.clone(), terminal2))
+            .expect("growing only the full membership keeps selected ⊆ full — the read succeeds");
+        // GROW THE SELECTED SIDE ONLY, WITHIN the full membership
+        // (selected + outcomes grow to equal full): selected ⊆ full stays —
+        // the read succeeds. The intent (whose slot_ids ARE the selected
+        // set for a group push) grows with the selection.
+        let mut terminal3 = terminal;
+        terminal3.selected_membership.push(slot(2));
+        terminal3
+            .outcomes
+            .insert(slot(2), outcome_for(&slot(2), SlotOutcomeKind::Activated));
+        let intent3 = agreeing_intent_with_group(&[slot(1), slot(2)], Some("g1"));
+        write_pair_ledger(&(intent3, terminal3)).expect(
+            "growing the selected membership (and its outcomes) within the full membership keeps selected ⊆ full — the read succeeds",
+        );
+    }
+
+    /// Write the pair as a two-line ledger AND a `deploy.toml` whose target
+    /// `t1` owns exactly the given SIMULATED current configuration slots,
+    /// then read the ledger back through the REAL consumer path. The
+    /// membership equations NEVER consult this configuration — the helper
+    /// exists to demonstrate (in
+    /// [`acceptance_is_pure_function_of_persisted_sets_and_mode_ignores_config`])
+    /// that acceptance is a PURE function of the persisted sets + mode:
+    /// re-reading the SAME pair under a DIFFERENT simulated config
+    /// membership yields the SAME verdict.
+    fn write_pair_ledger_under_config(
+        pair: &(LedgerIntentWire, LedgerTerminalWire),
+        simulated_slots: &[SlotId],
+    ) -> Result<Vec<LedgerEntry>> {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
+        // A real, LOADABLE project config whose target `t1` owns exactly
+        // `simulated_slots` (one server, one release). `read_ledger` never
+        // touches it — the config exists only to make the simulation
+        // concrete: a hypothetical config-reading consumer would see THIS
+        // current membership.
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(project.join("releases").join("v1")).unwrap();
+        let mut release = String::from("[artifact]\nmappings = []\n\n");
+        for s in simulated_slots {
+            release.push_str(&format!(
+                "[[slots]]\nid = \"{}\"\nserver = \"s1\"\ntarget = \"t1\"\ngroups = []\ndeploy_dir = \"/srv\"\n\n",
+                s.as_str()
+            ));
+        }
+        release.push_str(
+            "[retention.per_server]\nkeep_distinct_artifacts = 1\nkeep_days = 0\nprotect_previous = true\n\n[retention.deployment]\nprotect_deployments = 1\n\n[activation]\nadapter = \"none\"\n\n[verification]\nadapter = \"command\"\nargv = [\"true\"]\ntimeout_seconds = 5\nattempts = 1\ninterval_seconds = 0\n",
+        );
+        std::fs::write(
+            project.join("releases").join("v1").join("standard.toml"),
+            release,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("deploy.toml"),
+            "schema_version = 2\napplication = \"records-tests\"\nrelease = \"v1\"\n\n\
+             [[servers]]\nid = \"s1\"\naddress = \"a\"\nuser = \"u\"\nhost_key_fingerprint = \"SHA256:test\"\n\n\
+             [targets.t1]\nrollout = { batch_size = 1, stop_on_failure = true, failure_policy = \"rollback_changed\" }\n",
+        )
+        .unwrap();
+        let line1 = serde_json::to_string(&LedgerLine::Intent(pair.0.clone())).unwrap();
+        let line2 = serde_json::to_string(&LedgerLine::Terminal(pair.1.clone())).unwrap();
+        let p = store.ledger_path("t1");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, format!("{line1}\n{line2}\n")).unwrap();
+        store.read_ledger("t1")
+    }
+
+    /// CONFIGURATION MEMBERSHIP INDEPENDENCE (the user's requirement):
+    /// acceptance of a Successful pair is a PURE function of the persisted
+    /// sets + mode — the read path ([`LocalStore::read_ledger`]) NEVER
+    /// consults the live configuration for the membership equations. The
+    /// SAME written pair is read back while simulating DIFFERENT current
+    /// configuration memberships (a target config whose slots differ from
+    /// the pair's persisted sets), and the verdict is unchanged: a valid
+    /// pair stays accepted, a tampered pair stays rejected.
+    #[test]
+    fn acceptance_is_pure_function_of_persisted_sets_and_mode_ignores_config() {
+        // A valid GROUP-mode pair: selected = {slot-1} ⊊ full = {slot-1,
+        // slot-2} — the group-proper-subset shape a group push legitimately
+        // records (outcomes == selected, rollback == full, selected ⊆ full).
+        let selected = vec![slot(1)];
+        let full = vec![slot(1), slot(2)];
+        let mut terminal = agreeing_terminal(&full, 0);
+        terminal.outcomes =
+            BTreeMap::from([(slot(1), outcome_for(&slot(1), SlotOutcomeKind::Activated))]);
+        terminal.selected_membership = selected.clone();
+        let intent = agreeing_intent_with_group(&selected, Some("g1"));
+        let pair = (intent, terminal);
+        assert!(membership_equations_hold(&pair), "the group pair is valid");
+        // Accepted under a config whose membership equals the FULL set …
+        write_pair_ledger_under_config(&pair, &full)
+            .expect("the valid pair reads under a config matching the full membership");
+        // … and accepted under a config whose membership is a DIFFERENT set
+        // (a simulated membership change): the verdict is unchanged.
+        write_pair_ledger_under_config(&pair, &[slot(9)])
+            .expect("the valid pair's acceptance is a PURE function of the persisted sets + mode — a different current configuration membership does not change it");
+
+        // A tampered variant: add a key to the SELECTED set only — outcomes
+        // == selected breaks. Rejected under BOTH simulated configs.
+        let mut bad = pair.clone();
+        bad.1.selected_membership.push(slot(3));
+        assert!(
+            !membership_equations_hold(&bad),
+            "the single-set mutation breaks the equations"
+        );
+        write_pair_ledger_under_config(&bad, &full).expect_err(
+            "the tampered pair must stay rejected under a config matching the full membership",
+        );
+        write_pair_ledger_under_config(&bad, &[slot(9)]).expect_err(
+            "the tampered pair must stay rejected under a DIFFERENT current configuration membership",
+        );
+
+        // A valid FULL-mode pair (selected == full) and its tamper: same
+        // independence.
+        let keys = vec![slot(1), slot(2)];
+        let pair = (agreeing_intent(&keys), agreeing_terminal(&keys, 0));
+        assert!(membership_equations_hold(&pair), "the full pair is valid");
+        write_pair_ledger_under_config(&pair, &keys)
+            .expect("the valid full pair reads under a config matching its membership");
+        write_pair_ledger_under_config(&pair, &[slot(5)]).expect(
+            "the valid full pair's acceptance is a PURE function of the persisted sets + mode — a different current configuration membership does not change it",
+        );
+        let mut bad = pair.clone();
+        bad.1.full_membership.push(slot(3));
+        bad.1
+            .rollback
+            .as_mut()
+            .unwrap()
+            .slots
+            .insert(slot(3), gen_ref_for(&slot(3)));
+        bad.1
+            .rollback
+            .as_mut()
+            .unwrap()
+            .bindings
+            .insert(slot(3), binding(&slot(3)));
+        assert!(
+            !membership_equations_hold(&bad),
+            "the full-side mutation breaks the equations"
+        );
+        write_pair_ledger_under_config(&bad, &keys)
+            .expect_err("the tampered full pair must stay rejected");
+        write_pair_ledger_under_config(&bad, &[slot(5)]).expect_err(
+            "the tampered full pair must stay rejected under a DIFFERENT current configuration membership",
+        );
+    }
+
+    /// THE ENTRY OWNS IDENTITY: the domain terminal carries no
+    /// deployment_id/target; the reader verifies the wire terminal's
+    /// identity against its ENTRY (the intent's) and the outcome keys
+    /// against the membership — a mismatch is refused before any consumer.
+    #[test]
+    fn entry_owns_identity_and_refuses_cross_record_disagreements() {
+        let keys = vec![slot(1), slot(2)];
+        let intent = agreeing_intent(&keys);
+        // A terminal claiming a DIFFERENT target than its entry.
+        let mut terminal = agreeing_terminal(&keys, 0);
+        terminal.target = TargetName::new("other".to_string());
+        let err = pair_to_domain(&(intent.clone(), terminal))
+            .expect_err("a target disagreement is refused");
+        assert!(err.to_string().contains("target"), "err: {err}");
+        // A terminal claiming a deployment id with no intent line.
+        let mut terminal = agreeing_terminal(&keys, 0);
+        terminal.deployment_id = test_deployment_id("deploy-ghost");
+        assert!(pair_to_domain(&(intent.clone(), terminal)).is_err());
+        // An outcome key outside the intent's membership.
+        let mut terminal = agreeing_terminal(&keys, 0);
+        terminal
+            .outcomes
+            .insert(slot(9), outcome_for(&slot(9), SlotOutcomeKind::Activated));
+        assert!(pair_to_domain(&(intent.clone(), terminal)).is_err());
+        // An outcome value naming a different slot than its key.
+        let mut terminal = agreeing_terminal(&keys, 0);
+        terminal.outcomes.get_mut(&slot(1)).unwrap().slot_id = slot(2);
+        assert!(pair_to_domain(&(intent, terminal)).is_err());
+    }
+}
+
+// ---- rollback payload ----
+// The ROLLBACK PAYLOAD semantics (feature area A2: Ledger semantics).
+//
+// [`build_rollback`] builds the rollback state of a successful deployment
+// from the attempt's OUTCOMES (`actuals`: per-slot actual state), never
+// from the intent record. The payload is the COMPLETE target snapshot (a
+// [`crate::ledger::records::LedgerRollback`]: per-slot generation refs +
+// COMPLETE physical bindings), so EXACT ROLLBACK is possible: `deploy push
+// <target> <deployment-id>` restores exactly that deployment's stored
+// state, verified by the binding map (a missing binding entry is
+// "unverifiable" and makes exact rollback refuse the slot). The payload
+// FAILS CLOSED on an unknown assignment: an `Unknown`/`KnownAbsent`
+// artifact with a recorded generation is a corrupted payload and the
+// builder refuses it rather than fabricating a `GenerationRef` with a fake
+// artifact.
+//
+// The wire/domain RECORDS themselves ([`crate::ledger::records::LedgerRollback`],
+// [`crate::ledger::records::LedgerRollbackWire`],
+// [`crate::ledger::records::PhysicalBinding`]) live in
+// [`crate::ledger::records`].
+//
+/// Build the rollback state of a successful deployment from the attempt's
+/// OUTCOMES (`actuals`: per-slot actual state), never from the intent record.
+/// A successful deployment carries one complete [`GenerationRef`] per slot;
+/// slots without a recorded generation are not part of a coherent rollback
+/// and are dropped. `bindings` records the COMPLETE physical binding
+/// (`{server, deploy_dir}`) each slot had when the deployment ran; a missing
+/// entry is "unverifiable" and makes exact rollback refuse the slot.
+///
+/// PARTIAL-ROLLOUT OVERLAY: the result is the COMPLETE target snapshot — the
+/// latest successful snapshot (`base`) with the SELECTED slots (the attempt's
+/// actual per-slot results) replaced by their actual assignments and current
+/// bindings, unselected slots carried forward unchanged, and slots absent
+/// from `current_slot_ids` (removed from the current target configuration)
+/// omitted. A full-target attempt replaces every slot, so the base is
+/// irrelevant. There is NO snapshot-wide release/behavior: each slot's
+/// `GenerationRef` carries its OWN artifact (release/variant/tree), so a
+/// partial snapshot can span several releases (group pushes over time) and
+/// the referenced releases are the set derived from the per-slot bindings.
+pub fn build_rollback(
+    actuals: &BTreeMap<SlotId, SlotAttemptState>,
+    bindings: &BTreeMap<SlotId, PhysicalBinding>,
+    base: Option<&LedgerRollback>,
+    current_slot_ids: &[SlotId],
+) -> Result<LedgerRollback> {
+    // Start from the base (or empty): unselected slots are carried forward
+    // unchanged.
+    let mut slots: BTreeMap<SlotId, GenerationRef> =
+        base.map(|b| b.slots.clone()).unwrap_or_default();
+    let mut out_bindings: BTreeMap<SlotId, PhysicalBinding> =
+        base.map(|b| b.bindings.clone()).unwrap_or_default();
+    // Replace the SELECTED slots with their actual successful assignments
+    // and current physical bindings.
+    for (slot, s) in actuals {
+        if let Some(generation) = s.generation.clone() {
+            // FAIL CLOSED on the artifact: the rollback payload must never
+            // carry an unknown assignment. A Successful attempt's actuals are
+            // `Known` in practice (the post-mutation refresh only records
+            // `Unknown` when a live assignment read fails, and the successful
+            // path validates the layout before it ever finalizes); an
+            // `Unknown`/`KnownAbsent` artifact with a recorded generation
+            // would be a corrupted payload, so the finalize REFUSES it rather
+            // than fabricating a `GenerationRef` with a fake artifact.
+            let Observation::Known(artifact) = &s.artifact else {
+                return Err(Error::integrity(format!(
+                    "successful rollback for slot '{slot}' carries an unknown assignment \
+                     (the artifact observation is not Known): the rollback payload must \
+                     never contain an unknown artifact"
+                )));
+            };
+            slots.insert(
+                slot.clone(),
+                GenerationRef {
+                    generation,
+                    assignment: PlacementSlotAssignment {
+                        placement_slot: slot.clone(),
+                        artifact: artifact.clone(),
+                    },
+                },
+            );
+        }
+        if let Some(b) = bindings.get(slot) {
+            out_bindings.insert(slot.clone(), b.clone());
+        }
+    }
+    // Omit slots removed from the current target configuration.
+    let current: std::collections::HashSet<&str> =
+        current_slot_ids.iter().map(|s| s.as_str()).collect();
+    slots.retain(|k, _| current.contains(k.as_str()));
+    out_bindings.retain(|k, _| current.contains(k.as_str()));
+    Ok(LedgerRollback {
+        slots,
+        bindings: out_bindings,
+    })
+}
+
+#[cfg(test)]
+mod tests_rollback {
+    use super::*;
+    use crate::identity::{
+        ArtifactRef, ServerId, SlotId, VariantName, test_deployment_id, test_generation_id,
+        test_tree_digest,
+    };
+    use crate::ledger::records::Observation;
+    use std::collections::BTreeMap;
+
+    /// `build_rollback` records each slot's complete physical binding.
+    #[test]
+    fn build_rollback_records_each_slots_physical_binding() {
+        let slot = SlotId::new("p1".to_string());
+        let actuals = BTreeMap::from([(
+            slot.clone(),
+            SlotAttemptState {
+                artifact: Observation::Known(ArtifactRef {
+                    release: crate::identity::test_release_id("rel-1"),
+                    variant: VariantName::new("standard".to_string()),
+                    tree: test_tree_digest("tree-1"),
+                }),
+                generation: Some(test_generation_id("gen-x")),
+            },
+        )]);
+        let bindings: BTreeMap<SlotId, PhysicalBinding> = BTreeMap::from([(
+            slot.clone(),
+            PhysicalBinding {
+                server: ServerId::new("server-01"),
+                deploy_dir: "/srv/deploy/p1".to_string(),
+            },
+        )]);
+
+        let rollback = build_rollback(&actuals, &bindings, None, std::slice::from_ref(&slot))
+            .expect("a Known actual builds the rollback");
+        assert_eq!(
+            rollback.bindings.get(&slot),
+            Some(&PhysicalBinding {
+                server: ServerId::new("server-01"),
+                deploy_dir: "/srv/deploy/p1".to_string(),
+            }),
+            "the rollback must record the slot's complete physical binding (server AND deploy_dir)"
+        );
+        assert_eq!(rollback.slots.len(), 1, "generation refs preserved intact");
+        assert_eq!(rollback.bindings.len(), 1);
+    }
+
+    /// The rollback payload must NEVER carry an unknown assignment: an actual
+    /// whose artifact is `Unknown` (or `KnownAbsent`) with a recorded
+    /// generation is a corrupted payload for a Successful rollback, so
+    /// `build_rollback` FAILS CLOSED with an integrity error rather than
+    /// fabricating a `GenerationRef` with a fake artifact. An actual with
+    /// `generation: None` stays dropped regardless of its artifact (the
+    /// existing "no coherent rollback" rule).
+    #[test]
+    fn build_rollback_refuses_unknown_actuals() {
+        let slot = SlotId::new("p1".to_string());
+        let bindings: BTreeMap<SlotId, PhysicalBinding> = BTreeMap::from([(
+            slot.clone(),
+            PhysicalBinding {
+                server: ServerId::new("server-01"),
+                deploy_dir: "/srv/deploy/p1".to_string(),
+            },
+        )]);
+        // An UNKNOWN actual with a generation: refused.
+        let actuals = BTreeMap::from([(
+            slot.clone(),
+            SlotAttemptState {
+                artifact: Observation::Unknown(crate::ledger::records::ObservationError {
+                    message: "assignment read failed: fixture".to_string(),
+                }),
+                generation: Some(test_generation_id("gen-x")),
+            },
+        )]);
+        let err = build_rollback(&actuals, &bindings, None, std::slice::from_ref(&slot))
+            .expect_err("an Unknown actual must not build a rollback");
+        assert!(
+            err.to_string().contains("unknown assignment"),
+            "the refusal names the unknown assignment, got: {err}"
+        );
+        // A KnownAbsent actual with a generation is equally a corrupted
+        // payload: refused (an advanced slot always has a Known artifact).
+        let actuals = BTreeMap::from([(
+            slot.clone(),
+            SlotAttemptState {
+                artifact: Observation::KnownAbsent,
+                generation: Some(test_generation_id("gen-x")),
+            },
+        )]);
+        build_rollback(&actuals, &bindings, None, std::slice::from_ref(&slot))
+            .expect_err("a KnownAbsent actual with a generation must not build a rollback");
+        // An Unknown actual WITHOUT a generation is dropped (no rollback
+        // entry), never an error: the "no recorded generation" rule applies
+        // regardless of the artifact observation.
+        let actuals = BTreeMap::from([(
+            slot.clone(),
+            SlotAttemptState {
+                artifact: Observation::Unknown(crate::ledger::records::ObservationError {
+                    message: "assignment read failed: fixture".to_string(),
+                }),
+                generation: None,
+            },
+        )]);
+        let rollback = build_rollback(&actuals, &bindings, None, std::slice::from_ref(&slot))
+            .expect("an Unknown actual without a generation is simply dropped");
+        assert_eq!(rollback.slots.len(), 0, "no fake GenerationRef is inserted");
+    }
+
+    /// A legacy LEDGER LINE whose rollback has no `bindings` key must still
+    /// deserialize; its `bindings` map defaults to empty, which rollback
+    /// treats as unverifiable rather than guessing the host/location. The
+    /// line ALSO carries the OLD snapshot-wide `behavior_sha256`/`release`
+    /// members — serde ignores the unknown fields, and the rollback payload
+    /// is interpreted purely through the per-slot bindings (legacy lines stay
+    /// readable after the snapshot-wide fields were removed). The line is
+    /// otherwise in the CURRENT v3 shape — it carries the REQUIRED
+    /// `selected_membership` / `full_membership` members (empty here) so the
+    /// legacy aspect under test is the rollback's missing `bindings` and the
+    /// snapshot-wide members, not the membership fields. A line WITHOUT the
+    /// v3 membership members is an OLD-SHAPE record and fails
+    /// DESERIALIZATION fail-closed (the fields are REQUIRED — no serde
+    /// default), pinned below.
+    #[test]
+    fn legacy_rollback_without_bindings_deserializes_with_empty_map() {
+        // The id must be a canonical (validated) deployment id — the legacy
+        // aspect under test is the missing `bindings` key and the
+        // snapshot-wide members, not the id format.
+        let did = test_deployment_id("deploy-old");
+        let rel = crate::identity::test_release_id("old");
+        let line = format!(
+            r#"{{"kind":"terminal","deployment_id":"{did}","target":"production","status":"successful","recorded_at":"2026-01-01T00:00:00Z","outcomes":{{}},"selected_membership":[],"full_membership":[],"rollback":{{"behavior_sha256":"sha256-aa","release":"{rel}","slots":{{}}}}}}"#
+        );
+        // The legacy line PARSES at the wire level (the legacy snapshot-wide
+        // members are tolerated by serde — unknown members are skipped), and
+        // the domain conversion REFUSES it (fail closed): the legacy
+        // `release` disagrees with the snapshot's derived releases (the
+        // per-slot bindings — empty here — are the authoritative source).
+        let wire: crate::ledger::records::LedgerTerminalWire = serde_json::from_str(&line).unwrap();
+        let err = wire.into_domain().expect_err(
+            "a legacy release that disagrees with the derived snapshot releases fails closed",
+        );
+        assert!(err.to_string().contains("release"), "error: {err}");
+
+        // AN OLD-SHAPE TERMINAL LINE (no `selected_membership` /
+        // `full_membership` members — the v2 shape) fails DESERIALIZATION
+        // fail-closed: the v3 membership fields are REQUIRED (no serde
+        // default), so a pre-v3 record can never be read as if it carried
+        // proven memberships (the intent-line `deployment_schema_version`
+        // check refuses its intent the same way).
+        let old_line = format!(
+            r#"{{"kind":"terminal","deployment_id":"{did}","target":"production","status":"successful","recorded_at":"2026-01-01T00:00:00Z","outcomes":{{}},"rollback":{{"slots":{{}}}}}}"#
+        );
+        let err = serde_json::from_str::<crate::ledger::records::LedgerTerminalWire>(&old_line)
+            .expect_err("an old-shape terminal line without the v3 memberships must fail deserialization fail-closed");
+        assert!(
+            err.to_string().contains("selected_membership")
+                || err.to_string().contains("full_membership"),
+            "the deserialization error must name the missing REQUIRED membership field, got: {err}"
+        );
+    }
+}
+
+// ---- rebinding proof ----
+// The REBINDING records of the deployment ledger (feature area A6
+// "RebindingPlan"): the wire's claimed [`RebindingPlan`] and the domain's
+// verified [`VerifiedReleaseRebinding`] (with the ONLY construction path
+// [`VerifiedReleaseRebinding::verify`]), plus the [`FrozenSlotTopology`]
+// payload they carry.
+/// The logical topology one slot is FROZEN into inside a release record:
+/// which variant declares the slot and which rollout groups it belongs to
+/// (the declaring variant file names the slot; a slot can belong to several
+/// groups or none). This is the slot→variant/group half of a release's
+/// temporal source — a `release:<id>` push resolves each slot's variant
+/// from THIS frozen map, never the caller's current variant files.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenSlotTopology {
+    /// The variant that declares the slot in the release's canonical slot
+    /// snapshot (`ReleaseRecord.slots` is keyed by variant name).
+    pub variant: String,
+    /// The rollout groups the slot belongs to within its owning target
+    /// (empty when the slot is not grouped).
+    #[serde(default)]
+    pub groups: Vec<String>,
+}
+
+/// The WIRE (claimed) rebinding context of a direct `release:<id>` plan: the
+/// historical release's frozen topology applied onto the CURRENT physical
+/// slots. This is the ON-DISK shape ([`DeploymentPlanWire::rebinding`]); the
+/// domain's verified form is [`VerifiedReleaseRebinding`] — the wire →
+/// domain conversion RECOMPUTES the proof from this claimed shape and the
+/// plan's own source/target/membership, succeeding only when the claimed
+/// rebinding matches the recomputed proof (a mismatch →
+/// [`crate::error::Error::integrity`]).
+///
+/// The membership proof backing a historical-release rebinding: the PROOF
+/// ([`MatchingMembership`]) that the release's FROZEN slot-id membership for
+/// the destination target and the target's CURRENT slot-id membership were
+/// verified EXACTLY EQUAL before planning proceeded (the only construction
+/// path is [`MatchingMembership::verify`], so a [`RebindingPlan`] can only
+/// record an already-verified agreement). The proof carries the agreed
+/// NON-EMPTY slot set; the comparison is LOGICAL membership only — slot IDs,
+/// never physical bindings (server / deploy_dir) — so two sets may be
+/// identical while every physical binding differs.
+///
+/// The serialized form is the agreed slot set (the persisted wire replay of
+/// the verified proof).
+///
+/// An EXPLICIT record that a `release:<id>` push is REBINDING a historical
+/// release's frozen topology onto the CURRENT physical slots.
+///
+/// The temporal-source rule names four sources — HEAD (current variant slot
+/// declarations), `release:<id>` (that release's frozen slot→variant and
+/// group topology), a deployment rollback (that deployment's exact per-slot
+/// artifact and physical binding), and the current server configuration
+/// (connectivity and live capacity ONLY, never topology). A direct release
+/// push is the one historically IMPLICIT exception: it applies the frozen
+/// release topology onto the CURRENT target's slots, so the physical
+/// rebinding happened without being named. This plan makes it explicit: it
+/// records the release, the destination target, the frozen
+/// slot→variant/group topology, the LOGICAL membership check (physical
+/// bindings MAY differ; the logical membership MUST match), and the CURRENT
+/// physical slots (`{server, deploy_dir}`) the frozen topology is bound
+/// onto. Produced at plan time in the `PushRef::Release` branch; HEAD and
+/// deployment-keyed plans carry `None`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebindingPlan {
+    /// The historical release being rebound.
+    pub release: ReleaseId,
+    /// The destination target the release is rebound onto.
+    pub target: TargetName,
+    /// The release's frozen slot→variant/group topology, filtered to the
+    /// destination target (from the release record's OWN canonical slot
+    /// snapshot). Complete regardless of group selection: a `--group` push
+    /// narrows the PLANNED assignments, never the recorded topology.
+    pub frozen_topology: BTreeMap<SlotId, FrozenSlotTopology>,
+    /// The membership PROOF that ran before planning (see
+    /// [`MatchingMembership`]): `frozen == current` verified (slot IDs only;
+    /// physical bindings may differ). For a group push this is the COMPLETE
+    /// membership — the group narrows the planned slots, never the
+    /// membership check.
+    pub(crate) membership: MatchingMembership,
+    /// The CURRENT physical slots the frozen topology is bound onto, per
+    /// PLANNED slot: `slot -> {server, deploy_dir}` from the caller's
+    /// current configuration. A group selection records exactly the selected
+    /// slots (the group-filtered assignments); a full push records every
+    /// member slot.
+    pub current_physical_slots: BTreeMap<SlotId, PhysicalBinding>,
+}
+
+/// The VERIFIED rebinding proof carried by a Release-origin plan: the
+/// complete evidence that the plan's claimed rebinding is REAL — the
+/// historical release, the destination target, the release's frozen
+/// slot→variant/group topology, the membership PROOF (frozen == current,
+/// verified), the SELECTED plan slots (the plan's membership), and the
+/// current physical slots the frozen topology is bound onto. A Release
+/// origin WITHOUT this proof is unrepresentable ([`PlanOrigin::Release`]
+/// carries it INSIDE the source); HEAD and deployment origins carry none.
+///
+/// The ONLY construction path is [`VerifiedReleaseRebinding::verify`], which
+/// checks that every component agrees — the frozen topology's keys equal the
+/// membership's agreed slots, every selected plan slot is a member of the
+/// agreed membership, and the current physical slots cover exactly the
+/// selected plan slots. The wire → domain conversion
+/// ([`DeploymentPlanWire::into_domain`]) RECOMPUTES the proof from the
+/// wire's claimed [`RebindingPlan`] and the plan's own source/target/
+/// membership, succeeding only when the claimed rebinding matches the
+/// recomputed proof (a mismatch → [`crate::error::Error::integrity`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedReleaseRebinding {
+    /// The historical release being rebound.
+    pub release: ReleaseId,
+    /// The destination target the release is rebound onto.
+    pub target: TargetName,
+    /// The release's frozen slot→variant/group topology, filtered to the
+    /// destination target (from the release record's OWN canonical slot
+    /// snapshot). Complete regardless of group selection: a `--group` push
+    /// narrows the PLANNED assignments, never the recorded topology.
+    pub frozen_topology: BTreeMap<SlotId, FrozenSlotTopology>,
+    /// The membership PROOF that ran before planning (see
+    /// [`MatchingMembership`]): `frozen == current` verified (slot IDs only;
+    /// physical bindings may differ). For a group push this is the COMPLETE
+    /// membership — the group narrows the planned slots, never the
+    /// membership check.
+    pub(crate) membership: MatchingMembership,
+    /// The SELECTED plan slots: the plan's membership (the `slots` map keys)
+    /// — the slots the frozen topology is actually bound onto. A group
+    /// selection records exactly the selected slots (the group-filtered
+    /// assignments); a full push records every member slot.
+    pub selected_plan_slots: BTreeSet<SlotId>,
+    /// The CURRENT physical slots the frozen topology is bound onto, per
+    /// SELECTED slot: `slot -> {server, deploy_dir}` from the caller's
+    /// current configuration.
+    pub current_physical_slots: BTreeMap<SlotId, PhysicalBinding>,
+}
+
+impl VerifiedReleaseRebinding {
+    /// The ONLY construction path: verify that the claimed rebinding
+    /// components agree — the frozen topology's keys must equal the
+    /// membership's agreed slots, every selected plan slot must be a member
+    /// of the agreed membership, and the current physical slots must cover
+    /// exactly the selected plan slots. Any disagreement →
+    /// [`crate::error::Error::integrity`] (fail closed: a hand-constructed
+    /// proof can never put the components out of agreement).
+    pub(crate) fn verify(
+        release: ReleaseId,
+        target: TargetName,
+        frozen_topology: BTreeMap<SlotId, FrozenSlotTopology>,
+        membership: MatchingMembership,
+        selected_plan_slots: BTreeSet<SlotId>,
+        current_physical_slots: BTreeMap<SlotId, PhysicalBinding>,
+    ) -> Result<Self> {
+        let membership_slots: BTreeSet<SlotId> = membership.slots().iter().cloned().collect();
+        let frozen_keys: BTreeSet<SlotId> = frozen_topology.keys().cloned().collect();
+        if frozen_keys != membership_slots {
+            return Err(Error::integrity(
+                "rebinding proof refused: the frozen topology keys disagree with the membership's agreed slots",
+            ));
+        }
+        for slot in &selected_plan_slots {
+            if !membership_slots.contains(slot) {
+                return Err(Error::integrity(format!(
+                    "rebinding proof refused: selected slot '{slot}' is outside the agreed membership"
+                )));
+            }
+        }
+        let physical_keys: BTreeSet<SlotId> = current_physical_slots.keys().cloned().collect();
+        if physical_keys != selected_plan_slots {
+            return Err(Error::integrity(
+                "rebinding proof refused: the current physical slots disagree with the selected plan slots",
+            ));
+        }
+        Ok(VerifiedReleaseRebinding {
+            release,
+            target,
+            frozen_topology,
+            membership,
+            selected_plan_slots,
+            current_physical_slots,
+        })
+    }
+}
+
+// ---- membership equations ----
+// The SUCCESSFUL membership-equation enforcement (the terminal-local half).
+//
+// A `Successful` terminal event PERSISTS both memberships so the record
+// PROVES the membership equations:
+//
+// * **outcomes == selected** — the outcomes are the selected slots'
+//   results ([`crate::ledger::records::SlotTable`] key set ==
+//   `selected_membership`);
+// * **rollback == full** — the rollback is the COMPLETE resulting target
+//   snapshot (rollback slot set == `full_membership`);
+// * **selected ⊆ full** — a group push's selected set is a subset of the
+//   full target (an unselected slot is carried forward from the base).
+//
+// The FULL-push EQUALITY (selected == full) is the CROSS-RECORD leg,
+// enforced where the terminal merges into its ledger entry (the mode —
+// group vs full — lives in the intent's `group`), not here.
+//
+// The single verification helper is shared by the wire → domain conversion
+// ([`crate::ledger::records::LedgerTerminalWire::into_domain`]); the
+// successful writer ([`crate::ledger::finalize::finalize_successful_attempt`])
+// produces the proven shape by construction and pins the rollback-key
+// equality itself.
+/// Verify THE SUCCESSFUL MEMBERSHIP EQUATIONS for a `Successful` terminal
+/// (the terminal-local half): the outcomes' key set must EXACTLY equal the
+/// `selected_membership`, the rollback's slot set must EXACTLY equal the
+/// `full_membership`, `selected_membership` must be a SUBSET of
+/// `full_membership`, and a successful deployment always records NON-EMPTY
+/// outcomes and both memberships (a successful deployment selected and
+/// covered at least one slot). A violation → `Error::integrity` (fail
+/// closed — a record that cannot prove its memberships is never read as if
+/// it could).
+pub(crate) fn verify_successful_membership_equations(
+    deployment_id: &DeploymentId,
+    outcome_keys: &BTreeSet<SlotId>,
+    rollback_slot_keys: &BTreeSet<SlotId>,
+    selected_membership: &BTreeSet<SlotId>,
+    full_membership: &BTreeSet<SlotId>,
+) -> Result<()> {
+    if selected_membership.is_empty() || full_membership.is_empty() {
+        return Err(Error::integrity(format!(
+            "terminal {}: status Successful requires NON-EMPTY selected_membership and full_membership — a successful deployment records the slots it selected and the complete target membership it covered",
+            deployment_id
+        )));
+    }
+    if outcome_keys.is_empty() {
+        return Err(Error::integrity(format!(
+            "terminal {}: status Successful requires NON-EMPTY outcomes — a successful deployment records outcomes for the slots it selected",
+            deployment_id
+        )));
+    }
+    if outcome_keys != selected_membership {
+        let missing: Vec<&SlotId> = selected_membership.difference(outcome_keys).collect();
+        let extra: Vec<&SlotId> = outcome_keys.difference(selected_membership).collect();
+        return Err(Error::integrity(format!(
+            "terminal {}: status Successful requires the outcomes to EXACTLY equal the selected_membership (outcomes {outcome_keys:?} vs selected_membership {selected_membership:?}; missing outcomes for {missing:?}, extra outcomes for {extra:?} — the outcomes ARE the selected slots' results)",
+            deployment_id
+        )));
+    }
+    if rollback_slot_keys != full_membership {
+        let missing: Vec<&SlotId> = full_membership.difference(rollback_slot_keys).collect();
+        let extra: Vec<&SlotId> = rollback_slot_keys.difference(full_membership).collect();
+        return Err(Error::integrity(format!(
+            "terminal {}: status Successful requires the rollback's slots to EXACTLY equal the full_membership (rollback slots {rollback_slot_keys:?} vs full_membership {full_membership:?}; missing rollback coverage for {missing:?}, extra rollback slots for {extra:?} — the rollback IS the complete snapshot over the full membership)",
+            deployment_id
+        )));
+    }
+    if !selected_membership.is_subset(full_membership) {
+        let outside: Vec<&SlotId> = selected_membership.difference(full_membership).collect();
+        return Err(Error::integrity(format!(
+            "terminal {}: status Successful requires selected_membership ⊆ full_membership (selected slots outside the full membership: {outside:?} — a push can only select slots the target covers)",
+            deployment_id
+        )));
+    }
+    Ok(())
+}
+
+// ---- schema versions ----
+// The wire FORMAT-VERSION constants of the ledger and pins records (feature
+// area A2 "schema versions"): [`LEDGER_SCHEMA_VERSION`] versions every
+// deployment record; [`PINS_SCHEMA_VERSION`] versions the `pins.json`
+// record. Both are re-exported at the area root ([`crate::ledger`]) and
+// consumed by the store reader's wire-version gates.
+/// The deployment LEDGER format version — the version every deployment
+/// record carries (`LedgerIntentWire.deployment_schema_version`, validated on
+/// every read in [`crate::store::local::LocalStore::read_ledger`]). Every
+/// ledger writer emits exactly `LEDGER_SCHEMA_VERSION`; every ledger reader
+/// refuses any other version (fail closed — a mismatched record is never
+/// silently interpreted). This is INDEPENDENT of
+/// [`crate::config::raw::CONFIG_SCHEMA_VERSION`]: the deployment records
+/// version themselves separately from the configuration format, so bumping
+/// one never invalidates the other.
+///
+/// The current format is version 3: deployment records use the canonical
+/// placement-slot-keyed shape (`BTreeMap<SlotId, _>` maps, nested
+/// artifact/generation refs) and carry the exclusive owning target + the
+/// optional rollout group of the attempt. Version 3 carries BOTH reshaping
+/// changes:
+///
+/// * the intent's `pre_push` per-slot state carries the pre-push ASSIGNMENT
+///   as a three-state observation ([`crate::ledger::Observation<ArtifactRef>`]
+///   — `Known` / `KnownAbsent` / `Unknown`) instead of a raw artifact, so an
+///   unreadable pre-push assignment is a DISTINCT `Unknown` value, never a
+///   valid-looking artifact (version 2 = the pre-observation `pre_push`
+///   shape that carried a raw artifact, including the removed
+///   `unknown_artifact()` sentinel);
+/// * a SUCCESSFUL terminal event persists BOTH memberships —
+///   `selected_membership` (the slots the push actually deployed) and
+///   `full_membership` (the complete target membership at terminal time) —
+///   so the record PROVES the membership equations (outcomes == selected,
+///   rollback == full, selected ⊆ full, full-push selected == full) instead
+///   of implying them.
+///
+/// Version 2 records (the shape WITHOUT the persisted memberships and the
+/// raw-artifact `pre_push` — and version 1 records, the multi-target
+/// `targets` membership shape) are REJECTED on read — no compatibility
+/// fallback: the intent-line version check refuses a foreign
+/// `deployment_schema_version`, and an old-shape terminal line fails
+/// deserialization (the new membership fields are REQUIRED, no serde
+/// default). A hypothetical pre-rekeying shape that keyed these maps by
+/// server ID with flat artifact fields is NOT the current schema and never
+/// loads.
+pub(crate) const LEDGER_SCHEMA_VERSION: u32 = 3;
+
+/// The `pins.json` record format version (`Pins.schema_version`). Pins are
+/// durable, store-global retention anchors for artifact CONTENT ONLY (see
+/// [`Pins`]): a pin never retains or reinserts an old deployment, attempt,
+/// or snapshot in history. Readers refuse any other version (fail closed — a
+/// pins file from a different schema is never silently interpreted).
+pub(crate) const PINS_SCHEMA_VERSION: u32 = 1;

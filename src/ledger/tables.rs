@@ -9,7 +9,7 @@
 //! VERIFIED [`NonEmptySlotTable::build`], which refuses the empty table).
 //! The wire outcome row ([`SlotResult`], the RAW serde form the ledger's
 //! JSONL carries) lives with its domain sibling in
-//! [`crate::ledger::outcomes`]; the deployment-record shapes that use these
+//! [`crate::ledger::records`]; the deployment-record shapes that use these
 //! tables live in [`crate::ledger::records`].
 //!
 //! THE TABLE IS ORDERED: iteration (`keys` / `values` / `iter`) is in
@@ -319,7 +319,7 @@ mod tests {
         ArtifactRef, GenerationRef, PlacementSlotAssignment, TargetName, VariantName,
         test_deployment_id, test_generation_id, test_release_id, test_tree_digest,
     };
-    use crate::ledger::intent::LedgerIntentWire;
+    use crate::ledger::records::LedgerIntentWire;
     use crate::ledger::records::SlotAttemptState;
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
