@@ -11,6 +11,7 @@ pub mod history;
 pub mod identity;
 pub mod init;
 pub mod layout;
+pub mod ledger;
 pub mod mapper;
 pub mod model;
 pub mod push;
