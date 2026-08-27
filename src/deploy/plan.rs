@@ -54,7 +54,7 @@ use crate::ledger::{
 };
 use crate::ledger::{PushRef, resolve_deployment};
 use crate::store::local::LocalStore;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The plan for one placement slot: exactly the canonical slot→artifact
 /// assignment ([`PlacementSlotAssignment`]), reused rather than re-declared.
@@ -170,6 +170,11 @@ impl PlannedResolution {
 // in [`crate::deploy::groups`]; re-imported here so `plan_assignments` (and
 // this module's tests, via `super::*`) keep naming them as before.
 use super::groups::{SlotSelection, validate_direct_release_membership};
+// The PARTIAL-ROLLOUT GUARDS moved to [`crate::deploy::partial_rollout`];
+// this re-export keeps the pre-split path `crate::deploy::plan::validate_partial_rollout`
+// (referenced by the ledger's finalization docs) resolving.
+#[allow(unused_imports)]
+pub(crate) use super::partial_rollout::validate_partial_rollout;
 
 /// The latest successful rollback state of a target (the base for a partial
 /// rollout's complete snapshot), or `None` when the target has no successful
@@ -186,114 +191,6 @@ pub(crate) fn latest_successful_rollback(
         }
     }
     Ok(None)
-}
-
-/// PARTIAL-ROLLOUT GUARDS, validated BEFORE any remote mutation: a group push
-/// derives its complete snapshot by overlaying the selected slots onto the
-/// latest successful target snapshot, so the base must be able to carry every
-/// unselected slot forward.
-///
-/// * On a target's FIRST deployment (no base snapshot), a partial group push
-///   is allowed only if the selected group covers every target slot.
-/// * After target membership changes, a partial push is allowed only when
-///   every current UNSELECTED slot has a prior assignment in the base AND its
-///   physical binding still matches (a slot added to the target after the
-///   base, or rebound/moved since, would otherwise be silently dropped from
-///   the new snapshot).
-///
-/// A full-target push (no group) is always allowed: it establishes a new
-/// complete snapshot from its own actuals.
-///
-/// `selected` is the PER-BRANCH resolved slot-ID set (the plan's assignments
-/// — HEAD/deployment from the current topology, `release:<id>` from the
-/// release's FROZEN group topology), NOT a resolution from the caller's
-/// current configuration: a historical release's frozen group partition may
-/// legitimately differ from the current one, and the guard must compare the
-/// slots the push actually selects against the current membership.
-pub(crate) fn validate_partial_rollout(
-    selection: &SlotSelection,
-    selected: &[SlotId],
-    config: &ProjectConfig,
-    store: &LocalStore,
-) -> Result<()> {
-    if selection.group.is_none() {
-        return Ok(());
-    }
-    let current = config.target_slots(selection.target.as_str())?;
-    let selected: HashSet<&str> = selected.iter().map(|s| s.as_str()).collect();
-    let unselected: Vec<(&crate::config::SlotConfig, &crate::config::ServerDef)> = current
-        .iter()
-        .filter(|(s, _)| !selected.contains(s.id.as_str()))
-        .copied()
-        .collect();
-    let base = latest_successful_rollback(store, selection.target.as_str())?;
-    match base {
-        None => {
-            // First deployment: the group must cover every target slot.
-            if !unselected.is_empty() {
-                return Err(Error::preflight(format!(
-                    "partial rollout of target '{}' with group '{}' on its first deployment is refused: \
-                     the group must cover every target slot (unselected: {})",
-                    selection.target,
-                    selection.group.as_deref().unwrap_or(""),
-                    unselected
-                        .iter()
-                        .map(|(s, _)| s.id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
-            }
-        }
-        Some(base) => {
-            // Membership drift: every unselected slot must have a prior
-            // assignment in the base and its physical binding must still
-            // match.
-            for (slot, sdef) in &unselected {
-                let slot_id =
-                    SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
-
-                let current_binding = PhysicalBinding {
-                    server: ServerId::parse(sdef.id.as_str())
-                        .expect("validated server id is a safe segment"),
-                    deploy_dir: slot.deploy_dir().to_string_lossy().into_owned(),
-                };
-                if !base.slots.contains_key(&slot_id) {
-                    return Err(Error::preflight(format!(
-                        "partial rollout of target '{}' with group '{}' is refused: unselected slot \
-                         '{}' has no prior assignment in the latest successful snapshot (it was \
-                         added to the target after that deployment)",
-                        selection.target,
-                        selection.group.as_deref().unwrap_or(""),
-                        slot_id
-                    )));
-                }
-                let recorded = base.bindings.get(&slot_id).ok_or_else(|| {
-                    Error::preflight(format!(
-                        "partial rollout of target '{}' with group '{}' is refused: unselected slot \
-                         '{}' has no recorded physical binding in the latest successful snapshot",
-                        selection.target,
-                        selection.group.as_deref().unwrap_or(""),
-                        slot_id
-                    ))
-                })?;
-                if recorded != &current_binding {
-                    return Err(Error::preflight(format!(
-                        "partial rollout of target '{}' with group '{}' is refused: unselected slot \
-                         '{}' was bound to server '{}' at '{}' in the latest successful snapshot, \
-                         now bound to '{}' at '{}'; the new snapshot could not carry it forward",
-                        selection.target,
-                        selection.group.as_deref().unwrap_or(""),
-                        slot_id,
-                        recorded.server,
-                        recorded.deploy_dir,
-                        current_binding.server,
-                        current_binding.deploy_dir
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Resolve the desired assignment for each SELECTED slot given the push
@@ -437,39 +334,18 @@ pub fn plan_assignments(
                     "target membership changed; exact rollback requires identical stable placement-slot set",
                 ));
             }
-            // Every SELECTED member's COMPLETE physical binding — the server
-            // AND the on-server deploy_dir — must match the one recorded in
-            // the snapshot: the generation is mapped to a slot by SLOT ID, so a
-            // slot rebound to a different server, or moved to a different
-            // deploy_dir on the SAME server, would otherwise silently roll
-            // the historical assignment onto the wrong host/location. A
-            // missing recorded binding (legacy pre-feature snapshot) is
-            // unverifiable and refuses for the same reason. Unselected slots
-            // are not planned (they remain at the latest current state).
-            for (slot, sdef) in &members {
-                let slot_id =
-                    SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
-
-                let current_binding = PhysicalBinding {
-                    server: ServerId::parse(sdef.id.as_str())
-                        .expect("validated server id is a safe segment"),
-                    deploy_dir: slot.deploy_dir().to_string_lossy().into_owned(),
-                };
-                let recorded = entry.bindings.get(&slot_id).ok_or_else(|| {
-                    Error::rollback(format!(
-                        "slot '{slot_id}' has no recorded physical binding in deployment '{deployment_id}' of target '{ft}'; exact rollback cannot verify the deployment location"
-                    ))
-                })?;
-                if recorded != &current_binding {
-                    return Err(Error::rollback(format!(
-                        "slot '{slot_id}' was bound to server '{}' at '{}' in deployment '{deployment_id}' of target '{ft}', now bound to '{}' at '{}'; exact rollback would deploy to the wrong host",
-                        recorded.server,
-                        recorded.deploy_dir,
-                        current_binding.server,
-                        current_binding.deploy_dir
-                    )));
-                }
-            }
+            // The EXACT-ROLLBACK VERIFICATION (A2): every SELECTED member's
+            // COMPLETE physical binding — the server AND the on-server
+            // deploy_dir — must match the one recorded in the snapshot (see
+            // [`crate::deploy::exact_rollback::verify_exact_rollback_bindings`]).
+            // Unselected slots are not planned (they remain at the latest
+            // current state).
+            super::exact_rollback::verify_exact_rollback_bindings(
+                &members,
+                &entry,
+                deployment_id,
+                ft,
+            )?;
             // The releases the snapshot's slots reference, derived PER SLOT
             // from each slot's OWN artifact binding: a partial snapshot can
             // carry slots from DIFFERENT releases (group pushes over time —

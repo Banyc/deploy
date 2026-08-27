@@ -36,12 +36,22 @@
 //!   `leave_changed`), the step-13 batch compensation pass, the degraded
 //!   derivation, and never-advanced outcome handling.
 //! * [`plan`] — assignment planning (the old `push::plan`):
-//!   `plan_assignments`, the proof-bearing [`plan::ResolvedSelection`],
-//!   partial-rollout guards, `VerifiedReleaseRebinding` usage, and
-//!   `latest_successful_rollback`.
+//!   `plan_assignments`, the proof-bearing [`plan::ResolvedSelection`], the
+//!   `VerifiedReleaseRebinding` usage, and `latest_successful_rollback`.
 //! * [`server`] — the per-server mutation pipeline (the old `push::server`):
-//!   `process_server` (publish/swap/activate/verify/commit per slot),
-//!   `compensate_server`, the step hooks.
+//!   `process_server` (publish/swap/activate/verify/commit per slot), the
+//!   step hooks.
+//! * [`partial_rollout`] — the PARTIAL-ROLLOUT GUARDS (A1):
+//!   [`partial_rollout::validate_partial_rollout`], the first-deployment /
+//!   membership-change rules a group push must satisfy before any remote
+//!   mutation.
+//! * [`exact_rollback`] — the EXACT ROLLBACK verification (A2):
+//!   [`exact_rollback::verify_exact_rollback_bindings`], the per-slot
+//!   physical-binding checks (recorded binding missing / rebound / moved
+//!   deploy_dir refuses) a deployment rollback runs before planning.
+//! * [`compensation`] — per-slot COMPENSATION (A1 step 11):
+//!   [`compensation::compensate_server`], the prior-generation restore /
+//!   remove-`current`-on-first-deploy logic with its CAS precondition.
 //! * [`staging`] — the disposable staging lifecycle (the old `push::staging`).
 //! * [`dryrun`] — the dry-run plan computation/rendering from the push spine.
 //! * [`capacity`] — capacity preflight (the old `push::capacity`).
@@ -54,13 +64,16 @@
 
 pub mod batching;
 pub mod capacity;
+pub mod compensation;
 pub mod coverage;
 pub mod dryrun;
+pub mod exact_rollback;
 pub mod failure;
 pub mod groups;
 pub mod lock;
 pub mod maintenance;
 pub mod noop;
+pub mod partial_rollout;
 pub mod plan;
 pub mod push;
 pub mod refs;
@@ -76,9 +89,13 @@ pub(crate) use batching::*;
 #[allow(unused_imports)]
 pub(crate) use capacity::*;
 #[allow(unused_imports)]
+pub(crate) use compensation::*;
+#[allow(unused_imports)]
 pub(crate) use coverage::*;
 #[allow(unused_imports)]
 pub(crate) use dryrun::*;
+#[allow(unused_imports)]
+pub(crate) use exact_rollback::*;
 #[allow(unused_imports)]
 pub(crate) use failure::*;
 pub use groups::*;
@@ -86,6 +103,8 @@ pub use groups::*;
 pub(crate) use maintenance::*;
 #[allow(unused_imports)]
 pub(crate) use noop::*;
+#[allow(unused_imports)]
+pub(crate) use partial_rollout::*;
 pub use plan::*;
 pub use push::*;
 #[allow(unused_imports)]

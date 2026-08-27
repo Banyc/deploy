@@ -825,7 +825,12 @@ fn push_inner(
     // accessor (`planned.resolved().slots()`), the exact non-empty slot set
     // the planner resolved against the reference's declared temporal source.
     let planned_slot_ids: Vec<SlotId> = resolved.slots().iter().cloned().collect();
-    crate::deploy::plan::validate_partial_rollout(selection, &planned_slot_ids, config, store)?;
+    crate::deploy::partial_rollout::validate_partial_rollout(
+        selection,
+        &planned_slot_ids,
+        config,
+        store,
+    )?;
 
     // Behavior coverage gate: EVERY planned assignment's (release, variant)
     // must have a frozen behavior contract BEFORE any remote state is touched
