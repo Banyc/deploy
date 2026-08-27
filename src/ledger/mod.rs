@@ -20,6 +20,9 @@
 //!   [`DeploymentIntent`]) with the verifying conversion + the in-memory
 //!   push report ([`LedgerIntentReport`]) (the “two line kinds — intent”
 //!   half).
+//! * [`log`] — the `deploy log` RENDERING ([`render_log`] + the
+//!   effective-status derivation): one line per attempt, newest last,
+//!   rollback-key prefix, ` group=<name>` note.
 //! * [`terminal`] — the terminal records ([`LedgerTerminalWire`] /
 //!   [`LedgerTerminal`] / [`TerminalDisposition`]) with the verifying
 //!   conversion + status accessor (the “two line kinds — terminal” half).
@@ -47,9 +50,6 @@
 //! Deferred modules (feature present, but the SEMANTIC TYPES do not live
 //! here — noted so the inventory stays complete):
 //!
-//! * **deploy log** — the rendering lives in [`crate::cli`] (`render_log`),
-//!   over the ledger's `LedgerEntry` stream; no log-rendering semantics live
-//!   in records/history, so there is no `log` module.
 //! * **commit markers** — the marker I/O lives in
 //!   [`crate::remote::helper::RemoteHelper::write_commit_marker`] and the
 //!   deterministic payload is built at the call sites; no marker SEMANTIC
@@ -71,6 +71,7 @@
 pub mod append;
 pub mod finalize;
 pub mod intent;
+pub mod log;
 pub mod membership;
 pub mod observation;
 pub mod outcomes;
@@ -88,6 +89,7 @@ pub use intent::{
     DeploymentIntent, DesiredGeneration, IntentSlot, LedgerIntentReport, LedgerIntentWire,
     PreviousGeneration,
 };
+pub use log::render_log;
 pub use observation::{
     Observation, ObservationError, ObservedGeneration, ObservedSlot, ObservedState, ObservedTarget,
 };

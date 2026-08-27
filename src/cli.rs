@@ -11,7 +11,12 @@ use crate::deploy::{PushOptions, PushReport, push};
 use crate::error::{Error, Result};
 use crate::identity::{DeploymentId, ReleaseId, valid_hex_digest};
 use crate::init::{InitOptions, init_project};
-use crate::ledger::{DeploymentStatus, LedgerEntry, Observation, ObservedTarget};
+use crate::ledger::{Observation, ObservedTarget};
+// The `deploy log` RENDERING lives in [`crate::ledger::log`]; cli.rs stays the
+// command wrapper (arg parsing + printing) and keeps the old
+// `crate::cli::render_log` path working via this thin re-export (the
+// integration tests reference it).
+pub use crate::ledger::log::render_log;
 use crate::remote::create_remote;
 use crate::remote::transport::Remote;
 use crate::store::local::LocalStore;
@@ -500,82 +505,6 @@ fn render_status(observed: &ObservedTarget) -> Vec<String> {
         .collect()
 }
 
-/// Effective status of an attempt for `deploy log`: the append-only
-/// attempts.jsonl record is immutable, but the attempt's status lives in its
-/// per-deployment TRANSITION STREAM (`deployments/<id>/transitions.jsonl`),
-/// so the effective status is the LATEST transition (plus its reason, if
-/// any). When no transition has been recorded yet, the attempt is treated as
-/// still pending.
-/// The effective status + reason of a ledger entry for `deploy log`: the
-/// entry's TERMINAL EVENT carries the status and reason; an intent-only
-/// entry (in flight or recoverable-pending) renders `PendingCommit`.
-fn effective_status(entry: &LedgerEntry) -> (DeploymentStatus, Option<String>) {
-    match entry.terminal.as_ref() {
-        // The status is DERIVED from the terminal's disposition (the domain
-        // terminal carries no separate status — they can never disagree).
-        Some(t) => (t.status(), t.reason.clone()),
-        None => (DeploymentStatus::PendingCommit, None),
-    }
-}
-
-/// Render `deploy log <target>` output: one line per recorded ledger entry,
-/// newest last, each PREFIXED with the DEPLOYMENT ID of the successful
-/// deployment that produced it — the exact rollback key the push reference
-/// grammar accepts (`deploy push <target> <deployment-id>`) — or `-` for
-/// entries that produced no rollback state (failed/degraded entries are
-/// visible here but are NOT valid rollback refs; a failed deployment id
-/// never resolves). The ledger IS the deployment history: a successful
-/// terminal event carries the rollback payload keyed by its deployment id
-/// (the old `sN` index prefix is gone — rollback payloads are keyed by
-/// deployment id). The CLI prints exactly these lines; the unit test
-/// asserts on them directly because lib unit tests cannot capture the
-/// harness-owned stdout sink.
-pub fn render_log(
-    _store: &LocalStore,
-    _target: &str,
-    entries: &[LedgerEntry],
-) -> Result<Vec<String>> {
-    // A successful entry's DEPLOYMENT ID is its rollback key — the prefix
-    // `deploy push <target> <deployment-id>` accepts. The public grammar is
-    // deployment-keyed (no sN).
-    let mut rolled_back: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for e in entries.iter().filter(|e| {
-        e.terminal
-            .as_ref()
-            .is_some_and(|t| t.status() == DeploymentStatus::Successful)
-    }) {
-        rolled_back.insert(e.deployment_id.as_str());
-    }
-    let mut out = Vec::with_capacity(entries.len());
-    for e in entries {
-        let (status, reason) = effective_status(e);
-        let prefix = if rolled_back.contains(e.deployment_id.as_str()) {
-            e.deployment_id.as_str().to_string()
-        } else {
-            "-".to_string()
-        };
-        // The optional rollout group the attempt selected (`--group <name>`),
-        // displayed when one was used. The group name is descriptive; the
-        // exact selected slot IDs are the authoritative historical evidence.
-        let group_note = e
-            .intent
-            .group
-            .as_ref()
-            .map(|g| format!(" group={g}"))
-            .unwrap_or_default();
-        out.push(match reason {
-            Some(r) => format!(
-                "{prefix}  {}  {status:?}  {}{group_note}  ({r})",
-                e.deployment_id, e.intent.attempted_at
-            ),
-            None => format!(
-                "{prefix}  {}  {status:?}  {}{group_note}",
-                e.deployment_id, e.intent.attempted_at
-            ),
-        });
-    }
-    Ok(out)
-}
 fn print_init_report(report: &crate::init::InitReport) {
     println!("created deploy project at {}", report.target.display());
     for f in &report.files {
@@ -625,8 +554,8 @@ mod tests {
         test_tree_digest,
     };
     use crate::ledger::{
-        DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
-        NonEmptySlotTable, ObservedSlot, SlotOutcomeKind, SlotResult, SlotTable,
+        DeploymentIntent, DeploymentStatus, DesiredGeneration, IntentSlot, LedgerRollback,
+        LedgerTerminal, NonEmptySlotTable, ObservedSlot, SlotOutcomeKind, SlotResult, SlotTable,
         TerminalDisposition,
     };
     use std::collections::BTreeMap;
@@ -741,7 +670,7 @@ mod tests {
         store.append_intent("production", &a).unwrap();
         let entries = store.read_ledger("production").unwrap();
         assert_eq!(
-            effective_status(&entries[0]),
+            crate::ledger::log::effective_status(&entries[0]),
             (DeploymentStatus::PendingCommit, None)
         );
 
@@ -759,7 +688,7 @@ mod tests {
             .unwrap();
         let entries = store.read_ledger("production").unwrap();
         assert_eq!(
-            effective_status(&entries[0]),
+            crate::ledger::log::effective_status(&entries[0]),
             (
                 DeploymentStatus::Successful,
                 Some("recovery finalization".to_string())

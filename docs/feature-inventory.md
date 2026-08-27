@@ -13,7 +13,6 @@ module is not yet dedicated.
 ## A1. DEPLOYMENT SEMANTICS — remaining
 
 - **Head-files push** — home: `src/deploy/push.rs` (the orchestration spine, still hosts the batch/status/compensation flow).
-- **Group push = COMPLETE snapshot** (unselected slots carried forward) — home: `src/ledger/finalize.rs` (shared with finalization).
 - **Partial-rollout guards** (first-deployment / membership-change rules) — home: `src/deploy/plan.rs` (shared with planning).
 - **Per-slot compensation (step 11)** (restore prior generation / remove `current` on first deploy) — home: `src/deploy/server.rs` (shared with the per-server process).
 - **Skipped slots still appear** in the attempt with their reconciled assignment — home: `src/deploy/push.rs`.
@@ -22,7 +21,6 @@ module is not yet dedicated.
 
 - **One ledger per target** (`targets/<target>/ledger.jsonl`, append-only JSONL) — home: `src/store/local.rs` (infrastructure).
 - **Deployment-id-keyed** (duplicate intent refused; terminal requires matching intent) — home: `src/store/local.rs`.
-- **`deploy log`** rendering (rollback-key prefix, ` group=<name>` note) — home: `src/cli.rs`.
 - **Exact rollback verification** (rebound slot / moved deploy_dir refuses) — home: `src/deploy/plan.rs` (shared with planning).
 
 ## A3. REMOTE / STORE SEMANTICS — remaining
@@ -51,11 +49,9 @@ module is not yet dedicated.
 - [HIDDEN] Three lock layers (local `FileLock` `src/deploy/lock.rs`, per-target, per-slot remote mutation locks `src/remote/current.rs`/`helper.rs`) — spans.
 - [HIDDEN] `ensure_target_dir_durable` (fsync before the lock file) — home: `src/store/local.rs`.
 - [HIDDEN] Durable debt markers (`retention-debt.json`, `sweep-debt.json`) — home: `src/store/local.rs` (I/O) + `src/retention/debt.rs`.
-- [HIDDEN] `deploy log` ` group=<name>` annotation — home: `src/cli.rs`.
 - [HIDDEN] Abandoned incoming cleanup before mutating — home: `src/deploy/push.rs`.
 - [HIDDEN] First-deployment compensation removes `current` (CAS), never writes — home: `src/deploy/server.rs`.
 - [HIDDEN] Compensation re-runs the PRIOR generation's stored behavior contract with the PRIOR assignment's identity — home: `src/deploy/server.rs`.
-- [HIDDEN] Group pushes still yield COMPLETE snapshots + partial-rollout guards — home: `src/ledger/finalize.rs` + `src/deploy/plan.rs`.
 - [HIDDEN] `UMASK_PROBE_MODE`/`UMASK_RESULT_FILE`, `FAKE_SYSTEMCTL_FAIL`/`FAKE_SYSTEMCTL_ONCE` — test-only shims — home: `src/remote/materialize.rs` + `src/deploy/push.rs` tests.
 
 ## Module map (encapsulation)
@@ -68,7 +64,7 @@ where each feature lives.
 | Feature | Module path |
 | --- | --- |
 | A1 deployment semantics | `src/deploy/` — `push.rs` (orchestration spine), `refs.rs` (reference grammar), `groups.rs`, `batching.rs`, `failure.rs`, `noop.rs` (up-to-date), `maintenance.rs` (step-17 + debt), `coverage.rs` (behavior gate), `plan.rs`, `server.rs`, `staging.rs`, `dryrun.rs`, `capacity.rs`, `lock.rs` |
-| A2 ledger semantics | `src/ledger/` — `records.rs` (shared tables), `intent.rs`, `terminal.rs`, `outcomes.rs`, `observation.rs`, `schema.rs` (`LEDGER`/`PINS_SCHEMA_VERSION`), `append.rs`, `membership.rs`, `rollback.rs`, `finalize.rs`, `recovery.rs`, `refs.rs`, `rebinding.rs` |
+| A2 ledger semantics | `src/ledger/` — `records.rs` (shared tables), `intent.rs`, `terminal.rs`, `outcomes.rs`, `observation.rs`, `schema.rs` (`LEDGER`/`PINS_SCHEMA_VERSION`), `log.rs` (deploy log rendering), `append.rs`, `membership.rs`, `rollback.rs`, `finalize.rs`, `recovery.rs`, `refs.rs`, `rebinding.rs` |
 | A3 remote / store semantics | `src/remote/` — `helper.rs` (core), `current.rs` (symlink chain + CAS), `markers.rs` (commit markers), `transactions.rs`, `publish.rs` (object store I/O), `rotate.rs` (receiver rotation I/O), `protocol.rs` (handshake), `canonical.rs` (tree), `materialize.rs` (mapper/template), `layout.rs`, `observed.rs`, `transport.rs`, `ssh.rs`, `hostkey.rs`, `runner.rs`; `src/store/` — `local.rs`, `atomic.rs` |
 | A4 retention / sweep | `src/retention/` — `policy.rs`, `pins.rs`, `gc.rs`, `history_floor.rs`, `checkpoint.rs`, `debt.rs`, `rotate.rs`, `sweep_tests.rs` |
 | A5 verification / activation | `src/verify/` — `command.rs`, `systemd.rs`, `behavior.rs`, `release.rs` |
