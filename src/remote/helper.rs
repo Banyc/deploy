@@ -1,11 +1,11 @@
 //! Remote helper: server-side operations over a [`Remote`] transport.
 //!
 //! The [`RemoteHelper`] struct and its constructor, plus the core read/status
-//! plumbing everything shares: the status/assignment/record types, assignment
-//! and behavior-contract reads, the server mutation lock (and its RAII
-//! guard), generation-record creation, and inventory writes. Per-feature
-//! method groups live in their owning modules: the `current` symlink chain in
-//! [`crate::remote::current`], commit markers in [`crate::remote::markers`],
+//! plumbing everything shares: the status/record types, behavior-contract
+//! reads, the server mutation lock (and its RAII guard), and inventory
+//! writes. Per-feature method groups live in their owning modules: the
+//! generation record in [`crate::remote::assignment`], the `current` symlink
+//! chain in [`crate::remote::current`], commit markers in [`crate::remote::markers`],
 //! transaction records in [`crate::remote::transactions`], object-store
 //! publication in [`crate::remote::publish`], receiver rotation in
 //! [`crate::remote::rotate`], and the protocol handshake in
@@ -13,34 +13,13 @@
 //! operation ID and is idempotent.
 
 use crate::error::{Error, Result};
-use crate::identity::{
-    ArtifactRef, BehaviorContract, DeploymentId, GenerationId, ReleaseId, ReleaseRecord, TargetName,
-};
+use crate::identity::{BehaviorContract, GenerationId, ReleaseId, ReleaseRecord};
 use crate::remote::layout;
 use crate::remote::transport::Remote;
-use serde::{Deserialize, Serialize};
 
-/// The remote generation record (`generations/<gen>/assignment.json`). The
-/// artifact relationship is expressed via the canonical [`ArtifactRef`]; the
-/// ID fields are the (string-shaped on the wire) typed newtypes so the JSON
-/// stays `{deployment_id, generation_id, artifact: {release, variant, tree},
-/// behavior_sha256, prior_generation, created_at, target}`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GenerationAssignment {
-    pub deployment_id: DeploymentId,
-    pub generation_id: GenerationId,
-    pub artifact: ArtifactRef,
-    pub behavior_sha256: String,
-    #[serde(default)]
-    pub prior_generation: Option<GenerationId>,
-    pub created_at: String,
-    /// The target whose push created this generation record. Retention on a
-    /// slot shared between several targets is attributed per originating
-    /// target; `None` marks a LEGACY record written before this field existed
-    /// (retained conservatively under every member policy).
-    #[serde(default)]
-    pub target: Option<TargetName>,
-}
+// Re-export so pre-extraction paths (`crate::remote::helper::GenerationAssignment`)
+// keep compiling unchanged.
+pub use crate::remote::assignment::GenerationAssignment;
 
 #[derive(Clone, Debug, Default)]
 pub struct RemoteStatus {
@@ -70,12 +49,6 @@ impl<'a> RemoteHelper<'a> {
 
     pub fn remote(&self) -> &dyn Remote {
         self.remote
-    }
-
-    pub fn read_assignment(&self, gen_id: &str) -> Result<GenerationAssignment> {
-        let p = layout::generation(gen_id).join("assignment.json");
-        let data = self.remote.read(&p)?;
-        serde_json::from_slice(&data).map_err(|e| Error::remote(format!("parse assignment: {e}")))
     }
 
     /// Read the behavior contract for a specific variant of a release. The
@@ -169,42 +142,6 @@ impl<'a> RemoteHelper<'a> {
         })
     }
 
-    /// Create a generation record and its `root` symlink. Does not move
-    /// `current`.
-    ///
-    /// The assignment record is immutable and installed with create-or-compare
-    /// semantics: a generation ID colliding with different content fails
-    /// integrity instead of silently rewriting history. Generation IDs are
-    /// fresh UUIDv7 values minted under the operation lock, so this can only
-    /// fire on corruption or retry-after-crash with divergent state.
-    pub fn create_generation(&self, op_id: &str, assignment: &GenerationAssignment) -> Result<()> {
-        let gen_dir = layout::generation(assignment.generation_id.as_str());
-        self.remote.create_dir_all(&gen_dir)?;
-        let json = serde_json::to_vec_pretty(assignment)
-            .map_err(|e| Error::remote(format!("serialize assignment: {e}")))?;
-        let assignment_path = gen_dir.join("assignment.json");
-        if !self.remote.try_write_new(&assignment_path, &json)? {
-            let existing = self.remote.read(&assignment_path)?;
-            if existing != json {
-                return Err(Error::integrity(format!(
-                    "generation {} already exists with different content",
-                    assignment.generation_id
-                )));
-            }
-        }
-        // The `root` symlink lives inside `generations/<gen>/`, so it must be
-        // relative to that directory (../../objects/...). Its target is derived
-        // deterministically from the (now-verified) assignment, so recreating
-        // it after a crash is safe.
-        let root_link_path = gen_dir.join("root");
-        if !self.remote.exists(&root_link_path) {
-            let root_link = layout::generation_root_link(assignment.artifact.tree.as_str());
-            self.remote.symlink(&root_link, &root_link_path)?;
-        }
-        let _ = op_id;
-        Ok(())
-    }
-
     /// Recompute and write `state/inventory.json`.
     pub fn write_inventory(&self) -> Result<()> {
         let mut inv = Vec::new();
@@ -256,71 +193,7 @@ pub fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::{test_deployment_id, test_generation_id, test_tree_digest};
     use crate::remote::transport::LocalTransport;
-
-    fn assignment(gen_id: &str, tree: &str) -> GenerationAssignment {
-        GenerationAssignment {
-            deployment_id: test_deployment_id("deploy-1"),
-            generation_id: test_generation_id(gen_id),
-            artifact: ArtifactRef {
-                release: crate::identity::test_release_id("rel-sha256-x"),
-                variant: crate::identity::VariantName::new("standard".to_string()),
-                tree: crate::identity::test_tree_digest(tree),
-            },
-            behavior_sha256: "b".to_string(),
-            prior_generation: None,
-            created_at: "2020-01-01T00:00:00Z".to_string(),
-            target: Some(TargetName::new("t1")),
-        }
-    }
-
-    /// A generation record is immutable: installed with create-or-compare, so
-    /// an ID collision with divergent content fails integrity instead of
-    /// rewriting history, and the original record survives untouched.
-    #[test]
-    fn generation_assignment_is_create_or_compare() {
-        let dir = tempfile::tempdir().unwrap();
-        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
-        let helper = RemoteHelper::new(&remote);
-
-        helper
-            .create_generation("op", &assignment("gen-1", "tree-a"))
-            .expect("first create");
-        // Identical recreation (retry after crash) is idempotent.
-        helper
-            .create_generation("op", &assignment("gen-1", "tree-a"))
-            .expect("identical recreation is idempotent");
-
-        // Divergent content for the same generation ID fails integrity...
-        let err = helper
-            .create_generation("op", &assignment("gen-1", "tree-TAMPERED"))
-            .expect_err("divergent generation rewrite must fail");
-        assert!(
-            err.to_string().contains("different content"),
-            "error must name the immutability violation, got: {err}"
-        );
-
-        // ...and the original record survives. (The `root` symlink may dangle
-        // here — no object was published in this test — so assert on the link
-        // itself rather than its resolved target.)
-        let a = helper
-            .read_assignment(test_generation_id("gen-1").as_str())
-            .unwrap();
-        assert_eq!(
-            a.artifact.tree.as_str(),
-            test_tree_digest("tree-a").as_str()
-        );
-        assert!(
-            std::fs::symlink_metadata(
-                remote
-                    .root()
-                    .join(format!("generations/{}/root", test_generation_id("gen-1")))
-            )
-            .is_ok(),
-            "generation root symlink must exist"
-        );
-    }
 
     /// The RAII lock guard releases the server mutation lock on drop, even
     /// when the guarded block exits through an error path (no explicit

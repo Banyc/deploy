@@ -4,10 +4,13 @@
 //!
 //! # Modules
 //!
+//! * [`assignment`] — the generation record [`GenerationAssignment`]
+//!   (`generations/<gen>/assignment.json`): `read_assignment` and the
+//!   create-or-compare `create_generation` write + `root` symlink (moved from
+//!   `helper`).
 //! * [`helper`] — [`RemoteHelper`](helper::RemoteHelper): the struct,
 //!   constructor, and the core read/status plumbing everything shares
-//!   (assignment/behavior reads, the mutation lock + RAII guard, generation
-//!   records, inventory writes).
+//!   (behavior reads, the mutation lock + RAII guard, inventory writes).
 //! * [`current`] — the `current` symlink chain: full-chain integrity
 //!   validation in `status`, the canonical-target parse, `swap_current`
 //!   (the CAS precondition), and `remove_current_if`.
@@ -28,6 +31,7 @@
 //! * [`transport`], [`ssh`], [`hostkey`], [`runner`] — transport and
 //!   execution layers.
 
+pub mod assignment;
 pub mod canonical;
 pub mod current;
 pub mod helper;
