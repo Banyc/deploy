@@ -22,7 +22,9 @@ mod ssh;
 
 pub use ssh::SshTransport;
 
+use crate::env::SysEnv;
 use crate::error::{Error, Result};
+use std::ffi::OsString;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -159,27 +161,38 @@ fn meta_to_remote(m: &std::fs::Metadata) -> RemoteMeta {
 /// host. It mirrors the SSH remote layout exactly.
 pub struct LocalTransport {
     base: PathBuf,
+    /// The child environment overlay: every spawned child (`exec`, `df`, the
+    /// timeout `kill`) receives THIS snapshot's variables
+    /// ([`SysEnv::child_env`]) — a deterministic environment resolved at the
+    /// construction boundary, never whatever the parent env looks like at
+    /// spawn time.
+    child_env: Vec<(OsString, OsString)>,
 }
 
 impl LocalTransport {
-    /// Build a transport rooted at `base`. Construction is side-effect-free:
-    /// no directories are created and nothing is touched on disk. Call
-    /// [`Remote::provision_layout`] to create the deployment layout before the
-    /// first mutation (the push engine does this behind its non-dry-run gate).
+    /// Build a transport rooted at `base` whose children run with the
+    /// environment snapshot `env` (see [`SysEnv::child_env`]). Construction
+    /// is side-effect-free: no directories are created and nothing is
+    /// touched on disk. Call [`Remote::provision_layout`] to create the
+    /// deployment layout before the first mutation (the push engine does
+    /// this behind its non-dry-run gate).
     ///
     /// The FILESYSTEM ROOT is refused (defense in depth, mirroring the
     /// [`crate::identity::AbsoluteDeployDir`] parse rule): a transport rooted at
     /// `/` would make the deployment cleanup (rotation/retention deleting
     /// stale generations, the GC sweep) operate on the system root, so the
     /// base must have at least one normal path component below the root.
-    pub fn new(base: PathBuf) -> Result<Self> {
+    pub fn new(env: &SysEnv, base: PathBuf) -> Result<Self> {
         if !has_normal_component_below_root(&base) {
             return Err(Error::transport(format!(
                 "deploy_dir {:?} must have at least one normal path component below the root (the filesystem root is not a valid deploy_dir)",
                 base
             )));
         }
-        Ok(LocalTransport { base })
+        Ok(LocalTransport {
+            base,
+            child_env: env.child_env(),
+        })
     }
 }
 
@@ -411,6 +424,7 @@ impl Remote for LocalTransport {
         }
         let mut cmd = std::process::Command::new(&argv[0]);
         cmd.args(&argv[1..]);
+        cmd.envs(self.child_env.iter().cloned());
         cmd.current_dir(&self.base);
         let child = cmd
             .stdout(std::process::Stdio::piped())
@@ -431,6 +445,7 @@ impl Remote for LocalTransport {
             Err(_) => {
                 // Timed out: kill the child.
                 let _ = std::process::Command::new("kill")
+                    .envs(self.child_env.iter().cloned())
                     .arg("-9")
                     .arg(pid.to_string())
                     .status();
@@ -450,6 +465,7 @@ impl Remote for LocalTransport {
 
     fn filesystem_bytes(&self) -> Result<FsBytes> {
         let out = std::process::Command::new("df")
+            .envs(self.child_env.iter().cloned())
             .args(["-k", self.base.to_string_lossy().as_ref()])
             .output()
             .map_err(|e| Error::transport(format!("df: {e}")))?;
@@ -490,8 +506,8 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Mutex};
 
-        let dir = tempfile::tempdir().unwrap();
-        let t = LocalTransport::new(dir.path().join("r")).unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let t = LocalTransport::new(&SysEnv::from_process(), dir.path().join("r")).unwrap();
         let markers = dir.path().join("r/markers");
         const PAYLOAD: &str =
             r#"{"committed":true,"generation":"gen-1","servers":["server-01","server-02"]}"#;
@@ -570,7 +586,7 @@ mod tests {
         // refused at construction: a transport rooted at `/` would make the
         // deployment cleanup operate on the system root.
         for bad in ["/", "//", "/./", "/../"] {
-            let err = LocalTransport::new(std::path::PathBuf::from(bad))
+            let err = LocalTransport::new(&SysEnv::from_process(), std::path::PathBuf::from(bad))
                 .err()
                 .unwrap_or_else(|| panic!("root deploy_dir {bad:?} must be refused"));
             assert!(
@@ -582,15 +598,15 @@ mod tests {
         // A deploy_dir with at least one normal component below the root is
         // accepted (construction stays side-effect-free).
         for ok in ["/srv", "/srv/app/", "/srv//app"] {
-            LocalTransport::new(std::path::PathBuf::from(ok))
+            LocalTransport::new(&SysEnv::from_process(), std::path::PathBuf::from(ok))
                 .expect("a deploy_dir with a normal component below the root is accepted");
         }
     }
 
     #[test]
     fn symlink_rename_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let t = LocalTransport::new(dir.path().join("r")).unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let t = LocalTransport::new(&SysEnv::from_process(), dir.path().join("r")).unwrap();
         t.create_dir_all(Path::new("generations/gen1")).unwrap();
         t.symlink(Path::new("generations/gen1"), Path::new(".tmp.x"))
             .unwrap();

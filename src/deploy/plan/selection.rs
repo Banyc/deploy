@@ -323,7 +323,7 @@ interval_seconds = 0
 "#;
 
     fn project_with_config() -> (tempfile::TempDir, ProjectConfig) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -396,7 +396,7 @@ interval_seconds = 0
     /// error (even a group selecting a single drifted slot).
     #[test]
     fn direct_release_group_plans_every_subset_but_full_membership_drift_refuses() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -648,7 +648,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// as today.
     #[test]
     fn release_group_resolves_frozen_partition_head_uses_current() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -1008,7 +1008,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         current_inc: [bool; 4],
     ) -> (tempfile::TempDir, ProjectConfig, LocalStore, ReleaseId) {
         const SLOTS: [&str; 4] = ["p1", "p2", "p3", "p4"];
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");

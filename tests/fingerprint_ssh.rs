@@ -8,20 +8,25 @@
 
 use deploy::config::ProjectConfig;
 use deploy::deploy::{PushOptions, push};
+use deploy::env::SysEnv;
 use deploy::error::Result;
 use deploy::ledger::DeploymentStatus;
 use deploy::remote::transport::Remote;
 use deploy::remote::transport::SshTransport;
 use deploy::store::local::LocalStore;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
-/// Serializes the fake-environment tests: they mutate the process-wide `PATH`
-/// (an `unsafe` operation in edition 2024), so they must not overlap. Each
-/// test also points `DEPLOY_SSH_KNOWNHOSTS_DIR` at its own temp dir, so the
-/// pin cache is fully isolated per test (never shared between tests or
-/// between the lib and integration binaries).
-static SSH_ENV_LOCK: Mutex<()> = Mutex::new(());
+// HERMETIC SNAPSHOT: each test builds ONE `SysEnv::from_map` carrying the
+// fake-bin dir first in `PATH` plus the fake-ssh variables (`FAKE_SSH_ROOT` /
+// `FAKE_SSH_REMOTE_PREFIX`) and its own pin cache
+// (`DEPLOY_SSH_KNOWNHOSTS_DIR`). The transport spawns its children
+// (`ssh`/`ssh-keyscan`/`ssh-keygen`/`stat`) with that snapshot's variables
+// (`cmd.envs(env.child_env())`), so the fake binaries resolve and their
+// inputs ride the same child env — the process-wide environment is NEVER
+// mutated (no lock, no set_var), and each test's pin cache is fully isolated
+// per test (never shared between tests or between the lib and integration
+// binaries).
 
 /// A real ed25519 host key plus its SHA256 fingerprint, and the fake-bin dir
 /// whose `ssh`/`ssh-keyscan`/`stat` scripts emulate the remote host.
@@ -191,50 +196,24 @@ exec /bin/mv "$@"
     }
 }
 
-/// Run `f` with `bin` prepended to `PATH` and `DEPLOY_SSH_KNOWNHOSTS_DIR`
-/// pointing at `cache` (both restored afterwards). Pointing the pin cache at a
-/// per-test dir isolates it from every other fake-ssh test in any binary — no
-/// two tests ever share cache state, so concurrent runs of the lib and
-/// integration suites cannot interfere.
-fn with_fake_path<T>(bin: &Path, cache: &Path, f: impl FnOnce() -> T) -> T {
+/// Build the hermetic fake-ssh snapshot: `bin` prepended to the ambient
+/// `PATH`, the per-test pin `cache`, and the fake-ssh variables. The
+/// transport's children receive exactly these variables — the process env is
+/// never mutated, so no two tests (in any binary) can interfere.
+fn fake_env(bin: &Path, cache: &Path, root: &Path, prefix: &str) -> SysEnv {
     let old_path = std::env::var_os("PATH").unwrap_or_default();
-    let old_cache = std::env::var_os("DEPLOY_SSH_KNOWNHOSTS_DIR");
     let mut paths: Vec<_> = std::env::split_paths(&old_path).collect();
     paths.insert(0, bin.to_path_buf());
     let joined = std::env::join_paths(paths).unwrap();
-    // SAFETY: edition 2024 marks `set_var` unsafe. The caller holds
-    // `SSH_ENV_LOCK`, and this binary contains no other tests.
-    unsafe {
-        std::env::set_var("PATH", &joined);
-        std::env::set_var("DEPLOY_SSH_KNOWNHOSTS_DIR", cache);
-    }
-    let result = f();
-    match old_cache {
-        Some(v) => unsafe {
-            std::env::set_var("DEPLOY_SSH_KNOWNHOSTS_DIR", v);
-        },
-        None => unsafe {
-            std::env::remove_var("DEPLOY_SSH_KNOWNHOSTS_DIR");
-        },
-    }
-    unsafe {
-        std::env::set_var("PATH", &old_path);
-    }
-    result
-}
-
-/// Set the fake-ssh environment for the duration of `f`.
-fn with_fake_root<T>(root: &Path, prefix: &str, f: impl FnOnce() -> T) -> T {
-    unsafe {
-        std::env::set_var("FAKE_SSH_ROOT", root);
-        std::env::set_var("FAKE_SSH_REMOTE_PREFIX", prefix);
-    }
-    let result = f();
-    unsafe {
-        std::env::remove_var("FAKE_SSH_ROOT");
-        std::env::remove_var("FAKE_SSH_REMOTE_PREFIX");
-    }
-    result
+    SysEnv::from_map(std::collections::BTreeMap::from([
+        (OsString::from("PATH"), joined),
+        (
+            OsString::from("DEPLOY_SSH_KNOWNHOSTS_DIR"),
+            cache.as_os_str().to_owned(),
+        ),
+        (OsString::from("FAKE_SSH_ROOT"), root.as_os_str().to_owned()),
+        (OsString::from("FAKE_SSH_REMOTE_PREFIX"), OsString::from(prefix)),
+    ]))
 }
 
 // ---- project fixtures (single slot, one standard variant) -------------------
@@ -370,228 +349,225 @@ fn remote_fingerprint(root: &Path) -> Vec<(String, String)> {
 /// identity must be prepared; but it must leave the REMOTE layout untouched.
 #[test]
 fn fingerprint_only_dry_run_leaves_remote_untouched() -> Result<()> {
-    let _guard = SSH_ENV_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let fake = make_fake_bin(tmp.path(), "dry.test");
     let deploy_dir = "/srv/deploy/dry-run";
+    let cache = tmp.path().join("knownhosts");
+    let env = fake_env(&fake.bin, &cache, &fake.remote_root, deploy_dir);
 
-    with_fake_path(&fake.bin, &tmp.path().join("knownhosts"), || {
-        with_fake_root(&fake.remote_root, deploy_dir, || {
-            let proj = tmp.path().join("proj");
-            std::fs::create_dir_all(&proj).unwrap();
-            let (config, config_path) = setup_project(&proj, "dry.test", deploy_dir);
-            let store = LocalStore::with_base(tmp.path().join("store"))?;
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let (config, config_path) = setup_project(&proj, "dry.test", deploy_dir);
+    let store = LocalStore::with_base(tmp.path().join("store"))?;
 
-            let fp = fake.fingerprint.clone();
-            let factory = move |s: &deploy::config::ServerDef,
-                                slot: &deploy::config::SlotConfig|
-                  -> Result<Box<dyn Remote>> {
-                Ok(Box::new(SshTransport::new(
-                    s.user(),
-                    s.address(),
-                    s.port(),
-                    slot.deploy_dir(),
-                    None,
-                    Some(&fp),
-                )?))
-            };
+    let fp = fake.fingerprint.clone();
+    let factory = move |s: &deploy::config::ServerDef,
+                        slot: &deploy::config::SlotConfig|
+     -> Result<Box<dyn Remote>> {
+        Ok(Box::new(SshTransport::new(
+            s.user(),
+            s.address(),
+            s.port(),
+            slot.deploy_dir(),
+            None,
+            Some(&fp),
+            &cache,
+            &env,
+        )?))
+    };
 
-            let r = push(
-                &config_path,
-                &store,
-                &factory,
-                "production",
-                &config,
-                &PushOptions {
-                    dry_run: true,
-                    ref_token: None,
-                    group: None,
-                },
-            )?;
-            assert!(r.dry_run, "report must be a dry run");
-            assert!(r.attempt.is_none());
-            assert!(
-                r.message.contains("first deployment"),
-                "dry-run plan should describe the pending first deployment, got: {}",
-                r.message
-            );
+    let r = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: true,
+            ref_token: None,
+            group: None,
+        },
+    )?;
+    assert!(r.dry_run, "report must be a dry run");
+    assert!(r.attempt.is_none());
+    assert!(
+        r.message.contains("first deployment"),
+        "dry-run plan should describe the pending first deployment, got: {}",
+        r.message
+    );
 
-            // The emulated REMOTE host is completely untouched: identity
-            // pinning happens in the LOCAL per-test `DEPLOY_SSH_KNOWNHOSTS_DIR`
-            // cache, never on the remote layout.
-            assert!(
-                remote_fingerprint(&fake.remote_root).is_empty(),
-                "dry run must not create anything on the remote layout"
-            );
-            Ok(())
-        })
-    })
+    // The emulated REMOTE host is completely untouched: identity
+    // pinning happens in the LOCAL per-test pin cache (from the snapshot),
+    // never on the remote layout.
+    assert!(
+        remote_fingerprint(&fake.remote_root).is_empty(),
+        "dry run must not create anything on the remote layout"
+    );
+    Ok(())
 }
 
 // ---- Scenario (c): first push over fingerprint-only ssh ---------------------
 
 #[test]
 fn fingerprint_only_first_push_succeeds() -> Result<()> {
-    let _guard = SSH_ENV_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let fake = make_fake_bin(tmp.path(), "first.test");
     let deploy_dir = "/srv/deploy/first-push";
+    let cache = tmp.path().join("knownhosts");
+    let env = fake_env(&fake.bin, &cache, &fake.remote_root, deploy_dir);
 
-    with_fake_path(&fake.bin, &tmp.path().join("knownhosts"), || {
-        with_fake_root(&fake.remote_root, deploy_dir, || {
-            let proj = tmp.path().join("proj");
-            std::fs::create_dir_all(&proj).unwrap();
-            let (config, config_path) = setup_project(&proj, "first.test", deploy_dir);
-            let store = LocalStore::with_base(tmp.path().join("store"))?;
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let (config, config_path) = setup_project(&proj, "first.test", deploy_dir);
+    let store = LocalStore::with_base(tmp.path().join("store"))?;
 
-            let fp = fake.fingerprint.clone();
-            let factory = move |s: &deploy::config::ServerDef,
-                                slot: &deploy::config::SlotConfig|
-                  -> Result<Box<dyn Remote>> {
-                Ok(Box::new(SshTransport::new(
-                    s.user(),
-                    s.address(),
-                    s.port(),
-                    slot.deploy_dir(),
-                    None,
-                    Some(&fp),
-                )?))
-            };
+    let fp = fake.fingerprint.clone();
+    let factory = move |s: &deploy::config::ServerDef,
+                        slot: &deploy::config::SlotConfig|
+     -> Result<Box<dyn Remote>> {
+        Ok(Box::new(SshTransport::new(
+            s.user(),
+            s.address(),
+            s.port(),
+            slot.deploy_dir(),
+            None,
+            Some(&fp),
+            &cache,
+            &env,
+        )?))
+    };
 
-            let r = push(
-                &config_path,
-                &store,
-                &factory,
-                "production",
-                &config,
-                &PushOptions {
-                    dry_run: false,
-                    ref_token: None,
-                    group: None,
-                },
-            )?;
-            assert_eq!(
-                r.status,
-                Some(DeploymentStatus::Successful),
-                "first push must succeed"
-            );
-            let attempt = r.attempt.expect("attempt recorded");
-            assert!(
-                attempt
-                    .slots
-                    .contains_key(&deploy::identity::SlotId::parse("p1").unwrap())
-            );
+    let r = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+            group: None,
+        },
+    )?;
+    assert_eq!(
+        r.status,
+        Some(DeploymentStatus::Successful),
+        "first push must succeed"
+    );
+    let attempt = r.attempt.expect("attempt recorded");
+    assert!(
+        attempt
+            .slots
+            .contains_key(&deploy::identity::SlotId::parse("p1").unwrap())
+    );
 
-            // The emulated remote now has the full layout: a generation under
-            // generations/, `current` pointing at it, and the protocol marker.
-            // (The remote deploy dir lives at `<fake-root>/srv/deploy/first-push`
-            // inside the emulated host filesystem.)
-            let remote_deploy = fake.remote_root.join("srv/deploy/first-push");
-            let fp_entries = remote_fingerprint(&remote_deploy);
-            assert!(
-                fp_entries
-                    .iter()
-                    .any(|(rel, _)| rel.starts_with("generations/")),
-                "remote must contain a generation record"
-            );
-            assert!(
-                fp_entries
-                    .iter()
-                    .any(|(rel, kind)| rel == "current" && kind.starts_with("symlink:")),
-                "remote `current` must be a symlink"
-            );
-            assert!(
-                fp_entries
-                    .iter()
-                    .any(|(rel, _)| rel == "control/protocol.json"),
-                "protocol marker must be recorded (handshake before layout)"
-            );
-            Ok(())
-        })
-    })
+    // The emulated remote now has the full layout: a generation under
+    // generations/, `current` pointing at it, and the protocol marker.
+    // (The remote deploy dir lives at `<fake-root>/srv/deploy/first-push`
+    // inside the emulated host filesystem.)
+    let remote_deploy = fake.remote_root.join("srv/deploy/first-push");
+    let fp_entries = remote_fingerprint(&remote_deploy);
+    assert!(
+        fp_entries
+            .iter()
+            .any(|(rel, _)| rel.starts_with("generations/")),
+        "remote must contain a generation record"
+    );
+    assert!(
+        fp_entries
+            .iter()
+            .any(|(rel, kind)| rel == "current" && kind.starts_with("symlink:")),
+        "remote `current` must be a symlink"
+    );
+    assert!(
+        fp_entries
+            .iter()
+            .any(|(rel, _)| rel == "control/protocol.json"),
+        "protocol marker must be recorded (handshake before layout)"
+    );
+    Ok(())
 }
 
 // ---- Scenario (d): repeat push is idempotent and reuses the pinned key ------
 
 #[test]
 fn fingerprint_only_repeat_push_is_idempotent() -> Result<()> {
-    let _guard = SSH_ENV_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let fake = make_fake_bin(tmp.path(), "repeat.test");
     let deploy_dir = "/srv/deploy/repeat-push";
+    let cache = tmp.path().join("knownhosts");
+    let env = fake_env(&fake.bin, &cache, &fake.remote_root, deploy_dir);
 
-    with_fake_path(&fake.bin, &tmp.path().join("knownhosts"), || {
-        with_fake_root(&fake.remote_root, deploy_dir, || {
-            let proj = tmp.path().join("proj");
-            std::fs::create_dir_all(&proj).unwrap();
-            let (config, config_path) = setup_project(&proj, "repeat.test", deploy_dir);
-            let store = LocalStore::with_base(tmp.path().join("store"))?;
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let (config, config_path) = setup_project(&proj, "repeat.test", deploy_dir);
+    let store = LocalStore::with_base(tmp.path().join("store"))?;
 
-            let fp = fake.fingerprint.clone();
-            let factory = move |s: &deploy::config::ServerDef,
-                                slot: &deploy::config::SlotConfig|
-                  -> Result<Box<dyn Remote>> {
-                Ok(Box::new(SshTransport::new(
-                    s.user(),
-                    s.address(),
-                    s.port(),
-                    slot.deploy_dir(),
-                    None,
-                    Some(&fp),
-                )?))
-            };
+    let fp = fake.fingerprint.clone();
+    let factory = move |s: &deploy::config::ServerDef,
+                        slot: &deploy::config::SlotConfig|
+     -> Result<Box<dyn Remote>> {
+        Ok(Box::new(SshTransport::new(
+            s.user(),
+            s.address(),
+            s.port(),
+            slot.deploy_dir(),
+            None,
+            Some(&fp),
+            &cache,
+            &env,
+        )?))
+    };
 
-            let r1 = push(
-                &config_path,
-                &store,
-                &factory,
-                "production",
-                &config,
-                &PushOptions {
-                    dry_run: false,
-                    ref_token: None,
-                    group: None,
-                },
-            )?;
-            assert_eq!(
-                r1.status,
-                Some(DeploymentStatus::Successful),
-                "first push must succeed"
-            );
+    let r1 = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+            group: None,
+        },
+    )?;
+    assert_eq!(
+        r1.status,
+        Some(DeploymentStatus::Successful),
+        "first push must succeed"
+    );
 
-            // The second push is a no-op ("Everything up to date").
-            let r2 = push(
-                &config_path,
-                &store,
-                &factory,
-                "production",
-                &config,
-                &PushOptions {
-                    dry_run: false,
-                    ref_token: None,
-                    group: None,
-                },
-            )?;
-            assert!(r2.status.is_none(), "re-push with no change is a no-op");
-            assert_eq!(r2.message, "Everything up to date");
+    // The second push is a no-op ("Everything up to date").
+    let r2 = push(
+        &config_path,
+        &store,
+        &factory,
+        "production",
+        &config,
+        &PushOptions {
+            dry_run: false,
+            ref_token: None,
+            group: None,
+        },
+    )?;
+    assert!(r2.status.is_none(), "re-push with no change is a no-op");
+    assert_eq!(r2.message, "Everything up to date");
 
-            // ssh-keyscan ran exactly once across BOTH pushes: the second
-            // push validated the cached pinned file against the configured
-            // fingerprint and reused it without re-fetching.
-            let calls = std::fs::read_to_string(&fake.keyscan_log)
-                .unwrap_or_default()
-                .lines()
-                .count();
-            assert_eq!(calls, 1, "repeat push must reuse the pinned host key");
+    // ssh-keyscan ran exactly once across BOTH pushes: the second
+    // push validated the cached pinned file against the configured
+    // fingerprint and reused it without re-fetching.
+    let calls = std::fs::read_to_string(&fake.keyscan_log)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    assert_eq!(calls, 1, "repeat push must reuse the pinned host key");
 
-            // The remote layout is unchanged by the repeat push.
-            let remote_deploy = fake.remote_root.join("srv/deploy/repeat-push");
-            let after = remote_fingerprint(&remote_deploy);
-            assert!(
-                after.iter().any(|(rel, _)| rel == "control/protocol.json"),
-                "remote layout must persist between pushes"
-            );
-            Ok(())
-        })
-    })
+    // The remote layout is unchanged by the repeat push.
+    let remote_deploy = fake.remote_root.join("srv/deploy/repeat-push");
+    let after = remote_fingerprint(&remote_deploy);
+    assert!(
+        after.iter().any(|(rel, _)| rel == "control/protocol.json"),
+        "remote layout must persist between pushes"
+    );
+    Ok(())
 }

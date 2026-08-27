@@ -290,7 +290,7 @@ mod tests {
     /// deployment id): a repeated finalize for the same attempt is a no-op.
     #[test]
     fn finalize_is_idempotent_by_deployment_id() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         let target = TargetName::new("production".to_string());
         let bindings: BTreeMap<SlotId, PhysicalBinding> = BTreeMap::from([(

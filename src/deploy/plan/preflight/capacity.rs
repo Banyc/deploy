@@ -175,7 +175,7 @@ mod capacity_tests {
     impl FakeCapacityRemote {
         fn build(base: PathBuf, total: u64, avail: u64) -> Result<Box<dyn Remote>> {
             Ok(Box::new(FakeCapacityRemote {
-                inner: LocalTransport::new(base)?,
+                inner: LocalTransport::new(&crate::testutil::fixture_env(), base)?,
                 total,
                 avail,
             }))
@@ -240,7 +240,7 @@ mod capacity_tests {
     }
 
     fn cfg() -> ProjectConfig {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -306,7 +306,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// of the TOTAL filesystem size, and that neither is ignored.
     #[test]
     fn capacity_reserves_the_larger_of_bytes_and_percent() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         // Fabricate a local object whose tree totals exactly 6000 bytes.
         let tree = test_tree_digest("tree-6000");
@@ -446,7 +446,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         reserve_bytes: u64,
         reserve_percent: u8,
     ) -> Result<()> {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         // Fabricate a local object whose tree totals exactly 6000 bytes.
         let tree = test_tree_digest("tree-6000");

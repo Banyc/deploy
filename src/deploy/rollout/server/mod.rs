@@ -591,11 +591,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     impl Harness {
         pub(crate) fn new(
+            env: &crate::env::SysEnv,
             deploy_toml: &str,
             variant_toml: &str,
             files: &[(&str, &str)],
         ) -> Harness {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
             let project = dir.path().join("proj");
             std::fs::create_dir_all(&project).unwrap();
             let release_dir = project.join("releases").join("v1");
@@ -640,7 +641,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 )
                 .unwrap();
 
-            let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+            let remote = LocalTransport::new(env, dir.path().join("remote")).unwrap();
             Harness {
                 _dir: dir,
                 config,
@@ -749,6 +750,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn clean_publish_activates() {
         let h = Harness::new(
+            &crate::testutil::fixture_env(),
             NONE_TOML,
             NONE_VARIANT,
             &[
@@ -765,6 +767,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn corrupted_existing_remote_object_fails_integrity() {
         let h = Harness::new(
+            &crate::testutil::fixture_env(),
             NONE_TOML,
             NONE_VARIANT,
             &[
@@ -797,6 +800,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn corrupted_upload_fails_integrity() {
         let h = Harness::new(
+            &crate::testutil::fixture_env(),
             NONE_TOML,
             NONE_VARIANT,
             &[
@@ -817,6 +821,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     fn missing_systemd_unit_fails() {
         // The unit file is NOT present in the tree.
         let h = Harness::new(
+            &crate::testutil::fixture_env(),
             SYSTEMD_TOML,
             SYSTEMD_VARIANT,
             &[
@@ -835,6 +840,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     fn wrong_artifact_type_fails() {
         // The artifact path exists but is a DIRECTORY, not a regular file.
         let h = Harness::new(
+            &crate::testutil::fixture_env(),
             SYSTEMD_TOML,
             SYSTEMD_VARIANT,
             &[
@@ -860,9 +866,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// shared `ENV_LOCK` serializes env-mutating tests).
     #[test]
     fn systemd_push_activation_uses_generation_root_not_nested() {
-        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
-
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         // Fake systemctl (daemon-reload/enable/restart all succeed) and a temp
         // config home so the installed unit lands somewhere hermetic.
         let bindir = tmp.path().join("bin");
@@ -871,25 +875,29 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let config_home = tmp.path().join("xdg");
-        let old_path = std::env::var_os("PATH");
-        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        unsafe {
-            std::env::set_var(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    bindir.display(),
-                    old_path
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                ),
-            );
-            std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        }
+        // Hermetic env: fake systemctl first on PATH, temp config home. The
+        // child processes (activation shell, transport commands) receive this
+        // snapshot; the parent process env is never touched.
+        let base = crate::testutil::fixture_env();
+        let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+            base.child_env().into_iter().collect();
+        vars.insert(
+            "PATH".into(),
+            format!(
+                "{}:{}",
+                bindir.display(),
+                base.path()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            )
+            .into(),
+        );
+        vars.insert("XDG_CONFIG_HOME".into(), config_home.as_os_str().to_owned());
+        let env = crate::env::SysEnv::from_map(vars);
 
         let outcome = {
             let h = Harness::new(
+                &env,
                 SYSTEMD_TOML,
                 SYSTEMD_VARIANT,
                 &[
@@ -951,14 +959,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             );
             Ok::<(), String>(())
         };
-        match old_path {
-            Some(p) => unsafe { std::env::set_var("PATH", p) },
-            None => unsafe { std::env::remove_var("PATH") },
-        }
-        match old_xdg {
-            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
-        }
         outcome.unwrap();
     }
 }

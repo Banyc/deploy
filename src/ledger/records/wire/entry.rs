@@ -325,7 +325,7 @@ mod tests_entry {
     fn write_pair_ledger(
         pair: &(LedgerIntentWire, LedgerTerminalWire),
     ) -> Result<Vec<LedgerEntry>> {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let line1 = serde_json::to_string(&LedgerLine::Intent(pair.0.clone())).unwrap();
         let line2 = serde_json::to_string(&LedgerLine::Terminal(pair.1.clone())).unwrap();
@@ -1049,7 +1049,7 @@ mod tests_entry {
         pair: &(LedgerIntentWire, LedgerTerminalWire),
         simulated_slots: &[SlotId],
     ) -> Result<Vec<LedgerEntry>> {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         // A real, LOADABLE project config whose target `t1` owns exactly
         // `simulated_slots` (one server, one release). `read_ledger` never

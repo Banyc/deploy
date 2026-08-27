@@ -101,8 +101,8 @@ mod tests_assignment {
     /// rewriting history, and the original record survives untouched.
     #[test]
     fn generation_assignment_is_create_or_compare() {
-        let dir = tempfile::tempdir().unwrap();
-        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
         let helper = RemoteHelper::new(&remote);
 
         helper

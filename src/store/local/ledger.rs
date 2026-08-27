@@ -670,7 +670,7 @@ mod tests {
     /// duplicate intent, or a duplicate terminal FAILS CLOSED (integrity).
     #[test]
     fn ledger_merges_intent_and_terminal_and_fails_closed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
         seed_successful(&store, target, "deploy-a");
@@ -731,7 +731,7 @@ mod tests {
     /// ledger), while a genuinely NEW id still appends fine.
     #[test]
     fn append_intent_duplicate_guard_scans_every_entry() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
         seed_successful(&store, target, "deploy-first");
@@ -761,7 +761,7 @@ mod tests {
     /// error, never a silent drop.
     #[test]
     fn ledger_accepts_only_ledger_schema_version_and_rejects_malformed_lines() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
         let foreign = intent("deploy-x", target);
@@ -788,7 +788,7 @@ mod tests {
     /// use; the same record with an AGREEING membership reads fine.
     #[test]
     fn read_ledger_refuses_disagreeing_records() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
         let p = store.ledger_path(target);
@@ -851,7 +851,7 @@ mod tests {
     /// and `None` for an unknown deployment.
     #[test]
     fn latest_status_derives_from_the_ledger() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
         store
@@ -920,7 +920,7 @@ mod tests {
     /// `Successful` terminal) — no separate ref file exists anymore.
     #[test]
     fn last_successful_is_derived() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
         assert_eq!(store.read_last_successful(target), None);
@@ -972,7 +972,7 @@ mod tests {
     /// terminal append fault fires on the matching deployment id only).
     #[test]
     fn append_terminal_fault_is_one_shot_and_id_qualified() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
         store
@@ -1023,7 +1023,7 @@ mod tests {
     /// one store can never be consumed by another store.
     #[test]
     fn arming_one_fixture_cannot_be_consumed_by_another_fixtures_store() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let s1 = LocalStore::with_base(dir.path().join("s1")).unwrap();
         let s2 = LocalStore::with_base(dir.path().join("s2")).unwrap();
         s1.fault_registry()
@@ -1066,7 +1066,7 @@ mod tests {
     /// entry is unsynced) and the append returns `Err`.
     #[test]
     fn ledger_append_faults_leave_wholly_old_or_wholly_new() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
         store
@@ -1141,7 +1141,7 @@ mod tests {
     /// crafted torn tail: never fused, never appended over, never mutated.
     #[test]
     fn append_guard_fails_closed_on_a_crafted_torn_tail() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let target = "t1";
         let p = store.ledger_path(target);
@@ -1174,7 +1174,7 @@ mod tests {
     /// returned `Ok` is visible, in order, and no torn line exists.
     #[test]
     fn successful_ledger_appends_are_visible_after_reopen() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let base = dir.path().join("store");
         let store = LocalStore::with_base(base.clone()).unwrap();
         let target = "t1";
@@ -1350,7 +1350,7 @@ mod tests {
     /// [`AppendStage::DirSync`] fires after the rename (wholly NEW — the
     /// error returns but the new ledger is already durable).
     fn run_ledger_durability_history(history: &[(LedgerOp, Option<AppendStage>)]) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let base = dir.path().join("store");
         let store = LocalStore::with_base(base.clone()).unwrap();
         let target = "t1";
@@ -1480,7 +1480,7 @@ mod tests {
             &[FaultKind::SyncNewTargetDir, FaultKind::SyncTargetsDir],
         ];
         for kinds in cases {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
             let base = dir.path().join("store");
             let store = LocalStore::with_base(base.clone()).unwrap();
             let target = "t1";
@@ -1546,7 +1546,7 @@ mod tests {
         sync_new_target_dir: bool,
         sync_targets_dir: bool,
     ) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let base = dir.path().join("store");
         let store = LocalStore::with_base(base.clone()).unwrap();
         let target = "t1";
@@ -1820,7 +1820,7 @@ mod tests {
     ///   landed dir-sync case is fail-closed: the recovered ledger already
     ///   holds the entry and the duplicate guard refuses the replay).
     fn run_lock_path_durability_model(existing: bool, boundary: LockPathBoundary) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let base = dir.path().join("store");
         let store = LocalStore::with_base(base.clone()).unwrap(); // store open
         let target = "t1";
@@ -2015,7 +2015,7 @@ mod tests {
         #[test]
         fn duplicate_intent_scan_leaves_ledger_bytes_unchanged(ledger in unique_ledger_strategy()) {
             let (ids, pos) = ledger;
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
             let store = LocalStore::with_base(dir.path().join("store")).unwrap();
             let target = "t1";
             for id in &ids {
@@ -2376,7 +2376,7 @@ mod tests {
     /// Bounded 16 cases, fixed seed 0x5EED_5EED (house style), no
     /// persistence.
     fn ledger_pair_mutation_case(intent: &DeploymentIntent) {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let config = consumer_config(tmp.path());
         let target = intent.target.as_str();
         for (variant, successful) in [("successful", true), ("failed", false)] {
@@ -2457,7 +2457,7 @@ mod tests {
     /// refused with `Error::integrity` by the read path.
     #[test]
     fn read_ledger_refuses_terminal_cross_field_and_cross_record_violations() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let config = consumer_config(tmp.path());
         let intent = exact_intent("deploy-unit", "t1", 2);
         let terminal = terminal_for_intent(&intent, "deploy-unit", true);

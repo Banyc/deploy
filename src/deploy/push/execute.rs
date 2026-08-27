@@ -269,7 +269,7 @@ pub(crate) mod execute_tests {
         // The remote never advanced: no `current`, no durable generation
         // record (the mid-mutation fault fired before the assignment write, so
         // the generation dir may exist but is empty).
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
         assert!(
             !remote.exists(crate::remote::layout::current()),
             "no current"
@@ -294,7 +294,7 @@ pub(crate) mod execute_tests {
             "the interrupted state must be recoverable: {}",
             r2.message
         );
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
         assert!(
             remote.exists(crate::remote::layout::current()),
             "remote advanced"
@@ -359,7 +359,7 @@ pub(crate) mod execute_tests {
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
+            Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
         };
         let r2 = push_inner(
             &config2.project_root(&h.cfg_path),
@@ -410,7 +410,7 @@ pub(crate) mod execute_tests {
         // The remote `current` points at the PRIOR generation, whose stored
         // assignment carries the PRIOR behavior digest (A), never B: the
         // prior behavior contract was restored, not the desired one.
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
         let status = RemoteHelper::new(&remote).status().unwrap();
         let cur = status
             .current_generation
@@ -536,7 +536,7 @@ host_key_fingerprint = "SHA256:test"
 [targets.t1]
 rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "rollback_changed" }
 "#;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -639,7 +639,7 @@ interval_seconds = 0
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
+            Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
         };
         let r = push_inner(
             &project_root,
@@ -699,7 +699,7 @@ interval_seconds = 0
 
         // The never-started server (p4) was left untouched: no `current`
         // pointer, no generation record.
-        let remote4 = LocalTransport::new(remotes_base.join("s4")).unwrap();
+        let remote4 = LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join("s4")).unwrap();
         assert!(
             !remote4.exists(crate::remote::layout::current()),
             "p4's server must never receive a current pointer"
@@ -713,7 +713,7 @@ interval_seconds = 0
             "p4's server must never receive a generation record"
         );
         // The failed slot's server was compensated back to no prior state.
-        let remote3 = LocalTransport::new(remotes_base.join("s3")).unwrap();
+        let remote3 = LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join("s3")).unwrap();
         assert!(
             !remote3.exists(crate::remote::layout::current()),
             "a compensated first-deploy slot has no current"
@@ -791,7 +791,7 @@ host_key_fingerprint = "SHA256:test"
 [targets.t1]
 rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_changed" }
 "#;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -885,7 +885,7 @@ interval_seconds = 0
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
+            Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
         };
         let r = push_inner(
             &config.project_root(&cfg_path),
@@ -958,12 +958,12 @@ interval_seconds = 0
 
     #[test]
     fn activation_failure_compensates_prior_and_observed_reflects_actual() {
-        // The env-lock invariant: PATH/XDG_CONFIG_HOME/FAKE_SYSTEMCTL_* are
-        // process-global, and the fake-ssh fingerprint suite mutates PATH too.
-        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
-        let h = SysdHarness::new();
-        let marker = h._dir.path().join("fail-restart");
-        let _env = install_fake_systemctl(h._dir.path(), &marker, true);
+        let env_dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let marker = env_dir.path().join("fail-restart");
+        // Hermetic env: the fake systemctl and its markers ride the snapshot's
+        // child env — the parent process environment is never touched.
+        let env = install_fake_systemctl(env_dir.path(), &marker, true);
+        let h = SysdHarness::with_env(env);
 
         // Push 1: baseline. The fake systemctl succeeds (no marker), so
         // activation completes; s0 records the prior generation/artifact and
@@ -975,7 +975,7 @@ interval_seconds = 0
         let prior_gen = prior.generation.clone().expect("prior generation");
         let prior_tree = known_artifact(&prior).tree.clone();
         let prior_release = known_artifact(&prior).release.clone();
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
         let prior_assignment: crate::remote::helper::GenerationAssignment = serde_json::from_slice(
             &remote
                 .read(
@@ -1005,11 +1005,6 @@ interval_seconds = 0
         std::fs::write(&marker, "fail").unwrap();
         let id2 = test_deployment_id("deploy-act-fail");
         let r2 = h.push_head(&id2).unwrap();
-        // Restore the environment and release the env lock BEFORE any
-        // assertion: a failing assertion must never poison the shared
-        // `ENV_LOCK` for the fingerprint/systemd env suites.
-        drop(_env);
-        drop(_lock);
         assert_eq!(
             r2.status,
             Some(DeploymentStatus::FailedRolledBack),
@@ -1043,7 +1038,7 @@ interval_seconds = 0
         // The remote `current` points at the PRIOR generation, whose stored
         // assignment carries the PRIOR behavior digest: the prior behavior
         // contract was restored, not the desired one.
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
         let status = RemoteHelper::new(&remote).status().unwrap();
         let cur = status
             .current_generation
@@ -1122,10 +1117,12 @@ interval_seconds = 0
         // otherwise mark it degraded and retain the actual mixed per-server
         // state." A failed compensation must therefore end `Degraded`, never a
         // falsely clean `FailedRolledBack`.
-        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
-        let h = SysdHarness::new();
-        let marker = h._dir.path().join("fail-restart");
-        let _env = install_fake_systemctl(h._dir.path(), &marker, false);
+        let env_dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let marker = env_dir.path().join("fail-restart");
+        // Hermetic env: the fake systemctl and its markers ride the snapshot's
+        // child env — the parent process environment is never touched.
+        let env = install_fake_systemctl(env_dir.path(), &marker, false);
+        let h = SysdHarness::with_env(env);
 
         let id1 = test_deployment_id("deploy-act-compfail-baseline");
         let r1 = h.push_head(&id1).unwrap();
@@ -1151,11 +1148,6 @@ interval_seconds = 0
         std::fs::write(&marker, "fail").unwrap();
         let id2 = test_deployment_id("deploy-act-compfail");
         let r2 = h.push_head(&id2).unwrap();
-        // Restore the environment and release the env lock BEFORE any
-        // assertion: a failing assertion must never poison the shared
-        // `ENV_LOCK` for the fingerprint/systemd env suites.
-        drop(_env);
-        drop(_lock);
         assert_eq!(
             r2.status,
             Some(DeploymentStatus::Degraded),
@@ -1195,7 +1187,7 @@ interval_seconds = 0
         // refresh reads the ACTUAL `current`, which the compensation swap-back
         // moved to the prior generation even though the prior service could
         // not be re-activated.
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
         let status = RemoteHelper::new(&remote).status().unwrap();
         assert_eq!(
             status.current_generation.as_ref().map(|g| g.as_str()),
@@ -1225,21 +1217,16 @@ interval_seconds = 0
     /// WITHOUT a stale `current` pointing at the dead generation.
     #[test]
     fn first_deploy_activation_failure_compensates_and_removes_current() {
-        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
-        let h = SysdHarness::new();
-        let marker = h._dir.path().join("fail-restart");
-        // One-shot marker: the desired activation's restart fails and consumes
-        // it; the (absent) prior activation contract has nothing to re-run.
-        let _env = install_fake_systemctl(h._dir.path(), &marker, true);
+        let env_dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let marker = env_dir.path().join("fail-restart");
+        // Hermetic env: the fake systemctl and its markers ride the snapshot's
+        // child env — the parent process environment is never touched.
+        let env = install_fake_systemctl(env_dir.path(), &marker, true);
+        let h = SysdHarness::with_env(env);
         std::fs::write(&marker, "fail").unwrap();
 
         let id = test_deployment_id("deploy-first-act-fail");
         let r = h.push_head(&id).unwrap();
-        // Restore the environment and release the env lock BEFORE any
-        // assertion: a failing assertion must never poison the shared
-        // `ENV_LOCK` for the fingerprint/systemd env suites.
-        drop(_env);
-        drop(_lock);
 
         assert_eq!(
             r.status,
@@ -1255,7 +1242,7 @@ interval_seconds = 0
         // The remote has NO stale `current`: the compare-and-swap removal
         // removed the link (it still pointed at the generation this attempt
         // advanced).
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
         assert!(
             !remote.exists(crate::remote::layout::current()),
             "first-deploy compensation must remove `current`"
@@ -1317,7 +1304,7 @@ interval_seconds = 0
             .expect("baseline generation");
 
         // Corrupt the live generation's assignment record on the remote.
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
         let asn_path = crate::remote::layout::generations()
             .join(gen1.as_str())
             .join("assignment.json");
@@ -1417,7 +1404,7 @@ host_key_fingerprint = "SHA256:test"
 [targets.t1]
 rollout = { batch_size = 2, stop_on_failure = true, failure_policy = "leave_changed" }
 "#;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -1519,7 +1506,7 @@ interval_seconds = 0
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
+            Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
         };
         let r = push_inner(
             &project_root,
@@ -1550,7 +1537,7 @@ interval_seconds = 0
         // The earlier successful batch is retained deliberately: p1/p2 keep
         // their live `current` (no compensation pass runs).
         for (sid, sname) in [("p1", "s1"), ("p2", "s2")] {
-            let remote = LocalTransport::new(remotes_base.join(sname)).unwrap();
+            let remote = LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join(sname)).unwrap();
             assert!(
                 remote.exists(crate::remote::layout::current()),
                 "slot {sid} must stay advanced under leave_changed"
@@ -1559,12 +1546,12 @@ interval_seconds = 0
         // The FAILING slot is still compensated in-process (step 11) and its
         // first-deploy `current` was removed; the never-started slot is
         // untouched.
-        let remote3 = LocalTransport::new(remotes_base.join("s3")).unwrap();
+        let remote3 = LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join("s3")).unwrap();
         assert!(
             !remote3.exists(crate::remote::layout::current()),
             "the failing slot's current is removed by in-process compensation"
         );
-        let remote4 = LocalTransport::new(remotes_base.join("s4")).unwrap();
+        let remote4 = LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join("s4")).unwrap();
         assert!(
             !remote4.exists(crate::remote::layout::current()),
             "the never-started slot has no current"

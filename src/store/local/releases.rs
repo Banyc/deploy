@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn release_aux_snapshots_are_immutable_and_atomic() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let (id, _contracts, _sha) = write_behavior_fixture(&store);
         let behavior = serde_json::to_value(behavior_fixture().0).unwrap();
@@ -267,7 +267,7 @@ mod tests {
     /// record reads fine, while an edited slot declaration fails closed.
     #[test]
     fn read_release_recomputes_and_verifies_identity() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let (id, _c, _sha) = write_behavior_fixture(&store);
         let read = store.read_release(&id).unwrap();

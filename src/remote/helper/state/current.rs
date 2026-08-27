@@ -399,11 +399,11 @@ mod tests_current {
         spec: &LayoutSpec,
         f: impl FnOnce(&RemoteHelper<'_>) -> Result<T>,
     ) -> Result<T> {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let base = dir.path().join("remote");
         std::fs::create_dir_all(&base).unwrap();
         spec.install(&base);
-        let remote = LocalTransport::new(base).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), base).unwrap();
         let helper = RemoteHelper::new(&remote);
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&helper)))
             .expect("must never panic on a malformed layout")
@@ -707,11 +707,11 @@ mod tests_current {
                 current: Some(CurrentLink::Symlink(target.to_string())),
                 ..LayoutSpec::default()
             };
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
             let base = dir.path().join("remote");
             std::fs::create_dir_all(&base).unwrap();
             spec.install(&base);
-            let remote = LocalTransport::new(base.clone()).unwrap();
+            let remote = LocalTransport::new(&crate::testutil::fixture_env(), base.clone()).unwrap();
             let helper = RemoteHelper::new(&remote);
             let new_gen = GenerationId::generate();
             let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -756,11 +756,11 @@ mod tests_current {
             current: Some(CurrentLink::PlainFile),
             ..LayoutSpec::default()
         };
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let base = dir.path().join("remote");
         std::fs::create_dir_all(&base).unwrap();
         spec.install(&base);
-        let remote = LocalTransport::new(base.clone()).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), base.clone()).unwrap();
         let helper = RemoteHelper::new(&remote);
         let new_gen = GenerationId::generate();
         let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -785,11 +785,11 @@ mod tests_current {
     #[test]
     fn swap_succeeds_on_genuine_absence() {
         let spec = LayoutSpec::default();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let base = dir.path().join("remote");
         std::fs::create_dir_all(&base).unwrap();
         spec.install(&base);
-        let remote = LocalTransport::new(base.clone()).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), base.clone()).unwrap();
         let helper = RemoteHelper::new(&remote);
         let new_gen = GenerationId::generate();
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -811,11 +811,11 @@ mod tests_current {
     #[test]
     fn swap_over_canonical_chain_keeps_cas_semantics() {
         let spec = LayoutSpec::canonical("gen-cas", "tree-a");
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let base = dir.path().join("remote");
         std::fs::create_dir_all(&base).unwrap();
         spec.install(&base);
-        let remote = LocalTransport::new(base.clone()).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), base.clone()).unwrap();
         let helper = RemoteHelper::new(&remote);
         let cas_gid = test_generation_id("gen-cas");
         let next_gen = GenerationId::generate();
@@ -1142,11 +1142,11 @@ mod tests_current {
             layout in any_layout(),
             new_gen in valid_gen_id(),
         ) {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
             let base = dir.path().join("remote");
             std::fs::create_dir_all(&base).unwrap();
             install_prop_layout(&layout, &base);
-            let remote = LocalTransport::new(base.clone()).unwrap();
+            let remote = LocalTransport::new(&crate::testutil::fixture_env(), base.clone()).unwrap();
             let helper = RemoteHelper::new(&remote);
 
             // The generation named by a canonical `current` target and the

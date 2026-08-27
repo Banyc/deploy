@@ -322,8 +322,8 @@ mod tests_publish {
     /// never published.
     #[test]
     fn publish_release_recomputes_and_verifies_identity() {
-        let dir = tempfile::tempdir().unwrap();
-        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
         let helper = RemoteHelper::new(&remote);
         let (rec, behavior_json) = publish_fixture();
         let release_json = serde_json::to_string(&rec).unwrap();
@@ -386,8 +386,8 @@ mod tests_publish {
         String,
         String,
     ) {
-        let dir = tempfile::tempdir().unwrap();
-        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
         let helper = RemoteHelper::new(&remote);
         let (rec, behavior_json) = publish_fixture();
         let release_json = serde_json::to_string(&rec).unwrap();
@@ -543,8 +543,8 @@ mod tests_publish {
     /// clause.
     #[test]
     fn publish_release_verifies_behavior_json_digest() {
-        let dir = tempfile::tempdir().unwrap();
-        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
         let helper = RemoteHelper::new(&remote);
         let (rec, behavior_json) = publish_fixture();
         let release_json = serde_json::to_string(&rec).unwrap();
@@ -650,7 +650,7 @@ mod tests_publish {
     /// deepest first. The uploaded tree's canonical digest equals the host's.
     #[test]
     fn copy_host_tree_to_remote_round_trips_read_only_directories() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let host = dir.path().join("host");
         // Top-level read-only directory (0o555) with a nested read-only
         // directory and files inside both: the parent must stay writable until
@@ -670,7 +670,7 @@ mod tests_publish {
         )
         .unwrap();
 
-        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
         let dest = Path::new("objects/sha256/x/root");
         copy_host_tree_to_remote(&host, dest, &remote)
             .expect("a tree with read-only directories must upload");
@@ -718,7 +718,7 @@ mod tests_publish {
     /// special bits and canonicalizes to the host's digest.
     #[test]
     fn copy_host_tree_to_remote_round_trips_special_modes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let host = dir.path().join("host");
         // setgid directory (0o2755) containing a setuid file (0o4755), plus a
         // sticky world-writable directory (0o1777).
@@ -731,7 +731,7 @@ mod tests_publish {
         std::fs::create_dir_all(&st).unwrap();
         std::fs::set_permissions(&st, std::fs::Permissions::from_mode(0o1777)).unwrap();
 
-        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
         let dest = Path::new("objects/sha256/y/root");
         copy_host_tree_to_remote(&host, dest, &remote)
             .expect("a tree with special modes must upload");

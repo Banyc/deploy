@@ -2,6 +2,8 @@
 //! deadline, kill, and deterministic reap, so no operation can run unbounded
 //! after connection establishment.
 
+use crate::env::SysEnv;
+use std::ffi::OsString;
 use std::os::fd::AsRawFd;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -117,7 +119,21 @@ trait SshRunnerSeam: Send + Sync {
 }
 
 /// Production seam: real `ssh` / `ssh-keyscan` subprocesses.
-struct RealRunner;
+struct RealRunner {
+    /// The child environment overlay: every spawned child receives THIS
+    /// snapshot's variables ([`SysEnv::child_env`]) — a deterministic
+    /// environment resolved at the transport boundary, never whatever the
+    /// parent env looks like at spawn time.
+    env: Vec<(OsString, OsString)>,
+}
+
+impl RealRunner {
+    fn new(env: &SysEnv) -> Self {
+        RealRunner {
+            env: env.child_env(),
+        }
+    }
+}
 
 impl SshRunnerSeam for RealRunner {
     fn spawn(
@@ -128,6 +144,7 @@ impl SshRunnerSeam for RealRunner {
     ) -> std::io::Result<SpawnedChild> {
         let mut cmd = std::process::Command::new(&argv[0]);
         cmd.args(&argv[1..]);
+        cmd.envs(self.env.iter().cloned());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         if stdin.is_some() {
@@ -322,9 +339,12 @@ pub(crate) struct SshRunner {
 }
 
 impl SshRunner {
-    pub(crate) fn new() -> Self {
+    /// Build the runner for the environment snapshot `env`: every real child
+    /// this runner spawns receives the snapshot's variables (see
+    /// [`SysEnv::child_env`]).
+    pub(crate) fn new(env: &SysEnv) -> Self {
         SshRunner {
-            seam: Arc::new(RealRunner),
+            seam: Arc::new(RealRunner::new(env)),
             connect_deadline: Duration::from_secs(SSH_CONNECT_TIMEOUT_SECS),
             command_deadline: Duration::from_secs(SSH_COMMAND_TIMEOUT_SECS),
             spawn_observer: None,
@@ -885,7 +905,7 @@ mod runner_property_tests {
     fn host_key() -> (String, String) {
         static KEY: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
         KEY.get_or_init(|| {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
             let keyfile = dir.path().join("hostkey");
             let out = std::process::Command::new("ssh-keygen")
                 .args(["-t", "ed25519", "-N", "", "-f"])
@@ -920,7 +940,13 @@ mod runner_property_tests {
         .clone()
     }
 
-    fn transport_for(kind: OpKind, fingerprint: &str, runner: SshRunner) -> SshTransport {
+    fn transport_for(
+        kind: OpKind,
+        fingerprint: &str,
+        runner: SshRunner,
+        cache: &Path,
+        env: &crate::env::SysEnv,
+    ) -> SshTransport {
         match kind {
             // The pin path requires a configured fingerprint (it reads
             // `self.host_key_fingerprint`), and must never have a known_hosts
@@ -932,6 +958,8 @@ mod runner_property_tests {
                 Path::new("/srv/app"),
                 None,
                 Some(fingerprint),
+                cache,
+                env,
                 runner,
             )
             .unwrap(),
@@ -943,6 +971,8 @@ mod runner_property_tests {
                 Path::new("/srv/app"),
                 Some(Path::new("/dev/null")),
                 None,
+                cache,
+                env,
                 runner,
             )
             .unwrap(),
@@ -956,19 +986,15 @@ mod runner_property_tests {
         let (pubkey, fingerprint) = host_key();
         let (seam, state) = FakeSeam::new(stall, Some(pubkey));
         let runner = SshRunner::with_seam(seam, deadline, deadline);
-        let t = transport_for(kind, &fingerprint, runner);
+        // The keyscan pin writes its cache under the RESOLVED per-pair cache
+        // dir passed to the transport at construction (never the process
+        // env): pointing it at a fresh per-pair temp dir guarantees the pin
+        // always performs the keyscan SPAWN (a reused cache file would skip
+        // the runner call entirely).
+        let cache = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let env = crate::env::SysEnv::from_map(std::collections::BTreeMap::new());
+        let t = transport_for(kind, &fingerprint, runner, cache.path(), &env);
 
-        // The env-lock invariant (crate::testutil): every env-mutating test in
-        // this binary serializes on ENV_LOCK. The keyscan pin writes its cache
-        // under DEPLOY_SSH_KNOWNHOSTS_DIR; pointing it at a fresh per-pair temp
-        // dir guarantees the pin always performs the keyscan SPAWN (a reused
-        // cache file would skip the runner call entirely).
-        let _guard = crate::testutil::ENV_LOCK.lock().unwrap();
-        let cache = tempfile::tempdir().unwrap();
-        let old_cache = std::env::var_os("DEPLOY_SSH_KNOWNHOSTS_DIR");
-        unsafe {
-            std::env::set_var("DEPLOY_SSH_KNOWNHOSTS_DIR", cache.path());
-        }
         let outcome = match kind {
             OpKind::Remote => match t.run_remote("printf ok") {
                 Ok(out) => PairOutcome::Remote(out),
@@ -988,15 +1014,7 @@ mod runner_property_tests {
             },
             OpKind::Exec => PairOutcome::Exec(t.exec(&["true".into()], deadline)),
         };
-        match old_cache {
-            Some(v) => unsafe {
-                std::env::set_var("DEPLOY_SSH_KNOWNHOSTS_DIR", v);
-            },
-            None => unsafe {
-                std::env::remove_var("DEPLOY_SSH_KNOWNHOSTS_DIR");
-            },
-        }
-        drop(_guard);
+        drop(cache);
 
         assert_pair(kind, stall, deadline, &state, outcome);
     }
@@ -1286,7 +1304,7 @@ mod runner_property_tests {
     #[test]
     fn real_runner_kills_and_reaps_a_stalled_child() {
         let spawned = Arc::new(Mutex::new(None));
-        let runner = SshRunner::new().with_spawn_observer({
+        let runner = SshRunner::new(&crate::testutil::fixture_env()).with_spawn_observer({
             let spawned = spawned.clone();
             Arc::new(move |pid: u32| *spawned.lock().unwrap() = Some(pid))
         });
@@ -1334,7 +1352,7 @@ mod runner_property_tests {
     fn real_runner_kills_and_reaps_a_timed_out_upload() {
         let spawned = Arc::new(Mutex::new(None));
         let runner = SshRunner::with_seam(
-            Arc::new(RealRunner),
+            Arc::new(RealRunner::new(&crate::testutil::fixture_env())),
             Duration::from_millis(50),
             Duration::from_millis(50),
         )
@@ -1379,7 +1397,7 @@ mod runner_property_tests {
     /// (no kill, no timeout), and a spawn failure surfaces as a spawn error.
     #[test]
     fn real_runner_completes_and_surfaces_spawn_errors() {
-        let runner = SshRunner::new();
+        let runner = SshRunner::new(&crate::testutil::fixture_env());
         let out = runner
             .run(
                 OpKind::Exec,
@@ -1408,7 +1426,7 @@ mod runner_property_tests {
     /// never land on a process the OS recycled the pid to.
     #[test]
     fn kill_after_reap_does_not_raise_or_signal() {
-        let seam = Arc::new(RealRunner);
+        let seam = Arc::new(RealRunner::new(&crate::testutil::fixture_env()));
         let child = seam
             .spawn(
                 OpKind::Exec,

@@ -708,7 +708,7 @@ interval_seconds = 0
 "#;
 
     fn project_with_config() -> (tempfile::TempDir, ProjectConfig) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -1021,7 +1021,7 @@ interval_seconds = 0
     /// with the membership-drift error (expected [p1] vs current [p1, p2]).
     #[test]
     fn release_membership_drift_missing_slot_refuses() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -1166,7 +1166,7 @@ interval_seconds = 0
     /// (contrast with the exact-rollback Snapshot branch, which refuses).
     #[test]
     fn release_membership_physical_binding_drift_plans() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -1359,7 +1359,7 @@ interval_seconds = 0
     /// ref must still plan `old` + its tree, not the current declaring file.
     #[test]
     fn snapshot_ref_restores_historical_variant_after_rename() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -1455,7 +1455,7 @@ interval_seconds = 0
     /// map path).
     #[test]
     fn snapshot_ref_without_recorded_bindings_refuses_rollback() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -1560,7 +1560,7 @@ interval_seconds = 0
     fn direct_release_fixture(
         old_binding: &(String, String),
     ) -> (tempfile::TempDir, ProjectConfig, LocalStore, ReleaseId) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -1938,7 +1938,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 "#;
 
     fn two_group_project() -> (tempfile::TempDir, ProjectConfig) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -2261,7 +2261,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         release_drift: bool,
         binding_drift: bool,
     ) -> (tempfile::TempDir, ProjectConfig, LocalStore, ReleaseId) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");

@@ -46,17 +46,18 @@ pub fn resolve_config_home(xdg_config_home: Option<&str>, home: Option<&str>) ->
     }
 }
 
-/// The configuration base directory for the current process environment.
-pub fn config_home() -> PathBuf {
+/// The configuration base directory, resolved from the environment
+/// snapshot (never the process env): `XDG_CONFIG_HOME` → `HOME/.config` →
+/// `.config`.
+pub fn config_home(env: &crate::env::SysEnv) -> PathBuf {
     resolve_config_home(
-        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
-        std::env::var("HOME").ok().as_deref(),
+        env.get("XDG_CONFIG_HOME")
+            .map(|v| v.to_string_lossy().into_owned())
+            .as_deref(),
+        env.get("HOME")
+            .map(|v| v.to_string_lossy().into_owned())
+            .as_deref(),
     )
-}
-
-/// Where user-scope unit links live: `<config_home>/systemd/user/<unit>`.
-pub fn user_unit_link(_deploy_dir: &Path, unit: &str) -> PathBuf {
-    user_unit_link_for(&config_home(), unit)
 }
 
 /// Pure variant of [`user_unit_link`] that takes an explicit config base, so it
@@ -331,13 +332,7 @@ pub(crate) mod tests {
     use crate::config::{ActivationConfig, ActivationScope, UnitDef};
     use crate::identity::{TreeDigest, test_deployment_id, test_generation_id};
     use crate::remote::transport::LocalTransport;
-
-    // THE single shared env lock (see `crate::testutil`): the fake-`systemctl`
-    // tests here, the engine-level systemd push regression in
-    // `push/engine.rs`, and the fake-`ssh` fingerprint suite in
-    // `remote/ssh.rs` ALL mutate the same process-global `PATH` — two separate
-    // locks would let them run concurrently and corrupt each other's PATH.
-    use crate::testutil::ENV_LOCK;
+    use std::os::unix::fs::PermissionsExt;
 
     fn cfg(scope: ActivationScope, units: Vec<&str>) -> ActivationConfig {
         ActivationConfig {
@@ -408,7 +403,7 @@ pub(crate) mod tests {
             PathBuf::from("/x/.config/systemd/user/example.service")
         );
         // The public helper resolves the environment-derived base.
-        let link = user_unit_link(Path::new("/srv/x"), "example.service");
+        let link = user_unit_link_for(Path::new("/srv/x/.config"), "example.service");
         assert!(link.ends_with("systemd/user/example.service"));
     }
 
@@ -475,9 +470,32 @@ pub(crate) mod tests {
     /// `[[servers]]` entry; `deployment_id` from the push being activated.
     #[test]
     fn rendered_unit_uses_slot_deploy_dir_and_server_metadata() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let base = tmp.path().join("remote");
-        let remote = LocalTransport::new(base.clone()).unwrap();
+        let bindir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let fake = bindir.join("systemctl");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config_home = tmp.path().join("xdg");
+        let base_env = crate::testutil::fixture_env();
+        let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+            base_env.child_env().into_iter().collect();
+        vars.insert(
+            "PATH".into(),
+            format!(
+                "{}:{}",
+                bindir.display(),
+                base_env
+                    .path()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            )
+            .into(),
+        );
+        vars.insert("XDG_CONFIG_HOME".into(), config_home.as_os_str().to_owned());
+        let env = crate::env::SysEnv::from_map(vars);
+        let remote = LocalTransport::new(&env, base.clone()).unwrap();
         // Tree content under the object store, like `tree::canonicalize_tree`.
         let tree_rel = crate::remote::layout::tree_root("abc123");
         let unit_rel = tree_rel.join("integration/systemd/example.service");
@@ -534,9 +552,32 @@ pub(crate) mod tests {
     /// the shape and proves staging reads the unit from the canonical root.
     #[test]
     fn activation_generation_root_is_single_root_not_nested() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let base = tmp.path().join("remote");
-        let remote = LocalTransport::new(base.clone()).unwrap();
+        let bindir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let fake = bindir.join("systemctl");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config_home = tmp.path().join("xdg");
+        let base_env = crate::testutil::fixture_env();
+        let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+            base_env.child_env().into_iter().collect();
+        vars.insert(
+            "PATH".into(),
+            format!(
+                "{}:{}",
+                bindir.display(),
+                base_env
+                    .path()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            )
+            .into(),
+        );
+        vars.insert("XDG_CONFIG_HOME".into(), config_home.as_os_str().to_owned());
+        let env = crate::env::SysEnv::from_map(vars);
+        let remote = LocalTransport::new(&env, base.clone()).unwrap();
         // Unit artifact under the tree content root.
         let tree_rel = crate::remote::layout::tree_root("abc123");
         let unit_rel = tree_rel.join("integration/systemd/example.service");
@@ -611,9 +652,32 @@ pub(crate) mod tests {
     /// loudly: nothing is staged and nothing is installed.
     #[test]
     fn unit_template_error_fails_loudly() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let base = tmp.path().join("remote");
-        let remote = LocalTransport::new(base.clone()).unwrap();
+        let bindir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let fake = bindir.join("systemctl");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config_home = tmp.path().join("xdg");
+        let base_env = crate::testutil::fixture_env();
+        let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+            base_env.child_env().into_iter().collect();
+        vars.insert(
+            "PATH".into(),
+            format!(
+                "{}:{}",
+                bindir.display(),
+                base_env
+                    .path()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            )
+            .into(),
+        );
+        vars.insert("XDG_CONFIG_HOME".into(), config_home.as_os_str().to_owned());
+        let env = crate::env::SysEnv::from_map(vars);
+        let remote = LocalTransport::new(&env, base.clone()).unwrap();
         let gen_rel = crate::remote::layout::generation("g1");
         let unit_rel = gen_rel.join("root/integration/systemd/example.service");
         std::fs::create_dir_all(base.join(unit_rel.parent().unwrap())).unwrap();
@@ -641,11 +705,33 @@ pub(crate) mod tests {
     #[test]
     fn run_activation_installs_rendered_unit_end_to_end() {
         use std::os::unix::fs::PermissionsExt;
-        let _lock = ENV_LOCK.lock().unwrap();
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let base = tmp.path().join("remote");
-        let remote = LocalTransport::new(base.clone()).unwrap();
+        let bindir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let fake = bindir.join("systemctl");
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config_home = tmp.path().join("xdg");
+        let base_env = crate::testutil::fixture_env();
+        let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+            base_env.child_env().into_iter().collect();
+        vars.insert(
+            "PATH".into(),
+            format!(
+                "{}:{}",
+                bindir.display(),
+                base_env
+                    .path()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            )
+            .into(),
+        );
+        vars.insert("XDG_CONFIG_HOME".into(), config_home.as_os_str().to_owned());
+        let env = crate::env::SysEnv::from_map(vars);
+        let remote = LocalTransport::new(&env, base.clone()).unwrap();
         // Unit artifact with a slot-dependent ExecStart and the per-server
         // deployment account, under the tree.
         let tree_rel = crate::remote::layout::tree_root("abc123");
@@ -664,30 +750,6 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        // Fake systemctl (daemon-reload/enable/restart all succeed) and a temp
-        // config home so the installed unit lands somewhere hermetic.
-        let bindir = tmp.path().join("bin");
-        std::fs::create_dir_all(&bindir).unwrap();
-        let fake = bindir.join("systemctl");
-        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let config_home = tmp.path().join("xdg");
-        let old_path = std::env::var_os("PATH");
-        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        unsafe {
-            std::env::set_var(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    bindir.display(),
-                    old_path
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                ),
-            );
-            std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        }
 
         // Regression pin: the activation generation root must be
         // `<remote>/generations/<gid>/root` (the symlink to the tree content
@@ -716,14 +778,6 @@ pub(crate) mod tests {
             let c = cfg(ActivationScope::User, vec!["example.service"]);
             run_activation(&remote, &generation_root, &c, &slot_vars())
         };
-        match old_path {
-            Some(p) => unsafe { std::env::set_var("PATH", p) },
-            None => unsafe { std::env::remove_var("PATH") },
-        }
-        match old_xdg {
-            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
-        }
         result.unwrap();
 
         // The installed unit is a REGULAR FILE with the slot-rendered content

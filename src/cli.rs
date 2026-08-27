@@ -8,6 +8,7 @@
 
 use crate::config::ProjectConfig;
 use crate::deploy::{PushOptions, PushReport, push};
+use crate::env::SysEnv;
 use crate::error::{Error, Result};
 use crate::identity::{DeploymentId, ReleaseId, valid_hex_digest};
 use crate::init::{InitOptions, init_project};
@@ -287,13 +288,20 @@ A checkpoint does not deploy anything or contact remote servers.",
     },
 }
 
-/// CLI entry point.
+/// CLI entry point: snapshot the process environment ONCE at the process
+/// boundary ([`SysEnv::from_process`]) and thread it down through
+/// [`cli::run_with`](`crate::cli::run_with`) — the house pattern (mirroring
+/// `run_with(std::env::args())` for argv): subsystem code never reads the
+/// live process env.
 pub fn run() -> Result<()> {
-    run_with(std::env::args())
+    run_with(std::env::args(), &SysEnv::from_process())
 }
 
-/// Parse `args` (argv, including the program name) and run the command.
-pub fn run_with<I, T>(args: I) -> Result<()>
+/// Parse `args` (argv, including the program name) and run the command
+/// against the environment snapshot `env` (resolved at the boundary; the
+/// store base and any child-process environment come from it, never from a
+/// live process read).
+pub fn run_with<I, T>(args: I, env: &SysEnv) -> Result<()>
 where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
@@ -357,13 +365,17 @@ where
     // a single safe path segment, so the store is constructed DIRECTLY from
     // it — no fallible identity conversion remains between a loaded config
     // and its store.
-    let store = LocalStore::new(config.application())?;
+    let store = LocalStore::new_in(env, config.application())?;
     let remotes_base = store.base().join("remotes");
     std::fs::create_dir_all(&remotes_base).ok();
 
+    // The factory owns a CLONE of the snapshot (the `RemoteFactory` type is
+    // `'static`): each remote is built from the same boundary snapshot, so
+    // every spawned child env is deterministic.
+    let env = env.clone();
     let factory = move |s: &crate::config::ServerDef,
                         slot: &crate::config::SlotConfig|
-          -> Result<Box<dyn Remote>> { create_remote(s, slot.deploy_dir()) };
+     -> Result<Box<dyn Remote>> { create_remote(&env, s, slot.deploy_dir()) };
 
     match cli.command {
         Command::Push {
@@ -661,7 +673,7 @@ mod tests {
 
     #[test]
     fn log_status_overlays_terminal_event() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         let a = pending_attempt("deploy-overlay");
 
@@ -707,7 +719,7 @@ mod tests {
     /// cannot capture the harness-owned stdout sink.
     #[test]
     fn log_prefixes_lines_with_rollback_ref() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
 
         // Two deployments: the first succeeds (producing rollback ref s0);
@@ -762,10 +774,15 @@ mod tests {
     /// unit tests cannot capture the harness-owned stdout sink.
     #[test]
     fn status_renders_observed_assignments() {
-        // The store lives under `$TMPDIR` and `run_with` reads the
-        // real process env, so the env-lock invariant applies.
-        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        // The store base is resolved from the SNAPSHOT passed to `run_with`
+        // (never the process env): build a hermetic snapshot whose
+        // `XDG_DATA_HOME` is a fresh temp root, and seed + read the store
+        // through the same snapshot.
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let env = SysEnv::from_map(std::collections::BTreeMap::from([(
+            std::ffi::OsString::from("XDG_DATA_HOME"),
+            dir.path().join("store-root").into_os_string(),
+        )]));
         let project = dir.path().join("proj");
         let release_dir = project.join("releases").join("v1");
         std::fs::create_dir_all(&release_dir).unwrap();
@@ -851,17 +868,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let cfg_path = project.join("deploy.toml");
         let config = ProjectConfig::load(&cfg_path).unwrap();
 
-        // Point the store at a hermetic `$TMPDIR` and seed the ONE
-        // physical observed record per slot (`slots/<slot-id>/observed.json`)
-        // with three slots: p1 has a full assignment, p2 has NO known
-        // with three slots: p1 has a full assignment, p2 has NO known
+        // Point the snapshot's store base at a hermetic `XDG_DATA_HOME` and
+        // seed the ONE physical observed record per slot
+        // (`slots/<slot-id>/observed.json`) with three slots: p1 has a full
+        // assignment, p2 has NO known
         // assignment (never observed / rotated away), and p3 has a FAILED
         // observation (the assignment could not be read — recorded as an
         // `Unknown` observation with its error preserved, never a forged
         // artifact).
-        let store_root = crate::testutil::hermetic_tmpdir_root();
-        unsafe { std::env::set_var("TMPDIR", &store_root) };
-        let store = LocalStore::with_base(crate::store::local::default_base()).unwrap();
+        let store = LocalStore::with_base(crate::store::local::default_base(&env)).unwrap();
         store
             .write_slot_observed(
                 &SlotId::new("p1".to_string()),
@@ -899,21 +914,19 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         // Drive the real CLI path end-to-end: argument parsing, config load,
         // store resolution, and the print loop must all succeed against the
-        // seeded store.
-        run_with([
-            "deploy",
-            "--config",
-            cfg_path.to_str().unwrap(),
-            "status",
-            "production",
-        ])
+        // seeded store (the snapshot's store base is the same one `run_with`
+        // resolves its store from).
+        run_with(
+            [
+                "deploy",
+                "--config",
+                cfg_path.to_str().unwrap(),
+                "status",
+                "production",
+            ],
+            &env,
+        )
         .expect("deploy status must succeed");
-
-        // Restore the environment and release the env lock BEFORE any
-        // assertion: a failing assertion must never poison the shared
-        // `ENV_LOCK`.
-        unsafe { std::env::remove_var("TMPDIR") };
-        drop(_lock);
 
         // The rendered lines are exactly what the CLI printed, one per slot
         // (BTreeMap order: p1, p2, p3). The read goes through the TARGET VIEW
@@ -954,11 +967,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "the preserved observation error must be rendered: {}",
             lines[2]
         );
-
-        // Clean up the hermetic store data (the root itself is left for the
-        // OS temp cleaner: other tests' tempdirs may land inside it while
-        // TMPDIR was redirected).
-        let _ = std::fs::remove_dir_all(store_root.join("deploy-test"));
     }
 
     use clap::{CommandFactory, Parser};
@@ -1054,8 +1062,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// is an idempotent no-op.
     #[test]
     fn checkpoint_dispatch_refuses_without_confirmation_and_is_idempotent() {
-        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        // The snapshot's store base (hermetic `XDG_DATA_HOME` under the
+        // tempdir) is passed to `run_with` — no process-env mutation.
+        let env = SysEnv::from_map(std::collections::BTreeMap::from([(
+            std::ffi::OsString::from("XDG_DATA_HOME"),
+            dir.path().join("store-root").into_os_string(),
+        )]));
         let project = dir.path().join("proj");
         let release_dir = project.join("releases").join("v1");
         std::fs::create_dir_all(&release_dir).unwrap();
@@ -1102,13 +1115,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         )
         .unwrap();
         let cfg_path = project.join("deploy.toml");
-        let store_root = crate::testutil::hermetic_tmpdir_root();
-        unsafe { std::env::set_var("TMPDIR", &store_root) };
         // `run_with` resolves the store as
-        // `LocalStore::new(config.application())`
-        // = $TMPDIR/deploy-test/checkpoint-cli.
+        // `LocalStore::new_in(&env, config.application())`
+        // = <XDG_DATA_HOME>/simple-deploy/checkpoint-cli.
         let store =
-            LocalStore::with_base(crate::store::local::default_base().join("checkpoint-cli"))
+            LocalStore::with_base(crate::store::local::default_base(&env).join("checkpoint-cli"))
                 .unwrap();
 
         // Seed a small history: deploy-0 (s0), deploy-1 (s1), deploy-2 (s2).
@@ -1124,14 +1135,17 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         // Bare checkpoint (no --yes, no --dry-run): refused as irreversible
         // BEFORE any store mutation.
-        let err = run_with([
-            "deploy",
-            "--config",
-            cfg_path.to_str().unwrap(),
-            "checkpoint",
-            "production",
-            c1.as_str(),
-        ])
+        let err = run_with(
+            [
+                "deploy",
+                "--config",
+                cfg_path.to_str().unwrap(),
+                "checkpoint",
+                "production",
+                c1.as_str(),
+            ],
+            &env,
+        )
         .expect_err("a bare checkpoint must be refused");
         assert!(
             err.to_string().contains("irreversible"),
@@ -1140,15 +1154,18 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(store.read_ledger("production").unwrap().len(), 3);
 
         // --dry-run: succeeds, enumerates the discards, writes NOTHING.
-        run_with([
-            "deploy",
-            "--config",
-            cfg_path.to_str().unwrap(),
-            "checkpoint",
-            "production",
-            c1.as_str(),
-            "--dry-run",
-        ])
+        run_with(
+            [
+                "deploy",
+                "--config",
+                cfg_path.to_str().unwrap(),
+                "checkpoint",
+                "production",
+                c1.as_str(),
+                "--dry-run",
+            ],
+            &env,
+        )
         .expect("dry-run checkpoint succeeds");
         assert_eq!(
             store.read_ledger("production").unwrap().len(),
@@ -1158,15 +1175,18 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         // --yes: atomically replaces the ledger with the retained suffix at
         // deploy-1 and sweeps the unreachable content.
-        run_with([
-            "deploy",
-            "--config",
-            cfg_path.to_str().unwrap(),
-            "checkpoint",
-            "production",
-            c1.as_str(),
-            "--yes",
-        ])
+        run_with(
+            [
+                "deploy",
+                "--config",
+                cfg_path.to_str().unwrap(),
+                "checkpoint",
+                "production",
+                c1.as_str(),
+                "--yes",
+            ],
+            &env,
+        )
         .expect("the confirmed checkpoint establishes the retained suffix");
         let entries = store.read_ledger("production").unwrap();
         assert_eq!(entries.len(), 2, "deploy-1 and deploy-2 are retained");
@@ -1177,22 +1197,21 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         // Repeating the same checkpoint: the suffix is identical (the ledger
         // already IS it) and the sweep finishes.
-        run_with([
-            "deploy",
-            "--config",
-            cfg_path.to_str().unwrap(),
-            "checkpoint",
-            "production",
-            c1.as_str(),
-            "--yes",
-        ])
+        run_with(
+            [
+                "deploy",
+                "--config",
+                cfg_path.to_str().unwrap(),
+                "checkpoint",
+                "production",
+                c1.as_str(),
+                "--yes",
+            ],
+            &env,
+        )
         .expect("a repeated checkpoint is idempotent");
         let entries2 = store.read_ledger("production").unwrap();
         assert_eq!(entries2, entries, "the retained suffix is unchanged");
-
-        unsafe { std::env::remove_var("TMPDIR") };
-        let _ = std::fs::remove_dir_all(store_root.join("deploy-test"));
-        drop(_lock);
     }
 
     // Host identity is exactly one source: `--known-hosts` and
@@ -1517,7 +1536,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     fn gc_unknown_aborts_before_deletion() {
         // Fail-closed: an UNKNOWN observation makes the GC abort with an
         // integrity error before any deletion (never retain nothing).
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         store
             .write_slot_observed(

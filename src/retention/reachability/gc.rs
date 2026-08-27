@@ -1031,7 +1031,7 @@ interval_seconds = 0
     /// One corrupt → zero-deletions → repair → exact-retry cycle for one
     /// anchor class over one generated partition.
     fn run_anchor_case(class: AnchorClass, retained: usize, garbage: usize) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let f = build_fixture(dir.path(), retained, garbage);
 
         // CORRUPT the anchor: the sweep must FAIL before any deletion — the
@@ -1163,7 +1163,7 @@ interval_seconds = 0
     /// reachability entries. This is the production code path the sweep and
     /// the checkpoint preview share — not a copy of its logic.
     fn run_assignment_observation_case(artifact: Observation<ArtifactRef>) {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let config = config_with_pin(tmp.path(), None);
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         let intent = intent_with_pre_push(artifact.clone());
@@ -1320,7 +1320,7 @@ interval_seconds = 0
     /// sweep with an integrity error before any deletion (missing on disk).
     #[test]
     fn config_pin_naming_missing_release_aborts_with_integrity() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let missing = crate::identity::test_release_id("rel-sha256-missing");
         let config = config_with_pin(dir.path(), Some(&missing));
@@ -1363,7 +1363,7 @@ interval_seconds = 0
     /// sweep with an integrity error before any deletion.
     #[test]
     fn store_pin_release_record_unverifiable_aborts_with_integrity() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let store_pin = seed_real_release(&store, "cfg");
         store
@@ -1413,7 +1413,7 @@ interval_seconds = 0
     /// the pin names a release that cannot be honored).
     #[test]
     fn exact_binding_pin_naming_missing_release_aborts_with_integrity() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let missing = crate::identity::test_release_id("rel-sha256-missing");
         store
@@ -1492,7 +1492,7 @@ interval_seconds = 0
         k: usize,
         stage: usize,
     ) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let config = config_with_pin(dir.path(), None);
         let deploys: Vec<String> = (0..n_deployments)
@@ -1672,7 +1672,7 @@ interval_seconds = 0
     /// those 2 and completes.
     #[test]
     fn unlink_failure_after_three_counts_removed_and_pending_exactly() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let config = config_with_pin(dir.path(), None);
         let candidates: Vec<String> = (0..5).map(|i| format!("rel-u-{i}")).collect();

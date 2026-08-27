@@ -688,14 +688,16 @@ mod tests {
 
     #[test]
     fn store_key_property_places_store_under_base_plus_single_component() {
-        // The property constructs REAL stores via `LocalStore::new`, so the
-        // process-global `$TMPDIR` is pointed at a hermetic temp root
-        // for the whole run (ENV_LOCK serializes against every other
-        // env-mutating test; the closure-form proptest runs all 16 cases in
-        // this thread).
-        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
-        let store_root = crate::testutil::hermetic_tmpdir_root();
-        unsafe { std::env::set_var("TMPDIR", &store_root) };
+        // The property constructs REAL stores via `LocalStore::new_in`, so
+        // the store base is resolved from a hermetic SNAPSHOT (a temp-root
+        // `XDG_DATA_HOME`) — no process-global env, no lock, no cross-test
+        // interference; the closure-form proptest runs all 16 cases in this
+        // thread.
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let env = crate::env::SysEnv::from_map(std::collections::BTreeMap::from([(
+            std::ffi::OsString::from("XDG_DATA_HOME"),
+            dir.path().join("store-root").into_os_string(),
+        )]));
         proptest!(ProptestConfig {
             cases: 16,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
@@ -709,17 +711,17 @@ mod tests {
                 "ApplicationStoreKey must accept exactly safe single segments: {s:?}"
             );
             if let Ok(key) = ApplicationStoreKey::parse(&s) {
-                // The store path is default_base().join(key): EXACTLY ONE
+                // The store path is default_base(env).join(key): EXACTLY ONE
                 // component appended — the key is a single safe segment, so
                 // the store can never escape the base. A safe-but-
                 // filesystem-incompatible key (a character the local
                 // filesystem refuses, e.g. some unicode) fails the store
                 // open with a STORE error — fail closed, never an escape.
-                match LocalStore::new(&key) {
+                match LocalStore::new_in(&env, &key) {
                     Ok(store) => {
                         assert_eq!(
                             store.base().parent(),
-                            Some(default_base().as_path()),
+                            Some(default_base(&env).as_path()),
                             "the store must sit directly under the base: {s:?}"
                         );
                         assert_eq!(
@@ -735,8 +737,6 @@ mod tests {
                 }
             }
         });
-        unsafe { std::env::remove_var("TMPDIR") };
-        let _ = std::fs::remove_dir_all(store_root.join("deploy-test"));
     }
 
     /// The independent characterization of the deploy_dir rule: an absolute
@@ -832,7 +832,7 @@ mod tests {
                 .components()
                 .any(|c| matches!(c, std::path::Component::Normal(_)));
             assert_eq!(
-                LocalTransport::new(std::path::PathBuf::from(&s)).is_ok(),
+                LocalTransport::new(&crate::testutil::fixture_env(), std::path::PathBuf::from(&s)).is_ok(),
                 !root_only,
                 "LocalTransport must refuse a root deploy_dir: {s:?}"
             );

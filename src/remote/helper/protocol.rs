@@ -54,8 +54,8 @@ mod tests_protocol {
     use std::path::PathBuf;
 
     fn setup() -> (tempfile::TempDir, LocalTransport, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
         let root = remote.root().to_path_buf();
         (dir, remote, root)
     }

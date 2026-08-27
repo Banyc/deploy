@@ -215,8 +215,8 @@ mod tests {
     /// lock on a `?` error and strand every later operation on the slot.
     #[test]
     fn lock_guard_releases_on_drop_after_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
         let helper = RemoteHelper::new(&remote);
 
         {

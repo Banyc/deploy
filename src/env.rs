@@ -102,7 +102,10 @@ impl SysEnv {
     /// gets THIS snapshot's environment — deterministic, and never dependent
     /// on whatever the parent env looks like at spawn time.
     pub fn child_env(&self) -> Vec<(OsString, OsString)> {
-        self.vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        self.vars
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 }
 

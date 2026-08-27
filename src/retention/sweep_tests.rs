@@ -377,10 +377,10 @@ fn run_no_leak_case(
     pusher_history: Vec<bool>,
     checkpoint_at: usize,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
 
     // ---- the receiver: a remote with a generation history -----------------
-    let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+    let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
     let helper = RemoteHelper::new(&remote);
     let n = receiver_trees.len();
     for (i, t) in receiver_trees.iter().enumerate() {
@@ -614,7 +614,7 @@ fn arm_sweep_fault(store: &LocalStore, checkpoint_id: &str, fault: SweepFault) {
 }
 
 fn run_fault_case(pusher_history: Vec<bool>, checkpoint_at: usize, fault: SweepFault) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let store = LocalStore::with_base(dir.path().join("store")).unwrap();
     let pinned = seed_real_release(&store);
     // The pinned release's tree object exists in the store.
@@ -763,7 +763,7 @@ proptest! {
 /// marker file is removed, leaving no trace).
 #[test]
 fn sweep_debt_marker_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let store = LocalStore::with_base(dir.path().join("store")).unwrap();
     assert_eq!(store.read_sweep_debt().unwrap(), None);
     store.write_sweep_debt(Some("sweep pending")).unwrap();
@@ -784,7 +784,7 @@ fn sweep_debt_marker_roundtrip() {
 /// `Err` — a debt-file fault can never turn a push into an error.
 #[test]
 fn sweep_debt_io_faults_are_warnings_not_errors() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let store = LocalStore::with_base(dir.path().join("store")).unwrap();
     let cfg = config_for(&dir, None);
     // A debt READ failure is treated as no debt: a warning, never an Err.
@@ -817,7 +817,7 @@ struct PushHarness {
 
 impl PushHarness {
     fn new() -> PushHarness {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -911,7 +911,7 @@ fn receiver_retention_failure_is_maintenance_not_correction() {
     let clean_factory = move |s: &crate::config::ServerDef,
                               _slot: &crate::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf2.join(&s.id)).unwrap()))
+        Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf2.join(&s.id)).unwrap()))
     };
     let r2 = push(
         &h.cfg_path,

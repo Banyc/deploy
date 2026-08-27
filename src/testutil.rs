@@ -1,40 +1,26 @@
 //! Shared test-only utilities.
 //!
-//! # The env-lock invariant
+//! # The hermetic-env invariant
 //!
-//! ANY test that mutates the process-global environment must hold
-//! [`ENV_LOCK`] for the entire duration of the mutation — `PATH`,
-//! `XDG_CONFIG_HOME`, `DEPLOY_SSH_KNOWNHOSTS_DIR`, `TMPDIR`,
-//! `FAKE_SSH_ROOT` / `FAKE_SSH_REMOTE_PREFIX`, or anything else.
+//! Tests NEVER read or mutate the process-global environment. Instead they
+//! build a [`crate::env::SysEnv`] — via [`SysEnv::from_map`] for hermetic
+//! values (a fake `systemctl`/`ssh` on `PATH`, a temp `XDG_CONFIG_HOME`,
+//! fake-bin markers), or [`fixture_env`] for a plain snapshot — and pass it
+//! to the fixture / transport under test. Child processes spawned by the
+//! transports receive the snapshot via `Command::envs`; the parent process
+//! environment is never touched. There is no `ENV_LOCK`: with zero
+//! `std::env::set_var`/`remove_var` calls in the suite there is nothing to
+//! serialize, and concurrent tests cannot corrupt each other (or spawn the
+//! real binaries) because each test's children resolve from its own
+//! snapshot.
 //!
-//! All lib unit tests share one process, and edition-2024
-//! `std::env::set_var` / `remove_var` are process-global (and `unsafe`), so
-//! two env-mutating tests running concurrently corrupt each other's
-//! environment: the fake-`ssh`/`ssh-keyscan` fingerprint suite and the
-//! fake-`systemctl` suite both rewrite the same `PATH`, and a race could make
-//! one of them spawn the REAL binaries (e.g. the real `ssh-keyscan`, whose
-//! getaddrinfo DNS failure panics and poisons the lock). Every env-mutating
-//! test must therefore serialize on THIS single lock — a private per-suite
-//! lock does not protect against the other suite.
-//!
-//! Per-test state that lives OUTSIDE the process env (e.g. each test's own
-//! `DEPLOY_SSH_KNOWNHOSTS_DIR` temp dir for the pin cache) stays isolated as
-//! before; the lock only serializes the env itself.
-//!
-//! The tests' temp root is `$TMPDIR` (defaulting to `/tmp` when unset):
-//! `tempfile::tempdir()` honors it natively (`tempfile` builds on
-//! `std::env::temp_dir()`, which reads `TMPDIR` on macOS/Linux), and the
-//! test-mode store base is `$TMPDIR/deploy-test` (`/tmp/deploy-test` when
-//! unset) — so every disk-writing test stays under the temp root, never
-//! `$HOME`/`$XDG_DATA_HOME`. Tests that need a hermetic per-test store base
-//! redirect `TMPDIR` to a fresh root under the REAL temp dir
-//! ([`hermetic_tmpdir_root`]); the root is never deleted by the test,
-//! because other tests' `tempfile::tempdir()` calls may land inside it while
-//! `TMPDIR` is redirected.
+//! Temp placement goes through the snapshot too: [`fixture_tmpdir`] creates
+//! a fresh tempdir under `env.temp_dir()` (which honors `TMPDIR` from the
+//! snapshot, falling back to the platform temp dir) — no test reads
+//! `std::env::temp_dir()` directly, and no test ever redirects `TMPDIR`.
 //!
 //! Note: each integration-test *binary* (`tests/*.rs`) is a separate process
-//! and cannot race the lib tests, so it only needs its own lock to serialize
-//! its own tests within that binary.
+//! and cannot race the lib tests.
 //!
 //! # Fault injection: per-fixture registries, no process-global slots
 //!
@@ -62,30 +48,27 @@
 //! method's consume hook converts to a one-line registry call:
 //! `self.fault_registry.consume(FaultKind::<Kind>, id)`.
 
-use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// THE lock guarding every env-mutating test in the lib test binary. See the
-/// module docs for the invariant.
-pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+/// A fresh process-environment snapshot for tests that exercise NO
+/// environment-dependent behavior (a transport whose children resolve from
+/// the ambient `PATH`, e.g. `LocalTransport::new`/`SshTransport::new` in
+/// filesystem-only tests). Tests that control the child environment build a
+/// hermetic [`SysEnv::from_map`] and pass that instead — the transport's
+/// children then receive the snapshot's variables, and the process env is
+/// never touched.
+#[cfg(test)]
+pub(crate) fn fixture_env() -> crate::env::SysEnv {
+    crate::env::SysEnv::from_process()
+}
 
-/// Create a fresh, unique root under the REAL temp dir for redirecting
-/// `TMPDIR` in tests. The root is deliberately never deleted by the caller:
-/// while `TMPDIR` is redirected, OTHER tests' `tempfile::tempdir()` calls
-/// may land inside it, so deleting it would delete their live tempdirs; the
-/// OS temp cleaner reclaims it. Callers must hold [`ENV_LOCK`], restore
-/// `TMPDIR` (e.g. `remove_var`) before releasing it, and may delete their
-/// own store data (`<root>/deploy-test`) once `TMPDIR` is restored.
-pub(crate) fn hermetic_tmpdir_root() -> PathBuf {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let root = std::env::temp_dir().join(format!(
-        "deploy-test-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&root).expect("create hermetic test temp root");
-    root
+/// A fresh tempdir placed under the snapshot's `TMPDIR` (`env.temp_dir()`),
+/// so tests never read the process environment for temp placement. A plain
+/// `crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env())` reads `std::env::temp_dir()` implicitly — route all
+/// test tempdirs through this helper instead.
+#[cfg(test)]
+pub(crate) fn fixture_tmpdir(env: &crate::env::SysEnv) -> std::io::Result<tempfile::TempDir> {
+    tempfile::Builder::new().tempdir_in(env.temp_dir())
 }
 
 /// Test-only one-shot fault injection for crash-mid-finalization tests.
@@ -831,7 +814,7 @@ pub(crate) mod test_remotes {
     impl FailOnceMarkerRemote {
         pub(crate) fn build(base: PathBuf, armed: Arc<AtomicBool>) -> Result<Box<dyn Remote>> {
             Ok(Box::new(FailOnceMarkerRemote {
-                inner: LocalTransport::new(base)?,
+                inner: LocalTransport::new(&crate::testutil::fixture_env(), base)?,
                 armed,
             }))
         }
@@ -924,7 +907,7 @@ pub(crate) mod test_remotes {
     impl FailOnceGenerationRemote {
         pub(crate) fn build(base: PathBuf, armed: Arc<AtomicBool>) -> Result<Box<dyn Remote>> {
             Ok(Box::new(FailOnceGenerationRemote {
-                inner: LocalTransport::new(base)?,
+                inner: LocalTransport::new(&crate::testutil::fixture_env(), base)?,
                 armed,
             }))
         }
@@ -1019,7 +1002,7 @@ pub(crate) mod test_remotes {
     impl FailOnceStagingRemote {
         pub(crate) fn build(base: PathBuf, armed: Arc<AtomicBool>) -> Result<Box<dyn Remote>> {
             Ok(Box::new(FailOnceStagingRemote {
-                inner: LocalTransport::new(base)?,
+                inner: LocalTransport::new(&crate::testutil::fixture_env(), base)?,
                 armed,
             }))
         }
@@ -1114,7 +1097,7 @@ pub(crate) mod test_remotes {
     impl FailOnceInventoryRemote {
         pub(crate) fn build(base: PathBuf, armed: Arc<AtomicBool>) -> Result<Box<dyn Remote>> {
             Ok(Box::new(FailOnceInventoryRemote {
-                inner: LocalTransport::new(base)?,
+                inner: LocalTransport::new(&crate::testutil::fixture_env(), base)?,
                 armed,
             }))
         }
@@ -1204,7 +1187,7 @@ pub(crate) mod test_remotes {
     impl CountingRemote {
         fn new(base: PathBuf, calls: Arc<AtomicUsize>) -> Result<Self> {
             Ok(CountingRemote {
-                inner: LocalTransport::new(base)?,
+                inner: LocalTransport::new(&crate::testutil::fixture_env(), base)?,
                 calls,
             })
         }

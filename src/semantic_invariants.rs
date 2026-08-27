@@ -335,7 +335,7 @@ struct FailOnceRemote {
 impl FailOnceRemote {
     fn build(base: PathBuf, fault: Arc<Mutex<RemoteFault>>) -> Result<Box<dyn Remote>> {
         Ok(Box::new(FailOnceRemote {
-            inner: LocalTransport::new(base)?,
+            inner: LocalTransport::new(&crate::testutil::fixture_env(), base)?,
             fault,
         }))
     }
@@ -912,7 +912,7 @@ impl Fixture {
     /// multi-server fixture (`t1` owns `p1`/`p2`, each its own batch); every
     /// other target keeps the default `rollback_changed`.
     fn with_failure_policy(policy: FailurePolicy) -> Fixture {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -1004,7 +1004,7 @@ impl Fixture {
     fn remote_for(&self, server: &str) -> Box<dyn Remote> {
         let p = self.remotes_base.join(server);
         std::fs::create_dir_all(&p).unwrap();
-        Box::new(LocalTransport::new(p).unwrap())
+        Box::new(LocalTransport::new(&crate::testutil::fixture_env(), p).unwrap())
     }
 
     /// A transport handle over the server's remote directory (`s1`). The
@@ -3524,7 +3524,7 @@ fn identity_duplicates_are_rejected_and_canonicalize_identically() {
     // ProjectConfig-level rejection: a slot with a duplicated GROUP name in its
     // `groups` list is rejected (a duplicate adds no membership yet would
     // change the release identity).
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     let release_dir = project.join("releases").join("v1");
     std::fs::create_dir_all(&release_dir).unwrap();
@@ -4319,7 +4319,7 @@ fn integrity_digest_unchanged_after_tamper_fails_closed() {
     // or, if the write is accepted, the read recomputes and refuses it.
     let rec: crate::identity::ReleaseRecord =
         serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
-    let fresh = tempfile::tempdir().unwrap();
+    let fresh = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let store2 = LocalStore::with_base(fresh.path().join("store")).unwrap();
     match store2.write_release(&rec) {
         Err(e) => assert!(
@@ -6810,7 +6810,7 @@ fn run_slot_view_property(members: Vec<Vec<bool>>, pushes: Vec<usize>) {
         }
     }
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     let release_dir = project.join("releases").join("v1");
@@ -6873,7 +6873,7 @@ fn run_slot_view_property(members: Vec<Vec<bool>>, pushes: Vec<usize>) {
     let factory = move |s: &crate::config::ServerDef,
                         _slot: &crate::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
+        Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
     };
 
     // The artifact source the variant maps; rewritten before every push so
@@ -6969,7 +6969,7 @@ fn assert_membership_never_changes_retention(
     let slot_id = &slot_def.id;
     let groups0 = &slot_def.groups;
     let retained = |cfg: &ProjectConfig| -> HashSet<String> {
-        let remote = LocalTransport::new(remotes_base.join("h1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join("h1")).unwrap();
         let helper = RemoteHelper::new(&remote);
         compute_retained(
             &helper,

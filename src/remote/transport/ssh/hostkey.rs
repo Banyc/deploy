@@ -2,9 +2,10 @@
 //! pre-verified fingerprint pinned into a managed cache (`ssh-keyscan`),
 //! never trust-on-first-use.
 
+use crate::env::SysEnv;
 use crate::error::{Error, Result};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use super::runner::{OpKind, RunError, SSH_CONNECT_TIMEOUT_SECS, SshRunner};
@@ -36,24 +37,29 @@ pub(crate) fn keyscan_args(port: u16, address: &str) -> Vec<String> {
 /// via `ssh-keyscan`). Fails closed if the key cannot be fetched or does
 /// not match. Returns the pinned file's path; the transport stores it for
 /// use as `UserKnownHostsFile` in later ssh invocations.
+///
+/// `cache_dir` is the RESOLVED pin-cache directory (resolved once at the
+/// transport-construction boundary from the environment snapshot — never
+/// read from the process env here), and `env` is the snapshot whose
+/// variables ride the `ssh-keygen` fingerprint-verification child.
 pub(crate) fn pin_known_hosts(
     fingerprint: &str,
     target: &str,
     address: &str,
     port: u16,
+    cache_dir: &Path,
+    env: &SysEnv,
     runner: &SshRunner,
 ) -> Result<PathBuf> {
     let expected = fingerprint.trim().to_lowercase();
 
     // Pinned keys live in a private (0700) cache directory owned by this
     // user, rather than a predictable world-readable temp file name, so a
-    // locally pre-created file cannot be trusted blindly. Tests may
-    // override the cache root via `DEPLOY_SSH_KNOWNHOSTS_DIR` to give each
-    // test its own isolated cache; production deployments leave it unset
-    // and use the default `$TMPDIR/deploy-ssh-knownhosts`.
-    let cache_dir = std::env::var_os("DEPLOY_SSH_KNOWNHOSTS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("deploy-ssh-knownhosts"));
+    // locally pre-created file cannot be trusted blindly. The cache root is
+    // resolved at the boundary (the snapshot's `DEPLOY_SSH_KNOWNHOSTS_DIR`,
+    // else `<temp_dir>/deploy-ssh-knownhosts`) and passed in — each test
+    // points it at its own isolated cache.
+    let cache_dir = cache_dir.to_path_buf();
     std::fs::create_dir_all(&cache_dir).map_err(|e| {
         Error::transport(format!(
             "create known_hosts cache {}: {e}",
@@ -73,7 +79,7 @@ pub(crate) fn pin_known_hosts(
     // never trusted without re-verification.
     if path.exists()
         && let Ok(text) = std::fs::read_to_string(&path)
-        && fingerprints_match(&text, &expected)
+        && fingerprints_match(&text, &expected, env)
     {
         return Ok(path);
     }
@@ -121,7 +127,7 @@ pub(crate) fn pin_known_hosts(
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if key_matches_fingerprint(line, &expected) {
+        if key_matches_fingerprint(line, &expected, env) {
             matched.push(line.to_string());
         }
     }
@@ -154,10 +160,13 @@ pub(crate) fn pin_known_hosts(
 
 /// Pipe a single key line into `ssh-keygen -lf` and return whether its
 /// fingerprint (the second whitespace-separated field) matches `expected`.
-pub(crate) fn key_matches_fingerprint(line: &str, expected: &str) -> bool {
+/// The child receives the environment snapshot's variables (`env.child_env()`)
+/// so its `PATH` (and any fake-bin variable) is the deterministic snapshot.
+pub(crate) fn key_matches_fingerprint(line: &str, expected: &str, env: &SysEnv) -> bool {
     let mut keygen = match Command::new("ssh-keygen")
         .arg("-lf")
         .arg("-")
+        .envs(env.child_env())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -189,10 +198,10 @@ pub(crate) fn key_matches_fingerprint(line: &str, expected: &str) -> bool {
 }
 
 /// Return true if any key line in `text` matches `expected` fingerprint.
-pub(crate) fn fingerprints_match(text: &str, expected: &str) -> bool {
+pub(crate) fn fingerprints_match(text: &str, expected: &str, env: &SysEnv) -> bool {
     text.lines().any(|line| {
         let line = line.trim();
-        !line.is_empty() && !line.starts_with('#') && key_matches_fingerprint(line, expected)
+        !line.is_empty() && !line.starts_with('#') && key_matches_fingerprint(line, expected, env)
     })
 }
 

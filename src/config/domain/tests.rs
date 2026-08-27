@@ -36,7 +36,7 @@ fn relative_path_validation() {
 
 #[test]
 fn mapping_to_must_be_artifact_relative() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     let release_dir = project.join("releases").join("v1");
@@ -93,7 +93,7 @@ fn overlapping_mapping_destinations_are_rejected_at_load() {
     // Two mappings whose destinations overlap (identical, or one nested
     // beneath the other) are rejected at config load: the materialized
     // tree would depend on declaration order.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     let release_dir = project.join("releases").join("v1");
@@ -161,7 +161,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
 #[test]
 fn loads_variant_config_from_release_directory() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     let release_dir = project.join("releases").join("v1");
@@ -371,7 +371,7 @@ pub(crate) fn write_standard_release(project: &Path, release: &str) {
 
 #[test]
 fn forced_structure_discovers_variant_files() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -400,7 +400,7 @@ fn forced_structure_discovers_variant_files() {
 
 #[test]
 fn release_name_map_form_is_rejected_with_migration_hint() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -438,7 +438,7 @@ slots = ["p1"]
 
 #[test]
 fn release_name_must_be_a_single_directory_component() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -454,7 +454,7 @@ fn release_name_must_be_a_single_directory_component() {
 
 #[test]
 fn missing_release_directory_errors_with_structure_hint() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     let p = project.join("deploy.toml");
@@ -469,7 +469,7 @@ fn missing_release_directory_errors_with_structure_hint() {
 
 #[test]
 fn release_directory_without_variants_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(project.join("releases/v1")).unwrap();
@@ -488,7 +488,7 @@ fn release_directory_without_variants_is_rejected() {
 /// configuration error.
 #[test]
 fn slot_target_must_reference_declared_target() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -512,7 +512,7 @@ fn slot_target_must_reference_declared_target() {
 /// a target with no member slot is still rejected.
 #[test]
 fn slots_declare_their_target_membership() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -566,7 +566,7 @@ fn slots_declare_their_target_membership() {
 /// member), so it is rejected at validation.
 #[test]
 fn slot_with_no_targets_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -592,7 +592,7 @@ fn slot_with_no_targets_is_rejected() {
 /// binding IS the declaring file.
 #[test]
 fn slots_must_reference_known_servers() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -626,7 +626,7 @@ fn slots_must_reference_known_servers() {
 
 #[test]
 fn duplicate_slot_ids_across_variants_are_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -646,7 +646,7 @@ fn duplicate_slot_ids_across_variants_are_rejected() {
 
 #[test]
 fn duplicate_target_names_in_a_slot_are_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -668,7 +668,7 @@ fn duplicate_target_names_in_a_slot_are_rejected() {
 
 #[test]
 fn slots_on_the_same_server_never_share_a_deploy_dir() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -709,7 +709,7 @@ fn slots_on_the_same_server_never_share_a_deploy_dir() {
 
 #[test]
 fn duplicate_top_level_server_ids_are_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -728,7 +728,7 @@ fn duplicate_top_level_server_ids_are_rejected() {
 
 #[test]
 fn server_capacity_is_validated_and_defaults() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -768,7 +768,7 @@ fn server_capacity_is_validated_and_defaults() {
 /// (ambiguous) are rejected at load time, naming the server.
 #[test]
 fn ssh_identity_requires_exactly_one_source() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -850,7 +850,7 @@ fn ssh_identity_requires_exactly_one_source() {
 /// a local endpoint, exactly-one by construction.
 #[test]
 fn local_address_identity_collapses_to_local() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -904,7 +904,7 @@ fn local_address_identity_collapses_to_local() {
 /// ignored (`deny_unknown_fields` on every config struct).
 #[test]
 fn unknown_fields_are_rejected_across_all_config_surfaces() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -1018,7 +1018,7 @@ fn unknown_fields_are_rejected_across_all_config_surfaces() {
 /// single generation).
 #[test]
 fn target_may_not_have_multiple_slots_on_one_server() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -1057,7 +1057,7 @@ fn target_may_not_have_multiple_slots_on_one_server() {
 /// target's per-server uniqueness is checked independently).
 #[test]
 fn same_server_in_different_targets_is_allowed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -1108,7 +1108,7 @@ fn same_server_in_different_targets_is_allowed() {
 /// `deny_unknown_fields` (it is NOT per-variant configuration).
 #[test]
 fn variant_file_capacity_block_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -1129,7 +1129,7 @@ fn variant_file_capacity_block_is_rejected() {
 /// under the exactly-one rule.
 #[test]
 fn server_port_defaults_to_22_and_is_not_an_identity_source() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -1169,7 +1169,7 @@ fn server_port_defaults_to_22_and_is_not_an_identity_source() {
 /// policy tables.
 #[test]
 fn unknown_fields_rejected_in_verification_rollout_mapping_and_retention() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -1308,7 +1308,7 @@ fn intended_intent(dep: &str) -> DeploymentIntent {
 /// `LEDGER_SCHEMA_VERSION` both decode.
 #[test]
 fn config_at_config_schema_and_ledger_at_ledger_schema_load() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -1339,7 +1339,7 @@ fn config_at_config_schema_and_ledger_at_ledger_schema_load() {
 /// affects the other.
 #[test]
 fn schema_version_swap_fails_only_the_swapped_side() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -1425,7 +1425,7 @@ proptest! {
         config_version in schema_version_candidate(),
         ledger_version in schema_version_candidate(),
     ) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         write_standard_release(&project, "v1");
@@ -2597,7 +2597,7 @@ fn failure_policy_parse_table_is_strict_exact() {
 /// NEVER silently behave as "leave changed".
 #[test]
 fn unknown_failure_policy_spelling_is_rejected_at_load() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -2631,7 +2631,7 @@ fn failure_policy_defaults_to_rollback_changed() {
         RolloutConfig::default().failure_policy,
         FailurePolicy::RollbackChanged
     );
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -2828,7 +2828,7 @@ fn application_name_is_the_store_key_load_and_store() {
     // A SAFE application name LOADS and constructs the store: the
     // config's `application` IS the store key, so the load implies the
     // store construction with no further fallible identity conversion.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     write_standard_release(&project, "v1");
@@ -2841,19 +2841,20 @@ fn application_name_is_the_store_key_load_and_store() {
     let cfg = ProjectConfig::load(&p).expect("a safe application name loads");
     assert_eq!(cfg.application().as_str(), "my-app");
     // The store is constructed DIRECTLY from the config's application
-    // (the field IS the key): `LocalStore::new(&config.application())`.
-    let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
-    let store_root = crate::testutil::hermetic_tmpdir_root();
-    unsafe { std::env::set_var("TMPDIR", &store_root) };
-    let store =
-        LocalStore::new(cfg.application()).expect("a loaded config must construct its LocalStore");
+    // (the field IS the key): `LocalStore::new_in(&env, &config.application())`,
+    // with the base resolved from a hermetic SNAPSHOT (never the process env).
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+    let env = crate::env::SysEnv::from_map(std::collections::BTreeMap::from([(
+        std::ffi::OsString::from("XDG_DATA_HOME"),
+        dir.path().join("store-root").into_os_string(),
+    )]));
+    let store = LocalStore::new_in(&env, cfg.application())
+        .expect("a loaded config must construct its LocalStore");
     assert_eq!(
         store.base().file_name(),
         Some(std::ffi::OsStr::new("my-app")),
         "the store sits under <base>/<application>"
     );
-    unsafe { std::env::remove_var("TMPDIR") };
-    let _ = std::fs::remove_dir_all(store_root.join("deploy-test"));
 
     // An UNSAFE application name (a path separator, a traversal
     // component, or padding) FAILS THE LOAD — fail closed at load, not
@@ -2942,14 +2943,16 @@ fn application_mutation_project() -> impl Strategy<Value = (RawProject, bool)> {
 
 #[test]
 fn loaded_config_always_constructs_its_store() {
-    // The property constructs REAL stores via `LocalStore::new`, so the
-    // process-global `$TMPDIR` is pointed at a hermetic temp root for
-    // the whole run (ENV_LOCK serializes against every other
-    // env-mutating test; the closure-form proptest runs all 16 cases in
-    // this thread).
-    let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
-    let store_root = crate::testutil::hermetic_tmpdir_root();
-    unsafe { std::env::set_var("TMPDIR", &store_root) };
+    // The property constructs REAL stores via `LocalStore::new_in`, so the
+    // store base is resolved from a hermetic SNAPSHOT (a temp-root
+    // `XDG_DATA_HOME`) — no process-global env, no lock, no cross-test
+    // interference; the closure-form proptest runs all 16 cases in this
+    // thread.
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+    let env = crate::env::SysEnv::from_map(std::collections::BTreeMap::from([(
+        std::ffi::OsString::from("XDG_DATA_HOME"),
+        dir.path().join("store-root").into_os_string(),
+    )]));
     proptest!(ProptestConfig {
         cases: 16,
         rng_seed: RngSeed::Fixed(0x5EED_5EED),
@@ -2965,7 +2968,7 @@ fn loaded_config_always_constructs_its_store() {
                 // THE LOAD IMPLIES THE STORE: the config's application
                 // IS the store key — no fallible identity conversion
                 // remains between a loaded config and its store.
-                LocalStore::new(cfg.application())
+                LocalStore::new_in(&env, cfg.application())
                     .expect("a loaded config must construct its LocalStore");
             }
             Err(e) => {
@@ -2980,6 +2983,4 @@ fn loaded_config_always_constructs_its_store() {
             }
         }
     });
-    unsafe { std::env::remove_var("TMPDIR") };
-    let _ = std::fs::remove_dir_all(store_root.join("deploy-test"));
 }

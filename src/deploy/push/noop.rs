@@ -386,7 +386,7 @@ interval_seconds = 0
 
         // The EXISTING generation's assignment: what the running service was
         // actually deployed with — the ground truth the no-op must render.
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
         let status = RemoteHelper::new(&remote).status().unwrap();
         let cur = status
             .current_generation
@@ -603,7 +603,7 @@ attempts = 1
 interval_seconds = 0
 "#;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -743,7 +743,7 @@ interval_seconds = 0
         // assignment carries variant `other`.
         assert_eq!(store.read_attempts("t1").unwrap().len(), 2);
         assert_eq!(store.read_snapshots("t1").unwrap().len(), 2);
-        let remote = LocalTransport::new(remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join("s1")).unwrap();
         let status = RemoteHelper::new(&remote).status().unwrap();
         let cur = status
             .current_generation

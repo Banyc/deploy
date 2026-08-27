@@ -593,7 +593,7 @@ pub(crate) mod preflight_tests {
         // fully removed before the push returns. Regression: the old Drop-only
         // cleanup swallowed remove_dir_all's EACCES and left `staging/dry-<id>`
         // (and every file inside it) behind forever.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -632,7 +632,7 @@ pub(crate) mod preflight_tests {
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
             Ok(Box::new(
-                LocalTransport::new(remotes_base.join("s1")).unwrap(),
+                LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join("s1")).unwrap(),
             ))
         };
 
@@ -680,7 +680,7 @@ pub(crate) mod preflight_tests {
         // stored under the digest. Regression: the old code swallowed
         // remove_dir_all's EACCES, downloaded INTO the stale dir, and
         // persisted a mixed tree (or failed verification).
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -707,7 +707,7 @@ pub(crate) mod preflight_tests {
         let factory = move |_s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(factory_path.clone()).unwrap()))
+            Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), factory_path.clone()).unwrap()))
         };
 
         // First push: deploys and publishes the tree into the remote object
@@ -745,7 +745,7 @@ pub(crate) mod preflight_tests {
         // Drop the local object: recovery must re-fetch from the remote.
         std::fs::remove_dir_all(store.object_root(&tree)).unwrap();
         assert!(!store.object_exists(&tree), "local object removed");
-        let remote_handle = LocalTransport::new(remote_path).unwrap();
+        let remote_handle = LocalTransport::new(&crate::testutil::fixture_env(), remote_path).unwrap();
         assert!(
             remote_handle.exists(&crate::remote::layout::tree_root(tree.as_str())),
             "remote still retains the tree"
@@ -825,7 +825,7 @@ pub(crate) mod preflight_tests {
         // inside the release directory's `artifacts` tree. The conflicting
         // project-root copy is created BEFORE materialization; if `from` were
         // resolved against the project root it would win. It must not.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -929,7 +929,7 @@ pub(crate) mod preflight_tests {
         );
         assert!(h.store.read_results(id.as_str()).is_err(), "no results");
         // ...and NOTHING on the remote mutated: no `current`, no generation.
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
         assert!(
             !remote.exists(crate::remote::layout::current()),
             "current must not exist before the intent is durable"
@@ -951,7 +951,7 @@ pub(crate) mod preflight_tests {
             Some(DeploymentStatus::Successful),
             "a clean follow-up push succeeds"
         );
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
         assert!(
             remote.exists(crate::remote::layout::current()),
             "remote advanced"
@@ -1005,7 +1005,7 @@ pub(crate) mod preflight_tests {
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
+            Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
         };
         let err = push(
             &h.cfg_path,
@@ -1051,7 +1051,7 @@ pub(crate) mod preflight_tests {
             snapshot_files(&h.remotes_base),
             "the refused rollback must not touch a single remote byte"
         );
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
         assert!(
             remote.exists(crate::remote::layout::current()),
             "the baseline s0 deployment on the remote is untouched"
@@ -1081,7 +1081,7 @@ pub(crate) mod preflight_tests {
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
+            Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
         };
         let r = push(
             &h.cfg_path,
@@ -1127,7 +1127,7 @@ pub(crate) mod preflight_tests {
             snapshot_files(&h.remotes_base),
             "a historical dry run must not touch a single remote byte"
         );
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
         let status = RemoteHelper::new(&remote).status().unwrap();
         assert_eq!(
             status.current_generation.as_ref().map(|g| g.as_str()),
@@ -1162,7 +1162,7 @@ pub(crate) mod preflight_tests {
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
+            Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
         };
         let r = push(
             &h.cfg_path,
@@ -1218,7 +1218,7 @@ pub(crate) mod preflight_tests {
     //
     // The fake systemctl is installed on PATH and `XDG_CONFIG_HOME` is pointed
     // at a hermetic temp dir (the unit gets installed there), under
-    // `crate::testutil::ENV_LOCK` per the env-mutation invariant.
+    // (env is passed as a snapshot; the parent env is never mutated).
 
     /// A CAPACITY preflight failure (after the intent is durable, before any
     /// server mutation) must end the attempt `FailedPreflight` —
@@ -1303,7 +1303,7 @@ pub(crate) mod preflight_tests {
         // no generation record, no tree object.
         assert!(h.store.read_snapshots("t1").unwrap().is_empty());
         assert!(h.store.read_last_successful("t1").is_none());
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
         assert!(
             !remote.exists(crate::remote::layout::current()),
             "no current"
@@ -1404,7 +1404,7 @@ pub(crate) mod preflight_tests {
         // no generation record, no published object.
         assert!(h.store.read_snapshots("t1").unwrap().is_empty());
         assert!(h.store.read_last_successful("t1").is_none());
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
         assert!(
             !remote.exists(crate::remote::layout::current()),
             "no current"
@@ -1441,7 +1441,7 @@ pub(crate) mod preflight_tests {
     /// never left behind for a later reconcile to trip over.
     #[test]
     fn staging_failure_on_later_assignment_cleans_earlier_incoming() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -1580,7 +1580,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // best-effort, and the second's partial upload too; no `current`,
         // generation, or published object on either server.
         for sname in ["s1", "s2"] {
-            let remote = LocalTransport::new(remotes_base.join(sname)).unwrap();
+            let remote = LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join(sname)).unwrap();
             assert!(
                 !remote.exists(&crate::remote::layout::incoming_dir(id.as_str())),
                 "slot {sname}'s incoming dir must be cleaned best-effort"
@@ -1702,7 +1702,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
+            Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
         };
         let err = push_inner(
             &project_root,
@@ -1816,7 +1816,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
+            Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
         };
         let r = push(
             &h.cfg_path,
@@ -2216,7 +2216,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let clean_factory = move |s: &crate::config::ServerDef,
                                       _slot: &crate::config::SlotConfig|
                      -> Result<Box<dyn Remote>> {
-                Ok(Box::new(LocalTransport::new(rf2.join(s.id.as_str()))?))
+                Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf2.join(s.id.as_str()))?))
             };
             let ref_id = test_deployment_id(&format!("deploy-relative-ref-{latest}-{depth}"));
             h.store

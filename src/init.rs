@@ -725,7 +725,7 @@ mod tests {
 
     #[test]
     fn init_scaffolds_valid_layout() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let proj = tmp.path().join("my-app");
         let report = init_project(&proj, &opts()).unwrap();
 
@@ -785,7 +785,7 @@ mod tests {
 
     #[test]
     fn init_refuses_to_clobber() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let proj = tmp.path().join("my-app");
         init_project(&proj, &opts()).unwrap();
 
@@ -799,7 +799,7 @@ mod tests {
     // both-set case is already a clap parse error (conflicting flags).
     #[test]
     fn init_ssh_address_requires_identity() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
 
         // SSH address + neither identity: handler error, nothing scaffolded.
         let proj = tmp.path().join("no-identity");
@@ -848,7 +848,7 @@ mod tests {
 
     #[test]
     fn init_with_ssh_overrides() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let proj = tmp.path().join("real-app");
         let opts = InitOptions {
             name: Some("prod".to_string()),
@@ -887,7 +887,7 @@ mod tests {
     // created for a fresh path.
     #[test]
     fn invalid_options_fail_before_writing_anything() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
 
         // SSH address with neither identity source.
         let proj = tmp.path().join("ssh-no-identity");
@@ -951,7 +951,7 @@ mod tests {
     // still loads through the strict ProjectConfig::load with identical semantics.
     #[test]
     fn scaffold_is_typed_toml_and_serializes_to_the_same_config() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let proj = tmp.path().join("typed-app");
         let report = init_project(&proj, &opts()).unwrap();
         let config =
@@ -1045,7 +1045,7 @@ mod tests {
     // options but fails the loader, and asserts nothing is left behind.
     #[test]
     fn failed_post_write_load_removes_the_tree() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let proj = tmp.path().join("bad-load");
 
         // The writes look scaffold-shaped but the deploy.toml is malformed
@@ -1087,7 +1087,7 @@ mod tests {
 
     #[test]
     fn init_defaults_and_ssh_flags_round_trip_through_loader() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         // SSH + known_hosts only: exactly one identity.
         let proj = tmp.path().join("kh-app");
         let opts = InitOptions {

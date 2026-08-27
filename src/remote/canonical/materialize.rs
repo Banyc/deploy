@@ -776,7 +776,7 @@ mod tests_materialize {
 
     #[test]
     fn preserves_source_mode_when_no_override() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().join("src");
         let app_dir = root.join("app");
         std::fs::create_dir_all(&app_dir).unwrap();
@@ -814,7 +814,7 @@ mod tests_materialize {
 
     #[test]
     fn interpolation_and_recursive_mappings() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().join("src");
         std::fs::create_dir_all(root.join("deployment/common")).unwrap();
         std::fs::write(root.join("deployment/common/README"), b"common").unwrap();
@@ -849,7 +849,7 @@ mod tests_materialize {
         // `from` referencing a per-server variable (e.g. `{{ user }}`) must
         // fail loudly — never render an empty path component, never produce a
         // slot-dependent tree.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().join("src");
         std::fs::create_dir_all(root.join("deployment")).unwrap();
         std::fs::write(root.join("deployment/x"), b"x").unwrap();
@@ -938,7 +938,7 @@ mod tests_materialize {
 
     #[test]
     fn overlapping_destinations_rejected_before_any_write() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().join("src");
         std::fs::create_dir_all(root.join("app")).unwrap();
         std::fs::write(root.join("app/run.sh"), b"x").unwrap();
@@ -955,7 +955,7 @@ mod tests_materialize {
 
     #[test]
     fn missing_source_rejected_before_any_write() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().join("src");
         std::fs::create_dir_all(&root).unwrap();
         let dest = dir.path().join("staging");
@@ -965,7 +965,7 @@ mod tests_materialize {
 
     #[test]
     fn escaping_destination_rejected_before_any_write() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().join("src");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("app.sh"), b"x").unwrap();
@@ -982,7 +982,7 @@ mod tests_materialize {
 
     #[test]
     fn symlink_source_rejected_before_any_write() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().join("src");
         std::fs::create_dir_all(root.join("bin")).unwrap();
         std::fs::write(root.join("bin/tool"), b"x").unwrap();
@@ -1004,7 +1004,7 @@ mod tests_materialize {
 
     #[test]
     fn colliding_destinations_error_but_re_materialization_is_a_no_op() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().join("src");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("app.sh"), b"version-1").unwrap();
@@ -1193,7 +1193,7 @@ mod tests_materialize {
         let result_file = std::env::var("UMASK_RESULT_FILE").expect("UMASK_RESULT_FILE is set");
         let _umask_guard = UmaskGuard::set(umask);
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().join("src");
         build_source_tree(&root);
         let mappings = umask_probe_mappings();
@@ -1217,7 +1217,7 @@ mod tests_materialize {
     #[test]
     fn tree_digest_independent_of_umask() {
         let exe = std::env::current_exe().expect("current test binary");
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let mut snapshots: Vec<(u32, TreeMetadata)> = Vec::new();
         for umask in [0o022, 0o002, 0o000, 0o077] {
             let result_file = dir.path().join(format!("umask-{umask:o}.json"));
@@ -1350,7 +1350,7 @@ mod tests_materialize {
     }
 
     fn run_mapper_case_property(case: &MapperCase) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().join("src");
         build_source_tree(&root);
         let vars = TemplateVars::mapping("app", "v1", "standard");
@@ -1535,7 +1535,7 @@ mod tests_materialize {
     }
 
     fn run_invalid_case_property(case: &InvalidCase) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().join("src");
         build_source_tree(&root);
         // A symlink source for the SymlinkSource cases.
@@ -1658,7 +1658,7 @@ mod tests_materialize {
     }
 
     fn run_symlink_rejection_property(case: &SymlinkRejectionCase) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().join("src");
         build_symlink_source(&root, case.depth);
 

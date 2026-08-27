@@ -405,7 +405,7 @@ mod tests {
     /// `@` / `HEAD` / `` / `parent(@, 0)` resolve to the default HEAD push.
     #[test]
     fn resolve_ref_head_forms() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         for token in ["", "HEAD", "@", "parent(@, 0)"] {
             assert_eq!(
@@ -425,7 +425,7 @@ mod tests {
     /// closed on the empty store.
     #[test]
     fn resolve_parent_at_0_fold_on_empty_store() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         for token in ["@", "parent(@, 0)"] {
             assert_eq!(
@@ -447,7 +447,7 @@ mod tests {
     /// `parent(deploy-1, 0)` forms name deploy-1 itself.
     #[test]
     fn resolve_ref_ancestor_steps() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         let ids = seed_chain(&store, 6);
         let target = TargetName::new("production".to_string());
@@ -476,7 +476,7 @@ mod tests {
     /// deployment history back from there.
     #[test]
     fn resolve_ref_deployment_refids() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         let ids = seed_chain(&store, 6);
         let target = TargetName::new("production".to_string());
@@ -512,7 +512,7 @@ mod tests {
     /// direct/cross-target release deployment.
     #[test]
     fn resolve_ref_direct_release_form_ignores_chain_and_store() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         // The canonical full form AND the bare 64-hex digest (converted by
         // the CLI parser BEFORE the strict domain parse) both resolve to the
@@ -562,7 +562,7 @@ mod tests {
     /// an EMPTY chain. Never underflow, never guess.
     #[test]
     fn resolve_ref_failures_fail_closed() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         seed_chain(&store, 4);
         let c0 = test_deployment_id("deploy-0");
@@ -705,7 +705,7 @@ mod tests {
     /// FIRST so it mirrors the engine's documented `Relative{At,0} ≡ Head`
     /// reduction).
     fn ref_grammar_resolve_case(history: Vec<(String, bool)>, token: String) {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(tmp.path().join("store")).unwrap();
         for (id, ok) in &history {
             store

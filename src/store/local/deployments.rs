@@ -37,7 +37,7 @@ mod tests {
     /// same-ID rewrite with different content is corruption.
     #[test]
     fn recorded_plan_is_immutable() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let plan = serde_json::json!({ "target": "t1" });
         store

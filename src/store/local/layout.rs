@@ -1,9 +1,10 @@
-//! The store directory layout (A3): the hermetic test / `$XDG_DATA_HOME`
-//! base ([`default_base`]), the per-target path plumbing
-//! ([`LocalStore::target_dir`]), and the durable first-creation of a
-//! target's directory on the ledger-append path (A7
+//! The store directory layout (A3): the store base resolution
+//! ([`default_base`] — pure, from the environment snapshot), the per-target
+//! path plumbing ([`LocalStore::target_dir`]), and the durable
+//! first-creation of a target's directory on the ledger-append path (A7
 //! [`LocalStore::ensure_target_dir_durable`]).
 
+use crate::env::SysEnv;
 use crate::error::Result;
 use crate::store::atomic::ensure_private_dir_durable;
 use crate::store::local::{LocalStore, sanitize};
@@ -14,26 +15,14 @@ use crate::error::Error;
 #[cfg(test)]
 use crate::testutil::test_faults::FaultKind;
 
-pub(crate) fn default_base() -> PathBuf {
-    #[cfg(test)]
-    {
-        let tmp = std::env::var("TMPDIR")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-        tmp.join("deploy-test")
-    }
-    #[cfg(not(test))]
-    {
-        let data = std::env::var("XDG_DATA_HOME")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("HOME").ok())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        data.join("simple-deploy")
-    }
+/// The store base for `env`: `<data home>/simple-deploy` (the user data
+/// home is `XDG_DATA_HOME`, else `$HOME`, else `.` — resolved by
+/// [`SysEnv::data_home`]). Pure: reads NOTHING from the process environment;
+/// the caller passes the snapshot taken at the process boundary. The old
+/// test-mode `$TMPDIR/deploy-test` branch is gone: tests build a hermetic
+/// `SysEnv::from_map` and resolve the base from it like any caller.
+pub(crate) fn default_base(env: &SysEnv) -> PathBuf {
+    env.data_home().join("simple-deploy")
 }
 
 impl LocalStore {
@@ -116,31 +105,40 @@ impl LocalStore {
 mod tests {
     use super::*;
     use crate::identity::ApplicationStoreKey;
+    use std::collections::BTreeMap;
+    use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
-    /// The store path is `default_base().join(key)`: a clean store key
+
+    /// Build a hermetic snapshot with `XDG_DATA_HOME` pointing under a fresh
+    /// temp root (the environment the store tests resolve their base from —
+    /// never the process env, never a global mutation).
+    fn store_env(root: &std::path::Path) -> SysEnv {
+        SysEnv::from_map(BTreeMap::from([(
+            OsString::from("XDG_DATA_HOME"),
+            root.to_path_buf().into_os_string(),
+        )]))
+    }
+
+    /// The store path is `default_base(env).join(key)`: a clean store key
     /// places the store DIRECTLY under the base with exactly ONE component
     /// appended (no traversal), and every escape class is rejected at the
     /// key parse — an invalid name can never reach the store construction
     /// (the key type is the only way in).
     #[test]
     fn new_places_store_under_base_plus_single_component() {
-        // Hermetic store base: `LocalStore::new` resolves `default_base()`
-        // from the process-global `$TMPDIR`, so it is pointed at a
-        // temp root under ENV_LOCK (the house env-mutation invariant).
-        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
-        let store_root = crate::testutil::hermetic_tmpdir_root();
-        unsafe { std::env::set_var("TMPDIR", &store_root) };
+        // Hermetic store base: `LocalStore::new_in` resolves `default_base`
+        // from the SNAPSHOT (never the process env) — the test points the
+        // snapshot's `XDG_DATA_HOME` at a fresh temp root.
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let env = store_env(&dir.path().join("store-root"));
 
         // A clean name → Ok, and the store path is `<base>/<name>` with no
         // traversal: exactly ONE component (the key) appended.
         let key = ApplicationStoreKey::parse("my-app").expect("clean name parses");
-        let store = LocalStore::new(&key).expect("a valid store key constructs a store");
-        assert_eq!(store.base().parent(), Some(default_base().as_path()));
-        assert_eq!(
-            store.base().file_name(),
-            Some(std::ffi::OsStr::new("my-app"))
-        );
-        assert_eq!(store.base(), default_base().join("my-app"));
+        let store = LocalStore::new_in(&env, &key).expect("a valid store key constructs a store");
+        assert_eq!(store.base().parent(), Some(default_base(&env).as_path()));
+        assert_eq!(store.base().file_name(), Some(OsStr::new("my-app")));
+        assert_eq!(store.base(), default_base(&env).join("my-app"));
 
         // Every escape class is rejected at the KEY parse — the store
         // construction takes the key type, so an invalid name can never
@@ -150,34 +148,28 @@ mod tests {
         ] {
             ApplicationStoreKey::parse(bad).expect_err("unsafe store key rejected");
         }
-
-        unsafe { std::env::remove_var("TMPDIR") };
-        let _ = std::fs::remove_dir_all(store_root.join("deploy-test"));
     }
 
-    /// The test-mode `default_base()` is hermetic: it resolves under
-    /// `$TMPDIR` (or `/tmp` when unset) — never `$XDG_DATA_HOME`/`$HOME` —
-    /// and `$TMPDIR` overrides the root explicitly.
+    /// `default_base` is a pure function of the SNAPSHOT: `XDG_DATA_HOME`
+    /// wins, `$HOME` falls back, and neither yields `.` — the data-home
+    /// resolution lives in [`SysEnv::data_home`], never in a process read.
     #[test]
-    fn test_mode_default_base_is_hermetic() {
-        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
-        unsafe { std::env::remove_var("TMPDIR") };
-        assert_eq!(
-            default_base(),
-            PathBuf::from("/tmp").join("deploy-test"),
-            "with TMPDIR unset the test-mode base must be /tmp/deploy-test"
-        );
-        // The override root is a fixed, never-deleted path under the real
-        // temp dir: while TMPDIR is redirected, other tests' tempdirs may
-        // land inside it, so it must never be deleted (their own drops
-        // clean them).
-        let override_root = std::env::temp_dir().join("deploy-test-override");
-        unsafe { std::env::set_var("TMPDIR", &override_root) };
-        assert_eq!(
-            default_base(),
-            override_root.join("deploy-test"),
-            "with TMPDIR set the test-mode base must be $TMPDIR/deploy-test"
-        );
-        unsafe { std::env::remove_var("TMPDIR") };
+    fn default_base_resolves_from_snapshot() {
+        let xdg = SysEnv::from_map(BTreeMap::from([
+            (OsString::from("XDG_DATA_HOME"), OsString::from("/x/data")),
+            (OsString::from("HOME"), OsString::from("/h")),
+        ]));
+        assert_eq!(default_base(&xdg), PathBuf::from("/x/data/simple-deploy"));
+
+        // HOME falls back.
+        let home = SysEnv::from_map(BTreeMap::from([(
+            OsString::from("HOME"),
+            OsString::from("/h"),
+        )]));
+        assert_eq!(default_base(&home), PathBuf::from("/h/simple-deploy"));
+
+        // Neither -> `./simple-deploy` (data_home falls back to `.`).
+        let none = SysEnv::from_map(BTreeMap::new());
+        assert_eq!(default_base(&none), PathBuf::from("./simple-deploy"));
     }
 }

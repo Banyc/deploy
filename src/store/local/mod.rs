@@ -30,6 +30,7 @@
 //! one test can never fire in another's push — structural isolation that
 //! holds under any parallel `cargo test` interleaving.
 
+use crate::env::SysEnv;
 use crate::error::{Error, Result};
 use crate::identity::ApplicationStoreKey;
 use crate::remote::layout as remote_layout;
@@ -182,8 +183,22 @@ impl LocalStore {
     /// path segment ([`crate::identity::ApplicationStoreKey`]), so the store
     /// path is `default_base().join(key)` — exactly ONE component appended
     /// — and an application name can never escape the store base.
+    ///
+    /// Entry-point convenience: snapshots the process environment ONCE
+    /// ([`SysEnv::from_process`]) and delegates to [`LocalStore::new_in`].
+    /// Subsystem code that already holds the boundary snapshot passes it to
+    /// [`LocalStore::new_in`] instead — never reads the process env itself.
     pub fn new(application: &ApplicationStoreKey) -> Result<LocalStore> {
-        let base = default_base().join(application.as_str());
+        Self::new_in(&SysEnv::from_process(), application)
+    }
+
+    /// Create a store rooted at `default_base(env).join(key)` with private
+    /// permissions, creating the directory tree if needed. The application
+    /// STORE KEY is the ONLY way in (see [`LocalStore::new`]); the store
+    /// base is resolved PURELY from the caller's environment snapshot —
+    /// never from a live process read.
+    pub fn new_in(env: &SysEnv, application: &ApplicationStoreKey) -> Result<LocalStore> {
+        let base = default_base(env).join(application.as_str());
         Self::with_base(base)
     }
 
@@ -300,7 +315,7 @@ mod tests {
         // End-to-end: a SLOT id named `..` must stay inside the slot tree,
         // never resolve to the store root (the slot's ONE physical observed
         // record lives at `slots/<slot-id>/observed.json`).
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let evil = SlotId::new("..".to_string());
         assert_eq!(

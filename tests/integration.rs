@@ -224,7 +224,7 @@ fn end_to_end_push_rollback() -> Result<()> {
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         let p = remotes_base.join(&s.id);
-        Ok(Box::new(LocalTransport::new(p)?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), p)?))
     };
 
     // First push (s0).
@@ -370,7 +370,7 @@ fn snapshot_records_each_slots_physical_binding() -> Result<()> {
     let factory = move |s: &deploy::config::ServerDef,
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(remotes_base.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), remotes_base.join(&s.id))?))
     };
 
     let r0 = push(
@@ -475,7 +475,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let factory = move |s: &deploy::config::ServerDef,
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(factory_base.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), factory_base.join(&s.id))?))
     };
 
     // Deploy s0 with the slot on server-01.
@@ -646,7 +646,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let factory = move |s: &deploy::config::ServerDef,
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(factory_base.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), factory_base.join(&s.id))?))
     };
 
     // Deploy s0 with the slot at deploy_dir A on server-01.
@@ -847,7 +847,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let factory = move |s: &deploy::config::ServerDef,
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), rf.join(&s.id))?))
     };
 
     let r0 = push(
@@ -969,7 +969,7 @@ fn dry_run_reports_plan() -> Result<()> {
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
         let p = remotes_base.join(&s.id);
-        Ok(Box::new(LocalTransport::new(p)?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), p)?))
     };
     let r = push(
         &config_path,
@@ -1020,7 +1020,7 @@ struct SpyRemote {
 impl SpyRemote {
     fn build(base: std::path::PathBuf, mutations: Arc<AtomicUsize>) -> Result<Box<dyn Remote>> {
         Ok(Box::new(SpyRemote {
-            inner: LocalTransport::new(base)?,
+            inner: LocalTransport::new(&deploy::env::SysEnv::from_process(), base)?,
             mutations,
         }))
     }
@@ -1132,7 +1132,7 @@ impl FaultRemote {
         attempted: Arc<AtomicUsize>,
     ) -> Result<Box<dyn Remote>> {
         Ok(Box::new(FaultRemote {
-            inner: LocalTransport::new(base)?,
+            inner: LocalTransport::new(&deploy::env::SysEnv::from_process(), base)?,
             fail_rename,
             fail_write,
             fail_exec,
@@ -1148,7 +1148,7 @@ impl FaultRemote {
         attempted: Arc<AtomicUsize>,
     ) -> Result<Box<dyn Remote>> {
         Ok(Box::new(FaultRemote {
-            inner: LocalTransport::new(base)?,
+            inner: LocalTransport::new(&deploy::env::SysEnv::from_process(), base)?,
             fail_rename: false,
             fail_write: false,
             fail_exec: false,
@@ -1164,7 +1164,7 @@ impl FaultRemote {
         attempted: Arc<AtomicUsize>,
     ) -> Result<Box<dyn Remote>> {
         Ok(Box::new(FaultRemote {
-            inner: LocalTransport::new(base)?,
+            inner: LocalTransport::new(&deploy::env::SysEnv::from_process(), base)?,
             fail_rename: false,
             fail_write: false,
             fail_exec: false,
@@ -1285,7 +1285,7 @@ struct FailOnceMarkerRemote {
 impl FailOnceMarkerRemote {
     fn build(base: std::path::PathBuf, armed: Arc<AtomicBool>) -> Result<Box<dyn Remote>> {
         Ok(Box::new(FailOnceMarkerRemote {
-            inner: LocalTransport::new(base)?,
+            inner: LocalTransport::new(&deploy::env::SysEnv::from_process(), base)?,
             armed,
         }))
     }
@@ -1391,7 +1391,7 @@ impl FailOnceRetentionRemote {
         avail: u64,
     ) -> Result<Box<dyn Remote>> {
         Ok(Box::new(FailOnceRetentionRemote {
-            inner: LocalTransport::new(base)?,
+            inner: LocalTransport::new(&deploy::env::SysEnv::from_process(), base)?,
             armed,
             fail_path,
             fail_list,
@@ -1492,7 +1492,7 @@ struct ConflictingMarkerRemote {
 impl ConflictingMarkerRemote {
     fn build(base: std::path::PathBuf, armed: Arc<AtomicBool>) -> Result<Box<dyn Remote>> {
         Ok(Box::new(ConflictingMarkerRemote {
-            inner: LocalTransport::new(base)?,
+            inner: LocalTransport::new(&deploy::env::SysEnv::from_process(), base)?,
             armed,
         }))
     }
@@ -1751,7 +1751,7 @@ interval_seconds = 0
 
     let factory = move |s: &deploy::config::ServerDef,
                         slot: &deploy::config::SlotConfig|
-          -> Result<Box<dyn Remote>> { create_remote(s, slot.deploy_dir()) };
+          -> Result<Box<dyn Remote>> { create_remote(&deploy::env::SysEnv::from_process(), s, slot.deploy_dir()) };
 
     let r = push(
         &proj.join("deploy.toml"),
@@ -1882,7 +1882,7 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
     let factory = move |s: &deploy::config::ServerDef,
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rb.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), rb.join(&s.id))?))
     };
 
     // Deploy with behavior A (s0).
@@ -1919,7 +1919,7 @@ fn historical_rollback_uses_historical_behavior() -> Result<()> {
     assert_eq!(rrb.status, Some(DeploymentStatus::Successful));
 
     // The rolled-back generation must carry behavior A's digest, NOT B's.
-    let remote = LocalTransport::new(remotes_base.join("server-01"))?;
+    let remote = LocalTransport::new(&deploy::env::SysEnv::from_process(), remotes_base.join("server-01"))?;
     let helper = RemoteHelper::new(&remote);
     let status = helper.status()?;
     let gen_id = status
@@ -1997,7 +1997,7 @@ fn historical_behavior_unavailable_fails_preflight() -> Result<()> {
     let factory = move |s: &deploy::config::ServerDef,
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rb.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), rb.join(&s.id))?))
     };
 
     let r0 = push(
@@ -2122,7 +2122,7 @@ fn incomplete_historical_behavior_fails_preflight_without_remote_mutation() -> R
     let factory = move |s: &deploy::config::ServerDef,
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rb.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), rb.join(&s.id))?))
     };
 
     let r0 = push(
@@ -2306,7 +2306,7 @@ interval_seconds = 0
     let factory = move |s: &deploy::config::ServerDef,
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), rf.join(&s.id))?))
     };
 
     // Must not panic.
@@ -2534,7 +2534,7 @@ fn capacity_retention_compute_retained_failure_releases_lock() -> Result<()> {
     // (The retention runs on the FIRST assignment in plan order, so check all
     // three servers rather than assuming a specific slot.)
     for server in ["server-01", "server-02", "server-03"] {
-        let remote = LocalTransport::new(remotes_base.join(server))?;
+        let remote = LocalTransport::new(&deploy::env::SysEnv::from_process(), remotes_base.join(server))?;
         assert!(
             !remote.exists(&deploy::remote::layout::operation_lock()),
             "the lock file must be removed when the guard drops ({server})"
@@ -2651,7 +2651,7 @@ fn step17_retention_failure_defers_maintenance_until_noop_retry() -> Result<()> 
     // (Step 17 rotates the FIRST assignment in plan order, so check all three
     // servers rather than assuming a specific slot.)
     for server in ["server-01", "server-02", "server-03"] {
-        let remote = LocalTransport::new(remotes_base.join(server))?;
+        let remote = LocalTransport::new(&deploy::env::SysEnv::from_process(), remotes_base.join(server))?;
         assert!(
             !remote.exists(&deploy::remote::layout::operation_lock()),
             "the lock file must be removed when the guard drops ({server})"
@@ -3000,7 +3000,7 @@ fn pending_commit_attempt_reconciled_on_next_push() -> Result<()> {
     let clean_factory = move |s: &deploy::config::ServerDef,
                               _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf2.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), rf2.join(&s.id))?))
     };
     let r2 = push(
         &proj.join("deploy.toml"),
@@ -3157,7 +3157,7 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
     // than a hand-written non-canonical target.
     let cur = remotes_base.join("server-01/current");
     std::fs::remove_file(&cur)?;
-    let foreign_remote = LocalTransport::new(remotes_base.join("server-01"))?;
+    let foreign_remote = LocalTransport::new(&deploy::env::SysEnv::from_process(), remotes_base.join("server-01"))?;
     let foreign_helper = RemoteHelper::new(&foreign_remote);
     let foreign_tree =
         TreeDigest::parse("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
@@ -3203,7 +3203,7 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
     let clean_factory = move |s: &deploy::config::ServerDef,
                               _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf2.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), rf2.join(&s.id))?))
     };
     let r2 = push(
         &proj.join("deploy.toml"),
@@ -3388,7 +3388,7 @@ fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result
     let clean_factory = move |s: &deploy::config::ServerDef,
                               _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf2.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), rf2.join(&s.id))?))
     };
     let r2 = push(
         &proj.join("deploy.toml"),
@@ -3429,7 +3429,7 @@ fn pending_commit_conflicting_marker_is_degraded_not_pending_forever() -> Result
     let clean_factory3 = move |s: &deploy::config::ServerDef,
                                _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf3.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), rf3.join(&s.id))?))
     };
     let r3 = push(
         &proj.join("deploy.toml"),
@@ -3500,7 +3500,7 @@ fn server_capacity_change_does_not_change_release_identity() -> Result<()> {
     let factory = move |s: &deploy::config::ServerDef,
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), rf.join(&s.id))?))
     };
 
     // s0: deploy with default (0/0) server capacity.
@@ -3694,7 +3694,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let factory = move |s: &deploy::config::ServerDef,
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), rf.join(&s.id))?))
     };
 
     // s0: p1 on server-01.
@@ -3805,7 +3805,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let factory = move |s: &deploy::config::ServerDef,
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), rf.join(&s.id))?))
     };
 
     let r0 = push(
@@ -3946,7 +3946,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let factory = move |s: &deploy::config::ServerDef,
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), rf.join(&s.id))?))
     };
 
     // s0: deploy T0.
@@ -4089,7 +4089,7 @@ fn dry_run_leaves_no_trace_fingerprint() -> Result<()> {
     let factory = move |s: &deploy::config::ServerDef,
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rb.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), rb.join(&s.id))?))
     };
 
     let before = remote_fingerprint(root);
@@ -4219,7 +4219,7 @@ fn server_policy_change_does_not_change_release_identity() -> Result<()> {
     let factory = move |s: &deploy::config::ServerDef,
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), rf.join(&s.id))?))
     };
 
     // s0: deploy with the original server policy.
@@ -4338,7 +4338,7 @@ interval_seconds = 0
     let factory = move |s: &deploy::config::ServerDef,
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), rf.join(&s.id))?))
     };
 
     let r = push(
@@ -4467,7 +4467,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let factory = move |s: &deploy::config::ServerDef,
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), rf.join(&s.id))?))
     };
     let push_opt = |_target: &str| PushOptions {
         dry_run: false,
@@ -4667,7 +4667,7 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
     let factory = move |s: &deploy::config::ServerDef,
                         _slot: &deploy::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf.join(&s.id))?))
+        Ok(Box::new(LocalTransport::new(&deploy::env::SysEnv::from_process(), rf.join(&s.id))?))
     };
 
     // On an EMPTY chain every relative reference fails closed as a ref

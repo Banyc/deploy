@@ -127,7 +127,7 @@ mod staging_tests {
 
     #[test]
     fn staging_cleanup_drop_removes_tree_take_prevents_removal() {
-        let base = tempfile::tempdir().unwrap();
+        let base = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
 
         // Drop removes the whole staging tree.
         let p = base.path().join("dry-a");
@@ -164,7 +164,7 @@ mod staging_tests {
         // its own tree (it must not touch anything outside). So a read-only
         // parent makes remove_dir_all fail with EACCES, and that failure must
         // surface as an Err — not a silent success that leaves the tree behind.
-        let base = tempfile::tempdir().unwrap();
+        let base = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = base.path().join("dry-x");
         std::fs::create_dir_all(root.join("nested")).unwrap();
         std::fs::write(root.join("nested/f"), b"x").unwrap();
@@ -220,7 +220,7 @@ mod staging_tests {
         // owner-write restore, and that failure must surface as an Err naming
         // the path — never a silent swallow that lets a mixed tree be stored.
         // Mirrors `dry_run_cleanup_failure_is_reported`.
-        let base = tempfile::tempdir().unwrap();
+        let base = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = base.path().join("recover-x");
         std::fs::create_dir_all(root.join("nested")).unwrap();
         std::fs::write(root.join("nested/f"), b"x").unwrap();

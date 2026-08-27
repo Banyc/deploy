@@ -184,7 +184,7 @@ pub(crate) struct TwoSlotHarness {
 
 impl TwoSlotHarness {
     pub(crate) fn new() -> TwoSlotHarness {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -231,7 +231,7 @@ pub(crate) fn two_slot_push(
     let factory = move |s: &crate::config::ServerDef,
                         _slot: &crate::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
+        Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
     };
     push_inner(
         &project_root,
@@ -271,7 +271,7 @@ impl RecoveryHarness {
     /// A harness whose variant file carries the given TOML (so a test can
     /// install a verification argv that renders template variables).
     pub(crate) fn with_variant(variant_toml: &str) -> RecoveryHarness {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -456,7 +456,7 @@ pub(crate) struct RecordingRemote {
 impl RecordingRemote {
     pub(crate) fn new(base: PathBuf, executed: Arc<Mutex<Vec<Vec<String>>>>) -> Result<Self> {
         Ok(RecordingRemote {
-            inner: LocalTransport::new(base)?,
+            inner: LocalTransport::new(&crate::testutil::fixture_env(), base)?,
             executed,
         })
     }
@@ -527,7 +527,7 @@ pub(crate) fn push_clean(h: &RecoveryHarness) -> Result<PushReport> {
     let clean_factory = move |s: &crate::config::ServerDef,
                               _slot: &crate::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
+        Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
     };
     push(
         &h.cfg_path,
@@ -644,7 +644,7 @@ pub(crate) fn push_main_with_id(
     let factory = move |s: &crate::config::ServerDef,
                         _slot: &crate::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
+        Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
     };
     push_inner(
         &project_root,
@@ -735,38 +735,6 @@ attempts = 1
 interval_seconds = 0
 "#;
 
-/// Restore the process env on drop, so a test that panics mid-way cannot
-/// leak a mutated PATH/XDG_CONFIG_HOME into a later test.
-pub(crate) struct EnvGuard {
-    pub(crate) old_path: Option<std::ffi::OsString>,
-    pub(crate) old_xdg: Option<std::ffi::OsString>,
-    pub(crate) fail_marker: Option<std::ffi::OsString>,
-    pub(crate) once: Option<std::ffi::OsString>,
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        unsafe {
-            match &self.old_path {
-                Some(p) => std::env::set_var("PATH", p),
-                None => std::env::remove_var("PATH"),
-            }
-            match &self.old_xdg {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-            match &self.fail_marker {
-                Some(v) => std::env::set_var("FAKE_SYSTEMCTL_FAIL", v),
-                None => std::env::remove_var("FAKE_SYSTEMCTL_FAIL"),
-            }
-            match &self.once {
-                Some(v) => std::env::set_var("FAKE_SYSTEMCTL_ONCE", v),
-                None => std::env::remove_var("FAKE_SYSTEMCTL_ONCE"),
-            }
-        }
-    }
-}
-
 /// Install a fake `systemctl` shim on PATH and point `XDG_CONFIG_HOME` at
 /// a hermetic temp dir (the installed unit lands there). The shim fails
 /// `restart` (exit 1) while the marker file exists; with `once` it
@@ -779,11 +747,16 @@ impl Drop for EnvGuard {
 /// `push_inner` through the `SysdHarness` — push-internal plumbing. The
 /// systemd adapter's own tests use a simpler inline `exit 0` shim; the
 /// FAIL/ONCE failure-injection semantics have no consumer there.
+/// Install a fake `systemctl` (daemon-reload/enable/restart all succeed,
+/// with an optional one-shot forced restart failure via `FAKE_SYSTEMCTL_FAIL`)
+/// and return the HERMETIC environment the fake rides in: the child processes
+/// (transport shell commands) receive this snapshot, so the parent process
+/// environment is never mutated.
 pub(crate) fn install_fake_systemctl(
     base: &std::path::Path,
     marker: &std::path::Path,
     once: bool,
-) -> EnvGuard {
+) -> crate::env::SysEnv {
     let bindir = base.join("bin");
     std::fs::create_dir_all(&bindir).unwrap();
     let fake = bindir.join("systemctl");
@@ -793,32 +766,25 @@ pub(crate) fn install_fake_systemctl(
         )
         .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let old_path = std::env::var_os("PATH");
-    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
-    let old_fail = std::env::var_os("FAKE_SYSTEMCTL_FAIL");
-    let old_once = std::env::var_os("FAKE_SYSTEMCTL_ONCE");
-    unsafe {
-        std::env::set_var(
-            "PATH",
-            format!(
-                "{}:{}",
-                bindir.display(),
-                old_path
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            ),
-        );
-        std::env::set_var("XDG_CONFIG_HOME", base.join("xdg"));
-        std::env::set_var("FAKE_SYSTEMCTL_FAIL", marker);
-        std::env::set_var("FAKE_SYSTEMCTL_ONCE", if once { "1" } else { "0" });
-    }
-    EnvGuard {
-        old_path,
-        old_xdg,
-        fail_marker: old_fail,
-        once: old_once,
-    }
+    let base_env = crate::testutil::fixture_env();
+    let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+        base_env.child_env().into_iter().collect();
+    vars.insert(
+        "PATH".into(),
+        format!(
+            "{}:{}",
+            bindir.display(),
+            base_env
+                .path()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        )
+        .into(),
+    );
+    vars.insert("XDG_CONFIG_HOME".into(), base.join("xdg").as_os_str().to_owned());
+    vars.insert("FAKE_SYSTEMCTL_FAIL".into(), marker.as_os_str().to_owned());
+    vars.insert("FAKE_SYSTEMCTL_ONCE".into(), if once { "1" } else { "0" }.into());
+    crate::env::SysEnv::from_map(vars)
 }
 
 /// A single-slot (`s1`/`t1`) project whose variant uses SYSTEMD
@@ -829,11 +795,19 @@ pub(crate) struct SysdHarness {
     pub(crate) config: ProjectConfig,
     pub(crate) store: LocalStore,
     pub(crate) remotes_base: PathBuf,
+    env: crate::env::SysEnv,
 }
 
 impl SysdHarness {
     pub(crate) fn new() -> SysdHarness {
-        let dir = tempfile::tempdir().unwrap();
+        SysdHarness::with_env(crate::testutil::fixture_env())
+    }
+
+    /// Build the harness with an explicit environment snapshot; the push
+    /// factory's transports and their child processes receive THIS env (e.g.
+    /// a hermetic env with a fake `systemctl` on PATH), never the parent's.
+    pub(crate) fn with_env(env: crate::env::SysEnv) -> SysdHarness {
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let release_dir = project.join("releases").join("v1");
@@ -863,6 +837,7 @@ impl SysdHarness {
             config,
             store,
             remotes_base,
+            env,
         }
     }
 
@@ -871,10 +846,11 @@ impl SysdHarness {
         let target = self.config.target("t1").expect("harness target");
         let op_id = OperationId::new(format!("op-{}", deployment_id.as_str()));
         let rf = self.remotes_base.clone();
+        let env = self.env.clone();
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(rf.join(s.id.as_str()))?))
+            Ok(Box::new(LocalTransport::new(&env, rf.join(s.id.as_str()))?))
         };
         push_inner(
             &project_root,
@@ -908,7 +884,7 @@ pub(crate) struct FakeCapacityRemote {
 impl FakeCapacityRemote {
     pub(crate) fn build(base: PathBuf, avail: u64) -> Result<Box<dyn Remote>> {
         Ok(Box::new(FakeCapacityRemote {
-            inner: LocalTransport::new(base)?,
+            inner: LocalTransport::new(&crate::testutil::fixture_env(), base)?,
             avail,
         }))
     }
@@ -1010,7 +986,7 @@ pub(crate) fn membership_drift_fixture(
     LocalStore,
     ReleaseId,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     let release_dir = project.join("releases").join("v1");
@@ -1332,7 +1308,7 @@ pub(crate) fn group_membership_fixture(
     ReleaseId,
     String,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     let release_dir = project.join("releases").join("v1");

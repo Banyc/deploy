@@ -786,7 +786,7 @@ interval_seconds = 0
     /// under-report this fix removes.
     #[test]
     fn preview_lists_artifacts_that_become_unreachable_only_after_the_suffix_replacement() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let cfg = config_for(&dir);
         // Three successful deployments, each with a UNIQUE release + tree
@@ -876,7 +876,7 @@ interval_seconds = 0
     /// deployment and sweeps the unreachable content.
     #[test]
     fn checkpoint_compacts_ledger_to_the_suffix_and_sweeps() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let cfg = config_for(&dir);
         // History: deploy-0 (successful, rel-a/tree-a), deploy-1 (FAILED),
@@ -921,7 +921,7 @@ interval_seconds = 0
     /// cleanly with the full history intact.
     #[test]
     fn checkpoint_fails_cleanly_when_replacement_faults() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let cfg = config_for(&dir);
         let ids = seed_history(&store, TARGET, "deploy", &[true, true, true]);
@@ -941,7 +941,7 @@ interval_seconds = 0
     /// only the unreachable content is swept.
     #[test]
     fn checkpoint_keeps_other_target_and_pinned_content() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         // A pin keeps a release that is NOT in any ledger (retained by the
         // PIN only). The release id is content-derived, so the pin must
@@ -1072,7 +1072,7 @@ interval_seconds = 0
     ///   the retained suffix, the unreachable content is gone, the sweep
     ///   debt is cleared.
     fn run_fault_case(at: usize, fault: CheckpointFault) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         config_for(&dir);
         // A pin keeps a release that is NOT in any ledger (retained by the
@@ -1446,7 +1446,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         t1_rest: &[(usize, usize)],
         t2_hist: &[(usize, usize)],
     ) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let cfg = config_for_property(&dir);
 

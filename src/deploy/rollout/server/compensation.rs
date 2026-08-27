@@ -130,34 +130,35 @@ mod compensation_tests {
     /// `TemplateVars::with_assignment` path through the real systemd adapter.
     #[test]
     fn compensation_renders_prior_artifact_release_id() {
-        let _lock = crate::testutil::ENV_LOCK.lock().unwrap();
-
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let bindir = tmp.path().join("bin");
         std::fs::create_dir_all(&bindir).unwrap();
         let fake = bindir.join("systemctl");
         std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let config_home = tmp.path().join("xdg");
-        let old_path = std::env::var_os("PATH");
-        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        unsafe {
-            std::env::set_var(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    bindir.display(),
-                    old_path
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                ),
-            );
-            std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        }
+        // Hermetic env: fake systemctl on PATH, temp config home — children
+        // receive this snapshot; the parent process env is never touched.
+        let base = crate::testutil::fixture_env();
+        let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+            base.child_env().into_iter().collect();
+        vars.insert(
+            "PATH".into(),
+            format!(
+                "{}:{}",
+                bindir.display(),
+                base.path()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            )
+            .into(),
+        );
+        vars.insert("XDG_CONFIG_HOME".into(), config_home.as_os_str().to_owned());
+        let env = crate::env::SysEnv::from_map(vars);
 
         let outcome = (|| {
             let h = Harness::new(
+                &env,
                 SYSTEMD_TOML,
                 SYSTEMD_VARIANT,
                 &[
@@ -293,14 +294,7 @@ mod compensation_tests {
             );
             Ok::<(), String>(())
         })();
-        match old_path {
-            Some(p) => unsafe { std::env::set_var("PATH", p) },
-            None => unsafe { std::env::remove_var("PATH") },
-        }
-        match old_xdg {
-            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
-        }
+
         outcome.unwrap();
     }
 
@@ -312,6 +306,7 @@ mod compensation_tests {
     #[test]
     fn compensation_refuses_when_current_moved() {
         let h = Harness::new(
+            &crate::testutil::fixture_env(),
             NONE_TOML,
             NONE_VARIANT,
             &[

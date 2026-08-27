@@ -58,8 +58,8 @@ mod tests_markers {
     use std::path::PathBuf;
 
     fn setup() -> (tempfile::TempDir, LocalTransport, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let remote = LocalTransport::new(dir.path().join("remote")).unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
         let root = remote.root().to_path_buf();
         (dir, remote, root)
     }
@@ -102,7 +102,7 @@ mod tests_markers {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Mutex};
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().join("remote");
         let commits_dir = root.join(layout::commits_dir());
         let done = Arc::new(AtomicBool::new(false));
@@ -123,7 +123,7 @@ mod tests_markers {
             let writer_error_writer = writer_error.clone();
             s.spawn(move || {
                 let _done = DoneGuard(done_w);
-                let Ok(remote) = LocalTransport::new(base) else {
+                let Ok(remote) = LocalTransport::new(&crate::testutil::fixture_env(), base) else {
                     *writer_error_writer.lock().unwrap() =
                         Some("transport setup failed".to_string());
                     return;

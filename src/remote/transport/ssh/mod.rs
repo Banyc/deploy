@@ -17,6 +17,7 @@
 mod hostkey;
 mod runner;
 
+use crate::env::SysEnv;
 use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -44,6 +45,14 @@ pub struct SshTransport {
     /// fingerprint was configured). Set only by [`SshTransport::prepare_identity`],
     /// never at construction, so building the transport has no side effects.
     pinned_known_hosts: std::sync::Mutex<Option<PathBuf>>,
+    /// The RESOLVED pin-cache directory for the managed known-hosts file
+    /// (the snapshot's `DEPLOY_SSH_KNOWNHOSTS_DIR`, else
+    /// `<temp_dir>/deploy-ssh-knownhosts`) — resolved ONCE at the
+    /// construction boundary, never read from the process env.
+    known_hosts_cache_dir: PathBuf,
+    /// The environment snapshot (owned): the pin path's `ssh-keygen`
+    /// fingerprint-verification child receives its variables.
+    env: SysEnv,
     /// THE bounded subprocess runner every ssh operation goes through
     /// ([`SshRunner`]): hard deadline, kill, and deterministic reap, so no
     /// operation can run unbounded after connection establishment.
@@ -64,6 +73,11 @@ impl SshTransport {
     /// the transport refuses to connect (no trust-on-first-use); if both are
     /// provided the choice is ambiguous (the ssh arguments would silently
     /// prefer `known_hosts`), so the construction is rejected.
+    ///
+    /// `known_hosts_cache_dir` is the RESOLVED pin-cache directory for the
+    /// managed known-hosts file (from the environment snapshot at the
+    /// boundary), and `env` is that snapshot: every child this transport
+    /// spawns (ssh, ssh-keyscan, ssh-keygen) receives its variables.
     pub fn new(
         user: &str,
         address: &str,
@@ -71,6 +85,8 @@ impl SshTransport {
         deploy_dir: &Path,
         known_hosts: Option<&Path>,
         host_key_fingerprint: Option<&str>,
+        known_hosts_cache_dir: &Path,
+        env: &SysEnv,
     ) -> Result<Self> {
         if user.is_empty() || address.is_empty() {
             return Err(Error::transport(
@@ -111,7 +127,9 @@ impl SshTransport {
             known_hosts: known_hosts.map(|p| p.to_path_buf()),
             host_key_fingerprint: host_key_fingerprint.map(|s| s.to_string()),
             pinned_known_hosts: std::sync::Mutex::new(None),
-            runner: SshRunner::new(),
+            known_hosts_cache_dir: known_hosts_cache_dir.to_path_buf(),
+            env: env.clone(),
+            runner: SshRunner::new(env),
         };
         // NOTE: construction is side-effect-free. When a fingerprint was
         // supplied without an explicit known-hosts file, the host key is
@@ -132,6 +150,8 @@ impl SshTransport {
         deploy_dir: &Path,
         known_hosts: Option<&Path>,
         host_key_fingerprint: Option<&str>,
+        known_hosts_cache_dir: &Path,
+        env: &SysEnv,
         runner: SshRunner,
     ) -> Result<Self> {
         let mut t = Self::new(
@@ -141,6 +161,8 @@ impl SshTransport {
             deploy_dir,
             known_hosts,
             host_key_fingerprint,
+            known_hosts_cache_dir,
+            env,
         )?;
         t.runner = runner;
         Ok(t)
@@ -202,6 +224,8 @@ impl SshTransport {
             &self.target,
             &self.address,
             self.port,
+            &self.known_hosts_cache_dir,
+            &self.env,
             &self.runner,
         )?;
         if let Ok(mut g) = self.pinned_known_hosts.lock() {
@@ -713,6 +737,13 @@ mod tests_ssh {
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
+    /// The unit tests construct transports with a dummy cache dir + a process
+    /// snapshot: they never pin (a known_hosts file is always configured), so
+    /// neither the cache path nor the snapshot's contents matter.
+    fn test_env() -> SysEnv {
+        SysEnv::from_process()
+    }
+
     fn transport() -> SshTransport {
         // Use a (dummy) known_hosts file so `new` does not attempt a live
         // ssh-keyscan pin; the unit tests below only exercise command
@@ -724,6 +755,8 @@ mod tests_ssh {
             Path::new("/srv/app"),
             Some(Path::new("/dev/null")),
             None,
+            Path::new("/tmp/deploy-ssh-knownhosts-unit"),
+            &test_env(),
         )
         .unwrap()
     }
@@ -743,6 +776,8 @@ mod tests_ssh {
             Path::new("/"),
             Some(Path::new("/dev/null")),
             None,
+            Path::new("/tmp/deploy-ssh-knownhosts-unit"),
+            &test_env(),
         )
         .err()
         .expect("the filesystem root must be refused as a deploy_dir");
@@ -762,6 +797,8 @@ mod tests_ssh {
             Path::new("/srv/app"),
             Some(Path::new("/etc/ssh/known_hosts")),
             Some("SHA256:abc"),
+            Path::new("/tmp/deploy-ssh-knownhosts-unit"),
+            &test_env(),
         )
         .err()
         .expect("both identity sources must be rejected");
@@ -782,6 +819,8 @@ mod tests_ssh {
             Path::new("/srv/app"),
             None,
             None,
+            Path::new("/tmp/deploy-ssh-knownhosts-unit"),
+            &test_env(),
         )
         .err()
         .expect("missing identity must be rejected");
@@ -970,7 +1009,7 @@ mod tests_ssh {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().to_path_buf();
         let rel = Path::new("state/op.json");
         let dest = root.join(rel);
@@ -1047,7 +1086,7 @@ mod tests_ssh {
     // remove only its own temp.
     #[test]
     fn try_write_new_recovers_from_stale_hardlinked_temp() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let root = dir.path().to_path_buf();
         let rel = Path::new("state/op.json");
         let dest = root.join(rel);
@@ -1131,16 +1170,17 @@ mod tests_ssh {
 mod fingerprint_ssh_tests {
     use super::*;
     use crate::remote::helper::RemoteHelper;
-    use crate::testutil::ENV_LOCK;
+    use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
-    // THE single shared env lock (see `crate::testutil`): every test that
-    // mutates the process-global environment — this fake-ssh suite (PATH,
-    // DEPLOY_SSH_KNOWNHOSTS_DIR, FAKE_SSH_ROOT/FAKE_SSH_REMOTE_PREFIX) and the
-    // systemd fake-`systemctl` suite (PATH, XDG_CONFIG_HOME) — holds this one
-    // lock, so a fake `ssh-keyscan` can never race a fake `systemctl`
-    // rewriting the same global PATH. Per-test `DEPLOY_SSH_KNOWNHOSTS_DIR`
-    // temp dirs keep the pin cache isolated as before.
+    // HERMETIC SNAPSHOT: every fake-ssh test builds ONE `SysEnv::from_map`
+    // carrying the fake bin dir first in `PATH` plus the fake-ssh variables
+    // (`FAKE_SSH_ROOT` / `FAKE_SSH_REMOTE_PREFIX`) and the per-test pin
+    // cache (`DEPLOY_SSH_KNOWNHOSTS_DIR`). The transport spawns its children
+    // (ssh / ssh-keyscan / ssh-keygen / stat) with that snapshot's variables
+    // (`cmd.envs(env.child_env())`), so the fake binaries resolve and their
+    // inputs ride the same child env — the process-global environment is
+    // NEVER touched (no lock, no set_var, no cross-test interference).
 
     struct FakeSsh {
         bin: PathBuf,
@@ -1293,8 +1333,10 @@ esac
         }
 
         /// A fingerprint-only `SshTransport` (no `known_hosts`) rooted at
-        /// `self.deploy_dir`.
-        fn transport(&self) -> SshTransport {
+        /// `self.deploy_dir`, pinning into the per-test `cache` dir with the
+        /// hermetic snapshot `env` (the fake ssh binaries resolve from its
+        /// `PATH`).
+        fn transport(&self, cache: &Path, env: &SysEnv) -> SshTransport {
             SshTransport::new(
                 "deploy",
                 &self.address,
@@ -1302,58 +1344,37 @@ esac
                 &self.deploy_dir,
                 None,
                 Some(self.fingerprint.as_str()),
+                cache,
+                env,
             )
             .unwrap()
         }
     }
 
-    /// Run `f` with `bin` prepended to `PATH` and `DEPLOY_SSH_KNOWNHOSTS_DIR`
-    /// pointing at `cache` (both restored afterwards). Pointing the pin cache
-    /// at a per-test dir isolates it from every other fake-ssh test in any
-    /// binary — no two tests ever share cache state, so concurrent runs of
-    /// the lib and integration suites cannot interfere.
-    fn with_fake_path<T>(bin: &Path, cache: &Path, f: impl FnOnce() -> T) -> T {
-        let old_path = std::env::var_os("PATH").unwrap_or_default();
-        let old_cache = std::env::var_os("DEPLOY_SSH_KNOWNHOSTS_DIR");
-        let mut paths: Vec<_> = std::env::split_paths(&old_path).collect();
+    /// Build the hermetic fake-ssh snapshot: `bin` prepended to the ambient
+    /// `PATH`, the per-test pin `cache`, and the fake-ssh variables. The
+    /// transport's children receive exactly these variables — the process
+    /// env is never mutated, so no two tests (in any binary) can interfere.
+    fn fake_env(bin: &Path, cache: &Path, root: &Path, prefix: &str) -> SysEnv {
+        let base = crate::testutil::fixture_env();
+        let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+            base.child_env().into_iter().collect();
+        let mut paths: Vec<_> = base
+            .path()
+            .map(|p| std::env::split_paths(&p).collect())
+            .unwrap_or_default();
         paths.insert(0, bin.to_path_buf());
         let joined = std::env::join_paths(paths).unwrap();
-        // SAFETY: edition 2024 marks `set_var` unsafe. The caller holds the
-        // single shared `ENV_LOCK` (crate::testutil), so no other
-        // env-mutating test can overlap and swap PATH out from under a
-        // spawned fake binary.
-        unsafe {
-            std::env::set_var("PATH", &joined);
-            std::env::set_var("DEPLOY_SSH_KNOWNHOSTS_DIR", cache);
-        }
-        let result = f();
-        match old_cache {
-            Some(v) => unsafe {
-                std::env::set_var("DEPLOY_SSH_KNOWNHOSTS_DIR", v);
-            },
-            None => unsafe {
-                std::env::remove_var("DEPLOY_SSH_KNOWNHOSTS_DIR");
-            },
-        }
-        unsafe {
-            std::env::set_var("PATH", &old_path);
-        }
-        result
-    }
-
-    /// Set the fake-ssh environment (`FAKE_SSH_ROOT` / `FAKE_SSH_REMOTE_PREFIX`)
-    /// for the duration of `f`.
-    fn with_fake_root<T>(root: &Path, prefix: &str, f: impl FnOnce() -> T) -> T {
-        unsafe {
-            std::env::set_var("FAKE_SSH_ROOT", root);
-            std::env::set_var("FAKE_SSH_REMOTE_PREFIX", prefix);
-        }
-        let result = f();
-        unsafe {
-            std::env::remove_var("FAKE_SSH_ROOT");
-            std::env::remove_var("FAKE_SSH_REMOTE_PREFIX");
-        }
-        result
+        vars.insert(OsString::from("PATH"), joined);
+        vars.extend(std::collections::BTreeMap::from([
+            (
+                OsString::from("DEPLOY_SSH_KNOWNHOSTS_DIR"),
+                cache.as_os_str().to_owned(),
+            ),
+            (OsString::from("FAKE_SSH_ROOT"), root.as_os_str().to_owned()),
+            (OsString::from("FAKE_SSH_REMOTE_PREFIX"), OsString::from(prefix)),
+        ]));
+        SysEnv::from_map(vars)
     }
 
     // Scenario (a): a fingerprint-only configuration can make a STATUS request
@@ -1361,41 +1382,38 @@ esac
     // build its ssh arguments — the exact regression this feature fixes.
     #[test]
     fn status_succeeds_with_fingerprint_only_config() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let fake = FakeSsh::new(
             tmp.path().join("bin"),
             tmp.path().join("remote"),
             "status-unit.test",
             Path::new("/srv/deploy/status-unit"),
         );
-        with_fake_path(&fake.bin, &tmp.path().join("knownhosts"), || {
-            with_fake_root(&fake.remote_root, "/srv/deploy/status-unit", || {
-                let t = fake.transport();
-                // Regression: without prepare_identity the transport refuses to
-                // build ssh arguments (no pinned key yet).
-                let err = t.ssh_args().unwrap_err();
-                assert!(
-                    err.to_string().contains("host identity is not configured"),
-                    "got: {err}"
-                );
-                t.prepare_identity().unwrap();
-                let args = t.ssh_args().unwrap();
-                assert!(
-                    args.iter().any(|a| a.starts_with("UserKnownHostsFile=")),
-                    "pinned known-hosts file must be used after prepare_identity"
-                );
-                // A status request now succeeds (the fake remote is empty).
-                let helper = RemoteHelper::new(&t);
-                let status = helper.status().unwrap();
-                assert!(status.current_generation.is_none());
-                assert!(status.inventory.is_empty());
-                assert!(status.lock.is_none());
-                // The pinned cache file was created on the LOCAL host.
-                let pinned = t.pinned_known_hosts.lock().unwrap().clone().unwrap();
-                assert!(pinned.exists(), "pinned file must exist");
-            });
-        });
+        let cache = tmp.path().join("knownhosts");
+        let env = fake_env(&fake.bin, &cache, &fake.remote_root, "/srv/deploy/status-unit");
+        let t = fake.transport(&cache, &env);
+        // Regression: without prepare_identity the transport refuses to
+        // build ssh arguments (no pinned key yet).
+        let err = t.ssh_args().unwrap_err();
+        assert!(
+            err.to_string().contains("host identity is not configured"),
+            "got: {err}"
+        );
+        t.prepare_identity().unwrap();
+        let args = t.ssh_args().unwrap();
+        assert!(
+            args.iter().any(|a| a.starts_with("UserKnownHostsFile=")),
+            "pinned known-hosts file must be used after prepare_identity"
+        );
+        // A status request now succeeds (the fake remote is empty).
+        let helper = RemoteHelper::new(&t);
+        let status = helper.status().unwrap();
+        assert!(status.current_generation.is_none());
+        assert!(status.inventory.is_empty());
+        assert!(status.lock.is_none());
+        // The pinned cache file was created on the LOCAL host.
+        let pinned = t.pinned_known_hosts.lock().unwrap().clone().unwrap();
+        assert!(pinned.exists(), "pinned file must exist");
     }
 
     /// Pinning is idempotent: a second `prepare_identity` validates the cached
@@ -1403,39 +1421,36 @@ esac
     /// re-running `ssh-keyscan`; a tampered cache is dropped and re-fetched.
     #[test]
     fn fingerprint_pin_is_validated_and_reused() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
         let fake = FakeSsh::new(
             tmp.path().join("bin"),
             tmp.path().join("remote-root"),
             "pin-unit.test",
             Path::new("/srv/deploy/pin-unit"),
         );
-        with_fake_path(&fake.bin, &tmp.path().join("knownhosts"), || {
-            with_fake_root(&fake.remote_root, "/srv/deploy/pin-unit", || {
-                let t = fake.transport();
-                t.prepare_identity().unwrap();
-                t.prepare_identity().unwrap();
-                let calls = std::fs::read_to_string(&fake.keyscan_log)
-                    .unwrap_or_default()
-                    .lines()
-                    .count();
-                assert_eq!(calls, 1, "cached pin must be reused without re-keyscan");
-                // A tampered cache is not trusted: dropped and re-pinned.
-                let pinned = t.pinned_known_hosts.lock().unwrap().clone().unwrap();
-                std::fs::write(&pinned, "evil.example.com ssh-ed25519 AAAA\n").unwrap();
-                t.prepare_identity().unwrap();
-                let calls = std::fs::read_to_string(&fake.keyscan_log)
-                    .unwrap_or_default()
-                    .lines()
-                    .count();
-                assert_eq!(calls, 2, "tampered pin must be re-fetched");
-                let text = std::fs::read_to_string(&pinned).unwrap();
-                assert!(
-                    text.contains("ssh-ed25519"),
-                    "repinned file must hold a valid key line"
-                );
-            });
-        });
+        let cache = tmp.path().join("knownhosts");
+        let env = fake_env(&fake.bin, &cache, &fake.remote_root, "/srv/deploy/pin-unit");
+        let t = fake.transport(&cache, &env);
+        t.prepare_identity().unwrap();
+        t.prepare_identity().unwrap();
+        let calls = std::fs::read_to_string(&fake.keyscan_log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(calls, 1, "cached pin must be reused without re-keyscan");
+        // A tampered cache is not trusted: dropped and re-pinned.
+        let pinned = t.pinned_known_hosts.lock().unwrap().clone().unwrap();
+        std::fs::write(&pinned, "evil.example.com ssh-ed25519 AAAA\n").unwrap();
+        t.prepare_identity().unwrap();
+        let calls = std::fs::read_to_string(&fake.keyscan_log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(calls, 2, "tampered pin must be re-fetched");
+        let text = std::fs::read_to_string(&pinned).unwrap();
+        assert!(
+            text.contains("ssh-ed25519"),
+            "repinned file must hold a valid key line"
+        );
     }
 }

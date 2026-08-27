@@ -552,7 +552,7 @@ pub(crate) mod commit_tests {
         );
         // The live deployment is undisturbed: the servers stay at the gen the
         // PendingCommit attempt actually advanced them to.
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
         assert_eq!(
             RemoteHelper::new(&remote)
                 .status()
@@ -629,7 +629,7 @@ pub(crate) mod commit_tests {
         assert!(h.store.read_snapshots("t1").unwrap().is_empty());
         assert!(h.store.read_last_successful("t1").is_none());
         // Servers DID advance (the mutation loop ran before write_results).
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
         assert!(
             remote.exists(crate::remote::layout::current()),
             "remote advanced"
@@ -726,7 +726,7 @@ pub(crate) mod commit_tests {
         let r1 = push_main_with_id(&h, &id_b).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let baseline = r1.attempt.as_ref().expect("attempt recorded");
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
         assert!(
             remote.exists(crate::remote::layout::current()),
             "remote advanced"
@@ -800,7 +800,7 @@ pub(crate) mod commit_tests {
         let r1 = push_main_with_id(&h, &id_b).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let baseline = r1.attempt.as_ref().expect("attempt recorded");
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
+        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
         assert!(
             remote.exists(crate::remote::layout::current()),
             "remote advanced"
@@ -1149,7 +1149,7 @@ pub(crate) mod commit_tests {
             ("s1", &slot_a, &digest_a, &r1_release),
             ("s2", &slot_b, &digest_a, &r1_release),
         ] {
-            let remote = LocalTransport::new(h.remotes_base.join(server)).unwrap();
+            let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join(server)).unwrap();
             let helper = RemoteHelper::new(&remote);
             let status = helper.status().unwrap();
             let cur = status

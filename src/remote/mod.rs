@@ -27,6 +27,7 @@ pub mod layout;
 pub mod transport;
 
 use crate::config::{ServerConnection, ServerDef};
+use crate::env::SysEnv;
 use crate::error::{Error, Result};
 use crate::remote::transport::{LocalTransport, Remote};
 
@@ -39,7 +40,17 @@ use crate::remote::transport::{LocalTransport, Remote};
 /// [`ServerConnection::Local`] (an explicit `local://` endpoint), which
 /// routes the transport to that exact filesystem location rather than the
 /// application store's `remotes/` directory.
-pub fn create_remote(server: &ServerDef, deploy_dir: &std::path::Path) -> Result<Box<dyn Remote>> {
+///
+/// `env` is the environment snapshot taken at the process boundary: the
+/// transport's children receive its variables ([`SysEnv::child_env`]) and
+/// the managed known-hosts pin cache is RESOLVED here (the snapshot's
+/// `DEPLOY_SSH_KNOWNHOSTS_DIR`, else `<temp_dir>/deploy-ssh-knownhosts`) —
+/// never read from the live process env.
+pub fn create_remote(
+    env: &SysEnv,
+    server: &ServerDef,
+    deploy_dir: &std::path::Path,
+) -> Result<Box<dyn Remote>> {
     match server.connection() {
         ServerConnection::Local { address, .. } => {
             let Some(local_path) = address.strip_prefix("local://") else {
@@ -53,7 +64,7 @@ pub fn create_remote(server: &ServerDef, deploy_dir: &std::path::Path) -> Result
                     "local:// endpoint must be an absolute path: '{local_path}'"
                 )));
             }
-            Ok(Box::new(LocalTransport::new(p)?))
+            Ok(Box::new(LocalTransport::new(env, p)?))
         }
         ServerConnection::Ssh {
             address,
@@ -71,6 +82,15 @@ pub fn create_remote(server: &ServerDef, deploy_dir: &std::path::Path) -> Result
                     )));
                 }
             };
+            // The managed known-hosts pin cache: resolved ONCE at this
+            // boundary from the snapshot (tests point it at a per-test cache
+            // via the snapshot's `DEPLOY_SSH_KNOWNHOSTS_DIR`; production uses
+            // `<temp_dir>/deploy-ssh-knownhosts`).
+            let known_hosts_cache_dir = env
+                .get("DEPLOY_SSH_KNOWNHOSTS_DIR")
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| env.temp_dir().join("deploy-ssh-knownhosts"));
             Ok(Box::new(transport::SshTransport::new(
                 user.as_str(),
                 address.as_str(),
@@ -78,6 +98,8 @@ pub fn create_remote(server: &ServerDef, deploy_dir: &std::path::Path) -> Result
                 deploy_dir,
                 known_hosts,
                 host_key_fingerprint,
+                &known_hosts_cache_dir,
+                env,
             )?))
         }
     }
