@@ -7,11 +7,11 @@
 //! to see it.
 
 use crate::config::ProjectConfig;
+use crate::deploy::{PushOptions, PushReport, push};
 use crate::error::{Error, Result};
+use crate::identity::{DeploymentId, ReleaseId, valid_hex_digest};
 use crate::init::{InitOptions, init_project};
-use crate::model::{DeploymentId, ReleaseId, valid_hex_digest};
-use crate::push::engine::{PushOptions, PushReport, push};
-use crate::records::{DeploymentStatus, LedgerEntry, Observation, ObservedTarget};
+use crate::ledger::{DeploymentStatus, LedgerEntry, Observation, ObservedTarget};
 use crate::remote::create_remote;
 use crate::remote::transport::Remote;
 use crate::store::local::LocalStore;
@@ -403,7 +403,7 @@ where
                         .iter()
                         .map(|(s, _)| s.id.as_str())
                         .collect();
-                    crate::records::ObservedTarget {
+                    crate::ledger::ObservedTarget {
                         target: observed.target,
                         slots: observed
                             .slots
@@ -432,14 +432,14 @@ where
                      (or --dry-run to preview exactly what would be discarded)",
                 ));
             }
-            let report = crate::push::checkpoint::run_checkpoint(
+            let report = crate::retention::checkpoint::run_checkpoint(
                 &store,
                 &config,
                 &target,
                 &deployment_id,
                 dry_run,
             )?;
-            for line in crate::push::checkpoint::render_checkpoint_report(&report) {
+            for line in crate::retention::checkpoint::render_checkpoint_report(&report) {
                 println!("{line}");
             }
         }
@@ -604,11 +604,11 @@ fn print_report(report: &PushReport) {
             // artifact, and a non-`Known` actual explicitly rather than
             // printing a fabricated variant/tree.
             let artifact = match &s.artifact {
-                crate::records::Observation::Known(a) => {
+                crate::ledger::Observation::Known(a) => {
                     format!("variant={} tree={}", a.variant, a.tree)
                 }
-                crate::records::Observation::KnownAbsent => "artifact=known_absent".to_string(),
-                crate::records::Observation::Unknown(e) => {
+                crate::ledger::Observation::KnownAbsent => "artifact=known_absent".to_string(),
+                crate::ledger::Observation::Unknown(e) => {
                     format!("artifact=unknown ({})", e.message)
                 }
             };
@@ -619,12 +619,12 @@ fn print_report(report: &PushReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{
+    use crate::identity::{
         ArtifactRef, GenerationRef, PlacementSlotAssignment, ReleaseId, ServerId, SlotId,
         TargetName, VariantName, test_deployment_id, test_generation_id, test_release_id,
         test_tree_digest,
     };
-    use crate::records::{
+    use crate::ledger::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
         NonEmptySlotTable, ObservedSlot, SlotOutcomeKind, SlotResult, SlotTable,
         TerminalDisposition,
@@ -703,7 +703,7 @@ mod tests {
                     )]),
                     bindings: BTreeMap::from([(
                         p1.clone(),
-                        crate::records::PhysicalBinding {
+                        crate::ledger::PhysicalBinding {
                             server: ServerId::new("s1".to_string()),
                             deploy_dir: "/srv/deploy/p1".to_string(),
                         },
@@ -937,9 +937,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .write_slot_observed(
                 &SlotId::new("p1".to_string()),
                 &ObservedSlot {
-                    observation: Observation::Known(crate::records::ObservedState {
+                    observation: Observation::Known(crate::ledger::ObservedState {
                         generation: test_generation_id("gen-41da"),
-                        artifact: crate::model::ArtifactRef {
+                        artifact: crate::identity::ArtifactRef {
                             release: test_release_id("rel-sha256-status"),
                             variant: VariantName::new("standard".to_string()),
                             tree: test_tree_digest("tree-2c4f"),
@@ -961,7 +961,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .write_slot_observed(
                 &SlotId::new("p3".to_string()),
                 &ObservedSlot {
-                    observation: Observation::Unknown(crate::records::ObservationError {
+                    observation: Observation::Unknown(crate::ledger::ObservationError {
                         message: "assignment read failed: boom".to_string(),
                     }),
                 },
@@ -1369,7 +1369,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// a shell would before parsing.
     #[test]
     fn documented_deploy_push_examples_parse() {
-        use crate::revset::parse_ref_expr;
+        use crate::deploy::refs::parse_ref_expr;
 
         let manifest = env!("CARGO_MANIFEST_DIR");
         let readme = std::fs::read_to_string(format!("{manifest}/README.md"))
@@ -1467,7 +1467,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(ReleaseId::parse(&full).unwrap().as_str(), full);
         assert_eq!(ReleaseId::parse(&full).unwrap().to_string(), full);
         // from_digest round-trips the exact form.
-        let d = crate::model::ReleaseDigest::parse(HARDENING_DIGEST).unwrap();
+        let d = crate::identity::ReleaseDigest::parse(HARDENING_DIGEST).unwrap();
         assert_eq!(ReleaseId::from_digest(&d).as_str(), full);
         for bad in [
             "",
@@ -1521,14 +1521,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // record. The derive is gone, so Default::default() must not exist;
         // empty string is rejected at the domain boundary.
         for bad in ["", "a/b", "..", " x"] {
-            crate::model::SlotId::parse(bad).expect_err("empty/traversal must be rejected");
+            crate::identity::SlotId::parse(bad).expect_err("empty/traversal must be rejected");
         }
-        crate::model::ReleaseId::parse("").expect_err("empty ReleaseId must be rejected");
+        crate::identity::ReleaseId::parse("").expect_err("empty ReleaseId must be rejected");
         // ArtifactRef likewise has no Default — empty release would be
         // malformed. A wire artifact with an empty release fails.
         let bad_json =
             format!(r#"{{"release":"","variant":"standard","tree":"{HARDENING_DIGEST}"}}"#);
-        serde_json::from_str::<crate::model::ArtifactRef>(&bad_json)
+        serde_json::from_str::<crate::identity::ArtifactRef>(&bad_json)
             .expect_err("empty release in artifact must be rejected");
     }
 
@@ -1538,22 +1538,21 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // variant with its preserved error — never as a forged ArtifactRef —
         // and round-trips. The bare string "unknown" is NOT a valid
         // Observation (the tagged three-state enum is the only wire form).
-        let unknown = Observation::<crate::records::ObservedState>::Unknown(
-            crate::records::ObservationError {
+        let unknown =
+            Observation::<crate::ledger::ObservedState>::Unknown(crate::ledger::ObservationError {
                 message: "boom".to_string(),
-            },
-        );
+            });
         let json = serde_json::to_string(&unknown).unwrap();
         assert!(
             json.contains(r#""state":"unknown""#),
             "Unknown must serialize as the tagged unknown state, got: {json}"
         );
         assert_eq!(
-            serde_json::from_str::<Observation<crate::records::ObservedState>>(&json).unwrap(),
+            serde_json::from_str::<Observation<crate::ledger::ObservedState>>(&json).unwrap(),
             unknown
         );
         assert!(
-            serde_json::from_str::<Observation<crate::records::ObservedState>>("\"unknown\"")
+            serde_json::from_str::<Observation<crate::ledger::ObservedState>>("\"unknown\"")
                 .is_err(),
             "the bare \"unknown\" string is not an Observation"
         );
@@ -1566,14 +1565,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(back.observation, Observation::KnownAbsent);
         // An unreadable observed state is Unknown, never a forged artifact.
         let slot_unknown = ObservedSlot {
-            observation: Observation::Unknown(crate::records::ObservationError {
+            observation: Observation::Unknown(crate::ledger::ObservationError {
                 message: "assignment read failed: boom".to_string(),
             }),
         };
         let lines = render_status(&ObservedTarget {
-            target: crate::model::TargetName::parse("production").unwrap(),
+            target: crate::identity::TargetName::parse("production").unwrap(),
             slots: std::collections::BTreeMap::from([(
-                crate::model::SlotId::parse("p1").unwrap(),
+                crate::identity::SlotId::parse("p1").unwrap(),
                 slot_unknown,
             )]),
         });
@@ -1593,9 +1592,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         store
             .write_slot_observed(
-                &crate::model::SlotId::parse("p1").unwrap(),
+                &crate::identity::SlotId::parse("p1").unwrap(),
                 &ObservedSlot {
-                    observation: Observation::Unknown(crate::records::ObservationError {
+                    observation: Observation::Unknown(crate::ledger::ObservationError {
                         message: "assignment read failed: boom".to_string(),
                     }),
                 },
@@ -1688,7 +1687,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // artifact would be a valid ArtifactRef JSON.
             if s == "unknown" {
                 assert!(
-                    serde_json::from_str::<Observation<crate::records::ObservedState>>(
+                    serde_json::from_str::<Observation<crate::ledger::ObservedState>>(
                         "\"unknown\""
                     )
                     .is_err(),

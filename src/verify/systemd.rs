@@ -2,7 +2,7 @@
 //!
 //! The mapped unit file remains an ordinary artifact in the tree, but its
 //! CONTENT is rendered with the slot's template context (see
-//! [`crate::template`]) at activation time: unit files use per-slot values
+//! [`crate::remote::materialize`]) at activation time: unit files use per-slot values
 //! such as `ExecStart={{ deploy_dir }}/current/app/server`, and trees are
 //! content-addressed and shared across slots, so the slot context can only be
 //! substituted when the unit is installed, never at materialization. The
@@ -16,8 +16,8 @@
 
 use crate::config::{ActivationConfig, validate_relative_path};
 use crate::error::{Error, Result};
+use crate::remote::materialize::TemplateVars;
 use crate::remote::transport::Remote;
-use crate::template::TemplateVars;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -236,7 +236,7 @@ pub fn stage_rendered_units(
         })?;
         let text = std::str::from_utf8(&raw)
             .map_err(|e| Error::remote(format!("unit '{}' is not UTF-8: {e}", u.name)))?;
-        let rendered = crate::template::render_template(text, vars).map_err(|e| {
+        let rendered = crate::remote::materialize::render_template(text, vars).map_err(|e| {
             Error::remote(format!(
                 "render unit '{}' ({}) with slot context: {e}",
                 u.name, u.artifact_path
@@ -329,7 +329,7 @@ pub fn run_activation(
 pub(crate) mod tests {
     use super::*;
     use crate::config::{ActivationConfig, ActivationScope, UnitDef};
-    use crate::model::{TreeDigest, test_deployment_id, test_generation_id};
+    use crate::identity::{TreeDigest, test_deployment_id, test_generation_id};
     use crate::remote::transport::LocalTransport;
 
     // THE single shared env lock (see `crate::testutil`): the fake-`systemctl`
@@ -479,7 +479,7 @@ pub(crate) mod tests {
         let base = tmp.path().join("remote");
         let remote = LocalTransport::new(base.clone()).unwrap();
         // Tree content under the object store, like `tree::canonicalize_tree`.
-        let tree_rel = crate::layout::tree_root("abc123");
+        let tree_rel = crate::remote::layout::tree_root("abc123");
         let unit_rel = tree_rel.join("integration/systemd/example.service");
         std::fs::create_dir_all(base.join(unit_rel.parent().unwrap())).unwrap();
         std::fs::write(
@@ -489,11 +489,11 @@ pub(crate) mod tests {
         .unwrap();
         // `generations/<gid>/root` -> the tree content root (symlink), as the
         // helper creates it.
-        let gen_rel = crate::layout::generation("g1");
+        let gen_rel = crate::remote::layout::generation("g1");
         let gen_dir = base.join(&gen_rel);
         std::fs::create_dir_all(&gen_dir).unwrap();
         std::os::unix::fs::symlink(
-            crate::layout::generation_root_link("abc123"),
+            crate::remote::layout::generation_root_link("abc123"),
             gen_dir.join("root"),
         )
         .unwrap();
@@ -538,7 +538,7 @@ pub(crate) mod tests {
         let base = tmp.path().join("remote");
         let remote = LocalTransport::new(base.clone()).unwrap();
         // Unit artifact under the tree content root.
-        let tree_rel = crate::layout::tree_root("abc123");
+        let tree_rel = crate::remote::layout::tree_root("abc123");
         let unit_rel = tree_rel.join("integration/systemd/example.service");
         std::fs::create_dir_all(base.join(unit_rel.parent().unwrap())).unwrap();
         std::fs::write(
@@ -548,10 +548,10 @@ pub(crate) mod tests {
         .unwrap();
         // `generations/<gid>/root` -> the tree content root (symlink), exactly
         // as `RemoteHelper::create_generation` installs it.
-        let gen_dir = base.join(crate::layout::generation("g1"));
+        let gen_dir = base.join(crate::remote::layout::generation("g1"));
         std::fs::create_dir_all(&gen_dir).unwrap();
         std::os::unix::fs::symlink(
-            crate::layout::generation_root_link("abc123"),
+            crate::remote::layout::generation_root_link("abc123"),
             gen_dir.join("root"),
         )
         .unwrap();
@@ -560,7 +560,7 @@ pub(crate) mod tests {
         // `run_activation` call sites: `<root>/generations/<gid>/root`.
         let generation_root = remote
             .root()
-            .join(crate::layout::generation("g1"))
+            .join(crate::remote::layout::generation("g1"))
             .join("root");
         assert!(
             generation_root.ends_with(Path::new("generations/g1/root")),
@@ -614,7 +614,7 @@ pub(crate) mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().join("remote");
         let remote = LocalTransport::new(base.clone()).unwrap();
-        let gen_rel = crate::layout::generation("g1");
+        let gen_rel = crate::remote::layout::generation("g1");
         let unit_rel = gen_rel.join("root/integration/systemd/example.service");
         std::fs::create_dir_all(base.join(unit_rel.parent().unwrap())).unwrap();
         std::fs::write(base.join(&unit_rel), "ExecStart={{ bogus }}\n").unwrap();
@@ -648,7 +648,7 @@ pub(crate) mod tests {
         let remote = LocalTransport::new(base.clone()).unwrap();
         // Unit artifact with a slot-dependent ExecStart and the per-server
         // deployment account, under the tree.
-        let tree_rel = crate::layout::tree_root("abc123");
+        let tree_rel = crate::remote::layout::tree_root("abc123");
         let unit_rel = tree_rel.join("integration/systemd/example.service");
         std::fs::create_dir_all(base.join(unit_rel.parent().unwrap())).unwrap();
         std::fs::write(
@@ -656,10 +656,10 @@ pub(crate) mod tests {
             "[Unit]\nDescription=Example service (managed by deploy, run as {{ user }})\n\n[Service]\nExecStart={{ deploy_dir }}/current/app/server\n",
         )
         .unwrap();
-        let gen_dir = base.join(crate::layout::generation("g1"));
+        let gen_dir = base.join(crate::remote::layout::generation("g1"));
         std::fs::create_dir_all(&gen_dir).unwrap();
         std::os::unix::fs::symlink(
-            crate::layout::generation_root_link("abc123"),
+            crate::remote::layout::generation_root_link("abc123"),
             gen_dir.join("root"),
         )
         .unwrap();
@@ -694,7 +694,9 @@ pub(crate) mod tests {
         // root), never a nested `root/root`. A double-join would make staging
         // read through a nonexistent `root` directory inside the tree content
         // root and fail below.
-        let generation_root = base.join(crate::layout::generation("g1")).join("root");
+        let generation_root = base
+            .join(crate::remote::layout::generation("g1"))
+            .join("root");
         assert!(
             generation_root.ends_with(Path::new("generations/g1/root")),
             "activation root must be <root>/generations/<gid>/root, got {}",

@@ -15,8 +15,8 @@ use crate::deploy::plan::PlannedAssignment;
 use crate::deploy::push::slot_vars;
 use crate::deploy::server::compensate_server;
 use crate::error::Result;
-use crate::model::{DeploymentId, GenerationId, OperationId, SlotId};
-use crate::records::{
+use crate::identity::{DeploymentId, GenerationId, OperationId, SlotId};
+use crate::ledger::{
     DeploymentStatus, Observation, ObservedGeneration, SlotOutcomeKind, SlotPlan, SlotResult,
 };
 use crate::remote::helper::RemoteHelper;

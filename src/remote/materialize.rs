@@ -3,7 +3,7 @@
 //!
 //! * `from` is relative to the project root and must stay beneath it.
 //! * `from` is rendered through the template module
-//!   ([`crate::template`]) with the mapping context, which exposes
+//!   ([`crate::remote::materialize`]) with the mapping context, which exposes
 //!   `{{ variant }}` only — trees are content-addressed and shared across
 //!   slots, so slot-level variables (`deploy_dir`, `server`, `target`) are
 //!   never available here and fail loudly if referenced.
@@ -69,7 +69,7 @@
 //! `ReleaseId`: the immutable `ReleaseId` is derived from the materialized
 //! trees, so it cannot be known — and must not be rendered — into a tree
 //! without creating a circular digest. Activation/verification, where the
-//! deployed [`ArtifactRef`](crate::model::ArtifactRef) is known, always
+//! deployed [`ArtifactRef`](crate::identity::ArtifactRef) is known, always
 //! render the artifact's own `ReleaseId`.
 //!
 //! The three deployment-scoped variables (`deployment_id`, `generation`,
@@ -91,11 +91,11 @@
 //! runs a shell).
 //!
 //! Render sites:
-//! * [`crate::mapper::materialize_variant`] renders each mapping `from` path
+//! * [`crate::remote::materialize::materialize_variant`] renders each mapping `from` path
 //!   (the `to` path is not templated) with `TemplateVars::mapping`.
-//! * [`crate::adapter::systemd::run_activation`] renders each unit artifact's
+//! * [`crate::verify::systemd::run_activation`] renders each unit artifact's
 //!   content with the slot context before installing it.
-//! * [`crate::adapter::verify::run_verification`] renders every argv element
+//! * [`crate::verify::command::run_verification`] renders every argv element
 //!   with the slot context before exec.
 
 use crate::config::{Mapping, destinations_overlap, resolved_mode};
@@ -719,9 +719,9 @@ impl TemplateVars {
     /// a template referencing an unfilled deployment variable fails loudly.
     pub fn with_deployment(
         mut self,
-        deployment_id: Option<&crate::model::DeploymentId>,
-        generation: Option<&crate::model::GenerationId>,
-        tree: Option<&crate::model::TreeDigest>,
+        deployment_id: Option<&crate::identity::DeploymentId>,
+        generation: Option<&crate::identity::GenerationId>,
+        tree: Option<&crate::identity::TreeDigest>,
     ) -> TemplateVars {
         self.deployment_id = deployment_id.map(|d| d.as_str().to_string());
         self.generation = generation.map(|g| g.as_str().to_string());
@@ -730,7 +730,7 @@ impl TemplateVars {
     }
 
     /// Same context with the artifact-scoped variables replaced from ONE
-    /// [`crate::model::ArtifactRef`]: `variant`, the immutable `release`
+    /// [`crate::identity::ArtifactRef`]: `variant`, the immutable `release`
     /// `ReleaseId`, and `tree` are all taken from the same artifact.
     /// Compensation re-runs the PRIOR generation's contract, whose
     /// release/variant/tree can all differ from the desired artifact; setting
@@ -738,7 +738,7 @@ impl TemplateVars {
     /// variant rendered with the desired release). Everything else
     /// (deploy_dir, application, server metadata, deployment identity, ...)
     /// is unchanged.
-    pub fn with_artifact(&self, artifact: &crate::model::ArtifactRef) -> TemplateVars {
+    pub fn with_artifact(&self, artifact: &crate::identity::ArtifactRef) -> TemplateVars {
         let mut out = self.clone();
         out.variant = Some(artifact.variant.as_str().to_string());
         out.release = Some(artifact.release.as_str().to_string());
@@ -851,7 +851,7 @@ pub fn render_argv(argv: &[String], vars: &TemplateVars) -> Result<Vec<String>> 
 mod tests {
     use super::*;
     use crate::config::{ConflictPolicy, Mapping};
-    use crate::model::{
+    use crate::identity::{
         ArtifactRef, DeploymentId, GenerationId, ReleaseId, TreeDigest, TreeMetadata, VariantName,
         test_deployment_id, test_generation_id, test_tree_digest,
     };
@@ -1270,7 +1270,7 @@ mod tests {
             &TemplateVars::mapping("app", "v1", "standard"),
             dest,
         )?;
-        crate::tree::canonicalize_tree(dest)
+        crate::remote::canonical::canonicalize_tree(dest)
     }
 
     /// Child runner, re-executed once per umask by
@@ -1465,8 +1465,8 @@ mod tests {
             "two materializations of the same valid mapping set must produce \
              byte-identical staging: {case:?}"
         );
-        let meta_a = crate::tree::canonicalize_tree(&dest_a).unwrap();
-        let meta_b = crate::tree::canonicalize_tree(&dest_b).unwrap();
+        let meta_a = crate::remote::canonical::canonicalize_tree(&dest_a).unwrap();
+        let meta_b = crate::remote::canonical::canonicalize_tree(&dest_b).unwrap();
         assert_eq!(
             meta_a, meta_b,
             "two materializations of the same valid mapping set must produce \
@@ -2104,7 +2104,7 @@ mod tests {
         // The prior artifact differs in every artifact-scoped variable: a
         // historical release, a different variant, a different tree.
         let prior = v.with_artifact(&ArtifactRef {
-            release: crate::model::test_release_id("rel-sha256-999"),
+            release: crate::identity::test_release_id("rel-sha256-999"),
             variant: VariantName::new("legacy"),
             tree: test_tree_digest("t9"),
         });
@@ -2118,7 +2118,7 @@ mod tests {
             .unwrap(),
             format!(
                 "legacy|/srv/a|{}|deploy|app-1|g1|{}",
-                crate::model::test_release_id("rel-sha256-999"),
+                crate::identity::test_release_id("rel-sha256-999"),
                 test_tree_digest("t9")
             )
         );
@@ -2154,14 +2154,14 @@ mod tests {
             deployment_id: DeploymentId::new("d-prior"),
             generation_id: GenerationId::new("g-prior"),
             artifact: ArtifactRef {
-                release: crate::model::test_release_id("rel-sha256-999"),
+                release: crate::identity::test_release_id("rel-sha256-999"),
                 variant: VariantName::new("legacy"),
                 tree: test_tree_digest("t9"),
             },
             behavior_sha256: "b".to_string(),
             prior_generation: None,
             created_at: "2020-01-01T00:00:00Z".to_string(),
-            target: Some(crate::model::TargetName::new("prod")),
+            target: Some(crate::identity::TargetName::new("prod")),
         });
         // All five move TOGETHER from the one assignment: never a torn
         // combination (prior artifact with the failed deployment identity).
@@ -2173,7 +2173,7 @@ mod tests {
             .unwrap(),
             format!(
                 "legacy|{}|{}|d-prior|g-prior",
-                crate::model::test_release_id("rel-sha256-999"),
+                crate::identity::test_release_id("rel-sha256-999"),
                 test_tree_digest("t9")
             )
         );

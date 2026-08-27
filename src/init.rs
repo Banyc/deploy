@@ -270,7 +270,7 @@ fn build_docs(
     deploy_dir: &Path,
 ) -> Result<ScaffoldDocs> {
     let manifest = ScaffoldManifest {
-        schema_version: crate::model::CONFIG_SCHEMA_VERSION,
+        schema_version: crate::config::raw::CONFIG_SCHEMA_VERSION,
         application: name.to_string(),
         release: "v1".to_string(),
         servers: vec![crate::config::raw::RawServer {
@@ -522,7 +522,7 @@ under releases/v1/artifacts/ and run `deploy push production` again.\n";
 
 /// The unit file shipped with the scaffold's `systemd` variant. It uses the
 /// template module's `{{ deploy_dir }}` and `{{ user }}` variables (see
-/// [`crate::template`]): the tree is content-addressed and shared across
+/// [`crate::remote::materialize`]): the tree is content-addressed and shared across
 /// slots, so the unit's `ExecStart` and the deployment-account comment are
 /// rendered per slot at activation time — for the default `local://` project
 /// the slot's `deploy_dir` is the absolute `.deploy-remote` path.

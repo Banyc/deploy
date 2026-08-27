@@ -24,31 +24,31 @@ id_newtype!(
     valid_name,
     "A server identity: a single safe path segment (non-empty, no path \
      separators or traversal components, no surrounding whitespace or control \
-     characters) — the shared segment rule from [`crate::scalar`]."
+     characters) — the shared segment rule from [`crate::identity`]."
 );
 id_newtype!(
     SlotId,
     valid_name,
     "A slot identity: a single safe path segment (the shared \
-     segment rule from [`crate::scalar`])."
+     segment rule from [`crate::identity`])."
 );
 id_newtype!(
     TargetName,
     valid_name,
     "A target name: a single safe path segment (the shared segment rule \
-     from [`crate::scalar`])."
+     from [`crate::identity`])."
 );
 id_newtype!(
     VariantName,
     valid_name,
     "A variant name: a single safe path segment (the shared segment rule \
-     from [`crate::scalar`])."
+     from [`crate::identity`])."
 );
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::scalars::RolloutGroupName;
+    use crate::identity::RolloutGroupName;
 
     /// The segment identities require a single safe path segment.
     #[test]

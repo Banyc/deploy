@@ -10,22 +10,22 @@
 
 use deploy::cli;
 use deploy::config::ProjectConfig;
+use deploy::deploy::{PushOptions, push};
 use deploy::error::Result;
-use deploy::layout;
-use deploy::push::engine::{PushOptions, push};
-use deploy::records::DeploymentStatus;
+use deploy::ledger::DeploymentStatus;
 use deploy::remote::create_remote;
 use deploy::remote::helper::RemoteHelper;
+use deploy::remote::layout;
 use deploy::remote::transport::{LocalTransport, Remote};
 use deploy::store::local::LocalStore;
 use std::path::Path;
 
-/// The KNOWN artifact of a report actual ([`deploy::records::SlotAttemptState`]):
+/// The KNOWN artifact of a report actual ([`deploy::ledger::SlotAttemptState`]):
 /// a successful push's actuals are always `Known`. Test code asserting on a
 /// real actual artifact unwraps the observation here.
-fn known_artifact(s: &deploy::records::SlotAttemptState) -> &deploy::model::ArtifactRef {
+fn known_artifact(s: &deploy::ledger::SlotAttemptState) -> &deploy::identity::ArtifactRef {
     match &s.artifact {
-        deploy::records::Observation::Known(a) => a,
+        deploy::ledger::Observation::Known(a) => a,
         other => panic!("expected a Known actual artifact, got {other:?}"),
     }
 }
@@ -184,7 +184,7 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     );
     let attempt = r.attempt.expect("attempt recorded");
     assert_eq!(attempt.slot_ids.len(), 1);
-    let srv = &attempt.slots[&deploy::model::SlotId::parse("app-1").unwrap()];
+    let srv = &attempt.slots[&deploy::identity::SlotId::parse("app-1").unwrap()];
     let generation = srv.generation.as_ref().expect("generation assigned");
 
     // 6. Remote state: the local endpoint now carries the full layout, the
@@ -256,8 +256,8 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     );
 
     let observed = store.read_observed("production", &config)?;
-    let obs = &observed.slots[&deploy::model::SlotId::parse("app-1").unwrap()];
-    let deploy::records::Observation::Known(state) = &obs.observation else {
+    let obs = &observed.slots[&deploy::identity::SlotId::parse("app-1").unwrap()];
+    let deploy::ledger::Observation::Known(state) = &obs.observation else {
         panic!("observed app-1 must be Known");
     };
     assert_eq!(

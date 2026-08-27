@@ -5,8 +5,8 @@
 //! invalidate the documented configuration.
 
 use deploy::config::ProjectConfig;
+use deploy::deploy::{PushOptions, push};
 use deploy::error::Result;
-use deploy::push::engine::{PushOptions, push};
 use deploy::remote::transport::{LocalTransport, Remote};
 use deploy::store::local::LocalStore;
 use std::path::Path;

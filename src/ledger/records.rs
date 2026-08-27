@@ -2,12 +2,12 @@
 //! area A2: Ledger semantics).
 //!
 //! Assignment relationships are expressed exclusively through the canonical
-//! model types ([`crate::model::ArtifactRef`],
-//! [`crate::model::PlacementSlotAssignment`], [`crate::model::GenerationRef`])
+//! model types ([`crate::identity::ArtifactRef`],
+//! [`crate::identity::PlacementSlotAssignment`], [`crate::identity::GenerationRef`])
 //! rather than re-declared per record. Every slot→assignment map (ledger
 //! intent `desired` / `pre_push`, terminal `outcomes`, the rollback payload)
-//! is keyed by [`crate::model::SlotId`] — the deployment-location
-//! identity — while [`crate::model::ServerId`] remains the actual-server
+//! is keyed by [`crate::identity::SlotId`] — the deployment-location
+//! identity — while [`crate::identity::ServerId`] remains the actual-server
 //! identity used for transport addressing (`ServerState`, config `ServerDef`).
 //!
 //! This module owns the RECORDS THEMSELVES: the wire shapes
@@ -37,7 +37,7 @@
 //! its `desired`/`pre_push` key sets EQUAL the authoritative `slot_ids`
 //! membership EXACTLY (a missing or extra key, or a duplicated member id,
 //! is a disagreement — an incomplete authoritative projection is never read
-//! as if it were complete), each [`crate::model::GenerationRef`]'s assignment
+//! as if it were complete), each [`crate::identity::GenerationRef`]'s assignment
 //! names its own map key, the stored `behavior_sha256` equals the digest
 //! derived from the behavior index, and the stored `desired_releases` equals
 //! the releases derived from the per-slot artifacts. A disagreement is an
@@ -107,19 +107,67 @@
 //! suffix (the floor is implicit — the ledger's first entry is the oldest
 //! retained rollback state) followed by a best-effort global sweep of
 //! unreachable deployment directories, release records, and tree objects
-//! (see [`crate::store::history_floor`]).
+//! (see [`crate::retention::history_floor`]).
 
 use crate::error::{Error, Result};
-use crate::model::{
+use crate::identity::{
     ArtifactRef, BehaviorContract, DeploymentId, GenerationId, GenerationRef, MatchingMembership,
     PlacementSlotAssignment, ReleaseId, ServerId, SlotId, TargetName, TreeDigest,
 };
-use crate::scalar::{BehaviorDigest, RolloutGroupName, Timestamp};
+use crate::identity::{BehaviorDigest, RolloutGroupName, Timestamp};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::ops::Index;
+
+/// The deployment LEDGER format version — the version every deployment
+/// record carries (`LedgerIntentWire.deployment_schema_version`, validated on
+/// every read in [`crate::store::local::LocalStore::read_ledger`]). Every
+/// ledger writer emits exactly `LEDGER_SCHEMA_VERSION`; every ledger reader
+/// refuses any other version (fail closed — a mismatched record is never
+/// silently interpreted). This is INDEPENDENT of
+/// [`crate::config::raw::CONFIG_SCHEMA_VERSION`]: the deployment records
+/// version themselves separately from the configuration format, so bumping
+/// one never invalidates the other.
+///
+/// The current format is version 3: deployment records use the canonical
+/// placement-slot-keyed shape (`BTreeMap<SlotId, _>` maps, nested
+/// artifact/generation refs) and carry the exclusive owning target + the
+/// optional rollout group of the attempt. Version 3 carries BOTH reshaping
+/// changes:
+///
+/// * the intent's `pre_push` per-slot state carries the pre-push ASSIGNMENT
+///   as a three-state observation ([`crate::ledger::Observation<ArtifactRef>`]
+///   — `Known` / `KnownAbsent` / `Unknown`) instead of a raw artifact, so an
+///   unreadable pre-push assignment is a DISTINCT `Unknown` value, never a
+///   valid-looking artifact (version 2 = the pre-observation `pre_push`
+///   shape that carried a raw artifact, including the removed
+///   `unknown_artifact()` sentinel);
+/// * a SUCCESSFUL terminal event persists BOTH memberships —
+///   `selected_membership` (the slots the push actually deployed) and
+///   `full_membership` (the complete target membership at terminal time) —
+///   so the record PROVES the membership equations (outcomes == selected,
+///   rollback == full, selected ⊆ full, full-push selected == full) instead
+///   of implying them.
+///
+/// Version 2 records (the shape WITHOUT the persisted memberships and the
+/// raw-artifact `pre_push` — and version 1 records, the multi-target
+/// `targets` membership shape) are REJECTED on read — no compatibility
+/// fallback: the intent-line version check refuses a foreign
+/// `deployment_schema_version`, and an old-shape terminal line fails
+/// deserialization (the new membership fields are REQUIRED, no serde
+/// default). A hypothetical pre-rekeying shape that keyed these maps by
+/// server ID with flat artifact fields is NOT the current schema and never
+/// loads.
+pub(crate) const LEDGER_SCHEMA_VERSION: u32 = 3;
+
+/// The `pins.json` record format version (`Pins.schema_version`). Pins are
+/// durable, store-global retention anchors for artifact CONTENT ONLY (see
+/// [`Pins`]): a pin never retains or reinserts an old deployment, attempt,
+/// or snapshot in history. Readers refuse any other version (fail closed — a
+/// pins file from a different schema is never silently interpreted).
+pub(crate) const PINS_SCHEMA_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // DOMAIN SLOT TABLES: the membership + per-slot data are ONE table
@@ -476,7 +524,7 @@ pub struct SlotAttemptState {
 /// The WIRE shape of a durable intent line: the RAW serde form the ledger's
 /// JSONL carries, holding every redundant member the domain reconciles (the
 /// per-slot maps' key sets next to the authoritative `slot_ids` membership,
-/// each [`crate::model::GenerationRef`]'s assignment slot next to its map
+/// each [`crate::identity::GenerationRef`]'s assignment slot next to its map
 /// key). [`crate::ledger::append::LedgerLine::Intent`] serializes this type; the ledger's wire
 /// format is therefore unchanged (existing ledgers keep loading — the wire
 /// reads the current format). The VERIFYING CONVERSION
@@ -533,7 +581,7 @@ impl LedgerIntentWire {
     /// desired + one pre_push entry; a missing OR extra key (and a duplicated
     /// member id) fails closed, so an incomplete authoritative projection is
     /// never read as if the maps were authoritative. Each desired
-    /// [`crate::model::GenerationRef`]'s assignment must name its own map key,
+    /// [`crate::identity::GenerationRef`]'s assignment must name its own map key,
     /// and every wire `slots` (actuals) key must be a member of `slot_ids`
     /// (the persisted intent keeps that map EMPTY — outcomes live in the
     /// terminal event's `outcomes` map and the in-memory report
@@ -686,7 +734,7 @@ pub struct IntentSlot {
 
 /// One slot's DESIRED generation: the generation the plan minted for the
 /// slot's planned artifact. The DOMAIN form of the wire's per-slot
-/// [`crate::model::GenerationRef`] with the REDUNDANT assignment slot
+/// [`crate::identity::GenerationRef`] with the REDUNDANT assignment slot
 /// dropped (the enclosing table key owns the slot identity — "store each
 /// fact exactly once"); the wire conversion verifies the assignment named
 /// its own map key before dropping it.
@@ -730,7 +778,7 @@ pub struct PreviousGeneration {
 /// rollback context), not duplicated projections — they are not part of the
 /// reshape. The wire `deployment_schema_version` is a WIRE format concern
 /// (checked by the reader on the wire, refused if not
-/// [`crate::model::LEDGER_SCHEMA_VERSION`]); the validated domain does not
+/// [`crate::ledger::LEDGER_SCHEMA_VERSION`]); the validated domain does not
 /// carry it and writers emit exactly the constant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeploymentIntent {
@@ -809,7 +857,7 @@ impl From<&DeploymentIntent> for LedgerIntentWire {
             })
             .collect();
         LedgerIntentWire {
-            deployment_schema_version: crate::model::LEDGER_SCHEMA_VERSION,
+            deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
             deployment_id: i.deployment_id.clone(),
             target: i.target.clone(),
             group: i.group.clone(),
@@ -1061,7 +1109,7 @@ pub struct LedgerRollbackWire {
 
 impl LedgerRollbackWire {
     /// VERIFYING CONVERSION (wire → domain): every duplicate projection must
-    /// agree — each slot's [`crate::model::GenerationRef`] assignment names
+    /// agree — each slot's [`crate::identity::GenerationRef`] assignment names
     /// its own map key, the `bindings` key set EQUALS the `slots` key set
     /// EXACTLY (every slotted generation has a physical binding and vice
     /// versa — no missing/extra binding keys), and the legacy snapshot-wide
@@ -1972,7 +2020,7 @@ impl LedgerTerminalWire {
 /// A durable pin: retained artifact CONTENT, store-global (a release or
 /// binding is shared by every target that references it, so a pin protects
 /// it everywhere). Persisted at `<base>/pins.json`; the artifact garbage
-/// collector ([`crate::store::gc`]) folds every pin into the retained
+/// collector ([`crate::retention::gc`]) folds every pin into the retained
 /// binding set BEFORE it unlinks anything, so a pinned release record and
 /// tree object are never deleted. These STORE-LEVEL pins are DISTINCT from
 /// the retention subsystem's project-file `[[pins]]`
@@ -1994,13 +2042,13 @@ impl LedgerTerminalWire {
 /// * `releases` — a RELEASE pin: retains the whole release record AND
 ///   every variant/tree binding in that record (the GC expands the record's
 ///   `variants` map). The canonical `rel-sha256-<digest>` id is required
-///   (accepted as a bare digest too via [`crate::model::ReleaseId::parse`]);
+///   (accepted as a bare digest too via [`crate::identity::ReleaseId::parse`]);
 ///   a release pin whose record is missing fails the GC closed (the pin
 ///   cannot be expanded — nothing is deleted that run).
 /// * `bindings` — an EXACT BINDING pin: one (release, variant, tree)
 ///   [`ArtifactRef`], which keeps that release record and that tree object.
 ///
-/// `schema_version` is exactly [`crate::model::PINS_SCHEMA_VERSION`];
+/// `schema_version` is exactly [`crate::ledger::PINS_SCHEMA_VERSION`];
 /// readers refuse any other version (fail closed).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pins {
@@ -2438,7 +2486,7 @@ impl DeploymentPlanWire {
                 self.deployment_id, self.desired_releases, releases
             )));
         }
-        let digest = crate::release::behavior_index_digest(&self.behaviors);
+        let digest = crate::verify::release::behavior_index_digest(&self.behaviors);
         if self.behavior_sha256 != digest {
             return Err(Error::integrity(format!(
                 "plan {}: stored behavior_sha256 disagrees with the derived digest of the behavior index",
@@ -2642,7 +2690,7 @@ impl DeploymentPlan {
     /// the [`BehaviorIndex`] the attempt is bound to — DERIVED from the
     /// authoritative `behaviors` index, never stored separately.
     pub fn behavior_digest(&self) -> String {
-        crate::release::behavior_index_digest(&self.behaviors)
+        crate::verify::release::behavior_index_digest(&self.behaviors)
     }
 }
 
@@ -2694,11 +2742,11 @@ pub struct SlotResult {
 mod tests {
     use super::*;
     // The ledger's two line kinds + merged entry live in [`crate::ledger::append`].
-    use crate::ledger::append::{LedgerEntry, LedgerLine};
-    use crate::model::{
+    use crate::identity::{
         PlacementSlotAssignment, SlotSet, VariantName, test_deployment_id, test_generation_id,
         test_release_id, test_tree_digest,
     };
+    use crate::ledger::append::{LedgerEntry, LedgerLine};
     use crate::store::local::LocalStore;
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -2762,7 +2810,7 @@ mod tests {
         let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> =
             keys.iter().map(|k| (k.clone(), None)).collect();
         LedgerIntentWire {
-            deployment_schema_version: crate::model::LEDGER_SCHEMA_VERSION,
+            deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
             deployment_id: test_deployment_id("deploy-w"),
             target: TargetName::new("t1".to_string()),
             group: group.map(str::to_string),
@@ -4038,7 +4086,7 @@ mod tests {
         let mut wire = agreeing_intent(&keys);
         // The report parses the intent's digest into a [`BehaviorDigest`], so
         // the fixture must carry a canonical sha256 digest.
-        wire.behavior_sha256 = crate::scalar::DIGEST_TEST_HEX_1.to_string();
+        wire.behavior_sha256 = crate::identity::DIGEST_TEST_HEX_1.to_string();
         let domain = wire.into_domain().unwrap();
         // The REPORT carries the observed per-slot actuals for display.
         let mut report = LedgerIntentReport::from_intent(&domain).expect("verified intent parses");
@@ -5066,7 +5114,7 @@ mod tests {
                 "2026-01-01T00:00:00.123+02:00".to_string(),
                 "yesterday".to_string(),
                 "2026-01-01".to_string(),
-                crate::scalar::DIGEST_TEST_HEX_1.to_string(),
+                crate::identity::DIGEST_TEST_HEX_1.to_string(),
                 "sha256-w".to_string(),
             ]),
             prop::collection::vec(prop::char::any(), 0..8).prop_map(|v| v.into_iter().collect()),
@@ -5085,12 +5133,12 @@ mod tests {
         let pre_push: BTreeMap<SlotId, Option<SlotAttemptState>> =
             slot_ids.iter().map(|k| (k.clone(), None)).collect();
         LedgerIntentWire {
-            deployment_schema_version: crate::model::LEDGER_SCHEMA_VERSION,
+            deployment_schema_version: crate::ledger::LEDGER_SCHEMA_VERSION,
             deployment_id: test_deployment_id("deploy-scalar"),
             target: TargetName::new("t1".to_string()),
             group: None,
             slot_ids,
-            behavior_sha256: crate::scalar::DIGEST_TEST_HEX_1.to_string(),
+            behavior_sha256: crate::identity::DIGEST_TEST_HEX_1.to_string(),
             attempted_at: "2026-01-01T00:00:00Z".to_string(),
             desired,
             pre_push,
@@ -5293,7 +5341,7 @@ mod tests {
         DeploymentPlanWire {
             deployment_id: test_deployment_id("deploy-plan"),
             target,
-            behavior_sha256: crate::release::behavior_index_digest(&behaviors),
+            behavior_sha256: crate::verify::release::behavior_index_digest(&behaviors),
             behaviors,
             slot_ids: keys.to_vec(),
             slots,

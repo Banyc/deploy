@@ -1,9 +1,9 @@
 //! Checkpoint: retain one target's history suffix and sweep the unreachable
 //! rest.
 //!
-//! Moved from `crate::push::checkpoint` (now a re-export shim); the ledger /
-//! history-floor primitives live in [`super::history_floor`] and the sweep-debt
-//! orchestration in [`super::debt`].
+//! Moved from `crate::push::checkpoint` during the encapsulation restructure;
+//! the ledger / history-floor primitives live in [`super::history_floor`] and
+//! the sweep-debt orchestration in [`super::debt`].
 //!
 //! `deploy checkpoint <target> <deployment-id>` compacts the target's ONE
 //! deployment LEDGER (`targets/<target>/ledger.jsonl`) to the retained
@@ -75,17 +75,17 @@
 //! # Concurrency
 //!
 //! The real operation runs under the SAME lock discipline as pushes
-//! ([`crate::push::lock::FileLock`]): the application-store lock then the
+//! ([`crate::deploy::lock::FileLock`]): the application-store lock then the
 //! target lock, both advisory (flock) and released on drop. The checkpoint
 //! itself NEVER opens a remote: it is local-only by construction. A
 //! `--dry-run` preview takes NO locks, writes NOTHING, and enumerates
 //! exactly what the replacement + sweep would discard.
 
 use crate::config::ProjectConfig;
+use crate::deploy::lock::FileLock;
 use crate::error::Result;
-use crate::model::{DeploymentId, OperationId};
-use crate::push::lock::FileLock;
-use crate::store::history_floor::{LedgerDiscards, LedgerOverride};
+use crate::identity::{DeploymentId, OperationId};
+use crate::retention::history_floor::{LedgerDiscards, LedgerOverride};
 use crate::store::local::LocalStore;
 
 /// The outcome of one checkpoint invocation (preview or real).
@@ -150,7 +150,7 @@ pub fn run_checkpoint(
     let local_guard = FileLock::acquire(&store.base().join("operation.lock"), op_id.as_str())?;
     let target_guard = {
         // Durable pre-creation of the target directory BEFORE the target
-        // lock, mirroring [`crate::push::engine::push`]: the lock path must
+        // lock, mirroring [`crate::deploy::push`]: the lock path must
         // never create the target dir with an unsynced mkdir (the lock file
         // lives inside it, so a plain `create_dir_all` here would bypass the
         // durable first-append helper exactly as the reported bug did).
@@ -170,7 +170,7 @@ pub fn run_checkpoint(
 
 /// Test-only entry point: drive [`checkpoint_inner`] for a REAL checkpoint
 /// with the advisory LOCK ACQUISITION SKIPPED — mirroring the fixture's push
-/// entry points ([`crate::push::engine::push_with_id`], which skip the local
+/// entry points ([`crate::deploy::push_with_id`], which skip the local
 /// `FileLock` acquisition the same way). The state-machine fixture is
 /// single-threaded, so the locks would only add I/O; the validation, the
 /// atomic ledger replacement (the logical commit), and the full sweep path
@@ -444,12 +444,12 @@ fn plural(n: usize) -> &'static str {
 mod tests {
     use super::*;
 
-    use crate::model::{
+    use crate::identity::{
         ArtifactRef, DeploymentId, GenerationRef, PlacementSlotAssignment, ReleaseId, ServerId,
         SlotId, TargetName, TreeDigest, VariantName, test_deployment_id, test_generation_id,
         test_tree_digest,
     };
-    use crate::records::{
+    use crate::ledger::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
         NonEmptySlotTable, Observation, ObservedSlot, ObservedState, Pins, SlotOutcomeKind,
         SlotResult, SlotTable, TerminalDisposition,
@@ -469,7 +469,7 @@ mod tests {
                 desired: DesiredGeneration {
                     generation: test_generation_id("gen-1"),
                     artifact: ArtifactRef {
-                        release: crate::model::test_release_id("rel-1"),
+                        release: crate::identity::test_release_id("rel-1"),
                         variant: VariantName::new("standard".to_string()),
                         tree: test_tree_digest("tree-1"),
                     },
@@ -493,11 +493,11 @@ mod tests {
             slots: BTreeMap::from([(
                 SlotId::new("p1".to_string()),
                 GenerationRef {
-                    generation: crate::model::test_generation_id("gen-1"),
+                    generation: crate::identity::test_generation_id("gen-1"),
                     assignment: PlacementSlotAssignment {
                         placement_slot: SlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
-                            release: crate::model::test_release_id(release),
+                            release: crate::identity::test_release_id(release),
                             variant: VariantName::new("standard".to_string()),
                             tree: test_tree_digest("tree-1"),
                         },
@@ -506,7 +506,7 @@ mod tests {
             )]),
             bindings: BTreeMap::from([(
                 SlotId::new("p1".to_string()),
-                crate::records::PhysicalBinding {
+                crate::ledger::PhysicalBinding {
                     server: ServerId::new("s1".to_string()),
                     deploy_dir: "/srv/deploy/p1".to_string(),
                 },
@@ -653,7 +653,7 @@ interval_seconds = 0
         let dir = store.deployment_dir(test_deployment_id(deployment).as_str());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("plan.json"), "{}").unwrap();
-        let rel_dir = store.release_dir(&crate::model::test_release_id(release));
+        let rel_dir = store.release_dir(&crate::identity::test_release_id(release));
         std::fs::create_dir_all(&rel_dir).unwrap();
         std::fs::write(rel_dir.join("release.json"), "{}").unwrap();
         let obj_dir = store.object_root(&test_tree_digest(tree));
@@ -665,7 +665,7 @@ interval_seconds = 0
     /// content-derived id (release ids are derived from content, so the pin
     /// must reference the id the record actually got).
     fn seed_real_release(store: &LocalStore) -> ReleaseId {
-        let rec = crate::release::build_release(
+        let rec = crate::verify::release::build_release(
             "cp",
             "sha256-aa",
             &BTreeMap::from([(
@@ -697,12 +697,12 @@ interval_seconds = 0
     /// refused). `tag` differentiates the record's variant tree so distinct
     /// seeds produce distinct ids.
     fn seed_named_release(store: &LocalStore, tag: &str) -> ReleaseId {
-        let rec = crate::release::build_release(
+        let rec = crate::verify::release::build_release(
             "sw",
             "sha256-aa",
             &std::collections::BTreeMap::from([(
-                crate::model::VariantName::new("standard".to_string()),
-                crate::model::test_tree_digest(&format!("tree-pinned-{tag}")),
+                crate::identity::VariantName::new("standard".to_string()),
+                crate::identity::test_tree_digest(&format!("tree-pinned-{tag}")),
             )]),
             &std::collections::BTreeMap::from([(
                 "standard".to_string(),
@@ -726,7 +726,7 @@ interval_seconds = 0
     /// names the ledgers/observations reference; only PINNED releases are
     /// read, and they need a real record seeded via [`seed_named_release`]).
     fn seed_named_release_dir(store: &LocalStore, name: &str) {
-        let dir = store.release_dir(&crate::model::test_release_id(name));
+        let dir = store.release_dir(&crate::identity::test_release_id(name));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("release.json"), "{}").unwrap();
     }
@@ -823,7 +823,7 @@ interval_seconds = 0
         );
         assert!(
             preview.discards.sweep_releases.contains(
-                &crate::model::test_release_id("rel-sha256-old")
+                &crate::identity::test_release_id("rel-sha256-old")
                     .as_str()
                     .to_string()
             ),
@@ -845,7 +845,7 @@ interval_seconds = 0
         );
         assert!(
             !preview.discards.sweep_releases.contains(
-                &crate::model::test_release_id("rel-sha256-mid")
+                &crate::identity::test_release_id("rel-sha256-mid")
                     .as_str()
                     .to_string()
             )
@@ -905,7 +905,7 @@ interval_seconds = 0
         );
         assert!(
             !store
-                .release_dir(&crate::model::test_release_id("rel-sha256-ghost"))
+                .release_dir(&crate::identity::test_release_id("rel-sha256-ghost"))
                 .exists()
         );
         assert!(!store.object_root(&test_tree_digest("tree-ghost")).exists());
@@ -980,19 +980,19 @@ interval_seconds = 0
         // ledger's release, and the pinned release.
         assert!(
             store
-                .release_dir(&crate::model::test_release_id("deploy-0"))
+                .release_dir(&crate::identity::test_release_id("deploy-0"))
                 .exists()
         );
         assert!(
             store
-                .release_dir(&crate::model::test_release_id("dep2-0"))
+                .release_dir(&crate::identity::test_release_id("dep2-0"))
                 .exists()
         );
         assert!(store.release_dir(&pinned).exists());
         // The ghost release was swept.
         assert!(
             !store
-                .release_dir(&crate::model::test_release_id("rel-sha256-ghost"))
+                .release_dir(&crate::identity::test_release_id("rel-sha256-ghost"))
                 .exists()
         );
     }
@@ -1499,7 +1499,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         store
             .write_pins(&Pins {
-                schema_version: crate::model::PINS_SCHEMA_VERSION,
+                schema_version: crate::ledger::PINS_SCHEMA_VERSION,
                 releases: vec![pinned.clone()],
                 bindings: vec![ArtifactRef {
                     release: pinned.clone(),
@@ -1568,7 +1568,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // The pre-suffix-only artifact MUST be in both (the fix).
         assert!(
             executed.discards.sweep_releases.contains(
-                &crate::model::test_release_id(PROPERTY_RELEASES[3])
+                &crate::identity::test_release_id(PROPERTY_RELEASES[3])
                     .as_str()
                     .to_string()
             ),
@@ -1638,7 +1638,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             );
             assert!(
                 clone
-                    .release_dir(&crate::model::test_release_id(PROPERTY_RELEASES[r]))
+                    .release_dir(&crate::identity::test_release_id(PROPERTY_RELEASES[r]))
                     .exists()
             );
             assert!(

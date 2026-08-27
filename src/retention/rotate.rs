@@ -14,7 +14,7 @@
 //! The rotation I/O itself lives in [`crate::remote::helper`]
 //! ([`RemoteHelper::rotate`]) and the receiver-side post-commit orchestration
 //! (the retention-debt retry that fires the rotation on the next push) lives
-//! in [`crate::push::engine`] — both owned by other passes; this module holds
+//! in [`crate::deploy`] — both owned by other passes; this module holds
 //! the retention-side contract the rotation honors. The pusher side of the
 //! two-sided sweep (checkpoint) lives in [`super::checkpoint`], and the
 //! two-sided no-leak contract tests live in [`super::sweep_tests`].

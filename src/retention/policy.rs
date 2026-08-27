@@ -8,9 +8,9 @@
 
 use crate::config::{Pin, RetentionConfig};
 use crate::error::Result;
-use crate::layout;
-use crate::model::TreeDigest;
+use crate::identity::TreeDigest;
 use crate::remote::helper::{RemoteHelper, RemoteStatus};
+use crate::remote::layout;
 use crate::store::local::LocalStore;
 use jiff::Timestamp;
 use std::collections::{BTreeMap, HashSet};
@@ -190,17 +190,18 @@ pub fn retained_summary(retained: &HashSet<String>) -> Vec<TreeDigest> {
 mod tests {
     use super::*;
     use crate::config::{ProjectConfig, SlotConfig};
+    use crate::deploy::set_retention_deferred;
     use crate::error::Error;
-    use crate::layout;
-    use crate::model::{
-        RELEASE_RECORD_SCHEMA_VERSION, ReleaseId, ReleaseRecord, SlotId, TreeDigest, VariantName,
-        test_deployment_id, test_generation_id, test_tree_digest,
+    use crate::identity::{
+        ReleaseId, ReleaseRecord, SlotId, TreeDigest, VariantName, test_deployment_id,
+        test_generation_id, test_tree_digest,
     };
-    use crate::push::engine::set_retention_deferred;
-    use crate::release::build_release;
     use crate::remote::helper::{GenerationAssignment, RemoteHelper};
+    use crate::remote::layout;
     use crate::remote::transport::LocalTransport;
     use crate::store::local::LocalStore;
+    use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
+    use crate::verify::release::build_release;
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
     use std::path::PathBuf;
@@ -285,8 +286,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &GenerationAssignment {
                     deployment_id: test_deployment_id("d1"),
                     generation_id: test_generation_id("g1"),
-                    artifact: crate::model::ArtifactRef {
-                        release: crate::model::test_release_id("r"),
+                    artifact: crate::identity::ArtifactRef {
+                        release: crate::identity::test_release_id("r"),
                         variant: VariantName::new("standard"),
                         tree: test_tree_digest("t1"),
                     },
@@ -303,8 +304,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &GenerationAssignment {
                     deployment_id: test_deployment_id("d2"),
                     generation_id: test_generation_id("g2"),
-                    artifact: crate::model::ArtifactRef {
-                        release: crate::model::test_release_id("r"),
+                    artifact: crate::identity::ArtifactRef {
+                        release: crate::identity::test_release_id("r"),
                         variant: VariantName::new("standard"),
                         tree: test_tree_digest("t2"),
                     },
@@ -344,12 +345,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // record must be a content-verifiable CURRENT-format record (its OWN
         // slot snapshot, identity recomputed from that content): an empty
         // slot snapshot is rejected by `write_release` (fail closed).
-        let mut rec = crate::model::ReleaseRecord {
+        let mut rec = crate::identity::ReleaseRecord {
             release_schema_version: RELEASE_RECORD_SCHEMA_VERSION,
             release_id: String::new(),
             release_sha256: String::new(),
             created_at: "2020-01-01T00:00:00Z".into(),
-            provenance: crate::model::Provenance {
+            provenance: crate::identity::Provenance {
                 mapping_sha256: String::new(),
                 behavior_sha256: String::new(),
             },
@@ -365,8 +366,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             ]),
             slots: std::collections::BTreeMap::from([(
                 "standard".to_string(),
-                crate::model::CanonicalSlots {
-                    slots: vec![crate::model::CanonicalSlot {
+                crate::identity::CanonicalSlots {
+                    slots: vec![crate::identity::CanonicalSlot {
                         id: "p1".to_string(),
                         server: "s1".to_string(),
                         deploy_dir: "/srv/pin".to_string(),
@@ -376,10 +377,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 },
             )]),
         };
-        let digest = crate::release::recompute_release_digest(&rec)
+        let digest = crate::verify::release::recompute_release_digest(&rec)
             .expect("pin-test release must carry a slot snapshot");
         rec.release_sha256 = digest.as_str().to_string();
-        rec.release_id = crate::model::ReleaseId::from_digest(&digest)
+        rec.release_id = crate::identity::ReleaseId::from_digest(&digest)
             .as_str()
             .to_string();
         store.write_release(&rec).unwrap();
@@ -434,15 +435,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 &crate::remote::helper::GenerationAssignment {
                     deployment_id: test_deployment_id(deployment_id),
                     generation_id: test_generation_id(generation_id),
-                    artifact: crate::model::ArtifactRef {
-                        release: crate::model::test_release_id("r"),
+                    artifact: crate::identity::ArtifactRef {
+                        release: crate::identity::test_release_id("r"),
                         variant: VariantName::new("standard"),
                         tree: canonical_tree,
                     },
                     behavior_sha256: "b".into(),
                     prior_generation: prior_generation.map(test_generation_id),
                     created_at: created.into(),
-                    target: target.map(|t| crate::model::TargetName::new(t.to_string())),
+                    target: target.map(|t| crate::identity::TargetName::new(t.to_string())),
                 },
             )
             .unwrap();
@@ -754,7 +755,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         std::fs::write(
             dir.path()
                 .join("remote")
-                .join(crate::layout::generation(test_generation_id("g1").as_str()))
+                .join(crate::remote::layout::generation(
+                    test_generation_id("g1").as_str(),
+                ))
                 .join("assignment.json"),
             b"{ corrupt !",
         )
@@ -800,9 +803,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "the retention failure must be an integrity error, got: {err}"
         );
         assert!(
-            helper
-                .remote()
-                .exists(&crate::layout::tree_root(test_tree_digest("t1").as_str())),
+            helper.remote().exists(&crate::remote::layout::tree_root(
+                test_tree_digest("t1").as_str()
+            )),
             "retention must not sweep the tree behind a corrupt current"
         );
     }

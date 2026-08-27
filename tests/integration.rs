@@ -2,10 +2,10 @@
 //! local (filesystem) transport that mirrors the SSH remote layout.
 
 use deploy::config::ProjectConfig;
+use deploy::deploy::{PushOptions, push};
 use deploy::error::Result;
-use deploy::model::{ServerId, SlotId, TreeDigest};
-use deploy::push::engine::{PushOptions, push};
-use deploy::records::{DeploymentStatus, LedgerEntry, LedgerRollback, PhysicalBinding};
+use deploy::identity::{ServerId, SlotId, TreeDigest};
+use deploy::ledger::{DeploymentStatus, LedgerEntry, LedgerRollback, PhysicalBinding};
 
 use deploy::remote::transport::{FsBytes, LocalTransport, Remote};
 use deploy::store::local::LocalStore;
@@ -35,19 +35,19 @@ fn rollback_of(e: &LedgerEntry) -> &LedgerRollback {
         .expect("a successful entry has a terminal")
         .disposition
     {
-        deploy::records::TerminalDisposition::Successful { rollback, .. } => rollback,
+        deploy::ledger::TerminalDisposition::Successful { rollback, .. } => rollback,
         _ => panic!("a successful entry carries a rollback state"),
     }
 }
 
-/// The KNOWN artifact of a report actual ([`deploy::records::SlotAttemptState`]):
+/// The KNOWN artifact of a report actual ([`deploy::ledger::SlotAttemptState`]):
 /// a successful push's actuals are always `Known` — an `Unknown` actual only
 /// arises for an unreadable live assignment, which fails the status read
 /// before any successful finalize. Test code asserting on a real actual
 /// artifact unwraps the observation here.
-fn known_artifact(s: &deploy::records::SlotAttemptState) -> &deploy::model::ArtifactRef {
+fn known_artifact(s: &deploy::ledger::SlotAttemptState) -> &deploy::identity::ArtifactRef {
     match &s.artifact {
-        deploy::records::Observation::Known(a) => a,
+        deploy::ledger::Observation::Known(a) => a,
         other => panic!("expected a Known actual artifact, got {other:?}"),
     }
 }
@@ -326,12 +326,12 @@ fn end_to_end_push_rollback() -> Result<()> {
     );
     let observed = store.read_observed("production", &config)?;
     let restored = match &observed.slots[&SlotId::parse("p1").unwrap()].observation {
-        deploy::records::Observation::Known(s) => s.artifact.tree.clone(),
+        deploy::ledger::Observation::Known(s) => s.artifact.tree.clone(),
         _ => panic!("observed p1 must be Known"),
     };
     assert_eq!(restored, std_v1, "server-01 rolled back to original tree");
     let hc_restored = match &observed.slots[&SlotId::parse("p3").unwrap()].observation {
-        deploy::records::Observation::Known(s) => s.artifact.tree.clone(),
+        deploy::ledger::Observation::Known(s) => s.artifact.tree.clone(),
         _ => panic!("observed p3 must be Known"),
     };
     assert_eq!(
@@ -933,7 +933,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     );
     let observed = store.read_observed("production", &config0)?;
     let restored = &observed.slots[&SlotId::parse("p1").unwrap()];
-    let deploy::records::Observation::Known(state) = &restored.observation else {
+    let deploy::ledger::Observation::Known(state) = &restored.observation else {
         panic!("observed p1 must be Known");
     };
 
@@ -1000,11 +1000,11 @@ fn dry_run_reports_plan() -> Result<()> {
 // Additional tests for the hardening findings (1, 2, 4, 5, 6).
 // ===========================================================================
 
-use deploy::records::SlotOutcomeKind;
-use deploy::release;
+use deploy::ledger::SlotOutcomeKind;
 use deploy::remote::create_remote;
 use deploy::remote::helper::{GenerationAssignment, RemoteHelper};
 use deploy::remote::transport::{ExecOutcome, RemoteEntry, RemoteMeta};
+use deploy::verify::release;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -2480,7 +2480,7 @@ fn capacity_retention_compute_retained_failure_releases_lock() -> Result<()> {
                 &id,
                 deploy::config::CapacityConfig {
                     reserve_bytes: 1024 * 1024,
-                    reserve_percent: deploy::scalar::CapacityPercent::new(0)
+                    reserve_percent: deploy::identity::CapacityPercent::new(0)
                         .expect("0 is in range"),
                 },
             )
@@ -2536,7 +2536,7 @@ fn capacity_retention_compute_retained_failure_releases_lock() -> Result<()> {
     for server in ["server-01", "server-02", "server-03"] {
         let remote = LocalTransport::new(remotes_base.join(server))?;
         assert!(
-            !remote.exists(&deploy::layout::operation_lock()),
+            !remote.exists(&deploy::remote::layout::operation_lock()),
             "the lock file must be removed when the guard drops ({server})"
         );
         let helper = RemoteHelper::new(&remote);
@@ -2653,7 +2653,7 @@ fn step17_retention_failure_defers_maintenance_until_noop_retry() -> Result<()> 
     for server in ["server-01", "server-02", "server-03"] {
         let remote = LocalTransport::new(remotes_base.join(server))?;
         assert!(
-            !remote.exists(&deploy::layout::operation_lock()),
+            !remote.exists(&deploy::remote::layout::operation_lock()),
             "the lock file must be removed when the guard drops ({server})"
         );
         let helper = RemoteHelper::new(&remote);
@@ -3164,19 +3164,19 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
             .expect("valid tree digest");
     foreign_helper
         .remote()
-        .create_dir_all(&deploy::layout::tree_root(foreign_tree.as_str()))?;
-    let foreign_gen = deploy::model::GenerationId::generate();
+        .create_dir_all(&deploy::remote::layout::tree_root(foreign_tree.as_str()))?;
+    let foreign_gen = deploy::identity::GenerationId::generate();
     foreign_helper.create_generation(
         "op-foreign",
         &GenerationAssignment {
-            deployment_id: deploy::model::DeploymentId::generate(),
+            deployment_id: deploy::identity::DeploymentId::generate(),
             generation_id: foreign_gen.clone(),
-            artifact: deploy::model::ArtifactRef {
-                release: deploy::model::ReleaseId::parse(
+            artifact: deploy::identity::ArtifactRef {
+                release: deploy::identity::ReleaseId::parse(
                     "rel-sha256-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
                 )
                 .expect("valid release id"),
-                variant: deploy::model::VariantName::parse("standard").expect("valid variant"),
+                variant: deploy::identity::VariantName::parse("standard").expect("valid variant"),
                 tree: foreign_tree,
             },
             behavior_sha256: "b".to_string(),
@@ -4060,7 +4060,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         "rollback must succeed once the current reserve is lowered"
     );
     let observed = store.read_observed("production", &config0)?;
-    let deploy::records::Observation::Known(s) =
+    let deploy::ledger::Observation::Known(s) =
         &observed.slots[&SlotId::parse("p1").unwrap()].observation
     else {
         panic!("observed p1 must be Known");
@@ -4499,7 +4499,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     let obs_prod = store.read_observed("production", &config)?;
     let os = &obs_prod.slots[&SlotId::parse("p1").unwrap()];
 
-    let deploy::records::Observation::Known(os_state) = &os.observation else {
+    let deploy::ledger::Observation::Known(os_state) = &os.observation else {
         panic!("observed p1 must be Known");
     };
     assert_eq!(
@@ -4546,7 +4546,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // and staging's p2 carries its fresh v2 actual.
     let obs_prod = store.read_observed("production", &config)?;
     let os = &obs_prod.slots[&SlotId::parse("p1").unwrap()];
-    let deploy::records::Observation::Known(os_state) = &os.observation else {
+    let deploy::ledger::Observation::Known(os_state) = &os.observation else {
         panic!("observed p1 must be Known");
     };
     assert_eq!(
@@ -4555,7 +4555,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     );
     let obs_staging = store.read_observed("staging", &config)?;
     let os = &obs_staging.slots[&SlotId::parse("p2").unwrap()];
-    let deploy::records::Observation::Known(os_state2) = &os.observation else {
+    let deploy::ledger::Observation::Known(os_state2) = &os.observation else {
         panic!("observed p2 must be Known");
     };
     assert_eq!(
@@ -4588,7 +4588,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         &rrb_prod.attempt.expect("attempt recorded").slots[&SlotId::parse("p1").unwrap()];
 
     let restored_prod = store.read_observed("production", &config)?;
-    let deploy::records::Observation::Known(rp_state) =
+    let deploy::ledger::Observation::Known(rp_state) =
         &restored_prod.slots[&SlotId::parse("p1").unwrap()].observation
     else {
         panic!("observed p1 must be Known");
@@ -4604,7 +4604,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     );
     // The production rollback does NOT touch staging's observed state.
     let obs_staging = store.read_observed("staging", &config)?;
-    let deploy::records::Observation::Known(os_state) =
+    let deploy::ledger::Observation::Known(os_state) =
         &obs_staging.slots[&SlotId::parse("p2").unwrap()].observation
     else {
         panic!("observed p2 must be Known");
@@ -4628,7 +4628,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     )?;
     assert_eq!(rrb_staging.status, Some(DeploymentStatus::Successful));
     let restored_staging = store.read_observed("staging", &config)?;
-    let deploy::records::Observation::Known(rs_state) =
+    let deploy::ledger::Observation::Known(rs_state) =
         &restored_staging.slots[&SlotId::parse("p2").unwrap()].observation
     else {
         panic!("observed p2 must be Known");
@@ -4740,7 +4740,7 @@ fn jj_style_refs_roll_back_along_snapshot_chain() -> Result<()> {
             match &store.read_observed("production", &config)?.slots[&SlotId::parse("p1").unwrap()]
                 .observation
             {
-                deploy::records::Observation::Known(s) => Some(s.artifact.tree.clone()),
+                deploy::ledger::Observation::Known(s) => Some(s.artifact.tree.clone()),
                 _ => None,
             },
         )

@@ -19,36 +19,36 @@
 //! no-op up-to-date path, the observed-refresh call, the ref-resolution
 //! ordering) live here too.
 
-use crate::adapter::verify::run_verification;
 use crate::config::{Mapping, ProjectConfig, RetentionConfig, SlotConfig};
 use crate::deploy::capacity::capacity_preflight;
+use crate::deploy::lock::FileLock;
 use crate::deploy::server::{REMOTE_RELEASE_JSON, download_tree_to_host};
 use crate::deploy::staging::{
     StagingCleanup, cleanup_dry_run_staging, remove_tree_restoring_write,
 };
 use crate::error::{Error, Result};
-use crate::history::{self, PushRef, RefExpr};
-use crate::layout;
-use crate::model::{
+use crate::identity::{
     ArtifactRef, BehaviorContract, DeploymentId, GenerationId, OperationId, ReleaseId, SlotId,
     TargetName, TreeDigest, VariantName,
 };
-use crate::push::lock::FileLock;
-use crate::push::reconcile::reconcile_pending_commits;
-use crate::records::{
+use crate::ledger::recovery::reconcile_pending_commits;
+use crate::ledger::{self, PushRef, RefExpr};
+use crate::ledger::{
     BehaviorIndex, DeploymentIntent, DeploymentPlan, DeploymentStatus, DesiredGeneration,
     IntentSlot, LedgerIntentReport, LedgerTerminal, NonEmptySlotTable, Observation,
     ObservationError, ObservedGeneration, ObservedSlot, ObservedState, PreviousGeneration,
     SlotAttemptState, SlotOutcome, SlotOutcomeKind, SlotPlan, SlotResult, SlotTable,
     TerminalDisposition,
 };
+use crate::remote::canonical as tree;
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
+use crate::remote::layout;
 use crate::remote::transport::Remote;
 use crate::retention::compute_retained;
 use crate::store::local::LocalStore;
 #[cfg(test)]
 use crate::testutil::step17_hook::HookPhase;
-use crate::tree;
+use crate::verify::command::run_verification;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
@@ -90,7 +90,7 @@ type RemoteFactory =
 /// it actually deploys, and a template never sees a torn (desired-variant,
 /// current-release) combination. Compensation overrides the five
 /// deployment-scoped values again with the PRIOR assignment via
-/// [`crate::template::TemplateVars::with_assignment`]: the prior artifact's
+/// [`crate::remote::materialize::TemplateVars::with_assignment`]: the prior artifact's
 /// release/variant/tree AND the prior deployment identity
 /// (`deployment_id`/`generation`) move together.
 ///
@@ -106,7 +106,7 @@ pub(crate) fn slot_vars(
     artifact: &ArtifactRef,
     deployment_id: Option<&DeploymentId>,
     generation: Option<&GenerationId>,
-) -> Result<crate::template::TemplateVars> {
+) -> Result<crate::remote::materialize::TemplateVars> {
     let (slot, server) = members
         .iter()
         .find(|(s, _)| s.id == slot_id.as_str())
@@ -116,7 +116,7 @@ pub(crate) fn slot_vars(
                 slot_id.as_str()
             ))
         })?;
-    Ok(crate::template::TemplateVars::slot(
+    Ok(crate::remote::materialize::TemplateVars::slot(
         slot.deploy_dir(),
         artifact.variant.as_str(),
         config.application().as_str(),
@@ -183,7 +183,7 @@ pub fn push(
     // time — post-lock, post-reconcile — never here, before the push even
     // holds the target lock.
     let ref_expr = match &opts.ref_token {
-        Some(t) => history::parse_ref_expr(t)?,
+        Some(t) => ledger::parse_ref_expr(t)?,
         None => RefExpr::Head,
     };
 
@@ -200,7 +200,7 @@ pub fn push(
     // resolve inside `push_inner` after reconciliation appended any
     // recovered snapshots: relative refs must see the reconciled append.
     let resolved = if opts.dry_run {
-        Some(history::resolve_ref_expr(&ref_expr, target_name, store)?)
+        Some(ledger::resolve_ref_expr(&ref_expr, target_name, store)?)
     } else {
         None
     };
@@ -368,7 +368,7 @@ pub(crate) fn push_ref_with_id(
     // Parse the ref token EARLY (syntax only, store-free — mirroring
     // [`push`]); `push_inner` resolves it after reconciliation.
     let ref_expr = match &opts.ref_token {
-        Some(t) => history::parse_ref_expr(t)?,
+        Some(t) => ledger::parse_ref_expr(t)?,
         None => RefExpr::Head,
     };
     let selection = crate::deploy::groups::SlotSelection::normalize(
@@ -506,10 +506,10 @@ fn push_inner(
             } else {
                 store.staging_dir().join(&v)
             };
-            crate::mapper::materialize_variant(
+            crate::remote::materialize::materialize_variant(
                 &release_root,
                 &config.variant(&v)?.artifact.mappings,
-                &crate::template::TemplateVars::mapping(
+                &crate::remote::materialize::TemplateVars::mapping(
                     config.application().as_str(),
                     config.release().as_str(),
                     &v,
@@ -558,8 +558,8 @@ fn push_inner(
         );
         variant_slots.insert(v.clone(), vcfg.slots.clone());
     }
-    let mapping_sha = crate::release::variant_mappings_digest(&variant_mappings);
-    let behavior_sha = crate::release::variant_behaviors_digest(&variant_behaviors);
+    let mapping_sha = crate::verify::release::variant_mappings_digest(&variant_mappings);
+    let behavior_sha = crate::verify::release::variant_behaviors_digest(&variant_behaviors);
     let behavior_json = serde_json::to_value(&variant_behaviors)?;
     let mapping_toml = toml::to_string_pretty(&variant_mappings)
         .map_err(|e| Error::store(format!("serialize mappings: {e}")))?;
@@ -615,7 +615,7 @@ fn push_inner(
     // absent. Runs under the local target lock already held by this push;
     // never reactivates or restarts services (markers/transition/snapshot
     // only). A recovered attempt finalizes through the SHARED finalizer
-    // (`history::finalize_successful_attempt`), which APPENDS its snapshot
+    // (`ledger::finalize_successful_attempt`), which APPENDS its snapshot
     // entry to the target's chain — the very append the relative refs below
     // must see. Dry-run never reconciles (it touches nothing).
     if !opts.dry_run {
@@ -635,7 +635,7 @@ fn push_inner(
     // form.
     let pref = match resolved {
         Some(pref) => pref,
-        None => history::resolve_ref_expr(ref_expr, target_name, store)?,
+        None => ledger::resolve_ref_expr(ref_expr, target_name, store)?,
     };
 
     // Historical and rollback pushes carry EACH referenced release's own
@@ -658,7 +658,7 @@ fn push_inner(
                 )
             })
             .collect();
-        let rec = crate::release::build_release(
+        let rec = crate::verify::release::build_release(
             &mapping_sha,
             &behavior_sha,
             &bindings,
@@ -688,7 +688,7 @@ fn push_inner(
             PushRef::Deployment {
                 target: ft,
                 deployment_id,
-            } => history::resolve_deployment(store, ft, deployment_id)?
+            } => ledger::resolve_deployment(store, ft, deployment_id)?
                 .slots
                 .values()
                 .map(|g| g.assignment.artifact.release.clone())
@@ -744,15 +744,15 @@ fn push_inner(
     // every declared variant's activation + verification contract).
     // Historical and rollback pushes use the historical releases' own
     // contracts.
-    let desired_behavior_sha = crate::release::behavior_index_digest(&behavior_index);
+    let desired_behavior_sha = crate::verify::release::behavior_index_digest(&behavior_index);
 
     // 5 & 7. Build the plan from the RESOLVED ref (post-reconciliation).
     // The plan covers exactly the SELECTED slots (the normalized selection).
     // THE SOURCE OWNS ITS REQUIRED PAYLOAD: the plan's origin
-    // ([`crate::records::PlanOrigin`]) is the VERIFIED form — a DIRECT
+    // ([`crate::ledger::PlanOrigin`]) is the VERIFIED form — a DIRECT
     // release ref (a `release:<id>` push applies the release's frozen
     // topology onto the CURRENT physical slots) carries its
-    // [`crate::records::VerifiedReleaseRebinding`] proof INSIDE the source;
+    // [`crate::ledger::VerifiedReleaseRebinding`] proof INSIDE the source;
     // HEAD and deployment refs carry none. The planner ALSO produces the
     // PROOF-BEARING resolution ([`crate::deploy::plan::ResolvedSelection`]:
     // target + declared temporal source + the non-empty resolved slot set),
@@ -774,7 +774,7 @@ fn push_inner(
     let (assignments, origin) = (planned.assignments, planned.origin);
     // The plan's target is DERIVED from the proof-bearing resolution: the
     // resolved target IS the plan's target. The plan's ORIGIN is the
-    // planner's VERIFIED [`crate::records::PlanOrigin`] (built from the
+    // planner's VERIFIED [`crate::ledger::PlanOrigin`] (built from the
     // resolution's declared temporal source — the planner's proof is the
     // single authority for what this plan resolves against — and, for a
     // Release origin, the membership gate's verified rebinding proof).
@@ -1472,7 +1472,7 @@ fn push_inner(
 
     // Finalize the attempt's terminal event. A SUCCESSFUL attempt goes
     // through the SAME shared finalizer as recovery
-    // ([`history::finalize_successful_attempt`]): ONE atomic terminal append
+    // ([`ledger::finalize_successful_attempt`]): ONE atomic terminal append
     // carrying the `Successful` status, the per-slot outcomes, and the
     // ROLLBACK STATE (built from the actual per-slot OUTCOMES
     // (`actual_servers`), never from the intent record). A non-successful
@@ -1510,7 +1510,7 @@ fn push_inner(
                 SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment")
             })
             .collect();
-        history::finalize_successful_attempt(
+        ledger::finalize_successful_attempt(
             store,
             &attempt_intent,
             &outcomes_map,
@@ -1930,8 +1930,8 @@ fn refresh_observed(
         let Some(observed_server) = observed_servers.get(&slot_id) else {
             continue;
         };
-        if let Err(e) = store.write_server(&crate::records::ServerState {
-            id: crate::model::ServerId::parse(sdef.id.as_str())
+        if let Err(e) = store.write_server(&crate::ledger::ServerState {
+            id: crate::identity::ServerId::parse(sdef.id.as_str())
                 .expect("validated server id is a safe segment"),
             last_seen_target: Some(
                 TargetName::parse(target_name).expect("target name is a safe segment"),
@@ -2105,7 +2105,7 @@ pub(crate) fn retry_pending_sweep(
     // The push-side sweep retry recomputes reachability from the CURRENT
     // ledgers — NO checkpoint ledger override: the override is the
     // checkpoint's retained-suffix hypothetical and exists only while a
-    // checkpoint sweep runs (see `crate::push::checkpoint`).
+    // checkpoint sweep runs (see `crate::retention::checkpoint`).
     match store.run_sweep(config, anchor, None) {
         Ok((_, true)) => {
             // The sweep completed: clear the marker. A write/remove failure
@@ -2243,15 +2243,16 @@ fn validate_behavior_coverage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{
-        CanonicalSlot, CanonicalSlots, GenerationRef, Provenance, RELEASE_RECORD_SCHEMA_VERSION,
-        ReleaseRecord, test_deployment_id, test_generation_id, test_tree_digest,
+    use crate::identity::{
+        CanonicalSlot, CanonicalSlots, GenerationRef, Provenance, ReleaseRecord,
+        test_deployment_id, test_generation_id, test_tree_digest,
     };
-    use crate::records::LedgerEntry;
+    use crate::ledger::LedgerEntry;
     use crate::remote::transport::{FsBytes, LocalTransport};
     use crate::testutil::test_remotes::{
         FailOnceGenerationRemote, FailOnceMarkerRemote, FailOnceStagingRemote, recording_factory,
     };
+    use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
     use std::os::unix::fs::PermissionsExt;
@@ -2640,7 +2641,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert!(!store.object_exists(&tree), "local object removed");
         let remote_handle = LocalTransport::new(remote_path).unwrap();
         assert!(
-            remote_handle.exists(&crate::layout::tree_root(tree.as_str())),
+            remote_handle.exists(&crate::remote::layout::tree_root(tree.as_str())),
             "remote still retains the tree"
         );
 
@@ -2691,7 +2692,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // remote: no stale leftovers mixed in.
         let obj = store.object_root(&tree);
         assert!(obj.exists(), "recovered object present");
-        let meta = crate::tree::canonicalize_tree(&obj).unwrap();
+        let meta = crate::remote::canonical::canonicalize_tree(&obj).unwrap();
         assert_eq!(
             meta.tree_sha256,
             tree.as_str(),
@@ -2748,10 +2749,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let release_root = config.release_root(&cfg_path);
         let vcfg = config.variant("standard").unwrap();
         let staging = store.staging_dir().join("standard");
-        crate::mapper::materialize_variant(
+        crate::remote::materialize::materialize_variant(
             &release_root,
             &vcfg.artifact.mappings,
-            &crate::template::TemplateVars::mapping(
+            &crate::remote::materialize::TemplateVars::mapping(
                 config.application().as_str(),
                 config.release().as_str(),
                 "standard",
@@ -2864,7 +2865,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         deployment_id: &str,
         behavior_sha256: &str,
         slots: BTreeMap<SlotId, GenerationRef>,
-        bindings: BTreeMap<SlotId, crate::records::PhysicalBinding>,
+        bindings: BTreeMap<SlotId, crate::ledger::PhysicalBinding>,
     ) {
         // ONE slot table: the membership + the desired entries.
         let slot_table: BTreeMap<SlotId, IntentSlot> = slots
@@ -2909,7 +2910,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     // them, so a seeded Successful terminal must carry one
                     // Activated outcome per slotted generation).
                     disposition: TerminalDisposition::Successful {
-                        rollback: crate::records::LedgerRollback {
+                        rollback: crate::ledger::LedgerRollback {
                             slots: slots.clone(),
                             bindings,
                         },
@@ -2975,7 +2976,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let marker = h
             .remotes_base
             .join("s1")
-            .join(crate::layout::commit_marker(attempt.deployment_id.as_str()));
+            .join(crate::remote::layout::commit_marker(
+                attempt.deployment_id.as_str(),
+            ));
         assert!(
             !marker.exists(),
             "marker must be absent after the failed push"
@@ -3114,7 +3117,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "exactly one successful entry, and it is the recovered attempt"
         );
         assert_eq!(
-            history::successful_index(&h.store, "t1", &attempt.deployment_id)
+            ledger::successful_index(&h.store, "t1", &attempt.deployment_id)
                 .unwrap()
                 .unwrap(),
             0,
@@ -3133,7 +3136,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let marker = h
             .remotes_base
             .join("s1")
-            .join(crate::layout::commit_marker(attempt.deployment_id.as_str()));
+            .join(crate::remote::layout::commit_marker(
+                attempt.deployment_id.as_str(),
+            ));
         assert!(
             marker.exists(),
             "commit marker must be present on the remote"
@@ -3153,7 +3158,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 )
             })
             .collect();
-        let rec = crate::release::build_release(
+        let rec = crate::verify::release::build_release(
             "mapping-sha",
             "behavior-sha",
             &variants,
@@ -3478,7 +3483,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // ---- Main-path replay-safe finalization ------------------------------
     //
     // The NORMAL success path finalizes through the SAME replay-safe
-    // finalizer as recovery (`history::finalize_successful_attempt`):
+    // finalizer as recovery (`ledger::finalize_successful_attempt`):
     // recoverable `PendingCommit` marker -> idempotent snapshot +
     // `refs/last-successful` -> terminal `Successful` transition LAST. These
     // tests fault a normal push's finalization once at each persistence step
@@ -3538,7 +3543,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     /// The rollback payload of a successful ledger entry (the test view of
     /// the `DeploymentSnapshot` fields: `slots`, `bindings`).
-    fn rollback_of(entry: &LedgerEntry) -> &crate::records::LedgerRollback {
+    fn rollback_of(entry: &LedgerEntry) -> &crate::ledger::LedgerRollback {
         match &entry
             .terminal
             .as_ref()
@@ -3654,7 +3659,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let marker_path = h
             .remotes_base
             .join("s1")
-            .join(crate::layout::commit_marker(dep2.as_str()));
+            .join(crate::remote::layout::commit_marker(dep2.as_str()));
         assert!(
             !marker_path.exists(),
             "marker absent after the faulted push"
@@ -3761,11 +3766,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // ...and NOTHING on the remote mutated: no `current`, no generation.
         let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
         assert!(
-            !remote.exists(crate::layout::current()),
+            !remote.exists(crate::remote::layout::current()),
             "current must not exist before the intent is durable"
         );
         assert_eq!(
-            remote.list(crate::layout::generations()).unwrap().len(),
+            remote
+                .list(crate::remote::layout::generations())
+                .unwrap()
+                .len(),
             0,
             "no generation may be created before the intent is durable"
         );
@@ -3779,7 +3787,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "a clean follow-up push succeeds"
         );
         let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
-        assert!(remote.exists(crate::layout::current()), "remote advanced");
+        assert!(
+            remote.exists(crate::remote::layout::current()),
+            "remote advanced"
+        );
         assert_finalized(&h, &single_attempt(&h));
     }
 
@@ -3829,7 +3840,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert!(h.store.read_last_successful("t1").is_none());
         // Servers DID advance (the mutation loop ran before write_results).
         let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
-        assert!(remote.exists(crate::layout::current()), "remote advanced");
+        assert!(
+            remote.exists(crate::remote::layout::current()),
+            "remote advanced"
+        );
 
         // Push 2: recovery verifies every slot is at the intent's desired
         // generation, then finalizes; the snapshot is built from the verified
@@ -3923,7 +3937,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let baseline = r1.attempt.as_ref().expect("attempt recorded");
         let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
-        assert!(remote.exists(crate::layout::current()), "remote advanced");
+        assert!(
+            remote.exists(crate::remote::layout::current()),
+            "remote advanced"
+        );
 
         // Craft an InProgress intent (id A) whose desired generation the
         // remote never minted: intent durable, finalization never started,
@@ -4118,11 +4135,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // record (the mid-mutation fault fired before the assignment write, so
         // the generation dir may exist but is empty).
         let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
-        assert!(!remote.exists(crate::layout::current()), "no current");
-        for e in remote.list(crate::layout::generations()).unwrap() {
+        assert!(
+            !remote.exists(crate::remote::layout::current()),
+            "no current"
+        );
+        for e in remote.list(crate::remote::layout::generations()).unwrap() {
             assert!(
                 !remote.exists(
-                    &crate::layout::generations()
+                    &crate::remote::layout::generations()
                         .join(&e.name)
                         .join("assignment.json")
                 ),
@@ -4140,7 +4160,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             r2.message
         );
         let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
-        assert!(remote.exists(crate::layout::current()), "remote advanced");
+        assert!(
+            remote.exists(crate::remote::layout::current()),
+            "remote advanced"
+        );
         assert_eq!(h.store.read_attempts("t1").unwrap().len(), 2);
     }
 
@@ -4271,7 +4294,7 @@ interval_seconds = 0
         let assignment: crate::remote::helper::GenerationAssignment = serde_json::from_slice(
             &remote
                 .read(
-                    &crate::layout::generations()
+                    &crate::remote::layout::generations()
                         .join(cur.as_str())
                         .join("assignment.json"),
                 )
@@ -4387,7 +4410,10 @@ interval_seconds = 0
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let baseline = r1.attempt.as_ref().expect("attempt recorded");
         let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
-        assert!(remote.exists(crate::layout::current()), "remote advanced");
+        assert!(
+            remote.exists(crate::remote::layout::current()),
+            "remote advanced"
+        );
 
         // Craft an intent with NO transition appended: eligibility treats the
         // absent status file as eligible (a just-recorded attempt).
@@ -4432,7 +4458,7 @@ interval_seconds = 0
         assert_eq!(snapshots.len(), 2, "baseline + reconciled attempt");
         assert_eq!(snapshots[1].deployment_id, id_a);
         assert_eq!(
-            history::successful_index(&h.store, "t1", &id_a)
+            ledger::successful_index(&h.store, "t1", &id_a)
                 .unwrap()
                 .unwrap(),
             1,
@@ -4445,7 +4471,7 @@ interval_seconds = 0
         let marker = h
             .remotes_base
             .join("s1")
-            .join(crate::layout::commit_marker(id_a.as_str()));
+            .join(crate::remote::layout::commit_marker(id_a.as_str()));
         assert!(marker.exists(), "marker written for the original id");
     }
 
@@ -4494,14 +4520,14 @@ interval_seconds = 0
         assert_eq!(snapshots[1].deployment_id, a.deployment_id);
         assert_eq!(snapshots[2].deployment_id, b.deployment_id);
         assert_eq!(
-            history::successful_index(&h.store, "t1", &a.deployment_id)
+            ledger::successful_index(&h.store, "t1", &a.deployment_id)
                 .unwrap()
                 .unwrap(),
             1,
             "successful-chain positions stay monotonic"
         );
         assert_eq!(
-            history::successful_index(&h.store, "t1", &b.deployment_id)
+            ledger::successful_index(&h.store, "t1", &b.deployment_id)
                 .unwrap()
                 .unwrap(),
             2
@@ -4523,7 +4549,7 @@ interval_seconds = 0
             let marker = h
                 .remotes_base
                 .join("s1")
-                .join(crate::layout::commit_marker(id));
+                .join(crate::remote::layout::commit_marker(id));
             assert!(marker.exists(), "marker present for {id}");
         }
     }
@@ -4551,10 +4577,11 @@ interval_seconds = 0
         let prior_release = known_artifact(&prior).release.clone();
         // Behavior digest A (verification argv "true") frozen into s0.
         let var_a = h.config.variant("standard").unwrap();
-        let a_digest = crate::release::behavior_contract_digest(&crate::model::BehaviorContract {
-            activation: crate::config::ActivationConfig::from(var_a.activation.clone()),
-            verification: var_a.verification.clone(),
-        });
+        let a_digest =
+            crate::verify::release::behavior_contract_digest(&crate::identity::BehaviorContract {
+                activation: crate::config::ActivationConfig::from(var_a.activation.clone()),
+                verification: var_a.verification.clone(),
+            });
 
         // v2: verification argv flips to "false" AND the artifact content
         // changes, so the desired tree + release differ from the prior state
@@ -4580,10 +4607,11 @@ interval_seconds = 0
         .unwrap();
         let config2 = ProjectConfig::load(&h.cfg_path).unwrap();
         let var_b = config2.variant("standard").unwrap();
-        let b_digest = crate::release::behavior_contract_digest(&crate::model::BehaviorContract {
-            activation: crate::config::ActivationConfig::from(var_b.activation.clone()),
-            verification: var_b.verification.clone(),
-        });
+        let b_digest =
+            crate::verify::release::behavior_contract_digest(&crate::identity::BehaviorContract {
+                activation: crate::config::ActivationConfig::from(var_b.activation.clone()),
+                verification: var_b.verification.clone(),
+            });
         assert_ne!(a_digest, b_digest, "behaviors must differ");
 
         let id2 = test_deployment_id("deploy-verify-fail");
@@ -4653,7 +4681,7 @@ interval_seconds = 0
         let assignment: crate::remote::helper::GenerationAssignment = serde_json::from_slice(
             &remote
                 .read(
-                    &crate::layout::generations()
+                    &crate::remote::layout::generations()
                         .join(cur.as_str())
                         .join("assignment.json"),
                 )
@@ -4935,18 +4963,21 @@ interval_seconds = 0
         // pointer, no generation record.
         let remote4 = LocalTransport::new(remotes_base.join("s4")).unwrap();
         assert!(
-            !remote4.exists(crate::layout::current()),
+            !remote4.exists(crate::remote::layout::current()),
             "p4's server must never receive a current pointer"
         );
         assert_eq!(
-            remote4.list(crate::layout::generations()).unwrap().len(),
+            remote4
+                .list(crate::remote::layout::generations())
+                .unwrap()
+                .len(),
             0,
             "p4's server must never receive a generation record"
         );
         // The failed slot's server was compensated back to no prior state.
         let remote3 = LocalTransport::new(remotes_base.join("s3")).unwrap();
         assert!(
-            !remote3.exists(crate::layout::current()),
+            !remote3.exists(crate::remote::layout::current()),
             "a compensated first-deploy slot has no current"
         );
 
@@ -5281,7 +5312,7 @@ interval_seconds = 0
         );
         let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
         assert!(
-            remote.exists(crate::layout::current()),
+            remote.exists(crate::remote::layout::current()),
             "the baseline s0 deployment on the remote is untouched"
         );
     }
@@ -5651,7 +5682,7 @@ interval_seconds = 0
         let prior_assignment: crate::remote::helper::GenerationAssignment = serde_json::from_slice(
             &remote
                 .read(
-                    &crate::layout::generations()
+                    &crate::remote::layout::generations()
                         .join(prior_gen.as_str())
                         .join("assignment.json"),
                 )
@@ -5724,7 +5755,7 @@ interval_seconds = 0
         let assignment: crate::remote::helper::GenerationAssignment = serde_json::from_slice(
             &remote
                 .read(
-                    &crate::layout::generations()
+                    &crate::remote::layout::generations()
                         .join(cur.as_str())
                         .join("assignment.json"),
                 )
@@ -6013,7 +6044,7 @@ interval_seconds = 0
         // advanced).
         let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
         assert!(
-            !remote.exists(crate::layout::current()),
+            !remote.exists(crate::remote::layout::current()),
             "first-deploy compensation must remove `current`"
         );
         let status = RemoteHelper::new(&remote).status().unwrap();
@@ -6068,7 +6099,8 @@ interval_seconds = 0
                 "s1",
                 crate::config::CapacityConfig {
                     reserve_bytes: 1024 * 1024,
-                    reserve_percent: crate::scalar::CapacityPercent::new(0).expect("0 is in range"),
+                    reserve_percent: crate::identity::CapacityPercent::new(0)
+                        .expect("0 is in range"),
                 },
             )
             .unwrap();
@@ -6131,16 +6163,22 @@ interval_seconds = 0
         assert!(h.store.read_snapshots("t1").unwrap().is_empty());
         assert!(h.store.read_last_successful("t1").is_none());
         let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
-        assert!(!remote.exists(crate::layout::current()), "no current");
+        assert!(
+            !remote.exists(crate::remote::layout::current()),
+            "no current"
+        );
         assert!(
             remote
-                .list(crate::layout::generations())
+                .list(crate::remote::layout::generations())
                 .unwrap()
                 .is_empty(),
             "no generation record may be durable"
         );
         assert!(
-            remote.list(crate::layout::objects()).unwrap().is_empty(),
+            remote
+                .list(crate::remote::layout::objects())
+                .unwrap()
+                .is_empty(),
             "no tree object may be published"
         );
     }
@@ -6226,16 +6264,22 @@ interval_seconds = 0
         assert!(h.store.read_snapshots("t1").unwrap().is_empty());
         assert!(h.store.read_last_successful("t1").is_none());
         let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
-        assert!(!remote.exists(crate::layout::current()), "no current");
+        assert!(
+            !remote.exists(crate::remote::layout::current()),
+            "no current"
+        );
         assert!(
             remote
-                .list(crate::layout::generations())
+                .list(crate::remote::layout::generations())
                 .unwrap()
                 .is_empty(),
             "no generation record may be durable"
         );
         assert!(
-            remote.list(crate::layout::objects()).unwrap().is_empty(),
+            remote
+                .list(crate::remote::layout::objects())
+                .unwrap()
+                .is_empty(),
             "no tree object may be published"
         );
 
@@ -6244,7 +6288,7 @@ interval_seconds = 0
         // its `app/` subdir were created, so a real partial upload existed and
         // must be gone.
         assert!(
-            !remote.exists(&crate::layout::incoming_dir(id.as_str())),
+            !remote.exists(&crate::remote::layout::incoming_dir(id.as_str())),
             "the partial incoming upload must be cleaned best-effort"
         );
     }
@@ -6397,22 +6441,25 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         for sname in ["s1", "s2"] {
             let remote = LocalTransport::new(remotes_base.join(sname)).unwrap();
             assert!(
-                !remote.exists(&crate::layout::incoming_dir(id.as_str())),
+                !remote.exists(&crate::remote::layout::incoming_dir(id.as_str())),
                 "slot {sname}'s incoming dir must be cleaned best-effort"
             );
             assert!(
-                !remote.exists(crate::layout::current()),
+                !remote.exists(crate::remote::layout::current()),
                 "no current on {sname}"
             );
             assert!(
                 remote
-                    .list(crate::layout::generations())
+                    .list(crate::remote::layout::generations())
                     .unwrap()
                     .is_empty(),
                 "no generation record on {sname}"
             );
             assert!(
-                remote.list(crate::layout::objects()).unwrap().is_empty(),
+                remote
+                    .list(crate::remote::layout::objects())
+                    .unwrap()
+                    .is_empty(),
                 "no published object on {sname}"
             );
         }
@@ -6439,20 +6486,20 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // content-verifiable current-format record (its OWN slot snapshot,
         // identity recomputed from that content) or `write_release` refuses
         // it: an empty slot snapshot cannot be verified (fail closed).
-        let mut rec = crate::model::ReleaseRecord {
+        let mut rec = crate::identity::ReleaseRecord {
             release_schema_version: RELEASE_RECORD_SCHEMA_VERSION,
             release_id: String::new(),
             release_sha256: String::new(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
-            provenance: crate::model::Provenance {
+            provenance: crate::identity::Provenance {
                 mapping_sha256: "m".to_string(),
                 behavior_sha256: "b".to_string(),
             },
             variants: BTreeMap::from([("standard".to_string(), "tree-x".to_string())]),
             slots: BTreeMap::from([(
                 "standard".to_string(),
-                crate::model::CanonicalSlots {
-                    slots: vec![crate::model::CanonicalSlot {
+                crate::identity::CanonicalSlots {
+                    slots: vec![crate::identity::CanonicalSlot {
                         id: "p1".to_string(),
                         server: "s1".to_string(),
                         deploy_dir: "/srv/eng".to_string(),
@@ -6462,13 +6509,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 },
             )]),
         };
-        let digest = crate::release::recompute_release_digest(&rec)
+        let digest = crate::verify::release::recompute_release_digest(&rec)
             .expect("test release must carry a slot snapshot");
         rec.release_sha256 = digest.as_str().to_string();
-        rec.release_id = crate::model::ReleaseId::from_digest(&digest)
+        rec.release_id = crate::identity::ReleaseId::from_digest(&digest)
             .as_str()
             .to_string();
-        let release = crate::model::ReleaseId::new(rec.release_id.clone());
+        let release = crate::identity::ReleaseId::new(rec.release_id.clone());
         h.store.write_release(&rec).unwrap();
         // A snapshot at index 0 whose slots reference that release: the ref
         // resolves to it, and the release-identity step then demands the
@@ -6482,7 +6529,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 SlotId::new("p1".to_string()),
                 GenerationRef {
                     generation: test_generation_id("gen-hist"),
-                    assignment: crate::model::PlacementSlotAssignment {
+                    assignment: crate::identity::PlacementSlotAssignment {
                         placement_slot: SlotId::new("p1".to_string()),
                         artifact: ArtifactRef {
                             release: release.clone(),
@@ -6499,8 +6546,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             // valid for the ledger to load at all.
             BTreeMap::from([(
                 SlotId::new("p1".to_string()),
-                crate::records::PhysicalBinding {
-                    server: crate::model::ServerId::new("s1".to_string()),
+                crate::ledger::PhysicalBinding {
+                    server: crate::identity::ServerId::new("s1".to_string()),
                     deploy_dir: "/srv/eng".to_string(),
                 },
             )]),
@@ -6522,7 +6569,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &factory,
             "t1",
             &crate::deploy::groups::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
-            &history::parse_ref_expr(test_deployment_id("deploy-hist-behavior-fixture").as_str())
+            &ledger::parse_ref_expr(test_deployment_id("deploy-hist-behavior-fixture").as_str())
                 .unwrap(),
             None,
             &id,
@@ -6578,7 +6625,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             &factory,
             "t1",
             &crate::deploy::groups::SlotSelection::normalize(&h.config, "t1", None).unwrap(),
-            &history::parse_ref_expr(test_deployment_id("deploy-hist-behavior-fixture").as_str())
+            &ledger::parse_ref_expr(test_deployment_id("deploy-hist-behavior-fixture").as_str())
                 .unwrap(),
             None,
             &id,
@@ -6641,7 +6688,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let r1 = two_slot_push(&h, &h.config, &RefExpr::Head, None, &id1).unwrap();
         assert_eq!(r1.status, Some(DeploymentStatus::Successful));
         let var_a = h.config.variant("standard").unwrap();
-        let digest_a = crate::release::behavior_contract_digest(&BehaviorContract {
+        let digest_a = crate::verify::release::behavior_contract_digest(&BehaviorContract {
             activation: crate::config::ActivationConfig::from(var_a.activation.clone()),
             verification: var_a.verification.clone(),
         });
@@ -6684,7 +6731,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         .unwrap();
         let config2 = ProjectConfig::load(&h.cfg_path).unwrap();
         let var_b = config2.variant("standard").unwrap();
-        let digest_b = crate::release::behavior_contract_digest(&BehaviorContract {
+        let digest_b = crate::verify::release::behavior_contract_digest(&BehaviorContract {
             activation: crate::config::ActivationConfig::from(var_b.activation.clone()),
             verification: var_b.verification.clone(),
         });
@@ -6748,7 +6795,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let r3 = two_slot_push(
             &h,
             &config2,
-            &history::parse_ref_expr(id2.as_str()).unwrap(),
+            &ledger::parse_ref_expr(id2.as_str()).unwrap(),
             None,
             &id3,
         )
@@ -6762,7 +6809,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let r4 = two_slot_push(
             &h,
             &config2,
-            &history::parse_ref_expr(id1.as_str()).unwrap(),
+            &ledger::parse_ref_expr(id1.as_str()).unwrap(),
             None,
             &id4,
         )
@@ -6789,7 +6836,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "one frozen behavior block per referenced release"
         );
         assert_eq!(
-            crate::release::behavior_contract_digest(&plan.behaviors[&r1_release]["standard"]),
+            crate::verify::release::behavior_contract_digest(
+                &plan.behaviors[&r1_release]["standard"]
+            ),
             digest_a
         );
 
@@ -6810,7 +6859,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let assignment: GenerationAssignment = serde_json::from_slice(
                 &remote
                     .read(
-                        &crate::layout::generations()
+                        &crate::remote::layout::generations()
                             .join(cur.as_str())
                             .join("assignment.json"),
                     )
@@ -6825,13 +6874,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             assert_eq!(assignment.artifact.release.as_str(), want_release.as_str());
             assert!(
                 remote.exists(
-                    &crate::layout::remote_release(want_release.as_str()).join("release.json")
+                    &crate::remote::layout::remote_release(want_release.as_str())
+                        .join("release.json")
                 ),
                 "slot {slot}'s release record must be published on its server's remote"
             );
             assert!(
                 remote.exists(
-                    &crate::layout::remote_release(want_release.as_str()).join("behavior.json")
+                    &crate::remote::layout::remote_release(want_release.as_str())
+                        .join("behavior.json")
                 ),
                 "slot {slot}'s release behavior.json must be published on its server's remote"
             );
@@ -7164,7 +7215,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         // Corrupt the live generation's assignment record on the remote.
         let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
-        let asn_path = crate::layout::generations()
+        let asn_path = crate::remote::layout::generations()
             .join(gen1.as_str())
             .join("assignment.json");
         remote.write(&asn_path, b"{ corrupt json !", 0o600).unwrap();
@@ -7215,8 +7266,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         // The remote `current` still points at gen1 — the failed push never
         // mutated the remote.
         assert_eq!(
-            remote.read_link(crate::layout::current()).unwrap(),
-            crate::layout::generation(gen1.as_str()).join("root"),
+            remote.read_link(crate::remote::layout::current()).unwrap(),
+            crate::remote::layout::generation(gen1.as_str()).join("root"),
             "current must still point at the baseline generation"
         );
     }
@@ -7398,7 +7449,7 @@ interval_seconds = 0
         for (sid, sname) in [("p1", "s1"), ("p2", "s2")] {
             let remote = LocalTransport::new(remotes_base.join(sname)).unwrap();
             assert!(
-                remote.exists(crate::layout::current()),
+                remote.exists(crate::remote::layout::current()),
                 "slot {sid} must stay advanced under leave_changed"
             );
         }
@@ -7407,12 +7458,12 @@ interval_seconds = 0
         // untouched.
         let remote3 = LocalTransport::new(remotes_base.join("s3")).unwrap();
         assert!(
-            !remote3.exists(crate::layout::current()),
+            !remote3.exists(crate::remote::layout::current()),
             "the failing slot's current is removed by in-process compensation"
         );
         let remote4 = LocalTransport::new(remotes_base.join("s4")).unwrap();
         assert!(
-            !remote4.exists(crate::layout::current()),
+            !remote4.exists(crate::remote::layout::current()),
             "the never-started slot has no current"
         );
 
@@ -7756,7 +7807,7 @@ interval_seconds = 0
         let asn: crate::remote::helper::GenerationAssignment = serde_json::from_slice(
             &remote
                 .read(
-                    &crate::layout::generations()
+                    &crate::remote::layout::generations()
                         .join(cur.as_str())
                         .join("assignment.json"),
                 )
@@ -7922,8 +7973,8 @@ interval_seconds = 0
             // all referencing the pending push's REAL release + tree (which
             // are durable in the store), each with the harness's exact
             // physical binding so `plan_assignments` accepts the rollback.
-            let bindings = crate::records::PhysicalBinding {
-                server: crate::model::ServerId::new("s1".to_string()),
+            let bindings = crate::ledger::PhysicalBinding {
+                server: crate::identity::ServerId::new("s1".to_string()),
                 deploy_dir: "/srv/eng".to_string(),
             };
             for i in 0..=latest {
@@ -7936,7 +7987,7 @@ interval_seconds = 0
                        slot.clone(),
                        GenerationRef {
                            generation: test_generation_id(&format!("gen-relative-{latest}-{i}")),
-                           assignment: crate::model::PlacementSlotAssignment {
+                           assignment: crate::identity::PlacementSlotAssignment {
                                placement_slot: slot.clone(),
                                artifact: pending_artifact.clone(),
                            },
@@ -7960,8 +8011,8 @@ interval_seconds = 0
             // The PRE-FIX behavior resolved BEFORE reconciliation: against the
            // pre-append chain it selected position latest - depth (stale) or
            // failed outright when the chain was too short for the walk.
-            let pre_reconcile = history::resolve_ref_expr(
-                &history::parse_ref_expr(&token).unwrap(),
+            let pre_reconcile = ledger::resolve_ref_expr(
+                &ledger::parse_ref_expr(&token).unwrap(),
                 "t1",
                 &h.store,
             );
@@ -8071,7 +8122,7 @@ interval_seconds = 0
                "the reconciled entry is the pending attempt (its intent line was first)"
            );
            assert_eq!(
-               history::successful_index(
+               ledger::successful_index(
                    &h.store,
                    "t1",
                    &DeploymentId::parse(pending_id.as_str()).expect("canonical pending id"),
@@ -8092,7 +8143,7 @@ interval_seconds = 0
             .unwrap();
             assert_eq!(
                 plan.source,
-                crate::records::PlanOrigin::Deployment(
+                crate::ledger::PlanOrigin::Deployment(
                     DeploymentId::parse(&selected_deployment).expect("canonical selected id")
                 ),
 
@@ -8133,12 +8184,12 @@ interval_seconds = 0
             let h = RecoveryHarness::new();
             let slot = SlotId::new("p1".to_string());
             let artifact = ArtifactRef {
-                release: crate::model::test_release_id("rel-sha256-1111"),
+                release: crate::identity::test_release_id("rel-sha256-1111"),
                 variant: VariantName::new("p1".to_string()),
                 tree: test_tree_digest("aa"),
             };
-            let bindings = crate::records::PhysicalBinding {
-                server: crate::model::ServerId::new("s1".to_string()),
+            let bindings = crate::ledger::PhysicalBinding {
+                server: crate::identity::ServerId::new("s1".to_string()),
                 deploy_dir: "/srv/eng".to_string(),
             };
             for i in 0..=2u64 {
@@ -8151,7 +8202,7 @@ interval_seconds = 0
                         slot.clone(),
                         GenerationRef {
                             generation: test_generation_id(&format!("gen-fixture-{i}")),
-                            assignment: crate::model::PlacementSlotAssignment {
+                            assignment: crate::identity::PlacementSlotAssignment {
                                 placement_slot: slot.clone(),
                                 artifact: artifact.clone(),
                             },
@@ -8175,9 +8226,9 @@ interval_seconds = 0
                 _ => format!("{}-", test_deployment_id("deploy-fixture-0")),
             };
             // Self-check: the token parses and genuinely fails to resolve.
-            let expr = history::parse_ref_expr(&token).unwrap();
+            let expr = ledger::parse_ref_expr(&token).unwrap();
             assert!(
-                history::resolve_ref_expr(&expr, "t1", &h.store).is_err(),
+                ledger::resolve_ref_expr(&expr, "t1", &h.store).is_err(),
                 "generated token must be semantically unresolvable: {token}"
             );
 
@@ -8334,10 +8385,10 @@ interval_seconds = 0
         // HEAD push would, so the matching-membership control can run a FULL
         // real push (staging reads the local object).
         let staging = store.staging_dir().join("membership-fixture");
-        crate::mapper::materialize_variant(
+        crate::remote::materialize::materialize_variant(
             &release_dir,
             &config.variant("standard").unwrap().artifact.mappings,
-            &crate::template::TemplateVars::mapping(
+            &crate::remote::materialize::TemplateVars::mapping(
                 config.application().as_str(),
                 config.release().as_str(),
                 "standard",
@@ -8345,7 +8396,7 @@ interval_seconds = 0
             &staging,
         )
         .unwrap();
-        let meta = crate::tree::canonicalize_tree(&staging).unwrap();
+        let meta = crate::remote::canonical::canonicalize_tree(&staging).unwrap();
         let tree = meta.tree_sha256;
         store
             .store_object(&TreeDigest::new(tree.clone()), &staging)
@@ -8394,11 +8445,11 @@ interval_seconds = 0
                 verification: vcfg.verification.clone(),
             },
         )]);
-        let behavior_sha = crate::release::variant_behaviors_digest(&variant_behaviors);
+        let behavior_sha = crate::verify::release::variant_behaviors_digest(&variant_behaviors);
         let behavior_json = serde_json::to_value(&variant_behaviors).unwrap();
         let mut variant_mappings: BTreeMap<String, Vec<Mapping>> = BTreeMap::new();
         variant_mappings.insert("standard".to_string(), vcfg.artifact.mappings.clone());
-        let mapping_sha = crate::release::variant_mappings_digest(&variant_mappings);
+        let mapping_sha = crate::verify::release::variant_mappings_digest(&variant_mappings);
 
         // Assemble the record with the REAL provenance digests, then recompute
         // its identity from its own content (the digest folds the slot
@@ -8416,10 +8467,10 @@ interval_seconds = 0
             variants: BTreeMap::from([("standard".to_string(), tree.clone())]),
             slots: BTreeMap::from([("standard".to_string(), CanonicalSlots { slots: canonical })]),
         };
-        let release = crate::release::recompute_release_digest(&rec)
+        let release = crate::verify::release::recompute_release_digest(&rec)
             .expect("the fixture record carries its slot snapshot");
         rec.release_sha256 = release.as_str().to_string();
-        rec.release_id = crate::model::ReleaseId::from_digest(&release)
+        rec.release_id = crate::identity::ReleaseId::from_digest(&release)
             .as_str()
             .to_string();
         let rid = ReleaseId::new(rec.release_id.clone());
@@ -8741,11 +8792,11 @@ interval_seconds = 0
                 verification: vcfg.verification.clone(),
             },
         )]);
-        let behavior_sha = crate::release::variant_behaviors_digest(&variant_behaviors);
+        let behavior_sha = crate::verify::release::variant_behaviors_digest(&variant_behaviors);
         let behavior_json = serde_json::to_value(&variant_behaviors).unwrap();
         let mut variant_mappings: BTreeMap<String, Vec<Mapping>> = BTreeMap::new();
         variant_mappings.insert("standard".to_string(), vcfg.artifact.mappings.clone());
-        let mapping_sha = crate::release::variant_mappings_digest(&variant_mappings);
+        let mapping_sha = crate::verify::release::variant_mappings_digest(&variant_mappings);
 
         // The release's OWN frozen canonical snapshot: the generated
         // membership (group declarations mirroring the config) plus the
@@ -8790,10 +8841,10 @@ interval_seconds = 0
             )]),
             slots: BTreeMap::from([("standard".to_string(), CanonicalSlots { slots: canonical })]),
         };
-        let release = crate::release::recompute_release_digest(&rec)
+        let release = crate::verify::release::recompute_release_digest(&rec)
             .expect("the fixture record carries its slot snapshot");
         rec.release_sha256 = release.as_str().to_string();
-        rec.release_id = crate::model::ReleaseId::from_digest(&release)
+        rec.release_id = crate::identity::ReleaseId::from_digest(&release)
             .as_str()
             .to_string();
         let rid = ReleaseId::new(rec.release_id.clone());
@@ -8824,7 +8875,7 @@ interval_seconds = 0
                     slot_id.clone(),
                     GenerationRef {
                         generation: test_generation_id(slot.id.as_str()),
-                        assignment: crate::model::PlacementSlotAssignment {
+                        assignment: crate::identity::PlacementSlotAssignment {
                             placement_slot: slot_id.clone(),
                             artifact: artifact.clone(),
                         },

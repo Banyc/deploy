@@ -20,18 +20,18 @@
 //! desired assignments).
 //!
 use crate::error::{Error, Result};
+use crate::identity::SlotId;
 use crate::ledger::records::{
     DeploymentIntent, LedgerTerminal, PhysicalBinding, SlotAttemptState, SlotOutcome, SlotResult,
     SlotTable, TerminalDisposition,
 };
 use crate::ledger::rollback::build_rollback;
-use crate::model::SlotId;
 use crate::store::local::LocalStore;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Finalize a successful deployment replay-safely: the SINGLE shared
 /// terminal path used by BOTH the normal push success path and recovery
-/// ([`crate::push::reconcile::reconcile_pending_commits`]). Appends the
+/// ([`crate::ledger::recovery::reconcile_pending_commits`]). Appends the
 /// TERMINAL EVENT (status `Successful`, the per-slot `outcomes`, and the
 /// rollback state built from `actuals`) to the target's ledger — ONE atomic
 /// line append, the only commit of the finalize.
@@ -67,7 +67,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// (rollback slots == full_membership), so the writer must produce
 /// equality — by construction the overlay covers exactly the current slots
 /// (unselected slots carried forward from the base, removed slots omitted,
-/// and the partial-rollout guards in [`crate::push::plan::validate_partial_rollout`]
+/// and the partial-rollout guards in [`crate::deploy::plan::validate_partial_rollout`]
 /// refuse any current slot without a base entry), and this check pins it.
 pub fn finalize_successful_attempt(
     store: &LocalStore,
@@ -88,7 +88,7 @@ pub fn finalize_successful_attempt(
     }
     // The base for the complete snapshot: the latest successful snapshot
     // BEFORE this attempt (this attempt's terminal is not yet appended).
-    let base = crate::push::plan::latest_successful_rollback(store, attempt.target.as_str())?;
+    let base = crate::deploy::plan::latest_successful_rollback(store, attempt.target.as_str())?;
     let rollback = build_rollback(actuals, bindings, base.as_ref(), current_slot_ids)?;
     // THE WRITER'S EQUALITY (fail closed): the rollback's key set must
     // EXACTLY equal the full membership (`current_slot_ids`) — the read
@@ -176,13 +176,13 @@ pub fn recovery_outcomes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::{
+        ArtifactRef, ServerId, SlotId, TargetName, VariantName, test_deployment_id,
+        test_generation_id, test_tree_digest,
+    };
     use crate::ledger::records::{
         DeploymentIntent, DeploymentStatus, DesiredGeneration, IntentSlot, NonEmptySlotTable,
         Observation,
-    };
-    use crate::model::{
-        ArtifactRef, ServerId, SlotId, TargetName, VariantName, test_deployment_id,
-        test_generation_id, test_tree_digest,
     };
     use std::collections::BTreeMap;
 
@@ -197,7 +197,7 @@ mod tests {
                 desired: DesiredGeneration {
                     generation: test_generation_id("gen-1"),
                     artifact: ArtifactRef {
-                        release: crate::model::test_release_id("rel-1"),
+                        release: crate::identity::test_release_id("rel-1"),
                         variant: VariantName::new("standard".to_string()),
                         tree: test_tree_digest("tree-1"),
                     },
@@ -236,7 +236,7 @@ mod tests {
             SlotId::new("p1".to_string()),
             SlotAttemptState {
                 artifact: Observation::Known(ArtifactRef {
-                    release: crate::model::test_release_id("rel-1"),
+                    release: crate::identity::test_release_id("rel-1"),
                     variant: VariantName::new("standard".to_string()),
                     tree: test_tree_digest("tree-1"),
                 }),
@@ -247,7 +247,7 @@ mod tests {
             SlotId::new("p1".to_string()),
             SlotResult {
                 slot_id: SlotId::new("p1".to_string()),
-                outcome: crate::records::SlotOutcomeKind::Activated,
+                outcome: crate::ledger::SlotOutcomeKind::Activated,
                 generation: Some(test_generation_id("gen-1")),
                 compensated: false,
                 error: None,

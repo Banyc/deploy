@@ -2,7 +2,8 @@
 
 Generated 2026-08-27 (readonly research agent, cross-checked cli.rs / model.rs /
 revset.rs / push engine / records / config / store / retention / gc / checkpoint /
-adapters / transports / README.md / requirement.md). Gitignored — not tracked.
+adapters / transports / README.md / requirement.md). See the
+"Module map (encapsulation)" section at the end for the post-restructure tree.
 
 ---
 
@@ -255,6 +256,28 @@ adapters / transports / README.md / requirement.md). Gitignored — not tracked.
   fabricated ones.
 - [HIDDEN] All names (application/server/slot/target/variant/group) are single
   safe path segments — can never escape their directory.
+
+## Module map (encapsulation)
+
+Post-encapsulation layout: every inventory feature now lives in the feature
+area that owns its semantics, and the crate is wired to the NEW paths only
+(no re-export shims). The module tree is the single source of truth for
+where each feature lives.
+
+| Feature | Module path |
+| --- | --- |
+| A1 deployment semantics | `src/deploy/` — `push.rs` (orchestration), `refs.rs` (reference grammar, the old `revset`), `groups.rs`, `batching.rs`, `failure.rs`, `plan.rs`, `server.rs`, `staging.rs`, `dryrun.rs`, `capacity.rs`, `lock.rs` |
+| A2 ledger semantics | `src/ledger/` — `records.rs` (wire + domain records, `LEDGER_SCHEMA_VERSION`/`PINS_SCHEMA_VERSION`), `append.rs`, `membership.rs`, `rollback.rs`, `finalize.rs`, `recovery.rs` (the old `push::reconcile`), `refs.rs` (resolution) |
+| A3 remote / store semantics | `src/remote/` — `helper.rs`, `canonical.rs` (the old `tree`, `TREE_SCHEMA_VERSION`), `materialize.rs` (the old `mapper`/`template`), `layout.rs` (the old `layout`), `observed.rs`, `transport.rs`, `ssh.rs`, `hostkey.rs`, `runner.rs`; `src/store/` — `local.rs`, `atomic.rs` |
+| A4 retention / sweep | `src/retention/` — `policy.rs`, `pins.rs`, `gc.rs` (the old `store::gc`), `history_floor.rs` (the old `store::history_floor`), `checkpoint.rs` (the old `push::checkpoint`), `debt.rs`, `rotate.rs`, `sweep_tests.rs` (the old `sweep`) |
+| A5 verification / activation | `src/verify/` — `command.rs` (the old `adapter::verify`), `systemd.rs` (the old `adapter::systemd`), `behavior.rs` + `release.rs` (the old `release`; `RELEASE_PAYLOAD_`/`RELEASE_RECORD_SCHEMA_VERSION`) |
+| A6 identity / proof | `src/identity/` — `release_id.rs`, `ids.rs`, `digests.rs`, `segments.rs`, `scalars.rs`, `payload.rs`, `proofs.rs` (the old `model` + `scalar` surface) |
+| A7 hidden / implicit | spread across the owning areas: `src/cli.rs` (log rendering, checkpoint CLI), `src/deploy/push.rs` (lock ordering, durable debt wiring), `src/retention/debt.rs` (durable markers), `src/remote/ssh.rs` (`DEPLOY_SSH_KNOWNHOSTS_DIR`), `src/config/raw.rs` (`CONFIG_SCHEMA_VERSION`) |
+| Configuration | `src/config/` — `raw.rs`, `domain.rs`, `pins.rs`, `slots.rs`, `rollout.rs`, `retention.rs`, `activation.rs`, `verification.rs`, `servers.rs`, `capacity.rs`, `release_name.rs` |
+
+Integration tests address the crate through the new tree: `deploy::deploy::…`
+(the A1 area), `deploy::ledger::…`, `deploy::identity::…`,
+`deploy::verify::release::…`, `deploy::remote::layout::…`, etc.
 
 ## B. Mismatches (stale docs vs code)
 

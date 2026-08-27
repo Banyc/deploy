@@ -205,7 +205,7 @@ pub(crate) mod test_faults {
         /// keyed by the empty global key.
         WriteSweepDebt,
         /// The artifact garbage collection SCAN (the retained-set
-        /// computation of [`crate::store::gc`]), keyed by the checkpoint
+        /// computation of [`crate::retention::gc`]), keyed by the checkpoint
         /// deployment id. Post-commit maintenance: a failure aborts the
         /// pass BEFORE any deletion (fail closed — nothing is ever unlinked
         /// against a partial retained set) and the sweep is reported
@@ -629,7 +629,7 @@ pub(crate) mod step17_hook {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use crate::model::DeploymentId;
+    use crate::identity::DeploymentId;
 
     /// WHICH step-17-equivalent lock acquisition the engine is parked at.
     /// Carried on the "at step-17" signal so the test-facing handle can
@@ -637,7 +637,7 @@ pub(crate) mod step17_hook {
     /// phase it intends to fault.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum HookPhase {
-        /// The deferred-maintenance retry ([`crate::push::engine`]'s
+        /// The deferred-maintenance retry ([`crate::deploy`]'s
         /// `retry_deferred_retentions`): the engine reads the retention debt
         /// FIRST (before this park), then services each slot under the
         /// mutation lock. Runs on later pushes — before the fresh step-17
@@ -1497,7 +1497,7 @@ mod step17_hook_property_tests {
     // assertion below is bounded via channels/timeouts (no sleeps).
 
     use super::step17_hook::{HookHandle, HookPhase, Step17Hook};
-    use crate::model::DeploymentId;
+    use crate::identity::DeploymentId;
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
     use std::sync::Arc;

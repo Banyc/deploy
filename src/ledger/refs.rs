@@ -1,9 +1,9 @@
 //! Reference RESOLUTION against the deployment ledger (feature area A2:
 //! Ledger semantics — the reference grammar itself lives in
-//! [`crate::revset`], owned by another pass).
+//! [`crate::deploy::refs`], owned by another pass).
 //!
-//! The reference LANGUAGE is encapsulated in [`crate::revset`]: a pure,
-//! store-free grammar whose [`crate::revset::parse_ref_expr`] returns only
+//! The reference LANGUAGE is encapsulated in [`crate::deploy::refs`]: a pure,
+//! store-free grammar whose [`crate::deploy::refs::parse_ref_expr`] returns only
 //! the AST ([`RefExpr`] and friends, re-exported below) — no store access,
 //! no resolution. This module keeps only the store-dependent RESOLUTION
 //! ([`resolve_ref_expr`]) that FOLLOWS the AST against the target's LEDGER:
@@ -25,21 +25,21 @@
 //! this push's reconciled append.
 //!
 use crate::error::{Error, Result};
+use crate::identity::{DeploymentId, ReleaseId, SlotId, TargetName};
 use crate::ledger::append::LedgerEntry;
 use crate::ledger::records::{
     DeploymentIntent, DeploymentStatus, LedgerRollback, TerminalDisposition,
 };
-use crate::model::{DeploymentId, ReleaseId, SlotId, TargetName};
 use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
 
 /// The reference LANGUAGE (types + parser) is re-exported here from
-/// [`crate::revset`], which owns the grammar; this module keeps only the
+/// [`crate::deploy::refs`], which owns the grammar; this module keeps only the
 /// store-dependent RESOLUTION ([`resolve_ref_expr`]) that FOLLOWS the AST.
-/// The re-export keeps the existing `history::parse_ref_expr` /
-/// `history::RefExpr` call sites (push engine, plan, checkpoint) resolving
-/// unchanged.
-pub(crate) use crate::revset::{RefExpr, RelBase, parse_ref_expr};
+/// The re-export keeps the grammar reachable at [`crate::ledger`] for the
+/// in-crate consumers (push engine, plan, checkpoint) that call it through
+/// the ledger path.
+pub(crate) use crate::deploy::refs::{RefExpr, RelBase, parse_ref_expr};
 
 /// A concrete push source reference (store + target already resolved).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -266,13 +266,13 @@ pub fn deployment_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::{
+        ArtifactRef, DeploymentId, GenerationRef, PlacementSlotAssignment, ReleaseId, ServerId,
+        SlotId, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
+    };
     use crate::ledger::records::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerTerminal, NonEmptySlotTable,
         PhysicalBinding, SlotResult, SlotTable, TerminalDisposition,
-    };
-    use crate::model::{
-        ArtifactRef, DeploymentId, GenerationRef, PlacementSlotAssignment, ReleaseId, ServerId,
-        SlotId, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
     };
     use proptest::prelude::*;
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
@@ -280,9 +280,9 @@ mod tests {
 
     // The reference-language test helpers (grammar generators, the
     // canonical fold, and the panic-free parse runner) live with the
-    // parser in [`crate::revset::tests`]; the resolve leg imports them so
+    // parser in [`crate::deploy::refs::tests`]; the resolve leg imports them so
     // the parse/resolve contract stays pinned in ONE place.
-    use crate::revset::tests::{fold, parse_no_panic, ref_token_strategy};
+    use crate::deploy::refs::tests::{fold, parse_no_panic, ref_token_strategy};
 
     /// A minimal but VALID intent for the target (EXACT key-set equality:
     /// `slot_ids == desired.keys() == pre_push.keys()`).
@@ -295,7 +295,7 @@ mod tests {
                 desired: DesiredGeneration {
                     generation: test_generation_id("gen-1"),
                     artifact: ArtifactRef {
-                        release: crate::model::test_release_id("rel-1"),
+                        release: crate::identity::test_release_id("rel-1"),
                         variant: VariantName::new("standard".to_string()),
                         tree: test_tree_digest("tree-1"),
                     },
@@ -353,7 +353,7 @@ mod tests {
                     SlotId::new("p1".to_string()),
                     SlotResult {
                         slot_id: SlotId::new("p1".to_string()),
-                        outcome: crate::records::SlotOutcomeKind::Activated,
+                        outcome: crate::ledger::SlotOutcomeKind::Activated,
                         generation: Some(test_generation_id(&format!("gen-{dep}"))),
                         compensated: false,
                         error: None,
@@ -382,7 +382,7 @@ mod tests {
                 .append_terminal(
                     "production",
                     &canonical,
-                    &successful_terminal(&id, crate::model::test_release_id(&id).as_str()),
+                    &successful_terminal(&id, crate::identity::test_release_id(&id).as_str()),
                 )
                 .unwrap();
             ids.push(canonical.as_str().to_string());
@@ -518,7 +518,7 @@ mod tests {
         // The canonical full form AND the bare 64-hex digest (converted by
         // the CLI parser BEFORE the strict domain parse) both resolve to the
         // same canonical release.
-        let rid = crate::model::test_release_id("rel-sha256-cccc");
+        let rid = crate::identity::test_release_id("rel-sha256-cccc");
         let bare = rid.digest();
         assert_eq!(
             resolve_ref_expr(
@@ -546,7 +546,7 @@ mod tests {
         // an EMPTY chain — resolve the same way: resolution never reads the
         // store.
         let empty = LocalStore::with_base(tmp.path().join("store2")).unwrap();
-        let rid2 = crate::model::test_release_id("rel-sha256-zzzz");
+        let rid2 = crate::identity::test_release_id("rel-sha256-zzzz");
         assert_eq!(
             resolve_ref_expr(
                 &parse_ref_expr(&format!("release:{rid2}")).expect("must parse"),
@@ -716,7 +716,7 @@ mod tests {
                 // Each successful deployment is a rollback payload keyed by
                 // its id, with a deterministic payload derived from the id
                 // (so "exactly its stored state" is a meaningful equality).
-                let release = crate::model::test_release_id(id).as_str().to_string();
+                let release = crate::identity::test_release_id(id).as_str().to_string();
                 store
                     .append_terminal(
                         "production",
@@ -739,7 +739,7 @@ mod tests {
                                     SlotId::new("p1".to_string()),
                                     SlotResult {
                                         slot_id: SlotId::new("p1".to_string()),
-                                        outcome: crate::records::SlotOutcomeKind::Restored,
+                                        outcome: crate::ledger::SlotOutcomeKind::Restored,
                                         generation: Some(test_generation_id("gen-1")),
                                         compensated: true,
                                         error: None,

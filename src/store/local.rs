@@ -2,11 +2,11 @@
 //!
 //! Record contract: ONE ordered deployment ledger per target
 //! (`targets/<target>/ledger.jsonl`, append-only JSON lines). An entry starts
-//! as the DURABLE INTENT ([`crate::records::DeploymentIntent`], appended BEFORE
+//! as the DURABLE INTENT ([`crate::ledger::DeploymentIntent`], appended BEFORE
 //! any remote mutation — the append-attempt contract) and its TERMINAL EVENT
-//! ([`crate::records::LedgerTerminal`], appended after the mutation loop)
+//! ([`crate::ledger::LedgerTerminal`], appended after the mutation loop)
 //! carries the status, the per-slot outcomes, and — when successful — the
-//! rollback state ([`crate::records::LedgerRollback`]). The append order IS
+//! rollback state ([`crate::ledger::LedgerRollback`]). The append order IS
 //! the history order; the deployment id keys each entry. There is no
 //! separate floor marker, snapshot op log, per-deployment results/transition
 //! stream, or cleanup-debt flag: the ledger replaces all of them.
@@ -60,16 +60,17 @@
 //! holds under any parallel `cargo test` interleaving.
 
 use crate::error::{Error, Result};
-use crate::layout;
-use crate::model::{
-    BehaviorContract, DeploymentId, LEDGER_SCHEMA_VERSION, ReleaseId, ReleaseRecord, SlotId,
-    TREE_SCHEMA_VERSION, TreeDigest, TreeMetadata,
+use crate::identity::ApplicationStoreKey;
+use crate::identity::{
+    BehaviorContract, DeploymentId, ReleaseId, ReleaseRecord, SlotId, TreeDigest, TreeMetadata,
 };
-use crate::records::{
-    DeploymentIntent, DeploymentStatus, LedgerEntry, LedgerIntentWire, LedgerLine, LedgerTerminal,
-    LedgerTerminalWire, ObservedSlot, ObservedTarget, Pins, ServerState, TerminalDisposition,
+use crate::ledger::{
+    DeploymentIntent, DeploymentStatus, LEDGER_SCHEMA_VERSION, LedgerEntry, LedgerIntentWire,
+    LedgerLine, LedgerTerminal, LedgerTerminalWire, ObservedSlot, ObservedTarget, Pins,
+    ServerState, TerminalDisposition,
 };
-use crate::scalar::ApplicationStoreKey;
+use crate::remote::canonical::TREE_SCHEMA_VERSION;
+use crate::remote::layout;
 use crate::store::atomic::{
     copy_dir_recursive, ensure_private_dir, ensure_private_dir_durable, path_state, read_json,
     set_private, sync_parent_dir, temp_name_for, write_atomic_replace,
@@ -80,7 +81,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
-use crate::records::Observation;
+use crate::ledger::Observation;
 #[cfg(test)]
 use crate::testutil::step17_hook::Step17Hook;
 #[cfg(test)]
@@ -237,7 +238,7 @@ impl LocalStore {
     /// Create a store rooted at `<data>/simple-deploy/<key>` with private
     /// permissions, creating the directory tree if needed. The application
     /// STORE KEY is the ONLY way in: the key is a validated single safe
-    /// path segment ([`crate::scalar::ApplicationStoreKey`]), so the store
+    /// path segment ([`crate::identity::ApplicationStoreKey`]), so the store
     /// path is `default_base().join(key)` — exactly ONE component appended
     /// — and an application name can never escape the store base.
     pub fn new(application: &ApplicationStoreKey) -> Result<LocalStore> {
@@ -337,7 +338,7 @@ impl LocalStore {
             let existing = std::fs::read_dir(&root)
                 .map_err(|e| Error::integrity(format!("read object {}: {e}", digest.as_str())))?;
             if existing.count() > 0 {
-                let meta = crate::tree::canonicalize_tree(&root)?;
+                let meta = crate::remote::canonical::canonicalize_tree(&root)?;
                 if meta.tree_sha256 != digest.as_str() {
                     return Err(Error::integrity(format!(
                         "existing object {} failed verification",
@@ -348,7 +349,7 @@ impl LocalStore {
             }
         }
         copy_dir_recursive(src_root, &root)?;
-        let meta = crate::tree::canonicalize_tree(&root)?;
+        let meta = crate::remote::canonical::canonicalize_tree(&root)?;
         if meta.tree_sha256 != digest.as_str() {
             let _ = std::fs::remove_dir_all(&root);
             return Err(Error::integrity(format!(
@@ -411,7 +412,7 @@ impl LocalStore {
     /// fails, but never by trusting the stored digest fields.
     pub fn write_release(&self, rec: &ReleaseRecord) -> Result<()> {
         // (a) Verify the incoming record from its content before any write.
-        crate::release::verify_release_identity(rec)?;
+        crate::verify::release::verify_release_identity(rec)?;
         let dir = self.release_dir(
             &ReleaseId::parse(&rec.release_id)
                 .expect("incoming release record carries a validated release id"),
@@ -421,7 +422,7 @@ impl LocalStore {
             // compare the recomputed identities (both records verified above,
             // so `release_sha256` equals the recomputed digest in each).
             let existing: ReleaseRecord = read_json(&dir.join("release.json"))?;
-            crate::release::verify_release_identity(&existing)?;
+            crate::verify::release::verify_release_identity(&existing)?;
             if existing.release_sha256 != rec.release_sha256 {
                 return Err(Error::store(format!(
                     "release {} already exists with different content",
@@ -458,7 +459,7 @@ impl LocalStore {
         // tampered record whose content was edited while the digest fields
         // were left unchanged fails closed with an integrity error, and an
         // empty slot snapshot is rejected outright.
-        crate::release::verify_release_identity(&rec)?;
+        crate::verify::release::verify_release_identity(&rec)?;
         // Bind the record to the read path: the stored record must actually
         // BE the release the caller asked for.
         if rec.release_id != id.as_str() {
@@ -511,7 +512,7 @@ impl LocalStore {
         let p = self.release_dir(id).join("behavior.json");
         let bytes = std::fs::read(&p)
             .map_err(|e| Error::store(format!("read behavior {}: {e}", p.display())))?;
-        crate::release::verify_behavior_json(
+        crate::verify::release::verify_behavior_json(
             &bytes,
             &rec.release_id,
             &rec.provenance.behavior_sha256,
@@ -540,7 +541,7 @@ impl LocalStore {
     /// there).
     ///
     /// The engine and checkpoint ALSO call this BEFORE acquiring the target
-    /// lock ([`crate::push::engine::push`], [`crate::push::checkpoint`]): the
+    /// lock ([`crate::deploy::push`], [`crate::retention::checkpoint`]): the
     /// lock file lives INSIDE the target dir, so the lock path used to create
     /// it with a plain unsynced mkdir that bypassed this helper — the
     /// lock-path pre-creation makes the directory durable BEFORE the lock is
@@ -706,7 +707,8 @@ impl LocalStore {
             .filter(|(id, _)| members.contains(id.as_str()))
             .collect();
         Ok(ObservedTarget {
-            target: crate::model::TargetName::parse(target).expect("target name is a safe segment"),
+            target: crate::identity::TargetName::parse(target)
+                .expect("target name is a safe segment"),
             slots,
         })
     }
@@ -1501,17 +1503,17 @@ impl LocalStore {
         // pin might protect).
         if !path_state(&p)? {
             return Ok(Pins {
-                schema_version: crate::model::PINS_SCHEMA_VERSION,
+                schema_version: crate::ledger::PINS_SCHEMA_VERSION,
                 releases: Vec::new(),
                 bindings: Vec::new(),
             });
         }
         let pins: Pins = read_json(&p)?;
-        if pins.schema_version != crate::model::PINS_SCHEMA_VERSION {
+        if pins.schema_version != crate::ledger::PINS_SCHEMA_VERSION {
             return Err(Error::integrity(format!(
                 "pins file carries unsupported schema_version {} (expected {}): only PINS_SCHEMA_VERSION is accepted",
                 pins.schema_version,
-                crate::model::PINS_SCHEMA_VERSION
+                crate::ledger::PINS_SCHEMA_VERSION
             )));
         }
         Ok(pins)
@@ -1543,12 +1545,12 @@ pub fn sanitize(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::ProjectConfig;
-    use crate::model::{
+    use crate::deploy::lock::FileLock;
+    use crate::identity::{
         ArtifactRef, GenerationRef, PlacementSlotAssignment, ReleaseId, ServerId, SlotId,
         TargetName, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
     };
-    use crate::push::lock::FileLock;
-    use crate::records::{
+    use crate::ledger::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerIntentWire, LedgerLine,
         LedgerRollback, LedgerTerminal, LedgerTerminalWire, NonEmptySlotTable, Observation,
         ObservedGeneration, ObservedState, PhysicalBinding, PreviousGeneration, SlotOutcome,
@@ -1631,7 +1633,7 @@ mod tests {
                 desired: DesiredGeneration {
                     generation: test_generation_id("1"),
                     artifact: ArtifactRef {
-                        release: crate::model::test_release_id("rel-1"),
+                        release: crate::identity::test_release_id("rel-1"),
                         variant: VariantName::new("standard".to_string()),
                         tree: test_tree_digest("1"),
                     },
@@ -1666,7 +1668,7 @@ mod tests {
                             assignment: PlacementSlotAssignment {
                                 placement_slot: SlotId::new("p1".to_string()),
                                 artifact: ArtifactRef {
-                                    release: crate::model::test_release_id("rel-sha256-a"),
+                                    release: crate::identity::test_release_id("rel-sha256-a"),
                                     variant: VariantName::new("standard".to_string()),
                                     tree: test_tree_digest("1"),
                                 },
@@ -1675,8 +1677,8 @@ mod tests {
                     )]),
                     bindings: BTreeMap::from([(
                         SlotId::new("p1".to_string()),
-                        crate::records::PhysicalBinding {
-                            server: crate::model::ServerId::new("s1".to_string()),
+                        crate::ledger::PhysicalBinding {
+                            server: crate::identity::ServerId::new("s1".to_string()),
                             deploy_dir: "/srv/deploy/p1".to_string(),
                         },
                     )]),
@@ -1747,7 +1749,7 @@ mod tests {
             observation: Observation::Known(ObservedState {
                 generation: test_generation_id("evil"),
                 artifact: ArtifactRef {
-                    release: crate::model::test_release_id("rel-sha256-evil"),
+                    release: crate::identity::test_release_id("rel-sha256-evil"),
                     variant: VariantName::new("standard".to_string()),
                     tree: test_tree_digest("evil"),
                 },
@@ -1810,7 +1812,7 @@ mod tests {
                 .artifact
                 .release
                 .as_str(),
-            crate::model::test_release_id("rel-sha256-a").as_str()
+            crate::identity::test_release_id("rel-sha256-a").as_str()
         );
         // A terminal without its intent is refused (fail closed).
         let err = store
@@ -1915,7 +1917,7 @@ mod tests {
                 assignment: PlacementSlotAssignment {
                     placement_slot: SlotId::new("not-a-member".to_string()),
                     artifact: ArtifactRef {
-                        release: crate::model::test_release_id("rel-1"),
+                        release: crate::identity::test_release_id("rel-1"),
                         variant: VariantName::new("standard".to_string()),
                         tree: test_tree_digest("1"),
                     },
@@ -1943,7 +1945,7 @@ mod tests {
                 assignment: PlacementSlotAssignment {
                     placement_slot: extra.clone(),
                     artifact: ArtifactRef {
-                        release: crate::model::test_release_id("rel-2"),
+                        release: crate::identity::test_release_id("rel-2"),
                         variant: VariantName::new("standard".to_string()),
                         tree: test_tree_digest("2"),
                     },
@@ -2108,7 +2110,7 @@ mod tests {
                 },
             },
         )]);
-        let sha = crate::release::variant_behaviors_digest(&contracts);
+        let sha = crate::verify::release::variant_behaviors_digest(&contracts);
         (contracts, sha)
     }
 
@@ -2118,8 +2120,8 @@ mod tests {
         store: &LocalStore,
     ) -> (ReleaseId, BTreeMap<String, BehaviorContract>, String) {
         let (contracts, sha) = behavior_fixture();
-        let variants: BTreeMap<crate::model::VariantName, TreeDigest> = BTreeMap::from([(
-            crate::model::VariantName::new("standard"),
+        let variants: BTreeMap<crate::identity::VariantName, TreeDigest> = BTreeMap::from([(
+            crate::identity::VariantName::new("standard"),
             test_tree_digest("1"),
         )]);
         let slots: BTreeMap<String, Vec<crate::config::SlotConfig>> = BTreeMap::from([(
@@ -2132,8 +2134,13 @@ mod tests {
                 Vec::new(),
             )],
         )]);
-        let rec =
-            crate::release::build_release("m", &sha, &variants, &slots, std::path::Path::new("."));
+        let rec = crate::verify::release::build_release(
+            "m",
+            &sha,
+            &variants,
+            &slots,
+            std::path::Path::new("."),
+        );
         let id = ReleaseId::new(rec.release_id.clone());
         store.write_release(&rec).unwrap();
         let behavior_json = serde_json::to_value(&contracts).unwrap();
@@ -3057,7 +3064,7 @@ mod tests {
     /// ledger entry already written), with the boundary fault armed per the
     /// spec; then the COMPLETE SEQUENCE — store open, the durable target-dir
     /// pre-creation + target lock acquisition exactly as the engine's lock
-    /// block runs it ([`crate::push::engine::push`]: local lock, then
+    /// block runs it ([`crate::deploy::push`]: local lock, then
     /// `ensure_target_dir_durable`, then the target lock), then the intent
     /// append — a fresh-store reopen over the same base, and the durability
     /// contract:
@@ -3329,7 +3336,7 @@ mod tests {
             assignment: PlacementSlotAssignment {
                 placement_slot: slot.clone(),
                 artifact: ArtifactRef {
-                    release: crate::model::test_release_id(slot.as_str()),
+                    release: crate::identity::test_release_id(slot.as_str()),
                     variant: VariantName::new("standard".to_string()),
                     tree: test_tree_digest(slot.as_str()),
                 },
@@ -3362,14 +3369,14 @@ mod tests {
                         desired: DesiredGeneration {
                             generation: test_generation_id(k.as_str()),
                             artifact: ArtifactRef {
-                                release: crate::model::test_release_id(k.as_str()),
+                                release: crate::identity::test_release_id(k.as_str()),
                                 variant: VariantName::new("standard".to_string()),
                                 tree: test_tree_digest(k.as_str()),
                             },
                         },
                         pre_push: Some(PreviousGeneration {
                             artifact: Observation::Known(ArtifactRef {
-                                release: crate::model::test_release_id(k.as_str()),
+                                release: crate::identity::test_release_id(k.as_str()),
                                 variant: VariantName::new("standard".to_string()),
                                 tree: test_tree_digest(k.as_str()),
                             }),
@@ -3510,7 +3517,7 @@ mod tests {
     /// Every consumer of a target's ledger goes through the SAME read
     /// ([`LocalStore::read_ledger`]), so a conversion-time refusal precedes
     /// ALL of them: the direct read, a rollback resolve
-    /// ([`crate::history::resolve_deployment`]), and the GC reachability
+    /// ([`crate::ledger::resolve_deployment`]), and the GC reachability
     /// scan ([`LocalStore::reachable_set`]). `why` names the mutation for
     /// the failure messages.
     fn assert_consumers_refuse_with_integrity(
@@ -3525,7 +3532,7 @@ mod tests {
             matches!(err, Error::Integrity(_)),
             "{why}: read_ledger must refuse with an integrity error before any consumer sees the line, got: {err}"
         );
-        let err = crate::history::resolve_deployment(
+        let err = crate::ledger::resolve_deployment(
             store,
             &TargetName::parse(target).expect("target name is a safe segment"),
             &test_deployment_id(id),
@@ -3644,7 +3651,7 @@ mod tests {
                 "the valid pair merges into one entry"
             );
             store.reachable_set(&config, None).unwrap();
-            let resolved = crate::history::resolve_deployment(
+            let resolved = crate::ledger::resolve_deployment(
                 &store,
                 &TargetName::parse(target).expect("target name is a safe segment"),
                 &test_deployment_id("deploy-pair"),
@@ -3721,7 +3728,7 @@ mod tests {
         let store = LocalStore::with_base(tmp.path().join("store-valid")).unwrap();
         append_pair(&store, target, &intent, &terminal);
         assert_eq!(store.read_ledger(target).unwrap().len(), 1);
-        crate::history::resolve_deployment(
+        crate::ledger::resolve_deployment(
             &store,
             &TargetName::parse(target).expect("target name is a safe segment"),
             &test_deployment_id(id),

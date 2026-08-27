@@ -19,8 +19,8 @@
 //! [`crate::ledger::records`].
 //!
 use crate::error::{Error, Result};
+use crate::identity::{GenerationRef, PlacementSlotAssignment, SlotId};
 use crate::ledger::records::{LedgerRollback, Observation, PhysicalBinding, SlotAttemptState};
-use crate::model::{GenerationRef, PlacementSlotAssignment, SlotId};
 use std::collections::BTreeMap;
 
 /// Build the rollback state of a successful deployment from the attempt's
@@ -100,11 +100,11 @@ pub fn build_rollback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ledger::records::Observation;
-    use crate::model::{
+    use crate::identity::{
         ArtifactRef, ServerId, SlotId, VariantName, test_deployment_id, test_generation_id,
         test_tree_digest,
     };
+    use crate::ledger::records::Observation;
     use std::collections::BTreeMap;
 
     /// `build_rollback` records each slot's complete physical binding.
@@ -115,7 +115,7 @@ mod tests {
             slot.clone(),
             SlotAttemptState {
                 artifact: Observation::Known(ArtifactRef {
-                    release: crate::model::test_release_id("rel-1"),
+                    release: crate::identity::test_release_id("rel-1"),
                     variant: VariantName::new("standard".to_string()),
                     tree: test_tree_digest("tree-1"),
                 }),
@@ -225,7 +225,7 @@ mod tests {
         // aspect under test is the missing `bindings` key and the
         // snapshot-wide members, not the id format.
         let did = test_deployment_id("deploy-old");
-        let rel = crate::model::test_release_id("old");
+        let rel = crate::identity::test_release_id("old");
         let line = format!(
             r#"{{"kind":"terminal","deployment_id":"{did}","target":"production","status":"successful","recorded_at":"2026-01-01T00:00:00Z","outcomes":{{}},"selected_membership":[],"full_membership":[],"rollback":{{"behavior_sha256":"sha256-aa","release":"{rel}","slots":{{}}}}}}"#
         );

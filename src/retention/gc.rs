@@ -1,8 +1,9 @@
 //! Global best-effort artifact garbage collection (the physical reclamation
 //! half of a checkpoint's sweep).
 //!
-//! Moved from `crate::store::gc` (now a re-export shim); the reachability
-//! model and the retained-suffix ledger override live in [`super::history_floor`].
+//! Moved from `crate::store::gc` during the encapsulation restructure; the
+//! reachability model and the retained-suffix ledger override live in
+//! [`super::history_floor`].
 //!
 //! A checkpoint atomically replaces the target's ONE deployment LEDGER with
 //! the retained suffix (the only logical commit — the floor is implicit: the
@@ -37,12 +38,12 @@
 //!    — the ONE physical observed record per slot; target views are a
 //!    selection over it): the observed artifact (release + tree) and the
 //!    observed `last_deployment` id. An observed slot whose observation
-//!    is `Unknown` ([`crate::records::Observation::Unknown`]; its live
+//!    is `Unknown` ([`crate::ledger::Observation::Unknown`]; its live
 //!    assignment could not be read) is treated CONSERVATIVELY: the GC
 //!    cannot verify what the slot runs, so it must NOT delete anything it
 //!    cannot verify — the sweep aborts with an integrity error before any
 //!    deletion (never silently sweeping an unknown slot's content).
-//! 3. **Every pin** ([`crate::records::Pins`], `<base>/pins.json`, and the
+//! 3. **Every pin** ([`crate::ledger::Pins`], `<base>/pins.json`, and the
 //!    caller's `deploy.toml` `[[pins]]`): a RELEASE pin marks every
 //!    variant/tree in that release record; an exact-binding entry keeps
 //!    `(release, variant, tree)`. Pins retain ARTIFACT CONTENT ONLY — a pin
@@ -62,7 +63,7 @@
 //! # Post-commit best-effort maintenance
 //!
 //! The GC runs as part of the checkpoint's post-commit sweep (the release /
-//! object stages of [`crate::store::history_floor::LocalStore::run_sweep`]).
+//! object stages of [`crate::retention::history_floor::LocalStore::run_sweep`]).
 //! Its failure model is best-effort with retry-by-recompute: a GC failure
 //! NEVER deletes anything in the retained set — the run aborts (fail
 //! closed) before any unlink it cannot prove safe, the checkpoint report
@@ -96,11 +97,11 @@
 
 use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
-use crate::layout;
 #[cfg(test)]
-use crate::model::ReleaseId;
+use crate::identity::ReleaseId;
+use crate::remote::layout;
+use crate::retention::history_floor::{LedgerOverride, ReachableSet};
 use crate::store::atomic::{path_state, sync_parent_dir};
-use crate::store::history_floor::{LedgerOverride, ReachableSet};
 use crate::store::local::LocalStore;
 use std::path::Path;
 
@@ -470,11 +471,11 @@ impl LocalStore {
 mod tests {
     use super::*;
     use crate::config::SlotConfig;
-    use crate::model::{
+    use crate::identity::{
         ArtifactRef, GenerationRef, PlacementSlotAssignment, SlotId, TargetName, TreeDigest,
         VariantName, test_deployment_id, test_generation_id, test_tree_digest,
     };
-    use crate::records::{
+    use crate::ledger::{
         DeploymentIntent, DesiredGeneration, IntentSlot, LedgerRollback, LedgerTerminal,
         NonEmptySlotTable, Observation, ObservationError, ObservedSlot, ObservedState, Pins,
         PreviousGeneration, SlotOutcomeKind, SlotResult, SlotTable, TerminalDisposition,
@@ -548,7 +549,7 @@ interval_seconds = 0
     /// tree `tree-pinned-<tag>`, and return the id it actually got — pins
     /// must reference the id the record got.
     fn seed_real_release(store: &LocalStore, tag: &str) -> ReleaseId {
-        let rec = crate::release::build_release(
+        let rec = crate::verify::release::build_release(
             "gc",
             "sha256-aa",
             &BTreeMap::from([(
@@ -586,7 +587,7 @@ interval_seconds = 0
                 desired: DesiredGeneration {
                     generation: test_generation_id("gen-1"),
                     artifact: ArtifactRef {
-                        release: crate::model::test_release_id("rel-1"),
+                        release: crate::identity::test_release_id("rel-1"),
                         variant: VariantName::new("standard".to_string()),
                         tree: test_tree_digest("tree-1"),
                     },
@@ -645,7 +646,7 @@ interval_seconds = 0
                 desired: DesiredGeneration {
                     generation: test_generation_id("gen-1"),
                     artifact: ArtifactRef {
-                        release: crate::model::test_release_id("desired-rel"),
+                        release: crate::identity::test_release_id("desired-rel"),
                         variant: VariantName::new("standard".to_string()),
                         tree: test_tree_digest("tree-desired"),
                     },
@@ -694,8 +695,8 @@ interval_seconds = 0
                     // bindings omit a slotted generation).
                     bindings: BTreeMap::from([(
                         SlotId::new(SLOT.to_string()),
-                        crate::records::PhysicalBinding {
-                            server: crate::model::ServerId::new("s1".to_string()),
+                        crate::ledger::PhysicalBinding {
+                            server: crate::identity::ServerId::new("s1".to_string()),
                             deploy_dir: "/srv/eng".to_string(),
                         },
                     )]),
@@ -812,7 +813,7 @@ interval_seconds = 0
                     TARGET,
                     &canonical,
                     &terminal_for(
-                        crate::model::test_release_id(&format!("ret-{i}")).as_str(),
+                        crate::identity::test_release_id(&format!("ret-{i}")).as_str(),
                         &format!("tree-ret-{i}"),
                     ),
                 )
@@ -826,7 +827,7 @@ interval_seconds = 0
             observation: Observation::Known(ObservedState {
                 generation: test_generation_id("gen-obs"),
                 artifact: ArtifactRef {
-                    release: crate::model::test_release_id("rel-sha256-obs"),
+                    release: crate::identity::test_release_id("rel-sha256-obs"),
                     variant: VariantName::new("standard".to_string()),
                     tree: test_tree_digest("tree-obs"),
                 },
@@ -842,7 +843,7 @@ interval_seconds = 0
         // Store-level pins: a whole-release pin on `store_pin` AND an exact
         // binding pin on the same release's `tree-pinned-store` tree.
         let pins = Pins {
-            schema_version: crate::model::PINS_SCHEMA_VERSION,
+            schema_version: crate::ledger::PINS_SCHEMA_VERSION,
             releases: vec![store_pin.clone()],
             bindings: vec![ArtifactRef {
                 release: store_pin.clone(),
@@ -862,14 +863,14 @@ interval_seconds = 0
         // `test_release_id("rel-sha256-obs")`, so its dir carries the same
         // canonical id).
         let mut retained_releases = vec![
-            crate::model::test_release_id("rel-sha256-obs")
+            crate::identity::test_release_id("rel-sha256-obs")
                 .as_str()
                 .to_string(),
         ];
         let mut retained_trees = vec![test_tree_digest("tree-obs").as_str().to_string()];
         for i in 0..retained {
             retained_releases.push(
-                crate::model::test_release_id(&format!("ret-{i}"))
+                crate::identity::test_release_id(&format!("ret-{i}"))
                     .as_str()
                     .to_string(),
             );
@@ -897,7 +898,7 @@ interval_seconds = 0
         let mut garbage_releases = Vec::new();
         let mut garbage_trees = Vec::new();
         for i in 0..garbage {
-            let r = crate::model::test_release_id(&format!("garbage-{i}"))
+            let r = crate::identity::test_release_id(&format!("garbage-{i}"))
                 .as_str()
                 .to_string();
             let t = test_tree_digest(&format!("tree-garbage-{i}"))
@@ -949,10 +950,13 @@ interval_seconds = 0
         let mut out = Vec::new();
         for (rel_root, abs) in [
             ("deployments", store.base().join("deployments")),
-            ("releases", store.base().join(crate::layout::RELEASES)),
+            (
+                "releases",
+                store.base().join(crate::remote::layout::RELEASES),
+            ),
             (
                 "objects/sha256",
-                store.base().join(crate::layout::objects()),
+                store.base().join(crate::remote::layout::objects()),
             ),
         ] {
             if abs.exists() {
@@ -1211,7 +1215,7 @@ interval_seconds = 0
                 assert!(
                     retained
                         .releases
-                        .contains(crate::model::test_release_id("desired-rel").as_str())
+                        .contains(crate::identity::test_release_id("desired-rel").as_str())
                 );
                 assert!(
                     retained
@@ -1238,7 +1242,7 @@ interval_seconds = 0
         // structurally above: no artifact is ever bound from it) and
         // `KnownAbsent` holds nothing, so neither can ever be mistaken for a
         // known artifact. The `unknown_artifact()` SENTINEL API is REMOVED
-        // from [`crate::model`] (any residual reference would not compile):
+        // from [`crate::identity`] (any residual reference would not compile):
         // an `ArtifactRef` in the system always means a known artifact.
         match &artifact {
             Observation::Known(a) => {
@@ -1318,11 +1322,11 @@ interval_seconds = 0
     fn config_pin_naming_missing_release_aborts_with_integrity() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let missing = crate::model::test_release_id("rel-sha256-missing");
+        let missing = crate::identity::test_release_id("rel-sha256-missing");
         let config = config_with_pin(dir.path(), Some(&missing));
         seed_named_release(
             &store,
-            crate::model::test_release_id("rel-sha256-garbage").as_str(),
+            crate::identity::test_release_id("rel-sha256-garbage").as_str(),
         );
         seed_object(&store, test_tree_digest("tree-garbage").as_str());
         let err = store.run_sweep(&config, "anchor", None).unwrap_err();
@@ -1336,7 +1340,7 @@ interval_seconds = 0
         );
         assert!(
             store
-                .release_dir(&crate::model::test_release_id("rel-sha256-garbage"))
+                .release_dir(&crate::identity::test_release_id("rel-sha256-garbage"))
                 .exists(),
             "zero deletions: the garbage release survives"
         );
@@ -1364,7 +1368,7 @@ interval_seconds = 0
         let store_pin = seed_real_release(&store, "cfg");
         store
             .write_pins(&Pins {
-                schema_version: crate::model::PINS_SCHEMA_VERSION,
+                schema_version: crate::ledger::PINS_SCHEMA_VERSION,
                 releases: vec![store_pin.clone()],
                 bindings: Vec::new(),
             })
@@ -1380,7 +1384,7 @@ interval_seconds = 0
         .unwrap();
         seed_named_release(
             &store,
-            crate::model::test_release_id("rel-sha256-garbage").as_str(),
+            crate::identity::test_release_id("rel-sha256-garbage").as_str(),
         );
         seed_object(&store, test_tree_digest("tree-garbage").as_str());
         let config = config_with_pin(dir.path(), None);
@@ -1392,7 +1396,7 @@ interval_seconds = 0
         assert!(err.to_string().contains("pin"), "got: {err}");
         assert!(
             store
-                .release_dir(&crate::model::test_release_id("rel-sha256-garbage"))
+                .release_dir(&crate::identity::test_release_id("rel-sha256-garbage"))
                 .exists(),
             "zero deletions: the garbage release survives"
         );
@@ -1411,10 +1415,10 @@ interval_seconds = 0
     fn exact_binding_pin_naming_missing_release_aborts_with_integrity() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let missing = crate::model::test_release_id("rel-sha256-missing");
+        let missing = crate::identity::test_release_id("rel-sha256-missing");
         store
             .write_pins(&Pins {
-                schema_version: crate::model::PINS_SCHEMA_VERSION,
+                schema_version: crate::ledger::PINS_SCHEMA_VERSION,
                 releases: Vec::new(),
                 bindings: vec![ArtifactRef {
                     release: missing.clone(),
@@ -1425,7 +1429,7 @@ interval_seconds = 0
             .unwrap();
         seed_named_release(
             &store,
-            crate::model::test_release_id("rel-sha256-garbage").as_str(),
+            crate::identity::test_release_id("rel-sha256-garbage").as_str(),
         );
         seed_object(&store, test_tree_digest("tree-garbage").as_str());
         let config = config_with_pin(dir.path(), None);
@@ -1436,7 +1440,7 @@ interval_seconds = 0
         );
         assert!(
             store
-                .release_dir(&crate::model::test_release_id("rel-sha256-garbage"))
+                .release_dir(&crate::identity::test_release_id("rel-sha256-garbage"))
                 .exists(),
             "zero deletions: the garbage release survives"
         );
@@ -1555,8 +1559,8 @@ interval_seconds = 0
         // category — a reported removal is a real unlink, never a candidate
         // that is still on disk.
         let depl_root = store.base().join("deployments");
-        let rel_root = store.base().join(crate::layout::RELEASES);
-        let tree_root = store.base().join(crate::layout::objects());
+        let rel_root = store.base().join(crate::remote::layout::RELEASES);
+        let tree_root = store.base().join(crate::remote::layout::objects());
         assert_eq!(
             count_dir_entries(&depl_root),
             deploys.len() - discards.removed_deployments,

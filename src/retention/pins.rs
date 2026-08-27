@@ -4,7 +4,7 @@
 //! the HONORING logic lives here:
 //!
 //! * [`LocalStore::honor_release_pin`] — the pusher-side GC anchor semantics
-//!   (moved from `crate::store::history_floor`): a pin that names a release
+//!   (moved from `crate::retention::history_floor`): a pin that names a release
 //!   with NO record on disk, or whose record cannot be read or
 //!   identity-verified, is an [`Error::integrity`] error — the retained set
 //!   would be incomplete, so the sweep must abort before any deletion.
@@ -15,9 +15,9 @@
 
 use crate::config::Pin;
 use crate::error::{Error, Result};
-use crate::model::ReleaseId;
+use crate::identity::ReleaseId;
+use crate::retention::history_floor::ReachableSet;
 use crate::store::atomic::path_state;
-use crate::store::history_floor::ReachableSet;
 use crate::store::local::LocalStore;
 use std::collections::HashSet;
 
@@ -93,7 +93,7 @@ impl LocalStore {
         pins: &[Pin],
     ) -> Result<()> {
         for pin in pins {
-            // The pin's release is the TYPED [`crate::model::ReleaseId`]: it was
+            // The pin's release is the TYPED [`crate::identity::ReleaseId`]: it was
             // validated when the config was loaded, so this can never be a late
             // release-id syntax error.
             let rid = pin.release.clone();

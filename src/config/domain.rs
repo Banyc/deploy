@@ -14,12 +14,12 @@ use crate::config::servers::{HostIdentity, ServerConnection, ServerDef, validate
 use crate::config::slots::SlotConfig;
 use crate::config::verification::VerificationConfig;
 use crate::error::{Error, Result};
-use crate::model::{ReleaseId, ServerId, SlotId};
-use crate::records::PhysicalBinding;
-use crate::scalar::{
+use crate::identity::{
     AbsoluteDeployDir, ApplicationStoreKey, BatchSize, CapacityPercent, Host, Identifier,
     RolloutGroupName, SshUser,
 };
+use crate::identity::{ReleaseId, ServerId, SlotId};
+use crate::ledger::PhysicalBinding;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::num::NonZeroU16;
@@ -94,7 +94,7 @@ pub fn destinations_overlap(a: &str, b: &str) -> bool {
 pub struct Mapping {
     /// Source path relative to the release directory (`releases/<release>/`),
     /// where the convention is `artifacts/...`. The path is rendered with the
-    /// template module (`crate::template`): `{{ variant }}` is available at
+    /// template module (`crate::remote::materialize`): `{{ variant }}` is available at
     /// materialization; slot-level variables such as `deploy_dir` are not
     /// (trees are content-addressed and shared across slots) and referencing
     /// them fails loudly.
@@ -177,7 +177,7 @@ pub struct ProjectConfig {
     /// ([`ProjectConfig::schema_version`]): the format identity is invariant.
     schema_version: u32,
     /// The deployment application identifier: a validated single safe
-    /// path segment ([`crate::scalar::ApplicationStoreKey`]) parsed by the
+    /// path segment ([`crate::identity::ApplicationStoreKey`]) parsed by the
     /// raw -> domain conversion (an application name that is not a safe
     /// store key — empty, control-bearing, `/`/`\`-separated, `.`/`..`, or
     /// padded — is rejected AT THE LOAD, fail closed). ONE safe
@@ -954,7 +954,7 @@ pub(crate) struct RawProject {
 /// content is allowed; an empty or whitespace-only identifier cannot name a
 /// server, slot, target, or variant). Kept for the test-side domain invariant
 /// assertions; the CONVERSION gates identifiers through the stricter
-/// [`crate::scalar::Identifier`] parse (which additionally rejects surrounding
+/// [`crate::identity::Identifier`] parse (which additionally rejects surrounding
 /// whitespace and control characters).
 #[cfg(test)]
 pub(crate) fn valid_identifier(id: &str) -> bool {
@@ -1014,7 +1014,7 @@ impl TryFrom<RawProject> for ProjectConfig {
         }
 
         // The application name is parsed into the validated single safe
-        // path segment [`crate::scalar::ApplicationStoreKey`]: an
+        // path segment [`crate::identity::ApplicationStoreKey`]: an
         // application name that is not a safe store key (empty,
         // control-bearing, `/`/`\`-separated, `.`/`..`, or padded) is
         // rejected HERE — at the LOAD, fail closed — so a successfully

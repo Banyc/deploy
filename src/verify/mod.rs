@@ -19,7 +19,7 @@
 //! * [`release`] — release identity/verification semantics (`build_release`,
 //!   `verify_release_identity`, the canonical payload recompute), moved from
 //!   `crate::release`, plus the behavior-contract re-exports that keep the
-//!   `crate::release` shim's legacy surface.
+//!   legacy `deploy::release::*` surface (e.g. `behavior_digest`).
 //!
 //! Host identity, key-pin caching, protocol handshake, and ssh timeouts live
 //! in [`crate::remote`] (`hostkey`, `helper`, `runner`) — an earlier pass

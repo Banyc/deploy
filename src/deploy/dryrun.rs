@@ -8,7 +8,7 @@
 //! and returns the report — the render itself touches nothing.
 
 use crate::deploy::plan::PlannedAssignment;
-use crate::model::{GenerationId, SlotId};
+use crate::identity::{GenerationId, SlotId};
 use crate::remote::helper::RemoteStatus;
 use crate::store::local::LocalStore;
 use std::collections::HashMap;

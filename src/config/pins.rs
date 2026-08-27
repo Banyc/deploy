@@ -1,10 +1,10 @@
 //! Durable release pins ([`Pin`]): one whole release retained forever, with
 //! the raw -> domain conversion parsing the pin's release into the typed
-//! [`crate::model::ReleaseId`].
+//! [`crate::identity::ReleaseId`].
 
 use crate::config::raw::RawPin;
 use crate::error::{Error, Result};
-use crate::model::ReleaseId;
+use crate::identity::ReleaseId;
 use serde::{Deserialize, Serialize};
 
 /// Durable protection for one whole release: every variant's artifact in the

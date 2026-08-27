@@ -1,7 +1,7 @@
 //! Per-server capacity headroom ([`CapacityConfig`]): the validated
-//! [`crate::scalar::CapacityPercent`] domain form.
+//! [`crate::identity::CapacityPercent`] domain form.
 
-use crate::scalar::CapacityPercent;
+use crate::identity::CapacityPercent;
 
 /// A server's capacity headroom policy, declared once per `[[servers]]` entry
 /// and shared by every deployment slot on that server. It is LIVE

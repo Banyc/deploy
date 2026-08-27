@@ -6,10 +6,10 @@
 //! operation that triggered it and never reports an ordinary failure — it
 //! records DURABLE DEBT and the NEXT PUSH (real or no-op) fires the pending
 //! sweep. The pusher's sweep debt is `<base>/sweep-debt.json`, serviced by
-//! [`crate::push::engine::retry_pending_sweep`] (the engine loop lives in
-//! `crate::push::engine`, owned by another pass); the receiver's retention
+//! [`crate::deploy::retry_pending_sweep`] (the engine loop lives in
+//! `crate::deploy`, owned by another pass); the receiver's retention
 //! debt is `targets/<target>/retention-debt.json`, serviced by
-//! [`crate::push::engine::retry_deferred_retentions`]. Both reports surface a
+//! [`crate::deploy::retry_deferred_retentions`]. Both reports surface a
 //! pending sweep as a WARNING, never an error.
 //!
 //! The marker I/O lives in [`crate::store::local::LocalStore`]

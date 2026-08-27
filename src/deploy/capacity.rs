@@ -6,7 +6,7 @@
 
 use crate::config::{ProjectConfig, SlotConfig};
 use crate::error::{Error, Result};
-use crate::model::{DeploymentId, OperationId, SlotId};
+use crate::identity::{DeploymentId, OperationId, SlotId};
 use crate::remote::helper::RemoteHelper;
 use crate::remote::transport::FsBytes;
 use crate::retention::compute_retained;
@@ -142,7 +142,7 @@ fn tree_size_on_host(root: &Path) -> u64 {
 mod tests {
     use super::*;
     use crate::deploy::plan::PlannedAssignment;
-    use crate::model::{
+    use crate::identity::{
         ArtifactRef, DeploymentId, OperationId, SlotId, VariantName, test_tree_digest,
     };
     use crate::remote::helper::RemoteHelper;
@@ -315,7 +315,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let assignment = PlannedAssignment {
             placement_slot: SlotId::new("p1".to_string()),
             artifact: ArtifactRef {
-                release: crate::model::test_release_id("rel-sha256-cap"),
+                release: crate::identity::test_release_id("rel-sha256-cap"),
                 variant: VariantName::new("standard".to_string()),
                 tree: tree.clone(),
             },
@@ -330,7 +330,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "s1",
                 crate::config::CapacityConfig {
                     reserve_bytes: 1000,
-                    reserve_percent: crate::scalar::CapacityPercent::new(1).expect("1 is in range"),
+                    reserve_percent: crate::identity::CapacityPercent::new(1)
+                        .expect("1 is in range"),
                 },
             )
             .unwrap();
@@ -351,7 +352,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "s1",
                 crate::config::CapacityConfig {
                     reserve_bytes: 4500,
-                    reserve_percent: crate::scalar::CapacityPercent::new(1).expect("1 is in range"),
+                    reserve_percent: crate::identity::CapacityPercent::new(1)
+                        .expect("1 is in range"),
                 },
             )
             .unwrap();
@@ -379,7 +381,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "s1",
                 crate::config::CapacityConfig {
                     reserve_bytes: 1000,
-                    reserve_percent: crate::scalar::CapacityPercent::new(10)
+                    reserve_percent: crate::identity::CapacityPercent::new(10)
                         .expect("10 is in range"),
                 },
             )
@@ -400,14 +402,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         // A tree ALREADY on the server skips the headroom check entirely.
         remote
-            .create_dir_all(&crate::layout::tree_root(tree.as_str()))
+            .create_dir_all(&crate::remote::layout::tree_root(tree.as_str()))
             .unwrap();
         config = config
             .with_server_capacity(
                 "s1",
                 crate::config::CapacityConfig {
                     reserve_bytes: u64::MAX,
-                    reserve_percent: crate::scalar::CapacityPercent::new(100)
+                    reserve_percent: crate::identity::CapacityPercent::new(100)
                         .expect("100 is in range"),
                 },
             )
@@ -452,7 +454,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 "s1",
                 crate::config::CapacityConfig {
                     reserve_bytes,
-                    reserve_percent: crate::scalar::CapacityPercent::new(reserve_percent)
+                    reserve_percent: crate::identity::CapacityPercent::new(reserve_percent)
                         .expect("fixture percent in range"),
                 },
             )
@@ -460,7 +462,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let assignment = PlannedAssignment {
             placement_slot: SlotId::new("p1".to_string()),
             artifact: ArtifactRef {
-                release: crate::model::test_release_id("rel-sha256-cap"),
+                release: crate::identity::test_release_id("rel-sha256-cap"),
                 variant: VariantName::new("standard".to_string()),
                 tree,
             },

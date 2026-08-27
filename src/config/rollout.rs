@@ -1,10 +1,10 @@
 //! Per-target rollout policy: the DOMAIN [`RolloutConfig`] (non-zero
-//! [`crate::scalar::BatchSize`], stop-on-failure, the strict
+//! [`crate::identity::BatchSize`], stop-on-failure, the strict
 //! [`FailurePolicy`] enum) and the strict exact-spelling [`FailurePolicy`]
 //! parse the raw `failure_policy` string goes through.
 
 use crate::error::{Error, Result};
-use crate::scalar::BatchSize;
+use crate::identity::BatchSize;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;

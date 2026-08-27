@@ -6,7 +6,7 @@
 use crate::config::capacity::CapacityConfig;
 use crate::config::raw::RawServer;
 use crate::error::{Error, Result};
-use crate::scalar::{Host, Identifier, SshUser};
+use crate::identity::{Host, Identifier, SshUser};
 use std::fmt;
 use std::num::NonZeroU16;
 use std::path::PathBuf;

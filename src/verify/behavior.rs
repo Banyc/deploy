@@ -3,10 +3,9 @@
 //! The canonical digest derivation and verification for the activation +
 //! verification contract that pins a release's runtime behavior. Moved from
 //! `crate::release` (area A5, verification/activation semantics) so the
-//! behavior-contract functions live with the adapters they describe, while
-//! `crate::release` keeps resolving through a re-export shim.
+//! behavior-contract functions live with the adapters they describe.
 //!
-//! A resolved contract is a [`crate::model::BehaviorContract`] (one activation
+//! A resolved contract is a [`crate::identity::BehaviorContract`] (one activation
 //! config + one verification config). Its canonical digest (`behavior_sha256`)
 //! is frozen into the release identity at build time; [`verify_behavior_json`]
 //! recomputes it from a stored `behavior.json` and fails closed on any
@@ -15,7 +14,7 @@
 use crate::config::{ActivationConfig, VerificationConfig};
 use crate::digest::sha256_bytes;
 use crate::error::{Error, Result};
-use crate::model::{BehaviorContract, ReleaseId};
+use crate::identity::{BehaviorContract, ReleaseId};
 use std::collections::BTreeMap;
 
 /// Canonical digest of the activation + verification contract.
@@ -47,7 +46,7 @@ pub fn variant_behaviors_digest(contracts: &BTreeMap<String, BehaviorContract>) 
 }
 
 /// Canonical digest over the PER-RELEASE, PER-VARIANT behavior index an
-/// attempt is bound to ([`crate::records::BehaviorIndex`]: release id ->
+/// attempt is bound to ([`crate::ledger::BehaviorIndex`]: release id ->
 /// variant name -> contract). An attempt whose slots reference several
 /// releases (a partial snapshot spans groups) carries ONE snapshot-wide
 /// behavior digest over the whole index; two attempts share it only when

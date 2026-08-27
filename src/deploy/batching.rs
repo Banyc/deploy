@@ -14,8 +14,8 @@ use crate::deploy::plan::PlannedAssignment;
 use crate::deploy::push::slot_vars;
 use crate::deploy::server::{ServerProc, process_server};
 use crate::error::Result;
-use crate::model::{DeploymentId, GenerationId, OperationId, SlotId};
-use crate::records::{BehaviorIndex, SlotOutcomeKind, SlotPlan, SlotResult};
+use crate::identity::{DeploymentId, GenerationId, OperationId, SlotId};
+use crate::ledger::{BehaviorIndex, SlotOutcomeKind, SlotPlan, SlotResult};
 use crate::remote::helper::{RemoteHelper, RemoteStatus};
 use crate::remote::transport::Remote;
 use crate::store::local::LocalStore;
@@ -109,7 +109,8 @@ pub(crate) fn run_batches(
                 }
                 continue;
             };
-            let variant_behavior_sha = crate::release::behavior_contract_digest(variant_behavior);
+            let variant_behavior_sha =
+                crate::verify::release::behavior_contract_digest(variant_behavior);
             let vars = slot_vars(
                 members,
                 config,

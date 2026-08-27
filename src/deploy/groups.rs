@@ -16,7 +16,7 @@
 
 use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
-use crate::model::{MatchingMembership, ReleaseId, ReleaseRecord, SlotId, SlotSet, TargetName};
+use crate::identity::{MatchingMembership, ReleaseId, ReleaseRecord, SlotId, SlotSet, TargetName};
 
 /// The NORMALIZED selection of one push/status invocation: the owning target
 /// and the optional rollout group. Normalized once near command entry as the
@@ -82,7 +82,7 @@ impl SlotSelection {
 
     /// The selected (slot, server) pairs for a DIRECT RELEASE reference: the
     /// group's slot IDs resolve from the RELEASE's FROZEN topology — each
-    /// frozen [`crate::model::CanonicalSlot`] in the record's own snapshot
+    /// frozen [`crate::identity::CanonicalSlot`] in the record's own snapshot
     /// carries its era's `groups` list, so the frozen partition governs (a
     /// slot the release pushed inside the group but the current config moved
     /// OUT of it still belongs to this push; a group named only in the

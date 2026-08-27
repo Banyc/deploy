@@ -2,17 +2,17 @@ use super::*;
 use crate::config::domain::{RawProject, valid_identifier};
 use crate::config::raw::CONFIG_SCHEMA_VERSION;
 use crate::error::{Error, Result};
-use crate::model::{
-    ArtifactRef, LEDGER_SCHEMA_VERSION, ReleaseId, SlotId, TargetName, VariantName,
-    test_deployment_id, test_generation_id, test_tree_digest,
-};
-use crate::records::{
-    DeploymentIntent, DesiredGeneration, IntentSlot, LedgerIntentWire, LedgerLine,
-    NonEmptySlotTable,
-};
-use crate::scalar::{
+use crate::identity::{
     AbsoluteDeployDir, ApplicationStoreKey, BatchSize, CapacityPercent, Host, Identifier,
     RolloutGroupName, SshUser,
+};
+use crate::identity::{
+    ArtifactRef, ReleaseId, SlotId, TargetName, VariantName, test_deployment_id,
+    test_generation_id, test_tree_digest,
+};
+use crate::ledger::{
+    DeploymentIntent, DesiredGeneration, IntentSlot, LEDGER_SCHEMA_VERSION, LedgerIntentWire,
+    LedgerLine, NonEmptySlotTable,
 };
 use crate::store::local::LocalStore;
 use proptest::prelude::*;
@@ -1284,7 +1284,7 @@ fn intended_intent(dep: &str) -> DeploymentIntent {
             desired: DesiredGeneration {
                 generation: test_generation_id("gen-1"),
                 artifact: ArtifactRef {
-                    release: crate::model::test_release_id("rel-1"),
+                    release: crate::identity::test_release_id("rel-1"),
                     variant: VariantName::new("standard".to_string()),
                     tree: test_tree_digest("tree-1"),
                 },
@@ -2431,7 +2431,9 @@ proptest! {
 /// accidentally produce a valid string — the property asserts the
 /// equivalence against [`ReleaseId::parse`] itself, so that is fine.)
 fn arbitrary_raw_pin_release() -> impl Strategy<Value = String> {
-    let digest = crate::model::test_tree_digest("prop").as_str().to_string();
+    let digest = crate::identity::test_tree_digest("prop")
+        .as_str()
+        .to_string();
     prop_oneof![
         // The canonical VALID form: `rel-sha256-` + 64 lowercase hex.
         prop::collection::vec(prop::sample::select(b"0123456789abcdef".to_vec()), 64)
@@ -2974,7 +2976,7 @@ fn rename_target_rewrites_slot_references() {
 fn pin_ops_add_remove_rename() {
     let cfg = unit_config();
     let pin = Pin {
-        release: crate::model::test_release_id("rel-1"),
+        release: crate::identity::test_release_id("rel-1"),
         reason: "known-good".to_string(),
     };
     let added = cfg.with_pin(pin.clone()).unwrap();
@@ -2986,14 +2988,14 @@ fn pin_ops_add_remove_rename() {
     assert!(removed.pins().is_empty());
     // Renaming rewrites the release (both ids are typed, so the new
     // release is valid by construction).
-    let other = crate::model::test_release_id("rel-2");
+    let other = crate::identity::test_release_id("rel-2");
     let renamed = added.rename_pin(&pin.release, &other).unwrap();
     assert_eq!(renamed.pins()[0].release, other);
     assert!(
         added
             .rename_pin(
-                &crate::model::test_release_id("rel-9"),
-                &crate::model::test_release_id("rel-3")
+                &crate::identity::test_release_id("rel-9"),
+                &crate::identity::test_release_id("rel-3")
             )
             .is_err()
     );
@@ -3429,7 +3431,7 @@ proptest! {
 // =====================================================================
 //
 // The config's `application` field IS the store key
-// ([`crate::scalar::ApplicationStoreKey`]): a single safe path segment
+// ([`crate::identity::ApplicationStoreKey`]): a single safe path segment
 // used for both display and storage. The raw -> domain conversion
 // parses it AS the store key, so a display name that is not a safe key
 // FAILS THE LOAD (fail closed at load, not at the store boundary), and

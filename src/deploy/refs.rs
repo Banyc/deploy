@@ -3,7 +3,7 @@
 //! owns ONLY the syntax — its [`parse_ref_expr`] returns an AST
 //! ([`RefExpr`]) with no `LocalStore` in scope and no resolution; the
 //! store-dependent resolution that FOLLOWS the AST lives in
-//! [`crate::history::resolve_ref_expr`].
+//! [`crate::ledger::resolve_ref_expr`].
 //!
 //! The push reference is jj-style: the TARGET IS NEVER REPEATED in the
 //! reference, and the `@`-relative forms resolve against the separately-given
@@ -14,8 +14,8 @@
 //!   token BEFORE it acquires locks or persists anything, so a malformed
 //!   token fails before any side effect and the deployment id/plan are never
 //!   serialized against a half-parsed reference.
-//! * [`crate::history::resolve_ref_expr`] turns the parsed expression into a
-//!   concrete [`crate::history::PushRef`] against the target's deployment
+//! * [`crate::ledger::resolve_ref_expr`] turns the parsed expression into a
+//!   concrete [`crate::ledger::PushRef`] against the target's deployment
 //!   history in the store.
 //!
 //! The accepted forms are:
@@ -58,7 +58,7 @@
 //! error — never underflow, never guess.
 
 use crate::error::{Error, Result};
-use crate::model::{DeploymentId, ReleaseId};
+use crate::identity::{DeploymentId, ReleaseId};
 use winnow::ascii::digit1;
 use winnow::combinator::{alt, cut_err, eof, peek, preceded, terminated};
 use winnow::error::{ErrMode, ParserError};
@@ -506,7 +506,7 @@ fn deployment_form(input: &mut &str, token: &str) -> ModalResult<RefExpr, RefErr
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::model::test_deployment_id;
+    use crate::identity::test_deployment_id;
     use proptest::prelude::*;
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
 
@@ -597,12 +597,12 @@ pub(crate) mod tests {
         let full = format!("rel-sha256-{digest}");
         assert_eq!(
             parse_ref_expr(&format!("release:{full}")).unwrap(),
-            RefExpr::Release(crate::model::ReleaseId::parse(&full).unwrap())
+            RefExpr::Release(crate::identity::ReleaseId::parse(&full).unwrap())
         );
         // A bare digest is normalized to the full `rel-sha256-` id.
         assert_eq!(
             parse_ref_expr(&format!("release:{digest}")).unwrap(),
-            RefExpr::Release(crate::model::ReleaseId::parse(&full).unwrap())
+            RefExpr::Release(crate::identity::ReleaseId::parse(&full).unwrap())
         );
     }
 

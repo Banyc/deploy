@@ -12,11 +12,11 @@
 //! floor marker must be durable BEFORE the compaction deletes anything, so
 //! an interrupted compaction can never expose history below the floor; the
 //! checkpoint's per-stage sequence (the transactional ADVANCE and its
-//! restore) lives in [`crate::store::history_floor`] on top of these
+//! restore) lives in [`crate::retention::history_floor`] on top of these
 //! primitives.
 //!
 //! The helpers here are the shared plumbing — `pub(crate)` free functions
-//! imported by [`crate::store::local`] and [`crate::store::history_floor`]:
+//! imported by [`crate::store::local`] and [`crate::retention::history_floor`]:
 //! the tri-state existence check ([`path_state`]), the fail-closed
 //! parent-dir fsync ([`sync_parent_dir`]), unique temp naming
 //! ([`temp_name_for`]), the atomic marker/JSONL rewrites

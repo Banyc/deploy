@@ -18,7 +18,7 @@
 //!
 //! The raw/wire layers keep the bare forms (strings, integers, paths) and
 //! the raw -> domain / wire -> domain conversions (in `crate::config` and
-//! `crate::records`) parse them into these scalars, REJECTING invalid input
+//! `crate::ledger`) parse them into these scalars, REJECTING invalid input
 //! with a config/integrity error (fail closed). A scalar is deliberately NOT
 //! introduced for a plain string that carries no invariant ("do not overdo
 //! one-line wrappers when they carry no invariant") — only the fields below

@@ -22,7 +22,7 @@
 //! equality itself.
 
 use crate::error::{Error, Result};
-use crate::model::{DeploymentId, SlotId};
+use crate::identity::{DeploymentId, SlotId};
 use std::collections::BTreeSet;
 
 /// Verify THE SUCCESSFUL MEMBERSHIP EQUATIONS for a `Successful` terminal

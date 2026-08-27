@@ -7,8 +7,8 @@
 //! be double-owned, and two live contenders can never both win the
 //! acquisition. Locks are taken in a fixed local-then-target order — the
 //! application-store `operation.lock` first, then the target lock — so the
-//! whole push pipeline, including [`crate::push::checkpoint`], runs under the
-//! same discipline as [`crate::push::engine::push`].
+//! whole push pipeline, including [`crate::retention::checkpoint`], runs under the
+//! same discipline as [`crate::deploy::push`].
 
 use crate::error::{Error, Result};
 use std::os::unix::io::AsRawFd;
@@ -21,9 +21,9 @@ use std::path::Path;
 /// lock is released by the kernel rather than lingering, and two live
 /// contenders can never both win the acquisition.
 ///
-/// `pub(crate)` so the checkpoint command ([`crate::push::checkpoint`]) runs
+/// `pub(crate)` so the checkpoint command ([`crate::retention::checkpoint`]) runs
 /// under the SAME lock discipline as pushes: the application-store lock then
-/// the target lock, exactly like [`crate::push::engine::push`].
+/// the target lock, exactly like [`crate::deploy::push`].
 pub(crate) struct FileLock {
     file: std::fs::File,
     path: std::path::PathBuf,
@@ -42,7 +42,7 @@ impl FileLock {
         // parent sync happened) and a reported-successful first push could
         // recover with the target directory missing after power loss. The
         // engine also durably pre-creates the target directory before
-        // locking (see [`crate::push::engine::push`]); this helper makes
+        // locking (see [`crate::deploy::push`]); this helper makes
         // the lock path itself durable for every caller.
         if let Some(parent) = path.parent() {
             crate::store::atomic::ensure_private_dir_durable(parent)

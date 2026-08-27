@@ -23,7 +23,7 @@
 //! the next push reconciles it ([`crate::ledger::recovery`]).
 //!
 //! DEPLOYMENT-ID KEYING: every entry is keyed by its
-//! [`crate::model::DeploymentId`] — the ledger is the deployment's full
+//! [`crate::identity::DeploymentId`] — the ledger is the deployment's full
 //! history record, and appends are idempotent by id (a duplicate intent or
 //! terminal for the same deployment is refused by the store's writer).
 //!
@@ -34,10 +34,10 @@
 //! carries; the wire shapes and their VERIFYING CONVERSIONS live with the
 //! records in [`crate::ledger::records`].
 
+use crate::identity::{DeploymentId, TargetName};
 use crate::ledger::records::{
     DeploymentIntent, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire,
 };
-use crate::model::{DeploymentId, TargetName};
 use serde::{Deserialize, Serialize};
 
 /// ONE physical line of a target's deployment ledger — the WIRE enum: the

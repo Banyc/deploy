@@ -97,7 +97,7 @@ impl NonEmptySlotSet {
 /// and current (live) memberships verified EXACTLY EQUAL, carrying the
 /// agreed NON-EMPTY slot set. The ONLY construction path is
 /// [`MatchingMembership::verify`] — the membership gate produces the proof
-/// and the planner consumes it (a [`crate::records::RebindingPlan`] records
+/// and the planner consumes it (a [`crate::ledger::RebindingPlan`] records
 /// it as the membership check that ran). The serde impls serialize the
 /// agreed set and deserialize only a NON-EMPTY set (the persisted-wire
 /// replay of an already-verified proof; the record's wire -> domain

@@ -71,29 +71,29 @@
 //! | Bounds: `need + reserve > available` wraps | `bounds_capacity_matches_u128_reference_over_grid` |
 
 use crate::config::{FailurePolicy, ProjectConfig, SlotConfig};
+use crate::deploy::capacity::capacity_fits;
+use crate::deploy::{PushOptions, PushReport, push, push_with_id};
 use crate::error::Result;
-use crate::history;
-use crate::layout;
-use crate::model::{
+use crate::identity::{
     ArtifactRef, DeploymentId, GenerationId, OperationId, ReleaseId, SlotId, TreeDigest,
     VariantName, test_deployment_id, test_tree_digest,
 };
-use crate::push::capacity::capacity_fits;
-use crate::push::checkpoint::{CheckpointReport, run_checkpoint_unlocked};
-use crate::push::engine::{PushOptions, PushReport, push, push_with_id};
-use crate::records::DeploymentStatus;
-use crate::records::LedgerEntry;
-use crate::records::SlotOutcomeKind;
-use crate::release::{
-    canonicalize_slots, release_digest, variant_slots_digest, verify_release_identity,
-};
+use crate::ledger;
+use crate::ledger::DeploymentStatus;
+use crate::ledger::LedgerEntry;
+use crate::ledger::SlotOutcomeKind;
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
+use crate::remote::layout;
 use crate::remote::transport::{
     ExecOutcome, FsBytes, LocalTransport, Remote, RemoteEntry, RemoteMeta,
 };
+use crate::retention::checkpoint::{CheckpointReport, run_checkpoint_unlocked};
 use crate::retention::compute_retained;
 use crate::store::local::LocalStore;
 use crate::testutil::step17_hook;
+use crate::verify::release::{
+    canonicalize_slots, release_digest, variant_slots_digest, verify_release_identity,
+};
 use proptest::prelude::*;
 use proptest::test_runner::{FileFailurePersistence, RngSeed};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -1266,7 +1266,7 @@ impl Fixture {
     /// chain is a no-op step (the model predicts the same: there is no
     /// deployment to checkpoint). The local advisory locks are skipped
     /// exactly like the fixture's push entry points
-    /// ([`crate::push::engine::push_with_id`]); the durable floor write, the
+    /// ([`crate::deploy::push_with_id`]); the durable floor write, the
     /// `checkpoint_discards` enumeration, and the `checkpoint_compact`
     /// compaction all run UNMODIFIED on the per-fixture store (its fault
     /// registry hooks are the checkpoint path's own — the generated failure
@@ -1355,7 +1355,7 @@ impl Fixture {
             None
         };
         let res = match ref_token {
-            Some(rt) => crate::push::engine::push_ref_with_id(
+            Some(rt) => crate::deploy::push_ref_with_id(
                 &self.cfg_path,
                 &self.store,
                 &self.remote_factory(),
@@ -1447,7 +1447,7 @@ impl Fixture {
         let t_owned = t.to_string();
         std::thread::scope(|s| {
             let push = s.spawn(|| match ref_token {
-                Some(rt) => crate::push::engine::push_ref_with_id(
+                Some(rt) => crate::deploy::push_ref_with_id(
                     &self.cfg_path,
                     &self.store,
                     &self.remote_factory(),
@@ -1662,7 +1662,7 @@ impl Fixture {
                 .slots
                 .get(&slot_id)
                 .unwrap_or_else(|| panic!("{target}: observed {slot_id} entry must be present"));
-            let crate::records::Observation::Known(state) = &slot.observation else {
+            let crate::ledger::Observation::Known(state) = &slot.observation else {
                 panic!("{target}: observed {slot_id} must be a successful read");
             };
             assert_eq!(
@@ -1773,7 +1773,7 @@ impl Fixture {
                 stored.artifact.variant = VariantName::new("canary".to_string())
             }
             TamperKind::AssignmentRelease => {
-                stored.artifact.release = crate::model::test_release_id("rel-sha256-tampered")
+                stored.artifact.release = crate::identity::test_release_id("rel-sha256-tampered")
             }
             TamperKind::BehaviorJson => unreachable!("handled above"),
             TamperKind::ReleaseSchemaVersion => {
@@ -1781,7 +1781,7 @@ impl Fixture {
                 // non-canonical value; the record must fail closed on read.
                 self.tamper_stored_release(|v| {
                     v["release_schema_version"] = serde_json::json!(
-                        crate::model::RELEASE_RECORD_SCHEMA_VERSION.wrapping_add(1)
+                        crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION.wrapping_add(1)
                     );
                 });
                 return;
@@ -1936,7 +1936,7 @@ impl Fixture {
                      evaluated by check_invariants)"
                 ),
             };
-            let crate::records::Observation::Known(state) = &slot.observation else {
+            let crate::ledger::Observation::Known(state) = &slot.observation else {
                 panic!("{target}: observed {slot_id} must be a successful read");
             };
             assert_eq!(
@@ -2189,7 +2189,7 @@ fn identity_artifact_component_change_prevents_noop() {
     let r1 = f.push("t1").expect("push v1");
     let first_tree = match &r1.attempt.as_ref().expect("attempt").slots[&SlotId::new("p1")].artifact
     {
-        crate::records::Observation::Known(a) => a.tree.clone(),
+        crate::ledger::Observation::Known(a) => a.tree.clone(),
         other => panic!("a successful push's actual artifact is Known, got {other:?}"),
     };
     f.apply(Action::Build(2));
@@ -2717,7 +2717,7 @@ fn state_machine_checkpoint_floor_discards_below_pending_keeps_above() {
         "the finalized pending commit must produce exactly ONE rollback state"
     );
     assert_eq!(
-        history::successful_index(&f.store, "t1", &DeploymentId::new(pending_id))
+        ledger::successful_index(&f.store, "t1", &DeploymentId::new(pending_id))
             .unwrap()
             .unwrap(),
         1,
@@ -2931,7 +2931,7 @@ fn observed_scope_interleaved_push_fail_retry_rollback_sequence() {
         .observation
         .clone();
     let stale_gen = match &stale {
-        crate::records::Observation::Known(s) => Some(s.generation.clone()),
+        crate::ledger::Observation::Known(s) => Some(s.generation.clone()),
         _ => None,
     };
     let id_c = test_deployment_id("si-obs-seq-crash");
@@ -3193,7 +3193,7 @@ fn run_failure_position_case(policy: FailurePolicy, position: usize) {
             .slots
             .get(&SlotId::new(sid.to_string()))
             .and_then(|o| match &o.observation {
-                crate::records::Observation::Known(s) => Some(s.generation.clone()),
+                crate::ledger::Observation::Known(s) => Some(s.generation.clone()),
                 _ => None,
             });
         assert_eq!(
@@ -3397,7 +3397,7 @@ fn run_remaining_changes_case(policy: FailurePolicy, position: usize) {
         .map(|s| SlotId::new(s.to_string()))
         .filter(|sid| {
             let observed_gen = observed.slots.get(sid).and_then(|o| match &o.observation {
-                crate::records::Observation::Known(s) => Some(s.generation.clone()),
+                crate::ledger::Observation::Known(s) => Some(s.generation.clone()),
                 _ => None,
             });
             let pre_gen = intent
@@ -3584,7 +3584,7 @@ fn identity_duplicates_are_rejected_and_canonicalize_identically() {
 #[test]
 fn identity_canonical_serialization_round_trips() {
     let art = ArtifactRef {
-        release: crate::model::test_release_id("rel-sha256-abc"),
+        release: crate::identity::test_release_id("rel-sha256-abc"),
         variant: VariantName::new("standard".to_string()),
         tree: test_tree_digest("tree-1"),
     };
@@ -4200,7 +4200,7 @@ fn integrity_stored_release_per_field_deletion_fails_closed() {
         // Deleting a required field makes the record unreadable or
         // unverifiable — never silently accepted.
         let result = (|| -> Result<()> {
-            let rec: crate::model::ReleaseRecord = serde_json::from_str(&tampered)?;
+            let rec: crate::identity::ReleaseRecord = serde_json::from_str(&tampered)?;
             verify_release_identity(&rec)?;
             Ok(())
         })();
@@ -4317,7 +4317,7 @@ fn integrity_digest_unchanged_after_tamper_fails_closed() {
     // An INCOMING tampered record must fail closed at one of the store's two
     // boundaries: `write_release` refuses it before writing (strict behavior)
     // or, if the write is accepted, the read recomputes and refuses it.
-    let rec: crate::model::ReleaseRecord =
+    let rec: crate::identity::ReleaseRecord =
         serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
     let fresh = tempfile::tempdir().unwrap();
     let store2 = LocalStore::with_base(fresh.path().join("store")).unwrap();
@@ -4461,7 +4461,7 @@ fn integrity_tampered_stored_behavior_json_blocks_historical_push() {
 
 /// The schema-version property, end-to-end: a stored release record whose
 /// `release_schema_version` was rewritten to any arbitrary `u32` value other
-/// than [`crate::model::RELEASE_RECORD_SCHEMA_VERSION`] must fail closed on
+/// than [`crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION`] must fail closed on
 /// every read and block the next push — never silently accepted, never
 /// republished. The dedicated [`TamperKind::ReleaseSchemaVersion`]
 /// action rewrites the field; the matrix here sweeps the full representative
@@ -4493,8 +4493,8 @@ fn integrity_stored_release_schema_version_tamper_fails_closed() {
     };
     let versions = [
         0u32,
-        crate::model::RELEASE_RECORD_SCHEMA_VERSION.wrapping_sub(1),
-        crate::model::RELEASE_RECORD_SCHEMA_VERSION.wrapping_add(1),
+        crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION.wrapping_sub(1),
+        crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION.wrapping_add(1),
         3,
         u32::MAX,
     ];
@@ -4529,7 +4529,7 @@ fn integrity_stored_release_schema_version_tamper_fails_closed() {
 
     // Restoring the canonical version restores readability (the tamper is
     // reversible; the record itself is unchanged otherwise).
-    write_version(crate::model::RELEASE_RECORD_SCHEMA_VERSION);
+    write_version(crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION);
     f.store
         .read_release(&id)
         .expect("the canonical version reads");
@@ -4585,7 +4585,7 @@ fn integrity_incoming_record_field_deletion_fails_closed() {
         let mut v: serde_json::Value = serde_json::from_str(intent_line.trim()).unwrap();
         v.as_object_mut().unwrap().remove(field);
         let tampered = serde_json::to_string(&v).unwrap();
-        let rec: std::result::Result<crate::records::LedgerLine, _> =
+        let rec: std::result::Result<crate::ledger::LedgerLine, _> =
             serde_json::from_str(&tampered);
         assert!(
             rec.is_err(),
@@ -4604,7 +4604,7 @@ fn integrity_incoming_record_field_deletion_fails_closed() {
         let mut v: serde_json::Value = serde_json::from_str(terminal_line.trim()).unwrap();
         v.as_object_mut().unwrap().remove(field);
         let tampered = serde_json::to_string(&v).unwrap();
-        let rec: std::result::Result<crate::records::LedgerLine, _> =
+        let rec: std::result::Result<crate::ledger::LedgerLine, _> =
             serde_json::from_str(&tampered);
         assert!(
             rec.is_err(),
@@ -5914,7 +5914,7 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
         );
         for (ss, (wi, wid, mv)) in sys_snaps.iter().zip(&want) {
             assert_eq!(
-                history::successful_index(&system.store, t, &ss.deployment_id)
+                ledger::successful_index(&system.store, t, &ss.deployment_id)
                     .unwrap()
                     .unwrap(),
                 *wi,
@@ -5927,7 +5927,7 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
                  must never resolve to a different deployment (no duplicate, no re-append)"
             );
             let rollback = match &ss.terminal.as_ref().expect("terminal").disposition {
-                crate::records::TerminalDisposition::Successful { rollback, .. } => rollback,
+                crate::ledger::TerminalDisposition::Successful { rollback, .. } => rollback,
                 _ => panic!("a successful entry carries a rollback state"),
             };
             // The snapshot's OWN first slot (a slot has exactly one owning
@@ -6051,7 +6051,7 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
                     )
                 }
                 (Some((v, dep)), Some(slot)) => {
-                    let crate::records::Observation::Known(state) = &slot.observation else {
+                    let crate::ledger::Observation::Known(state) = &slot.observation else {
                         panic!("{ctx}: {t} observed {slot_id} must be a successful read");
                     };
                     let art = state.artifact.clone();
@@ -6119,7 +6119,7 @@ fn assert_semantic_invariants(model: &Model, system: &Fixture) {
 /// The PENDING-COMMIT × CHECKPOINT (retained-suffix) invariant bundle,
 /// asserted after EVERY step and at the end of a state-machine run
 /// (alongside [`assert_semantic_invariants`]). Pins the documented contract
-/// ([`crate::push::checkpoint`]): a pending-commit entry whose ledger line
+/// ([`crate::retention::checkpoint`]): a pending-commit entry whose ledger line
 /// lies BELOW the checkpoint deployment's position is discarded with the
 /// rest of the below-checkpoint history (its intent line, its terminal (if
 /// any), and its deployment dir all vanish — no resurrection on recovery);
@@ -6206,14 +6206,14 @@ fn assert_checkpoint_invariants(model: &Model, system: &Fixture) {
         // checkpoint discarded fails closed (the below-suffix ids no longer
         // exist).
         for (_, wid) in &successful_positions {
-            let resolved = history::resolve_ref_expr(
-                &history::parse_ref_expr(wid).expect("a deployment id parses"),
+            let resolved = ledger::resolve_ref_expr(
+                &ledger::parse_ref_expr(wid).expect("a deployment id parses"),
                 t,
                 &system.store,
             )
             .unwrap_or_else(|e| panic!("{ctx}: deployment {wid} on {t} must resolve: {e}"));
             match resolved {
-                history::PushRef::Deployment { deployment_id, .. } => {
+                ledger::PushRef::Deployment { deployment_id, .. } => {
                     assert_eq!(
                         deployment_id.as_str(),
                         wid,
@@ -6237,7 +6237,7 @@ fn assert_checkpoint_invariants(model: &Model, system: &Fixture) {
             format!("parent(@, {beyond})")
         };
         let err =
-            history::resolve_ref_expr(&history::parse_ref_expr(&token).unwrap(), t, &system.store)
+            ledger::resolve_ref_expr(&ledger::parse_ref_expr(&token).unwrap(), t, &system.store)
                 .unwrap_err();
         let msg = err.to_string();
         assert!(

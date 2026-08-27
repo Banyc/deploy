@@ -35,24 +35,27 @@
 //! * [`capacity`] — capacity preflight (the old `push::capacity`).
 //!
 //! The old `push::engine` / `push::plan` / `push::server` / `push::staging` /
-//! `push::capacity` and `revset` modules are re-export shims over this
-//! module, so `crate::push::*` and `crate::revset::*` keep resolving as
-//! before.
+//! `push::capacity` and `revset` modules have been folded in here, and their
+//! items are reachable either at the area root (the re-export globs below) or
+//! through the submodule paths (`crate::deploy::plan::…`,
+//! `crate::deploy::refs::…`, …).
 
 pub mod batching;
 pub mod capacity;
 pub mod dryrun;
 pub mod failure;
 pub mod groups;
+pub mod lock;
 pub mod plan;
 pub mod push;
 pub mod refs;
 pub mod server;
 pub mod staging;
 
-// The re-export globs feed the `push::*` / `revset` shims' own globs
-// (`pub use crate::deploy::*`), which the unused-imports lint cannot see;
-// the modules' items are consumed through those shims, not by name here.
+// The area-root re-export globs make every submodule's items nameable at
+// `crate::deploy::…` (the old `push::engine::*` / `revset::*` call sites
+// resolve here); the `pub(crate)` globs are kept for the items the engine
+// consumes by the area-root path rather than by submodule path.
 #[allow(unused_imports)]
 pub(crate) use batching::*;
 #[allow(unused_imports)]

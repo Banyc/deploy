@@ -129,8 +129,8 @@ pub(crate) fn test_operation_id(tag: &str) -> OperationId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::RolloutGroupName;
     use crate::identity::digests::{ReleaseDigest, TreeDigest, test_tree_digest};
-    use crate::identity::scalars::RolloutGroupName;
     use crate::identity::segments::{ServerId, SlotId, TargetName, VariantName};
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;

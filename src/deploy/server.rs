@@ -6,19 +6,19 @@
 //! plus the tree-download helper and the per-process release-JSON publication
 //! cache shared with `push::engine`. Extracted from `push::engine`.
 
-use crate::adapter::systemd::{run_activation, validate_artifact_paths};
-use crate::adapter::verify::run_verification;
 use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
-use crate::layout;
-use crate::model::{
+use crate::identity::{
     ArtifactRef, BehaviorContract, DeploymentId, GenerationId, OperationId, ReleaseId, TargetName,
 };
-use crate::records::SlotOutcomeKind;
+use crate::ledger::SlotOutcomeKind;
+use crate::remote::canonical as tree;
 use crate::remote::helper::RemoteHelper;
+use crate::remote::layout;
 use crate::remote::transport::Remote;
 use crate::store::local::LocalStore;
-use crate::tree;
+use crate::verify::command::run_verification;
+use crate::verify::systemd::{run_activation, validate_artifact_paths};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -60,7 +60,7 @@ pub(crate) fn process_server(
     expected_gen: Option<&GenerationId>,
     behavior: &BehaviorContract,
     behavior_sha256: &str,
-    template_vars: &crate::template::TemplateVars,
+    template_vars: &crate::remote::materialize::TemplateVars,
     config: &ProjectConfig,
 ) -> Result<ServerProc> {
     // Acquire the slot's mutation lock via an RAII guard so every return path
@@ -366,7 +366,7 @@ pub(crate) fn compensate_server(
     prior_gen: Option<&GenerationId>,
     advanced_gen: &GenerationId,
     _config: &ProjectConfig,
-    template_vars: &crate::template::TemplateVars,
+    template_vars: &crate::remote::materialize::TemplateVars,
 ) -> Result<bool> {
     // Hold the slot's mutation lock for the duration of compensation. Re-acquiring
     // is idempotent when the same op_id already holds it (process_server holds it
@@ -484,10 +484,9 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{
-        RELEASE_RECORD_SCHEMA_VERSION, TreeDigest, VariantName, test_deployment_id,
-    };
+    use crate::identity::{TreeDigest, VariantName, test_deployment_id};
     use crate::remote::transport::LocalTransport;
+    use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
     use std::path::PathBuf;
 
     const NONE_VARIANT: &str = r#"
@@ -612,13 +611,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// `behavior_sha256` must be the canonical digest of the behavior payload
     /// published alongside the record (computed from the harness's own
     /// configured contract), or the publish path refuses the pair.
-    fn harness_release_record(behavior_sha: &str) -> crate::model::ReleaseRecord {
-        let mut rec = crate::model::ReleaseRecord {
+    fn harness_release_record(behavior_sha: &str) -> crate::identity::ReleaseRecord {
+        let mut rec = crate::identity::ReleaseRecord {
             release_schema_version: RELEASE_RECORD_SCHEMA_VERSION,
             release_id: String::new(),
             release_sha256: String::new(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
-            provenance: crate::model::Provenance {
+            provenance: crate::identity::Provenance {
                 mapping_sha256: "m".to_string(),
                 behavior_sha256: behavior_sha.to_string(),
             },
@@ -628,8 +627,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             )]),
             slots: std::collections::BTreeMap::from([(
                 "standard".to_string(),
-                crate::model::CanonicalSlots {
-                    slots: vec![crate::model::CanonicalSlot {
+                crate::identity::CanonicalSlots {
+                    slots: vec![crate::identity::CanonicalSlot {
                         id: "p1".to_string(),
                         server: "s1".to_string(),
                         deploy_dir: "/srv/eng".to_string(),
@@ -639,10 +638,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 },
             )]),
         };
-        let digest = crate::release::recompute_release_digest(&rec)
+        let digest = crate::verify::release::recompute_release_digest(&rec)
             .expect("harness release must carry a slot snapshot");
         rec.release_sha256 = digest.as_str().to_string();
-        rec.release_id = crate::model::ReleaseId::from_digest(&digest)
+        rec.release_id = crate::identity::ReleaseId::from_digest(&digest)
             .as_str()
             .to_string();
         rec
@@ -682,10 +681,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let release_root = config.release_root(&cfg_path);
             let vcfg = config.variant("standard").unwrap();
             let staging = store.staging_dir().join("standard");
-            crate::mapper::materialize_variant(
+            crate::remote::materialize::materialize_variant(
                 &release_root,
                 &vcfg.artifact.mappings,
-                &crate::template::TemplateVars::mapping(
+                &crate::remote::materialize::TemplateVars::mapping(
                     config.application().as_str(),
                     config.release().as_str(),
                     "standard",
@@ -730,17 +729,17 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         fn behavior_sha256(&self) -> String {
             let behaviors =
                 std::collections::BTreeMap::from([("standard".to_string(), self.behave())]);
-            crate::release::variant_behaviors_digest(&behaviors)
+            crate::verify::release::variant_behaviors_digest(&behaviors)
         }
 
         /// The synthetic release record bound to THIS harness's configured
         /// behavior (so the published behavior JSON matches its provenance).
-        fn harness_release(&self) -> crate::model::ReleaseRecord {
+        fn harness_release(&self) -> crate::identity::ReleaseRecord {
             harness_release_record(&self.behavior_sha256())
         }
 
-        fn harness_release_id(&self) -> crate::model::ReleaseId {
-            crate::model::ReleaseId::new(self.harness_release().release_id)
+        fn harness_release_id(&self) -> crate::identity::ReleaseId {
+            crate::identity::ReleaseId::new(self.harness_release().release_id)
         }
 
         fn harness_release_json(&self) -> String {
@@ -758,7 +757,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                 )
                 .unwrap();
             let behavior = self.behave();
-            let sha = crate::release::behavior_contract_digest(&behavior);
+            let sha = crate::verify::release::behavior_contract_digest(&behavior);
             let new_gen = GenerationId::generate();
             let helper = self.helper();
             // Slot context from the harness config (one slot p1 on server s1,
@@ -772,7 +771,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             };
             let members = self.config.target_slots("t1").unwrap();
             let (slot, server) = members[0];
-            let vars = crate::template::TemplateVars::slot(
+            let vars = crate::remote::materialize::TemplateVars::slot(
                 slot.deploy_dir(),
                 artifact.variant.as_str(),
                 self.config.application().as_str(),
@@ -843,7 +842,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let obj_file = h
             .remote
             .root()
-            .join(crate::layout::objects())
+            .join(crate::remote::layout::objects())
             .join(h.tree.as_str())
             .join("root")
             .join("app-common")
@@ -980,7 +979,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let gen_root = h
                 .remote
                 .root()
-                .join(crate::layout::generation(proc.generation.as_str()))
+                .join(crate::remote::layout::generation(proc.generation.as_str()))
                 .join("root");
             assert!(
                 gen_root.ends_with(
@@ -1000,7 +999,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             assert!(
                 !h.remote
                     .root()
-                    .join(crate::layout::generation(proc.generation.as_str()))
+                    .join(crate::remote::layout::generation(proc.generation.as_str()))
                     .join("root/root")
                     .exists(),
                 "published tree must have no nested root dir (root/root double-join would ENOENT)"
@@ -1103,11 +1102,11 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let members = h.config.target_slots("t1").unwrap();
             let (slot, server) = members[0];
             let desired = ArtifactRef {
-                release: crate::model::test_release_id("rel-sha256-desired"),
+                release: crate::identity::test_release_id("rel-sha256-desired"),
                 variant: VariantName::new("standard"),
                 tree: TreeDigest::new("desired-tree"),
             };
-            let desired_vars = crate::template::TemplateVars::slot(
+            let desired_vars = crate::remote::materialize::TemplateVars::slot(
                 slot.deploy_dir(),
                 desired.variant.as_str(),
                 h.config.application().as_str(),
@@ -1240,13 +1239,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     generation_id: g2.clone(),
                     artifact: ArtifactRef {
                         release: h.harness_release_id(),
-                        variant: crate::model::VariantName::new("standard"),
+                        variant: crate::identity::VariantName::new("standard"),
                         tree: h.tree.clone(),
                     },
                     behavior_sha256: "b".into(),
                     prior_generation: Some(first.generation.clone()),
                     created_at: crate::remote::helper::now_rfc3339(),
-                    target: Some(crate::model::TargetName::new("t1")),
+                    target: Some(crate::identity::TargetName::new("t1")),
                 },
             )
             .unwrap();
@@ -1264,13 +1263,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     generation_id: g3.clone(),
                     artifact: ArtifactRef {
                         release: h.harness_release_id(),
-                        variant: crate::model::VariantName::new("standard"),
+                        variant: crate::identity::VariantName::new("standard"),
                         tree: h.tree.clone(),
                     },
                     behavior_sha256: "b".into(),
                     prior_generation: Some(g2.clone()),
                     created_at: crate::remote::helper::now_rfc3339(),
-                    target: Some(crate::model::TargetName::new("t1")),
+                    target: Some(crate::identity::TargetName::new("t1")),
                 },
             )
             .unwrap();
@@ -1291,7 +1290,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         let members = h.config.target_slots("t1").unwrap();
         let (slot, server) = members[0];
-        let vars = crate::template::TemplateVars::slot(
+        let vars = crate::remote::materialize::TemplateVars::slot(
             slot.deploy_dir(),
             "standard",
             h.config.application().as_str(),

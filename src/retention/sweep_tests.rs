@@ -13,7 +13,7 @@
 //! * PUSHER side (the local store): swept by CHECKPOINT. The checkpoint
 //!   atomically replaces the target's ONE ledger with the retained suffix
 //!   (the only logical commit) and then runs the GLOBAL reachability sweep
-//!   ([`crate::store::history_floor::LocalStore::run_sweep`]): unreachable
+//!   ([`crate::retention::history_floor::LocalStore::run_sweep`]): unreachable
 //!   deployment directories, release records, and tree objects are unlinked;
 //!   everything reachable from a retained ledger, the current/incomplete
 //!   state, or a pin survives.
@@ -23,9 +23,9 @@
 //! operation that triggered it and never reports an ordinary failure — it
 //! records DURABLE DEBT and the NEXT PUSH (real or no-op) fires the pending
 //! sweep. The receiver's retention debt is `targets/<target>/retention-debt.json`
-//! (serviced by [`crate::push::engine::retry_deferred_retentions`]); the
+//! (serviced by [`crate::deploy::retry_deferred_retentions`]); the
 //! pusher's sweep debt is `<base>/sweep-debt.json` (serviced by
-//! [`crate::push::engine::retry_pending_sweep`]). Both reports surface a
+//! [`crate::deploy::retry_pending_sweep`]). Both reports surface a
 //! pending sweep as a WARNING, never an error.
 //!
 //! The property tests below assert the no-leak contract on both sides, the
@@ -34,20 +34,20 @@
 //! push converges).
 
 use crate::config::ProjectConfig;
+use crate::deploy::{PushOptions, push, retry_pending_sweep};
 use crate::error::Result;
-use crate::layout;
-use crate::model::{
+use crate::identity::{
     ArtifactRef, DeploymentId, PlacementSlotAssignment, ReleaseId, ServerId, SlotId, TargetName,
     TreeDigest, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
 };
-use crate::push::checkpoint::run_checkpoint_unlocked;
-use crate::push::engine::{PushOptions, push, retry_pending_sweep};
-use crate::records::{
+use crate::ledger::{
     DeploymentIntent, DeploymentStatus, DesiredGeneration, IntentSlot, LedgerRollback,
     LedgerTerminal, NonEmptySlotTable, SlotOutcomeKind, SlotResult, SlotTable, TerminalDisposition,
 };
 use crate::remote::helper::{GenerationAssignment, RemoteHelper};
+use crate::remote::layout;
 use crate::remote::transport::{LocalTransport, Remote};
+use crate::retention::checkpoint::run_checkpoint_unlocked;
 use crate::retention::compute_retained;
 use crate::store::local::LocalStore;
 use crate::testutil::test_faults::FaultKind;
@@ -122,7 +122,7 @@ fn config_for(dir: &tempfile::TempDir, pinned: Option<&ReleaseId>) -> ProjectCon
 /// `tree-pinned`, and return its id — the pin must reference the id the
 /// record actually got.
 fn seed_real_release(store: &LocalStore) -> ReleaseId {
-    let rec = crate::release::build_release(
+    let rec = crate::verify::release::build_release(
         "sw",
         "sha256-aa",
         &BTreeMap::from([(
@@ -174,7 +174,7 @@ fn make_gen(
                 deployment_id: test_deployment_id(deployment_id),
                 generation_id: test_generation_id(generation_id),
                 artifact: ArtifactRef {
-                    release: crate::model::test_release_id("r"),
+                    release: crate::identity::test_release_id("r"),
                     variant: VariantName::new("standard".to_string()),
                     tree: canonical_tree,
                 },
@@ -213,7 +213,7 @@ fn intent(id: &str, target: &str) -> DeploymentIntent {
             desired: DesiredGeneration {
                 generation: test_generation_id("gen-1"),
                 artifact: ArtifactRef {
-                    release: crate::model::test_release_id("rel-1"),
+                    release: crate::identity::test_release_id("rel-1"),
                     variant: VariantName::new("standard".to_string()),
                     tree: test_tree_digest("tree-1"),
                 },
@@ -245,7 +245,7 @@ fn terminal_for(release: &str, tree: &str) -> LedgerTerminal {
             rollback: LedgerRollback {
                 slots: BTreeMap::from([(
                     SlotId::new("p1".to_string()),
-                    crate::model::GenerationRef {
+                    crate::identity::GenerationRef {
                         generation: test_generation_id("gen-1"),
                         assignment: PlacementSlotAssignment {
                             placement_slot: SlotId::new("p1".to_string()),
@@ -259,7 +259,7 @@ fn terminal_for(release: &str, tree: &str) -> LedgerTerminal {
                 )]),
                 bindings: BTreeMap::from([(
                     SlotId::new("p1".to_string()),
-                    crate::records::PhysicalBinding {
+                    crate::ledger::PhysicalBinding {
                         server: ServerId::new("s1".to_string()),
                         deploy_dir: "/srv/deploy/p1".to_string(),
                     },
@@ -320,7 +320,7 @@ fn seed_history(store: &LocalStore, target: &str, prefix: &str, history: &[bool]
         let canonical = test_deployment_id(&id);
         store.append_intent(target, &intent(&id, target)).unwrap();
         if *ok {
-            let rel = crate::model::test_release_id(&id).as_str().to_string();
+            let rel = crate::identity::test_release_id(&id).as_str().to_string();
             let tree = format!("tree-{id}");
             store
                 .append_terminal(target, &canonical, &terminal_for(&rel, &tree))
@@ -439,13 +439,13 @@ fn run_no_leak_case(
     let ids = seed_history(&store, TARGET, "deploy", &pusher_history);
     for (i, _) in pusher_history.iter().enumerate() {
         let id = format!("deploy-{i}");
-        seed_named_release(&store, crate::model::test_release_id(&id).as_str());
+        seed_named_release(&store, crate::identity::test_release_id(&id).as_str());
         seed_object(&store, &format!("tree-{id}"));
     }
     seed_unreachable(
         &store,
         "ghost-deploy",
-        crate::model::test_release_id("rel-sha256-ghost").as_str(),
+        crate::identity::test_release_id("rel-sha256-ghost").as_str(),
         "tree-ghost",
     );
 
@@ -511,7 +511,7 @@ fn run_no_leak_case(
         let reachable = *ok && i >= pos;
         assert_eq!(
             store
-                .release_dir(&crate::model::test_release_id(&id))
+                .release_dir(&crate::identity::test_release_id(&id))
                 .exists(),
             reachable,
             "release of entry {id} must survive iff it is in the retained suffix"
@@ -528,7 +528,7 @@ fn run_no_leak_case(
     assert!(!store.deployment_dir("ghost-deploy").exists());
     assert!(
         !store
-            .release_dir(&crate::model::test_release_id("rel-sha256-ghost"))
+            .release_dir(&crate::identity::test_release_id("rel-sha256-ghost"))
             .exists()
     );
     assert!(!store.object_root(&test_tree_digest("tree-ghost")).exists());
@@ -623,13 +623,13 @@ fn run_fault_case(pusher_history: Vec<bool>, checkpoint_at: usize, fault: SweepF
     let ids = seed_history(&store, TARGET, "deploy", &pusher_history);
     for (i, _) in pusher_history.iter().enumerate() {
         let id = format!("deploy-{i}");
-        seed_named_release(&store, crate::model::test_release_id(&id).as_str());
+        seed_named_release(&store, crate::identity::test_release_id(&id).as_str());
         seed_object(&store, &format!("tree-{id}"));
     }
     seed_unreachable(
         &store,
         "ghost-deploy",
-        crate::model::test_release_id("rel-sha256-ghost").as_str(),
+        crate::identity::test_release_id("rel-sha256-ghost").as_str(),
         "tree-ghost",
     );
     let at = checkpoint_at % ids.len();
@@ -681,7 +681,7 @@ fn run_fault_case(pusher_history: Vec<bool>, checkpoint_at: usize, fault: SweepF
         | SweepFault::GcDeleteReleases => {
             assert!(
                 store
-                    .release_dir(&crate::model::test_release_id("rel-sha256-ghost"))
+                    .release_dir(&crate::identity::test_release_id("rel-sha256-ghost"))
                     .exists()
             );
         }
@@ -704,14 +704,14 @@ fn run_fault_case(pusher_history: Vec<bool>, checkpoint_at: usize, fault: SweepF
     assert!(!store.deployment_dir("ghost-deploy").exists());
     assert!(
         !store
-            .release_dir(&crate::model::test_release_id("rel-sha256-ghost"))
+            .release_dir(&crate::identity::test_release_id("rel-sha256-ghost"))
             .exists()
     );
     assert!(!store.object_root(&test_tree_digest("tree-ghost")).exists());
     // Reachable + pinned content survives the converged sweep.
     assert!(
         store
-            .release_dir(&crate::model::test_release_id(&format!("deploy-{pos}")))
+            .release_dir(&crate::identity::test_release_id(&format!("deploy-{pos}")))
             .exists()
     );
     assert!(

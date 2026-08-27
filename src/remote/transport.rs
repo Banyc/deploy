@@ -161,7 +161,7 @@ impl LocalTransport {
     /// first mutation (the push engine does this behind its non-dry-run gate).
     ///
     /// The FILESYSTEM ROOT is refused (defense in depth, mirroring the
-    /// [`crate::scalar::AbsoluteDeployDir`] parse rule): a transport rooted at
+    /// [`crate::identity::AbsoluteDeployDir`] parse rule): a transport rooted at
     /// `/` would make the deployment cleanup (rotation/retention deleting
     /// stale generations, the GC sweep) operate on the system root, so the
     /// base must have at least one normal path component below the root.
@@ -186,8 +186,8 @@ impl Remote for LocalTransport {
             std::fs::create_dir_all(&self.base)
                 .map_err(|e| Error::transport(format!("mkdir {}: {e}", self.base.display())))?;
         }
-        // Provision the expected top-level layout (owned by `crate::layout`).
-        for d in crate::layout::bootstrap_dirs() {
+        // Provision the expected top-level layout (owned by `crate::remote::layout`).
+        for d in crate::remote::layout::bootstrap_dirs() {
             let p = self.base.join(d);
             if !p.exists() {
                 std::fs::create_dir_all(&p)

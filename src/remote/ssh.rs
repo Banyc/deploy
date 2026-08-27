@@ -66,7 +66,7 @@ impl SshTransport {
     /// application root is the absolute `deploy_dir` path on that host — a
     /// path with at least one normal component below the root (the
     /// filesystem root itself is refused, mirroring the
-    /// [`crate::scalar::AbsoluteDeployDir`] parse rule: a transport rooted
+    /// [`crate::identity::AbsoluteDeployDir`] parse rule: a transport rooted
     /// at `/` would make the deployment cleanup operate on the system
     /// root).
     ///
@@ -483,13 +483,13 @@ impl Remote for SshTransport {
 
     fn provision_layout(&self) -> Result<()> {
         // Create the deployment-directory layout on the remote host. The set of
-        // bootstrap directories is owned by `crate::layout::bootstrap_dirs` —
+        // bootstrap directories is owned by `crate::remote::layout::bootstrap_dirs` —
         // the same list LocalTransport provisions — and every path is
         // single-quoted by `argv_cmd`/`shell_quote` so it reaches `mkdir`
         // verbatim. This runs only after the push engine's non-dry-run gate.
         let mut argv: Vec<String> = vec!["mkdir".into(), "-p".into()];
         argv.extend(
-            crate::layout::bootstrap_dirs()
+            crate::remote::layout::bootstrap_dirs()
                 .iter()
                 .map(|d| self.root.join(d).to_string_lossy().into_owned()),
         );
@@ -869,8 +869,11 @@ mod tests {
     #[test]
     fn try_write_new_creates_parent_dir() {
         let t = transport();
-        let cmd =
-            SshTransport::write_new_cmd(t.root(), &crate::layout::operation_lock(), "op-proc");
+        let cmd = SshTransport::write_new_cmd(
+            t.root(),
+            &crate::remote::layout::operation_lock(),
+            "op-proc",
+        );
         assert!(
             cmd.starts_with("mkdir -p '/srv/app/state'"),
             "parent directory is created first, got: {cmd}"
@@ -893,7 +896,7 @@ mod tests {
         let cmd = SshTransport::rename_cmd(
             t.root(),
             Path::new(".current.tmp.op-x"),
-            crate::layout::current(),
+            crate::remote::layout::current(),
         );
         assert!(
             cmd.contains("mv -T"),
@@ -914,8 +917,11 @@ mod tests {
     #[test]
     fn try_write_new_temp_is_dot_prefixed_inside_destination_parent() {
         let t = transport();
-        let cmd =
-            SshTransport::write_new_cmd(t.root(), &crate::layout::operation_lock(), "op-proc");
+        let cmd = SshTransport::write_new_cmd(
+            t.root(),
+            &crate::remote::layout::operation_lock(),
+            "op-proc",
+        );
         assert!(
             cmd.contains("mktemp '/srv/app/state/.operation.lock.tmp.XXXXXX'"),
             "temp must be inside the destination parent, dot-prefixed, and mktemp-allocated, got: {cmd}"

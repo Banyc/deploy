@@ -1,14 +1,15 @@
 //! Checkpoint persistence: the store side of the ONE per-target ledger.
 //!
-//! Moved from `crate::store::history_floor` (now a re-export shim); the
-//! checkpoint command orchestration lives in [`super::checkpoint`], the pin
-//! honoring in [`super::pins`], and the artifact reclamation in [`super::gc`].
+//! Moved from `crate::store::history_floor` during the encapsulation
+//! restructure; the checkpoint command orchestration lives in
+//! [`super::checkpoint`], the pin honoring in [`super::pins`], and the
+//! artifact reclamation in [`super::gc`].
 //!
 //! A target's entire deployment history is ONE ordered, append-only JSONL
-//! ledger (`targets/<target>/ledger.jsonl`, see [`crate::records`]): each
+//! ledger (`targets/<target>/ledger.jsonl`, see [`crate::ledger`]): each
 //! entry starts as the DURABLE INTENT (written BEFORE any remote mutation)
 //! and its TERMINAL EVENT carries the status, the per-slot outcomes, and —
-//! when successful — the rollback state ([`crate::records::LedgerRollback`]).
+//! when successful — the rollback state ([`crate::ledger::LedgerRollback`]).
 //! There is NO history-floor marker, NO snapshot op log, NO per-deployment
 //! results/transition stream, and NO cleanup-pending debt flag: the old
 //! multi-file model (and with it the transactional floor-advance backup
@@ -19,7 +20,7 @@
 //! checkpoint's best-effort global sweep is POST-COMMIT MAINTENANCE, so an
 //! incomplete sweep records a durable marker and the NEXT PUSH (not just the
 //! next checkpoint) retries the sweep and clears it — see
-//! [`crate::push::engine::retry_pending_sweep`].
+//! [`crate::deploy::retry_pending_sweep`].
 //!
 //! A checkpoint (`deploy checkpoint <target> <deployment-id>`) is exactly
 //! three steps:
@@ -64,17 +65,17 @@ use crate::error::{Error, Result};
 // KEEP-BOTH (merge): the gc side's `ReleaseId` (pins honored by name in the
 // reachability scan) and the preview side's `LedgerEntry` (the override
 // carries parsed entries) are both live imports — keep both.
-use crate::model::DeploymentId;
-use crate::records::{LedgerEntry, Observation, TerminalDisposition};
+use crate::identity::DeploymentId;
+use crate::ledger::{LedgerEntry, Observation, TerminalDisposition};
+use crate::retention::gc::SweepStageStats;
 use crate::store::atomic::{path_state, write_atomic_replace};
-use crate::store::gc::SweepStageStats;
 use crate::store::local::LocalStore;
 use std::collections::BTreeSet;
 
 #[cfg(test)]
-use crate::model::SlotId;
+use crate::identity::SlotId;
 #[cfg(test)]
-use crate::records::{
+use crate::ledger::{
     DeploymentIntent, DeploymentStatus, LedgerRollback, LedgerTerminal, SlotResult, SlotTable,
 };
 #[cfg(test)]
@@ -443,7 +444,7 @@ impl LocalStore {
         }
         // Durable pins: a pin marks the WHOLE release — its record and every
         // variant's tree. ProjectConfig pins (`deploy.toml` `[[pins]]`) AND the
-        // store-level pins (`pins.json` — [`crate::records::Pins`]) are both
+        // store-level pins (`pins.json` — [`crate::ledger::Pins`]) are both
         // retention anchors: the checkpoint is store-only by construction, but
         // the CLI accepts both surfaces. FAIL CLOSED: a pin that names a
         // release with no record on disk, or whose record cannot be read or
@@ -451,7 +452,7 @@ impl LocalStore {
         // — the pin cannot be honored, so reachability is incomplete and the
         // sweep must abort before any deletion.
         for pin in config.pins() {
-            // The pin's release is the TYPED [`crate::model::ReleaseId`]: the
+            // The pin's release is the TYPED [`crate::identity::ReleaseId`]: the
             // raw -> domain conversion validated every pin's release at load,
             // so this id is already the canonical `rel-sha256-<64 lowercase
             // hex>` form — no late parse can fail.
@@ -530,7 +531,7 @@ impl LocalStore {
                 }
             }
         }
-        let rel_root = self.base().join(crate::layout::RELEASES);
+        let rel_root = self.base().join(crate::remote::layout::RELEASES);
         if path_state(&rel_root)? {
             let mut names: Vec<String> = std::fs::read_dir(&rel_root)
                 .map_err(|e| Error::store(format!("read_dir releases: {e}")))?
@@ -544,7 +545,7 @@ impl LocalStore {
                 }
             }
         }
-        let obj_root = self.base().join(crate::layout::objects());
+        let obj_root = self.base().join(crate::remote::layout::objects());
         if path_state(&obj_root)? {
             let mut names: Vec<String> = std::fs::read_dir(&obj_root)
                 .map_err(|e| Error::store(format!("read_dir objects: {e}")))?
@@ -569,7 +570,7 @@ impl LocalStore {
     /// ([`FaultKind::SweepObjects`]) each fire at the stage's entry, so a
     /// faulted stage deletes nothing and the report says sweep
     /// retry-required. The release-record and tree-object stages are performed
-    /// by the GLOBAL ARTIFACT GC ([`crate::store::gc::LocalStore::gc_artifacts`])
+    /// by the GLOBAL ARTIFACT GC ([`crate::retention::gc::LocalStore::gc_artifacts`])
     /// — its own faults ([`FaultKind::GcScan`] / [`FaultKind::GcDeleteReleases`]
     /// / [`FaultKind::GcDeleteTrees`]) fire inside the pass, and its
     /// per-candidate unlink faults ([`FaultKind::GcUnlinkReleases`] /

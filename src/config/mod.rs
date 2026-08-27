@@ -52,10 +52,10 @@
 //! [`retention`], [`activation`], [`verification`], [`servers`],
 //! [`capacity`], [`release_name`]).
 //!
-//! The crate-facing surface is re-exported here (this module IS the shim
-//! source): `crate::config::Pin`, `crate::config::ProjectConfig`,
-//! `crate::config::raw::RawConfig`, ... resolve exactly as they did when the
-//! whole config surface lived in `src/config.rs`.
+//! The crate-facing surface is re-exported here: `crate::config::Pin`,
+//! `crate::config::ProjectConfig`, `crate::config::raw::RawConfig`, ...
+//! resolve exactly as they did when the whole config surface lived in
+//! `src/config.rs`.
 
 pub(crate) mod raw;
 

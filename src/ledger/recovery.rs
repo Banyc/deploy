@@ -13,12 +13,12 @@
 
 use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
+use crate::identity::{GenerationId, OperationId, SlotId};
 use crate::ledger::finalize::{finalize_successful_attempt, recovery_outcomes};
 use crate::ledger::records::{
     DeploymentIntent, LedgerTerminal, Observation, ObservedGeneration, SlotOutcome,
     SlotOutcomeKind, SlotTable, SlotTransition, TerminalDisposition,
 };
-use crate::model::{GenerationId, OperationId, SlotId};
 use crate::remote::helper::RemoteHelper;
 use crate::store::local::LocalStore;
 use std::collections::{BTreeMap, HashMap, HashSet};

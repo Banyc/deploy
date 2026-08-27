@@ -7,9 +7,9 @@
 //! the four scenarios: status, dry-run, first push, and repeat push.
 
 use deploy::config::ProjectConfig;
+use deploy::deploy::{PushOptions, push};
 use deploy::error::Result;
-use deploy::push::engine::{PushOptions, push};
-use deploy::records::DeploymentStatus;
+use deploy::ledger::DeploymentStatus;
 use deploy::remote::ssh::SshTransport;
 use deploy::remote::transport::Remote;
 use deploy::store::local::LocalStore;
@@ -479,7 +479,7 @@ fn fingerprint_only_first_push_succeeds() -> Result<()> {
             assert!(
                 attempt
                     .slots
-                    .contains_key(&deploy::model::SlotId::parse("p1").unwrap())
+                    .contains_key(&deploy::identity::SlotId::parse("p1").unwrap())
             );
 
             // The emulated remote now has the full layout: a generation under

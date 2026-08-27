@@ -3,7 +3,7 @@
 //! The observation types (`Observation<T>`, `ObservedState`,
 //! `ObservedGeneration`, `ObservedSlot`, `ObservedTarget`,
 //! `ObservationError`) are owned by `crate::ledger::records` (the A2: Ledger
-//! semantics area — they moved from `crate::records` during the
+//! semantics area — they moved from `crate::ledger` during the
 //! encapsulation restructure), so this module is a thin re-export keeping the
 //! remote-facing observation surface reachable through
 //! `crate::remote::observed`.

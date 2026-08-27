@@ -27,8 +27,6 @@
 //! * [`proofs`] — the membership proofs [`SlotSet`]/[`NonEmptySlotSet`]/
 //!   [`MatchingMembership`]: the ONLY construction path is
 //!   [`MatchingMembership::verify`] (frozen == current).
-//! * [`versions`] — the `*_SCHEMA_VERSION` constants (parked here; each
-//!   moves to its owning area in a later pass).
 //!
 //! Deployment, operation, and generation IDs are opaque collision-resistant
 //! IDs (UUIDv7 in schema version 1). They identify events and are never used
@@ -48,7 +46,6 @@ mod proofs;
 mod release_id;
 mod scalars;
 mod segments;
-mod versions;
 
 pub use digests::*;
 pub use ids::*;
@@ -57,7 +54,6 @@ pub(crate) use proofs::*;
 pub use release_id::*;
 pub use scalars::*;
 pub use segments::*;
-pub use versions::*;
 
 /// The validated identity newtype: construction goes through [`parse`]
 /// (or `FromStr`/`TryFrom`), which enforces the type's format rule, and the

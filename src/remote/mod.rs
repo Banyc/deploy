@@ -11,14 +11,12 @@
 //!   they are [`RemoteHelper`](helper::RemoteHelper) methods interdependent
 //!   with the rest of the struct, and splitting them would loosen the struct's
 //!   field encapsulation).
-//! * [`canonical`] — canonical tree objects (moved from `crate::tree`, which
-//!   is now a re-export shim).
+//! * [`canonical`] — canonical tree objects (moved from `crate::tree`).
 //! * [`materialize`] — mapping resolution + the template renderer (moved from
-//!   `crate::mapper` / `crate::template`, both now re-export shims).
-//! * [`layout`] — canonical on-server layout paths (moved from `crate::layout`,
-//!   now a re-export shim).
+//!   `crate::mapper` / `crate::template`).
+//! * [`layout`] — canonical on-server layout paths (moved from `crate::layout`).
 //! * [`observed`] — the three-state observation types, re-exported from
-//!   `crate::records` (a later pass owns them).
+//!   [`crate::ledger`] (owned by the A2 ledger area).
 //! * [`transport`], [`ssh`], [`hostkey`], [`runner`] — transport and
 //!   execution layers.
 

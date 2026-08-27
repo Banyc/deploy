@@ -25,10 +25,10 @@
 //! * [`finalize`] — replay-safe finalization
 //!   ([`finalize_successful_attempt`]) + recovery outcomes.
 //! * [`recovery`] — pending-attempt reconciliation
-//!   ([`reconcile_pending_commits`], moved from `crate::push::reconcile`).
+//!   ([`reconcile_pending_commits`], moved from `crate::ledger::recovery`).
 //! * [`refs`] — reference RESOLUTION against the ledger
 //!   ([`resolve_ref_expr`] + the derived successful-chain helpers; the
-//!   GRAMMAR stays in [`crate::revset`]).
+//!   GRAMMAR stays in [`crate::deploy::refs`]).
 //!
 //! Deferred modules (feature present, but the SEMANTIC TYPES do not live
 //! here — noted so the inventory stays complete):
@@ -40,19 +40,20 @@
 //!   [`crate::remote::helper::RemoteHelper::write_commit_marker`] and the
 //!   deterministic payload is built at the call sites; no marker SEMANTIC
 //!   TYPES live in records.rs, so there is no `markers` module.
-//! * **schema versions** — `LEDGER_SCHEMA_VERSION` stays parked in
-//!   [`crate::identity::versions`] (a later pass relocates it) and the
+//! * **schema versions** — `LEDGER_SCHEMA_VERSION` and `PINS_SCHEMA_VERSION`
+//!   live next to the wire records they version in
+//!   [`crate::ledger::records`] (re-exported at the area root), and the
 //!   wire-version gate lives in the store reader
-//!   ([`crate::store::local::LocalStore::read_ledger`]); there is no
-//!   version-check logic to move here, so there is no `schema` module.
+//!   ([`crate::store::local::LocalStore::read_ledger`]).
 //! * **transaction records** — the `transactions/<op-id>.json` I/O lives in
 //!   [`crate::remote::helper::RemoteHelper::transaction_record`]; no
 //!   transaction-record SEMANTIC TYPES live in records.rs, so there is no
 //!   `transactions` module.
 //!
-//! During the encapsulation restructure, `crate::records`, `crate::history`,
-//! and `crate::push::reconcile` are RE-EXPORT SHIMS over this module; later
-//! passes update call sites and remove the shims.
+//! During the encapsulation restructure, the old `crate::records`,
+//! `crate::history`, and `crate::push::reconcile` paths were folded into
+//! this area (`records`/`finalize`/`refs`/`rollback`/`recovery` here; the
+//! reference GRAMMAR lives in [`crate::deploy::refs`]); the shims are gone.
 
 pub mod append;
 pub mod finalize;
@@ -79,8 +80,11 @@ pub use refs::{
 };
 pub use rollback::build_rollback;
 // Crate-internal items: the reference RESOLUTION + grammar re-exports stay
-// pub(crate) (the push engine / plan consume them through the `crate::history`
-// shim). The membership-equation verifier and the reconciliation entry point
+// pub(crate) — the push engine / plan consume them through the ledger path.
+// The membership-equation verifier and the reconciliation entry point
 // are NOT re-exported at the area root: their only in-crate consumers use the
 // module paths directly ([`crate::ledger::records`] / [`crate::ledger::recovery`]).
 pub(crate) use refs::{RefExpr, parse_ref_expr, resolve_ref_expr};
+// The ledger/pins format-version constants (defined next to the wire records
+// in [`crate::ledger::records`]).
+pub(crate) use records::{LEDGER_SCHEMA_VERSION, PINS_SCHEMA_VERSION};

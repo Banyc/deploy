@@ -34,14 +34,14 @@
 //!   receiver-side retention pin expansion. The config/store pin types live in
 //!   [`crate::config::pins`] and the store; the honoring logic lives here.
 //! * [`gc`] — the global artifact garbage collection (moved from
-//!   `crate::store::gc`, now a re-export shim): reachability, the sweep stages,
-//!   the PLANNED-vs-REMOVED counting, and the sweep-debt interactions.
+//!   `crate::store::gc`): reachability, the sweep stages, the
+//!   PLANNED-vs-REMOVED counting, and the sweep-debt interactions.
 //! * [`history_floor`] — the pusher-side ledger/history semantics (moved from
-//!   `crate::store::history_floor`, now a re-export shim): `reachable_set`,
+//!   `crate::store::history_floor`): `reachable_set`,
 //!   the retained-suffix [`LedgerOverride`](history_floor::LedgerOverride), the
 //!   Unknown-observation conservatism, and the post-commit sweep.
-//! * [`checkpoint`] — the checkpoint command (moved from `crate::push::checkpoint`,
-//!   now a re-export shim): the retained suffix, the atomic replace, the
+//! * [`checkpoint`] — the checkpoint command (moved from `crate::push::checkpoint`):
+//!   the retained suffix, the atomic replace, the
 //!   post-commit sweep, preview/override parity, and the post-commit warnings.
 //! * [`debt`] — the sweep-debt orchestration: when a sweep is incomplete the
 //!   durable marker is recorded so the next push retries it; a completed sweep
@@ -53,7 +53,7 @@
 //!   object NOT in the retained set; the rotation I/O lives in
 //!   [`crate::remote::helper`].
 //! * [`sweep_tests`] (test-only) — the two-sided sweep contract tests (moved
-//!   from `crate::sweep`, now a re-export shim): receiver retention +
+//!   from `crate::sweep`): receiver retention +
 //!   pusher checkpoint independence, no-leak, and maintenance-not-correction.
 
 pub mod checkpoint;

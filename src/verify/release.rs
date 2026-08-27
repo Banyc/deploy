@@ -11,26 +11,47 @@
 //!
 //! Moved from `crate::release` (area A5). The behavior-contract digest
 //! functions live in [`crate::verify::behavior`]; they are re-exported here
-//! so the single-glob `crate::release` shim keeps the legacy
-//! `crate::release::*` surface (including `behavior_digest`, which the
-//! integration tests reach as `deploy::release::behavior_digest`).
+//! so the legacy `crate::release::*` surface resolves through
+//! [`crate::verify::release`] (including `behavior_digest`, which the
+//! integration tests reach as `deploy::verify::release::behavior_digest`).
 
 pub use crate::verify::behavior::*;
 
 use crate::config::{Mapping, SlotConfig};
 use crate::digest::sha256_bytes;
 use crate::error::{Error, Result};
-use crate::model::{
-    CanonicalReleasePayload, CanonicalSlot, CanonicalSlots, Provenance,
-    RELEASE_PAYLOAD_SCHEMA_VERSION, RELEASE_RECORD_SCHEMA_VERSION, ReleaseDigest, ReleaseId,
+use crate::identity::{
+    CanonicalReleasePayload, CanonicalSlot, CanonicalSlots, Provenance, ReleaseDigest, ReleaseId,
     ReleaseRecord, TreeDigest, VariantName,
 };
 use jiff::Timestamp;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
+/// The canonical release identity PAYLOAD version
+/// (`CanonicalReleasePayload.schema_version`), FROZEN INTO the release
+/// digest: the field is part of the hashed identity payload, so its value
+/// can never change without producing a new release ID. Version 3 is the
+/// exclusive-ownership payload: the per-variant canonical slot declaration
+/// digest (`slots_digest`) now carries each slot's ONE owning target and
+/// its rollout groups (replacing the multi-target `targets` membership
+/// list). Read-side enforcement is implicit and fail-closed:
+/// `verify_release_identity` recomputes the digest using exactly this
+/// version, so a release whose identity was derived from any other payload
+/// version fails the recompute-and-verify check.
+pub(crate) const RELEASE_PAYLOAD_SCHEMA_VERSION: u32 = 3;
+
+/// The `release.json` record format version
+/// (`ReleaseRecord.release_schema_version`). `build_release` emits exactly
+/// this value and [`verify_release_identity`] refuses any other version
+/// (fail closed) on every write and read path. Version 2 records the
+/// exclusive-ownership canonical slot snapshot (each slot's one `target` +
+/// `groups`); version 1 records (the multi-target `targets` shape) are
+/// rejected on read — no compatibility fallback.
+pub(crate) const RELEASE_RECORD_SCHEMA_VERSION: u32 = 2;
+
 #[cfg(test)]
-use crate::model::BehaviorContract;
+use crate::identity::BehaviorContract;
 
 /// Canonical digest of the frozen mapping set.
 pub fn mapping_digest(mappings: &[Mapping]) -> String {

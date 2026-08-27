@@ -6,10 +6,10 @@
 //! keyed by an operation ID and is idempotent.
 
 use crate::error::{Error, Result};
-use crate::layout;
-use crate::model::{
+use crate::identity::{
     ArtifactRef, BehaviorContract, DeploymentId, GenerationId, ReleaseId, ReleaseRecord, TargetName,
 };
+use crate::remote::layout;
 use crate::remote::transport::Remote;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -301,14 +301,14 @@ impl<'a> RemoteHelper<'a> {
                 .read(&layout::remote_release(release_id.as_str()).join("release.json"))?,
         )
         .map_err(|e| Error::integrity(format!("malformed release record for {release_id}: {e}")))?;
-        crate::release::verify_release_identity(&rec)?;
+        crate::verify::release::verify_release_identity(&rec)?;
         if rec.release_id != release_id.as_str() {
             return Err(Error::integrity(format!(
                 "release record identity {} does not match the read path {release_id}",
                 rec.release_id
             )));
         }
-        let behaviors = crate::release::verify_behavior_json(
+        let behaviors = crate::verify::release::verify_behavior_json(
             &data,
             &rec.release_id,
             &rec.provenance.behavior_sha256,
@@ -401,7 +401,7 @@ impl<'a> RemoteHelper<'a> {
         let rec: ReleaseRecord = serde_json::from_str(release_json).map_err(|e| {
             Error::integrity(format!("malformed release record for {release_id}: {e}"))
         })?;
-        crate::release::verify_release_identity(&rec)?;
+        crate::verify::release::verify_release_identity(&rec)?;
         if rec.release_id != release_id {
             return Err(Error::integrity(format!(
                 "release record identity {} does not match the publish path {release_id}",
@@ -415,7 +415,7 @@ impl<'a> RemoteHelper<'a> {
         // closed), so a release never publishes a behavior snapshot that does
         // not match the release it is stored under. A payload that parses to
         // the SAME canonical contract set (e.g. key reordering) passes.
-        crate::release::verify_behavior_json(
+        crate::verify::release::verify_behavior_json(
             behavior_json.as_bytes(),
             &rec.release_id,
             &rec.provenance.behavior_sha256,
@@ -456,7 +456,7 @@ impl<'a> RemoteHelper<'a> {
                     rel.display()
                 ))
             })?;
-            crate::release::verify_release_identity(&existing_rec)?;
+            crate::verify::release::verify_release_identity(&existing_rec)?;
             if existing_rec.release_sha256 != rec.release_sha256 {
                 return Err(Error::integrity(format!(
                     "refusing to replace existing {} with a different release",
@@ -864,7 +864,7 @@ pub fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{test_deployment_id, test_generation_id, test_tree_digest};
+    use crate::identity::{test_deployment_id, test_generation_id, test_tree_digest};
     use crate::remote::transport::LocalTransport;
     use proptest::prelude::*;
     use proptest::test_runner::RngSeed;
@@ -880,9 +880,9 @@ mod tests {
             deployment_id: test_deployment_id("deploy-1"),
             generation_id: test_generation_id(gen_id),
             artifact: ArtifactRef {
-                release: crate::model::test_release_id("rel-sha256-x"),
-                variant: crate::model::VariantName::new("standard".to_string()),
-                tree: crate::model::test_tree_digest(tree),
+                release: crate::identity::test_release_id("rel-sha256-x"),
+                variant: crate::identity::VariantName::new("standard".to_string()),
+                tree: crate::identity::test_tree_digest(tree),
             },
             behavior_sha256: "b".to_string(),
             prior_generation: None,
@@ -896,11 +896,11 @@ mod tests {
     /// (adapter `systemd` — non-default, so field deletions change the
     /// digest — plus a command verification), and the serialized behavior JSON
     /// for that same set.
-    fn publish_fixture() -> (crate::model::ReleaseRecord, String) {
-        let contracts: std::collections::BTreeMap<String, crate::model::BehaviorContract> =
+    fn publish_fixture() -> (crate::identity::ReleaseRecord, String) {
+        let contracts: std::collections::BTreeMap<String, crate::identity::BehaviorContract> =
             std::collections::BTreeMap::from([(
                 "standard".to_string(),
-                crate::model::BehaviorContract {
+                crate::identity::BehaviorContract {
                     activation: crate::config::ActivationConfig {
                         adapter: "systemd".to_string(),
                         scope: crate::config::ActivationScope::System,
@@ -921,13 +921,13 @@ mod tests {
                     },
                 },
             )]);
-        let behavior_sha = crate::release::variant_behaviors_digest(&contracts);
+        let behavior_sha = crate::verify::release::variant_behaviors_digest(&contracts);
         let variants: std::collections::BTreeMap<
-            crate::model::VariantName,
-            crate::model::TreeDigest,
+            crate::identity::VariantName,
+            crate::identity::TreeDigest,
         > = std::collections::BTreeMap::from([(
-            crate::model::VariantName::new("standard"),
-            crate::model::test_tree_digest("t1"),
+            crate::identity::VariantName::new("standard"),
+            crate::identity::test_tree_digest("t1"),
         )]);
         let slots: std::collections::BTreeMap<String, Vec<crate::config::SlotConfig>> =
             std::collections::BTreeMap::from([(
@@ -940,7 +940,7 @@ mod tests {
                     Vec::new(),
                 )],
             )]);
-        let rec = crate::release::build_release(
+        let rec = crate::verify::release::build_release(
             "m",
             &behavior_sha,
             &variants,
@@ -1424,8 +1424,8 @@ mod tests {
 
         // Post-upload integrity: the uploaded tree canonicalizes to the host's
         // digest.
-        let host_meta = crate::tree::canonicalize_tree(&host).unwrap();
-        let remote_meta = crate::tree::canonicalize_tree(&remote_root).unwrap();
+        let host_meta = crate::remote::canonical::canonicalize_tree(&host).unwrap();
+        let remote_meta = crate::remote::canonical::canonicalize_tree(&remote_root).unwrap();
         assert_eq!(
             remote_meta.tree_sha256, host_meta.tree_sha256,
             "uploaded tree must match the host tree digest"
@@ -1478,8 +1478,8 @@ mod tests {
 
         // Post-upload integrity: the uploaded tree canonicalizes to the host's
         // digest.
-        let host_meta = crate::tree::canonicalize_tree(&host).unwrap();
-        let remote_meta = crate::tree::canonicalize_tree(&remote_root).unwrap();
+        let host_meta = crate::remote::canonical::canonicalize_tree(&host).unwrap();
+        let remote_meta = crate::remote::canonical::canonicalize_tree(&remote_root).unwrap();
         assert_eq!(
             remote_meta.tree_sha256, host_meta.tree_sha256,
             "uploaded tree must match the host tree digest"
@@ -2044,7 +2044,7 @@ mod tests {
     fn arbitrary_gen_id() -> impl Strategy<Value = String> {
         prop_oneof![
             // Valid: gen-<uuid-v7> derived from an arbitrary tag.
-            "[a-z0-9]{1,16}".prop_map(|tag| format!("gen-{}", crate::model::test_uuid_v7(&tag))),
+            "[a-z0-9]{1,16}".prop_map(|tag| format!("gen-{}", crate::identity::test_uuid_v7(&tag))),
             // Malformed: wrong prefix, empty, garbage.
             "[a-zA-Z0-9]{0,40}",
         ]
@@ -2052,7 +2052,7 @@ mod tests {
 
     /// A VALID canonical generation id (`gen-<uuid-v7>` derived from a tag).
     fn valid_gen_id() -> impl Strategy<Value = String> {
-        "[a-z0-9]{1,16}".prop_map(|tag| format!("gen-{}", crate::model::test_uuid_v7(&tag)))
+        "[a-z0-9]{1,16}".prop_map(|tag| format!("gen-{}", crate::identity::test_uuid_v7(&tag)))
     }
 
     /// A tree digest: either a VALID 64-hex digest (derived from a tag) or
@@ -2060,7 +2060,7 @@ mod tests {
     /// derived from it may not be a valid digest at all).
     fn arbitrary_tree() -> impl Strategy<Value = String> {
         prop_oneof![
-            "[a-z0-9]{1,32}".prop_map(|tag| crate::model::test_sha256_hex(&tag)),
+            "[a-z0-9]{1,32}".prop_map(|tag| crate::identity::test_sha256_hex(&tag)),
             "[a-zA-Z0-9]{0,70}",
         ]
     }
@@ -2110,7 +2110,7 @@ mod tests {
             // A structurally valid record.
             (arbitrary_gen_id(), arbitrary_tree()).prop_map(|(gid, tree)| {
                 serde_json::to_vec(&serde_json::json!({
-                    "deployment_id": format!("deploy-{}", crate::model::test_uuid_v7("prop")),
+                    "deployment_id": format!("deploy-{}", crate::identity::test_uuid_v7("prop")),
                     "generation_id": gid,
                     "artifact": {
                         "release": format!("rel-sha256-{}", "0".repeat(64)),
@@ -2165,8 +2165,8 @@ mod tests {
     /// and the tree object directory present.
     fn consistent_layout() -> impl Strategy<Value = PropLayout> {
         ("[a-z0-9]{1,16}", "[a-z0-9]{1,32}").prop_map(|(g_tag, t_tag)| {
-            let gid = format!("gen-{}", crate::model::test_uuid_v7(&g_tag));
-            let tree = crate::model::test_sha256_hex(&t_tag);
+            let gid = format!("gen-{}", crate::identity::test_uuid_v7(&g_tag));
+            let tree = crate::identity::test_sha256_hex(&t_tag);
             PropLayout {
                 current: Some(CurrentKind::Symlink(format!(
                     "{}/{}/root",

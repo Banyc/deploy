@@ -5,23 +5,29 @@
 //! content digests. It deliberately excludes ownership, timestamps, ACLs, and
 //! extended attributes (stripped in schema version 1).
 //!
-//! This canonical format is a cross-module contract: the mapper materializes
-//! into it (`mapper.rs`), the store verifies objects against it
-//! (`store/local.rs::store_object`), recovery and pre-activation checks
-//! re-hash with it (`push/engine.rs`), and the SSH transport must preserve
-//! exactly these bytes on upload — modes as raw octal in `list`, symlinks
-//! pinned to a fixed recorded mode. Any module that serializes or transfers
-//! tree bytes diverging from this format silently breaks digest equality for
-//! every other verifier.
+//! This canonical format is a cross-module contract: [`crate::remote::materialize`]
+//! materializes into it, the store verifies objects against it
+//! ([`crate::store::local::LocalStore::store_object`]), recovery and
+//! pre-activation checks re-hash with it ([`crate::deploy::push`]), and the
+//! SSH transport must preserve exactly these bytes on upload — modes as raw
+//! octal in `list`, symlinks pinned to a fixed recorded mode. Any module that
+//! serializes or transfers tree bytes diverging from this format silently
+//! breaks digest equality for every other verifier.
 
 use crate::digest::sha256_bytes;
 use crate::error::{Error, Result};
-use crate::model::{TREE_SCHEMA_VERSION, TreeEntry, TreeMetadata};
+use crate::identity::{TreeEntry, TreeMetadata};
 use std::collections::BTreeSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
+
+/// The `tree.json` metadata format version (`TreeMetadata.tree_schema_version`).
+/// [`canonicalize_tree`] emits exactly this value and
+/// [`crate::store::local::LocalStore::read_tree_meta`] refuses any other
+/// version (fail closed).
+pub(crate) const TREE_SCHEMA_VERSION: u32 = 1;
 
 fn fmt_mode(m: u32) -> String {
     format!("{:04o}", m & 0o7777)
