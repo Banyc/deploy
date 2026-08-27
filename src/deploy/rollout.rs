@@ -745,7 +745,7 @@ pub(crate) fn compensate_server(
     prior_gen: Option<&GenerationId>,
     advanced_gen: &GenerationId,
     _config: &ProjectConfig,
-    template_vars: &crate::remote::materialize::TemplateVars,
+    template_vars: &crate::remote::canonical::TemplateVars,
 ) -> Result<bool> {
     // Hold the slot's mutation lock for the duration of compensation. Re-acquiring
     // is idempotent when the same op_id already holds it (process_server holds it
@@ -901,7 +901,7 @@ mod compensation_tests {
                 variant: VariantName::new("standard"),
                 tree: TreeDigest::new("desired-tree"),
             };
-            let desired_vars = crate::remote::materialize::TemplateVars::slot(
+            let desired_vars = crate::remote::canonical::TemplateVars::slot(
                 slot.deploy_dir(),
                 desired.variant.as_str(),
                 h.config.application().as_str(),
@@ -1085,7 +1085,7 @@ mod compensation_tests {
 
         let members = h.config.target_slots("t1").unwrap();
         let (slot, server) = members[0];
-        let vars = crate::remote::materialize::TemplateVars::slot(
+        let vars = crate::remote::canonical::TemplateVars::slot(
             slot.deploy_dir(),
             "standard",
             h.config.application().as_str(),
@@ -1174,7 +1174,7 @@ pub(crate) fn process_server(
     expected_gen: Option<&GenerationId>,
     behavior: &BehaviorContract,
     behavior_sha256: &str,
-    template_vars: &crate::remote::materialize::TemplateVars,
+    template_vars: &crate::remote::canonical::TemplateVars,
     config: &ProjectConfig,
 ) -> Result<ServerProc> {
     // Acquire the slot's mutation lock via an RAII guard so every return path
@@ -1711,10 +1711,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             let release_root = config.release_root(&cfg_path);
             let vcfg = config.variant("standard").unwrap();
             let staging = store.staging_dir().join("standard");
-            crate::remote::materialize::materialize_variant(
+            crate::remote::canonical::materialize_variant(
                 &release_root,
                 &vcfg.artifact.mappings,
-                &crate::remote::materialize::TemplateVars::mapping(
+                &crate::remote::canonical::TemplateVars::mapping(
                     config.application().as_str(),
                     config.release().as_str(),
                     "standard",
@@ -1801,7 +1801,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             };
             let members = self.config.target_slots("t1").unwrap();
             let (slot, server) = members[0];
-            let vars = crate::remote::materialize::TemplateVars::slot(
+            let vars = crate::remote::canonical::TemplateVars::slot(
                 slot.deploy_dir(),
                 artifact.variant.as_str(),
                 self.config.application().as_str(),

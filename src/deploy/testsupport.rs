@@ -1093,10 +1093,10 @@ pub(crate) fn membership_drift_fixture(
     // HEAD push would, so the matching-membership control can run a FULL
     // real push (staging reads the local object).
     let staging = store.staging_dir().join("membership-fixture");
-    crate::remote::materialize::materialize_variant(
+    crate::remote::canonical::materialize_variant(
         &release_dir,
         &config.variant("standard").unwrap().artifact.mappings,
-        &crate::remote::materialize::TemplateVars::mapping(
+        &crate::remote::canonical::TemplateVars::mapping(
             config.application().as_str(),
             config.release().as_str(),
             "standard",

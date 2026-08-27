@@ -159,7 +159,7 @@ pub(crate) struct PushContext<'a> {
 /// it actually deploys, and a template never sees a torn (desired-variant,
 /// current-release) combination. Compensation overrides the five
 /// deployment-scoped values again with the PRIOR assignment via
-/// [`crate::remote::materialize::TemplateVars::with_assignment`]: the prior artifact's
+/// [`crate::remote::canonical::TemplateVars::with_assignment`]: the prior artifact's
 /// release/variant/tree AND the prior deployment identity
 /// (`deployment_id`/`generation`) move together.
 ///
@@ -175,7 +175,7 @@ pub(crate) fn slot_vars(
     artifact: &ArtifactRef,
     deployment_id: Option<&DeploymentId>,
     generation: Option<&GenerationId>,
-) -> Result<crate::remote::materialize::TemplateVars> {
+) -> Result<crate::remote::canonical::TemplateVars> {
     let (slot, server) = members
         .iter()
         .find(|(s, _)| s.id == slot_id.as_str())
@@ -185,7 +185,7 @@ pub(crate) fn slot_vars(
                 slot_id.as_str()
             ))
         })?;
-    Ok(crate::remote::materialize::TemplateVars::slot(
+    Ok(crate::remote::canonical::TemplateVars::slot(
         slot.deploy_dir(),
         artifact.variant.as_str(),
         config.application().as_str(),
@@ -939,10 +939,10 @@ pub(crate) fn run_preflight(
             } else {
                 store.staging_dir().join(&v)
             };
-            crate::remote::materialize::materialize_variant(
+            crate::remote::canonical::materialize_variant(
                 &release_root,
                 &config.variant(&v)?.artifact.mappings,
-                &crate::remote::materialize::TemplateVars::mapping(
+                &crate::remote::canonical::TemplateVars::mapping(
                     config.application().as_str(),
                     config.release().as_str(),
                     &v,
@@ -1700,10 +1700,10 @@ pub(crate) mod preflight_tests {
         let release_root = config.release_root(&cfg_path);
         let vcfg = config.variant("standard").unwrap();
         let staging = store.staging_dir().join("standard");
-        crate::remote::materialize::materialize_variant(
+        crate::remote::canonical::materialize_variant(
             &release_root,
             &vcfg.artifact.mappings,
-            &crate::remote::materialize::TemplateVars::mapping(
+            &crate::remote::canonical::TemplateVars::mapping(
                 config.application().as_str(),
                 config.release().as_str(),
                 "standard",

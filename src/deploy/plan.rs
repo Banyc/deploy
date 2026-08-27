@@ -4988,7 +4988,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 /// Restore owner-write permission (u+w, mode bit 0o200) on every directory and
 /// file under `root` that lacks it, leaving all other mode bits untouched.
 /// Materialized dry-run staging trees can contain read-only entries — artifact
-/// source modes are preserved by [`crate::remote::materialize::materialize_variant`] — and
+/// source modes are preserved by [`crate::remote::canonical::materialize_variant`] — and
 /// POSIX `remove_dir_all` needs write permission on every directory it enters,
 /// so a read-only subdirectory makes the whole removal fail with EACCES.
 /// Symlinks are never followed or modified.

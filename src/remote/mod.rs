@@ -1,51 +1,29 @@
-//! Transport, remote helper, remote adapter orchestration, and the remote-
-//! facing semantics: canonical tree objects, mapping/template materialization,
-//! and the canonical on-server layout.
+//! Transport, remote helper, and the remote-facing semantics: the remote
+//! helper operations (status/chain, CAS swap, commit markers, transactions,
+//! publication, rotation, protocol handshake, assignment records, observed
+//! state), the transport stack (Remote trait, Local/Ssh transports, host
+//! identity pinning, execution runner), canonical tree content
+//! (canonicalization + mapping/template materialization), and the canonical
+//! on-server layout.
 //!
 //! # Modules
 //!
-//! * [`assignment`] — the generation record [`GenerationAssignment`]
-//!   (`generations/<gen>/assignment.json`): `read_assignment` and the
-//!   create-or-compare `create_generation` write + `root` symlink (moved from
-//!   `helper`).
-//! * [`helper`] — [`RemoteHelper`](helper::RemoteHelper): the struct,
-//!   constructor, and the core read/status plumbing everything shares
-//!   (behavior reads, the mutation lock + RAII guard, inventory writes).
-//! * [`current`] — the `current` symlink chain: full-chain integrity
-//!   validation in `status`, the canonical-target parse, `swap_current`
-//!   (the CAS precondition), and `remove_current_if`.
-//! * [`markers`] — commit markers (write-once create-or-compare).
-//! * [`transactions`] — transaction records (`prepared` → `committed` →
-//!   `compensated`).
-//! * [`publish`] — object-store-facing publication: `tree_exists`,
-//!   `stage_incoming`, `publish_from_incoming`, `remove_incoming`,
-//!   `publish_tree`, `publish_release` (identity re-verified before install).
-//! * [`rotate`] — receiver rotation I/O (contract in `crate::retention::rotate`).
-//! * [`protocol`] — the protocol handshake (A5).
-//! * [`canonical`] — canonical tree objects (moved from `crate::tree`).
-//! * [`materialize`] — mapping resolution + the template renderer (moved from
-//!   `crate::mapper` / `crate::template`).
-//! * [`layout`] — canonical on-server layout paths (moved from `crate::layout`).
-//! * [`observed`] — the three-state observation types, re-exported from
-//!   [`crate::ledger`] (owned by the A2 ledger area).
-//! * [`transport`], [`ssh`], [`hostkey`], [`runner`] — transport and
-//!   execution layers.
+//! * [`helper`] — THE REMOTE HELPER OPERATIONS: [`RemoteHelper`](helper::RemoteHelper),
+//!   the `current`-chain status inspection, the CAS `current` swap, commit
+//!   markers, transaction records, object-store publication, receiver
+//!   rotation, the protocol handshake, the generation assignment record, and
+//!   the observed-state re-exports.
+//! * [`transport`] — THE TRANSPORT STACK: the [`Remote`](transport::Remote)
+//!   trait, [`LocalTransport`](transport::LocalTransport) and
+//!   [`SshTransport`](transport::SshTransport), host-identity verification
+//!   and pinning, and the bounded subprocess execution runner.
+//! * [`canonical`] — THE TREE CONTENT: canonical tree objects plus
+//!   mapping/template materialization.
+//! * [`layout`] — canonical on-server layout paths (crate-wide infra).
 
-pub mod assignment;
 pub mod canonical;
-pub mod current;
 pub mod helper;
-pub mod hostkey;
 pub mod layout;
-pub mod markers;
-pub mod materialize;
-pub mod observed;
-pub mod protocol;
-pub mod publish;
-pub mod rotate;
-pub mod runner;
-pub mod ssh;
-pub mod transactions;
 pub mod transport;
 
 use crate::config::{ServerConnection, ServerDef};
@@ -93,7 +71,7 @@ pub fn create_remote(server: &ServerDef, deploy_dir: &std::path::Path) -> Result
                     )));
                 }
             };
-            Ok(Box::new(ssh::SshTransport::new(
+            Ok(Box::new(transport::SshTransport::new(
                 user.as_str(),
                 address.as_str(),
                 port.get(),

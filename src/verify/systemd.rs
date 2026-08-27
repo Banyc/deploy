@@ -2,7 +2,7 @@
 //!
 //! The mapped unit file remains an ordinary artifact in the tree, but its
 //! CONTENT is rendered with the slot's template context (see
-//! [`crate::remote::materialize`]) at activation time: unit files use per-slot values
+//! [`crate::remote::canonical`]) at activation time: unit files use per-slot values
 //! such as `ExecStart={{ deploy_dir }}/current/app/server`, and trees are
 //! content-addressed and shared across slots, so the slot context can only be
 //! substituted when the unit is installed, never at materialization. The
@@ -16,7 +16,7 @@
 
 use crate::config::{ActivationConfig, validate_relative_path};
 use crate::error::{Error, Result};
-use crate::remote::materialize::TemplateVars;
+use crate::remote::canonical::TemplateVars;
 use crate::remote::transport::Remote;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -236,7 +236,7 @@ pub fn stage_rendered_units(
         })?;
         let text = std::str::from_utf8(&raw)
             .map_err(|e| Error::remote(format!("unit '{}' is not UTF-8: {e}", u.name)))?;
-        let rendered = crate::remote::materialize::render_template(text, vars).map_err(|e| {
+        let rendered = crate::remote::canonical::render_template(text, vars).map_err(|e| {
             Error::remote(format!(
                 "render unit '{}' ({}) with slot context: {e}",
                 u.name, u.artifact_path

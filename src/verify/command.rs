@@ -3,7 +3,7 @@
 //! and interval. Success requires a zero exit status within the timeout.
 //!
 //! Every argv element is rendered through the template module
-//! ([`crate::remote::materialize`]) with the slot context BEFORE exec, so a check like
+//! ([`crate::remote::canonical`]) with the slot context BEFORE exec, so a check like
 //! `argv = ["{{ deploy_dir }}/current/app/server", "health-check"]` resolves
 //! to the slot's real deployment directory. Elements without templates are
 //! unchanged; an unknown or malformed variable fails loudly before anything
@@ -11,7 +11,7 @@
 
 use crate::config::VerificationConfig;
 use crate::error::{Error, Result};
-use crate::remote::materialize::TemplateVars;
+use crate::remote::canonical::TemplateVars;
 use crate::remote::transport::Remote;
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ pub fn run_verification(
     let timeout = Duration::from_secs(cfg.timeout_seconds);
     // Render BEFORE the first exec: a template error fails the verification
     // loudly instead of executing a half-rendered command.
-    let argv = crate::remote::materialize::render_argv(&cfg.argv, vars)?;
+    let argv = crate::remote::canonical::render_argv(&cfg.argv, vars)?;
     let mut last_stderr = String::new();
     for attempt in 0..attempts {
         let outcome = remote.exec(&argv, timeout)?;
