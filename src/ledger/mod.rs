@@ -8,16 +8,30 @@
 //!   merged entry ([`LedgerEntry`]): the crash-atomic append + deployment-id
 //!   keying contracts (the physical I/O stays in
 //!   [`crate::store::local::LocalStore`]).
-//! * [`records`] — the core wire + domain RECORDS: the intents
-//!   ([`LedgerIntentWire`] / [`DeploymentIntent`]), terminals
-//!   ([`LedgerTerminalWire`] / [`LedgerTerminal`] /
-//!   [`TerminalDisposition`]), the rollback records
+//! * [`records`] — the SHARED core RECORDS: the per-slot tables
+//!   ([`SlotTable`] / [`NonEmptySlotTable`]), the wire outcome
+//!   ([`SlotResult`]), the shared deployment-record fields
+//!   ([`SlotAttemptState`] / [`DeploymentStatus`]), the rollback records
 //!   ([`LedgerRollbackWire`] / [`LedgerRollback`] / [`PhysicalBinding`]),
-//!   the per-slot tables ([`SlotTable`] / [`NonEmptySlotTable`]), the slot
-//!   outcomes ([`SlotOutcome`] / [`SlotResult`] / [`SlotOutcomeKind`] /
-//!   [`SlotTransition`]), the three-state observations ([`Observation`] and
-//!   friends), the plan/report records, and the verifying wire → domain
-//!   conversions.
+//!   the plan/report records ([`DeploymentPlanWire`] / [`DeploymentPlan`]
+//!   / [`PlanSource`] / [`PlanOrigin`]), and the pins/server records
+//!   ([`Pins`] / [`ServerState`]).
+//! * [`intent`] — the intent records ([`LedgerIntentWire`] /
+//!   [`DeploymentIntent`]) with the verifying conversion + the in-memory
+//!   push report ([`LedgerIntentReport`]) (the “two line kinds — intent”
+//!   half).
+//! * [`terminal`] — the terminal records ([`LedgerTerminalWire`] /
+//!   [`LedgerTerminal`] / [`TerminalDisposition`]) with the verifying
+//!   conversion + status accessor (the “two line kinds — terminal” half).
+//! * [`outcomes`] — the per-slot outcomes ([`SlotOutcome`] /
+//!   [`SlotOutcomeKind`] / [`SlotTransition`]) + the remaining-changes /
+//!   compensation derivations.
+//! * [`observation`] — the three-state observations ([`Observation`] and
+//!   friends).
+//! * [`schema`] — the ledger/pins format-version constants
+//!   ([`LEDGER_SCHEMA_VERSION`] / [`PINS_SCHEMA_VERSION`]).
+//! * [`rebinding`] — the rebinding proof records ([`RebindingPlan`] /
+//!   [`VerifiedReleaseRebinding`]).
 //! * [`membership`] — the SUCCESSFUL membership-equation enforcement
 //!   (outcomes == selected, rollback == full, selected ⊆ full).
 //! * [`rollback`] — the rollback PAYLOAD builder ([`build_rollback`]): the
@@ -41,9 +55,8 @@
 //!   deterministic payload is built at the call sites; no marker SEMANTIC
 //!   TYPES live in records.rs, so there is no `markers` module.
 //! * **schema versions** — `LEDGER_SCHEMA_VERSION` and `PINS_SCHEMA_VERSION`
-//!   live next to the wire records they version in
-//!   [`crate::ledger::records`] (re-exported at the area root), and the
-//!   wire-version gate lives in the store reader
+//!   live in [`crate::ledger::schema`] (re-exported at the area root), and
+//!   the wire-version gate lives in the store reader
 //!   ([`crate::store::local::LocalStore::read_ledger`]).
 //! * **transaction records** — the `transactions/<op-id>.json` I/O lives in
 //!   [`crate::remote::helper::RemoteHelper::transaction_record`]; no
@@ -57,34 +70,46 @@
 
 pub mod append;
 pub mod finalize;
+pub mod intent;
 pub mod membership;
+pub mod observation;
+pub mod outcomes;
+pub mod rebinding;
 pub mod records;
 pub mod recovery;
 pub mod refs;
 pub mod rollback;
+pub mod schema;
+pub mod terminal;
 
 pub use append::{LedgerEntry, LedgerLine};
 pub use finalize::{finalize_successful_attempt, recovery_outcomes};
+pub use intent::{
+    DeploymentIntent, DesiredGeneration, IntentSlot, LedgerIntentReport, LedgerIntentWire,
+    PreviousGeneration,
+};
+pub use observation::{
+    Observation, ObservationError, ObservedGeneration, ObservedSlot, ObservedState, ObservedTarget,
+};
+pub use outcomes::{CompensationReport, SlotOutcome, SlotOutcomeKind, SlotTransition};
+pub use rebinding::{FrozenSlotTopology, RebindingPlan, VerifiedReleaseRebinding};
 pub use records::{
-    BehaviorIndex, CompensationReport, CompleteRollback, DeploymentIntent, DeploymentPlan,
-    DeploymentPlanWire, DeploymentStatus, DesiredGeneration, FrozenSlotTopology, IntentSlot,
-    LedgerIntentReport, LedgerIntentWire, LedgerRollback, LedgerRollbackWire, LedgerTerminal,
-    LedgerTerminalWire, NonEmptySlotTable, Observation, ObservationError, ObservedGeneration,
-    ObservedSlot, ObservedState, ObservedTarget, PhysicalBinding, Pins, PlanOrigin, PlanSource,
-    PreviousGeneration, RebindingPlan, ServerState, SlotAttemptState, SlotOutcome, SlotOutcomeKind,
-    SlotPlan, SlotResult, SlotTable, SlotTransition, TerminalDisposition, VerifiedReleaseRebinding,
+    BehaviorIndex, CompleteRollback, DeploymentPlan, DeploymentPlanWire, DeploymentStatus,
+    LedgerRollback, LedgerRollbackWire, NonEmptySlotTable, PhysicalBinding, Pins, PlanOrigin,
+    PlanSource, ServerState, SlotAttemptState, SlotPlan, SlotResult, SlotTable,
 };
 pub use refs::{
     PushRef, attempt_slot_ids, deployment_index, ref_name, resolve_deployment,
     successful_deployments, successful_index,
 };
 pub use rollback::build_rollback;
+pub use terminal::{LedgerTerminal, LedgerTerminalWire, TerminalDisposition};
 // Crate-internal items: the reference RESOLUTION + grammar re-exports stay
 // pub(crate) — the push engine / plan consume them through the ledger path.
 // The membership-equation verifier and the reconciliation entry point
 // are NOT re-exported at the area root: their only in-crate consumers use the
-// module paths directly ([`crate::ledger::records`] / [`crate::ledger::recovery`]).
+// module paths directly ([`crate::ledger::membership`] /
+// [`crate::ledger::recovery`]).
 pub(crate) use refs::{RefExpr, parse_ref_expr, resolve_ref_expr};
-// The ledger/pins format-version constants (defined next to the wire records
-// in [`crate::ledger::records`]).
-pub(crate) use records::{LEDGER_SCHEMA_VERSION, PINS_SCHEMA_VERSION};
+// The ledger/pins format-version constants (defined in [`crate::ledger::schema`]).
+pub(crate) use schema::{LEDGER_SCHEMA_VERSION, PINS_SCHEMA_VERSION};

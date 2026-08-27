@@ -15,10 +15,11 @@ use crate::config::ProjectConfig;
 use crate::error::{Error, Result};
 use crate::identity::{GenerationId, OperationId, SlotId};
 use crate::ledger::finalize::{finalize_successful_attempt, recovery_outcomes};
-use crate::ledger::records::{
-    DeploymentIntent, LedgerTerminal, Observation, ObservedGeneration, SlotOutcome,
-    SlotOutcomeKind, SlotTable, SlotTransition, TerminalDisposition,
-};
+use crate::ledger::intent::DeploymentIntent;
+use crate::ledger::observation::{Observation, ObservedGeneration};
+use crate::ledger::outcomes::{SlotOutcome, SlotOutcomeKind, SlotTransition};
+use crate::ledger::records::SlotTable;
+use crate::ledger::terminal::{LedgerTerminal, TerminalDisposition};
 use crate::remote::helper::RemoteHelper;
 use crate::store::local::LocalStore;
 use std::collections::{BTreeMap, HashMap, HashSet};

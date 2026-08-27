@@ -16,7 +16,7 @@
 //! group vs full — lives in the intent's `group`), not here.
 //!
 //! The single verification helper is shared by the wire → domain conversion
-//! ([`crate::ledger::records::LedgerTerminalWire::into_domain`]); the
+//! ([`crate::ledger::terminal::LedgerTerminalWire::into_domain`]); the
 //! successful writer ([`crate::ledger::finalize::finalize_successful_attempt`])
 //! produces the proven shape by construction and pins the rollback-key
 //! equality itself.

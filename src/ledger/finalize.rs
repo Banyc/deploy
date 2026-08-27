@@ -21,11 +21,11 @@
 //!
 use crate::error::{Error, Result};
 use crate::identity::SlotId;
-use crate::ledger::records::{
-    DeploymentIntent, LedgerTerminal, PhysicalBinding, SlotAttemptState, SlotOutcome, SlotResult,
-    SlotTable, TerminalDisposition,
-};
+use crate::ledger::intent::DeploymentIntent;
+use crate::ledger::outcomes::SlotOutcome;
+use crate::ledger::records::{PhysicalBinding, SlotAttemptState, SlotResult, SlotTable};
 use crate::ledger::rollback::build_rollback;
+use crate::ledger::terminal::{LedgerTerminal, TerminalDisposition};
 use crate::store::local::LocalStore;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -156,7 +156,7 @@ pub fn recovery_outcomes(
             sid.clone(),
             SlotResult {
                 slot_id: sid.clone(),
-                outcome: crate::ledger::records::SlotOutcomeKind::Activated,
+                outcome: crate::ledger::outcomes::SlotOutcomeKind::Activated,
                 generation: Some(slot.desired.generation.clone()),
                 compensated: false,
                 error: None,
@@ -166,7 +166,9 @@ pub fn recovery_outcomes(
         actuals.insert(
             sid.clone(),
             SlotAttemptState {
-                artifact: crate::ledger::records::Observation::Known(slot.desired.artifact.clone()),
+                artifact: crate::ledger::observation::Observation::Known(
+                    slot.desired.artifact.clone(),
+                ),
                 generation: Some(slot.desired.generation.clone()),
             },
         );
@@ -180,10 +182,9 @@ mod tests {
         ArtifactRef, ServerId, SlotId, TargetName, VariantName, test_deployment_id,
         test_generation_id, test_tree_digest,
     };
-    use crate::ledger::records::{
-        DeploymentIntent, DeploymentStatus, DesiredGeneration, IntentSlot, NonEmptySlotTable,
-        Observation,
-    };
+    use crate::ledger::intent::{DeploymentIntent, DesiredGeneration, IntentSlot};
+    use crate::ledger::observation::Observation;
+    use crate::ledger::records::{DeploymentStatus, NonEmptySlotTable};
     use std::collections::BTreeMap;
 
     /// A minimal but VALID intent for the target (EXACT key-set equality:

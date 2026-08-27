@@ -27,9 +27,9 @@
 use crate::error::{Error, Result};
 use crate::identity::{DeploymentId, ReleaseId, SlotId, TargetName};
 use crate::ledger::append::LedgerEntry;
-use crate::ledger::records::{
-    DeploymentIntent, DeploymentStatus, LedgerRollback, TerminalDisposition,
-};
+use crate::ledger::intent::DeploymentIntent;
+use crate::ledger::records::{DeploymentStatus, LedgerRollback};
+use crate::ledger::terminal::TerminalDisposition;
 use crate::store::local::LocalStore;
 use std::collections::BTreeMap;
 
@@ -270,10 +270,9 @@ mod tests {
         ArtifactRef, DeploymentId, GenerationRef, PlacementSlotAssignment, ReleaseId, ServerId,
         SlotId, VariantName, test_deployment_id, test_generation_id, test_tree_digest,
     };
-    use crate::ledger::records::{
-        DeploymentIntent, DesiredGeneration, IntentSlot, LedgerTerminal, NonEmptySlotTable,
-        PhysicalBinding, SlotResult, SlotTable, TerminalDisposition,
-    };
+    use crate::ledger::intent::{DeploymentIntent, DesiredGeneration, IntentSlot};
+    use crate::ledger::records::{NonEmptySlotTable, PhysicalBinding, SlotResult, SlotTable};
+    use crate::ledger::terminal::{LedgerTerminal, TerminalDisposition};
     use proptest::prelude::*;
     use proptest::test_runner::{FileFailurePersistence, RngSeed};
     use std::collections::{BTreeMap, BTreeSet};

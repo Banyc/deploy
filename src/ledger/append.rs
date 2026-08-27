@@ -35,9 +35,8 @@
 //! records in [`crate::ledger::records`].
 
 use crate::identity::{DeploymentId, TargetName};
-use crate::ledger::records::{
-    DeploymentIntent, LedgerIntentWire, LedgerTerminal, LedgerTerminalWire,
-};
+use crate::ledger::intent::{DeploymentIntent, LedgerIntentWire};
+use crate::ledger::terminal::{LedgerTerminal, LedgerTerminalWire};
 use serde::{Deserialize, Serialize};
 
 /// ONE physical line of a target's deployment ledger — the WIRE enum: the

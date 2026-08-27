@@ -20,7 +20,8 @@
 //!
 use crate::error::{Error, Result};
 use crate::identity::{GenerationRef, PlacementSlotAssignment, SlotId};
-use crate::ledger::records::{LedgerRollback, Observation, PhysicalBinding, SlotAttemptState};
+use crate::ledger::observation::Observation;
+use crate::ledger::records::{LedgerRollback, PhysicalBinding, SlotAttemptState};
 use std::collections::BTreeMap;
 
 /// Build the rollback state of a successful deployment from the attempt's
@@ -104,7 +105,7 @@ mod tests {
         ArtifactRef, ServerId, SlotId, VariantName, test_deployment_id, test_generation_id,
         test_tree_digest,
     };
-    use crate::ledger::records::Observation;
+    use crate::ledger::observation::Observation;
     use std::collections::BTreeMap;
 
     /// `build_rollback` records each slot's complete physical binding.
@@ -165,7 +166,7 @@ mod tests {
         let actuals = BTreeMap::from([(
             slot.clone(),
             SlotAttemptState {
-                artifact: Observation::Unknown(crate::ledger::records::ObservationError {
+                artifact: Observation::Unknown(crate::ledger::observation::ObservationError {
                     message: "assignment read failed: fixture".to_string(),
                 }),
                 generation: Some(test_generation_id("gen-x")),
@@ -194,7 +195,7 @@ mod tests {
         let actuals = BTreeMap::from([(
             slot.clone(),
             SlotAttemptState {
-                artifact: Observation::Unknown(crate::ledger::records::ObservationError {
+                artifact: Observation::Unknown(crate::ledger::observation::ObservationError {
                     message: "assignment read failed: fixture".to_string(),
                 }),
                 generation: None,
@@ -234,7 +235,8 @@ mod tests {
         // the domain conversion REFUSES it (fail closed): the legacy
         // `release` disagrees with the snapshot's derived releases (the
         // per-slot bindings — empty here — are the authoritative source).
-        let wire: crate::ledger::records::LedgerTerminalWire = serde_json::from_str(&line).unwrap();
+        let wire: crate::ledger::terminal::LedgerTerminalWire =
+            serde_json::from_str(&line).unwrap();
         let err = wire.into_domain().expect_err(
             "a legacy release that disagrees with the derived snapshot releases fails closed",
         );
@@ -249,7 +251,7 @@ mod tests {
         let old_line = format!(
             r#"{{"kind":"terminal","deployment_id":"{did}","target":"production","status":"successful","recorded_at":"2026-01-01T00:00:00Z","outcomes":{{}},"rollback":{{"slots":{{}}}}}}"#
         );
-        let err = serde_json::from_str::<crate::ledger::records::LedgerTerminalWire>(&old_line)
+        let err = serde_json::from_str::<crate::ledger::terminal::LedgerTerminalWire>(&old_line)
             .expect_err("an old-shape terminal line without the v3 memberships must fail deserialization fail-closed");
         assert!(
             err.to_string().contains("selected_membership")
