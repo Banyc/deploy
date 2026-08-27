@@ -6,11 +6,23 @@
 //! `revset`):
 //!
 //! * [`push`] — the push ORCHESTRATION: `push`/`push_inner` (the numbered
-//!   steps), the no-op up-to-date path, dry-run orchestration, the
-//!   maintenance/step-17 wiring, the observed-refresh call, and the
-//!   ref-resolution ordering — the spine of the old `push::engine`, kept
-//!   together with the interdependent private helpers and the giant
+//!   steps), the ref-resolution ordering, the preflight/batch/finalization
+//!   calls, the maintenance wiring, the abandoned-incoming cleanup and the
+//!   commit-diverged handling (A7) — the spine of the old `push::engine`,
+//!   kept together with the interdependent private helpers and the giant
 //!   `#[cfg(test)] mod tests` (which drives `push_inner` directly).
+//! * [`noop`] — the "Everything up to date" no-op (A1): the up-to-date
+//!   detection (complete [`ArtifactRef`] equality + per-slot verification
+//!   rendering the EXISTING generation's identities) and the no-op path's
+//!   hidden maintenance wiring (A7: deferred-retention retry, pending-sweep
+//!   retry, observed refresh).
+//! * [`maintenance`] — post-commit maintenance (A4): the step-17 per-slot
+//!   retention loop + [`maintenance::retain_slot_post_commit`] +
+//!   [`maintenance::retry_deferred_retentions`] +
+//!   [`maintenance::retry_pending_sweep`] + the observed-refresh call (A7
+//!   durable debt wiring; shared by the real-push path and the no-op path).
+//! * [`coverage`] — the behavior-coverage gate (A5):
+//!   [`coverage::validate_behavior_coverage`].
 //! * [`refs`] — the push reference GRAMMAR (pure, store-free): the old
 //!   `revset` module, `parse_ref_expr`, [`refs::RefExpr`], and the
 //!   `@`/`@-`/`@--`/`parent(...)`/deployment-id/`release:<id>` forms.
@@ -42,10 +54,13 @@
 
 pub mod batching;
 pub mod capacity;
+pub mod coverage;
 pub mod dryrun;
 pub mod failure;
 pub mod groups;
 pub mod lock;
+pub mod maintenance;
+pub mod noop;
 pub mod plan;
 pub mod push;
 pub mod refs;
@@ -61,10 +76,16 @@ pub(crate) use batching::*;
 #[allow(unused_imports)]
 pub(crate) use capacity::*;
 #[allow(unused_imports)]
+pub(crate) use coverage::*;
+#[allow(unused_imports)]
 pub(crate) use dryrun::*;
 #[allow(unused_imports)]
 pub(crate) use failure::*;
 pub use groups::*;
+#[allow(unused_imports)]
+pub(crate) use maintenance::*;
+#[allow(unused_imports)]
+pub(crate) use noop::*;
 pub use plan::*;
 pub use push::*;
 #[allow(unused_imports)]

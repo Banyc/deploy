@@ -2,24 +2,31 @@
 //! the old `push::engine`.
 //!
 //! [`push`] → [`push_inner`] run the numbered deployment pipeline:
-//! validation, locking, materialization, release identity, reconciliation,
-//! ref resolution, planning, capacity + staging preflight, batched
-//! per-server publication (the batch loop lives in
-//! [`crate::deploy::batching`]), failure-policy compensation and status
-//! derivation ([`crate::deploy::failure`]), commit markers, observed
-//! refresh, history/rollback finalization, and step-17 per-slot retention.
-//! The dry-run branch renders its plan via [`crate::deploy::dryrun`].
+//! validation, locking (the advisory-lock ordering, A7), materialization,
+//! release identity, reconciliation, ref resolution (the post-reconciliation
+//! ordering), planning, capacity + staging preflight, batched per-server
+//! publication (the batch loop lives in [`crate::deploy::batching`]),
+//! failure-policy compensation and status derivation
+//! ([`crate::deploy::failure`]), commit markers (A7 pending-commit demotion
+//! reasons: "recoverable metadata failure", "commit diverged", "marker
+//! integrity conflict"), the no-op up-to-date check
+//! ([`crate::deploy::noop`]), observed refresh + history/rollback
+//! finalization, and the step-17 post-commit maintenance wiring
+//! ([`crate::deploy::maintenance`]). The dry-run branch renders its plan
+//! via [`crate::deploy::dryrun`]; the behavior-coverage gate lives in
+//! [`crate::deploy::coverage`].
 //!
 //! This module keeps the genuinely-interdependent private helpers
-//! (`run_capacity_and_staging`, `slot_vars`, the observed-refresh +
-//! deferred-maintenance wiring, `recover_if_missing`,
-//! `validate_behavior_coverage`) and the giant `#[cfg(test)] mod tests`
+//! (`run_capacity_and_staging`, `slot_vars`, `recover_if_missing` — the A3
+//! local-object recovery called from the mutating remote phase, next to the
+//! A7 abandoned-incoming cleanup) and the giant `#[cfg(test)] mod tests`
 //! (which drives `push_inner` directly through the fault-matrix entry
-//! points), so the A1 features that are inseparable from the spine (the
-//! no-op up-to-date path, the observed-refresh call, the ref-resolution
-//! ordering) live here too.
+//! points), so the A1/A7 features that are inseparable from the spine — the
+//! ref-resolution ordering, the lock acquisition, the abandoned-incoming
+//! cleanup, the pending-commit demotion reasons, the commit-diverged
+//! handling — live here too.
 
-use crate::config::{Mapping, ProjectConfig, RetentionConfig, SlotConfig};
+use crate::config::{Mapping, ProjectConfig, SlotConfig};
 use crate::deploy::capacity::capacity_preflight;
 use crate::deploy::lock::FileLock;
 use crate::deploy::server::{REMOTE_RELEASE_JSON, download_tree_to_host};
@@ -36,20 +43,15 @@ use crate::ledger::{self, PushRef, RefExpr};
 use crate::ledger::{
     BehaviorIndex, DeploymentIntent, DeploymentPlan, DeploymentStatus, DesiredGeneration,
     IntentSlot, LedgerIntentReport, LedgerTerminal, NonEmptySlotTable, Observation,
-    ObservationError, ObservedGeneration, ObservedSlot, ObservedState, PreviousGeneration,
-    SlotAttemptState, SlotOutcome, SlotOutcomeKind, SlotPlan, SlotResult, SlotTable,
-    TerminalDisposition,
+    ObservationError, ObservedGeneration, PreviousGeneration, SlotAttemptState, SlotOutcome,
+    SlotOutcomeKind, SlotPlan, SlotResult, SlotTable, TerminalDisposition,
 };
 use crate::remote::canonical as tree;
-use crate::remote::helper::{GenerationAssignment, RemoteHelper};
+use crate::remote::helper::RemoteHelper;
 use crate::remote::layout;
 use crate::remote::transport::Remote;
-use crate::retention::compute_retained;
 use crate::store::local::LocalStore;
-#[cfg(test)]
-use crate::testutil::step17_hook::HookPhase;
-use crate::verify::command::run_verification;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 pub struct PushOptions {
@@ -834,7 +836,7 @@ fn push_inner(
     // without this gate the missing entry would panic mid-rollout, after
     // remote trees had already been staged. Fail closed in preflight with
     // context instead.
-    validate_behavior_coverage(&behavior_index, &assignments)?;
+    super::coverage::validate_behavior_coverage(&behavior_index, &assignments)?;
 
     // Mutating remote phase (phase B), only behind the non-dry-run gate:
     // protocol handshake FIRST, then create the remote layout, clear
@@ -962,171 +964,27 @@ fn push_inner(
         });
     }
 
-    // Early "Everything up to date" check for HEAD pushes. Run BEFORE persisting
-    // any plan/status record so an up-to-date no-op leaves no dangling
-    // `in_progress` deployment behind.
-    if matches!(&pref, PushRef::Head) {
-        // Retain the CURRENT generation assignment for every matching slot: the
-        // no-op verification below renders the EXISTING generation's identities
-        // (deployment_id/generation_id/artifact) — the running service was
-        // deployed with those, and the no-op creates no records, so the NEW
-        // deployment/generation ids would be fabricated.
-        let mut existing: BTreeMap<SlotId, GenerationAssignment> = BTreeMap::new();
-        let mut all_match = true;
-        for a in &assignments {
-            let st = statuses.get(&a.placement_slot).expect("status present");
-            let matches = st
-                .current_generation
-                .as_ref()
-                .map(|g| {
-                    helpers[&a.placement_slot]
-                        .read_assignment(g.as_str())
-                        .map(|asn| {
-                            // COMPLETE ArtifactRef equality (release + variant
-                            // + tree). Two variants can share a release AND the
-                            // same tree bytes (identical artifact mappings) yet
-                            // carry DIFFERENT behavior contracts; matching only
-                            // tree+release would falsely report "Everything up to
-                            // date" when the slot's variant changes, leaving the
-                            // service claimed verified under the new contract
-                            // without ever running it.
-                            let ok = asn.artifact == a.artifact;
-                            if ok {
-                                existing.insert(a.placement_slot.clone(), asn);
-                            }
-                            ok
-                        })
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if !matches {
-                all_match = false;
-                break;
-            }
-        }
-        if all_match {
-            // Verify the running services to confirm true up-to-date state. The
-            // template vars render the EXISTING generation's identities from
-            // the retained assignment (deployment_id/generation_id/artifact) —
-            // the no-op creates no records, so the NEW deployment/generation ids
-            // would be fabricated. The behavior contract to verify against stays
-            // the DESIRED variant's contract: in a true no-op the existing
-            // generation's variant equals the desired one (the comparison above
-            // already proved complete ArtifactRef equality, variant included).
-            let mut verified = true;
-            for a in &assignments {
-                let remote = remotes[&a.placement_slot].as_ref();
-                // PER-ASSIGNMENT behavior resolution: the slot's contract is
-                // its OWN artifact binding's (release, variant) — a partial
-                // snapshot can carry slots from DIFFERENT releases.
-                let Some(variant_behavior) = behavior_index
-                    .get(&a.artifact.release)
-                    .and_then(|m| m.get(a.artifact.variant.as_str()))
-                else {
-                    // Coverage was validated before any remote mutation; a miss
-                    // means the up-to-date claim cannot be established. Fall
-                    // through to a real push rather than panicking.
-                    verified = false;
-                    break;
-                };
-                let Some(asn) = existing.get(&a.placement_slot) else {
-                    // A matching slot must have retained its assignment above; a
-                    // miss means the up-to-date claim cannot be established.
-                    // Fall through to a real push rather than panicking.
-                    verified = false;
-                    break;
-                };
-                let vars = slot_vars(
-                    &members,
-                    config,
-                    target_name,
-                    &a.placement_slot,
-                    &asn.artifact,
-                    Some(&asn.deployment_id),
-                    Some(&asn.generation_id),
-                )?;
-                if run_verification(remote, &variant_behavior.verification, &vars).is_err() {
-                    verified = false;
-                    break;
-                }
-            }
-            if verified {
-                // Post-commit maintenance hook for the no-op path: a no-op push
-                // creates no records and skips step 17, so any retention debt
-                // left by an earlier push would never be serviced here — retry
-                // it explicitly before reporting "Everything up to date".
-                // Best-effort: a failure stays as the marker and surfaces as a
-                // warning; the no-op report itself is unchanged. The retry is
-                // NON-FALLIBLE (post-commit maintenance): every debt read/write
-                // failure is collected into the returned warnings, never an
-                // `Err` — the no-op report stays "Everything up to date".
-                let deferred = retry_deferred_retentions(
-                    store,
-                    config,
-                    target_name,
-                    &helpers,
-                    op_id,
-                    deployment_id,
-                );
-                // Refresh observed state on the NO-OP path (the same
-                // [`refresh_observed`] helper and projection as the real-push
-                // path). A crash-window push — one that aborted AFTER the
-                // remote advanced but BEFORE the observed refresh (e.g. a
-                // faulted `write_results`) — was finalized by the reconcile
-                // above and now matches here as "Everything up to date";
-                // without this refresh the shared slot's observed projection
-                // would stay stale/absent in every member target. The
-                // projections are rebuilt from the EXISTING generation's
-                // assignment (the no-op creates no records), so after ANY
-                // completed or recovered mutation every member target's
-                // observed projection equals the remote assignment. Best-effort
-                // per the post-commit lifecycle: a refresh failure warns but
-                // never converts the no-op into an error — the report below
-                // stays "Everything up to date".
-                let mut observed_servers: BTreeMap<SlotId, ObservedSlot> = BTreeMap::new();
-                for (slot_id, asn) in &existing {
-                    observed_servers.insert(
-                        slot_id.clone(),
-                        ObservedSlot {
-                            observation: Observation::Known(ObservedState {
-                                generation: asn.generation_id.clone(),
-                                artifact: asn.artifact.clone(),
-                                last_deployment: asn.deployment_id.clone(),
-                            }),
-                        },
-                    );
-                }
-                let mut observed_warnings: Vec<String> = Vec::new();
-                refresh_observed(
-                    store,
-                    target_name,
-                    &members,
-                    &observed_servers,
-                    &mut observed_warnings,
-                );
-                let mut maintenance = deferred;
-                // The store-global PENDING SWEEP (deferred by an earlier
-                // checkpoint whose sweep did not complete) is also
-                // POST-COMMIT MAINTENANCE: a no-op push creates no records
-                // and skips step 17, so the sweep debt would never be
-                // serviced here — retry it explicitly before reporting
-                // "Everything up to date". Best-effort: a failure stays as
-                // the marker and surfaces as a warning; the no-op report
-                // itself is unchanged. NON-FALLIBLE (post-commit
-                // maintenance): every debt read/write failure is collected
-                // into the returned warnings, never an `Err`.
-                maintenance.extend(retry_pending_sweep(store, config, deployment_id.as_str()));
-                maintenance.extend(observed_warnings);
-                let warning = maintenance_warning(&maintenance);
-                return Ok(PushReport {
-                    status: None,
-                    attempt: None,
-                    message: "Everything up to date".to_string(),
-                    warning,
-                    dry_run: false,
-                });
-            }
-        }
+    // Early "Everything up to date" check for HEAD pushes, run BEFORE
+    // persisting any plan/status record so an up-to-date no-op leaves no
+    // dangling `in_progress` deployment behind. The detection (complete
+    // ArtifactRef equality + per-slot verification rendering the EXISTING
+    // generation's identities) and the no-op path's hidden maintenance
+    // wiring (A7) live in [`super::noop`].
+    if let Some(report) = super::noop::check_up_to_date(
+        &pref,
+        store,
+        config,
+        target_name,
+        &members,
+        &assignments,
+        &statuses,
+        &helpers,
+        &remotes,
+        &behavior_index,
+        op_id,
+        deployment_id,
+    )? {
+        return Ok(report);
     }
 
     // Persist the plan before any server mutation (finding 6), then persist
@@ -1588,7 +1446,7 @@ fn push_inner(
     }
 
     let (_observed, observed_warnings) =
-        refresh_observed_from_live(store, target_name, &members, &helpers);
+        super::maintenance::refresh_observed_from_live(store, target_name, &members, &helpers);
 
     let mut maintenance: Vec<String> = Vec::new();
     // Observed-refresh deferrals (post-commit projection lag) ride the same
@@ -1601,7 +1459,7 @@ fn push_inner(
     // NON-FALLIBLE (post-commit maintenance): every debt read/write failure is
     // a warning entry in the returned vec, never an `Err` — a debt-file fault
     // must not change the outcome of a deployment that already committed.
-    maintenance.extend(retry_deferred_retentions(
+    maintenance.extend(super::maintenance::retry_deferred_retentions(
         store,
         config,
         target_name,
@@ -1616,545 +1474,31 @@ fn push_inner(
     // debt read/write failure is a warning entry in the returned vec, never
     // an `Err` — a debt-file fault must not change the outcome of a
     // deployment that already committed.
-    maintenance.extend(retry_pending_sweep(store, config, deployment_id.as_str()));
+    maintenance.extend(super::maintenance::retry_pending_sweep(
+        store,
+        config,
+        deployment_id.as_str(),
+    ));
     // Step 17: per-slot retention — post-commit maintenance, never a push
-    // failure (the contract is structural in `retain_slot_post_commit`).
-    for sid in &servers_order {
-        // The slot's ONE retention policy, from its OWNING VARIANT (the
-        // variant that declares the slot) — never a member-target union.
-        let slot_retention = config
-            .slot_retention(sid.as_str())
-            .expect("every planned slot is declared by some variant");
-        retain_slot_post_commit(
-            store,
-            config,
-            target_name,
-            &helpers[sid],
-            sid,
-            slot_retention,
-            op_id,
-            deployment_id,
-            &mut maintenance,
-        );
-        // Clean up this deployment's incoming directory. Best-effort by
-        // design: the push already succeeded, so a leftover here cannot change
-        // the reported outcome, and the next push's reconciliation removes
-        // abandoned incoming dirs explicitly. Same for the (already released)
-        // lock file: releasing the advisory lock again is a no-op, and a
-        // stale lock file is re-acquired harmlessly next time.
-        helpers[sid].remove_incoming(deployment_id.as_str()).ok();
-        helpers[sid].release_lock(op_id.as_str()).ok();
-    }
-
+    // failure (the contract is structural in
+    // [`crate::deploy::maintenance::retain_slot_post_commit`]).
+    super::maintenance::run_step17_retention(
+        store,
+        config,
+        target_name,
+        &helpers,
+        &servers_order,
+        op_id,
+        deployment_id,
+        &mut maintenance,
+    );
     Ok(PushReport {
         status: Some(commit_status),
         attempt: Some(attempt),
         message,
-        warning: maintenance_warning(&maintenance),
+        warning: super::maintenance::maintenance_warning(&maintenance),
         dry_run: false,
     })
-}
-
-/// Step-17 per-slot retention, run as POST-COMMIT maintenance: the
-/// deployment already durably committed, so this NEVER fails the push — a
-/// retention failure (or a contended slot lock) defers the slot as a durable
-/// debt marker + a warning, never a silent skip. `slot_retention` is the
-/// slot's ONE policy, already resolved by the caller from its OWNING VARIANT
-/// (never a per-target union); the RAII mutation lock guards the whole block.
-// The 9 parameters are one slot's full per-slot maintenance context (store,
-// config, target_name, helper, sid, slot_retention, op_id, deployment_id)
-// plus the shared `maintenance` warning channel; bundling them would obscure
-// the slot-owned-policy contract this signature enforces, so the allow
-// documents the deliberate choice rather than a band-aid (mirrors
-// `push_inner`).
-#[allow(clippy::too_many_arguments)]
-fn retain_slot_post_commit(
-    store: &LocalStore,
-    config: &ProjectConfig,
-    target_name: &str,
-    helper: &RemoteHelper,
-    sid: &SlotId,
-    slot_retention: &RetentionConfig,
-    op_id: &OperationId,
-    deployment_id: &DeploymentId,
-    maintenance: &mut Vec<String>,
-) {
-    // TEST-ONLY step-17 phase hook: when a test armed the barrier for
-    // THIS deployment id, signal "at step-17 lock acquisition" (with the
-    // FRESH-STEP-17 phase — this push's own per-slot retention, whose
-    // contended else-branch defers the maintenance as a debt marker) and
-    // park until the test releases the engine (the fixture holds the
-    // competing guard meanwhile) — per-slot lock contention becomes
-    // DETERMINISTIC, with no thread racing the lock file. A no-op in
-    // production builds (both this call and the store method are
-    // `#[cfg(test)]`) and in unarmed tests.
-    #[cfg(test)]
-    store.step17_hook_barrier(deployment_id, HookPhase::FreshStep17);
-    if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
-        match rotate_slot_locked(helper, store, config, slot_retention, deployment_id) {
-            Ok(()) => {
-                maintenance.extend(clear_retention_deferred(store, target_name, sid));
-            }
-            Err(e) => {
-                maintenance.extend(set_retention_deferred(
-                    store,
-                    target_name,
-                    sid,
-                    &e.to_string(),
-                ));
-                maintenance.push(format!(
-                    "retention deferred for slot '{}': {e}",
-                    sid.as_str()
-                ));
-            }
-        }
-    } else {
-        maintenance.push(format!(
-            "retention deferred for slot '{}': slot lock held by another operation",
-            sid.as_str()
-        ));
-        maintenance.extend(set_retention_deferred(
-            store,
-            target_name,
-            sid,
-            "slot lock held by another operation",
-        ));
-    }
-}
-
-/// Run one slot's retention — retained-set computation plus mark-and-sweep —
-/// for a caller already holding the slot's mutation lock (RAII guard). The
-/// single retention block shared by step 17 and by deferred-maintenance
-/// retries, so both paths apply the same retention semantics and the same
-/// lock discipline. `deployment_id` marks this operation's incoming
-/// directory as active so retention never sweeps a deployment currently being
-/// published. `retention` is the slot's ONE policy, already resolved from its
-/// OWNING VARIANT by the caller (`ProjectConfig::slot_retention`) — retention is
-/// slot-owned, never a per-target surface. Pins are the config's own pins
-/// (policy lives in the caller-supplied `config` settings object, never a
-/// separate argument).
-fn rotate_slot_locked(
-    helper: &RemoteHelper,
-    store: &LocalStore,
-    config: &ProjectConfig,
-    retention: &RetentionConfig,
-    deployment_id: &DeploymentId,
-) -> Result<()> {
-    let retained = compute_retained(helper, config.pins(), store, retention)?;
-    let active_incoming = HashSet::from([deployment_id.as_str().to_string()]);
-    helper.rotate(&retained, &active_incoming)?;
-    Ok(())
-}
-
-/// Record a deferred-retention debt marker for one slot (keyed by
-/// target+slot). Called only when the retention failed after the deployment
-/// already committed — POST-COMMIT MAINTENANCE, so this function is
-/// NON-FALLIBLE: every debt I/O failure (a read or write of the marker file)
-/// becomes a WARNING returned here (merged into the report's `maintenance`
-/// channel by the caller), never an `Err`. On a read failure the write is
-/// skipped entirely — writing a map built from scratch would silently drop
-/// the OTHER slots' existing markers — and the returned warning names the
-/// deferral, so the maintenance is explicitly warned even though this slot's
-/// marker was not persisted.
-pub(crate) fn set_retention_deferred(
-    store: &LocalStore,
-    target: &str,
-    slot: &SlotId,
-    reason: &str,
-) -> Vec<String> {
-    let mut warnings = Vec::new();
-    let mut debt = match store.read_retention_debt(target) {
-        Ok(debt) => debt,
-        Err(e) => {
-            warnings.push(format!(
-                "retention debt maintenance deferred: failed to read retention debt for \
-                 '{target}': {e}"
-            ));
-            return warnings;
-        }
-    };
-    debt.insert(slot.as_str().to_string(), reason.to_string());
-    if let Err(e) = store.write_retention_debt(target, &debt) {
-        warnings.push(format!(
-            "retention debt maintenance deferred: failed to write retention debt for \
-             '{target}': {e}"
-        ));
-    }
-    warnings
-}
-
-/// Clear a slot's deferred-retention debt marker once the retention succeeded.
-/// POST-COMMIT MAINTENANCE, so this is NON-FALLIBLE: a debt read failure
-/// leaves the marker in place (a later push retries it) and a write/remove
-/// failure keeps the stale marker — both become WARNING entries returned to
-/// the caller (merged into the report's `maintenance` channel), never an
-/// `Err`.
-fn clear_retention_deferred(store: &LocalStore, target: &str, slot: &SlotId) -> Vec<String> {
-    let mut warnings = Vec::new();
-    let mut debt = match store.read_retention_debt(target) {
-        Ok(debt) => debt,
-        Err(e) => {
-            warnings.push(format!(
-                "retention debt maintenance deferred: failed to read retention debt for \
-                 '{target}': {e}"
-            ));
-            return warnings;
-        }
-    };
-    if debt.remove(slot.as_str()).is_some()
-        && let Err(e) = store.write_retention_debt(target, &debt)
-    {
-        warnings.push(format!(
-            "retention debt maintenance deferred: failed to clear retention debt for \
-             '{target}': {e}"
-        ));
-    }
-    warnings
-}
-
-/// Rebuild `target_name`'s observed projection from each member slot's LIVE
-/// remote assignment only (the per-slot `helpers` — never the desired plan
-/// and never a deployment id: untouched slots keep the live assignment's own
-/// minting deployment). Refreshes each slot's ONE physical record and returns
-/// the projection with warning-only failures — NON-FALLIBLE, since the
-/// deployment already durably committed (lag converges next push, no marker).
-fn refresh_observed_from_live(
-    store: &LocalStore,
-    target_name: &str,
-    members: &[(&crate::config::SlotConfig, &crate::config::ServerDef)],
-    helpers: &HashMap<SlotId, RemoteHelper>,
-) -> (BTreeMap<SlotId, ObservedSlot>, Vec<String>) {
-    let mut observed_servers: BTreeMap<SlotId, ObservedSlot> = BTreeMap::new();
-    for (slot, _sdef) in members {
-        let slot_id = SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
-
-        // The slot's LIVE remote assignment. `status` is a read; under the
-        // one-shot pre-swap arm it has already fired and been consumed inside
-        // `process_server`, so this read reflects the true post-mutation
-        // state: the new generation for an advanced slot, the PRIOR
-        // generation for a skipped/unreachable one.
-        let status = helpers[&slot_id].status();
-        match status {
-            Ok(s) => match s.current_generation {
-                Some(g) => match helpers[&slot_id].read_assignment(g.as_str()) {
-                    Ok(asn) => {
-                        observed_servers.insert(
-                            slot_id.clone(),
-                            ObservedSlot {
-                                observation: Observation::Known(ObservedState {
-                                    generation: asn.generation_id.clone(),
-                                    artifact: asn.artifact.clone(),
-                                    last_deployment: asn.deployment_id.clone(),
-                                }),
-                            },
-                        );
-                    }
-                    Err(_) => {
-                        // The generation is observed but its assignment
-                        // cannot be read (missing/corrupt): the observed
-                        // state is UNKNOWN — never a fabricated artifact,
-                        // never a stale prior record presented as current.
-                        observed_servers.insert(
-                            slot_id.clone(),
-                            ObservedSlot {
-                                observation: Observation::Unknown(ObservationError {
-                                    message: format!("assignment read failed for {g}"),
-                                }),
-                            },
-                        );
-                    }
-                },
-                None => {
-                    // The read succeeded showing no state: the slot has no
-                    // observed state (never deployed) — keep it absent (an
-                    // explicit KnownAbsent would fabricate an entry for a slot
-                    // never observed; a stale prior record is never presented
-                    // as current).
-                }
-            },
-            Err(e) => {
-                // THE OBSERVATION FAILED: a failed status read is NOT
-                // evidence of no change — the slot may have changed; the
-                // failure just means we cannot see it. Record `Unknown(error)`
-                // (never the prior record, which would claim "unchanged").
-                observed_servers.insert(
-                    slot_id.clone(),
-                    ObservedSlot {
-                        observation: Observation::Unknown(ObservationError {
-                            message: format!("status read failed: {e}"),
-                        }),
-                    },
-                );
-            }
-        }
-    }
-    let mut observed_warnings: Vec<String> = Vec::new();
-    refresh_observed(
-        store,
-        target_name,
-        members,
-        &observed_servers,
-        &mut observed_warnings,
-    );
-    (observed_servers, observed_warnings)
-}
-
-/// Refresh `observed.json` for `target_name`'s member slots from a
-/// caller-supplied per-slot projection: each slot's ONE physical record
-/// (`slots/<slot-id>/observed.json`) is written EXACTLY ONCE, never once per
-/// member target — targets are selection views over the global slot map, so a
-/// shared slot's single record serves every member target's `read_observed`
-/// view. Every store fault is WARNING-ONLY (pushed into `observed_warnings`,
-/// merged into the report's `maintenance` channel): the refresh runs after
-/// the deployment durably committed, so it must never change the push's
-/// reported outcome — this function NEVER returns `Err`.
-///
-/// The single source of truth for the observed refresh: the REAL-push path
-/// (which feeds the actual post-mutation state via
-/// [`refresh_observed_from_live`]) and the NO-OP path (which feeds the
-/// EXISTING generation's assignment, since an up-to-date push creates no
-/// records) both run this exact block, so a shared slot's physical record is
-/// refreshed identically by whichever path last touched it. A member slot
-/// with no entry in `observed_servers` keeps its prior physical record
-/// untouched.
-fn refresh_observed(
-    store: &LocalStore,
-    target_name: &str,
-    members: &[(&crate::config::SlotConfig, &crate::config::ServerDef)],
-    observed_servers: &BTreeMap<SlotId, ObservedSlot>,
-    observed_warnings: &mut Vec<String>,
-) {
-    for (slot, sdef) in members {
-        let slot_id = SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
-
-        let Some(observed_server) = observed_servers.get(&slot_id) else {
-            continue;
-        };
-        if let Err(e) = store.write_server(&crate::ledger::ServerState {
-            id: crate::identity::ServerId::parse(sdef.id.as_str())
-                .expect("validated server id is a safe segment"),
-            last_seen_target: Some(
-                TargetName::parse(target_name).expect("target name is a safe segment"),
-            ),
-            last_observed: Some(observed_server.clone()),
-        }) {
-            // The durable facts are recorded; only the per-server projection
-            // is stale. Warn and continue — a later push's refresh rewrites it.
-            observed_warnings.push(format!(
-                "observed refresh deferred for server '{}': {e}",
-                sdef.id.as_str()
-            ));
-        }
-        // ONE physical write per slot — the slot's own observed record. A
-        // shared slot is written ONCE regardless of how many targets it is a
-        // member of: every member target's view (a filter over the global
-        // slot map) sees the same physical record, so no per-target
-        // propagation is needed (or possible) anymore.
-        if let Err(e) = store.write_slot_observed(&slot_id, observed_server) {
-            // A fault leaves only THIS slot's physical record stale — every
-            // member target's view of it lags together. The next real push
-            // re-projects from durable facts, so convergence needs no marker.
-            observed_warnings.push(format!(
-                "observed refresh deferred for slot '{}': {e}",
-                slot_id.as_str()
-            ));
-        }
-    }
-}
-
-/// Retry deferred post-commit retention maintenance for `target_name`: every slot
-/// carrying a debt marker gets its retention re-attempted under the slot's
-/// mutation lock (the same RAII-guarded block as step 17). Success clears the
-/// marker; failure keeps it and refreshes its reason. Runs on later pushes —
-/// before step 17 on the normal path and at the no-op return — because
-/// retention is maintenance that must never change a deployment's reported
-/// outcome. NON-FALLIBLE by contract: this function never returns `Err` — a
-/// debt I/O failure (a read treated as empty debt, or a write/remove of the
-/// marker) becomes a WARNING entry in the returned vec, so a debt-file fault
-/// can never turn a push (real or no-op) into an error after the deployment
-/// durably committed. Returns the slots still deferred, for the push report's
-/// warning.
-pub(crate) fn retry_deferred_retentions(
-    store: &LocalStore,
-    config: &ProjectConfig,
-    target_name: &str,
-    helpers: &HashMap<SlotId, RemoteHelper>,
-    op_id: &OperationId,
-    deployment_id: &DeploymentId,
-) -> Vec<String> {
-    // A debt READ failure is treated as empty debt: nothing can be serviced
-    // this push, and the marker file (if any) is left untouched for a later
-    // push to retry — the warning keeps the deferral explicit.
-    let mut debt = match store.read_retention_debt(target_name) {
-        Ok(debt) => debt,
-        Err(e) => {
-            return vec![format!(
-                "retention debt maintenance deferred: failed to read retention debt for \
-                 '{target_name}': {e}"
-            )];
-        }
-    };
-    if debt.is_empty() {
-        return Vec::new();
-    }
-    let mut still_deferred: Vec<String> = Vec::new();
-    let mut serviced: Vec<String> = Vec::new();
-    for slot_str in debt.keys().cloned().collect::<Vec<_>>() {
-        let sid = SlotId::parse(&slot_str).expect("rotation debt slot id is a safe segment");
-
-        let Some(helper) = helpers.get(&sid) else {
-            // The slot is no longer a member of this target, so its retention
-            // cannot be serviced from here; keep the marker and say so.
-            still_deferred.push(format!(
-                "retention still deferred for slot '{slot_str}' (no longer a member of target \
-                 '{target_name}')"
-            ));
-            continue;
-        };
-        // TEST-ONLY phase hook: the deferred-maintenance retry shares the
-        // same RAII-guarded retention block as step 17, so it signals + parks
-        // at the SAME barrier, tagged with the DEFERRED-RETRY phase (it runs
-        // BEFORE the fresh step-17 retention and reads the debt FIRST — a test
-        // that arms the debt fault only at the fresh step-17 phase therefore
-        // does NOT arm it here). A test that armed the step-17 hook for this
-        // deployment id gets deterministic contention at the retry too (the
-        // no-op path reaches a step-17-equivalent lock acquisition only
-        // here). A no-op in production builds and unarmed tests.
-        #[cfg(test)]
-        store.step17_hook_barrier(deployment_id, HookPhase::DeferredRetry);
-        if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
-            // The slot's ONE retention policy, from its OWNING VARIANT
-            // (resolved from the current config — retention is never a
-            // member-target union).
-            let slot_retention = match config.slot_retention(slot_str.as_str()) {
-                Ok(retention) => retention,
-                Err(e) => {
-                    // The slot is no longer declared by any variant: its
-                    // retention cannot be serviced from here; keep the marker
-                    // and say so.
-                    still_deferred.push(format!(
-                        "retention still deferred for slot '{slot_str}': {e}"
-                    ));
-                    continue;
-                }
-            };
-            match rotate_slot_locked(helper, store, config, slot_retention, deployment_id) {
-                Ok(()) => serviced.push(slot_str.clone()),
-                Err(e) => {
-                    // Keep the marker with the fresh reason.
-                    debt.insert(slot_str.clone(), e.to_string());
-                    still_deferred.push(format!(
-                        "retention still deferred for slot '{slot_str}': {e}"
-                    ));
-                }
-            }
-        } else {
-            still_deferred.push(format!(
-                "retention still deferred for slot '{slot_str}': slot lock held by another \
-                 operation"
-            ));
-        }
-    }
-    for s in &serviced {
-        debt.remove(s);
-    }
-    // A debt WRITE/REMOVE failure (the marker could not be persisted or
-    // removed) is post-commit maintenance: warn and leave the marker file as
-    // it is — the retention itself succeeded, but a later push retries and
-    // converges. Never an `Err`.
-    if let Err(e) = store.write_retention_debt(target_name, &debt) {
-        still_deferred.push(format!(
-            "retention debt maintenance deferred: failed to write retention debt for \
-             '{target_name}': {e}"
-        ));
-    }
-    still_deferred
-}
-
-/// Retry the store-global PENDING SWEEP (the checkpoint's best-effort global
-/// sweep, deferred as durable sweep debt — `<base>/sweep-debt.json`). Runs on
-/// later pushes — real and no-op — because the sweep is POST-COMMIT
-/// MAINTENANCE that must never change a deployment's reported outcome: a
-/// sweep that has not run (or failed) is retried here, recomputing
-/// reachability FRESH (no persisted deletion worklist), and the marker is
-/// cleared once the sweep completes. NON-FALLIBLE by contract: this function
-/// never returns `Err` — a debt read/write failure (a read treated as no
-/// debt, or a write/remove of the marker) becomes a WARNING entry in the
-/// returned vec, so a debt-file fault can never turn a push (real or no-op)
-/// into an error after the deployment durably committed. Returns the
-/// pending-sweep warnings for the push report's maintenance channel.
-pub(crate) fn retry_pending_sweep(
-    store: &LocalStore,
-    config: &ProjectConfig,
-    anchor: &str,
-) -> Vec<String> {
-    // A debt READ failure is treated as no debt: nothing can be serviced
-    // this push, and the marker file (if any) is left untouched for a later
-    // push to retry — the warning keeps the deferral explicit.
-    let pending = match store.read_sweep_debt() {
-        Ok(p) => p,
-        Err(e) => {
-            return vec![format!(
-                "sweep debt maintenance deferred: failed to read sweep debt: {e}"
-            )];
-        }
-    };
-    let Some(reason) = pending else {
-        return Vec::new();
-    };
-    // The push-side sweep retry recomputes reachability from the CURRENT
-    // ledgers — NO checkpoint ledger override: the override is the
-    // checkpoint's retained-suffix hypothetical and exists only while a
-    // checkpoint sweep runs (see `crate::retention::checkpoint`).
-    match store.run_sweep(config, anchor, None) {
-        Ok((_, true)) => {
-            // The sweep completed: clear the marker. A write/remove failure
-            // is post-commit maintenance: warn and leave the marker as it
-            // is — a later push retries and converges. Never an `Err`.
-            if let Err(e) = store.write_sweep_debt(None) {
-                return vec![format!(
-                    "sweep debt maintenance deferred: failed to clear sweep debt: {e}"
-                )];
-            }
-            Vec::new()
-        }
-        Ok((_, false)) => {
-            // Still incomplete: keep the marker with the fresh reason.
-            if let Err(e) = store.write_sweep_debt(Some(
-                "sweep still incomplete on retry; a later push retries it",
-            )) {
-                return vec![format!(
-                    "sweep debt maintenance deferred: failed to write sweep debt: {e}"
-                )];
-            }
-            vec![format!(
-                "sweep still deferred: the global sweep did not complete ({reason}); a later push retries it"
-            )]
-        }
-        Err(e) => {
-            // The sweep failed: keep the marker with the fresh reason.
-            if let Err(e2) = store.write_sweep_debt(Some(&e.to_string())) {
-                return vec![format!(
-                    "sweep debt maintenance deferred: failed to write sweep debt: {e2}"
-                )];
-            }
-            vec![format!("sweep still deferred: {e}")]
-        }
-    }
-}
-
-/// Build the report's `warning` from deferred-maintenance entries: `None`
-/// when nothing is outstanding, otherwise one message describing the deferred
-/// work.
-fn maintenance_warning(deferred: &[String]) -> Option<String> {
-    if deferred.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "post-commit maintenance deferred: {}",
-            deferred.join("; ")
-        ))
-    }
 }
 
 /// Download a tree from a server into the local object store if missing.
@@ -2192,62 +1536,15 @@ fn recover_if_missing(remote: &dyn Remote, store: &LocalStore, digest: &TreeDige
     Ok(())
 }
 
-/// Fail closed in preflight if any planned assignment's (release, variant)
-/// lacks a frozen behavior contract. EACH SLOT's behavior resolves from ITS
-/// OWN artifact binding (`slot.assignment.artifact = {release, variant,
-/// tree}`) — the per-release, per-variant index — never a snapshot-wide
-/// single release. Historical behavior snapshots can be incomplete (a
-/// corrupted or truncated `behavior.json` parses successfully but covers only
-/// some variants); reaching rollout with a missing entry previously panicked
-/// after trees were already staged onto servers. This gate runs before any
-/// remote mutation and names the missing (release, variant) pairs and the
-/// affected servers.
-fn validate_behavior_coverage(
-    index: &BehaviorIndex,
-    assignments: &[crate::deploy::plan::PlannedAssignment],
-) -> Result<()> {
-    let mut missing: BTreeMap<(ReleaseId, String), Vec<&str>> = BTreeMap::new();
-    for a in assignments {
-        let covered = index
-            .get(&a.artifact.release)
-            .is_some_and(|m| m.contains_key(a.artifact.variant.as_str()));
-        if !covered {
-            missing
-                .entry((
-                    a.artifact.release.clone(),
-                    a.artifact.variant.as_str().to_string(),
-                ))
-                .or_default()
-                .push(a.placement_slot.as_str());
-        }
-    }
-    if missing.is_empty() {
-        return Ok(());
-    }
-    let detail = missing
-        .iter()
-        .map(|((release, variant), slots)| {
-            format!(
-                "release {release} variant '{variant}' (slots: {})",
-                slots.join(", ")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    Err(Error::preflight(format!(
-        "behavior snapshot incomplete: missing {detail}; \
-         refusing to start before any remote state is changed"
-    )))
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::identity::{
         CanonicalSlot, CanonicalSlots, GenerationRef, Provenance, ReleaseRecord,
         test_deployment_id, test_generation_id, test_tree_digest,
     };
     use crate::ledger::LedgerEntry;
+    use crate::remote::helper::GenerationAssignment;
     use crate::remote::transport::{FsBytes, LocalTransport};
     use crate::testutil::test_remotes::{
         FailOnceGenerationRemote, FailOnceMarkerRemote, FailOnceStagingRemote, recording_factory,
@@ -2266,7 +1563,7 @@ mod tests {
     /// only records `Unknown` for an unreadable live assignment, which fails
     /// the status read before any successful finalize. Test code asserting
     /// on a real actual artifact unwraps the observation here.
-    fn known_artifact(s: &SlotAttemptState) -> &ArtifactRef {
+    pub(crate) fn known_artifact(s: &SlotAttemptState) -> &ArtifactRef {
         match &s.artifact {
             Observation::Known(a) => a,
             other => panic!("expected a Known actual artifact, got {other:?}"),
@@ -2309,7 +1606,7 @@ attempts = 1
 interval_seconds = 0
 "#;
 
-    const NONE_TOML: &str = r#"
+    pub(crate) const NONE_TOML: &str = r#"
 schema_version = 2
 application = "eng"
 release = "v1"
@@ -2804,22 +2101,22 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     /// A single-server (`s1`/`t1`) project + store + remote base for the
     /// full-push recovery scenarios, mirroring the integration-test setup.
-    struct RecoveryHarness {
+    pub(crate) struct RecoveryHarness {
         _dir: tempfile::TempDir,
-        cfg_path: PathBuf,
-        config: ProjectConfig,
-        store: LocalStore,
-        remotes_base: PathBuf,
+        pub(crate) cfg_path: PathBuf,
+        pub(crate) config: ProjectConfig,
+        pub(crate) store: LocalStore,
+        pub(crate) remotes_base: PathBuf,
     }
 
     impl RecoveryHarness {
-        fn new() -> RecoveryHarness {
+        pub(crate) fn new() -> RecoveryHarness {
             RecoveryHarness::with_variant(NONE_VARIANT)
         }
 
         /// A harness whose variant file carries the given TOML (so a test can
         /// install a verification argv that renders template variables).
-        fn with_variant(variant_toml: &str) -> RecoveryHarness {
+        pub(crate) fn with_variant(variant_toml: &str) -> RecoveryHarness {
             let dir = tempfile::tempdir().unwrap();
             let project = dir.path().join("proj");
             std::fs::create_dir_all(&project).unwrap();
@@ -2997,13 +2294,13 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// A remote that records every `exec` argv it is handed (delegating all
     /// other operations to the wrapped `LocalTransport`), so a test can assert
     /// the RENDERED verification command vector without spawning a process.
-    struct RecordingRemote {
+    pub(crate) struct RecordingRemote {
         inner: LocalTransport,
         executed: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
     impl RecordingRemote {
-        fn new(base: PathBuf, executed: Arc<Mutex<Vec<Vec<String>>>>) -> Result<Self> {
+        pub(crate) fn new(base: PathBuf, executed: Arc<Mutex<Vec<Vec<String>>>>) -> Result<Self> {
             Ok(RecordingRemote {
                 inner: LocalTransport::new(base)?,
                 executed,
@@ -3071,7 +2368,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     }
 
     /// A push with a healthy `LocalTransport` remote.
-    fn push_clean(h: &RecoveryHarness) -> Result<PushReport> {
+    pub(crate) fn push_clean(h: &RecoveryHarness) -> Result<PushReport> {
         let rf = h.remotes_base.clone();
         let clean_factory = move |s: &crate::config::ServerDef,
                                   _slot: &crate::config::SlotConfig|
@@ -3147,7 +2444,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     /// Build and persist a valid release record protecting the given variant
     /// trees (the pin-only trees of the engine-level pin-abort test).
-    fn engine_pin_release(store: &LocalStore, pin_trees: &[&str]) -> ReleaseRecord {
+    pub(crate) fn engine_pin_release(store: &LocalStore, pin_trees: &[&str]) -> ReleaseRecord {
         let variants: BTreeMap<VariantName, TreeDigest> = pin_trees
             .iter()
             .enumerate()
@@ -3176,156 +2473,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         );
         store.write_release(&rec).unwrap();
         rec
-    }
-
-    /// ENGINE-LEVEL wiring for the fail-closed pin abort: a post-commit
-    /// step-17 retention whose pinned release record is unreadable must abort
-    /// before ANY deletion, and the retention caller must convert the abort
-    /// into the retention-debt machinery — the push still reports SUCCESS with
-    /// a deferred-maintenance warning and a durable debt marker (never a hard
-    /// push failure), and the NEXT push's maintenance retry services the
-    /// marker once the record is repaired, deleting EXACTLY the genuinely
-    /// unretained trees: the pin-only trees survive and the true garbage is
-    /// removed. (All three corruption classes — missing / malformed /
-    /// unverifiable — produce the SAME integrity abort and are each covered
-    /// deterministically in the retention unit tests plus the 16-case
-    /// property; this engine test proves the debt/warning/retry wiring with
-    /// the missing-record class.)
-    #[test]
-    fn pin_abort_defers_retention_and_retry_after_repair_deletes_exactly() {
-        let mut h = RecoveryHarness::new();
-
-        // Push 1 (no pins yet): the first deployment establishes the
-        // receiver — generation, current, tree.
-        let r1 = push_clean(&h).unwrap();
-        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-
-        // The pinned release protects two pin-only trees (referenced ONLY by
-        // the pin — outside every count/age window), and a garbage object is
-        // referenced by nothing.
-        let rec = engine_pin_release(&h.store, &["tree-pin-a", "tree-pin-b"]);
-        h.config = h
-            .config
-            .with_pin(crate::config::Pin {
-                release: ReleaseId::parse(&rec.release_id).unwrap(),
-                reason: "known-good".into(),
-            })
-            .unwrap();
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
-        let helper = RemoteHelper::new(&remote);
-        for t in ["tree-pin-a", "tree-pin-b", "tree-garbage"] {
-            helper
-                .remote()
-                .create_dir_all(&layout::tree_root(t))
-                .unwrap();
-        }
-
-        // MISSING pinned release record: the pin names nothing on disk.
-        let path = h
-            .store
-            .release_dir(&ReleaseId::new(rec.release_id.clone()))
-            .join("release.json");
-        std::fs::remove_file(&path).unwrap();
-
-        // Push 2 (a REAL push — changed artifact content promotes a new
-        // generation, so step-17 retention runs): the pin abort must NOT fail
-        // the push. It is converted into retention debt + a warning, and
-        // NOTHING is deleted.
-        let artifacts = h
-            .cfg_path
-            .parent()
-            .unwrap()
-            .join("releases")
-            .join("v1")
-            .join("artifacts");
-        std::fs::write(
-            artifacts
-                .join("build")
-                .join("output")
-                .join("app")
-                .join("server"),
-            "v2\n",
-        )
-        .unwrap();
-        let r2 = push_clean(&h).unwrap();
-        assert_eq!(
-            r2.status,
-            Some(DeploymentStatus::Successful),
-            "the pin abort must never hard-fail the push (post-commit maintenance)"
-        );
-        let warning = r2
-            .warning
-            .as_ref()
-            .expect("the push must warn about the deferred retention");
-        assert!(
-            warning.contains("retention deferred"),
-            "the warning describes the deferred retention, got: {warning}"
-        );
-        let debt = h.store.read_retention_debt("t1").unwrap();
-        let reason = debt
-            .get("p1")
-            .expect("a durable debt marker for slot p1 must be recorded");
-        assert!(
-            reason.contains("pin names release"),
-            "the debt marker records the un-honorable pin, got: {reason}"
-        );
-
-        // ZERO DELETIONS: every pre-existing object survives push 2 (the
-        // only inventory delta is the push's own new tree object).
-        let inventory_after = helper.status().unwrap().inventory;
-        for t in ["tree-pin-a", "tree-pin-b", "tree-garbage"] {
-            assert!(
-                inventory_after.contains(&t.to_string()),
-                "tree {t} must survive the failed retention"
-            );
-        }
-
-        // Repair the pinned release's record.
-        let dir = h.store.release_dir(&ReleaseId::new(rec.release_id.clone()));
-        std::fs::remove_dir_all(&dir).unwrap();
-        h.store.write_release(&rec).unwrap();
-
-        // Push 3 (up-to-date no-op): the deferred-maintenance retry
-        // services the marker — the retention now succeeds, deleting
-        // EXACTLY the genuinely unretained trees — and clears the marker.
-        let r3 = push_clean(&h).unwrap();
-        assert_eq!(r3.message, "Everything up to date");
-        assert!(
-            r3.warning.is_none(),
-            "the retried retention succeeded: no warning remains, got {:?}",
-            r3.warning
-        );
-        assert!(
-            h.store.read_retention_debt("t1").unwrap().is_empty(),
-            "the debt marker is cleared once the retry succeeds"
-        );
-        let inventory = helper.status().unwrap().inventory;
-        for t in ["tree-pin-a", "tree-pin-b"] {
-            assert!(
-                inventory.contains(&t.to_string()),
-                "pin-only tree {t} survives the retry"
-            );
-        }
-        assert!(
-            !inventory.contains(&"tree-garbage".to_string()),
-            "the true garbage is removed by the retry"
-        );
-        let cur = helper
-            .status()
-            .unwrap()
-            .current_generation
-            .expect("a current generation exists");
-        let live = helper
-            .read_assignment(cur.as_str())
-            .unwrap()
-            .artifact
-            .tree
-            .as_str()
-            .to_string();
-        assert!(
-            inventory.contains(&live),
-            "the live tree {live} survives the retry"
-        );
     }
 
     /// The TERMINAL EVENT append (the deployment's ONE atomic finalize write)
@@ -3502,7 +2649,10 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// healthy `LocalTransport` remotes (no injected remote faults). Drives
     /// the FULL normal success path (`push_inner`) so a test can arm store
     /// faults keyed by the fixed deployment id BEFORE the push runs.
-    fn push_main_with_id(h: &RecoveryHarness, deployment_id: &DeploymentId) -> Result<PushReport> {
+    pub(crate) fn push_main_with_id(
+        h: &RecoveryHarness,
+        deployment_id: &DeploymentId,
+    ) -> Result<PushReport> {
         let project_root = h.config.project_root(&h.cfg_path);
         let target = h.config.target("t1").expect("harness configures target t1");
         let op_id = OperationId::new(format!("op-{}", deployment_id.as_str()));
@@ -4002,7 +3152,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
     /// Recursively snapshot every file under `dir` as (relative path, bytes),
     /// sorted, for byte-for-byte store-comparison assertions.
-    fn snapshot_files(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    pub(crate) fn snapshot_files(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
         let mut out = Vec::new();
         let mut stack = vec![dir.to_path_buf()];
         while let Some(d) = stack.pop() {
@@ -4165,238 +3315,6 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             "remote advanced"
         );
         assert_eq!(h.store.read_attempts("t1").unwrap().len(), 2);
-    }
-
-    /// Everything-up-to-date no-op: a second push with nothing changed records
-    /// no new attempt, no new snapshot, no transition stream, and leaves the
-    /// whole per-target store state byte-for-byte identical (attempts,
-    /// transitions, observed, refs).
-    #[test]
-    fn no_op_push_leaves_store_untouched() {
-        let h = RecoveryHarness::new();
-        let id = test_deployment_id("deploy-noop-baseline");
-        let r1 = push_main_with_id(&h, &id).unwrap();
-        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-
-        let target_dir = h.store.target_dir("t1");
-        let before = snapshot_files(&target_dir);
-
-        let r2 = push_clean(&h).unwrap();
-        assert_eq!(r2.status, None, "no-op push creates no attempt");
-        assert_eq!(r2.message, "Everything up to date");
-        assert_eq!(
-            h.store.read_attempts("t1").unwrap().len(),
-            1,
-            "no new attempt may be recorded by the no-op"
-        );
-        assert_eq!(
-            h.store.read_snapshots("t1").unwrap().len(),
-            1,
-            "no new snapshot may be appended by the no-op"
-        );
-
-        let after = snapshot_files(&target_dir);
-        assert_eq!(
-            before, after,
-            "the no-op push must not touch any store file (attempts, transitions, observed, refs)"
-        );
-        // Observed still reflects the successful push.
-        let observed = h.store.read_observed("t1", &h.config).unwrap();
-        let Observation::Known(obs_state) = &observed.slots[&SlotId::new("p1")].observation else {
-            panic!("observed p1 must be a successful read");
-        };
-        assert_eq!(
-            Some(obs_state.generation.clone()),
-            r1.attempt.as_ref().unwrap().slots[&SlotId::new("p1")].generation
-        );
-    }
-
-    /// A variant whose verification argv renders the per-deployment identity
-    /// templates (`{{ deployment_id }}` / `{{ generation }}` / `{{ tree }}`)
-    /// so a no-op push's verification can be captured and asserted.
-    const VERIFY_IDENTITY_VARIANT: &str = r#"
-[[slots]]
-id = "p1"
-server = "s1"
-target = "t1"
-deploy_dir = "/srv/eng"
-
-[[artifact.mappings]]
-from = "artifacts/build/output/"
-to = "app/"
-recursive = true
-
-[[artifact.mappings]]
-from = "artifacts/deployment/common/"
-to = "app-common/"
-recursive = true
-
-[activation]
-adapter = "none"
-
-[verification]
-adapter = "command"
-argv = ["true", "{{ deployment_id }}", "{{ generation }}", "{{ tree }}"]
-timeout_seconds = 5
-attempts = 1
-interval_seconds = 0
-"#;
-
-    /// A no-op push's verification must render the EXISTING generation's
-    /// identities — deployment_id, generation_id, and tree from the running
-    /// generation's assignment — never the NEW deployment/generation ids: the
-    /// no-op creates no records, so those would be fabricated. The rendered
-    /// argv is captured via a recording remote wrapper and asserted to equal
-    /// the first push's assignment; the no-op must create no records at all
-    /// (no attempt, no transition, no snapshot, `refs/last-successful` and
-    /// `observed.json` unchanged).
-    #[test]
-    fn no_op_verification_renders_existing_generation_identities() {
-        let h = RecoveryHarness::with_variant(VERIFY_IDENTITY_VARIANT);
-        let executed: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
-        let rf = h.remotes_base.clone();
-        let recorded = executed.clone();
-        let factory = move |s: &crate::config::ServerDef,
-                            _slot: &crate::config::SlotConfig|
-              -> Result<Box<dyn Remote>> {
-            Ok(Box::new(RecordingRemote::new(
-                rf.join(s.id.as_str()),
-                recorded.clone(),
-            )?))
-        };
-
-        // Push 1: a real push. Its verification argv renders the NEW
-        // deployment's identities (those records ARE created), so it is not
-        // the subject here — the no-op's argv is captured separately below.
-        let r1 = push(
-            &h.cfg_path,
-            &h.store,
-            &factory,
-            "t1",
-            &h.config,
-            &PushOptions {
-                dry_run: false,
-                ref_token: None,
-                group: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-        let first_attempt = r1.attempt.as_ref().expect("attempt recorded");
-
-        // The EXISTING generation's assignment: what the running service was
-        // actually deployed with — the ground truth the no-op must render.
-        let remote = LocalTransport::new(h.remotes_base.join("s1")).unwrap();
-        let status = RemoteHelper::new(&remote).status().unwrap();
-        let cur = status
-            .current_generation
-            .expect("first push must leave a current generation");
-        let assignment: crate::remote::helper::GenerationAssignment = serde_json::from_slice(
-            &remote
-                .read(
-                    &crate::remote::layout::generations()
-                        .join(cur.as_str())
-                        .join("assignment.json"),
-                )
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            assignment.deployment_id, first_attempt.deployment_id,
-            "the generation assignment must carry the deployment that created it"
-        );
-        assert_eq!(
-            assignment.generation_id.as_str(),
-            cur.as_str(),
-            "the assignment must be the current generation's"
-        );
-
-        // Push 2: the no-op. Capture ONLY the no-op's verification argv.
-        let target_dir = h.store.target_dir("t1");
-        let before = snapshot_files(&target_dir);
-        executed.lock().unwrap().clear();
-        let r2 = push(
-            &h.cfg_path,
-            &h.store,
-            &factory,
-            "t1",
-            &h.config,
-            &PushOptions {
-                dry_run: false,
-                ref_token: None,
-                group: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(r2.status, None, "no-op push creates no attempt");
-        assert_eq!(r2.message, "Everything up to date");
-
-        let recorded = executed.lock().unwrap();
-        assert_eq!(
-            recorded.len(),
-            1,
-            "the no-op runs verification exactly once, got: {recorded:?}"
-        );
-        let argv = &recorded[0];
-        // argv = ["true", "<deployment_id>", "<generation>", "<tree>"]
-        assert_eq!(argv.len(), 4, "argv: {argv:?}");
-        assert_eq!(
-            argv[1],
-            assignment.deployment_id.as_str(),
-            "the no-op verification must render the EXISTING generation's deployment id, not a fabricated one"
-        );
-        assert_eq!(
-            argv[2],
-            assignment.generation_id.as_str(),
-            "the no-op verification must render the EXISTING generation id, not a fabricated one"
-        );
-        assert_eq!(
-            argv[3],
-            assignment.artifact.tree.as_str(),
-            "the no-op verification must render the EXISTING generation's tree"
-        );
-        drop(recorded);
-
-        // The no-op creates NO records: no new attempt, no new transition, no
-        // new snapshot, `refs/last-successful` unchanged, observed.json
-        // unchanged (the whole per-target store is byte-for-byte identical).
-        let after = snapshot_files(&target_dir);
-        assert_eq!(
-            before, after,
-            "the no-op push must not touch any store file (attempts, transitions, observed, refs)"
-        );
-        assert_eq!(
-            h.store.read_attempts("t1").unwrap().len(),
-            1,
-            "no new attempt may be recorded by the no-op"
-        );
-        assert_eq!(
-            h.store.read_snapshots("t1").unwrap().len(),
-            1,
-            "no new snapshot may be appended by the no-op"
-        );
-        assert_eq!(
-            h.store.read_last_successful("t1").unwrap(),
-            first_attempt.deployment_id.as_str(),
-            "refs/last-successful must be unchanged"
-        );
-        assert_eq!(
-            h.store
-                .read_transitions(first_attempt.deployment_id.as_str())
-                .unwrap()
-                .len(),
-            1,
-            "no new terminal event may be appended to the first deployment"
-        );
-        let observed = h.store.read_observed("t1", &h.config).unwrap();
-        let Observation::Known(obs_state) = &observed.slots[&SlotId::new("p1")].observation else {
-            panic!("observed p1 must be a successful read");
-        };
-        assert_eq!(
-            Some(&obs_state.generation),
-            Some(&assignment.generation_id),
-            "observed.json must be unchanged"
-        );
     }
 
     /// A just-recorded attempt with NO transition stream at all (latest status
@@ -7541,303 +6459,6 @@ interval_seconds = 0
             r.message.contains(s0_tree.as_str()),
             "the bare deployment-id form must plan that deployment's stored state for the push's              own target, got: {}",
             r.message
-        );
-    }
-
-    /// Regression: the early "Everything up to date" comparison must compare
-    /// the COMPLETE `ArtifactRef` (release + variant + tree), never just
-    /// tree+release. Two variants can materialize the SAME tree bytes
-    /// (identical artifact mappings and identical artifact source content ->
-    /// same tree digest) while carrying DIFFERENT behavior contracts.
-    /// Switching the slot's variant binding from `standard` to `other` (with
-    /// the same tree) must be a REAL push (new generation, new attempt,
-    /// verification under `other`'s contract) — a tree+release comparison
-    /// would falsely report "Everything up to date", leaving the service
-    /// claimed verified under the new contract without ever running it.
-    #[test]
-    fn variant_switch_same_tree_no_op_comparison() {
-        // Two variants with IDENTICAL artifact mappings (and identical source
-        // content) -> the SAME tree digest, but DIFFERENT verification
-        // contracts: `standard` runs `["true"]`, `other` runs
-        // `["true", "{{ variant }}"]` so the recording remote proves WHICH
-        // contract actually ran.
-        const STD_VARIANT: &str = r#"
-[[slots]]
-id = "p1"
-server = "s1"
-target = "t1"
-deploy_dir = "/srv/eng"
-
-[[artifact.mappings]]
-from = "artifacts/build/output/"
-to = "app/"
-recursive = true
-
-[[artifact.mappings]]
-from = "artifacts/deployment/common/"
-to = "app-common/"
-recursive = true
-
-[activation]
-adapter = "none"
-
-[verification]
-adapter = "command"
-argv = ["true"]
-timeout_seconds = 5
-attempts = 1
-interval_seconds = 0
-"#;
-        const OTHER_VARIANT_NO_SLOTS: &str = r#"
-[[artifact.mappings]]
-from = "artifacts/build/output/"
-to = "app/"
-recursive = true
-
-[[artifact.mappings]]
-from = "artifacts/deployment/common/"
-to = "app-common/"
-recursive = true
-
-[activation]
-adapter = "none"
-
-[verification]
-adapter = "command"
-argv = ["true", "{{ variant }}"]
-timeout_seconds = 5
-attempts = 1
-interval_seconds = 0
-"#;
-        const OTHER_VARIANT_WITH_SLOTS: &str = r#"
-[[slots]]
-id = "p1"
-server = "s1"
-target = "t1"
-deploy_dir = "/srv/eng"
-
-[[artifact.mappings]]
-from = "artifacts/build/output/"
-to = "app/"
-recursive = true
-
-[[artifact.mappings]]
-from = "artifacts/deployment/common/"
-to = "app-common/"
-recursive = true
-
-[activation]
-adapter = "none"
-
-[verification]
-adapter = "command"
-argv = ["true", "{{ variant }}"]
-timeout_seconds = 5
-attempts = 1
-interval_seconds = 0
-"#;
-        const STD_VARIANT_NO_SLOTS: &str = r#"
-[[artifact.mappings]]
-from = "artifacts/build/output/"
-to = "app/"
-recursive = true
-
-[[artifact.mappings]]
-from = "artifacts/deployment/common/"
-to = "app-common/"
-recursive = true
-
-[activation]
-adapter = "none"
-
-[verification]
-adapter = "command"
-argv = ["true"]
-timeout_seconds = 5
-attempts = 1
-interval_seconds = 0
-"#;
-
-        let dir = tempfile::tempdir().unwrap();
-        let project = dir.path().join("proj");
-        std::fs::create_dir_all(&project).unwrap();
-        let release_dir = project.join("releases").join("v1");
-        std::fs::create_dir_all(&release_dir).unwrap();
-        std::fs::write(release_dir.join("standard.toml"), STD_VARIANT).unwrap();
-        std::fs::write(release_dir.join("other.toml"), OTHER_VARIANT_NO_SLOTS).unwrap();
-        std::fs::write(project.join("deploy.toml"), NONE_TOML).unwrap();
-        let artifacts_dir = release_dir.join("artifacts");
-        for (p, c) in [
-            ("build/output/app/server", "v1\n"),
-            ("deployment/common/README", "common\n"),
-        ] {
-            let fp = artifacts_dir.join(p);
-            std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
-            std::fs::write(&fp, c).unwrap();
-        }
-
-        let cfg_path = project.join("deploy.toml");
-        let config = ProjectConfig::load(&cfg_path).unwrap();
-        assert_eq!(config.slot_variant("p1").unwrap(), "standard");
-        let store = LocalStore::with_base(dir.path().join("store")).unwrap();
-        let remotes_base = dir.path().join("remotes");
-        std::fs::create_dir_all(&remotes_base).unwrap();
-        let executed: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
-        let rf = remotes_base.clone();
-        let recorded = executed.clone();
-        let factory = move |s: &crate::config::ServerDef,
-                            _slot: &crate::config::SlotConfig|
-              -> Result<Box<dyn Remote>> {
-            Ok(Box::new(RecordingRemote::new(
-                rf.join(s.id.as_str()),
-                recorded.clone(),
-            )?))
-        };
-
-        // Push 1: slot p1 on variant `standard`. Successful; the verification
-        // contract that ran is standard's `["true"]`.
-        let r1 = push(
-            &cfg_path,
-            &store,
-            &factory,
-            "t1",
-            &config,
-            &PushOptions {
-                dry_run: false,
-                ref_token: None,
-                group: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(r1.status, Some(DeploymentStatus::Successful));
-        let first_attempt = r1.attempt.as_ref().expect("attempt recorded");
-        let first_slot = &first_attempt.slots[&SlotId::new("p1")];
-        assert_eq!(known_artifact(first_slot).variant.as_str(), "standard");
-        let first_tree = known_artifact(first_slot).tree.clone();
-        let first_gen = first_slot.generation.clone().expect("generation minted");
-        let argv1 = executed.lock().unwrap().clone();
-        assert_eq!(argv1.len(), 1, "push 1 runs verification once: {argv1:?}");
-        assert_eq!(
-            argv1[0],
-            vec!["true".to_string()],
-            "push 1 must run the standard contract: {argv1:?}"
-        );
-
-        // Switch the slot binding: `standard.toml` loses the slot
-        // declaration, `other.toml` gains it (identical server/deploy_dir,
-        // IDENTICAL artifact mappings + source content). The SAME slot id now
-        // resolves to variant `other` with the SAME tree bytes as `standard`.
-        std::fs::write(release_dir.join("standard.toml"), STD_VARIANT_NO_SLOTS).unwrap();
-        std::fs::write(release_dir.join("other.toml"), OTHER_VARIANT_WITH_SLOTS).unwrap();
-        let config2 = ProjectConfig::load(&cfg_path).unwrap();
-        assert_eq!(config2.slot_variant("p1").unwrap(), "other");
-
-        // Push 2: the variant changed (standard -> other) even though the
-        // tree bytes are identical. The up-to-date comparison must compare
-        // the COMPLETE ArtifactRef (variant included): this must be a REAL
-        // push — a new generation minted, a new attempt recorded, a new
-        // snapshot — and verification must run under `other`'s contract
-        // (`["true", "{{ variant }}"]` rendering `other`). A tree+release
-        // comparison would falsely report "Everything up to date" and leave
-        // the service claimed verified under the new contract without ever
-        // running it.
-        executed.lock().unwrap().clear();
-        let r2 = push(
-            &cfg_path,
-            &store,
-            &factory,
-            "t1",
-            &config2,
-            &PushOptions {
-                dry_run: false,
-                ref_token: None,
-                group: None,
-            },
-        )
-        .unwrap();
-        assert_ne!(
-            r2.message, "Everything up to date",
-            "a variant switch with an identical tree must not no-op"
-        );
-        assert_eq!(r2.status, Some(DeploymentStatus::Successful));
-        let second_attempt = r2.attempt.as_ref().expect("attempt recorded");
-        let second_slot = &second_attempt.slots[&SlotId::new("p1")];
-        assert_eq!(known_artifact(second_slot).variant.as_str(), "other");
-        assert_eq!(
-            known_artifact(second_slot).tree,
-            first_tree,
-            "both variants materialize the SAME tree bytes; only the variant differs"
-        );
-        let second_gen = second_slot.generation.clone().expect("generation minted");
-        assert_ne!(
-            second_gen, first_gen,
-            "the switch must mint a NEW generation, never reuse the standard one"
-        );
-        assert_eq!(
-            second_attempt.desired[&SlotId::new("p1")]
-                .assignment
-                .artifact
-                .variant
-                .as_str(),
-            "other",
-            "the attempt's desired assignment must carry the other variant"
-        );
-
-        // Verification ran under `other`'s contract: the recording remote
-        // captured `["true", "{{ variant }}"]` with the variant rendered.
-        let argv2 = executed.lock().unwrap().clone();
-        assert_eq!(argv2.len(), 1, "push 2 runs verification once: {argv2:?}");
-        assert_eq!(
-            argv2[0],
-            vec!["true".to_string(), "other".to_string()],
-            "push 2 must run the OTHER variant's contract with {{ variant }} rendered: {argv2:?}"
-        );
-
-        // A REAL push means fresh durable records: a second attempt, a second
-        // snapshot, and the remote advanced to the new generation whose stored
-        // assignment carries variant `other`.
-        assert_eq!(store.read_attempts("t1").unwrap().len(), 2);
-        assert_eq!(store.read_snapshots("t1").unwrap().len(), 2);
-        let remote = LocalTransport::new(remotes_base.join("s1")).unwrap();
-        let status = RemoteHelper::new(&remote).status().unwrap();
-        let cur = status
-            .current_generation
-            .expect("push 2 must advance the remote");
-        assert_eq!(cur.as_str(), second_gen.as_str());
-        let asn: crate::remote::helper::GenerationAssignment = serde_json::from_slice(
-            &remote
-                .read(
-                    &crate::remote::layout::generations()
-                        .join(cur.as_str())
-                        .join("assignment.json"),
-                )
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(asn.artifact.variant.as_str(), "other");
-        assert_eq!(asn.artifact.tree, first_tree);
-
-        // The reverse stays true: a push with NO change at all still no-ops
-        // ("Everything up to date", no new attempt).
-        let r3 = push(
-            &cfg_path,
-            &store,
-            &factory,
-            "t1",
-            &config2,
-            &PushOptions {
-                dry_run: false,
-                ref_token: None,
-                group: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(r3.status, None, "an unchanged push is a no-op");
-        assert_eq!(r3.message, "Everything up to date");
-        assert_eq!(
-            store.read_attempts("t1").unwrap().len(),
-            2,
-            "the no-op must not record a third attempt"
         );
     }
 
