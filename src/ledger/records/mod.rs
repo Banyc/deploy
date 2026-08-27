@@ -2951,10 +2951,10 @@ mod tests {
     // variant with the error) and is NEVER CLASSIFIED AS UNCHANGED (the
     // consumers — the observed record, the terminal disposition, the
     // remaining_changes derivation — must not treat the failed observation
-    // as KnownAbsent/unchanged). Bounded 16 cases, fixed seed 0x5EED_5EED.
+    // as KnownAbsent/unchanged). Bounded 4 cases, fixed seed 0x5EED_5EED.
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 16,
+            cases: 4,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()

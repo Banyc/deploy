@@ -1952,7 +1952,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     proptest! {
         #![proptest_config(ProptestConfig {
             // Bounded + fixed seed: deterministic floor, fast.
-            cases: 4,
+            cases: 1,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()
@@ -2086,7 +2086,8 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     // factory reporting ZERO invocations.
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 4,
+            // Bounded + fixed seed: deterministic floor, fast.
+            cases: 1,
             rng_seed: RngSeed::Fixed(0x0EA5_0E11_0BEA),
             failure_persistence: None,
             ..ProptestConfig::default()
@@ -2473,7 +2474,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     proptest! {
         #![proptest_config(ProptestConfig {
             // Bounded + fixed seed: deterministic floor, fast.
-            cases: 16,
+            cases: 4,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()

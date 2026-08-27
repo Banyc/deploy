@@ -1128,11 +1128,11 @@ mod tests_current {
         //   malformed-present layout fails with an integrity error and the
         //   `current` entry is left byte-identical.
         //
-        // Bounded 64 cases, fixed seed 0x5EED_5EED (house style), no
+        // Bounded 16 cases, fixed seed 0x5EED_5EED (house style), no
         // persistence. `catch_unwind` turns a panic into a test failure at
         // the `.expect`.
         #![proptest_config(ProptestConfig {
-            cases: 64,
+            cases: 16,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()

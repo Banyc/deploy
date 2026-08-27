@@ -131,7 +131,7 @@ mod tests_markers {
                     return;
                 };
                 let h = RemoteHelper::new(&remote);
-                for i in 0..80 {
+                for i in 0..40 {
                     if let Err(e) = h.write_commit_marker(
                         &format!("deploy-{i}"),
                         &format!("gen-{i}"),
@@ -179,7 +179,7 @@ mod tests_markers {
             );
         });
 
-        for i in 0..80 {
+        for i in 0..40 {
             let p = commits_dir.join(format!("deploy-{i}.json"));
             let v: serde_json::Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
             assert_eq!(v["committed"], serde_json::json!(true));

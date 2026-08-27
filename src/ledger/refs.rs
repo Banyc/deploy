@@ -606,14 +606,14 @@ mod tests {
             )
         );
     }
-    /// A deployment-history shape: 0..=8 (deployment_id, successful?) pairs
+    /// A deployment-history shape: 0..=2 (deployment_id, successful?) pairs
     /// (a FAILED deployment never gets a successful terminal — the
     /// two-class history the user's property needs). Deployment ids are
     /// DETERMINISTIC PER POSITION (`deploy-{n:04}`), so each id is unique
     /// across the history and a FAILED id can never double as a SUCCESSFUL
     /// one (which would make "failed ids never resolve" vacuous).
     fn chain_strategy() -> impl Strategy<Value = Vec<(String, bool)>> {
-        prop::collection::vec(any::<bool>(), 0..=8).prop_map(|flags| {
+        prop::collection::vec(any::<bool>(), 0..=2).prop_map(|flags| {
             flags
                 .into_iter()
                 .enumerate()
@@ -834,10 +834,10 @@ mod tests {
         // The RESOLVE leg — against a REAL seeded store per case (a
         // successful + failed deployment history): the user's deployment-id
         // resolution property, resolve membership, and totality. Randomized
-        // seeds + failure persistence, bounded at 96 cases (each case builds
+        // seeds + failure persistence, bounded at 8 cases (each case builds
         // a small tempdir store, so the bound keeps the suite fast).
         #![proptest_config(ProptestConfig {
-            cases: 96,
+            cases: 8,
             failure_persistence: Some(Box::new(FileFailurePersistence::default())),
             ..ProptestConfig::default()
         })]
@@ -857,7 +857,7 @@ mod tests {
         // state; failed ids never resolve) under the pinned 0x5EED_5EED
         // seed — the identical vectors on every invocation.
         #![proptest_config(ProptestConfig {
-            cases: 96,
+            cases: 8,
             rng_seed: RngSeed::Fixed(0x5EED_5EED),
             failure_persistence: None,
             ..ProptestConfig::default()

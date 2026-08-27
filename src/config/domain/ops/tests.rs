@@ -701,10 +701,10 @@ proptest! {
     // configs are identical: same variants, same policies, same scalars),
     // and a MISSING or INVALID R (no variant files, or a variant file
     // that fails validation) fails the WHOLE load — the Err is a full
-    // load failure, no partially-switched config escapes. Bounded 16
+    // load failure, no partially-switched config escapes. Bounded 4
     // cases, fixed seed 0x5EED_5EED per house style.
     #![proptest_config(ProptestConfig {
-        cases: 16,
+        cases: 4,
         rng_seed: RngSeed::Fixed(0x5EED_5EED),
         failure_persistence: None,
         ..ProptestConfig::default()

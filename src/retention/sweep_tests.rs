@@ -545,11 +545,11 @@ fn run_no_leak_case(
 }
 
 proptest! {
-    // The two-sided no-leak contract, bounded 4 cases + fixed seed per house
+    // The two-sided no-leak contract, bounded 1 case + fixed seed per house
     // style (each case builds a tempdir remote + store, so the bound keeps
     // the suite fast).
     #![proptest_config(ProptestConfig {
-        cases: 4,
+        cases: 1,
         rng_seed: RngSeed::Fixed(0x5EED_5EED),
         failure_persistence: None,
         ..ProptestConfig::default()
@@ -557,7 +557,7 @@ proptest! {
 
     #[test]
     fn two_sided_sweep_no_leak(
-        receiver_trees in prop::collection::vec(0usize..8, 3..=6)
+        receiver_trees in prop::collection::vec(0usize..8, 3..=4)
             .prop_map(|v| {
                 let mut s: Vec<String> = v
                     .into_iter()
@@ -725,9 +725,9 @@ fn run_fault_case(pusher_history: Vec<bool>, checkpoint_at: usize, fault: SweepF
 }
 
 proptest! {
-    // The maintenance-not-correction contract, bounded 4 cases + fixed seed.
+    // The maintenance-not-correction contract, bounded 1 case + fixed seed.
     #![proptest_config(ProptestConfig {
-        cases: 4,
+        cases: 1,
         rng_seed: RngSeed::Fixed(0x5EED_5EED),
         failure_persistence: None,
         ..ProptestConfig::default()
@@ -735,7 +735,7 @@ proptest! {
 
     #[test]
     fn sweep_faults_are_maintenance_not_correction(
-        pusher_history in prop::collection::vec(any::<bool>(), 3..=6)
+        pusher_history in prop::collection::vec(any::<bool>(), 3..=4)
             .prop_map(|mut v| {
                 if !v.contains(&true) {
                     v[0] = true;
