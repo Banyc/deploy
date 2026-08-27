@@ -1380,11 +1380,37 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     }
                 }
                 extracted += 1;
-                if let Err(e) = parse_ref_expr(&ref_spec) {
+                // THE REAL CLI PARSER: run the full `deploy push ...` line
+                // through clap's actual argument parsing (`Cli::try_parse_from`
+                // → the `push` subcommand), so flags, the required target, the
+                // optional reference token, and `--group`/`--dry-run` are all
+                // exercised exactly as a user's shell line would be.
+                // argv = `deploy push <target>` + the post-target tokens: the
+                // unquoted ref as ONE argument (the shell would unquote it),
+                // or the raw flag tokens (`--dry-run`, `--group <name>`).
+                let mut argv: Vec<&str> = vec!["deploy", "push"];
+                let target = code.split_whitespace().nth(2).expect("{loc}: missing target");
+                argv.push(target);
+                if ref_spec.is_empty() {
+                    argv.extend(code.split_whitespace().skip(3));
+                } else {
+                    argv.push(&ref_spec);
+                }
+                if let Err(e) = Cli::try_parse_from(&argv) {
                     panic!(
-                        "{loc}: documented example contradicts the strict ref parser: \
-                         parse_ref_expr({ref_spec:?}) failed: {e}"
+                        "{loc}: documented example fails the REAL CLI parser: \
+                         Cli::try_parse_from({argv:?}) failed: {e}"
                     );
+                }
+                // And the reference token itself must satisfy the strict ref
+                // grammar (the CLI defers ref validation to push()).
+                if !ref_spec.is_empty() {
+                    if let Err(e) = parse_ref_expr(&ref_spec) {
+                        panic!(
+                            "{loc}: documented example contradicts the strict ref parser: \
+                             parse_ref_expr({ref_spec:?}) failed: {e}"
+                        );
+                    }
                 }
             }
         }
