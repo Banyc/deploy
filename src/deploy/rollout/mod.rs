@@ -1,9 +1,9 @@
 //! EXECUTION SEMANTICS: the per-slot rollout machinery.
 //!
 //! Nested along the execution concerns: this module holds the
-//! deployment-order batch loop ([`run_batches`], [`BatchRun`]); [`attempt`]
+//! deployment-order batch loop (`run_batches`, `BatchRun`); `attempt`
 //! the per-attempt outcome derivation (failure policies, result shaping,
-//! status/disposition); [`server`] the per-server mutation pipeline and its
+//! status/disposition); `server` the per-server mutation pipeline and its
 //! per-slot compensation.
 
 use crate::config::ProjectConfig;

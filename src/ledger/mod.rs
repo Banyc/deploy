@@ -10,11 +10,11 @@
 //!   [`DeploymentStatus`]) and the plan/pins records live in
 //!   [`crate::ledger::records`] itself; the LEDGER LINE + ENTRY facets
 //!   (intent, terminal, outcomes, the merged entry) live in
-//!   [`crate::ledger::records::wire`]; the RECORD-VALIDATION facets
+//!   `crate::ledger::records::wire`; the RECORD-VALIDATION facets
 //!   (rollback payload builder, rebinding proof, membership equations,
-//!   schema versions) live in [`crate::ledger::records::validation`]; the
+//!   schema versions) live in `crate::ledger::records::validation`; the
 //!   foundational three-state observation lives in
-//!   [`crate::ledger::records::observation`]. The record names are all
+//!   `crate::ledger::records::observation`. The record names are all
 //!   re-exported at [`crate::ledger::records`]: the rollback records
 //!   ([`LedgerRollback`] / [`LedgerRollbackWire`] /
 //!   [`PhysicalBinding`] / [`CompleteRollback`]), the plan/report records
@@ -30,9 +30,9 @@
 //!   ([`build_rollback`]), the rebinding proof ([`RebindingPlan`] /
 //!   [`VerifiedReleaseRebinding`] / [`FrozenSlotTopology`]), the successful
 //!   membership-equation enforcement
-//!   ([`records::verify_successful_membership_equations`]), and the
-//!   schema-version constants ([`LEDGER_SCHEMA_VERSION`] /
-//!   [`PINS_SCHEMA_VERSION`]).
+//!   (`records::verify_successful_membership_equations`), and the
+//!   schema-version constants (`LEDGER_SCHEMA_VERSION` /
+//!   `PINS_SCHEMA_VERSION`).
 //! * [`tables`] — the per-slot ordered TABLES ([`SlotTable`] /
 //!   [`NonEmptySlotTable`] over the private ordered map): generic slot
 //!   collection INFRASTRUCTURE shared by the record model.
@@ -41,9 +41,9 @@
 //!   physical append line kinds ([`LedgerLine`] — the intent + terminal
 //!   WIRE events) with the merged-entry re-export.
 //! * [`recovery`] — pending-attempt RECONCILIATION
-//!   ([`reconcile_pending_commits`]).
+//!   (`reconcile_pending_commits`).
 //! * [`refs`] — reference RESOLUTION against the ledger
-//!   ([`resolve_ref_expr`] + the derived successful-chain helpers; the
+//!   (`resolve_ref_expr` + the derived successful-chain helpers; the
 //!   GRAMMAR stays in [`crate::deploy::refs`]).
 //! * [`log`] — the `deploy log` RENDERING ([`render_log`] + the
 //!   effective-status derivation): one line per attempt, newest last,

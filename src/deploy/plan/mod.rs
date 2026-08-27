@@ -2,10 +2,10 @@
 //!
 //! Nested along the planning concerns: this module holds the assignment
 //! planner itself ([`plan_assignments`], [`release_behavior_index`]);
-//! [`selection`] holds slot selection + the proof-bearing resolution;
-//! [`groups`] the direct-release membership gate; [`preflight`] the
+//! `selection` holds slot selection + the proof-bearing resolution;
+//! `groups` the direct-release membership gate; `preflight` the
 //! capacity preflight + the disposable staging lifecycle (the capacity +
-//! staging preflight pair); [`guards`] the partial-rollout guards, the
+//! staging preflight pair); `guards` the partial-rollout guards, the
 //! exact-rollback binding verification and the behavior-coverage gate.
 
 use crate::config::ProjectConfig;
@@ -97,9 +97,9 @@ pub type PlannedAssignment = PlacementSlotAssignment;
 /// release reference carries its [`VerifiedReleaseRebinding`] proof INSIDE
 /// the source (a Release origin without the proof is unrepresentable);
 /// HEAD and deployment references carry none — plus the PROOF-BEARING
-/// [`ResolvedSelection`] the assignments were derived from: the target, its
+/// `ResolvedSelection` the assignments were derived from: the target, its
 /// declared temporal source, and the non-empty resolved slot set. The
-/// engine consumes the resolution by accessor ([`PlannedResolution::resolved`]);
+/// engine consumes the resolution by accessor (`PlannedResolution::resolved`);
 /// it can never construct one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannedResolution {
@@ -148,7 +148,7 @@ pub(crate) fn latest_successful_rollback(
 /// releases the assignments reference (per-slot artifact provenance — a
 /// partial snapshot can span several releases, so there is NO single
 /// snapshot-wide release), the plan source, and — for a DIRECT release
-/// reference — the explicit [`RebindingPlan`] documenting that the
+/// reference — the explicit [`crate::ledger::RebindingPlan`] documenting that the
 /// historical release's frozen topology is being applied onto the CURRENT
 /// physical slots (`None` for HEAD and deployment references). Each
 /// reference kind consults ONLY its declared temporal source: HEAD reads the
@@ -162,7 +162,7 @@ pub(crate) fn latest_successful_rollback(
 /// See the module docs for the full rule; in short: HEAD plans from the
 /// CURRENT variant slot declarations; `release:<id>` plans from the
 /// RELEASE's frozen topology + the logical membership check and produces the
-/// explicit [`RebindingPlan`]; a deployment rollback uses the DEPLOYMENT's
+/// explicit [`crate::ledger::RebindingPlan`]; a deployment rollback uses the DEPLOYMENT's
 /// exact per-slot artifact and physical binding.
 pub fn plan_assignments(
     selection: &SlotSelection,

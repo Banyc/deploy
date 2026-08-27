@@ -60,7 +60,7 @@ pub fn config_home(env: &crate::env::SysEnv) -> PathBuf {
     )
 }
 
-/// Pure variant of [`user_unit_link`] that takes an explicit config base, so it
+/// Pure variant of `user_unit_link` that takes an explicit config base, so it
 /// can be tested without depending on the process environment.
 pub fn user_unit_link_for(config_base: &Path, unit: &str) -> PathBuf {
     config_base.join("systemd/user").join(unit)

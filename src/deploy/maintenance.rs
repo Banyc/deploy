@@ -1,25 +1,25 @@
 //! Post-commit maintenance wiring shared by the real-push path (step 17)
 //! and the no-op path (A4 retention/sweep semantics; A7 hidden debt wiring).
 //!
-//! * [`retain_slot_post_commit`] + [`run_step17_retention`] — the step-17
+//! * `retain_slot_post_commit` + `run_step17_retention` — the step-17
 //!   per-slot retention contract (A4 "post-commit step-17 retention": never
 //!   fails the push — a failure or a contended slot lock defers the slot as
 //!   a durable debt marker + a warning, never a silent skip).
-//! * [`retry_deferred_retentions`] / [`retry_pending_sweep`] — the
+//! * `retry_deferred_retentions` / `retry_pending_sweep` — the
 //!   deferred-maintenance retry (A4 "deferred-retention retry": later
 //!   pushes — real and no-op — service the debt markers; the push report's
 //!   `warning` channel surfaces what stayed deferred).
-//! * [`refresh_observed_from_live`] / [`refresh_observed`] — the observed
+//! * `refresh_observed_from_live` / `refresh_observed` — the observed
 //!   refresh projection: the real-push path feeds the actual post-mutation
 //!   state, the no-op path feeds the EXISTING generation's assignment —
-//!   both run the same [`refresh_observed`] block.
-//! * [`set_retention_deferred`] / [`clear_retention_deferred`] — the
+//!   both run the same `refresh_observed` block.
+//! * `set_retention_deferred` / `clear_retention_deferred` — the
 //!   durable debt-marker I/O (A7 "durable debt wiring":
 //!   `retention-debt.json` / `sweep-debt.json`), NON-FALLIBLE by contract:
 //!   a debt I/O failure becomes a warning entry, never an `Err`.
 //!
-//! The push spine ([`crate::deploy::push`]) wires this module into step 17
-//! of `push_inner`; the no-op path ([`crate::deploy::push`]) services the
+//! The push spine ([`crate::deploy::push::push`]) wires this module into step 17
+//! of `push_inner`; the no-op path ([`push`](mod@crate::deploy::push)) services the
 //! same debt before reporting "Everything up to date".
 
 use crate::config::{ProjectConfig, RetentionConfig};

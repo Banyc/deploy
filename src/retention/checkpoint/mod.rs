@@ -4,7 +4,7 @@
 //! Moved from `crate::push::checkpoint` during the encapsulation restructure;
 //! the ledger / history-floor primitives live in
 //! [`super::reachability::history_floor`] and the sweep-debt orchestration in
-//! [`debt`].
+//! `debt`.
 //!
 //! `deploy checkpoint <target> <deployment-id>` compacts the target's ONE
 //! deployment LEDGER (`targets/<target>/ledger.jsonl`) to the retained
@@ -22,10 +22,10 @@
 //!
 //! # The three steps (the only commit is the atomic replacement)
 //!
-//! 1. CALCULATE THE RETAINED SUFFIX ([`LocalStore::ledger_suffix`]): every
+//! 1. CALCULATE THE RETAINED SUFFIX (`LocalStore::ledger_suffix`): every
 //!    physical ledger line from the checkpoint entry's intent line onward.
 //! 2. ATOMICALLY REPLACE the ledger with that suffix
-//!    ([`LocalStore::write_ledger_suffix`]: temp + fsync + chmod-private +
+//!    (`LocalStore::write_ledger_suffix`: temp + fsync + chmod-private +
 //!    rename + parent-dir fsync). THIS is the checkpoint's ONLY logical
 //!    commit: a reader never observes a torn ledger (wholly old or wholly
 //!    new). IF THE REPLACEMENT FAILS, NO DELETION HAPPENS — the checkpoint
@@ -36,11 +36,11 @@
 //!    may surface as an `Err`; each is converted into a report with
 //!    `established: true`, `sweep_completed: false`, and a warning (see
 //!    step 3).
-//! 3. BEST-EFFORT GLOBAL SWEEP ([`LocalStore::run_sweep`]) of unreachable
+//! 3. BEST-EFFORT GLOBAL SWEEP (`LocalStore::run_sweep`) of unreachable
 //!    deployment directories (`deployments/<id>/`), release records
 //!    (`releases/<release-id>/`), and tree objects
 //!    (`objects/sha256/<digest>/`). The reachability scan
-//!    ([`LocalStore::reachable_set`]) is recomputed FRESH on every retry and
+//!    (`LocalStore::reachable_set`) is recomputed FRESH on every retry and
 //!    keeps everything reachable from ANOTHER target's ledger, the
 //!    current/incomplete state (observed artifacts, pending intent-only
 //!    entries, in-flight deployment dirs), or a PIN. A failed sweep is
@@ -52,7 +52,7 @@
 //! # Preview == execution (the ledger override)
 //!
 //! The sweep's reachability is computed against the checkpointed target's
-//! ledger AS-IF the suffix replacement ALREADY happened ([`LedgerOverride`]):
+//! ledger AS-IF the suffix replacement ALREADY happened (`LedgerOverride`):
 //! the pre-checkpoint history's releases, trees, and deployment dirs are
 //! unreachable the MOMENT the ledger is shortened. The flow computes the
 //! retained suffix ONCE and feeds the parsed suffix as the override to BOTH
@@ -76,7 +76,7 @@
 //! # Concurrency
 //!
 //! The real operation runs under the SAME lock discipline as pushes
-//! ([`crate::deploy::lock::FileLock`]): the application-store lock then the
+//! (`crate::deploy::lock::FileLock`): the application-store lock then the
 //! target lock, both advisory (flock) and released on drop. The checkpoint
 //! itself NEVER opens a remote: it is local-only by construction. A
 //! `--dry-run` preview takes NO locks, writes NOTHING, and enumerates

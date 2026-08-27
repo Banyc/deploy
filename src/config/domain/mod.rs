@@ -68,7 +68,7 @@ pub(crate) use shapes::raw;
 /// comes from its owning variant (see [`VariantConfig::retention`]), so a
 /// target that shares a slot with other targets can never change that slot's
 /// policy. Built ONLY by the raw -> domain conversion; the raw serialization
-/// shape is [`raw::RawTargetConfig`] (bare integer batch size).
+/// shape is `raw::RawTargetConfig` (bare integer batch size).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetConfig {
     pub rollout: RolloutConfig,
@@ -97,7 +97,7 @@ pub struct VariantConfig {
 
 /// The validated domain configuration. Privately constructed: the ONLY ways
 /// to obtain a [`ProjectConfig`] are [`ProjectConfig::load`] (parse + discover + convert)
-/// and the crate-internal conversion [`ProjectConfig::from_raw_parts`], both of
+/// and the crate-internal conversion `ProjectConfig::from_raw_parts`, both of
 /// which run the full validation and fail closed on any invalid input.
 ///
 /// IMMUTABLE VALIDATED DOMAIN: EVERY field is private and read-only — the
@@ -208,7 +208,7 @@ impl ProjectConfig {
     }
 
     /// The schema version this configuration was validated as — ALWAYS
-    /// [`CONFIG_SCHEMA_VERSION`] by construction (the conversion refuses any
+    /// `CONFIG_SCHEMA_VERSION` by construction (the conversion refuses any
     /// other value). Read-only accessor: the schema identity of a loaded
     /// config is immutable.
     pub fn schema_version(&self) -> u32 {

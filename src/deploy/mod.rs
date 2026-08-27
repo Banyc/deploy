@@ -6,18 +6,18 @@
 //! level, down to single-concern leaves. The area-root re-export globs keep
 //! every former submodule path compiling:
 //!
-//! * [`push`] — THE PUSH OPERATION, nested by phase: the spine
+//! * [`push`](mod@crate::deploy::push) — THE PUSH OPERATION, nested by phase: the spine
 //!   (`push` / `push_inner`, the numbered steps, report assembly) in
 //!   `push/mod.rs`, plus `execute`, `commit`, `noop`, `dryrun` and the
-//!   multi-phase [`push::preflight`] group (`gate`, `locks`, `remotes`,
+//!   multi-phase `push::preflight` group (`gate`, `locks`, `remotes`,
 //!   `capacity`, `intent`).
 //! * [`plan`] — PLANNING, nested by concern: the planner core in
-//!   `plan/mod.rs`, plus `selection`, `groups`, the [`plan::preflight`]
-//!   pair (`capacity`, `staging`) and the [`plan::guards`] gates
+//!   `plan/mod.rs`, plus `selection`, `groups`, the `plan::preflight`
+//!   pair (`capacity`, `staging`) and the `plan::guards` gates
 //!   (`partial_rollout`, `exact_rollback`, `coverage`).
 //! * [`rollout`] — EXECUTION SEMANTICS, nested by concern: the batch loop in
-//!   `rollout/mod.rs`, the [`rollout::attempt`] outcome derivation
-//!   (`failure`, `results`, `status`) and the [`rollout::server`] per-server
+//!   `rollout/mod.rs`, the `rollout::attempt` outcome derivation
+//!   (`failure`, `results`, `status`) and the `rollout::server` per-server
 //!   pipeline (`server`, `compensation`).
 //! * [`refs`] — the push reference GRAMMAR (pure, store-free).
 //! * [`maintenance`] — post-commit maintenance (step-17 retention loop,

@@ -1,7 +1,7 @@
 //! The SEGMENT identities: [`SlotId`], [`ServerId`], [`TargetName`],
 //! [`VariantName`] — a single safe path segment (non-empty, no path
 //! separators or traversal components, no surrounding whitespace or control
-//! characters), the shared segment rule from [`crate::identity::scalars::valid_name`].
+//! characters), the shared segment rule from `crate::identity::scalars::valid_name`.
 //!
 //! [`SlotId`] is the DEPLOYMENT-LOCATION identity — the key of every
 //! slot→assignment relationship (plans, attempts, observed state, snapshots,

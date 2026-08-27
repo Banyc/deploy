@@ -272,10 +272,10 @@ pub fn recompute_release_digest(rec: &ReleaseRecord) -> Option<ReleaseDigest> {
 /// naming the release and the expected vs recomputed digest.
 ///
 /// The record's `release_schema_version` is checked FIRST and must be
-/// exactly [`RELEASE_RECORD_SCHEMA_VERSION`]: a record carrying any other
+/// exactly `RELEASE_RECORD_SCHEMA_VERSION`: a record carrying any other
 /// version is refused outright (fail closed, naming the version) before any
 /// digest work — only the current record format is ever interpreted. The
-/// identity payload version ([`RELEASE_PAYLOAD_SCHEMA_VERSION`]) is enforced
+/// identity payload version (`RELEASE_PAYLOAD_SCHEMA_VERSION`) is enforced
 /// implicitly by the recompute below, which re-derives the digest with
 /// exactly that payload version: a release whose identity was derived from
 /// any other payload version fails the recompute-and-verify check.

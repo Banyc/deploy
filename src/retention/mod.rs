@@ -31,9 +31,9 @@
 //!   `deployment` (`protect_deployments`), and the retained-set computation.
 //!   The policy group also owns its selection concerns:
 //!   * [`policy::pins`] — pin honoring, fail closed on BOTH sweep sides: the
-//!     pusher-side GC anchor semantics ([`LocalStore::honor_release_pin`]) and the
+//!     pusher-side GC anchor semantics (`LocalStore::honor_release_pin`) and the
 //!     receiver-side retention pin expansion. The config/store pin types live in
-//!     [`crate::config::pins`] and the store; the honoring logic lives here.
+//!     `crate::config::pins` and the store; the honoring logic lives here.
 //!   * [`policy::rotate`] — receiver-side rotation semantics: the mark-and-sweep
 //!     pass ([`crate::remote::helper::RemoteHelper::rotate`]) deletes every tree
 //!     object NOT in the retained set; the rotation I/O lives in
@@ -46,18 +46,18 @@
 //!   * [`reachability::history_floor`] — the pusher-side ledger/history
 //!     semantics (moved from `crate::store::history_floor`): `reachable_set`,
 //!     the retained-suffix
-//!     [`LedgerOverride`](reachability::history_floor::LedgerOverride), the
+//!     `LedgerOverride`, the
 //!     Unknown-observation conservatism, and the post-commit sweep.
 //! * [`checkpoint`] — the checkpoint command (moved from `crate::push::checkpoint`):
 //!   the retained suffix, the atomic replace, the post-commit sweep,
 //!   preview/override parity, and the post-commit warnings. Its sweep-debt
 //!   orchestration nests with it:
-//!   * [`checkpoint::debt`] — when a sweep is incomplete the durable marker is
+//!   * `checkpoint::debt` — when a sweep is incomplete the durable marker is
 //!     recorded so the next push retries it; a completed sweep clears the
 //!     marker. The marker I/O lives in
-//!     [`crate::store::local::LocalStore`] ([`LocalStore::read_sweep_debt`] /
-//!     [`LocalStore::write_sweep_debt`]); the orchestration lives here.
-//! * [`sweep_tests`] (test-only) — the two-sided sweep contract tests (moved
+//!     [`crate::store::local::LocalStore`] (`LocalStore::read_sweep_debt` /
+//!     `LocalStore::write_sweep_debt`); the orchestration lives here.
+//! * `sweep_tests` (test-only) — the two-sided sweep contract tests (moved
 //!   from `crate::sweep`): receiver retention +
 //!   pusher checkpoint independence, no-leak, and maintenance-not-correction.
 

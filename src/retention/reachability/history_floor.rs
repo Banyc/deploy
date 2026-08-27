@@ -21,16 +21,16 @@
 //! checkpoint's best-effort global sweep is POST-COMMIT MAINTENANCE, so an
 //! incomplete sweep records a durable marker and the NEXT PUSH (not just the
 //! next checkpoint) retries the sweep and clears it — see
-//! [`crate::deploy::retry_pending_sweep`].
+//! `crate::deploy::retry_pending_sweep`.
 //!
 //! A checkpoint (`deploy checkpoint <target> <deployment-id>`) is exactly
 //! three steps:
 //!
 //! 1. CALCULATE THE RETAINED SUFFIX — everything at/after the checkpoint
-//!    deployment's position in the target's ledger ([`LocalStore::ledger_suffix`]).
+//!    deployment's position in the target's ledger (`LocalStore::ledger_suffix`).
 //!    The floor is IMPLICIT: the ledger's first entry is the oldest retained
 //!    rollback state; no separate floor marker exists.
-//! 2. ATOMICALLY REPLACE the ledger with that suffix ([`LocalStore::write_ledger_suffix`]
+//! 2. ATOMICALLY REPLACE the ledger with that suffix (`LocalStore::write_ledger_suffix`
 //!    — temp + fsync + chmod-private + rename + parent-directory fsync). This
 //!    is the checkpoint's ONLY logical commit; a reader never observes a torn
 //!    ledger (wholly old or wholly new). IF THE REPLACEMENT FAILS, NO
@@ -39,13 +39,13 @@
 //! 3. BEST-EFFORT GLOBAL SWEEP of unreachable deployment directories
 //!    (`deployments/<id>/`), release records (`releases/<release-id>/`), and
 //!    tree objects (`objects/sha256/<digest>/`). The reachability scan
-//!    ([`LocalStore::sweep_discards`]) is recomputed FRESH on every retry:
+//!    (`LocalStore::sweep_discards`) is recomputed FRESH on every retry:
 //!    everything reachable from ANOTHER target's ledger, the CURRENT /
 //!    INCOMPLETE state (observed artifacts, pending intent-only entries,
 //!    in-flight deployment dirs), or a PIN is kept; everything else is
 //!    unreachable and swept. A checkpoint sweep scans the checkpointed
 //!    target's ledger AS-IF the suffix replacement ALREADY happened — the
-//!    retained-suffix [`LedgerOverride`] — so the pre-checkpoint history's
+//!    retained-suffix `LedgerOverride` — so the pre-checkpoint history's
 //!    releases/trees/deployment dirs are unreachable the moment the ledger
 //!    is shortened, and the DRY-RUN PREVIEW computes its deletion sets with
 //!    the SAME override the real execution uses: the previewed deletions
@@ -878,7 +878,7 @@ impl LocalStore {
 
 /// The LOCAL store's reachable set for a checkpoint sweep: the union of
 /// everything the sweep must keep (retained ledgers, current/incomplete
-/// state, pins). See [`LocalStore::reachable_set`].
+/// state, pins). See `LocalStore::reachable_set`.
 #[derive(Clone, Debug, Default)]
 pub struct ReachableSet {
     /// Deployment ids reachable (their `deployments/<id>/` dirs stay).

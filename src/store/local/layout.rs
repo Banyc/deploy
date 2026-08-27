@@ -1,8 +1,8 @@
 //! The store directory layout (A3): the store base resolution
-//! ([`default_base`] — pure, from the environment snapshot), the per-target
+//! (`default_base` — pure, from the environment snapshot), the per-target
 //! path plumbing ([`LocalStore::target_dir`]), and the durable
 //! first-creation of a target's directory on the ledger-append path (A7
-//! [`LocalStore::ensure_target_dir_durable`]).
+//! `LocalStore::ensure_target_dir_durable`).
 
 use crate::env::SysEnv;
 use crate::error::Result;

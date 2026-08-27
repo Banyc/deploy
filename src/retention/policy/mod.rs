@@ -4,7 +4,7 @@
 //! `deployment` `protect_deployments`), evaluated against every generation
 //! record on the server. Pin honoring lives in [`super::pins`]; the durable
 //! pins are expanded into the retained set by
-//! [`LocalStore::expand_retention_pins`].
+//! `LocalStore::expand_retention_pins`.
 //!
 //! The policy group also owns the two selection concerns that feed the
 //! retained set: [`pins`] (durable pin honoring, fail closed on BOTH sweep

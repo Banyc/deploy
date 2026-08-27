@@ -12,8 +12,8 @@ use std::path::{Component, Path};
 /// The name carries the single-directory-component invariant
 /// ([`ReleaseName::parse`] is the production constructor; the raw
 /// deserialization path is re-validated by the raw -> domain conversion and by
-/// [`ProjectConfig::load_release`], so an invalid name can never enter a validated
-/// [`ProjectConfig`]).
+/// [`crate::config::ProjectConfig::load_release`], so an invalid name can never enter a validated
+/// [`crate::config::ProjectConfig`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct ReleaseName(String);
@@ -22,7 +22,7 @@ impl ReleaseName {
     /// (the forced structure is `<project>/releases/<name>/`), so the name
     /// can never escape the release directory. This is the PRODUCTION
     /// constructor for a validated release name; the deserialization path
-    /// stays raw and the conversion / [`ProjectConfig::load_release`] re-validate.
+    /// stays raw and the conversion / [`crate::config::ProjectConfig::load_release`] re-validate.
     pub fn parse(s: &str) -> Result<ReleaseName> {
         validate_release_name(s)?;
         Ok(ReleaseName(s.to_string()))

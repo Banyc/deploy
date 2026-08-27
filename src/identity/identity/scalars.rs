@@ -12,7 +12,7 @@
 //! local store directory). Each
 //! such value is
 //! wrapped in a NEWTYPE whose CONSTRUCTION validates the invariant (a
-//! private inner value, reachable only through [`parse`]-style constructors
+//! private inner value, reachable only through `parse`-style constructors
 //! and read-only accessors) — an invalid value cannot be constructed, so the
 //! domain never has to re-check what it holds.
 //!

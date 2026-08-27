@@ -3,10 +3,10 @@
 //! [`crate::deploy::refs`], owned by another pass).
 //!
 //! The reference LANGUAGE is encapsulated in [`crate::deploy::refs`]: a pure,
-//! store-free grammar whose [`crate::deploy::refs::parse_ref_expr`] returns only
-//! the AST ([`RefExpr`] and friends, re-exported below) — no store access,
+//! store-free grammar whose `crate::deploy::refs::parse_ref_expr` returns only
+//! the AST (`RefExpr` and friends, re-exported below) — no store access,
 //! no resolution. This module keeps only the store-dependent RESOLUTION
-//! ([`resolve_ref_expr`]) that FOLLOWS the AST against the target's LEDGER:
+//! (`resolve_ref_expr`) that FOLLOWS the AST against the target's LEDGER:
 //! the ledger's SUCCESSFUL terminal events in append order ARE the
 //! deployment history (each successful deployment IS a rollback payload
 //! KEYED BY ITS DEPLOYMENT ID), so `deploy push <target> <deployment-id>`

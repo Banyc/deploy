@@ -1,13 +1,13 @@
 //! The per-slot ordered TABLES (feature area A2: Ledger semantics) — the
 //! domain's keyed-by-slot collection types the ledger records share.
 //!
-//! THIS module owns the PRIVATE [`OrderedSlotMap`] and the two tables built
+//! THIS module owns the PRIVATE `OrderedSlotMap` and the two tables built
 //! on it: the possibly-empty [`SlotTable`] (the terminal's per-slot
 //! OUTCOMES, legitimately empty for a pre-mutation failure) and the
 //! NON-EMPTY [`NonEmptySlotTable`] (the deployment intent's slots and the
 //! degraded disposition's remaining changes — the only constructor is the
 //! VERIFIED [`NonEmptySlotTable::build`], which refuses the empty table).
-//! The wire outcome row ([`SlotResult`], the RAW serde form the ledger's
+//! The wire outcome row ([`crate::ledger::SlotResult`], the RAW serde form the ledger's
 //! JSONL carries) lives with its domain sibling in
 //! [`crate::ledger::records`]; the deployment-record shapes that use these
 //! tables live in [`crate::ledger::records`].

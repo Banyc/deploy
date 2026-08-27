@@ -12,7 +12,7 @@ use crate::identity::CapacityPercent;
 ///
 /// The DOMAIN form: `reserve_percent` is a validated [`CapacityPercent`]
 /// (0..=100). Built ONLY by the raw -> domain conversion; the raw
-/// serialization shape is [`raw::RawCapacityConfig`] (bare integer percent).
+/// serialization shape is `raw::RawCapacityConfig` (bare integer percent).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct CapacityConfig {
     /// Keep at least this many bytes free on the server after an upload.

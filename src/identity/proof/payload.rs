@@ -53,7 +53,7 @@ pub struct TreeEntry {
 }
 
 /// Canonical tree metadata (the `tree.json` payload). `tree_schema_version`
-/// is [`TREE_SCHEMA_VERSION`]; readers refuse any other value.
+/// is `TREE_SCHEMA_VERSION`; readers refuse any other value.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeMetadata {
     pub tree_schema_version: u32,
@@ -127,7 +127,7 @@ pub struct CanonicalSlots {
 /// resolved from the caller's current configuration, so a server-capacity
 /// change does NOT produce a new release.
 ///
-/// Schema version 2 ([`RELEASE_PAYLOAD_SCHEMA_VERSION`]): the identity
+/// Schema version 2 (`RELEASE_PAYLOAD_SCHEMA_VERSION`): the identity
 /// payload includes the per-variant slot declaration digest (added
 /// alongside the mappings/behavior digests). The version is frozen into the
 /// release digest; `verify_release_identity` recomputes it with exactly
@@ -151,7 +151,7 @@ pub struct Provenance {
 }
 
 /// Immutable release record (`release.json`). `release_schema_version` is
-/// [`RELEASE_RECORD_SCHEMA_VERSION`]; readers (`verify_release_identity`)
+/// `RELEASE_RECORD_SCHEMA_VERSION`; readers (`verify_release_identity`)
 /// refuse any other version (fail closed).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseRecord {

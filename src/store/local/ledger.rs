@@ -2,7 +2,7 @@
 //! — the durable intent / terminal-event appends, the deployment-id-keyed
 //! duplicate guards, the intent+terminal merge with its cross-record
 //! invariants, and the crash-atomic whole-ledger rewrite
-//! ([`LocalStore::append_ledger_atomic`]).
+//! (`LocalStore::append_ledger_atomic`).
 
 use crate::error::{Error, Result};
 use crate::identity::{DeploymentId, SlotId};
@@ -40,7 +40,7 @@ impl LocalStore {
     /// lose the deployment (the intent is already durable and the next push
     /// reconciles it). The append is a CRASH-ATOMIC whole-ledger rewrite
     /// (temp + fsync + chmod + rename + parent-dir fsync, see
-    /// [`LocalStore::append_ledger_atomic`]): a successful append is durable
+    /// `LocalStore::append_ledger_atomic`): a successful append is durable
     /// and a crash can never leave a torn line. Fail-closed keying: the
     /// deployment id keys the entry, so a second intent for the same id (a
     /// corrupted duplicate) is refused rather than silently merged. The
@@ -83,7 +83,7 @@ impl LocalStore {
     /// The terminal carries the status, the per-slot outcomes, and — when
     /// successful — the rollback state. Like the intent it is appended via
     /// the crash-atomic whole-ledger rewrite (see
-    /// [`LocalStore::append_ledger_atomic`]). Fail-closed key contract: the
+    /// `LocalStore::append_ledger_atomic`). Fail-closed key contract: the
     /// deployment's intent must already exist in the ledger (a terminal for
     /// an unknown deployment is corruption) and the entry must not already
     /// have a terminal (the terminal event is written exactly once;
@@ -93,7 +93,7 @@ impl LocalStore {
     /// The terminal carries the disposition (status), the per-slot outcomes,
     /// and — when successful — the rollback state. Like the intent it is
     /// appended via the crash-atomic whole-ledger rewrite (see
-    /// [`LocalStore::append_ledger_atomic`]). Fail-closed key contract: the
+    /// `LocalStore::append_ledger_atomic`). Fail-closed key contract: the
     /// deployment's intent must already exist in the ledger (a terminal for
     /// an unknown deployment is corruption) and the entry must not already
     /// have a terminal (the terminal event is written exactly once;

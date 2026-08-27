@@ -5,7 +5,7 @@
 //! releases, targets, and activation adapters. Every identity-bearing value
 //! lives in this area, TWO group directories:
 //!
-//! * [`identity`] — THE IDENTITY TYPES: a group directory of the identity
+//! * `identity` — THE IDENTITY TYPES: a group directory of the identity
 //!   modules — [`identity::release_id`] ([`ReleaseId`]: EXACT
 //!   `rel-sha256-<64 lowercase hex>`; bare/`rel-` forms rejected at the
 //!   domain boundary — the CLI accepts a bare 64-hex digest, converted
@@ -21,14 +21,14 @@
 //!   ([`TreeDigest`]/[`ReleaseDigest`]: exactly 64 lowercase hex), and the
 //!   segment ids ([`SlotId`], [`ServerId`], [`TargetName`], [`VariantName`]:
 //!   a single safe path segment).
-//! * [`proof`] — THE PROOF MACHINERY: a group directory of the payload +
-//!   proofs modules — [`proof::payload`] (the release identity payload
+//! * `proof` — THE PROOF MACHINERY: a group directory of the payload +
+//!   proofs modules — `proof::payload` (the release identity payload
 //!   [`CanonicalReleasePayload`]: name-sorted mapping digest + behavior
 //!   digest + slot-declaration digest + variant→tree bindings; capacity
 //!   excluded, slots ARE identity, plus the canonical payload/record types)
-//!   and [`proof::proofs`] (the membership proofs
-//!   [`SlotSet`]/[`NonEmptySlotSet`]/[`MatchingMembership`]: the ONLY
-//!   construction path is [`MatchingMembership::verify`] (frozen ==
+//!   and `proof::proofs` (the membership proofs
+//!   `SlotSet`/`NonEmptySlotSet`/`MatchingMembership`: the ONLY
+//!   construction path is `MatchingMembership::verify` (frozen ==
 //!   current)).
 //!
 //! The area re-exports the whole surface FLAT AND keeps the module paths,
@@ -44,7 +44,7 @@
 //! Identities deliberately carry NO `Default` (an empty identity would be a
 //! malformed durable record constructible by anyone — the exact gap this
 //! hardening closes). An identity can only be built through the validated
-//! [`parse`]-style constructors (`parse` / `FromStr` / `TryFrom`); the serde
+//! `parse`-style constructors (`parse` / `FromStr` / `TryFrom`); the serde
 //! `Deserialize` impls route every wire string through the same validation
 //! (an invalid wire identity fails deserialization — fail closed).
 
@@ -138,7 +138,7 @@ macro_rules! id_newtype {
             }
         }
 
-        /// UNCHECKED conversion — TEST FIXTURES ONLY (mirrors [`$name::new`]).
+        /// UNCHECKED conversion — TEST FIXTURES ONLY (mirrors `$name::new`).
         /// NOTE: deliberately NO `From<String>`/`From<&str>` impl — clap's
         /// value-parser inference prefers those over `FromStr`, which would
         /// silently bypass validation in test builds (and `From<&str>` would

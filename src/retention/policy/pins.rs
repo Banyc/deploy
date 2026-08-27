@@ -1,14 +1,14 @@
 //! Pin honoring, fail closed on BOTH sweep sides (feature area A4).
 //!
-//! The config/store pin types live in [`crate::config::pins`] and the store;
+//! The config/store pin types live in `crate::config::pins` and the store;
 //! the HONORING logic lives here:
 //!
-//! * [`LocalStore::honor_release_pin`] — the pusher-side GC anchor semantics
+//! * `LocalStore::honor_release_pin` — the pusher-side GC anchor semantics
 //!   (moved from `crate::retention::history_floor`): a pin that names a release
 //!   with NO record on disk, or whose record cannot be read or
 //!   identity-verified, is an [`Error::integrity`] error — the retained set
 //!   would be incomplete, so the sweep must abort before any deletion.
-//! * [`LocalStore::expand_retention_pins`] — the receiver-side mirror (the
+//! * `LocalStore::expand_retention_pins` — the receiver-side mirror (the
 //!   retention policy's durable pins): a pin protects the whole release, and
 //!   an un-honorable pin aborts retention with an integrity error before any
 //!   tree deletion, never treating the pin as absent.

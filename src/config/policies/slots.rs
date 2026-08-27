@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 /// This is both the raw serialization shape of a slot and the domain record:
 /// its validity (id non-empty/unique, references resolvable, groups clean,
 /// location unique) is enforced by the raw -> domain conversion; a slot can
-/// never enter a [`ProjectConfig`] graph except through that conversion.
+/// never enter a [`crate::config::ProjectConfig`] graph except through that conversion.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SlotConfig {
@@ -53,7 +53,7 @@ pub struct SlotConfig {
 impl SlotConfig {
     /// Build a slot from its raw parts. The graph-level rules (identifier
     /// validity, reference resolution, deploy_dir absoluteness, location
-    /// uniqueness) are enforced when the slot enters a [`ProjectConfig`]: the
+    /// uniqueness) are enforced when the slot enters a [`crate::config::ProjectConfig`]: the
     /// raw -> domain conversion and every validated rebuild operation
     /// re-validate the whole graph, so an invalid slot can never enter a
     /// validated config.

@@ -403,7 +403,7 @@ fn validate_mapping_set(
 /// `dest`. `dest` is created/cleared before mapping.
 ///
 /// The FULL mapping set + source tree is pre-validated first
-/// ([`validate_mapping_set`]) and only a fully-valid set reaches
+/// (`validate_mapping_set`) and only a fully-valid set reaches
 /// materialization: overlapping destinations, missing sources, symlink/special
 /// sources, escaping paths, and destination collisions all fail BEFORE the
 /// staging directory is touched. The staging tree itself is a disposable
@@ -512,7 +512,7 @@ pub const ELECTED_VARIABLES: [&str; 13] = [
     "tree",
 ];
 
-/// The context for one [`render`] call.
+/// The context for one `render` call.
 ///
 /// Every field is `Option` because a render site can only fill the variables
 /// it actually knows: materialization ([`TemplateVars::mapping`]) knows only

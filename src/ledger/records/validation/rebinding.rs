@@ -30,7 +30,7 @@ pub struct FrozenSlotTopology {
 
 /// The WIRE (claimed) rebinding context of a direct `release:<id>` plan: the
 /// historical release's frozen topology applied onto the CURRENT physical
-/// slots. This is the ON-DISK shape ([`DeploymentPlanWire::rebinding`]); the
+/// slots. This is the ON-DISK shape ([`crate::ledger::DeploymentPlanWire::rebinding`]); the
 /// domain's verified form is [`VerifiedReleaseRebinding`] — the wire →
 /// domain conversion RECOMPUTES the proof from this claimed shape and the
 /// plan's own source/target/membership, succeeding only when the claimed
@@ -38,10 +38,10 @@ pub struct FrozenSlotTopology {
 /// [`crate::error::Error::integrity`]).
 ///
 /// The membership proof backing a historical-release rebinding: the PROOF
-/// ([`MatchingMembership`]) that the release's FROZEN slot-id membership for
+/// (`MatchingMembership`) that the release's FROZEN slot-id membership for
 /// the destination target and the target's CURRENT slot-id membership were
 /// verified EXACTLY EQUAL before planning proceeded (the only construction
-/// path is [`MatchingMembership::verify`], so a [`RebindingPlan`] can only
+/// path is `MatchingMembership::verify`, so a [`RebindingPlan`] can only
 /// record an already-verified agreement). The proof carries the agreed
 /// NON-EMPTY slot set; the comparison is LOGICAL membership only — slot IDs,
 /// never physical bindings (server / deploy_dir) — so two sets may be
@@ -98,15 +98,15 @@ pub struct RebindingPlan {
 /// slot→variant/group topology, the membership PROOF (frozen == current,
 /// verified), the SELECTED plan slots (the plan's membership), and the
 /// current physical slots the frozen topology is bound onto. A Release
-/// origin WITHOUT this proof is unrepresentable ([`PlanOrigin::Release`]
+/// origin WITHOUT this proof is unrepresentable ([`crate::ledger::PlanOrigin::Release`]
 /// carries it INSIDE the source); HEAD and deployment origins carry none.
 ///
-/// The ONLY construction path is [`VerifiedReleaseRebinding::verify`], which
+/// The ONLY construction path is `VerifiedReleaseRebinding::verify`, which
 /// checks that every component agrees — the frozen topology's keys equal the
 /// membership's agreed slots, every selected plan slot is a member of the
 /// agreed membership, and the current physical slots cover exactly the
 /// selected plan slots. The wire → domain conversion
-/// ([`DeploymentPlanWire::into_domain`]) RECOMPUTES the proof from the
+/// ([`crate::ledger::DeploymentPlanWire::into_domain`]) RECOMPUTES the proof from the
 /// wire's claimed [`RebindingPlan`] and the plan's own source/target/
 /// membership, succeeding only when the claimed rebinding matches the
 /// recomputed proof (a mismatch → [`crate::error::Error::integrity`]).

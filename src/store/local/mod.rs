@@ -1,11 +1,11 @@
 //! Filesystem-backed local store: the [`LocalStore`] struct, its
 //! constructors, the store base, and the shared I/O primitives
-//! ([`write_json`], [`write_atomic_cas`], [`sanitize`]). The per-feature
+//! (`write_json`, `write_atomic_cas`, [`sanitize`]). The per-feature
 //! record I/O lives in sibling modules ([`super::ledger`], [`super::objects`],
 //! [`super::observed`], [`super::deployments`], [`super::debt`],
 //! [`super::layout`], [`super::pins`], [`super::releases`]) as inherent
 //! `impl LocalStore` blocks on this type; this module re-exports
-//! [`default_base`] so callers keep the `crate::store::local::default_base`
+//! `default_base` so callers keep the `crate::store::local::default_base`
 //! path.
 //!
 //! # Submodules (the per-feature record I/O)
@@ -21,10 +21,10 @@
 //! # Test-only fault injection (per-fixture registry)
 //!
 //! Under `#[cfg(test)]` each [`LocalStore`] owns a per-fixture
-//! [`crate::testutil::test_faults::FaultRegistry`] (created empty by
+//! `crate::testutil::test_faults::FaultRegistry` (created empty by
 //! [`LocalStore::with_base`]); the store methods consult ONLY that registry
 //! (`self.fault_registry.consume(...)`). Tests arm the fixture's registry via
-//! [`LocalStore::fault_registry`] (`store.fault_registry().arm_append_attempt(id)`
+//! `LocalStore::fault_registry` (`store.fault_registry().arm_append_attempt(id)`
 //! etc.). There are NO process-global fault slots and NO shared fault lock:
 //! two fixtures' registries are disjoint by construction, so a fault armed by
 //! one test can never fire in another's push — structural isolation that

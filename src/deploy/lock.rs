@@ -1,6 +1,6 @@
 //! Advisory locking for push transactions.
 //!
-//! [`FileLock`] is an advisory (flock) lock held by an open file descriptor.
+//! `FileLock` is an advisory (flock) lock held by an open file descriptor.
 //! While the guard is alive the kernel prevents any other process from
 //! acquiring the same lock, and the lock is released automatically if the
 //! owning process dies — so a stale lock from a crashed controller can never
@@ -8,7 +8,7 @@
 //! acquisition. Locks are taken in a fixed local-then-target order — the
 //! application-store `operation.lock` first, then the target lock — so the
 //! whole push pipeline, including [`crate::retention::checkpoint`], runs under the
-//! same discipline as [`crate::deploy::push`].
+//! same discipline as [`crate::deploy::push::push`].
 
 use crate::error::{Error, Result};
 use std::os::unix::io::AsRawFd;

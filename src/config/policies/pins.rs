@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// hex>` grammar — a loaded configuration can never carry a pin whose
 /// release would later fail [`ReleaseId::parse`] (the consumers that used to
 /// parse the raw string late now receive the typed id by construction). The
-/// raw WIRE shape is [`RawPin`] (a plain string); the raw -> domain
+/// raw WIRE shape is `RawPin` (a plain string); the raw -> domain
 /// conversion validates every pin during load via `TryFrom<RawPin>`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

@@ -98,7 +98,7 @@ pub enum ServerConnection {
 /// the raw -> domain conversion or the validated rebuild operations, so an
 /// inconsistent connection (an SSH form with a `Local` identity, a
 /// `local://` address that is not absolute) can never enter a validated
-/// [`ProjectConfig`].
+/// [`crate::config::ProjectConfig`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerDef {
     /// The server's validated identifier (non-empty, well-formed): parsed by
@@ -121,7 +121,7 @@ impl ServerDef {
     /// Build a server from its validated parts. The connection's
     /// well-formedness (a `local://` address that is absolute, an SSH form
     /// with a `KnownHosts`/`Fingerprint` identity) is enforced when the
-    /// server enters a [`ProjectConfig`]: the conversion and every validated
+    /// server enters a [`crate::config::ProjectConfig`]: the conversion and every validated
     /// rebuild operation re-validate the whole graph.
     pub fn new(
         id: Identifier,

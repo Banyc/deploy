@@ -10,7 +10,7 @@
 //! The house pattern (mirroring `cli::run_with(std::env::args())`): the
 //! process boundary takes [`SysEnv::from_process`] ONCE and threads it down.
 //! The only other place `std::env::` is allowed is the child-process boundary
-//! ([`Command::envs`]): every spawned child receives this snapshot's
+//! ([`std::process::Command::envs`]): every spawned child receives this snapshot's
 //! variables, so a child's `PATH` (and any fake-bin/test variable) is the
 //! deterministic snapshot, never whatever `PATH` won the race in the parent.
 

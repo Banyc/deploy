@@ -13,8 +13,8 @@
 //!   markers, transaction records, object-store publication, receiver
 //!   rotation, the protocol handshake, the generation assignment record, and
 //!   the observed-state re-exports.
-//! * [`transport`] — THE TRANSPORT STACK: the [`Remote`](transport::Remote)
-//!   trait, [`LocalTransport`](transport::LocalTransport) and
+//! * [`transport`] — THE TRANSPORT STACK: the [`Remote`]
+//!   trait, [`LocalTransport`] and
 //!   [`SshTransport`](transport::SshTransport), host-identity verification
 //!   and pinning, and the bounded subprocess execution runner.
 //! * [`canonical`] — THE TREE CONTENT: canonical tree objects plus

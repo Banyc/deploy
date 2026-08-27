@@ -260,7 +260,7 @@ pub struct PreviousGeneration {
 /// generations can never lose the deployment: the intent is already durable
 /// and the next push reconciles it) and never edited. The attempt's STATUS,
 /// per-slot OUTCOMES and (when successful) ROLLBACK STATE come from its
-/// TERMINAL EVENT ([`LedgerTerminal`]), never from this record.
+/// TERMINAL EVENT ([`crate::ledger::LedgerTerminal`]), never from this record.
 ///
 /// STORE EACH FACT EXACTLY ONCE: the wire's `slot_ids` / `desired` /
 /// `pre_push` split collapses into ONE authoritative table
@@ -273,7 +273,7 @@ pub struct PreviousGeneration {
 /// rollback context), not duplicated projections — they are not part of the
 /// reshape. The wire `deployment_schema_version` is a WIRE format concern
 /// (checked by the reader on the wire, refused if not
-/// [`crate::ledger::LEDGER_SCHEMA_VERSION`]); the validated domain does not
+/// `crate::ledger::LEDGER_SCHEMA_VERSION`); the validated domain does not
 /// carry it and writers emit exactly the constant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeploymentIntent {

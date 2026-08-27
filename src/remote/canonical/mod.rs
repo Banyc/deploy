@@ -3,12 +3,12 @@
 //! The canonical tree objects ([`canonicalize_tree`], [`compute_tree_digest`],
 //! [`entry_paths`]) lead this module; mapping/template materialization
 //! ([`materialize_variant`], [`TemplateVars`], [`render_template`],
-//! [`render_argv`]) lives in the [`materialize`] submodule.
+//! [`render_argv`]) lives in the `materialize` submodule.
 //!
 //! The canonical format is a cross-module contract: the store verifies
 //! objects against it ([`crate::store::local::LocalStore::store_object`]),
 //! recovery and pre-activation checks re-hash with it
-//! ([`crate::deploy::push`]), and the SSH transport must preserve exactly
+//! ([`crate::deploy::push::push`]), and the SSH transport must preserve exactly
 //! these bytes on upload. Any module that serializes or transfers tree bytes
 //! diverging from this format silently breaks digest equality for every other
 //! verifier.

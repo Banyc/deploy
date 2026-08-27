@@ -3,7 +3,7 @@
 //!
 //! [`finalize_successful_attempt`] is the SINGLE shared terminal path used
 //! by BOTH the normal push success path and recovery
-//! ([`crate::ledger::recovery::reconcile_pending_commits`]): it APPENDS the
+//! (`crate::ledger::recovery::reconcile_pending_commits`): it APPENDS the
 //! TERMINAL EVENT (status `Successful`, the per-slot `outcomes`, and the
 //! rollback state built from `actuals`) to the target's ledger — ONE atomic
 //! line append, the only commit of the finalize. Replay idempotency: a
@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Finalize a successful deployment replay-safely: the SINGLE shared
 /// terminal path used by BOTH the normal push success path and recovery
-/// ([`crate::ledger::recovery::reconcile_pending_commits`]). Appends the
+/// (`crate::ledger::recovery::reconcile_pending_commits`). Appends the
 /// TERMINAL EVENT (status `Successful`, the per-slot `outcomes`, and the
 /// rollback state built from `actuals`) to the target's ledger — ONE atomic
 /// line append, the only commit of the finalize.
@@ -73,7 +73,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// (rollback slots == full_membership), so the writer must produce
 /// equality — by construction the overlay covers exactly the current slots
 /// (unselected slots carried forward from the base, removed slots omitted,
-/// and the partial-rollout guards in [`crate::deploy::plan::validate_partial_rollout`]
+/// and the partial-rollout guards in `crate::deploy::plan::validate_partial_rollout`
 /// refuse any current slot without a base entry), and this check pins it.
 pub fn finalize_successful_attempt(
     store: &LocalStore,

@@ -8,7 +8,7 @@
 //! produced no rollback state (failed/degraded attempts are visible here
 //! but are NOT valid rollback refs). A successful attempt additionally
 //! renders the optional rollout ` group=<name>` annotation when it selected
-//! a group (`--group <name>`). [`effective_status`] derives the displayed
+//! a group (`--group <name>`). `effective_status` derives the displayed
 //! status: the entry's TERMINAL EVENT carries the status + reason; an
 //! intent-only entry (in flight or recoverable-pending) renders
 //! `PendingCommit`. The CLI wrapper (`crate::cli`) stays the command

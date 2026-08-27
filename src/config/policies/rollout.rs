@@ -124,7 +124,7 @@ impl<'de> Deserialize<'de> for FailurePolicy {
 /// conversion: `batch_size` is a validated NONZERO [`BatchSize`] (the raw
 /// integer is parsed by the conversion, which rejects zero), `failure_policy`
 /// is the closed typed enum. The raw serialization shape is
-/// [`raw::RawRolloutConfig`] (bare integer batch size); this domain type is
+/// `raw::RawRolloutConfig` (bare integer batch size); this domain type is
 /// never deserialized from the file directly.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct RolloutConfig {

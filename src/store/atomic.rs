@@ -17,22 +17,22 @@
 //!
 //! The helpers here are the shared plumbing — `pub(crate)` free functions
 //! imported by [`crate::store::local`] and [`crate::retention::history_floor`]:
-//! the tri-state existence check ([`path_state`]), the fail-closed
-//! parent-dir fsync ([`sync_parent_dir`]), unique temp naming
-//! ([`temp_name_for`]), the atomic marker/JSONL rewrites
-//! ([`write_atomic_replace`], [`write_jsonl_atomic`]), private permissions
-//! ([`set_private`], [`ensure_private_dir`]), the tree-object directory
-//! copy ([`copy_dir_recursive`]), and the JSON readers.
+//! the tri-state existence check (`path_state`), the fail-closed
+//! parent-dir fsync (`sync_parent_dir`), unique temp naming
+//! (`temp_name_for`), the atomic marker/JSONL rewrites
+//! (`write_atomic_replace`, `write_jsonl_atomic`), private permissions
+//! (`set_private`, `ensure_private_dir`), the tree-object directory
+//! copy (`copy_dir_recursive`), and the JSON readers.
 //!
 //! Parse-sensitive marker reads: a PRESENT-but-malformed marker CONTENT is
 //! semantic CORRUPTION and maps to [`Error::integrity`] via
-//! [`read_json_marker`] (the file exists, it is just not a valid marker),
+//! `read_json_marker` (the file exists, it is just not a valid marker),
 //! while a mechanical filesystem I/O failure (open/read/rename/fsync)
 //! stays [`Error::store`] — the class split a caller can always
 //! distinguish "this marker is corrupt" from "disk read failed".
-//! [`read_json`] folds both into [`Error::store`], which is correct for
+//! `read_json` folds both into [`Error::store`], which is correct for
 //! its non-marker callers (observed.json, retention-debt.json, tree
-//! metadata, ...); callers of [`read_json_marker`] must still perform
+//! metadata, ...); callers of `read_json_marker` must still perform
 //! their own schema-version check after a successful parse (also
 //! [`Error::integrity`]): an unsupported `schema_version` is a
 //! marker-format violation, not an I/O failure.

@@ -31,7 +31,7 @@
 //!    artifacts must stay. When the GC runs for a CHECKPOINT, the
 //!    checkpointed target's ledger is scanned AS-IF the atomic suffix
 //!    replacement already happened — the retained-suffix
-//!    [`LedgerOverride`] — so the pre-checkpoint history's artifacts are
+//!    `LedgerOverride` — so the pre-checkpoint history's artifacts are
 //!    unreachable and swept, and the dry-run preview uses the SAME override
 //!    (previewed deletions == real deletions).
 //! 2. **Every target's CURRENT OBSERVED state** (`slots/<id>/observed.json`
@@ -63,7 +63,7 @@
 //! # Post-commit best-effort maintenance
 //!
 //! The GC runs as part of the checkpoint's post-commit sweep (the release /
-//! object stages of [`super::history_floor::LocalStore::run_sweep`]).
+//! object stages of `super::history_floor::LocalStore::run_sweep`).
 //! Its failure model is best-effort with retry-by-recompute: a GC failure
 //! NEVER deletes anything in the retained set — the run aborts (fail
 //! closed) before any unlink it cannot prove safe, the checkpoint report

@@ -1,4 +1,4 @@
-//! The remote helper: server-side operations over a [`Remote`](crate::remote::transport::Remote)
+//! The remote helper: server-side operations over a [`Remote`]
 //! transport. The [`RemoteHelper`] struct, its constructor, and the shared
 //! read/status plumbing everything uses (status/record types, behavior-contract
 //! reads, the server mutation lock and its RAII guard, inventory writes) lead
@@ -8,14 +8,14 @@
 //!
 //! # Submodules
 //!
-//! * [`state`] — the generation-state facets: `current` status/chain +
-//!   swap/CAS ([`current`](state::current)), commit [`markers`](state::markers),
-//!   and the generation [`assignment`](state::assignment) records.
-//! * [`mutation`] — the mutation facets: object-store [`publish`](mutation::publish)
-//!   (publication/staging), receiver [`rotate`](mutation::rotate), and per-operation
-//!   [`transactions`](mutation::transactions) records.
-//! * [`protocol`] — the protocol handshake.
-//! * [`observed`] — the observed-state re-exports.
+//! * `state` — the generation-state facets: `current` status/chain +
+//!   swap/CAS (`current`), commit (`markers`),
+//!   and the generation (`assignment`) records.
+//! * `mutation` — the mutation facets: object-store (`publish`)
+//!   (publication/staging), receiver (`rotate`), and per-operation
+//!   (`transactions`) records.
+//! * `protocol` — the protocol handshake.
+//! * `observed` — the observed-state re-exports.
 
 mod mutation;
 mod observed;

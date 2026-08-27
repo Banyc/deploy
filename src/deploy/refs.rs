@@ -1,20 +1,20 @@
 //! The push reference LANGUAGE: a pure, store-free grammar over reference
 //! tokens (`@`, `@-`, `@--`, `parent(...)`, deployment ids, ...). The module
-//! owns ONLY the syntax — its [`parse_ref_expr`] returns an AST
-//! ([`RefExpr`]) with no `LocalStore` in scope and no resolution; the
+//! owns ONLY the syntax — its `parse_ref_expr` returns an AST
+//! (`RefExpr`) with no `LocalStore` in scope and no resolution; the
 //! store-dependent resolution that FOLLOWS the AST lives in
-//! [`crate::ledger::resolve_ref_expr`].
+//! `crate::ledger::resolve_ref_expr`.
 //!
 //! The push reference is jj-style: the TARGET IS NEVER REPEATED in the
 //! reference, and the `@`-relative forms resolve against the separately-given
 //! target argument. Resolution is a TWO-PHASE process:
 //!
-//! * [`parse_ref_expr`] (this module) turns the token into a structured
-//!   [`RefExpr`] with NO store access — pure syntax. The engine parses the
+//! * `parse_ref_expr` (this module) turns the token into a structured
+//!   `RefExpr` with NO store access — pure syntax. The engine parses the
 //!   token BEFORE it acquires locks or persists anything, so a malformed
 //!   token fails before any side effect and the deployment id/plan are never
 //!   serialized against a half-parsed reference.
-//! * [`crate::ledger::resolve_ref_expr`] turns the parsed expression into a
+//! * `crate::ledger::resolve_ref_expr` turns the parsed expression into a
 //!   concrete [`crate::ledger::PushRef`] against the target's deployment
 //!   history in the store.
 //!

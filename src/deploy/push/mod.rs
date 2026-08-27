@@ -1,17 +1,17 @@
 //! THE PUSH OPERATION: the full `deploy push` transaction.
 //!
 //! Nested along the push phases: this module holds the push spine
-//! ([`push`] / [`push_inner`] and the numbered steps), the [`PushContext`]
+//! (`push` / `push_inner` and the numbered steps), the `PushContext`
 //! and the report assembly; each phase group lives in its own submodule:
 //!
-//! * [`preflight`] — the PRE-mutation phases (read-only remotes, intent
+//! * `preflight` — the PRE-mutation phases (read-only remotes, intent
 //!   persistence, capacity + staging), itself nested by phase.
-//! * [`execute`] — the MUTATION phases (batch loop, failure policy, status
+//! * `execute` — the MUTATION phases (batch loop, failure policy, status
 //!   decision, actual observation).
-//! * [`commit`] — the POST-mutation phases (terminal finalization, step-17
+//! * `commit` — the POST-mutation phases (terminal finalization, step-17
 //!   maintenance wiring, report assembly).
-//! * [`noop`] — the "Everything up to date" no-op path.
-//! * [`dryrun`] — the dry-run plan rendering.
+//! * `noop` — the "Everything up to date" no-op path.
+//! * `dryrun` — the dry-run plan rendering.
 
 use crate::config::ProjectConfig;
 use crate::config::SlotConfig;
@@ -175,7 +175,7 @@ pub(crate) fn slot_vars(
 /// Run a push against `target_name`.
 ///
 /// Dry-run gating: `opts.dry_run` short-circuits every mutating stage of
-/// [`push_inner`] — no local or remote locks, no handshake or recovery, no
+/// `push_inner` — no local or remote locks, no handshake or recovery, no
 /// object persistence (disposable staging only), no plan/status/results
 /// records, and it returns before capacity preflight — so a dry run never
 /// checks disk headroom. Any new mutating stage added to `push_inner` MUST sit

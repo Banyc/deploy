@@ -12,9 +12,9 @@
 //!   design; the disk usage — the tree content — is reclaimed.
 //!
 //! The rotation I/O itself lives in [`crate::remote::helper`]
-//! ([`RemoteHelper::rotate`]) and the receiver-side post-commit orchestration
+//! ([`crate::remote::helper::RemoteHelper::rotate`]) and the receiver-side post-commit orchestration
 //! (the retention-debt retry that fires the rotation on the next push) lives
 //! in [`crate::deploy`] — both owned by other passes; this module holds
 //! the retention-side contract the rotation honors. The pusher side of the
 //! two-sided sweep (checkpoint) lives in [`crate::retention::checkpoint`], and the
-//! two-sided no-leak contract tests live in [`crate::retention::sweep_tests`].
+//! two-sided no-leak contract tests live in `crate::retention::sweep_tests`.

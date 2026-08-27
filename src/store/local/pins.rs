@@ -19,7 +19,7 @@ impl LocalStore {
     }
 
     /// Write the store's pins durably (atomic temp + rename + parent-dir
-    /// fsync via [`write_atomic_replace`](crate::store::atomic::write_atomic_replace):
+    /// fsync via `write_atomic_replace`:
     /// replacing the pin set is a mutable user operation, so the file is
     /// replaced atomically, never CAS'd). A no-op in the sense that the
     /// file may be absent entirely — [`LocalStore::read_pins`] treats a
@@ -34,7 +34,7 @@ impl LocalStore {
     /// pins file exists. FAILS CLOSED on every integrity violation,
     /// mirroring the other marker readers:
     ///
-    /// * `schema_version` must be exactly [`PINS_SCHEMA_VERSION`]; any other
+    /// * `schema_version` must be exactly `PINS_SCHEMA_VERSION`; any other
     ///   version fails with an error naming the version (a pins file written
     ///   by a different schema is never silently interpreted).
     /// * a present but MALFORMED pins file is a parse failure (semantic

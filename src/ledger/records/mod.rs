@@ -2,11 +2,11 @@
 //! deployment ledger (feature area A2: Ledger semantics), one cohesive
 //! feature GROUP DIRECTORY, recursively nested by relatedness: the SHARED
 //! core record shapes live in this module ([`SlotAttemptState`] /
-//! [`DeploymentStatus`]), the LEDGER LINE + ENTRY facets live in [`wire`]
+//! [`DeploymentStatus`]), the LEDGER LINE + ENTRY facets live in `wire`
 //! (intent, terminal, outcomes, the merged entry), the RECORD-VALIDATION
-//! facets live in [`validation`] (rollback payload, rebinding proof,
+//! facets live in `validation` (rollback payload, rebinding proof,
 //! membership equations, schema versions), and the foundational
-//! THREE-STATE observation lives in [`observation`].
+//! THREE-STATE observation lives in `observation`.
 //!
 //! The SHARED core comes first — the deployment-record fields
 //! ([`SlotAttemptState`] / [`DeploymentStatus`]), the ROLLBACK records
@@ -39,9 +39,9 @@
 //! * **rebinding proof** — the rebinding proof records ([`RebindingPlan`] /
 //!   [`VerifiedReleaseRebinding`] / [`FrozenSlotTopology`]);
 //! * **membership equations** — the SUCCESSFUL membership-equation
-//!   enforcement ([`verify_successful_membership_equations`]);
+//!   enforcement (`verify_successful_membership_equations`);
 //! * **schema versions** — the format-version constants
-//!   ([`LEDGER_SCHEMA_VERSION`] / [`PINS_SCHEMA_VERSION`]).
+//!   (`LEDGER_SCHEMA_VERSION` / `PINS_SCHEMA_VERSION`).
 //!
 //! The per-slot ordered TABLES ([`crate::ledger::tables::SlotTable`] /
 //! [`crate::ledger::tables::NonEmptySlotTable`] over the private ordered
@@ -379,7 +379,7 @@ pub type CompleteRollback = LedgerRollback;
 /// * `bindings` — an EXACT BINDING pin: one (release, variant, tree)
 ///   [`ArtifactRef`], which keeps that release record and that tree object.
 ///
-/// `schema_version` is exactly [`crate::ledger::PINS_SCHEMA_VERSION`];
+/// `schema_version` is exactly `crate::ledger::PINS_SCHEMA_VERSION`;
 /// readers refuse any other version (fail closed).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pins {

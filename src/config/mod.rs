@@ -3,15 +3,15 @@
 //! The config layer is split into TWO layers with a total-fail-closed
 //! conversion between them:
 //!
-//! 1. [`raw`] — the raw SERDE shapes: [`raw::RawConfig`] (the `deploy.toml`
-//!    manifest), [`raw::RawServer`] (one `[[servers]]` entry), and
-//!    [`raw::RawVariant`] (one variant file). These types hold exactly what
+//! 1. `raw` — the raw SERDE shapes: `raw::RawConfig` (the `deploy.toml`
+//!    manifest), `raw::RawServer` (one `[[servers]]` entry), and
+//!    `raw::RawVariant` (one variant file). These types hold exactly what
 //!    the file says — `known_hosts` and `host_key_fingerprint` as a plain
 //!    `Option` pair, activation as a bare `adapter` string — and refuse
 //!    unknown fields (`deny_unknown_fields`). They are crate-internal: the
 //!    only entry point into a validated configuration is [`ProjectConfig::load`]
 //!    (parse -> convert) or the crate-internal conversion
-//!    [`ProjectConfig::from_raw_parts`].
+//!    `ProjectConfig::from_raw_parts`.
 //! 2. [`ProjectConfig`] (`DomainConfig`) — the VALIDATED domain model, public but
 //!    privately constructed: the conversion performs every validity rule
 //!    (identifier validity, reference resolution, exactly-one host identity,
@@ -45,16 +45,16 @@
 //! slot declarations (each variant's `[[slots]]` canonicalized and sorted by
 //! slot id), and every declared variant's tree binding.
 //!
-//! The module is organized by feature. [`domain`] is THE CONFIG CORE — a
-//! directory of single-concern modules: the serialization shapes ([`raw`] —
+//! The module is organized by feature. `domain` is THE CONFIG CORE — a
+//! directory of single-concern modules: the serialization shapes (`raw` —
 //! the raw wire shapes, re-exported here — and the artifact-mapping leaf
 //! types + path/mode helpers), the validated [`ProjectConfig`] graph record,
 //! the total-fail-closed raw -> domain conversion, the derived slot/target
 //! resolution views, the validated mutation / graph-rebuild operations, and
-//! the config test suite. The per-surface policy leaf modules ([`pins`],
-//! [`slots`], [`rollout`], [`retention`], [`activation`], [`verification`],
-//! [`servers`], [`capacity`], [`release_name`]) are grouped under the
-//! [`policies`] directory and re-exported at their original paths: each is a
+//! the config test suite. The per-surface policy leaf modules (`pins`,
+//! `slots`, `rollout`, `retention`, `activation`, `verification`,
+//! `servers`, `capacity`, `release_name`) are grouped under the
+//! `policies` directory and re-exported at their original paths: each is a
 //! distinct, independently-validated config surface.
 //!
 //! The crate-facing surface is re-exported here: `crate::config::Pin`,

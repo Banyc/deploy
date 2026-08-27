@@ -14,9 +14,9 @@
 //!
 //! # Submodules
 //!
-//! * [`ssh`] — the SSH transport group: the [`SshTransport`] itself plus
-//!   host-key verification ([`ssh::hostkey`]) and the bounded subprocess
-//!   runner ([`ssh::runner`]).
+//! * `ssh` — the SSH transport group: the [`SshTransport`] itself plus
+//!   host-key verification (`ssh::hostkey`) and the bounded subprocess
+//!   runner (`ssh::runner`).
 
 mod ssh;
 

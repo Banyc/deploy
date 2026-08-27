@@ -1,5 +1,5 @@
 //! THE ID FAMILY — a deeper group DIRECTORY of the format-validated
-//! identity NEWTYPES (every one built through the shared [`id_newtype!`]
+//! identity NEWTYPES (every one built through the shared `id_newtype!`
 //! macro: the format validator + the `parse`/`FromStr`/`TryFrom`/serde
 //! contract):
 //!
