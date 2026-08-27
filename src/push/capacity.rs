@@ -4,7 +4,7 @@
 //! tree-size walker (`tree_size_on_host`), resolved from the caller's current
 //! `deploy.toml` capacity policy. Extracted from `push::engine`.
 
-use crate::config::ProjectConfig;
+use crate::config::{ProjectConfig, SlotConfig};
 use crate::error::{Error, Result};
 use crate::model::{DeploymentId, OperationId, SlotId};
 use crate::remote::helper::RemoteHelper;
@@ -70,40 +70,7 @@ pub(crate) fn capacity_preflight(
         // or panicking in a debug build. `capacity_fits` never adds (see the
         // helper for the disjunctive form).
         if !capacity_fits(need, reserve, fs.available) {
-            // Run protected retention under the slot's ONE policy — the
-            // policy of the slot's OWNING VARIANT (a slot has exactly one
-            // retention policy; its member targets own rollout behavior
-            // only), then recheck capacity directly rather than failing the
-            // restore. Best-effort by design: retention is only an
-            // optimization to free capacity, and the hard capacity check below
-            // decides the outcome — a retention failure (compute_retained
-            // abort or mark-and-sweep failure) is not recoverable at this
-            // point, so it is skipped and the recheck fails the push loudly
-            // if space is genuinely short. A compute_retained abort — e.g. an
-            // un-honorable pinned release whose record is missing, unreadable,
-            // or identity-unverifiable — must NEVER hard-fail the push here:
-            // the post-commit step-17 retention defers it to the retention-debt
-            // machinery (a durable marker + warning, retried on the next push
-            // once the pinned release is repaired).
-            //
-            // The mutation lock is held via an RAII guard for the whole
-            // retention block, so EVERY exit path releases it on drop. A manual
-            // acquire/release pair would leak the lock, stranding every later
-            // operation on this slot with "mutation lock held by ...".
-            if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
-                let retention = config
-                    .slot_retention(&slot.id)
-                    .expect("the assignment's slot is declared by its owning variant");
-                // Best-effort by design (compute_retained failure INCLUDED):
-                // retention is only an optimization to free capacity, and the
-                // hard capacity check below decides the outcome. The recheck
-                // below still fails the push loudly if space is genuinely
-                // short.
-                if let Ok(retained) = compute_retained(helper, config.pins(), store, retention) {
-                    let active = HashSet::from([deployment_id.as_str().to_string()]);
-                    helper.rotate(&retained, &active).ok();
-                }
-            }
+            retain_best_effort_for_capacity(helper, config, store, slot, op_id, deployment_id);
             let fs2 = helper.remote().filesystem_bytes().unwrap_or(FsBytes {
                 total: 0,
                 available: 0,
@@ -119,6 +86,30 @@ pub(crate) fn capacity_preflight(
         }
     }
     Ok(())
+}
+
+/// Best-effort capacity-freeing retention for one slot, under the slot's ONE
+/// policy (its owning variant), the mutation lock held via an RAII guard for
+/// the whole block. Returns nothing, so it CANNOT fail the push: retention is
+/// only an optimization to free capacity — a `compute_retained` abort is
+/// deferred to the step-17 debt-marker machinery; the hard recheck decides.
+fn retain_best_effort_for_capacity(
+    helper: &RemoteHelper,
+    config: &ProjectConfig,
+    store: &LocalStore,
+    slot: &SlotConfig,
+    op_id: &OperationId,
+    deployment_id: &DeploymentId,
+) {
+    if let Ok(_guard) = helper.acquire_lock_guard(op_id.as_str()) {
+        let retention = config
+            .slot_retention(&slot.id)
+            .expect("the assignment's slot is declared by its owning variant");
+        if let Ok(retained) = compute_retained(helper, config.pins(), store, retention) {
+            let active = HashSet::from([deployment_id.as_str().to_string()]);
+            helper.rotate(&retained, &active).ok();
+        }
+    }
 }
 
 /// Overflow-free headroom decision: `true` exactly when `need + reserve` fits
