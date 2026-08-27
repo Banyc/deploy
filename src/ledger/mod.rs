@@ -5,9 +5,18 @@
 //! named module here, regrouped into SIX cohesive feature modules:
 //!
 //! * [`records`] — THE LEDGER RECORD MODEL: every wire + domain record
-//!   shape the ledger carries, one feature organized by facet — the shared
-//!   core fields ([`SlotAttemptState`] / [`DeploymentStatus`]), the
-//!   rollback records ([`LedgerRollback`] / [`LedgerRollbackWire`] /
+//!   shape the ledger carries, one feature GROUP DIRECTORY recursively
+//!   nested by relatedness — the shared core fields ([`SlotAttemptState`] /
+//!   [`DeploymentStatus`]) and the plan/pins records live in
+//!   [`crate::ledger::records`] itself; the LEDGER LINE + ENTRY facets
+//!   (intent, terminal, outcomes, the merged entry) live in
+//!   [`crate::ledger::records::wire`]; the RECORD-VALIDATION facets
+//!   (rollback payload builder, rebinding proof, membership equations,
+//!   schema versions) live in [`crate::ledger::records::validation`]; the
+//!   foundational three-state observation lives in
+//!   [`crate::ledger::records::observation`]. The record names are all
+//!   re-exported at [`crate::ledger::records`]: the rollback records
+//!   ([`LedgerRollback`] / [`LedgerRollbackWire`] /
 //!   [`PhysicalBinding`] / [`CompleteRollback`]), the plan/report records
 //!   ([`DeploymentPlanWire`] / [`DeploymentPlan`] / [`PlanSource`] /
 //!   [`PlanOrigin`] / [`BehaviorIndex`] / [`SlotPlan`]), the pins/server
