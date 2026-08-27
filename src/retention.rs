@@ -27,7 +27,7 @@
 use crate::config::{Pin, RetentionConfig};
 use crate::error::{Error, Result};
 use crate::layout;
-use crate::model::{ReleaseId, TreeDigest};
+use crate::model::TreeDigest;
 use crate::remote::helper::{RemoteHelper, RemoteStatus};
 use crate::store::local::LocalStore;
 use jiff::Timestamp;
@@ -120,7 +120,10 @@ pub fn compute_retained(
     // warning, post-commit maintenance): the next push retries retention once
     // the pinned release is repaired.
     for pin in pins {
-        let rid = ReleaseId::parse(&pin.release)?;
+        // The pin's release is the TYPED [`crate::model::ReleaseId`]: it was
+        // validated when the config was loaded, so this can never be a late
+        // release-id syntax error.
+        let rid = pin.release.clone();
         let rec = store.read_release(&rid).map_err(|e| {
             Error::integrity(format!(
                 "pin names release {rid} whose record cannot be read or verified ({e}): \
@@ -232,7 +235,7 @@ mod tests {
     use crate::config::{ProjectConfig, SlotConfig};
     use crate::layout;
     use crate::model::{
-        RELEASE_RECORD_SCHEMA_VERSION, ReleaseRecord, SlotId, TreeDigest, VariantName,
+        RELEASE_RECORD_SCHEMA_VERSION, ReleaseId, ReleaseRecord, SlotId, TreeDigest, VariantName,
         test_deployment_id, test_generation_id, test_tree_digest,
     };
     use crate::push::engine::set_retention_deferred;
@@ -425,7 +428,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
 
         let c = cfg();
         let pinned = [Pin {
-            release: rec.release_id.clone(),
+            release: ReleaseId::from_digest(&digest),
             reason: "known-good".into(),
         }];
 
@@ -1189,7 +1192,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let rec = seed_pin_receiver(&helper, &store, &["tree-pin-a", "tree-pin-b"]);
         let c = cfg()
             .with_pin(Pin {
-                release: rec.release_id.clone(),
+                release: ReleaseId::parse(&rec.release_id).unwrap(),
                 reason: "known-good".into(),
             })
             .unwrap();
@@ -1338,10 +1341,12 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
                     .unwrap();
             }
             let mut c = cfg();
-            c = c.with_pin(Pin {
-                release: rec.release_id.clone(),
-                reason: "known-good".into(),
-            }).unwrap();
+            c = c
+                .with_pin(Pin {
+                    release: ReleaseId::parse(&rec.release_id).unwrap(),
+                    reason: "known-good".into(),
+                })
+                .unwrap();
 
             // Sanity: the valid record pins every variant tree; every garbage
             // object is unretained.

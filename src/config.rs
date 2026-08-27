@@ -46,7 +46,7 @@
 //! slot id), and every declared variant's tree binding.
 
 use crate::error::{Error, Result};
-use crate::model::{CONFIG_SCHEMA_VERSION, ServerId, SlotId};
+use crate::model::{CONFIG_SCHEMA_VERSION, ReleaseId, ServerId, SlotId};
 use crate::records::PhysicalBinding;
 use crate::scalar::{
     AbsoluteDeployDir, ApplicationStoreKey, BatchSize, CapacityPercent, Host, Identifier,
@@ -279,11 +279,35 @@ pub struct RetentionConfig {
 
 /// Durable protection for one whole release: every variant's artifact in the
 /// pinned release is retained forever; retention never sweeps it.
+///
+/// The DOMAIN shape: `release` carries the TYPED [`ReleaseId`], so a pin can
+/// only name a release that satisfies the exact `rel-sha256-<64 lowercase
+/// hex>` grammar — a loaded configuration can never carry a pin whose
+/// release would later fail [`ReleaseId::parse`] (the consumers that used to
+/// parse the raw string late now receive the typed id by construction). The
+/// raw WIRE shape is [`raw::RawPin`] (a plain string); the raw -> domain
+/// conversion validates every pin during load via `TryFrom<raw::RawPin>`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Pin {
-    pub release: String,
+    pub release: ReleaseId,
     pub reason: String,
+}
+
+/// Raw -> domain conversion for ONE pin: the raw wire `release` string is
+/// parsed into the typed [`ReleaseId`]. A pin string that does not satisfy
+/// the exact `rel-sha256-<64 lowercase hex>` grammar fails the WHOLE config
+/// load (fail closed, like every sibling raw -> domain gate), so a
+/// successfully loaded configuration can never produce a later release-id
+/// syntax error.
+impl TryFrom<raw::RawPin> for Pin {
+    type Error = Error;
+    fn try_from(raw: raw::RawPin) -> Result<Pin> {
+        Ok(Pin {
+            release: ReleaseId::parse(&raw.release)?,
+            reason: raw.reason,
+        })
+    }
 }
 
 /// The active release: the name of a directory directly beneath `releases/` in
@@ -624,9 +648,22 @@ pub(crate) mod raw {
         pub application: String,
         pub release: ReleaseName,
         #[serde(default)]
-        pub pins: Vec<Pin>,
+        pub pins: Vec<RawPin>,
         pub servers: Vec<RawServer>,
         pub targets: BTreeMap<String, RawTargetConfig>,
+    }
+
+    /// One raw `[[pins]]` entry: the pin's release as a PLAIN string (exactly
+    /// what the file says). The domain conversion parses the string into the
+    /// typed [`super::Pin::release`] [`super::ReleaseId`] — a malformed pin
+    /// string fails the whole load (fail closed, at the raw -> domain
+    /// conversion) — so the raw shape keeps the bare string for the
+    /// fail-closed property.
+    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct RawPin {
+        pub release: String,
+        pub reason: String,
     }
 
     /// One raw `[[servers]]` entry: the raw host-identity option PAIR. The
@@ -1555,11 +1592,13 @@ impl ProjectConfig {
     }
 
     /// Remove every pin naming the given release. Fails if no pin names it;
-    /// the ORIGINAL is untouched.
-    pub fn without_pin(&self, release: &str) -> Result<ProjectConfig> {
+    /// the ORIGINAL is untouched. The release is a typed [`ReleaseId`] (valid
+    /// by construction), so a removed pin always names a grammar-valid
+    /// release.
+    pub fn without_pin(&self, release: &ReleaseId) -> Result<ProjectConfig> {
         let mut next = self.clone();
         let before = next.pins.len();
-        next.pins.retain(|p| p.release != release);
+        next.pins.retain(|p| p.release != *release);
         if next.pins.len() == before {
             return Err(Error::not_found(format!("pin for release '{release}'")));
         }
@@ -1568,13 +1607,15 @@ impl ProjectConfig {
     }
 
     /// Rename every pin naming `old` to name `new`. Fails if no pin names
-    /// `old`; the ORIGINAL is untouched.
-    pub fn rename_pin(&self, old: &str, new: &str) -> Result<ProjectConfig> {
+    /// `old`; the ORIGINAL is untouched. Both ids are typed [`ReleaseId`]s, so
+    /// `new` is valid by construction — the renamed pin always names a
+    /// grammar-valid release.
+    pub fn rename_pin(&self, old: &ReleaseId, new: &ReleaseId) -> Result<ProjectConfig> {
         let mut next = self.clone();
         let mut renamed = false;
         for pin in &mut next.pins {
-            if pin.release == old {
-                pin.release = new.to_string();
+            if pin.release == *old {
+                pin.release = new.clone();
                 renamed = true;
             }
         }
@@ -1876,6 +1917,19 @@ impl TryFrom<RawProject> for ProjectConfig {
                 manifest.schema_version
             )));
         }
+
+        // Every pin's release must satisfy the EXACT `rel-sha256-<64
+        // lowercase hex>` grammar: the raw wire string is parsed into the
+        // typed [`ReleaseId`] HERE, at the load — a malformed pin string
+        // fails the WHOLE conversion (fail closed, like the sibling
+        // identifier gates), stopping at the FIRST bad pin. A successfully
+        // loaded configuration therefore can never carry a pin whose
+        // release would later fail [`ReleaseId::parse`].
+        let pins = manifest
+            .pins
+            .into_iter()
+            .map(Pin::try_from)
+            .collect::<Result<Vec<_>>>()?;
 
         // The release name must be exactly one directory component so it
         // cannot escape the forced `releases/` directory.
@@ -2234,7 +2288,7 @@ impl TryFrom<RawProject> for ProjectConfig {
             schema_version: manifest.schema_version,
             application,
             release: manifest.release,
-            pins: manifest.pins,
+            pins,
             servers: domain_servers,
             targets: domain_targets,
             variants: domain_variants,
@@ -4291,6 +4345,20 @@ interval_seconds = 0
         ]
     }
 
+    /// A VALID release id — the exact `rel-sha256-<64 lowercase hex>` form
+    /// [`ReleaseId::parse`] accepts, built from 64 generated hex digits. The
+    /// typed mutation APIs only accept typed ids, so every update-op payload
+    /// is valid by construction; the rebuild-op property is about invariants
+    /// after successful ops (an op that does not apply simply fails).
+    fn arbitrary_release_id() -> impl Strategy<Value = ReleaseId> {
+        prop::collection::vec(prop::sample::select(b"0123456789abcdef".to_vec()), 64).prop_map(
+            |hex| {
+                ReleaseId::parse(&format!("rel-sha256-{}", String::from_utf8(hex).unwrap()))
+                    .expect("64 lowercase hex chars form a canonical release id")
+            },
+        )
+    }
+
     fn arbitrary_path() -> impl Strategy<Value = PathBuf> {
         prop::sample::select(vec![
             PathBuf::from("/etc/ssh/known_hosts"),
@@ -4708,6 +4776,127 @@ interval_seconds = 0
     }
 
     // =====================================================================
+    // THE PIN-STRING PROPERTY: config load gates EXACTLY on the release-id
+    // grammar
+    // =====================================================================
+    //
+    // THE USER'S REQUIREMENT: strict `ReleaseId` validation must cover
+    // configuration pins. The raw wire `[[pins]]` entry carries a plain
+    // string; the raw -> domain conversion parses EVERY pin's release into
+    // the typed [`ReleaseId`], so a config loads exactly when every pin
+    // satisfies the `rel-sha256-<64 lowercase hex>` grammar — and a loaded
+    // config can never produce a later release-id syntax error (the
+    // consumers that used to parse the raw string late now receive the
+    // typed id by construction).
+
+    /// Arbitrary RAW pin release strings: canonical valid ids (generated via
+    /// hex chars) plus every near-miss class the grammar must reject — wrong
+    /// prefix, non-hex / non-64 / non-lowercase suffix, the bare-digest and
+    /// `rel-` forms, empty, garbage, Unicode. (The garbage arm may
+    /// accidentally produce a valid string — the property asserts the
+    /// equivalence against [`ReleaseId::parse`] itself, so that is fine.)
+    fn arbitrary_raw_pin_release() -> impl Strategy<Value = String> {
+        let digest = crate::model::test_tree_digest("prop").as_str().to_string();
+        prop_oneof![
+            // The canonical VALID form: `rel-sha256-` + 64 lowercase hex.
+            prop::collection::vec(prop::sample::select(b"0123456789abcdef".to_vec()), 64)
+                .prop_map(|hex| { format!("rel-sha256-{}", String::from_utf8(hex).unwrap()) }),
+            // Near-misses.
+            prop::sample::select(vec![
+                String::new(),
+                "rel-sha256-".to_string(),
+                "rel-sha256".to_string(),
+                format!("rel-sha256-{}", &digest[..63]),
+                format!("rel-sha256-{}", digest.to_uppercase()),
+                format!("rel-sha256-{}", "z".repeat(64)),
+                format!("rel-sha256-{}", "0".repeat(63)),
+                format!("rel-{digest}"),
+                digest.clone(),
+                format!("rel-sha256-{digest} "),
+                "rel-sha256-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+                "rel-sha256-α".to_string(),
+                "rel-sha256-0x".to_string(),
+                "rel-sha256----".to_string(),
+            ]),
+            // Arbitrary garbage / Unicode.
+            prop::collection::vec(prop::char::any(), 0..80).prop_map(|v| v.into_iter().collect()),
+        ]
+    }
+
+    proptest! {
+        // THE PROPERTY: over ARBITRARY raw pin-string lists (canonical valid
+        // ids, every near-miss class, garbage, Unicode) with arbitrary
+        // reasons, config loading succeeds EXACTLY when every pin satisfies
+        // the release-id grammar (an invalid pin — the FIRST one — fails the
+        // WHOLE load), and every successfully loaded configuration carries
+        // typed release ids: for every pin, the parse the consumers used to
+        // perform late can never fail. Bounded 16 cases, fixed seed
+        // 0x5EED_5EED per house style; generation is pure (no filesystem).
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn raw_pin_strings_gate_config_load_exactly(
+            pins in prop::collection::vec(
+                (arbitrary_raw_pin_release(), arbitrary_identifier()),
+                0..6,
+            ),
+        ) {
+            let mut project = minimal_raw_project();
+            project.manifest.pins = pins
+                .iter()
+                .map(|(release, reason)| raw::RawPin {
+                    release: release.clone(),
+                    reason: reason.clone(),
+                })
+                .collect();
+            let every_pin_valid = pins.iter().all(|(r, _)| ReleaseId::parse(r).is_ok());
+            let converted = ProjectConfig::from_raw_parts(project.manifest, project.variants);
+            assert_eq!(
+                converted.is_ok(),
+                every_pin_valid,
+                "config load must succeed exactly when every pin satisfies the \
+                 release-id grammar (pins: {pins:?})"
+            );
+            match converted {
+                Ok(cfg) => {
+                    assert_eq!(cfg.pins().len(), pins.len());
+                    // THE never-a-later-error guarantee: every pin carries
+                    // the typed id by construction — the exact statement the
+                    // late-parsing consumers (history_floor / retention) made
+                    // can never fail.
+                    for pin in cfg.pins() {
+                        let rid = pin.release.clone();
+                        assert_eq!(ReleaseId::parse(rid.as_str()).unwrap(), rid);
+                    }
+                    assert_domain_invariants(&cfg);
+                }
+                Err(err) => {
+                    // The exactly-direction: a bad pin is present, the load
+                    // failed closed, and the error names the FIRST bad pin
+                    // (the conversion stops at the first [`ReleaseId::parse`]
+                    // failure).
+                    assert!(!every_pin_valid);
+                    let (first_bad, _) = pins
+                        .iter()
+                        .find(|(r, _)| ReleaseId::parse(r).is_err())
+                        .expect("at least one bad pin when the load fails");
+                    let msg = err.to_string();
+                    assert!(
+                        msg.contains(&format!("invalid ReleaseId value {first_bad:?}")),
+                        "the load must fail on the FIRST bad pin (message: {msg})"
+                    );
+                }
+            }
+        }
+    }
+
+    // =====================================================================
     // THE REBUILD-OP PROPERTY: validated graph-rebuilding operations
     // =====================================================================
     //
@@ -4824,8 +5013,8 @@ interval_seconds = 0
         RemoveTarget(String),
         RenameTarget(String, String),
         AddPin(Pin),
-        RemovePin(String),
-        RenamePin(String, String),
+        RemovePin(ReleaseId),
+        RenamePin(ReleaseId, ReleaseId),
         AddSlot(String, SlotConfig),
         RemoveSlot(String, String),
         RenameSlot(String, String, String),
@@ -4943,10 +5132,10 @@ interval_seconds = 0
             arbitrary_identifier().prop_map(UpdateOp::RemoveTarget),
             (arbitrary_identifier(), arbitrary_identifier())
                 .prop_map(|(a, b)| UpdateOp::RenameTarget(a, b)),
-            (arbitrary_identifier(), arbitrary_identifier())
+            (arbitrary_release_id(), arbitrary_identifier())
                 .prop_map(|(release, reason)| UpdateOp::AddPin(Pin { release, reason })),
-            arbitrary_identifier().prop_map(UpdateOp::RemovePin),
-            (arbitrary_identifier(), arbitrary_identifier())
+            arbitrary_release_id().prop_map(UpdateOp::RemovePin),
+            (arbitrary_release_id(), arbitrary_release_id())
                 .prop_map(|(a, b)| UpdateOp::RenamePin(a, b)),
             (arbitrary_identifier(), arbitrary_slot()).prop_map(|(v, s)| UpdateOp::AddSlot(v, s)),
             (arbitrary_identifier(), arbitrary_identifier())
@@ -5150,20 +5339,29 @@ interval_seconds = 0
     fn pin_ops_add_remove_rename() {
         let cfg = unit_config();
         let pin = Pin {
-            release: "rel-1".to_string(),
+            release: crate::model::test_release_id("rel-1"),
             reason: "known-good".to_string(),
         };
         let added = cfg.with_pin(pin.clone()).unwrap();
         assert_eq!(added.pins().len(), 1);
-        assert_eq!(added.pins()[0].release, "rel-1");
+        assert_eq!(added.pins()[0].release, pin.release);
         // Removing a pin that is not present fails.
-        assert!(cfg.without_pin("rel-1").is_err());
-        let removed = added.without_pin("rel-1").unwrap();
+        assert!(cfg.without_pin(&pin.release).is_err());
+        let removed = added.without_pin(&pin.release).unwrap();
         assert!(removed.pins().is_empty());
-        // Renaming rewrites the release.
-        let renamed = added.rename_pin("rel-1", "rel-2").unwrap();
-        assert_eq!(renamed.pins()[0].release, "rel-2");
-        assert!(added.rename_pin("rel-9", "rel-3").is_err());
+        // Renaming rewrites the release (both ids are typed, so the new
+        // release is valid by construction).
+        let other = crate::model::test_release_id("rel-2");
+        let renamed = added.rename_pin(&pin.release, &other).unwrap();
+        assert_eq!(renamed.pins()[0].release, other);
+        assert!(
+            added
+                .rename_pin(
+                    &crate::model::test_release_id("rel-9"),
+                    &crate::model::test_release_id("rel-3")
+                )
+                .is_err()
+        );
     }
 
     #[test]

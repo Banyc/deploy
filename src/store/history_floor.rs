@@ -417,7 +417,11 @@ impl LocalStore {
         // — the pin cannot be honored, so reachability is incomplete and the
         // sweep must abort before any deletion.
         for pin in config.pins() {
-            let rid = crate::model::ReleaseId::parse(&pin.release)?;
+            // The pin's release is the TYPED [`crate::model::ReleaseId`]: the
+            // raw -> domain conversion validated every pin's release at load,
+            // so this id is already the canonical `rel-sha256-<64 lowercase
+            // hex>` form — no late parse can fail.
+            let rid = pin.release.clone();
             self.honor_release_pin(&mut out, &rid, true)?;
         }
         // Store-level pins (`pins.json`): a MISSING file is the empty pin set

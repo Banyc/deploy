@@ -3422,7 +3422,7 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         h.config = h
             .config
             .with_pin(crate::config::Pin {
-                release: rec.release_id.clone(),
+                release: ReleaseId::parse(&rec.release_id).unwrap(),
                 reason: "known-good".into(),
             })
             .unwrap();
