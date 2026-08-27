@@ -1769,132 +1769,8 @@ fn push_inner(
         )?;
     }
 
-    // Refresh observed state — the shared [`refresh_observed`] helper, also
-    // used by the no-op path so the projection is IDENTICAL whichever path
-    // last touched a slot. Observed state is stored ONCE PER PLACEMENT SLOT
-    // (`slots/<slot-id>/observed.json`), never per target: targets are
-    // SELECTION VIEWS over the global slot map, so `deploy status <other>`
-    // and every consumer of a target's observed view see the CURRENT
-    // assignment (generation, artifact, last deployment) through the slot's
-    // single physical record — a shared slot is written ONCE regardless of
-    // how many targets it is a member of. The per-server record
-    // (`servers/<id>.json`) keeps the actual [`crate::model::ServerId`] for
-    // transport identity.
-    //
-    // POST-COMMIT MAINTENANCE: this refresh runs AFTER the terminal transition
-    // was written — for a Successful attempt the shared finalizer already
-    // appended the snapshot, `refs/last-successful`, and the terminal
-    // `Successful` transition — so the deployment is DURABLY committed here.
-    // A local store fault in this block (a `write_server`, `read_slot_observed`,
-    // or `write_slot_observed` failure) must therefore NEVER turn the push into
-    // an `Err`: it is recorded as a warning on the report (merged into the same
-    // `maintenance` channel as retention) and the push still returns `Ok` with
-    // the committed status.
-    //
-    // Unlike retention there is deliberately NO persistent debt marker. The
-    // observed records are exactly that — PROJECTIONS of already-durable
-    // facts (generations, artifacts, deployments), none of which depend on
-    // this refresh — so a failure is only a projection lag. Convergence needs
-    // no marker to retry: the next real push re-projects from current state,
-    // and the refresh is not incremental — it rewrites each advanced slot's
-    // physical record from the LIVE per-slot assignments. Retries therefore
-    // converge without duplicate history: the projection refresh never
-    // re-records an attempt, snapshot, or transition.
-    //
-    // THE PROJECTION MUST EQUAL THE LIVE REMOTE ASSIGNMENT — never the
-    // desired plan and never this deployment's id for a slot it did not
-    // touch. `actual_servers` substitutes the DESIRED artifact when the
-    // post-mutation status read fails (a pre-swap-unreachable slot), and the
-    // old refresh stamped THIS deployment's id on every member slot
-    // regardless of whether the deployment advanced it — a slot that was
-    // SKIPPED (stop_on_failure) or UNREACHABLE pre-swap (its `process_server`
-    // aborted `Ok(Failed)` before the swap) kept its prior live generation
-    // yet had its truthful observed record overwritten with a fabricated
-    // `{generation: None, artifact: desired}` and a false `last_deployment`.
-    // The projection is therefore rebuilt from each slot's LIVE generation
-    // assignment (read directly, not from `actual_servers`): a slot this
-    // deployment advanced IS the live assignment this deployment created
-    // (same generation, artifact, and deployment id as before — behavior
-    // preserved), while a skipped/unreachable/unadvanced slot keeps the
-    // assignment's OWN deployment id — the deployment that actually created
-    // the live generation — and, when the live assignment cannot be read, the
-    // observed state is `Unknown(error)` — never a fabricated artifact, never
-    // a stale prior record presented as current. A FAILED status read is
-    // likewise NEVER carried over as "unchanged": the observation is
-    // `Unknown(error)` — the slot may have changed; the failure just means we
-    // cannot see it.
-    let mut observed_warnings: Vec<String> = Vec::new();
-    let mut observed_servers: BTreeMap<SlotId, ObservedSlot> = BTreeMap::new();
-    for (slot, _sdef) in &members {
-        let slot_id = SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
-
-        // The slot's LIVE remote assignment. `status` is a read; under the
-        // one-shot pre-swap arm it has already fired and been consumed inside
-        // `process_server`, so this read reflects the true post-mutation
-        // state: the new generation for an advanced slot, the PRIOR
-        // generation for a skipped/unreachable one.
-        let status = helpers[&slot_id].status();
-        match status {
-            Ok(s) => match s.current_generation {
-                Some(g) => match helpers[&slot_id].read_assignment(g.as_str()) {
-                    Ok(asn) => {
-                        observed_servers.insert(
-                            slot_id.clone(),
-                            ObservedSlot {
-                                observation: Observation::Known(ObservedState {
-                                    generation: asn.generation_id.clone(),
-                                    artifact: asn.artifact.clone(),
-                                    last_deployment: asn.deployment_id.clone(),
-                                }),
-                            },
-                        );
-                    }
-                    Err(_) => {
-                        // The generation is observed but its assignment
-                        // cannot be read (missing/corrupt): the observed
-                        // state is UNKNOWN — never a fabricated artifact,
-                        // never a stale prior record presented as current.
-                        observed_servers.insert(
-                            slot_id.clone(),
-                            ObservedSlot {
-                                observation: Observation::Unknown(ObservationError {
-                                    message: format!("assignment read failed for {g}"),
-                                }),
-                            },
-                        );
-                    }
-                },
-                None => {
-                    // The read succeeded showing no state: the slot has no
-                    // observed state (never deployed) — keep it absent (an
-                    // explicit KnownAbsent would fabricate an entry for a slot
-                    // never observed; a stale prior record is never presented
-                    // as current).
-                }
-            },
-            Err(e) => {
-                // THE OBSERVATION FAILED: a failed status read is NOT
-                // evidence of no change — the slot may have changed; the
-                // failure just means we cannot see it. Record `Unknown(error)`
-                // (never the prior record, which would claim "unchanged").
-                observed_servers.insert(
-                    slot_id.clone(),
-                    ObservedSlot {
-                        observation: Observation::Unknown(ObservationError {
-                            message: format!("status read failed: {e}"),
-                        }),
-                    },
-                );
-            }
-        }
-    }
-    refresh_observed(
-        store,
-        target_name,
-        &members,
-        &observed_servers,
-        &mut observed_warnings,
-    );
+    let (_observed, observed_warnings) =
+        refresh_observed_from_live(store, target_name, &members, &helpers);
 
     // 17. Per-slot retention under each slot's mutation lock. Retention uses
     // the slot's ACTUAL final assignment (read after any compensation), not
@@ -2142,39 +2018,111 @@ fn clear_retention_deferred(store: &LocalStore, target: &str, slot: &SlotId) -> 
     warnings
 }
 
-/// Refresh `observed.json` for `target_name` from a caller-supplied per-slot
-/// observed projection, and propagate every shared slot's entry to EACH of its
-/// member targets. Every store fault in this block is WARNING-ONLY: the
-/// refresh runs after the deployment durably committed, so a fault must never
-/// change the push's reported outcome. The warnings are pushed into
-/// `observed_warnings` (merged into the report's `maintenance` warning
-/// channel); this function NEVER returns `Err`.
+/// Rebuild `target_name`'s observed projection from each member slot's LIVE
+/// remote assignment only (the per-slot `helpers` — never the desired plan
+/// and never a deployment id: untouched slots keep the live assignment's own
+/// minting deployment). Refreshes each slot's ONE physical record and returns
+/// the projection with warning-only failures — NON-FALLIBLE, since the
+/// deployment already durably committed (lag converges next push, no marker).
+fn refresh_observed_from_live(
+    store: &LocalStore,
+    target_name: &str,
+    members: &[(&crate::config::SlotConfig, &crate::config::ServerDef)],
+    helpers: &HashMap<SlotId, RemoteHelper>,
+) -> (BTreeMap<SlotId, ObservedSlot>, Vec<String>) {
+    let mut observed_servers: BTreeMap<SlotId, ObservedSlot> = BTreeMap::new();
+    for (slot, _sdef) in members {
+        let slot_id = SlotId::parse(slot.id.as_str()).expect("validated slot id is a safe segment");
+
+        // The slot's LIVE remote assignment. `status` is a read; under the
+        // one-shot pre-swap arm it has already fired and been consumed inside
+        // `process_server`, so this read reflects the true post-mutation
+        // state: the new generation for an advanced slot, the PRIOR
+        // generation for a skipped/unreachable one.
+        let status = helpers[&slot_id].status();
+        match status {
+            Ok(s) => match s.current_generation {
+                Some(g) => match helpers[&slot_id].read_assignment(g.as_str()) {
+                    Ok(asn) => {
+                        observed_servers.insert(
+                            slot_id.clone(),
+                            ObservedSlot {
+                                observation: Observation::Known(ObservedState {
+                                    generation: asn.generation_id.clone(),
+                                    artifact: asn.artifact.clone(),
+                                    last_deployment: asn.deployment_id.clone(),
+                                }),
+                            },
+                        );
+                    }
+                    Err(_) => {
+                        // The generation is observed but its assignment
+                        // cannot be read (missing/corrupt): the observed
+                        // state is UNKNOWN — never a fabricated artifact,
+                        // never a stale prior record presented as current.
+                        observed_servers.insert(
+                            slot_id.clone(),
+                            ObservedSlot {
+                                observation: Observation::Unknown(ObservationError {
+                                    message: format!("assignment read failed for {g}"),
+                                }),
+                            },
+                        );
+                    }
+                },
+                None => {
+                    // The read succeeded showing no state: the slot has no
+                    // observed state (never deployed) — keep it absent (an
+                    // explicit KnownAbsent would fabricate an entry for a slot
+                    // never observed; a stale prior record is never presented
+                    // as current).
+                }
+            },
+            Err(e) => {
+                // THE OBSERVATION FAILED: a failed status read is NOT
+                // evidence of no change — the slot may have changed; the
+                // failure just means we cannot see it. Record `Unknown(error)`
+                // (never the prior record, which would claim "unchanged").
+                observed_servers.insert(
+                    slot_id.clone(),
+                    ObservedSlot {
+                        observation: Observation::Unknown(ObservationError {
+                            message: format!("status read failed: {e}"),
+                        }),
+                    },
+                );
+            }
+        }
+    }
+    let mut observed_warnings: Vec<String> = Vec::new();
+    refresh_observed(
+        store,
+        target_name,
+        members,
+        &observed_servers,
+        &mut observed_warnings,
+    );
+    (observed_servers, observed_warnings)
+}
+
+/// Refresh `observed.json` for `target_name`'s member slots from a
+/// caller-supplied per-slot projection: each slot's ONE physical record
+/// (`slots/<slot-id>/observed.json`) is written EXACTLY ONCE, never once per
+/// member target — targets are selection views over the global slot map, so a
+/// shared slot's single record serves every member target's `read_observed`
+/// view. Every store fault is WARNING-ONLY (pushed into `observed_warnings`,
+/// merged into the report's `maintenance` channel): the refresh runs after
+/// the deployment durably committed, so it must never change the push's
+/// reported outcome — this function NEVER returns `Err`.
 ///
 /// The single source of truth for the observed refresh: the REAL-push path
-/// (which feeds it the actual post-mutation state) and the NO-OP path (which
-/// feeds it the EXISTING generation's assignment, since an up-to-date push
-/// creates no records) both run this exact block, so a shared slot's
-/// projection in every member target is refreshed identically by whichever
-/// Refresh the PHYSICAL observed state for `target_name`'s member slots: each
-/// advanced slot's ONE record is written EXACTLY ONCE (`slots/<slot-id>/observed.json`),
-/// never once per member target — targets are selection views over the global
-/// slot map, so a shared slot's single physical record serves every member
-/// target's `read_observed` view. Every store fault in this block is
-/// WARNING-ONLY: the refresh runs after the deployment durably committed, so a
-/// fault must never change the push's reported outcome. The warnings are
-/// pushed into `observed_warnings` (merged into the report's `maintenance`
-/// warning channel); this function NEVER returns `Err`.
-///
-/// The single source of truth for the observed refresh: the REAL-push path
-/// (which feeds it the actual post-mutation state) and the NO-OP path (which
-/// feeds it the EXISTING generation's assignment, since an up-to-date push
-/// creates no records) both run this exact block, so a shared slot's
-/// physical record is refreshed identically by whichever path last touched
-/// it. Observed maps are keyed by placement slot (the deployment-location
-/// identity); the per-server record (`servers/<id>.json`) keeps the actual
-/// [`crate::model::ServerId`] for transport identity. A member slot with no
-/// entry in `observed_servers` is skipped (slots the caller's push did not
-/// plan keep their prior physical record untouched).
+/// (which feeds the actual post-mutation state via
+/// [`refresh_observed_from_live`]) and the NO-OP path (which feeds the
+/// EXISTING generation's assignment, since an up-to-date push creates no
+/// records) both run this exact block, so a shared slot's physical record is
+/// refreshed identically by whichever path last touched it. A member slot
+/// with no entry in `observed_servers` keeps its prior physical record
+/// untouched.
 fn refresh_observed(
     store: &LocalStore,
     target_name: &str,
