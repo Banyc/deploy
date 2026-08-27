@@ -1,5 +1,8 @@
-//! The ledger's append/read SEMANTIC types: the two physical line kinds and
-//! the merged entry.
+//! The ledger's append/read SEMANTIC types: the two physical line kinds
+//! (the WIRE enum the append-only JSONL stream carries). The MERGED entry
+//! ([`LedgerEntry`] — the durable intent + optional terminal event, with the
+//! entry owning the deployment identity) lives in [`crate::ledger::entry`]
+//! and is re-exported here for the append/read path.
 //!
 //! A target's ENTIRE deployment history lives in ONE ordered, append-only
 //! JSONL file: `targets/<target>/ledger.jsonl`. There are exactly two
@@ -34,9 +37,8 @@
 //! carries; the wire shapes and their VERIFYING CONVERSIONS live with the
 //! records in [`crate::ledger::records`].
 
-use crate::identity::{DeploymentId, TargetName};
-use crate::ledger::intent::{DeploymentIntent, LedgerIntentWire};
-use crate::ledger::terminal::{LedgerTerminal, LedgerTerminalWire};
+use crate::ledger::intent::LedgerIntentWire;
+use crate::ledger::terminal::LedgerTerminalWire;
 use serde::{Deserialize, Serialize};
 
 /// ONE physical line of a target's deployment ledger — the WIRE enum: the
@@ -59,18 +61,8 @@ pub enum LedgerLine {
     Terminal(LedgerTerminalWire),
 }
 
-/// A merged deployment entry of the target's ledger: the durable INTENT plus
-/// the optional TERMINAL EVENT (absent while the deployment is in flight or
-/// recoverable-pending). The append order is the history order; `seq` is the
-/// position of the intent line in the ledger. Only VALIDATED domain records
-/// ([`DeploymentIntent`], [`LedgerTerminal`]) live here — never raw wire shapes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LedgerEntry {
-    pub deployment_id: DeploymentId,
-    pub target: TargetName,
-    pub intent: DeploymentIntent,
-    pub terminal: Option<LedgerTerminal>,
-    /// The position of this entry's intent line in the ledger (0-based
-    /// append order — the entry's history position).
-    pub seq: u64,
-}
+/// The MERGED deployment entry — re-exported from its home in
+/// [`crate::ledger::entry`] so the append/read path (`LedgerLine` consumers,
+/// [`crate::store::local::LocalStore::read_ledger`]) keeps one path to the
+/// entry type.
+pub use crate::ledger::entry::LedgerEntry;

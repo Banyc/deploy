@@ -7,15 +7,22 @@
 //! * [`append`] — the two physical line kinds ([`LedgerLine`]) and the
 //!   merged entry ([`LedgerEntry`]): the crash-atomic append + deployment-id
 //!   keying contracts (the physical I/O stays in
-//!   [`crate::store::local::LocalStore`]).
-//! * [`records`] — the SHARED core RECORDS: the per-slot tables
-//!   ([`SlotTable`] / [`NonEmptySlotTable`]), the wire outcome
-//!   ([`SlotResult`]), the shared deployment-record fields
+//!   [`crate::store::local::LocalStore`]). The merged ENTRY type itself
+//!   lives in [`entry`].
+//! * [`entry`] — the MERGED deployment entry ([`LedgerEntry`], the intent +
+//!   optional terminal merge type the append/read path carries) + the
+//!   verifying pair-conversion tests.
+//! * [`records`] — the SHARED core RECORDS: the deployment-record fields
 //!   ([`SlotAttemptState`] / [`DeploymentStatus`]), the rollback records
 //!   ([`LedgerRollbackWire`] / [`LedgerRollback`] / [`PhysicalBinding`]),
 //!   the plan/report records ([`DeploymentPlanWire`] / [`DeploymentPlan`]
 //!   / [`PlanSource`] / [`PlanOrigin`]), and the pins/server records
-//!   ([`Pins`] / [`ServerState`]).
+//!   ([`Pins`] / [`ServerState`]), plus the re-exports of the moved
+//!   collections ([`SlotTable`] / [`NonEmptySlotTable`] from [`tables`],
+//!   [`SlotResult`] from [`outcomes`]).
+//! * [`tables`] — the per-slot ordered TABLES ([`SlotTable`] /
+//!   [`NonEmptySlotTable`] over the private ordered map): the domain's
+//!   keyed-by-slot collection types.
 //! * [`intent`] — the intent records ([`LedgerIntentWire`] /
 //!   [`DeploymentIntent`]) with the verifying conversion + the in-memory
 //!   push report ([`LedgerIntentReport`]) (the “two line kinds — intent”
@@ -69,6 +76,7 @@
 //! reference GRAMMAR lives in [`crate::deploy::refs`]); the shims are gone.
 
 pub mod append;
+pub mod entry;
 pub mod finalize;
 pub mod intent;
 pub mod log;
@@ -81,6 +89,7 @@ pub mod recovery;
 pub mod refs;
 pub mod rollback;
 pub mod schema;
+pub mod tables;
 pub mod terminal;
 
 pub use append::{LedgerEntry, LedgerLine};

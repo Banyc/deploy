@@ -2,15 +2,17 @@
 //! "outcome dispositions" / "per-slot outcome kinds" / "degraded
 //! semantics"): the per-slot outcome kinds ([`SlotOutcomeKind`]) and the
 //! domain outcome ([`SlotOutcome`]) with its [`SlotTransition`] state, the
-//! wire → domain derivations ([`SlotOutcome::from_wire`],
-//! [`SlotResult::from_outcome`]), the [`CompensationReport`] alias, and the
+//! WIRE outcome row ([`SlotResult`] — the raw serde form the ledger's
+//! JSONL carries, owned HERE next to its domain sibling), the wire → domain
+//! derivations ([`SlotOutcome::from_wire`], [`SlotResult::from_outcome`]),
+//! the [`CompensationReport`] alias, and the
 //! [`LedgerTerminal::remaining_changes`],
 //! [`LedgerTerminal::compensation`]).
 
-use crate::identity::SlotId;
+use crate::identity::{GenerationId, SlotId};
 use crate::ledger::intent::DeploymentIntent;
 use crate::ledger::observation::{Observation, ObservationError, ObservedGeneration};
-use crate::ledger::records::{SlotResult, SlotTable};
+use crate::ledger::tables::SlotTable;
 use crate::ledger::terminal::{LedgerTerminal, TerminalDisposition};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -59,6 +61,31 @@ pub enum SlotTransition {
     /// desired one); the slot is a remaining change iff that observed state
     /// differs from pre_push.
     AdvanceUnknown,
+}
+
+/// The WIRE outcome of one slot during a deployment's mutation loop — the
+/// RAW serde form the ledger's JSONL carries, with the REDUNDANT `slot_id`
+/// next to its map key (the wire keeps the on-disk shape; the wire → domain
+/// conversion verifies the outcome names its own key and then DROPS the
+/// slot into the key — the domain value [`SlotOutcome`] carries no slot).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotResult {
+    pub slot_id: SlotId,
+    pub outcome: SlotOutcomeKind,
+    /// The generation this slot advanced to, or `None` if it never started.
+    pub generation: Option<GenerationId>,
+    pub compensated: bool,
+    /// The pure OPERATION error (e.g. a swap failure) — the slot's own
+    /// failure, INDEPENDENT of the post-mutation observation. NEVER
+    /// rewritten by the post-observation pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The preserved error of a FAILED post-mutation OBSERVATION, or `None`
+    /// when the observation succeeded (a recorded generation) or showed no
+    /// state (`KnownAbsent`). Independent of `error`: an operation failure
+    /// and a failed observation are TWO facts and both survive the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_error: Option<String>,
 }
 
 /// The per-slot OUTCOME of one slot during a deployment's mutation loop —
@@ -287,6 +314,319 @@ impl LedgerTerminal {
             Some(self.outcomes())
         } else {
             None
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::{GenerationId, SlotId, test_generation_id};
+    use crate::ledger::observation::{ObservationError, ObservedGeneration};
+    use proptest::prelude::*;
+    use proptest::test_runner::RngSeed;
+
+    // ---- fixtures ----------------------------------------------------------
+
+    fn slot(i: u32) -> SlotId {
+        SlotId::new(format!("slot-{i}"))
+    }
+
+    // =====================================================================
+
+    /// An arbitrary OPERATION error (the slot's pure failure — the wire's
+    /// `error` field): any failure reason, or none.
+    fn arbitrary_operation_error() -> impl Strategy<Value = Option<String>> {
+        prop::option::of(prop::sample::select(vec![
+            "swap failed: boom".to_string(),
+            "verification failed".to_string(),
+            "internal: no behavior contract for variant 'x'".to_string(),
+        ]))
+    }
+
+    /// An arbitrary THREE-STATE OBSERVATION: `Known` with an arbitrary
+    /// VALID generation id, `KnownAbsent`, or `Unknown` with an arbitrary
+    /// preserved message (the wire's `observation_error` field) — generated
+    /// INDEPENDENTLY of the operation error.
+    fn arbitrary_observation() -> impl Strategy<Value = Observation<ObservedGeneration>> {
+        prop_oneof![
+            (0u32..6).prop_map(|i| Observation::Known(ObservedGeneration {
+                generation: test_generation_id(&format!("obs-{i}")),
+            })),
+            Just(Observation::KnownAbsent),
+            prop::sample::select(vec![
+                "status read failed: boom".to_string(),
+                "assignment read failed: boom".to_string(),
+            ])
+            .prop_map(|e| Observation::Unknown(ObservationError { message: e })),
+        ]
+    }
+
+    /// MIRROR of the engine's post-observation pass (`src/push/engine.rs`'s
+    /// `never_advanced` loop): apply a generated post-mutation observation
+    /// to a wire [`SlotResult`], mutating ONLY the observation fields
+    /// (`generation` / `observation_error`) — the operation error (`error`)
+    /// is NEVER touched. The engine loop is not cleanly reachable from a
+    /// records-level unit test, so this helper mirrors its fixed logic.
+    fn apply_post_observation(r: &mut SlotResult, observation: &Observation<ObservedGeneration>) {
+        match observation {
+            Observation::Known(og) => r.generation = Some(og.generation.clone()),
+            Observation::Unknown(e) => {
+                r.generation = None;
+                r.observation_error = Some(e.message.clone());
+            }
+            Observation::KnownAbsent => {
+                r.generation = None;
+                r.observation_error = None;
+            }
+        }
+    }
+
+    /// (a) An outcome carrying BOTH an operation error AND an `Unknown`
+    /// observation round-trips preserving both — the two facts are
+    /// INDEPENDENT on the wire (the old single-error wire could not carry a
+    /// distinct operation error alongside a failed observation).
+    #[test]
+    fn operation_error_and_unknown_observation_round_trip_preserves_both() {
+        let outcome = SlotOutcome {
+            outcome: SlotOutcomeKind::Failed,
+            observation: Observation::Unknown(ObservationError {
+                message: "status read failed: boom".to_string(),
+            }),
+            compensated: false,
+            error: Some("swap failed: boom".to_string()),
+            transition: SlotTransition::AdvanceUnknown,
+        };
+        let wire = SlotResult::from_outcome(&slot(1), &outcome);
+        assert_eq!(wire.generation, None);
+        assert_eq!(
+            wire.error,
+            Some("swap failed: boom".to_string()),
+            "the operation error is written to the wire's error field"
+        );
+        assert_eq!(
+            wire.observation_error,
+            Some("status read failed: boom".to_string()),
+            "the observation error is written to the wire's observation_error field"
+        );
+        // A full serde_json round trip of the wire keeps both fields.
+        let json = serde_json::to_string(&wire).unwrap();
+        let wire_json: SlotResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(wire_json.error, Some("swap failed: boom".to_string()));
+        assert_eq!(
+            wire_json.observation_error,
+            Some("status read failed: boom".to_string())
+        );
+        let back = SlotOutcome::from_wire(wire);
+        assert_eq!(
+            back.error,
+            Some("swap failed: boom".to_string()),
+            "the operation error survives the wire untouched"
+        );
+        assert_eq!(
+            back.observation,
+            Observation::Unknown(ObservationError {
+                message: "status read failed: boom".to_string(),
+            }),
+            "the Unknown observation survives the wire untouched"
+        );
+    }
+
+    /// (b) The engine's post-observation semantics preserve the operation
+    /// error: a `KnownAbsent` observation must NOT wipe it and an `Unknown`
+    /// observation must NOT overwrite it (the old loop did both).
+    #[test]
+    fn post_observation_preserves_the_operation_error() {
+        // A pre-swap FAILED outcome ALREADY carries its operation error; the
+        // post-observation pass mutates only the observation fields.
+        let mut known_absent = SlotResult {
+            slot_id: slot(1),
+            outcome: SlotOutcomeKind::Failed,
+            generation: Some(GenerationId::new("desired-1".to_string())),
+            compensated: false,
+            error: Some("swap failed: boom".to_string()),
+            observation_error: None,
+        };
+        apply_post_observation(&mut known_absent, &Observation::KnownAbsent);
+        assert_eq!(
+            known_absent.error,
+            Some("swap failed: boom".to_string()),
+            "KnownAbsent must NOT wipe the operation error"
+        );
+        assert_eq!(
+            known_absent.generation, None,
+            "KnownAbsent clears the generation"
+        );
+        assert_eq!(known_absent.observation_error, None);
+
+        let mut unknown = SlotResult {
+            slot_id: slot(1),
+            outcome: SlotOutcomeKind::Failed,
+            generation: Some(GenerationId::new("desired-1".to_string())),
+            compensated: false,
+            error: Some("swap failed: boom".to_string()),
+            observation_error: None,
+        };
+        apply_post_observation(
+            &mut unknown,
+            &Observation::Unknown(ObservationError {
+                message: "status read failed: boom".to_string(),
+            }),
+        );
+        assert_eq!(
+            unknown.error,
+            Some("swap failed: boom".to_string()),
+            "Unknown must NOT overwrite the operation error"
+        );
+        assert_eq!(unknown.generation, None);
+        assert_eq!(
+            unknown.observation_error,
+            Some("status read failed: boom".to_string()),
+            "the observation error lands in observation_error, never in error"
+        );
+
+        let mut known = SlotResult {
+            slot_id: slot(1),
+            outcome: SlotOutcomeKind::Failed,
+            generation: Some(GenerationId::new("desired-1".to_string())),
+            compensated: false,
+            error: Some("swap failed: boom".to_string()),
+            observation_error: None,
+        };
+        apply_post_observation(
+            &mut known,
+            &Observation::Known(ObservedGeneration {
+                generation: GenerationId::new("observed-1".to_string()),
+            }),
+        );
+        assert_eq!(
+            known.error,
+            Some("swap failed: boom".to_string()),
+            "Known must not touch the operation error"
+        );
+        assert_eq!(
+            known.generation,
+            Some(GenerationId::new("observed-1".to_string()))
+        );
+        assert_eq!(known.observation_error, None);
+    }
+
+    proptest! {
+        // THE USER'S PROPERTY: the operation error and the post-mutation
+        // observation are TWO INDEPENDENT facts. (1) Every (operation_error,
+        // observation) pair round-trips domain → wire → domain EXACTLY,
+        // including a full serde_json round trip of the wire. (2) Failure
+        // injection (the engine's post-observation pass, mirrored by
+        // [`apply_post_observation`]) never rewrites the operation error and
+        // reflects the observation in the observation fields. The cross
+        // product covers the directions where the OLD code was wrong: an
+        // `Unknown` observation + a distinct operation error both survive,
+        // and a `KnownAbsent` observation + an operation error survives.
+        // Bounded 16 cases, fixed seed 0x5EED_5EED (house style), no
+        // persistence.
+        #![proptest_config(ProptestConfig {
+            cases: 16,
+            rng_seed: RngSeed::Fixed(0x5EED_5EED),
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn outcome_wire_round_trip_preserves_operation_error_and_observation_independently(
+            operation_error in arbitrary_operation_error(),
+            observation in arbitrary_observation(),
+        ) {
+            // A domain outcome carrying EXACTLY the two generated facts.
+            let outcome = SlotOutcome {
+                outcome: SlotOutcomeKind::Failed,
+                observation: observation.clone(),
+                compensated: false,
+                error: operation_error.clone(),
+                transition: SlotTransition::AdvanceUnknown,
+            };
+            // Domain → wire: each fact lands in its OWN wire field.
+            let wire = SlotResult::from_outcome(&slot(0), &outcome);
+            assert_eq!(
+                wire.error,
+                operation_error,
+                "the operation error is written to the wire's error field"
+            );
+            // Wire → domain: both facts survive INDEPENDENTLY.
+            let back = SlotOutcome::from_wire(wire.clone());
+            assert_eq!(
+                back.error,
+                operation_error.clone(),
+                "the operation error survives the wire untouched"
+            );
+            assert_eq!(
+                back.observation,
+                observation,
+                "the observation survives the wire untouched"
+            );
+            // A full serde_json round trip of the wire preserves both fields.
+            let json = serde_json::to_string(&wire).unwrap();
+            let wire2: SlotResult = serde_json::from_str(&json).unwrap();
+            assert_eq!(wire2.error, operation_error.clone());
+            assert_eq!(wire2.observation_error, wire.observation_error);
+            let back2 = SlotOutcome::from_wire(wire2);
+            assert_eq!(back2.error, operation_error);
+            assert_eq!(back2.observation, observation);
+        }
+
+        #[test]
+        fn post_observation_preserves_both_facts(
+            operation_error in arbitrary_operation_error(),
+            observation in arbitrary_observation(),
+        ) {
+            // A pre-swap FAILED wire outcome ALREADY carries the original
+            // operation error (e.g. "swap failed: ..."); its desired
+            // generation is about to be replaced by the observed post-state.
+            let mut wire = SlotResult {
+                slot_id: slot(0),
+                outcome: SlotOutcomeKind::Failed,
+                generation: Some(GenerationId::new("desired-0".to_string())),
+                compensated: false,
+                error: operation_error.clone(),
+                observation_error: None,
+            };
+            // Failure injection: the engine's post-observation pass.
+            apply_post_observation(&mut wire, &observation);
+            // The operation error is NEVER rewritten by the observation.
+            assert_eq!(
+                wire.error,
+                operation_error.clone(),
+                "the operation error must never be rewritten by the post-mutation observation"
+            );
+            // The observation facts reflect the observation.
+            match &observation {
+                Observation::Known(og) => {
+                    assert_eq!(wire.generation, Some(og.generation.clone()));
+                    assert_eq!(wire.observation_error, None);
+                }
+                Observation::KnownAbsent => {
+                    assert_eq!(wire.generation, None);
+                    assert_eq!(wire.observation_error, None);
+                }
+                Observation::Unknown(e) => {
+                    assert_eq!(wire.generation, None);
+                    assert_eq!(
+                        wire.observation_error,
+                        Some(e.message.clone()),
+                        "the observation error lands in observation_error, never in error"
+                    );
+                }
+            }
+            // The injected wire still converts back to the SAME two facts.
+            let back = SlotOutcome::from_wire(wire);
+            assert_eq!(
+                back.error,
+                operation_error,
+                "the operation error survives the injection untouched"
+            );
+            assert_eq!(
+                back.observation,
+                observation,
+                "the observation survives the injection untouched"
+            );
         }
     }
 }
