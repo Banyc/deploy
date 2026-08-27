@@ -1,0 +1,174 @@
+//! Proof-bearing slot-set types (immutability + membership proofs).
+//!
+//! The proof-bearing resolution layer builds on two slot-set forms:
+//!
+//! * [`SlotSet`] — a plain (possibly EMPTY) slot-id set, the INPUT form of a
+//!   membership verification.
+//! * [`NonEmptySlotSet`] — the NON-EMPTY, UNIQUE slot-id set: the canonical
+//!   membership/set form carried by the proof types ([`MatchingMembership`],
+//!   and the planner's resolved selection). Compose with the sibling
+//!   records-shape `NonEmptySlotTable` (the map form): this is the set form
+//!   of the same non-empty membership invariant.
+//!
+//! [`MatchingMembership`] is the PROOF that two memberships match: the ONLY
+//! way to obtain one is [`MatchingMembership::verify`] (the membership gate
+//! produces it; the planner consumes it). The serde impls serialize the
+//! agreed set and deserialize only a non-empty set — the persisted-wire
+//! replay of an already-verified proof (the record's wire -> domain
+//! conversion re-checks the plan's key-set projections on read).
+
+use super::segments::SlotId;
+use crate::error::{Error, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+
+/// A slot-ID set (possibly EMPTY) — the INPUT form of a membership
+/// verification ([`MatchingMembership::verify`]). A plain set of
+/// [`SlotId`]s; emptiness is legal here (the non-empty requirement
+/// applies to the PROOF result, never to the inputs being compared).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub(crate) struct SlotSet(BTreeSet<SlotId>);
+
+impl SlotSet {
+    /// Build a slot set from slot ids; duplicate ids collapse (a set).
+    pub(crate) fn new(ids: impl IntoIterator<Item = SlotId>) -> Self {
+        SlotSet(ids.into_iter().collect())
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The distinct slot ids in sorted (deterministic) order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &SlotId> {
+        self.0.iter()
+    }
+}
+
+/// The NON-EMPTY, UNIQUE slot-ID set: the canonical membership/slot-set
+/// type carried by the proof-bearing types. Construction is gated on
+/// non-emptiness ([`NonEmptySlotSet::try_new`] refuses an empty input) — a
+/// target with zero slots is never a valid resolution or membership proof
+/// (the raw -> domain conversion rejects targets without slots), so the
+/// invariant holds by construction. This is the SET form; the sibling
+/// records-shape work carries the companion [`NonEmptySlotTable`]-shaped
+/// (map-keyed) non-empty tables the records use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NonEmptySlotSet(BTreeSet<SlotId>);
+
+impl NonEmptySlotSet {
+    /// Build from slot ids; `None` when the input is EMPTY (a non-empty set
+    /// cannot be built from nothing). Duplicate ids are deduplicated (a set).
+    pub(crate) fn try_new(ids: impl IntoIterator<Item = SlotId>) -> Option<Self> {
+        let ids: BTreeSet<SlotId> = ids.into_iter().collect();
+        (!ids.is_empty()).then_some(NonEmptySlotSet(ids))
+    }
+
+    /// The number of distinct slot ids.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The distinct slot ids in sorted (deterministic) order.
+    pub fn iter(&self) -> impl Iterator<Item = &SlotId> {
+        self.0.iter()
+    }
+
+    /// Whether the set contains the slot id.
+    #[cfg(test)]
+    pub fn contains(&self, id: &SlotId) -> bool {
+        self.0.contains(id)
+    }
+
+    /// The backing set as a read-only view (composes with the sibling
+    /// records-shape non-empty tables, which carry the same slot keys).
+    pub fn as_set(&self) -> &BTreeSet<SlotId> {
+        &self.0
+    }
+}
+
+/// The PROOF that two slot-ID memberships match: the frozen (historical)
+/// and current (live) memberships verified EXACTLY EQUAL, carrying the
+/// agreed NON-EMPTY slot set. The ONLY construction path is
+/// [`MatchingMembership::verify`] — the membership gate produces the proof
+/// and the planner consumes it (a [`crate::records::RebindingPlan`] records
+/// it as the membership check that ran). The serde impls serialize the
+/// agreed set and deserialize only a NON-EMPTY set (the persisted-wire
+/// replay of an already-verified proof; the record's wire -> domain
+/// conversion re-checks the plan's key-set projections on read).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MatchingMembership {
+    slots: NonEmptySlotSet,
+}
+
+impl MatchingMembership {
+    /// Verify that the FROZEN and CURRENT slot memberships are EXACTLY
+    /// EQUAL and non-empty, producing the proof. `Ok` exactly when
+    /// `frozen == current` and the agreed set is non-empty (a target's
+    /// membership is never empty — the raw -> domain conversion rejects
+    /// targets without slots, so an empty agreement can never be a proof);
+    /// `Err` on any mismatch or an empty agreement. This is the ONLY
+    /// construction path: the fields are private, so a `MatchingMembership`
+    /// cannot be hand-built.
+    pub fn verify(frozen: SlotSet, current: SlotSet) -> Result<Self> {
+        if frozen.is_empty() || current.is_empty() {
+            return Err(Error::rollback(
+                "membership proof refused: a membership is never empty",
+            ));
+        }
+        if frozen != current {
+            return Err(Error::rollback(
+                "membership proof refused: frozen and current slot sets differ",
+            ));
+        }
+        // `frozen == current` and both non-empty: the agreed set is non-empty.
+        let slots = NonEmptySlotSet::try_new(frozen.iter().cloned()).ok_or_else(|| {
+            Error::internal("verified-equal non-empty memberships yield a non-empty set")
+        })?;
+        Ok(MatchingMembership { slots })
+    }
+
+    /// The agreed (frozen == current) membership: the non-empty slot set
+    /// the proof verifies. Read path: the wire → domain conversion
+    /// re-checks the claimed proof's agreed set against the plan's own
+    /// membership (the frozen topology keys must equal it, and every
+    /// selected plan slot must be a member); the property suite asserts its
+    /// content through this accessor.
+    pub(crate) fn slots(&self) -> &NonEmptySlotSet {
+        &self.slots
+    }
+}
+
+impl Serialize for MatchingMembership {
+    /// The persisted wire form is the agreed slot set (the frozen/current
+    /// halves were verified equal at plan time; the record keeps the agreed
+    /// set).
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.slots.as_set().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MatchingMembership {
+    /// Wire replay of a verified proof: reconstructs the proof from the
+    /// persisted agreed set, refusing an EMPTY set (the non-empty invariant
+    /// holds on the wire too).
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let ids: BTreeSet<SlotId> = Deserialize::deserialize(deserializer)?;
+        let slots = NonEmptySlotSet::try_new(ids).ok_or_else(|| {
+            serde::de::Error::custom("a membership proof must carry a non-empty slot set")
+        })?;
+        Ok(MatchingMembership { slots })
+    }
+}
