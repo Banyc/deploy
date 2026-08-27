@@ -2179,8 +2179,12 @@ fn identity_artifact_component_change_prevents_noop() {
     assert!(r2.attempt.is_some(), "a real push records an attempt");
     f.check_invariants();
 
-    // (b) TREE: tamper the stored tree to a DIFFERENT REAL tree (the repair
-    // push keeps the history consistent, so the invariant checks still hold).
+    // (b) TREE: tamper the stored tree to a DIFFERENT REAL tree. The tampered
+    // assignment now names a different tree than the current generation's
+    // `root` symlink (which still names the tree the generation was created
+    // with), so the remote chain is INTERNALLY INCONSISTENT: `status()` must
+    // fail closed with an integrity error and the next push must refuse —
+    // never proceed, and certainly never no-op.
     let f = Fixture::new();
     let r1 = f.push("t1").expect("push v1");
     let first_tree = r1.attempt.as_ref().expect("attempt").slots[&SlotId::new("p1")]
@@ -2190,13 +2194,13 @@ fn identity_artifact_component_change_prevents_noop() {
     f.apply(Action::Build(2));
     f.push("t1").expect("push v2 (current is now T2)");
     f.tamper_stored_tree(&first_tree);
-    let r2 = f.push("t1").expect("a tree tamper forces a real push");
-    assert_ne!(
-        r2.message, "Everything up to date",
-        "changing the tree component must prevent a no-op"
+    let err = f
+        .push("t1")
+        .expect_err("a tree tamper makes the remote chain inconsistent and must fail closed");
+    assert!(
+        err.to_string().contains("integrity"),
+        "the tampered chain must fail with an integrity error, got: {err}"
     );
-    assert!(r2.attempt.is_some());
-    f.check_invariants();
 
     // (c) RELEASE: tamper the stored release id.
     let f = Fixture::new();

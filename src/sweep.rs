@@ -174,7 +174,7 @@ fn make_gen(
                 deployment_id: test_deployment_id(deployment_id),
                 generation_id: test_generation_id(generation_id),
                 artifact: ArtifactRef {
-                    release: ReleaseId::new("r".to_string()),
+                    release: crate::model::test_release_id("r"),
                     variant: VariantName::new("standard".to_string()),
                     tree: canonical_tree,
                 },
@@ -389,7 +389,11 @@ fn run_no_leak_case(
         );
     }
     helper
-        .swap_current(None, &format!("g{}", n - 1), "op")
+        .swap_current(
+            None,
+            test_generation_id(&format!("g{}", n - 1)).as_str(),
+            "op",
+        )
         .unwrap();
     // The pinned tree exists on the receiver (pin-protected content). The
     // receiver's tree dirs are keyed by the canonical digest.

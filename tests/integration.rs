@@ -3139,9 +3139,44 @@ fn pending_commit_diverged_generation_is_degraded_not_successful() -> Result<()>
     // generation the pending attempt did not mint, and change the pushed
     // content so this push is a real deployment (a fresh release) rather than
     // an up-to-date no-op.
+    // Simulate another controller advancing the server with a REAL foreign
+    // generation: the canonical `current` -> `generations/<foreign-gen>/root`
+    // chain (`create_generation` + a published tree object), a generation the
+    // pending attempt did not mint. Under the fail-closed contract a `current`
+    // link that does NOT name a valid generation would itself be an integrity
+    // error, so the simulation must mint a genuine foreign generation rather
+    // than a hand-written non-canonical target.
     let cur = remotes_base.join("server-01/current");
     std::fs::remove_file(&cur)?;
-    std::os::unix::fs::symlink("generations/manual-diverge/root", &cur)?;
+    let foreign_remote = LocalTransport::new(remotes_base.join("server-01"))?;
+    let foreign_helper = RemoteHelper::new(&foreign_remote);
+    let foreign_tree =
+        TreeDigest::parse("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+            .expect("valid tree digest");
+    foreign_helper
+        .remote()
+        .create_dir_all(&deploy::layout::tree_root(foreign_tree.as_str()))?;
+    let foreign_gen = deploy::model::GenerationId::generate();
+    foreign_helper.create_generation(
+        "op-foreign",
+        &GenerationAssignment {
+            deployment_id: deploy::model::DeploymentId::generate(),
+            generation_id: foreign_gen.clone(),
+            artifact: deploy::model::ArtifactRef {
+                release: deploy::model::ReleaseId::parse(
+                    "rel-sha256-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                )
+                .expect("valid release id"),
+                variant: deploy::model::VariantName::parse("standard").expect("valid variant"),
+                tree: foreign_tree,
+            },
+            behavior_sha256: "b".to_string(),
+            prior_generation: None,
+            created_at: "2020-01-01T00:00:00Z".to_string(),
+            target: None,
+        },
+    )?;
+    foreign_helper.swap_current(None, foreign_gen.as_str(), "op-foreign")?;
     write_file(
         &proj
             .join("releases")
