@@ -323,7 +323,9 @@ mod tests_publish {
     #[test]
     fn publish_release_recomputes_and_verifies_identity() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
         let helper = RemoteHelper::new(&remote);
         let (rec, behavior_json) = publish_fixture();
         let release_json = serde_json::to_string(&rec).unwrap();
@@ -387,7 +389,9 @@ mod tests_publish {
         String,
     ) {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
         let helper = RemoteHelper::new(&remote);
         let (rec, behavior_json) = publish_fixture();
         let release_json = serde_json::to_string(&rec).unwrap();
@@ -544,7 +548,9 @@ mod tests_publish {
     #[test]
     fn publish_release_verifies_behavior_json_digest() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
         let helper = RemoteHelper::new(&remote);
         let (rec, behavior_json) = publish_fixture();
         let release_json = serde_json::to_string(&rec).unwrap();
@@ -670,7 +676,9 @@ mod tests_publish {
         )
         .unwrap();
 
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
         let dest = Path::new("objects/sha256/x/root");
         copy_host_tree_to_remote(&host, dest, &remote)
             .expect("a tree with read-only directories must upload");
@@ -731,7 +739,9 @@ mod tests_publish {
         std::fs::create_dir_all(&st).unwrap();
         std::fs::set_permissions(&st, std::fs::Permissions::from_mode(0o1777)).unwrap();
 
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
         let dest = Path::new("objects/sha256/y/root");
         copy_host_tree_to_remote(&host, dest, &remote)
             .expect("a tree with special modes must upload");

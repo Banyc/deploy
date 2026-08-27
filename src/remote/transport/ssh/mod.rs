@@ -78,6 +78,7 @@ impl SshTransport {
     /// managed known-hosts file (from the environment snapshot at the
     /// boundary), and `env` is that snapshot: every child this transport
     /// spawns (ssh, ssh-keyscan, ssh-keygen) receives its variables.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         user: &str,
         address: &str,
@@ -143,6 +144,7 @@ impl SshTransport {
     /// drive the deadline/kill/reap contract through the real entry points
     /// without any real subprocess.
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_runner(
         user: &str,
         address: &str,
@@ -1372,7 +1374,10 @@ esac
                 cache.as_os_str().to_owned(),
             ),
             (OsString::from("FAKE_SSH_ROOT"), root.as_os_str().to_owned()),
-            (OsString::from("FAKE_SSH_REMOTE_PREFIX"), OsString::from(prefix)),
+            (
+                OsString::from("FAKE_SSH_REMOTE_PREFIX"),
+                OsString::from(prefix),
+            ),
         ]));
         SysEnv::from_map(vars)
     }
@@ -1390,7 +1395,12 @@ esac
             Path::new("/srv/deploy/status-unit"),
         );
         let cache = tmp.path().join("knownhosts");
-        let env = fake_env(&fake.bin, &cache, &fake.remote_root, "/srv/deploy/status-unit");
+        let env = fake_env(
+            &fake.bin,
+            &cache,
+            &fake.remote_root,
+            "/srv/deploy/status-unit",
+        );
         let t = fake.transport(&cache, &env);
         // Regression: without prepare_identity the transport refuses to
         // build ssh arguments (no pinned key yet).

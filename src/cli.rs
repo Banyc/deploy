@@ -373,9 +373,10 @@ where
     // `'static`): each remote is built from the same boundary snapshot, so
     // every spawned child env is deterministic.
     let env = env.clone();
-    let factory = move |s: &crate::config::ServerDef,
-                        slot: &crate::config::SlotConfig|
-     -> Result<Box<dyn Remote>> { create_remote(&env, s, slot.deploy_dir()) };
+    let factory =
+        move |s: &crate::config::ServerDef,
+              slot: &crate::config::SlotConfig|
+              -> Result<Box<dyn Remote>> { create_remote(&env, s, slot.deploy_dir()) };
 
     match cli.command {
         Command::Push {

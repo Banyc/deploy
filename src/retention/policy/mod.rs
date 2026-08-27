@@ -278,7 +278,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn retains_current_and_previous() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
         let helper = RemoteHelper::new(&remote);
         helper
             .remote()
@@ -345,7 +347,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn pin_protects_every_variant_of_a_release() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
         let helper = RemoteHelper::new(&remote);
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
 
@@ -464,7 +468,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn keep_distinct_artifacts_retains_newest_distinct_bindings() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
         let helper = RemoteHelper::new(&remote);
         make_gen(
             &helper,
@@ -540,7 +546,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn keep_days_retains_recent_artifacts() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
         let helper = RemoteHelper::new(&remote);
         let now = jiff::Timestamp::now();
         let old = (now - jiff::SignedDuration::from_hours(60 * 24)).to_string();
@@ -600,7 +608,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn snapshot_protect_deployments_retains_newest_deployments() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
         let helper = RemoteHelper::new(&remote);
         make_gen(
             &helper,
@@ -676,7 +686,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn current_and_protected_previous_survive_zero_windows() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
         let helper = RemoteHelper::new(&remote);
         make_gen(
             &helper,
@@ -745,7 +757,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn retention_fails_closed_when_live_assignment_is_unreadable() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
         let helper = RemoteHelper::new(&remote);
         make_gen(
             &helper,
@@ -828,7 +842,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn group_membership_never_changes_retention() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
         let helper = RemoteHelper::new(&remote);
         make_gen(
             &helper,
@@ -952,7 +968,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     #[test]
     fn legacy_records_are_retained_under_the_single_policy() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
         let helper = RemoteHelper::new(&remote);
         // Legacy records: no originating target on any of them.
         make_gen(
@@ -1155,7 +1173,9 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
     /// garbage is removed).
     fn assert_pin_corruption_abort_then_repair(kind: PinRecordCorruption) {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
         let helper = RemoteHelper::new(&remote);
         let store = LocalStore::with_base(dir.path().join("store")).unwrap();
         let rec = seed_pin_receiver(&helper, &store, &["tree-pin-a", "tree-pin-b"]);

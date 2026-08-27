@@ -629,7 +629,9 @@ mod tests {
                 reason: "known-good".into(),
             })
             .unwrap();
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1"))
+                .unwrap();
         let helper = RemoteHelper::new(&remote);
         for t in ["tree-pin-a", "tree-pin-b", "tree-garbage"] {
             helper

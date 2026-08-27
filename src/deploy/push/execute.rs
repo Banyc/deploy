@@ -269,7 +269,9 @@ pub(crate) mod execute_tests {
         // The remote never advanced: no `current`, no durable generation
         // record (the mid-mutation fault fired before the assignment write, so
         // the generation dir may exist but is empty).
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1"))
+                .unwrap();
         assert!(
             !remote.exists(crate::remote::layout::current()),
             "no current"
@@ -294,7 +296,9 @@ pub(crate) mod execute_tests {
             "the interrupted state must be recoverable: {}",
             r2.message
         );
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1"))
+                .unwrap();
         assert!(
             remote.exists(crate::remote::layout::current()),
             "remote advanced"
@@ -359,7 +363,10 @@ pub(crate) mod execute_tests {
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
+            Ok(Box::new(LocalTransport::new(
+                &crate::testutil::fixture_env(),
+                rf.join(s.id.as_str()),
+            )?))
         };
         let r2 = push_inner(
             &config2.project_root(&h.cfg_path),
@@ -410,7 +417,9 @@ pub(crate) mod execute_tests {
         // The remote `current` points at the PRIOR generation, whose stored
         // assignment carries the PRIOR behavior digest (A), never B: the
         // prior behavior contract was restored, not the desired one.
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1"))
+                .unwrap();
         let status = RemoteHelper::new(&remote).status().unwrap();
         let cur = status
             .current_generation
@@ -639,7 +648,10 @@ interval_seconds = 0
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
+            Ok(Box::new(LocalTransport::new(
+                &crate::testutil::fixture_env(),
+                rf.join(s.id.as_str()),
+            )?))
         };
         let r = push_inner(
             &project_root,
@@ -699,7 +711,8 @@ interval_seconds = 0
 
         // The never-started server (p4) was left untouched: no `current`
         // pointer, no generation record.
-        let remote4 = LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join("s4")).unwrap();
+        let remote4 =
+            LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join("s4")).unwrap();
         assert!(
             !remote4.exists(crate::remote::layout::current()),
             "p4's server must never receive a current pointer"
@@ -713,7 +726,8 @@ interval_seconds = 0
             "p4's server must never receive a generation record"
         );
         // The failed slot's server was compensated back to no prior state.
-        let remote3 = LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join("s3")).unwrap();
+        let remote3 =
+            LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join("s3")).unwrap();
         assert!(
             !remote3.exists(crate::remote::layout::current()),
             "a compensated first-deploy slot has no current"
@@ -885,7 +899,10 @@ interval_seconds = 0
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
+            Ok(Box::new(LocalTransport::new(
+                &crate::testutil::fixture_env(),
+                rf.join(s.id.as_str()),
+            )?))
         };
         let r = push_inner(
             &config.project_root(&cfg_path),
@@ -975,7 +992,9 @@ interval_seconds = 0
         let prior_gen = prior.generation.clone().expect("prior generation");
         let prior_tree = known_artifact(&prior).tree.clone();
         let prior_release = known_artifact(&prior).release.clone();
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1"))
+                .unwrap();
         let prior_assignment: crate::remote::helper::GenerationAssignment = serde_json::from_slice(
             &remote
                 .read(
@@ -1038,7 +1057,9 @@ interval_seconds = 0
         // The remote `current` points at the PRIOR generation, whose stored
         // assignment carries the PRIOR behavior digest: the prior behavior
         // contract was restored, not the desired one.
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1"))
+                .unwrap();
         let status = RemoteHelper::new(&remote).status().unwrap();
         let cur = status
             .current_generation
@@ -1187,7 +1208,9 @@ interval_seconds = 0
         // refresh reads the ACTUAL `current`, which the compensation swap-back
         // moved to the prior generation even though the prior service could
         // not be re-activated.
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1"))
+                .unwrap();
         let status = RemoteHelper::new(&remote).status().unwrap();
         assert_eq!(
             status.current_generation.as_ref().map(|g| g.as_str()),
@@ -1242,7 +1265,9 @@ interval_seconds = 0
         // The remote has NO stale `current`: the compare-and-swap removal
         // removed the link (it still pointed at the generation this attempt
         // advanced).
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1"))
+                .unwrap();
         assert!(
             !remote.exists(crate::remote::layout::current()),
             "first-deploy compensation must remove `current`"
@@ -1304,7 +1329,9 @@ interval_seconds = 0
             .expect("baseline generation");
 
         // Corrupt the live generation's assignment record on the remote.
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), h.remotes_base.join("s1"))
+                .unwrap();
         let asn_path = crate::remote::layout::generations()
             .join(gen1.as_str())
             .join("assignment.json");
@@ -1506,7 +1533,10 @@ interval_seconds = 0
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
+            Ok(Box::new(LocalTransport::new(
+                &crate::testutil::fixture_env(),
+                rf.join(s.id.as_str()),
+            )?))
         };
         let r = push_inner(
             &project_root,
@@ -1537,7 +1567,9 @@ interval_seconds = 0
         // The earlier successful batch is retained deliberately: p1/p2 keep
         // their live `current` (no compensation pass runs).
         for (sid, sname) in [("p1", "s1"), ("p2", "s2")] {
-            let remote = LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join(sname)).unwrap();
+            let remote =
+                LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join(sname))
+                    .unwrap();
             assert!(
                 remote.exists(crate::remote::layout::current()),
                 "slot {sid} must stay advanced under leave_changed"
@@ -1546,12 +1578,14 @@ interval_seconds = 0
         // The FAILING slot is still compensated in-process (step 11) and its
         // first-deploy `current` was removed; the never-started slot is
         // untouched.
-        let remote3 = LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join("s3")).unwrap();
+        let remote3 =
+            LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join("s3")).unwrap();
         assert!(
             !remote3.exists(crate::remote::layout::current()),
             "the failing slot's current is removed by in-process compensation"
         );
-        let remote4 = LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join("s4")).unwrap();
+        let remote4 =
+            LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join("s4")).unwrap();
         assert!(
             !remote4.exists(crate::remote::layout::current()),
             "the never-started slot has no current"

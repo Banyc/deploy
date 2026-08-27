@@ -216,7 +216,9 @@ mod tests {
     #[test]
     fn lock_guard_releases_on_drop_after_error() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
         let helper = RemoteHelper::new(&remote);
 
         {

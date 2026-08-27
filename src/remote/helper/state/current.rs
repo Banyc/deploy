@@ -711,7 +711,8 @@ mod tests_current {
             let base = dir.path().join("remote");
             std::fs::create_dir_all(&base).unwrap();
             spec.install(&base);
-            let remote = LocalTransport::new(&crate::testutil::fixture_env(), base.clone()).unwrap();
+            let remote =
+                LocalTransport::new(&crate::testutil::fixture_env(), base.clone()).unwrap();
             let helper = RemoteHelper::new(&remote);
             let new_gen = GenerationId::generate();
             let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

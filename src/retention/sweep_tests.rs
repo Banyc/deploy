@@ -380,7 +380,8 @@ fn run_no_leak_case(
     let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
 
     // ---- the receiver: a remote with a generation history -----------------
-    let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+    let remote =
+        LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
     let helper = RemoteHelper::new(&remote);
     let n = receiver_trees.len();
     for (i, t) in receiver_trees.iter().enumerate() {
@@ -911,7 +912,9 @@ fn receiver_retention_failure_is_maintenance_not_correction() {
     let clean_factory = move |s: &crate::config::ServerDef,
                               _slot: &crate::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf2.join(&s.id)).unwrap()))
+        Ok(Box::new(
+            LocalTransport::new(&crate::testutil::fixture_env(), rf2.join(&s.id)).unwrap(),
+        ))
     };
     let r2 = push(
         &h.cfg_path,

@@ -6873,7 +6873,10 @@ fn run_slot_view_property(members: Vec<Vec<bool>>, pushes: Vec<usize>) {
     let factory = move |s: &crate::config::ServerDef,
                         _slot: &crate::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
+        Ok(Box::new(LocalTransport::new(
+            &crate::testutil::fixture_env(),
+            rf.join(s.id.as_str()),
+        )?))
     };
 
     // The artifact source the variant maps; rewritten before every push so
@@ -6969,7 +6972,8 @@ fn assert_membership_never_changes_retention(
     let slot_id = &slot_def.id;
     let groups0 = &slot_def.groups;
     let retained = |cfg: &ProjectConfig| -> HashSet<String> {
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join("h1")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), remotes_base.join("h1")).unwrap();
         let helper = RemoteHelper::new(&remote);
         compute_retained(
             &helper,

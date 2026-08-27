@@ -212,7 +212,10 @@ fn fake_env(bin: &Path, cache: &Path, root: &Path, prefix: &str) -> SysEnv {
             cache.as_os_str().to_owned(),
         ),
         (OsString::from("FAKE_SSH_ROOT"), root.as_os_str().to_owned()),
-        (OsString::from("FAKE_SSH_REMOTE_PREFIX"), OsString::from(prefix)),
+        (
+            OsString::from("FAKE_SSH_REMOTE_PREFIX"),
+            OsString::from(prefix),
+        ),
     ]))
 }
 
@@ -363,7 +366,7 @@ fn fingerprint_only_dry_run_leaves_remote_untouched() -> Result<()> {
     let fp = fake.fingerprint.clone();
     let factory = move |s: &deploy::config::ServerDef,
                         slot: &deploy::config::SlotConfig|
-     -> Result<Box<dyn Remote>> {
+          -> Result<Box<dyn Remote>> {
         Ok(Box::new(SshTransport::new(
             s.user(),
             s.address(),
@@ -424,7 +427,7 @@ fn fingerprint_only_first_push_succeeds() -> Result<()> {
     let fp = fake.fingerprint.clone();
     let factory = move |s: &deploy::config::ServerDef,
                         slot: &deploy::config::SlotConfig|
-     -> Result<Box<dyn Remote>> {
+          -> Result<Box<dyn Remote>> {
         Ok(Box::new(SshTransport::new(
             s.user(),
             s.address(),
@@ -506,7 +509,7 @@ fn fingerprint_only_repeat_push_is_idempotent() -> Result<()> {
     let fp = fake.fingerprint.clone();
     let factory = move |s: &deploy::config::ServerDef,
                         slot: &deploy::config::SlotConfig|
-     -> Result<Box<dyn Remote>> {
+          -> Result<Box<dyn Remote>> {
         Ok(Box::new(SshTransport::new(
             s.user(),
             s.address(),

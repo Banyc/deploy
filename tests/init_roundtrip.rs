@@ -142,7 +142,9 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     let store = LocalStore::with_base(tmp.path().join("store"))?;
     let factory = move |s: &deploy::config::ServerDef,
                         slot: &deploy::config::SlotConfig|
-          -> Result<Box<dyn Remote>> { create_remote(&deploy::env::SysEnv::from_process(), s, slot.deploy_dir()) };
+          -> Result<Box<dyn Remote>> {
+        create_remote(&deploy::env::SysEnv::from_process(), s, slot.deploy_dir())
+    };
 
     let r_dry = push(
         &config_path,
@@ -196,7 +198,10 @@ fn cli_init_then_push_roundtrip() -> Result<()> {
     // 6. Remote state: the local endpoint now carries the full layout, the
     // `current` symlink points at the new generation, and the mapped artifact
     // is present with the placeholder content.
-    let endpoint = LocalTransport::new(&deploy::env::SysEnv::from_process(), proj.join(".deploy-remote"))?;
+    let endpoint = LocalTransport::new(
+        &deploy::env::SysEnv::from_process(),
+        proj.join(".deploy-remote"),
+    )?;
     let helper = RemoteHelper::new(&endpoint);
     let status = helper.status()?;
     assert_eq!(

@@ -48,8 +48,6 @@
 //! method's consume hook converts to a one-line registry call:
 //! `self.fault_registry.consume(FaultKind::<Kind>, id)`.
 
-use std::sync::Mutex;
-
 /// A fresh process-environment snapshot for tests that exercise NO
 /// environment-dependent behavior (a transport whose children resolve from
 /// the ambient `PATH`, e.g. `LocalTransport::new`/`SshTransport::new` in

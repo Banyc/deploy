@@ -750,7 +750,6 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-
         // Regression pin: the activation generation root must be
         // `<remote>/generations/<gid>/root` (the symlink to the tree content
         // root), never a nested `root/root`. A double-join would make staging

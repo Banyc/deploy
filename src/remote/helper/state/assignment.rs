@@ -102,7 +102,9 @@ mod tests_assignment {
     #[test]
     fn generation_assignment_is_create_or_compare() {
         let dir = crate::testutil::fixture_tmpdir(&crate::testutil::fixture_env()).unwrap();
-        let remote = LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote")).unwrap();
+        let remote =
+            LocalTransport::new(&crate::testutil::fixture_env(), dir.path().join("remote"))
+                .unwrap();
         let helper = RemoteHelper::new(&remote);
 
         helper

@@ -231,7 +231,10 @@ pub(crate) fn two_slot_push(
     let factory = move |s: &crate::config::ServerDef,
                         _slot: &crate::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
+        Ok(Box::new(LocalTransport::new(
+            &crate::testutil::fixture_env(),
+            rf.join(s.id.as_str()),
+        )?))
     };
     push_inner(
         &project_root,
@@ -527,7 +530,10 @@ pub(crate) fn push_clean(h: &RecoveryHarness) -> Result<PushReport> {
     let clean_factory = move |s: &crate::config::ServerDef,
                               _slot: &crate::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
+        Ok(Box::new(LocalTransport::new(
+            &crate::testutil::fixture_env(),
+            rf.join(s.id.as_str()),
+        )?))
     };
     push(
         &h.cfg_path,
@@ -644,7 +650,10 @@ pub(crate) fn push_main_with_id(
     let factory = move |s: &crate::config::ServerDef,
                         _slot: &crate::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf.join(s.id.as_str()))?))
+        Ok(Box::new(LocalTransport::new(
+            &crate::testutil::fixture_env(),
+            rf.join(s.id.as_str()),
+        )?))
     };
     push_inner(
         &project_root,
@@ -781,9 +790,15 @@ pub(crate) fn install_fake_systemctl(
         )
         .into(),
     );
-    vars.insert("XDG_CONFIG_HOME".into(), base.join("xdg").as_os_str().to_owned());
+    vars.insert(
+        "XDG_CONFIG_HOME".into(),
+        base.join("xdg").as_os_str().to_owned(),
+    );
     vars.insert("FAKE_SYSTEMCTL_FAIL".into(), marker.as_os_str().to_owned());
-    vars.insert("FAKE_SYSTEMCTL_ONCE".into(), if once { "1" } else { "0" }.into());
+    vars.insert(
+        "FAKE_SYSTEMCTL_ONCE".into(),
+        if once { "1" } else { "0" }.into(),
+    );
     crate::env::SysEnv::from_map(vars)
 }
 
@@ -799,10 +814,6 @@ pub(crate) struct SysdHarness {
 }
 
 impl SysdHarness {
-    pub(crate) fn new() -> SysdHarness {
-        SysdHarness::with_env(crate::testutil::fixture_env())
-    }
-
     /// Build the harness with an explicit environment snapshot; the push
     /// factory's transports and their child processes receive THIS env (e.g.
     /// a hermetic env with a fake `systemctl` on PATH), never the parent's.
