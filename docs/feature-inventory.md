@@ -1,261 +1,94 @@
-# deploy — semantic feature inventory
+# deploy — feature inventory (post-encapsulation)
 
-Generated 2026-08-27 (readonly research agent, cross-checked cli.rs / model.rs /
-revset.rs / push engine / records / config / store / retention / gc / checkpoint /
-adapters / transports / README.md / requirement.md). See the
-"Module map (encapsulation)" section at the end for the post-restructure tree.
+Generated 2026-08-27. **Confirmed-encapsulated features have been REMOVED**:
+each of them now lives in its own dedicated module (verified per-pass with the
+full gate; see the Module map below for where every feature lives). The
+sections below retain ONLY the features that are NOT yet individually
+encapsulated — those still sharing a module (or spread across areas) — each
+with a note of its current home. A7 (hidden/implicit semantics) is retained
+in full: it is inherently spread across the owning areas.
 
 ---
 
-## A1. DEPLOYMENT SEMANTICS
+## A1. DEPLOYMENT SEMANTICS — remaining
 
-- **Head-files push**: `deploy push <target>` materializes the locally mapped files
-  of the active release (`releases/<release>/<variant>.toml` -> trees) and deploys
-  to every member slot of the target (cli.rs:180, engine.rs:386).
-- **Reference grammar** (`push <target> [ref]`, jj-style; parsed store-free by
-  winnow, resolved against the target's ledger; revset.rs):
-  - `` / `HEAD` / `@` — current local files (default).
-  - `@-` / `@--` — 1/2 deployments before the latest *successful* deployment.
-  - `parent(@, N)` — N steps back from latest (shell-quote needed: comma).
-  - `<deployment-id>` — restore that deployment's exact stored snapshot.
-  - `<deployment-id>-` / `<deployment-id>--` — 1/2 steps back from that deployment.
-  - `parent(<deployment-id>, N)` — N steps back (N=0 = the deployment itself).
-  - `release:<id>` — DIRECT release deploy (cross-target, no snapshot history
-    needed; full `rel-sha256-...` id or bare 64-hex digest at the CLI boundary).
-  - **REMOVED** (fail closed with migration hints): `sN`/`fN` forms, release-refid
-    ancestor forms (`rel-...--`, `parent(rel-..., M)`), bare release ids,
-    `release/<id>`, target-repeated `target@ref`, `:current`.
-  - `parent(@, 0)` folds to `@` (is_head_push).
-  - Out-of-range refs are ref errors — never underflow/guess.
-- **Rollout groups**: `--group <name>` selects the target's slots whose `groups`
-  list contains the name; membership for historical/HEAD refs from the CURRENT
-  topology, for `release:<id>` from the RELEASE's frozen topology (plan.rs:502).
-- **Group push = COMPLETE snapshot**: unselected slots carried forward from the
-  latest successful base; fully rollback-capable (history.rs:259).
-- **Partial-rollout guards**: first deployment requires the group to cover every
-  slot; after membership changes every unselected slot needs a prior assignment
-  with matching physical binding (plan.rs:332).
-- **`--dry-run`**: prints the per-slot plan, touches nothing (no store writes, no
-  locks, no remote mutation; still connects READ-ONLY + pins host key locally).
-- **"Everything up to date"** no-op for HEAD pushes: requires complete ArtifactRef
-  equality (release+variant+tree) AND a successful per-slot verification run.
-- **Batching**: `rollout.batch_size` (validated NONZERO) slots per batch, in
-  deployment (assignment) order — not sorted slot ids.
-- **`stop_on_failure`**: halts remaining batches after the first failed slot.
-- **Failure policies** (strict typed enum; unknown spelling = config load error):
-  `rollback_changed` (default) and `leave_changed`.
-- **Per-slot compensation (step 11)**: activation/verification failure after
-  `current` advanced -> restore prior generation (or remove `current` on first
-  deploy, CAS) with the prior generation's stored behavior contract + identity.
-- **Batch-failure compensation (step 13)**: under `rollback_changed`, every
-  `advanced` server compensated via CAS; failed compensation -> Degraded.
-- **Outcome dispositions**: InProgress (intent-only), Successful, PendingCommit,
-  FailedPreflight, FailedRolledBack, Degraded.
-- **Per-slot outcome kinds**: Activated, Failed, Skipped, Restored;
-  `Compensated` RESERVED, never emitted.
-- **Degraded semantics**: remaining changes DERIVED from outcomes (never stored);
-  all-restored outcomes refused for Degraded (must be FailedRolledBack).
-- **CAS precondition**: `swap_current` only advances if `current` still points at
-  the expected generation; divergence -> Skipped, never a clobber.
-- **Skipped slots still appear** in the attempt with their reconciled assignment.
-- **Per-slot mutation lock** held across publish/swap/activate/commit (RAII).
+- **Head-files push** — home: `src/deploy/push.rs` (shares the orchestration module with the push steps).
+- **Group push = COMPLETE snapshot** (unselected slots carried forward, fully rollback-capable) — home: `src/ledger/finalize.rs` (shared with finalization).
+- **Partial-rollout guards** (first-deployment / membership-change rules) — home: `src/deploy/plan.rs` (shared with planning).
+- **"Everything up to date" no-op** (ArtifactRef equality + per-slot verification) — home: `src/deploy/push.rs`.
+- **Per-slot compensation (step 11)** (restore prior generation / remove `current` on first deploy) — home: `src/deploy/server.rs` (shared with the per-server process).
+- **Outcome dispositions** (InProgress/Successful/PendingCommit/FailedPreflight/FailedRolledBack/Degraded) — home: `src/ledger/records.rs`.
+- **Per-slot outcome kinds** (Activated/Failed/Skipped/Restored; Compensated reserved) — home: `src/ledger/records.rs`.
+- **Degraded semantics** (remaining-changes derivation, all-restored refusal) — home: `src/ledger/records.rs`.
+- **CAS precondition** (`swap_current` only advances on the expected generation) — home: `src/remote/helper.rs` (shared with the remote helper).
+- **Skipped slots still appear** in the attempt with their reconciled assignment — home: `src/deploy/push.rs`.
 
-## A2. LEDGER SEMANTICS
+## A2. LEDGER SEMANTICS — remaining
 
-- **One ledger per target**: `targets/<target>/ledger.jsonl`, append-only JSONL.
-- **Two line kinds**: `intent` (durable, persisted BEFORE any remote mutation)
-  and `terminal` (status, outcomes, rollback); merged on read.
-- **Crash-atomic appends**: temp + fsync + rename + parent-dir fsync.
-- **Deployment-id-keyed**: duplicate intent refused; terminal requires matching
-  intent (fail closed).
-- **`deploy log <target>`**: newest last, PREFIXED with the rollback payload's
-  deployment id (or `-`); failed/degraded visible but never valid rollback refs;
-  optional ` group=<name>` note.
-- **Recovery / pending-commit reconciliation** (`reconcile_pending_commits`): runs
-  at the START of every real push (before ref resolution + no-op check);
-  intent-only entries processed oldest-first: membership check, fresh remote
-  generation == desired, idempotent commit markers under slot locks, finalize via
-  the SHARED finalizer; mismatch/integrity conflict -> Degraded; transient
-  failures stay pending.
-- **Replay-safe finalization**: `append_terminal` refuses duplicates.
-- **Commit markers** (remote, per server): `state/commits/<deployment-id>.json`
-  with deployment id, generation, full participating slot set, target; written
-  idempotently; differing content = integrity conflict -> Degraded.
-- **Schema versions** (each fail-closed on read, independent): CONFIG=2,
-  LEDGER=3 (three-state pre_push + persisted selected/full memberships; v1/v2
-  REJECTED), RELEASE_PAYLOAD=3, RELEASE_RECORD=2, TREE=1, PINS=1, PROTOCOL=1.
-- **Membership proof equations** (every Successful terminal): outcomes ==
-  selected_membership, rollback == full_membership, selected ⊆ full, full-push
-  selected == full.
-- **Rollback payload** = complete resulting target snapshot: per-slot
-  GenerationRef + PhysicalBinding {server, deploy_dir}.
-- **Exact rollback verification**: rebound slot or moved deploy_dir refuses.
-- **Transaction records**: `transactions/<op-id>.json` prepared -> committed /
-  compensated — [HIDDEN] WRITTEN but never read back (documented PLANNED).
+- **One ledger per target** (`targets/<target>/ledger.jsonl`, append-only JSONL) — home: `src/store/local.rs` (infrastructure).
+- **Two line kinds** (intent / terminal, merged on read) — home: `src/ledger/records.rs` (shared with the record types).
+- **Deployment-id-keyed** (duplicate intent refused; terminal requires matching intent) — home: `src/store/local.rs` + `src/ledger/records.rs`.
+- **`deploy log`** rendering — home: `src/cli.rs`.
+- **Commit markers** (idempotent per-server markers; integrity conflict → Degraded) — home: `src/remote/helper.rs` (shared).
+- **Schema versions** (fail-closed, independent; constants live in their owning areas) — home: `LEDGER`/`PINS` → `src/ledger/records.rs`, `CONFIG` → `src/config/raw.rs`, `TREE` → `src/remote/canonical.rs`, `RELEASE_PAYLOAD`/`RELEASE_RECORD` → `src/verify/release.rs`, `PROTOCOL` → `src/remote/transport.rs`.
+- **Exact rollback verification** (rebound slot / moved deploy_dir refuses) — home: `src/deploy/push.rs`.
+- **Transaction records** (written `prepared`→`committed`/`compensated`, never read back — PLANNED) — home: `src/remote/helper.rs` (shared).
 
-## A3. REMOTE / STORE SEMANTICS
+## A3. REMOTE / STORE SEMANTICS — remaining
 
-- **`current` symlink chain**: `current` -> `generations/<gen>/root` ->
-  `../../objects/sha256/<tree>/root` (canonical byte-exact target); the COMPLETE
-  chain validated on every status read — missing gen dir, malformed/mismatched
-  assignment, non-symlink or wrong root link, missing tree object are integrity
-  errors (never reported as absent).
-- **`assignment.json`** (per generation): deployment_id, generation_id, artifact,
-  behavior_sha256, prior_generation, created_at, owning target.
-- **Content-addressed object store** (local + remote): `objects/sha256/<digest>/root`
-  + `tree.json`; immutable, re-verified on reuse.
-- **Tree canonicalization**: NFC-normalized UTF-8 paths, umask-independent modes,
-  relative in-root symlinks only, absolute/devices/sockets/FIFOs/hard links
-  rejected, ownership/timestamps/xattrs stripped.
-- **Materialization**: mappings `from` relative to release dir (cannot escape);
-  overlapping destinations rejected; dirs keep source mode; `{{ variant }}` only
-  at mapping time.
-- **Staging**: per-variant persistent staging dirs; operation-unique remote
-  incoming dirs (`incoming/<deployment-id>/<digest>.partial`); dry-run disposable.
-- **Publish**: rename staged `.partial` into the store only if digest absent;
-  EXISTING remote objects re-hashed (download -> canonicalize -> digest compare)
-  before trust.
-- **Local object recovery**: `recover_if_missing` downloads from a retaining server.
-- **Remote layout**: control/protocol.json, helpers/ (created, unused), objects/,
-  releases/, generations/, incoming/, state/ (operation.lock, inventory.json,
-  commits/), adapters/, transactions/, current.
-- **Observed state**: ONE physical record per slot (`slots/<slot-id>/observed.json`);
-  target views are projections.
-- **Three-state observation**: Known / KnownAbsent / Unknown(error) — unreadable
-  assignment is a DISTINCT value, never a valid-looking artifact; `deploy status`
-  renders Unknown as None columns + "observation failed: ...", never unchanged.
-- **Filesystem-root refusal**: LocalTransport + deploy_dir validation refuse `/`.
-- **Local transport** mirrors the SSH layout exactly (local:// full peers).
+- **`current` symlink chain** (full integrity validation) — home: `src/remote/helper.rs` (shared with the remote helper).
+- **`assignment.json`** (per-generation record) — home: `src/remote/helper.rs` (shared).
+- **Content-addressed object store** (immutable, re-verified) — home: `src/store/local.rs` (infrastructure).
+- **Publish** (rename staged `.partial`; existing remote objects re-hashed before trust) — home: `src/remote/helper.rs` (shared).
+- **Local object recovery** (`recover_if_missing` from a retaining server) — home: `src/remote/helper.rs` (shared) / `src/store/local.rs`.
+- **Local store layout** (default_base, 0700 dirs, per-deployment plan records) — home: `src/store/local.rs` (infrastructure).
+- **`deployments/<id>/`** per-deployment plan records (swept by checkpoint) — home: `src/store/local.rs`.
+- **Three-state observation types** (`Observation<T>`, `ObservedState/Generation/Slot/Target`) — home: `src/ledger/records.rs` (shared; re-exported by `src/remote/observed.rs`).
 
-## A4. RETENTION / SWEEP SEMANTICS
+## A4. RETENTION / SWEEP SEMANTICS — remaining
 
-- **Slot-owned retention**: one policy per slot, from the OWNING VARIANT; targets
-  carry rollout only, membership changes never change retention.
-- **Per-server policy**: keep_distinct_artifacts (5), keep_days (14),
-  protect_previous (true — protects the immediate rollback target).
-- **Deployment window**: protect_deployments (0 = off).
-- **Current tree always retained**; malformed current chain already failed closed.
-- **Post-commit step-17 retention**: per slot after durable commit, under the slot
-  mutation lock; failure/lock contention NEVER fails the push — durable debt
-  marker + warning.
-- **Deferred-retention retry**: later pushes + the no-op path.
-- **Pins**: config `[[pins]]` AND store `pins.json`; whole-release or exact-binding;
-  retain artifact content only, never history.
-- **Pin fail-closed**: unreadable/unverifiable pinned release ABORTS before deletion.
-- **Receiver rotation**: mark-and-sweep per server (trees not in retained set +
-  abandoned incoming); rewrites inventory.
-- **Checkpoint command**: retained-suffix computation at a SUCCESSFUL deployment,
-  ATOMIC suffix replace (the only logical commit), best-effort GLOBAL sweep.
-- **Irreversibility guards**: deployment id required positional, `--yes` required,
-  `--dry-run` previews the EXACT discard list (same LedgerOverride).
-- **Global GC reachability** (fail closed on every anchor: unreadable ledger /
-  observed / pins aborts before any deletion).
-- **Unknown-observation conservatism**: an Unknown observed slot aborts the sweep.
-- **Sweep debt**: `<base>/sweep-debt.json`; next push recomputes fresh; no
-  persisted deletion worklist.
-- **Both sweeps post-commit maintenance**: failures are WARNINGS, never errors.
-- **Not secure erasure**: unlink + fsync only.
+- **Post-commit step-17 retention** (never fails the push; debt marker + warning) — home: `src/deploy/push.rs` (`retain_slot_post_commit`).
+- **Deferred-retention retry** (later pushes + the no-op path) — home: `src/deploy/push.rs`.
+- **Receiver rotation** (contract in `src/retention/rotate.rs`; the mark-and-sweep I/O lives in `src/remote/helper.rs` — spans both).
+- **Pusher/receiver split** (receiver rotation vs pusher checkpoint sweep; conceptual, spans `src/retention/` + `src/remote/helper.rs`).
 
-## A5. VERIFICATION / ACTIVATION SEMANTICS
+## A5. VERIFICATION / ACTIVATION SEMANTICS — remaining
 
-- **Verification adapter `command`**: argv executed directly (never a shell),
-  timeout_seconds, attempts (default 1), interval_seconds; zero exit within
-  timeout = success.
-- **argv templating** with the full slot context BEFORE exec; unknown/malformed
-  variable fails loudly.
-- **Activation adapters**: `none` (default) and `systemd`.
-- **systemd user scope**: staged rendered units, copied to ~/.config/systemd/user/,
-  daemon-reload, enable, restart.
-- **systemd system scope**: NEVER links units into /etc/systemd/system; only a
-  scoped restart of the fixed admin wrapper.
-- **`reconcile_managed_units`** (default true): disables/removes formerly managed
-  links absent from the desired contract; ownership in adapters/systemd.json.
-- **Unit-name safety**: absolute paths / `..` / `.` / empty names rejected.
-- **Artifact-path validation** before `current` changes.
-- **Behavior contract frozen**: canonicalized + hashed into release identity
-  (behavior_sha256) + copied into every deployment/generation record; historical
-  pushes use historical contracts, never current config.
-- **Behavior coverage gate**: every planned (release, variant) must have a frozen
-  contract BEFORE any remote mutation.
-- **Host identity**: exactly one of known_hosts (StrictHostKeyChecking=yes) or
-  host_key_fingerprint (SSH256:..., pinned via ssh-keyscan); TOFU refused; both
-  rejected as ambiguous.
-- **Key-pin cache**: $TMPDIR/deploy-ssh-knownhosts/knownhosts-<hash>.txt,
-  validated against the fingerprint before reuse.
-- **Protocol handshake**: first contact records control/protocol.json (exclusive
-  create); later contacts refuse on version mismatch.
-- **SSH transport bounds**: ConnectTimeout=10 bounds the connection; a process
-  deadline (60s) bounds the whole operation; on deadline SIGKILL + deterministic
-  reap (no zombies).
+- **Behavior coverage gate** (every planned (release, variant) needs a frozen contract before mutation) — home: `src/deploy/push.rs`.
+- **Protocol handshake** (first-contact `control/protocol.json`, later contacts refuse on version mismatch) — home: `src/remote/helper.rs` (shared).
 
-## A6. IDENTITY / PROOF SEMANTICS
+## A6. IDENTITY / PROOF SEMANTICS — remaining
 
-- **ReleaseId**: exact `rel-sha256-<64 lowercase hex>`; bare/`rel-` forms rejected
-  at the domain boundary; CLI accepts a bare 64-hex digest (converted first).
-- **DeploymentId / GenerationId / OperationId**: `deploy-`/`gen-`/`op-` +
-  canonical hyphenated UUIDv7 (version nibble enforced; v4 rejected).
-- **TreeDigest / ReleaseDigest**: exactly 64 lowercase hex.
-- **Segment identities**: SlotId, ServerId, TargetName, VariantName,
-  RolloutGroupName — single safe path segment.
-- **ApplicationStoreKey**: single safe segment; store = base.join(key).
-- **BatchSize**: nonzero u64; **CapacityPercent**: 0..=100; **AbsoluteDeployDir**:
-  absolute.
-- **Release identity payload**: name-sorted mapping digest + behavior digest +
-  slot-declaration digest + variant->tree bindings; capacity excluded; slots ARE
-  identity (rebind/move/retarget = new release).
-- **verify_release_identity**: recompute on EVERY read; foreign payload version
-  fails verification.
-- **Membership proofs**: SlotSet / NonEmptySlotSet / MatchingMembership — only
-  construction path is `MatchingMembership::verify` (frozen == current).
-- **RebindingPlan / VerifiedReleaseRebinding**: `release:<id>` pushes carry the
-  verified rebinding proof (frozen topology -> current physical slots).
-- **No `Default` on identities** (empty identity unrepresentable).
+- **`RebindingPlan` / `VerifiedReleaseRebinding`** (the verified rebinding proof) — home: `src/ledger/records.rs` (shared with the record types).
 
-## A7. HIDDEN / IMPLICIT SEMANTICS [HIDDEN]
+## A7. HIDDEN / IMPLICIT SEMANTICS (retained in full — inherently spread)
 
-- [HIDDEN] `DEPLOY_SSH_KNOWNHOSTS_DIR` env var — LIVE in production builds,
-  relocates the pinned-known-hosts cache; undocumented (hostkey.rs:74).
-- [HIDDEN] No-op push silently runs: deferred-retention retry, pending-sweep
-  retry, observed projection refresh, per-slot verification (invisible except the
-  `warning:` line).
-- [HIDDEN] `reconcile_pending_commits` runs before ref resolution — relative refs
-  like `@-` see the post-recovery chain.
-- [HIDDEN] PendingCommit demotion reasons: "recoverable metadata failure",
-  "commit diverged", "marker integrity conflict".
-- [HIDDEN] Commit-marker integrity conflicts finalize Degraded, never
-  stranded-pending.
-- [HIDDEN] Step-17 test hook (`step17_hook_barrier`, `HookPhase`) — #[cfg(test)]
-  only; cannot be armed in production builds.
-- [HIDDEN] `UMASK_PROBE_MODE`/`UMASK_RESULT_FILE`, `FAKE_SYSTEMCTL_FAIL`/
-  `FAKE_SYSTEMCTL_ONCE` — test-only shims.
-- [HIDDEN] Transaction records written but never read back (documented PLANNED).
-- [HIDDEN] `helpers/` remote dir created but unused (planned helper binary).
-- [HIDDEN] Full current-chain integrity on every status read (malformed != nothing
-  deployed).
-- [HIDDEN] Remote objects never trusted (re-canonicalize + digest compare before
-  use).
-- [HIDDEN] `verify_release_identity` on every release read.
-- [HIDDEN] Filesystem root refused as deploy_dir.
-- [HIDDEN] Abandoned incoming cleanup before mutating.
-- [HIDDEN] First-deployment compensation removes `current` (CAS), never writes.
-- [HIDDEN] Compensation re-runs the PRIOR generation's stored behavior contract
-  with the PRIOR assignment's identity (no torn combinations).
-- [HIDDEN] `SlotOutcomeKind::Compensated` reserved, never emitted.
-- [HIDDEN] `parent(@,0) ≡ @` fold (parse + resolution).
-- [HIDDEN] Group pushes still yield COMPLETE snapshots (unselected carried
-  forward) + partial-rollout guards.
-- [HIDDEN] Dry-run still connects to remotes (read-only status; pins host keys) —
-  "touches nothing" means no writes/locks/mutation, not no network.
-- [HIDDEN] Three lock layers: local operation.lock, per-target lock, per-slot
-  remote mutation locks.
-- [HIDDEN] `ensure_target_dir_durable` (fsync before the lock file lives inside).
-- [HIDDEN] Durable debt markers (retention-debt.json, sweep-debt.json) are the
-  only persisted sweep/retention state.
-- [HIDDEN] `deploy log` ` group=<name>` annotation.
-- [HIDDEN] No-op verification renders EXISTING generation identities, never
-  fabricated ones.
-- [HIDDEN] All names (application/server/slot/target/variant/group) are single
-  safe path segments — can never escape their directory.
+- [HIDDEN] `DEPLOY_SSH_KNOWNHOSTS_DIR` env var — LIVE in production builds (relocates the pinned-known-hosts cache); undocumented — home: `src/remote/ssh.rs` / `src/remote/hostkey.rs`.
+- [HIDDEN] No-op push silently runs: deferred-retention retry, pending-sweep retry, observed refresh, per-slot verification — home: `src/deploy/push.rs`.
+- [HIDDEN] `reconcile_pending_commits` runs before ref resolution (relative refs see the post-recovery chain) — home: `src/ledger/recovery.rs`.
+- [HIDDEN] PendingCommit demotion reasons ("recoverable metadata failure", "commit diverged", "marker integrity conflict") — home: `src/deploy/push.rs`.
+- [HIDDEN] Commit-marker integrity conflicts finalize Degraded, never stranded-pending — home: `src/ledger/recovery.rs`.
+- [HIDDEN] Step-17 test hook (`step17_hook_barrier`, `HookPhase`) — `#[cfg(test)]` only — home: `src/deploy/push.rs`.
+- [HIDDEN] `UMASK_PROBE_MODE`/`UMASK_RESULT_FILE`, `FAKE_SYSTEMCTL_FAIL`/`FAKE_SYSTEMCTL_ONCE` — test-only shims — home: `src/remote/materialize.rs`, `src/deploy/push.rs`.
+- [HIDDEN] Transaction records written but never read back (documented PLANNED) — home: `src/remote/helper.rs`.
+- [HIDDEN] `helpers/` remote dir created but unused (planned helper binary) — home: `src/remote/layout.rs`.
+- [HIDDEN] Full current-chain integrity on every status read (malformed != nothing deployed) — home: `src/remote/helper.rs`.
+- [HIDDEN] Remote objects never trusted (re-canonicalize + digest compare before use) — home: `src/remote/helper.rs`.
+- [HIDDEN] `verify_release_identity` on every release read — home: `src/verify/release.rs`.
+- [HIDDEN] Filesystem root refused as deploy_dir — home: `src/remote/transport.rs`.
+- [HIDDEN] Abandoned incoming cleanup before mutating — home: `src/deploy/push.rs`.
+- [HIDDEN] First-deployment compensation removes `current` (CAS), never writes — home: `src/deploy/server.rs`.
+- [HIDDEN] Compensation re-runs the PRIOR generation's stored behavior contract with the PRIOR assignment's identity — home: `src/deploy/server.rs`.
+- [HIDDEN] `SlotOutcomeKind::Compensated` reserved, never emitted — home: `src/ledger/records.rs`.
+- [HIDDEN] `parent(@,0) ≡ @` fold — home: `src/deploy/refs.rs` + `src/ledger/refs.rs`.
+- [HIDDEN] Group pushes still yield COMPLETE snapshots + partial-rollout guards — home: `src/ledger/finalize.rs` + `src/deploy/plan.rs`.
+- [HIDDEN] Dry-run still connects to remotes (read-only) — home: `src/deploy/dryrun.rs`.
+- [HIDDEN] Three lock layers (local `FileLock` in `src/deploy/lock.rs`, per-target, per-slot remote mutation locks in `src/remote/helper.rs`).
+- [HIDDEN] `ensure_target_dir_durable` (fsync before the lock file) — home: `src/store/local.rs`.
+- [HIDDEN] Durable debt markers (`retention-debt.json`, `sweep-debt.json`) — home: `src/store/local.rs` (I/O) + `src/retention/debt.rs`.
+- [HIDDEN] `deploy log` ` group=<name>` annotation — home: `src/cli.rs`.
+- [HIDDEN] No-op verification renders EXISTING generation identities, never fabricated ones — home: `src/deploy/push.rs`.
+- [HIDDEN] All names are single safe path segments — home: `src/identity/segments.rs` + `src/identity/scalars.rs`.
 
 ## Module map (encapsulation)
 
