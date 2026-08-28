@@ -21,6 +21,11 @@ jiff = "0.2.35"
 
 [dev-dependencies]
 assert_fs = "1"
+# The serialized real-process lifecycle target (`tests/process_lifecycle.rs`)
+# probes pids with `kill(2)` / `waitpid(2)` directly (no external `kill`
+# binary — the syscall-level probes the runner contract is about). `libc` is
+# already a main dependency; this enables it for the integration tests.
+libc = "0.2"
 # Property-based state-machine coverage (src/semantic_invariants.rs): bounded
 # RANDOM action vectors with shrinking instead of only the fixed sequences.
 # Default features (fork/timeout) are unused; the test pins its own

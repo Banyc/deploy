@@ -1,0 +1,18 @@
+# Nextest configuration.
+#
+# The real-process lifecycle target (`tests/process_lifecycle.rs`) must NEVER
+# run its cases concurrently with each other or with the deterministic
+# deployment/state-machine properties: it spawns real children, process
+# groups, and grandchildren, and its assertions probe the pid space. The
+# deterministic properties drive a scripted fake exec (no real processes), so
+# the only thing left to serialize is THIS binary: `test-threads = 1` runs
+# its test cases strictly serially. (Nextest otherwise runs test cases within
+# a binary in parallel on a worker pool.)
+#
+# The lifecycle property drives real children under a 1s runner deadline plus
+# cleanup + load-tolerant no-post-return-fs probe windows (~1-3s per pair,
+# up to 3 pairs × 16 cases), so it can legitimately take minutes under heavy
+# load; give it a generous slow timeout instead of the 60s default.
+[profile.default.binaries."process_lifecycle"]
+test-threads = 1
+slow-timeout = { period = "120s", terminate-after = 2 }

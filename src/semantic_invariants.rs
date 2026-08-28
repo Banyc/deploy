@@ -335,9 +335,18 @@ struct FailOnceRemote {
 }
 
 impl FailOnceRemote {
-    fn build(base: PathBuf, fault: Arc<Mutex<RemoteFault>>) -> Result<Box<dyn Remote>> {
+    fn build(
+        base: PathBuf,
+        fault: Arc<Mutex<RemoteFault>>,
+        script: crate::remote::transport::scripted::ScriptedExec,
+    ) -> Result<Box<dyn Remote>> {
         Ok(Box::new(FailOnceRemote {
-            inner: LocalTransport::new(&crate::testutil::fixture_env(), base)?,
+            // The deterministic fake exec: the push logic branches on the
+            // exec OUTCOME only (verification success/failure), and the
+            // property's fault injection is FILE-level — the fake replaces
+            // the real `true` subprocess with the scripted outcome, so the
+            // state-machine properties spawn nothing and stay deterministic.
+            inner: LocalTransport::with_exec(&crate::testutil::fixture_env(), base, script)?,
             fault,
         }))
     }
@@ -883,6 +892,12 @@ pub(crate) struct Fixture {
     store: LocalStore,
     remotes_base: PathBuf,
     fault: Arc<Mutex<RemoteFault>>,
+    /// The deterministic fake exec every transport this fixture builds
+    /// injects (see [`Fixture::remote_factory`] / [`Fixture::remote_for`]):
+    /// scripted verification outcomes, no real subprocesses — the property
+    /// suites stay parallel-safe and deterministic under the in-process
+    /// harness.
+    script: crate::remote::transport::scripted::ScriptedExec,
     /// Monotonic counter for the property test's fixed deployment ids
     /// (`si-<tag>-<NNNN>`): every property push/rollback uses a caller id so
     /// the store faults (keyed by deployment id) can be armed per step, and
@@ -955,6 +970,13 @@ impl Fixture {
             store,
             remotes_base,
             fault: Arc::new(Mutex::new(RemoteFault::default())),
+            // The deterministic fake exec every transport this fixture builds
+            // injects (see [`FailOnceRemote::build`] / [`Fixture::remote_for`]):
+            // the state-machine properties exercise the push LOGIC with
+            // scripted verification outcomes — no real subprocess, no
+            // wall-clock — so they are parallel-safe under `cargo test --lib`
+            // and heavy nextest parallelism.
+            script: crate::remote::transport::scripted::ScriptedExec::default_success(),
             prop_ids: AtomicU64::new(0),
             prop_tag,
             last_prop: Mutex::new(None),
@@ -980,8 +1002,9 @@ impl Fixture {
     + 'static {
         let rf = self.remotes_base.clone();
         let fault = self.fault.clone();
+        let script = self.script.clone();
         move |s: &crate::config::ServerDef, _slot: &crate::config::SlotConfig| {
-            FailOnceRemote::build(rf.join(s.id.as_str()), fault.clone())
+            FailOnceRemote::build(rf.join(s.id.as_str()), fault.clone(), script.clone())
         }
     }
 
@@ -1006,7 +1029,10 @@ impl Fixture {
     fn remote_for(&self, server: &str) -> Box<dyn Remote> {
         let p = self.remotes_base.join(server);
         std::fs::create_dir_all(&p).unwrap();
-        Box::new(LocalTransport::new(&crate::testutil::fixture_env(), p).unwrap())
+        Box::new(
+            LocalTransport::with_exec(&crate::testutil::fixture_env(), p, self.script.clone())
+                .unwrap(),
+        )
     }
 
     /// A transport handle over the server's remote directory (`s1`). The
@@ -6914,12 +6940,12 @@ fn run_slot_view_property(members: Vec<Vec<bool>>, pushes: Vec<usize>) {
     let factory = move |s: &crate::config::ServerDef,
                         _slot: &crate::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(
+        Ok(Box::new(LocalTransport::with_exec(
             &crate::testutil::fixture_env(),
             rf.join(s.id.as_str()),
+            crate::remote::transport::scripted::ScriptedExec::default_success(),
         )?))
     };
-
     // The artifact source the variant maps; rewritten before every push so
     // each push is a REAL deployment.
     let artifacts = release_dir.join("artifacts/build/output/app");

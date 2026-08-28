@@ -25,7 +25,9 @@ pub(crate) use crate::ledger::{
     ObservationWire, ObservedAssignment, ObservedGenerationWire, RefExpr, SlotAttemptState,
     TerminalDisposition,
 };
-pub(crate) use crate::remote::transport::{CreateNewVerdict, FsBytes, LocalTransport, Remote};
+pub(crate) use crate::remote::transport::{
+    CreateNewVerdict, FsBytes, LocalTransport, Remote, scripted::ScriptedExec,
+};
 pub(crate) use crate::store::local::LocalStore;
 pub(crate) use crate::testutil::test_remotes::FailOnceMarkerRemote;
 pub(crate) use crate::verify::release::RELEASE_RECORD_SCHEMA_VERSION;
@@ -181,6 +183,10 @@ pub(crate) struct TwoSlotHarness {
     pub(crate) config: ProjectConfig,
     pub(crate) store: LocalStore,
     pub(crate) remotes_base: PathBuf,
+    /// The deterministic fake exec every transport this harness builds
+    /// injects: scripted verification outcomes, no real subprocesses — the
+    /// push properties stay parallel-safe and deterministic.
+    pub(crate) script: ScriptedExec,
 }
 
 impl TwoSlotHarness {
@@ -212,6 +218,7 @@ impl TwoSlotHarness {
             config,
             store,
             remotes_base,
+            script: ScriptedExec::default_success(),
         }
     }
 }
@@ -229,12 +236,14 @@ pub(crate) fn two_slot_push(
     let target = config.target("t1").expect("harness target");
     let op_id = OperationId::new(format!("op-{}", deployment_id.as_str()));
     let rf = h.remotes_base.clone();
+    let script = h.script.clone();
     let factory = move |s: &crate::config::ServerDef,
                         _slot: &crate::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(
+        Ok(Box::new(LocalTransport::with_exec(
             &crate::testutil::fixture_env(),
             rf.join(s.id.as_str()),
+            script.clone(),
         )?))
     };
     push_inner(
@@ -265,6 +274,12 @@ pub(crate) struct RecoveryHarness {
     pub(crate) config: ProjectConfig,
     pub(crate) store: LocalStore,
     pub(crate) remotes_base: PathBuf,
+    /// The deterministic fake exec every transport this harness builds
+    /// injects: scripted verification outcomes, no real subprocesses — the
+    /// push/recovery properties stay parallel-safe and deterministic. Tests
+    /// that need a scripted failure (e.g. a non-zero verification driving
+    /// the compensation branch) build the harness's script before pushing.
+    pub(crate) script: ScriptedExec,
 }
 
 impl RecoveryHarness {
@@ -302,6 +317,7 @@ impl RecoveryHarness {
             config,
             store,
             remotes_base,
+            script: ScriptedExec::default_success(),
         }
     }
 }
@@ -452,8 +468,15 @@ pub(crate) struct RecordingRemote {
 
 impl RecordingRemote {
     pub(crate) fn new(base: PathBuf, executed: Arc<Mutex<Vec<Vec<String>>>>) -> Result<Self> {
+        // The inner transport injects the deterministic fake exec: the
+        // wrapper records every argv (the assertions' subject) while the fake
+        // returns the scripted success outcome — no real `true` process.
         Ok(RecordingRemote {
-            inner: LocalTransport::new(&crate::testutil::fixture_env(), base)?,
+            inner: LocalTransport::with_exec(
+                &crate::testutil::fixture_env(),
+                base,
+                ScriptedExec::default_success(),
+            )?,
             executed,
         })
     }
@@ -570,7 +593,11 @@ impl SwapInjectRemote {
         stage: SwapStage,
         foreign_gen: crate::identity::GenerationId,
     ) -> Result<Box<dyn Remote>> {
-        let inner = LocalTransport::new(&crate::testutil::fixture_env(), base)?;
+        let inner = LocalTransport::with_exec(
+            &crate::testutil::fixture_env(),
+            base,
+            ScriptedExec::default_success(),
+        )?;
         let wrapper = SwapInjectRemote {
             inner,
             stage,
@@ -729,12 +756,14 @@ impl Remote for SwapInjectRemote {
 /// A push with a healthy `LocalTransport` remote.
 pub(crate) fn push_clean(h: &RecoveryHarness) -> Result<PushReport> {
     let rf = h.remotes_base.clone();
+    let script = h.script.clone();
     let clean_factory = move |s: &crate::config::ServerDef,
                               _slot: &crate::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(
+        Ok(Box::new(LocalTransport::with_exec(
             &crate::testutil::fixture_env(),
             rf.join(s.id.as_str()),
+            script.clone(),
         )?))
     };
     push(
@@ -849,12 +878,14 @@ pub(crate) fn push_main_with_id(
     let target = h.config.target("t1").expect("harness configures target t1");
     let op_id = OperationId::new(format!("op-{}", deployment_id.as_str()));
     let rf = h.remotes_base.clone();
+    let script = h.script.clone();
     let factory = move |s: &crate::config::ServerDef,
                         _slot: &crate::config::SlotConfig|
           -> Result<Box<dyn Remote>> {
-        Ok(Box::new(LocalTransport::new(
+        Ok(Box::new(LocalTransport::with_exec(
             &crate::testutil::fixture_env(),
             rf.join(s.id.as_str()),
+            script.clone(),
         )?))
     };
     push_inner(
@@ -1097,7 +1128,11 @@ pub(crate) struct FakeCapacityRemote {
 impl FakeCapacityRemote {
     pub(crate) fn build(base: PathBuf, avail: u64) -> Result<Box<dyn Remote>> {
         Ok(Box::new(FakeCapacityRemote {
-            inner: LocalTransport::new(&crate::testutil::fixture_env(), base)?,
+            inner: LocalTransport::with_exec(
+                &crate::testutil::fixture_env(),
+                base,
+                ScriptedExec::default_success(),
+            )?,
             avail,
         }))
     }

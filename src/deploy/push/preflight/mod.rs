@@ -1010,12 +1010,14 @@ pub(crate) mod preflight_tests {
         let remotes_before = snapshot_files(&h.remotes_base);
         let observed_before = h.store.read_observed("t1", &h.config).unwrap();
         let rf = h.remotes_base.clone();
+        let script = h.script.clone();
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(
+            Ok(Box::new(LocalTransport::with_exec(
                 &crate::testutil::fixture_env(),
                 rf.join(s.id.as_str()),
+                script.clone(),
             )?))
         };
         let err = push(
@@ -1091,12 +1093,14 @@ pub(crate) mod preflight_tests {
         let store_before = snapshot_files(h.store.base());
         let remotes_before = snapshot_files(&h.remotes_base);
         let rf = h.remotes_base.clone();
+        let script = h.script.clone();
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(
+            Ok(Box::new(LocalTransport::with_exec(
                 &crate::testutil::fixture_env(),
                 rf.join(s.id.as_str()),
+                script.clone(),
             )?))
         };
         let r = push(
@@ -1179,12 +1183,14 @@ pub(crate) mod preflight_tests {
         let store_before = snapshot_files(h.store.base());
         let remotes_before = snapshot_files(&h.remotes_base);
         let rf = h.remotes_base.clone();
+        let script = h.script.clone();
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(
+            Ok(Box::new(LocalTransport::with_exec(
                 &crate::testutil::fixture_env(),
                 rf.join(s.id.as_str()),
+                script.clone(),
             )?))
         };
         let r = push(
@@ -1728,12 +1734,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
         let op_id = OperationId::new("op-historical-behavior".to_string());
         let id = test_deployment_id("deploy-hist-behavior");
         let rf = h.remotes_base.clone();
+        let script = h.script.clone();
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(
+            Ok(Box::new(LocalTransport::with_exec(
                 &crate::testutil::fixture_env(),
                 rf.join(s.id.as_str()),
+                script.clone(),
             )?))
         };
         let err = push_inner(
@@ -1845,12 +1853,14 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
             .clone();
 
         let rf = h.remotes_base.clone();
+        let script = h.script.clone();
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(
+            Ok(Box::new(LocalTransport::with_exec(
                 &crate::testutil::fixture_env(),
                 rf.join(s.id.as_str()),
+                script.clone(),
             )?))
         };
         let r = push(
@@ -2249,10 +2259,15 @@ rollout = { batch_size = 1, stop_on_failure = true, failure_policy = "rollback_c
            // so the plan's resolved source is observable without the (slow)
            // mutation loop.
             let rf2 = h.remotes_base.clone();
+            let script = h.script.clone();
             let clean_factory = move |s: &crate::config::ServerDef,
                                       _slot: &crate::config::SlotConfig|
                      -> Result<Box<dyn Remote>> {
-                Ok(Box::new(LocalTransport::new(&crate::testutil::fixture_env(), rf2.join(s.id.as_str()))?))
+                Ok(Box::new(LocalTransport::with_exec(
+                    &crate::testutil::fixture_env(),
+                    rf2.join(s.id.as_str()),
+                    script.clone(),
+                )?))
             };
             let ref_id = test_deployment_id(&format!("deploy-relative-ref-{latest}-{depth}"));
             h.store

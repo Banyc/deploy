@@ -17,18 +17,25 @@
 //! * `runner` — the shared bounded child-runner: synchronized child
 //!   ownership, process-group termination, and mandatory wait/reap before
 //!   every returned outcome (used by [`LocalTransport::exec`]).
+//! * `scripted` — the deterministic fake exec the deployment/state-machine
+//!   property tests inject (test-only): scripted outcomes keyed by argv, no
+//!   subprocess, no wall-clock — the parallel-safety seam.
 //! * `ssh` — the SSH transport group: the [`SshTransport`] itself plus
 //!   host-key verification (`ssh::hostkey`) and the bounded subprocess
 //!   runner (`ssh::runner`).
 
 mod runner;
+#[cfg(test)]
+pub(crate) mod scripted;
 mod ssh;
 
+pub use runner::{
+    ChildRunner, KillSeam, RealKill, RunError, RunOutcome, RunnerConfig, kill_process_group,
+};
 pub use ssh::SshTransport;
 
 use crate::env::SysEnv;
 use crate::error::{Error, Result};
-use runner::{ChildRunner, RunOutcome, RunnerConfig};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -63,6 +70,47 @@ pub struct ExecOutcome {
 impl ExecOutcome {
     pub fn success(&self) -> bool {
         self.exit_code == 0
+    }
+}
+
+/// THE command-execution seam behind [`LocalTransport::exec`]. Production
+/// uses [`ChildRunner`] (the bounded real runner: spawn into an own process
+/// group, bounded wait, group termination, mandatory reap before every
+/// outcome); the deterministic deployment/state-machine properties inject a
+/// scripted fake (`ScriptedExec`, test-only: scripted outcomes keyed by argv
+/// — no subprocess, no wall-clock). The seam is what makes the property
+/// suites parallel-safe: the deterministic tests exercise the SAME logic
+/// branches (verification success/failure, activation, compensation) without
+/// spawning real processes or contending for the pid space.
+pub trait Exec: Send + Sync {
+    /// Execute `argv` (no shell) bounded by `timeout`, returning the
+    /// outcome. A conforming implementation never leaves a live process
+    /// behind and never blocks past `timeout`.
+    fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome>;
+}
+
+/// The REAL exec: [`ChildRunner`] through the outcome mapping the transport
+/// always applied (a timed-out child surfaces as `exit_code: -1` with the
+/// runner's stderr; a kill/reap failure is an error, never a fake success).
+impl Exec for ChildRunner {
+    fn exec(&self, argv: &[String], timeout: Duration) -> Result<ExecOutcome> {
+        match ChildRunner::exec(self, argv, timeout) {
+            Ok(RunOutcome::Exited {
+                exit_code,
+                stdout,
+                stderr,
+            }) => Ok(ExecOutcome {
+                exit_code,
+                stdout,
+                stderr,
+            }),
+            Ok(RunOutcome::TimedOut { stderr }) => Ok(ExecOutcome {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr,
+            }),
+            Err(e) => Err(Error::transport(e.to_string())),
+        }
     }
 }
 
@@ -750,19 +798,21 @@ pub(crate) fn verified_to_verdict(v: VerifiedExisting) -> CreateNewVerdict {
 /// host. It mirrors the SSH remote layout exactly.
 pub struct LocalTransport {
     base: PathBuf,
-    /// The child environment snapshot: every spawned child (`exec`, `df`)
+    /// The child environment snapshot: every spawned child (`df`)
     /// receives THIS snapshot as its ENTIRE environment
     /// ([`SysEnv::apply_to_command`]: `env_clear` first, then the snapshot's
     /// variables) — a deterministic HERMETIC environment resolved at the
     /// construction boundary, never whatever the parent env looks like at
     /// spawn time, and nothing else.
     env: SysEnv,
-    /// THE shared bounded child-runner every `exec` goes through: the runner
-    /// owns the child from spawn to the mandatory reap, terminates the whole
-    /// process GROUP on timeout (TERM, grace, KILL), and returns every
-    /// outcome — success, timeout, error — only after the child was reaped; a
-    /// timeout-kill failure is an error, never a successful timeout outcome.
-    runner: ChildRunner,
+    /// THE command-execution seam every `exec` goes through: production uses
+    /// [`ChildRunner`] (the bounded real runner: owns the child from spawn
+    /// to the mandatory reap, terminates the whole process GROUP on timeout
+    /// (TERM, grace, KILL), and returns every outcome — success, timeout,
+    /// error — only after the child was reaped; a timeout-kill failure is an
+    /// error, never a successful timeout outcome); the deterministic
+    /// properties inject a scripted fake (no subprocess, no wall-clock).
+    exec: Box<dyn Exec>,
 }
 
 impl LocalTransport {
@@ -780,6 +830,20 @@ impl LocalTransport {
     /// stale generations, the GC sweep) operate on the system root, so the
     /// base must have at least one normal path component below the root.
     pub fn new(env: &SysEnv, base: PathBuf) -> Result<Self> {
+        Self::with_exec(
+            env,
+            base.clone(),
+            ChildRunner::new(env, base, RunnerConfig::production()),
+        )
+    }
+
+    /// Build a transport whose `exec` calls are handled by `exec` instead of
+    /// the production [`ChildRunner`]. Construction stays side-effect-free
+    /// (no directories created, nothing spawned). Test-support seam: the
+    /// deterministic deployment/state-machine properties inject a scripted
+    /// fake so the push LOGIC (verification/activation outcomes) is exercised
+    /// without spawning real processes.
+    pub fn with_exec(env: &SysEnv, base: PathBuf, exec: impl Exec + 'static) -> Result<Self> {
         if !has_normal_component_below_root(&base) {
             return Err(Error::transport(format!(
                 "deploy_dir {:?} must have at least one normal path component below the root (the filesystem root is not a valid deploy_dir)",
@@ -787,9 +851,9 @@ impl LocalTransport {
             )));
         }
         Ok(LocalTransport {
-            runner: ChildRunner::new(env, base.clone(), RunnerConfig::production()),
             base,
             env: env.clone(),
+            exec: Box::new(exec),
         })
     }
 }
@@ -1069,29 +1133,11 @@ impl Remote for LocalTransport {
         if argv.is_empty() {
             return Err(Error::transport("empty command"));
         }
-        // THE bounded child-runner: the runner owns the child (spawned into
-        // its OWN process group), waits with the caller's timeout, and on
-        // timeout terminates the whole group (TERM, grace, KILL) then reaps
-        // before ANY outcome escapes — the timeout outcome is returned only
-        // after the child was proven dead and reaped, and a timeout-KILL
-        // failure surfaces as an error, never a successful timeout.
-        match self.runner.exec(argv, timeout) {
-            Ok(RunOutcome::Exited {
-                exit_code,
-                stdout,
-                stderr,
-            }) => Ok(ExecOutcome {
-                exit_code,
-                stdout,
-                stderr,
-            }),
-            Ok(RunOutcome::TimedOut { stderr }) => Ok(ExecOutcome {
-                exit_code: -1,
-                stdout: String::new(),
-                stderr,
-            }),
-            Err(e) => Err(Error::transport(e.to_string())),
-        }
+        // THE command-execution seam: production is the bounded child-runner
+        // (spawn into an OWN process group, bounded wait, group termination,
+        // mandatory reap before any outcome escapes); the deterministic
+        // properties inject a scripted fake — same trait surface, no process.
+        self.exec.exec(argv, timeout)
     }
 
     fn filesystem_bytes(&self) -> Result<FsBytes> {

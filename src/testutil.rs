@@ -868,7 +868,9 @@ pub(crate) mod test_remotes {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::error::{Error, Result};
-    use crate::remote::transport::{CreateNewVerdict, LocalTransport, Remote};
+    use crate::remote::transport::{
+        CreateNewVerdict, LocalTransport, Remote, scripted::ScriptedExec,
+    };
 
     /// A remote that fails commit marker writes exactly once: the first
     /// write/create under `state/commits/` errors (leaving the marker absent),
@@ -885,7 +887,11 @@ pub(crate) mod test_remotes {
     impl FailOnceMarkerRemote {
         pub(crate) fn build(base: PathBuf, armed: Arc<AtomicBool>) -> Result<Box<dyn Remote>> {
             Ok(Box::new(FailOnceMarkerRemote {
-                inner: LocalTransport::new(&crate::testutil::fixture_env(), base)?,
+                inner: LocalTransport::with_exec(
+                    &crate::testutil::fixture_env(),
+                    base,
+                    ScriptedExec::default_success(),
+                )?,
                 armed,
             }))
         }
@@ -978,7 +984,11 @@ pub(crate) mod test_remotes {
     impl FailOnceGenerationRemote {
         pub(crate) fn build(base: PathBuf, armed: Arc<AtomicBool>) -> Result<Box<dyn Remote>> {
             Ok(Box::new(FailOnceGenerationRemote {
-                inner: LocalTransport::new(&crate::testutil::fixture_env(), base)?,
+                inner: LocalTransport::with_exec(
+                    &crate::testutil::fixture_env(),
+                    base,
+                    ScriptedExec::default_success(),
+                )?,
                 armed,
             }))
         }
@@ -1073,7 +1083,11 @@ pub(crate) mod test_remotes {
     impl FailOnceStagingRemote {
         pub(crate) fn build(base: PathBuf, armed: Arc<AtomicBool>) -> Result<Box<dyn Remote>> {
             Ok(Box::new(FailOnceStagingRemote {
-                inner: LocalTransport::new(&crate::testutil::fixture_env(), base)?,
+                inner: LocalTransport::with_exec(
+                    &crate::testutil::fixture_env(),
+                    base,
+                    ScriptedExec::default_success(),
+                )?,
                 armed,
             }))
         }
@@ -1168,7 +1182,11 @@ pub(crate) mod test_remotes {
     impl FailOnceInventoryRemote {
         pub(crate) fn build(base: PathBuf, armed: Arc<AtomicBool>) -> Result<Box<dyn Remote>> {
             Ok(Box::new(FailOnceInventoryRemote {
-                inner: LocalTransport::new(&crate::testutil::fixture_env(), base)?,
+                inner: LocalTransport::with_exec(
+                    &crate::testutil::fixture_env(),
+                    base,
+                    ScriptedExec::default_success(),
+                )?,
                 armed,
             }))
         }
@@ -1258,7 +1276,11 @@ pub(crate) mod test_remotes {
     impl CountingRemote {
         fn new(base: PathBuf, calls: Arc<AtomicUsize>) -> Result<Self> {
             Ok(CountingRemote {
-                inner: LocalTransport::new(&crate::testutil::fixture_env(), base)?,
+                inner: LocalTransport::with_exec(
+                    &crate::testutil::fixture_env(),
+                    base,
+                    ScriptedExec::default_success(),
+                )?,
                 calls,
             })
         }

@@ -360,12 +360,23 @@ pub(crate) mod execute_tests {
         let target = config2.target("t1").expect("harness target");
         let op_id = OperationId::new(format!("op-{}", id2.as_str()));
         let rf = h.remotes_base.clone();
+        // The verification contract flips to `false`: the deterministic fake
+        // exec scripts that EXACT argv to a non-zero outcome, so the
+        // compensation branch runs — no real `false` process, no wall-clock.
+        let script = crate::remote::transport::scripted::ScriptedExec::default_success()
+            .with_outcome(
+                &["false"],
+                crate::remote::transport::scripted::ScriptedOutcome::failure(
+                    "scripted verification failure (the false contract)",
+                ),
+            );
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(
+            Ok(Box::new(LocalTransport::with_exec(
                 &crate::testutil::fixture_env(),
                 rf.join(s.id.as_str()),
+                script.clone(),
             )?))
         };
         let r2 = push_inner(
@@ -656,12 +667,24 @@ interval_seconds = 0
         let target = config.target("t1").expect("target t1");
         let op_id = OperationId::new(format!("op-{}", id.as_str()));
         let rf = remotes_base.clone();
+        // Deterministic fake exec: `["true"]` succeeds by script while the
+        // `z-failing` variant's `["false"]` contract is scripted to FAIL —
+        // the same verification-outcome branch the real `false` binary
+        // drove, without any subprocess.
+        let script = crate::remote::transport::scripted::ScriptedExec::default_success()
+            .with_outcome(
+                &["false"],
+                crate::remote::transport::scripted::ScriptedOutcome::failure(
+                    "scripted verification failure (the z-failing contract)",
+                ),
+            );
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(
+            Ok(Box::new(LocalTransport::with_exec(
                 &crate::testutil::fixture_env(),
                 rf.join(s.id.as_str()),
+                script.clone(),
             )?))
         };
         let r = push_inner(
@@ -919,12 +942,24 @@ interval_seconds = 0
         let id = test_deployment_id("deploy-ordered");
         let op_id = OperationId::new(format!("op-{}", id.as_str()));
         let rf = remotes_base.clone();
+        // Deterministic fake exec: `["true"]` succeeds by script while the
+        // `z-failing` variant's `["false"]` contract is scripted to FAIL —
+        // the same verification-outcome branch the real `false` binary
+        // drove, without any subprocess.
+        let script = crate::remote::transport::scripted::ScriptedExec::default_success()
+            .with_outcome(
+                &["false"],
+                crate::remote::transport::scripted::ScriptedOutcome::failure(
+                    "scripted verification failure (the z-failing contract)",
+                ),
+            );
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(
+            Ok(Box::new(LocalTransport::with_exec(
                 &crate::testutil::fixture_env(),
                 rf.join(s.id.as_str()),
+                script.clone(),
             )?))
         };
         let r = push_inner(
@@ -1569,12 +1604,24 @@ interval_seconds = 0
         let target = config.target("t1").expect("target t1");
         let op_id = OperationId::new(format!("op-{}", id.as_str()));
         let rf = remotes_base.clone();
+        // Deterministic fake exec: `["true"]` succeeds by script while the
+        // `z-failing` variant's `["false"]` contract is scripted to FAIL —
+        // the same verification-outcome branch the real `false` binary
+        // drove, without any subprocess.
+        let script = crate::remote::transport::scripted::ScriptedExec::default_success()
+            .with_outcome(
+                &["false"],
+                crate::remote::transport::scripted::ScriptedOutcome::failure(
+                    "scripted verification failure (the z-failing contract)",
+                ),
+            );
         let factory = move |s: &crate::config::ServerDef,
                             _slot: &crate::config::SlotConfig|
               -> Result<Box<dyn Remote>> {
-            Ok(Box::new(LocalTransport::new(
+            Ok(Box::new(LocalTransport::with_exec(
                 &crate::testutil::fixture_env(),
                 rf.join(s.id.as_str()),
+                script.clone(),
             )?))
         };
         let r = push_inner(
